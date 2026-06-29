@@ -215,6 +215,18 @@ class InjectionSweepSolver:
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
             _normalize_device(device))
 
+    @classmethod
+    def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
+                      strategy='direct_refactor_every'):
+        """Wrap an already-constructed C++ InjectionSweepSession (zero-copy
+        lightsim2grid bridge). Reuses all wrapper ergonomics."""
+        self = cls.__new__(cls)
+        self._s = session
+        self._max_iter_base = int(max_iter_base)
+        self._tol_base = float(tol_base)
+        self._strategy = strategy
+        return self
+
     # --- mutable config ---
     @property
     def batch_size(self):

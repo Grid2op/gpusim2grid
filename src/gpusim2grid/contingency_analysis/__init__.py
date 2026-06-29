@@ -148,6 +148,21 @@ class ContingencyAnalysisSolver:
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
             _normalize_device(device))
 
+    @classmethod
+    def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
+                      strategy='direct_refactor_every'):
+        """Wrap an already-constructed C++ ContingencyAnalysisSession.
+
+        Used by the zero-copy lightsim2grid bridge, which builds the session in
+        C++ directly from a solved LSGrid. Reuses all wrapper ergonomics.
+        """
+        self = cls.__new__(cls)
+        self._s = session
+        self._max_iter_base = int(max_iter_base)
+        self._tol_base = float(tol_base)
+        self._strategy = strategy
+        return self
+
     @property
     def batch_size(self):
         return self._s.batch_size

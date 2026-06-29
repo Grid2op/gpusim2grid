@@ -10,6 +10,10 @@
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 
+#ifdef GPUSIM2GRID_HAVE_LS2G
+#include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -628,6 +632,56 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("v_results_dlpack", &export_v_results_dlpack_inj,
          "Export batch voltages as DLPack capsule, shape [n_scenarios, n_bus].\n"
          "Requires run() to have been called.  Syncs the solver stream.");
+
+    // -----------------------------------------------------------------
+    // Zero-copy construction from a solved lightsim2grid LSGrid
+    // (only when gpusim2grid was built against lightsim2grid_core)
+    // -----------------------------------------------------------------
+#ifdef GPUSIM2GRID_HAVE_LS2G
+    m.def("_make_ca_session_from_lsgrid",
+        [](pybind11::object grid_py, bool init_from_n_powerflow,
+           int batch_size, int nb_iter, int max_iter_base, double tol_base,
+           int device) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_ca_session_from_lsgrid(
+                grid, init_from_n_powerflow, batch_size, nb_iter,
+                max_iter_base, tol_base, device);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("init_from_n_powerflow") = true,
+        pybind11::arg("batch_size")            = 100,
+        pybind11::arg("nb_iter")               = 4,
+        pybind11::arg("max_iter_base")         = 10,
+        pybind11::arg("tol_base")              = 1e-6,
+        pybind11::arg("device")                = -1,
+        "Build a ContingencyAnalysisSession directly from a solved lightsim2grid "
+        "LSGrid (zero-copy: Ybus/Sbus/V/pv/pq/slack + branch admittances are "
+        "read off the C++ object). Branch data is set automatically.");
+
+    m.def("_make_is_session_from_lsgrid",
+        [](pybind11::object grid_py, bool init_from_n_powerflow,
+           int batch_size, int nb_iter, int max_iter_base, double tol_base,
+           int device, bool with_branch_data) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_is_session_from_lsgrid(
+                grid, init_from_n_powerflow, batch_size, nb_iter,
+                max_iter_base, tol_base, device, with_branch_data);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("init_from_n_powerflow") = true,
+        pybind11::arg("batch_size")            = 100,
+        pybind11::arg("nb_iter")               = 4,
+        pybind11::arg("max_iter_base")         = 10,
+        pybind11::arg("tol_base")              = 1e-6,
+        pybind11::arg("device")                = -1,
+        pybind11::arg("with_branch_data")      = true,
+        "Build an InjectionSweepSession directly from a solved lightsim2grid "
+        "LSGrid (zero-copy). Branch data is set automatically when requested.");
+
+    m.attr("have_ls2g_bridge") = true;
+#else
+    m.attr("have_ls2g_bridge") = false;
+#endif
 
     // -----------------------------------------------------------------
     // Compilation options — queryable at runtime

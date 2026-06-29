@@ -66,11 +66,20 @@ def ieee14_grid():
     reference voltages are as accurate as possible.
     """
     import pandapower.networks as pn
-    from lightsim2grid.gridmodel import init_from_pandapower
-    from lightsim2grid.solver import SolverType
 
-    grid = init_from_pandapower(pn.case14())
-    grid.change_solver(SolverType.KLU)
+    try:
+        from lightsim2grid.network import init_from_pandapower
+        from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+        grid = init_from_pandapower(pn.case14())
+        grid.change_algorithm(AlgorithmType.NR_KLU)
+    except ImportError:
+        # Older lightsim2grid API.
+        from lightsim2grid.gridmodel import init_from_pandapower
+        from lightsim2grid.solver import SolverType
+
+        grid = init_from_pandapower(pn.case14())
+        grid.change_solver(SolverType.KLU)
     return grid
 
 
