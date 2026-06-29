@@ -45,6 +45,7 @@
 #include "acpf_nr.hpp"
 #include "acpf_nr_kernels.cuh"
 #include "nr_iter_step.cuh"
+#include "ledger_data.hpp"
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -183,6 +184,63 @@ static void build_J_structure(
 }
 
 // =============================================================================
+// §2b  CPU helper: build_scatter_maps_aug
+//   Augmented-Jacobian counterpart of build_J_structure: the J sparsity skeleton
+//   is GIVEN (read off lightsim2grid's solved NRSystem, RowMajor CSR), and the
+//   four dS scatter maps are resolved against it using the NRLedger bus→row/col
+//   maps. Each Ybus(i,j) contributes up to four entries:
+//     J(p_row(i), theta_col(j)) ← Re(dS/dVa)   [map_j11]
+//     J(p_row(i), vm_col(j))    ← Re(dS/dVm)   [map_j12]
+//     J(q_row(i), theta_col(j)) ← Im(dS/dVa)   [map_j21]
+//     J(q_row(i), vm_col(j))    ← Im(dS/dVm)   [map_j22]
+//   A -1 in any ledger map drops that contribution (e.g. the reference slack has
+//   no theta column). Mirrors NRSystem::build_J_sparsity's generic dS pass.
+// =============================================================================
+static void build_scatter_maps_aug(
+    std::vector<int>& map_j11,
+    std::vector<int>& map_j12,
+    std::vector<int>& map_j21,
+    std::vector<int>& map_j22,
+    const std::vector<int>& J_outer,
+    const std::vector<int>& J_inner,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus,
+    const std::vector<int>& p_row_of_bus,
+    const std::vector<int>& q_row_of_bus,
+    const std::vector<int>& theta_col_of_bus,
+    const std::vector<int>& vm_col_of_bus)
+{
+    const int nnz_Y = Ybus.nonZeros();
+    map_j11.assign(nnz_Y, -1);
+    map_j12.assign(nnz_Y, -1);
+    map_j21.assign(nnz_Y, -1);
+    map_j22.assign(nnz_Y, -1);
+
+    auto find_J_pos = [&](int row, int col) -> int {
+        const int start = J_outer[row];
+        const int end   = J_outer[row + 1];
+        const int* inner = J_inner.data();
+        auto it = std::lower_bound(inner + start, inner + end, col);
+        if (it == inner + end || *it != col) return -1;
+        return static_cast<int>(it - inner);
+    };
+
+    int k = 0;
+    for (int outer = 0; outer < Ybus.outerSize(); ++outer) {
+        for (Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>::InnerIterator
+             it(Ybus, outer); it; ++it, ++k)
+        {
+            const int i = (int)it.row(), j = (int)it.col();
+            const int ri = p_row_of_bus[i], rq = q_row_of_bus[i];
+            const int ci = theta_col_of_bus[j], cq = vm_col_of_bus[j];
+            if (ri >= 0 && ci >= 0) map_j11[k] = find_J_pos(ri, ci);
+            if (ri >= 0 && cq >= 0) map_j12[k] = find_J_pos(ri, cq);
+            if (rq >= 0 && ci >= 0) map_j21[k] = find_J_pos(rq, ci);
+            if (rq >= 0 && cq >= 0) map_j22[k] = find_J_pos(rq, cq);
+        }
+    }
+}
+
+// =============================================================================
 // §4  AcPfNrState constructor
 // =============================================================================
 
@@ -194,7 +252,8 @@ AcPfNrState::AcPfNrState(
     Eigen::Ref<const Eigen::VectorXi>           pq_in,
     int                                         max_iter,
     eigen_real_type                             tol,
-    int                                         device)
+    int                                         device,
+    const LedgerData*                           ledger)
 {
     // =========================================================================
     // Device selection — must happen before any stream/allocation.
@@ -240,11 +299,55 @@ AcPfNrState::AcPfNrState(
     // previously by introducing Ybus_rm).
     Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm = Ybus;
 
-    Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J_csr;
+    // Augmented J skeleton (RowMajor CSR) + dS scatter maps + NRLedger pair lists.
+    // Two sources:
+    //   • ledger == nullptr → trivial feature-free ledger built from pv/pq (the
+    //     skeleton is derived from Ybus by build_J_structure; legacy layout).
+    //   • ledger != nullptr → the augmented skeleton + ledger maps read off a
+    //     solved lightsim2grid grid; the dS maps are resolved against it.
     std::vector<int> h_map_j11, h_map_j12, h_map_j21, h_map_j22;
-    build_J_structure(J_csr, h_map_j11, h_map_j12, h_map_j21, h_map_j22,
-                      Ybus_rm, pvpq_host, pq_in);
-    nnz_J = J_csr.nonZeros();
+    std::vector<int> J_outer_h, J_inner_h;
+    std::vector<int> p_buses, p_rows, q_buses, q_rows;
+    std::vector<int> theta_buses, theta_cols, vm_buses, vm_cols;
+
+    if (ledger == nullptr) {
+        Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J_csr;
+        build_J_structure(J_csr, h_map_j11, h_map_j12, h_map_j21, h_map_j22,
+                          Ybus_rm, pvpq_host, pq_in);
+        dim_J = n_pvpq + n_pq;
+        nnz_J = J_csr.nonZeros();
+        J_outer_h.assign(J_csr.outerIndexPtr(), J_csr.outerIndexPtr() + dim_J + 1);
+        J_inner_h.assign(J_csr.innerIndexPtr(), J_csr.innerIndexPtr() + nnz_J);
+
+        // Trivial ledger pair lists: P/theta on sorted(pvpq) at rows/cols
+        // [0,n_pvpq); Q/vm on pq (input order) at [n_pvpq, dim_J).
+        p_buses.resize(n_pvpq); p_rows.resize(n_pvpq);
+        q_buses.resize(n_pq);   q_rows.resize(n_pq);
+        for (int i = 0; i < n_pvpq; ++i) { p_buses[i] = pvpq_host(i); p_rows[i] = i; }
+        for (int i = 0; i < n_pq;   ++i) { q_buses[i] = pq_in(i);     q_rows[i] = n_pvpq + i; }
+        theta_buses = p_buses; theta_cols = p_rows;   // theta == P buses (feature-free)
+        vm_buses    = q_buses; vm_cols    = q_rows;   // vm    == Q buses
+    } else {
+        dim_J     = ledger->dim_J;
+        J_outer_h = ledger->J_outer;
+        J_inner_h = ledger->J_inner;
+        nnz_J     = static_cast<int>(J_inner_h.size());
+        build_scatter_maps_aug(h_map_j11, h_map_j12, h_map_j21, h_map_j22,
+                               J_outer_h, J_inner_h, Ybus_rm,
+                               ledger->p_row_of_bus, ledger->q_row_of_bus,
+                               ledger->theta_col_of_bus, ledger->vm_col_of_bus);
+
+        // Derive the ledger pair lists from the bus→row/col maps (order is
+        // irrelevant: each pair is an independent scatter target).
+        for (int bus = 0; bus < n_bus; ++bus) {
+            if (ledger->p_row_of_bus[bus]     >= 0) { p_buses.push_back(bus);     p_rows.push_back(ledger->p_row_of_bus[bus]); }
+            if (ledger->q_row_of_bus[bus]     >= 0) { q_buses.push_back(bus);     q_rows.push_back(ledger->q_row_of_bus[bus]); }
+            if (ledger->theta_col_of_bus[bus] >= 0) { theta_buses.push_back(bus); theta_cols.push_back(ledger->theta_col_of_bus[bus]); }
+            if (ledger->vm_col_of_bus[bus]    >= 0) { vm_buses.push_back(bus);    vm_cols.push_back(ledger->vm_col_of_bus[bus]); }
+        }
+    }
+    n_p = (int)p_buses.size(); n_q = (int)q_buses.size();
+    n_theta = (int)theta_buses.size(); n_vm = (int)vm_buses.size();
     timings.t_build_J_ms = ms_since(t_wall_start);
 
     // =========================================================================
@@ -264,11 +367,57 @@ AcPfNrState::AcPfNrState(
     upload_h2d(d_pvpq, pvpq_host.data(),       n_pvpq, cs);
     upload_h2d(d_pq,   pq_in.data(),           n_pq,   cs);
 
+    // NRLedger pair lists (H→D)
+    upload_h2d(d_p_buses,     p_buses.data(),     n_p,     cs);
+    upload_h2d(d_p_rows,      p_rows.data(),      n_p,     cs);
+    upload_h2d(d_q_buses,     q_buses.data(),     n_q,     cs);
+    upload_h2d(d_q_rows,      q_rows.data(),      n_q,     cs);
+    upload_h2d(d_theta_buses, theta_buses.data(), n_theta, cs);
+    upload_h2d(d_theta_cols,  theta_cols.data(),  n_theta, cs);
+    upload_h2d(d_vm_buses,    vm_buses.data(),    n_vm,    cs);
+    upload_h2d(d_vm_cols,     vm_cols.data(),     n_vm,    cs);
+
     // Scatter maps (H→D)
     upload_h2d(d_map_j11, h_map_j11.data(), nnz_Y, cs);
     upload_h2d(d_map_j12, h_map_j12.data(), nnz_Y, cs);
     upload_h2d(d_map_j21, h_map_j21.data(), nnz_Y, cs);
     upload_h2d(d_map_j22, h_map_j22.data(), nnz_Y, cs);
+
+    // MultiSlack feature data (distributed slack in the Jacobian). Slack
+    // participants are the buses with a nonzero slack weight; each owns a P row
+    // in the augmented ledger. We stamp J(slack_p_row, slack_col) = weight and
+    // adjust the P mismatch by slack_absorbed·weight (see the MultiSlack kernels).
+    if (ledger != nullptr && ledger->has_multislack()) {
+        slack_col = ledger->slack_col;
+        std::vector<int>            h_prow, h_feat_pos;
+        std::vector<cuda_real_type> h_w;
+        // resolve a feature position via lower_bound on the (RowMajor) skeleton
+        auto find_J_pos = [&](int row, int col) -> int {
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* in = J_inner_h.data();
+            auto it = std::lower_bound(in + s, in + e, col);
+            return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
+        };
+        for (int bus = 0; bus < n_bus; ++bus) {
+            const double w = ledger->slack_weights[bus];
+            if (w == 0.0) continue;
+            const int prow = ledger->p_row_of_bus[bus];
+            if (prow < 0) continue;   // defensive: a weighted bus must own a P row
+            h_prow.push_back(prow);
+            h_w.push_back(static_cast<cuda_real_type>(w));
+            h_feat_pos.push_back(find_J_pos(prow, slack_col));
+        }
+        n_slack = static_cast<int>(h_prow.size());
+        upload_h2d(d_slack_prow,     h_prow.data(),     n_slack, cs);
+        upload_h2d(d_slack_w,        h_w.data(),        n_slack, cs);
+        upload_h2d(d_slack_feat_pos, h_feat_pos.data(), n_slack, cs);
+
+        // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
+        cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
+        for (int i = 0; i < n_bus; ++i) sa0 += static_cast<cuda_real_type>(Sbus_host(i).real());
+        std::vector<cuda_real_type> h_sa(1, sa0);
+        upload_h2d(d_slack_absorbed, h_sa.data(), 1, cs);
+    }
 
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)
     {
@@ -308,9 +457,9 @@ AcPfNrState::AcPfNrState(
     d_F.resize(dim_J);   zero_d(d_F,  cs);
     d_dx.resize(dim_J);  zero_d(d_dx, cs);
 
-    // Jacobian skeleton (H→D)
-    upload_h2d(d_J_outer, J_csr.outerIndexPtr(), J_csr.outerSize() + 1, cs);
-    upload_h2d(d_J_inner, J_csr.innerIndexPtr(), nnz_J,                 cs);
+    // Jacobian skeleton (H→D) — augmented or trivial, both in J_outer_h/J_inner_h
+    upload_h2d(d_J_outer, J_outer_h.data(), dim_J + 1, cs);
+    upload_h2d(d_J_inner, J_inner_h.data(), nnz_J,     cs);
     d_J_values.resize(nnz_J);  zero_d(d_J_values, cs);
 
     timings.t_upload_ms = ms_since(t_upload_start);
@@ -412,10 +561,27 @@ AcPfNrState::AcPfNrState(
         thrust::raw_pointer_cast(d_map_j12.data()),
         thrust::raw_pointer_cast(d_map_j21.data()),
         thrust::raw_pointer_cast(d_map_j22.data()),
-        thrust::raw_pointer_cast(d_pvpq.data()),
-        thrust::raw_pointer_cast(d_pq.data()),
+        thrust::raw_pointer_cast(d_p_buses.data()),
+        thrust::raw_pointer_cast(d_p_rows.data()),
+        n_p,
+        thrust::raw_pointer_cast(d_q_buses.data()),
+        thrust::raw_pointer_cast(d_q_rows.data()),
+        n_q,
+        thrust::raw_pointer_cast(d_theta_buses.data()),
+        thrust::raw_pointer_cast(d_theta_cols.data()),
+        n_theta,
+        thrust::raw_pointer_cast(d_vm_buses.data()),
+        thrust::raw_pointer_cast(d_vm_cols.data()),
+        n_vm,
         thrust::raw_pointer_cast(d_Sbus.data()),
         /*sbus_stride=*/0,   // single-system NR: shared Sbus
+        // MultiSlack (inactive: slack_col=-1, empty vectors → nullptr; kernels skipped)
+        slack_col,
+        n_slack,
+        thrust::raw_pointer_cast(d_slack_prow.data()),
+        thrust::raw_pointer_cast(d_slack_w.data()),
+        thrust::raw_pointer_cast(d_slack_feat_pos.data()),
+        thrust::raw_pointer_cast(d_slack_absorbed.data()),
     };
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
@@ -535,13 +701,14 @@ AcPfNrSession::AcPfNrSession(
     Eigen::Ref<const Eigen::VectorXi>           pq,
     int                                         max_iter,
     eigen_real_type                             tol,
-    int                                         device
+    int                                         device,
+    const LedgerData*                           ledger
 )
 {
     (void)slack_ids;
     (void)slack_weights;
     state_ = std::make_shared<AcPfNrState>(Ybus, Vinit, Sbus, pv, pq,
-                                            max_iter, tol, device);
+                                            max_iter, tol, device, ledger);
 }
 
 // =============================================================================

@@ -74,20 +74,27 @@ __global__ void apply_contingencies_kernel(
 // ---------------------------------------------------------------------------
 // fill_FP_kernel
 //
-// Stores −ΔP at d_F[b * dim_J + k] for each pvpq bus k of contingency b.
+// Stores −ΔP at the ledger P-equation row of each P bus.
 //   ΔP = Re(V · conj(Ibus)) − Re(Sbus)
+//   d_F[b * dim_J + p_rows[k]] = −ΔP,   bus = p_buses[k]
 //
-// Sbus is the shared base-case injection (not modified by contingencies).
+// Ledger-driven (augmented J): the (bus, row) pairs come from the NRLedger's
+// P-equation list, so a bus' P row is no longer assumed to be its slot index.
+// For a feature-free grid p_buses == sorted(pvpq) and p_rows == [0, n_pvpq),
+// reproducing the legacy layout exactly.
+//
+// Sbus is indexed as d_Sbus[b * sbus_stride + bus]; stride 0 falls back to the
+// shared single-system access pattern.
 //
 // Parameters
 // ----------
-// d_F        : [actual_batch * dim_J] — mismatch RHS; ΔP written to [0, n_pvpq)
+// d_F        : [actual_batch * dim_J] — mismatch RHS
 // d_V        : [actual_batch * n_bus] — current voltages
 // d_Ibus     : [actual_batch * n_bus] — result of batched SpMV (Ybus · V)
-// d_Sbus     : [n_bus] or [actual_batch * n_bus] — scheduled injections,
-//              indexed as d_Sbus[b * sbus_stride + bus]
-// pvpq       : [n_pvpq]              — sorted non-slack bus indices
-// n_pvpq, n_bus, dim_J, actual_batch : dimensions
+// d_Sbus     : [n_bus] or [actual_batch * n_bus] — scheduled injections
+// p_buses    : [n_p] — bus owning each P equation
+// p_rows     : [n_p] — J row of each P equation
+// n_p, n_bus, dim_J, actual_batch : dimensions
 // sbus_stride: 0 (shared) or n_bus (per-batch row)
 // ---------------------------------------------------------------------------
 __global__ void fill_FP_kernel(
@@ -95,8 +102,9 @@ __global__ void fill_FP_kernel(
     const cudaComplexType* __restrict__ d_V,
     const cudaComplexType* __restrict__ d_Ibus,
     const cudaComplexType* __restrict__ d_Sbus,
-    const int*             __restrict__ pvpq,
-    int n_pvpq,
+    const int*             __restrict__ p_buses,
+    const int*             __restrict__ p_rows,
+    int n_p,
     int n_bus,
     int dim_J,
     int actual_batch,
@@ -105,20 +113,22 @@ __global__ void fill_FP_kernel(
 // ---------------------------------------------------------------------------
 // fill_FQ_kernel
 //
-// Stores −ΔQ at d_F[b * dim_J + n_pvpq + k] for each pq bus k.
+// Stores −ΔQ at the ledger Q-equation row of each Q bus.
 //   ΔQ = Im(V · conj(Ibus)) − Im(Sbus)
+//   d_F[b * dim_J + q_rows[k]] = −ΔQ,   bus = q_buses[k]
 //
-// Sbus is indexed as d_Sbus[b * sbus_stride + bus]; stride 0 falls back to
-// the shared single-system access pattern.
+// Ledger-driven counterpart of fill_FP_kernel. For a feature-free grid
+// q_buses == pq and q_rows == [n_pvpq, n_pvpq + n_pq), reproducing the legacy
+// layout. Sbus indexed as d_Sbus[b * sbus_stride + bus].
 // ---------------------------------------------------------------------------
 __global__ void fill_FQ_kernel(
           cuda_real_type*  __restrict__ d_F,
     const cudaComplexType* __restrict__ d_V,
     const cudaComplexType* __restrict__ d_Ibus,
     const cudaComplexType* __restrict__ d_Sbus,
-    const int*             __restrict__ pq_idx,
-    int n_pvpq,
-    int n_pq,
+    const int*             __restrict__ q_buses,
+    const int*             __restrict__ q_rows,
+    int n_q,
     int n_bus,
     int dim_J,
     int actual_batch,
@@ -168,16 +178,19 @@ __global__ void fill_J_kernel(
 // ---------------------------------------------------------------------------
 // update_Va_kernel
 //
-// Applies angle corrections dx[b * dim_J + k] to d_V[b * n_bus + pvpq[k]].
-//   Va_new = Va_old + dx[k]
+// Applies angle corrections to each bus owning a theta unknown.
+//   Va_new = Va_old + dx[b * dim_J + theta_cols[k]],   bus = theta_buses[k]
 //   V_new  = |V| * exp(j * Va_new)
+// Ledger-driven: the (bus, col) pairs come from the NRLedger's theta-unknown
+// list. Feature-free: theta_buses == sorted(pvpq), theta_cols == [0, n_pvpq).
 // Must complete before update_Vm_kernel (same stream → implicit order).
 // ---------------------------------------------------------------------------
 __global__ void update_Va_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,
-    const int*             __restrict__ pvpq,
-    int n_pvpq,
+    const int*             __restrict__ theta_buses,
+    const int*             __restrict__ theta_cols,
+    int n_theta,
     int n_bus,
     int dim_J,
     int actual_batch);
@@ -185,18 +198,65 @@ __global__ void update_Va_kernel(
 // ---------------------------------------------------------------------------
 // update_Vm_kernel
 //
-// Applies magnitude corrections dx[b * dim_J + n_pvpq + k] to pq buses.
-//   Vm_new = Vm_old + dx[n_pvpq + k]
+// Applies magnitude corrections to each bus owning a vm unknown.
+//   Vm_new = Vm_old + dx[b * dim_J + vm_cols[k]],   bus = vm_buses[k]
 //   V_new  = Vm_new * exp(j * Va)
+// Feature-free: vm_buses == pq, vm_cols == [n_pvpq, n_pvpq + n_pq).
 // Reads Va from d_V after update_Va_kernel has written it (same stream).
 // ---------------------------------------------------------------------------
 __global__ void update_Vm_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,
-    const int*             __restrict__ pq_idx,
-    int n_pvpq,
-    int n_pq,
+    const int*             __restrict__ vm_buses,
+    const int*             __restrict__ vm_cols,
+    int n_vm,
     int n_bus,
+    int dim_J,
+    int actual_batch);
+
+// ===========================================================================
+// MultiSlack (distributed slack in the Jacobian) — Phase 2
+//
+// Three small per-slack kernels, launched only when the extension is active
+// (slack_col >= 0). They implement, on the GPU, MultiSlack::adjust_mismatch /
+// fill_feature_values / apply_step from lightsim2grid's NRSystem:
+//   • adjust_slack_mismatch_kernel : mis += slack_absorbed · slack_weight  ⇒
+//                                    d_F[p_row] -= slack_absorbed · weight
+//   • fill_slack_feature_kernel    : J(slack_p_row, slack_col) = slack_weight
+//   • update_slack_absorbed_kernel : slack_absorbed += dx[slack_col]
+//
+// Each slack bus owns a distinct P row / feature position, so within one batch
+// slot the n_slack threads touch distinct entries — no atomics needed.
+// ===========================================================================
+
+// d_F[b*dim_J + slack_prow[k]] -= slack_absorbed[b] * slack_w[k]
+// Run AFTER fill_FP/FQ (which wrote the bare −ΔP), using the pre-step
+// slack_absorbed so the residual matches lightsim2grid's _residual.
+__global__ void adjust_slack_mismatch_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_slack_absorbed,  // [actual_batch]
+    const int*            __restrict__ d_slack_prow,       // [n_slack]
+    const cuda_real_type* __restrict__ d_slack_w,          // [n_slack]
+    int n_slack,
+    int dim_J,
+    int actual_batch);
+
+// d_J_values[b*nnz_J + slack_feat_pos[k]] = slack_w[k]
+// Run AFTER each fill_J (those J positions carry no dS contribution, so a plain
+// assignment restamps the constant slack-weight coefficients).
+__global__ void fill_slack_feature_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*            __restrict__ d_slack_feat_pos,   // [n_slack]
+    const cuda_real_type* __restrict__ d_slack_w,          // [n_slack]
+    int n_slack,
+    int nnz_J,
+    int actual_batch);
+
+// slack_absorbed[b] += dx[b*dim_J + slack_col]   (one thread per batch slot)
+__global__ void update_slack_absorbed_kernel(
+          cuda_real_type* __restrict__ d_slack_absorbed,   // [actual_batch]
+    const cuda_real_type* __restrict__ d_dx,               // [actual_batch*dim_J]
+    int slack_col,
     int dim_J,
     int actual_batch);
 

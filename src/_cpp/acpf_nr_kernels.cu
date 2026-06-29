@@ -130,26 +130,28 @@ __global__ void fill_FP_kernel(
     const cudaComplexType* __restrict__ d_V,
     const cudaComplexType* __restrict__ d_Ibus,
     const cudaComplexType* __restrict__ d_Sbus,
-    const int*             __restrict__ pvpq,
-    int n_pvpq,
+    const int*             __restrict__ p_buses,
+    const int*             __restrict__ p_rows,
+    int n_p,
     int n_bus,
     int dim_J,
     int actual_batch,
     int sbus_stride)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_pvpq;   // contingency index
-    const int k   = tid % n_pvpq;   // pvpq slot
+    const int b   = tid / n_p;   // contingency index
+    const int k   = tid % n_p;   // P-equation slot
     if (b >= actual_batch) return;
 
-    const int bus = pvpq[k];
+    const int bus = p_buses[k];
+    const int row = p_rows[k];
     const cudaComplexType S_calc = CudaFunHelper::my_cuCmul(
         d_V   [b * n_bus + bus],
         CudaFunHelper::my_cuConj(d_Ibus[b * n_bus + bus]));
     const cuda_real_type dP =
         CudaFunHelper::my_cuCreal(S_calc) -
         CudaFunHelper::my_cuCreal(d_Sbus[b * sbus_stride + bus]);
-    d_F[b * dim_J + k] = -dP;
+    d_F[b * dim_J + row] = -dP;
 }
 
 // =============================================================================
@@ -160,27 +162,28 @@ __global__ void fill_FQ_kernel(
     const cudaComplexType* __restrict__ d_V,
     const cudaComplexType* __restrict__ d_Ibus,
     const cudaComplexType* __restrict__ d_Sbus,
-    const int*             __restrict__ pq_idx,
-    int n_pvpq,
-    int n_pq,
+    const int*             __restrict__ q_buses,
+    const int*             __restrict__ q_rows,
+    int n_q,
     int n_bus,
     int dim_J,
     int actual_batch,
     int sbus_stride)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_pq;
-    const int k   = tid % n_pq;
+    const int b   = tid / n_q;
+    const int k   = tid % n_q;
     if (b >= actual_batch) return;
 
-    const int bus = pq_idx[k];
+    const int bus = q_buses[k];
+    const int row = q_rows[k];
     const cudaComplexType S_calc = CudaFunHelper::my_cuCmul(
         d_V   [b * n_bus + bus],
         CudaFunHelper::my_cuConj(d_Ibus[b * n_bus + bus]));
     const cuda_real_type dQ =
         CudaFunHelper::my_cuCimag(S_calc) -
         CudaFunHelper::my_cuCimag(d_Sbus[b * sbus_stride + bus]);
-    d_F[b * dim_J + n_pvpq + k] = -dQ;
+    d_F[b * dim_J + row] = -dQ;
 }
 
 // =============================================================================
@@ -278,23 +281,25 @@ __global__ void fill_J_kernel(
 __global__ void update_Va_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,
-    const int*             __restrict__ pvpq,
-    int n_pvpq,
+    const int*             __restrict__ theta_buses,
+    const int*             __restrict__ theta_cols,
+    int n_theta,
     int n_bus,
     int dim_J,
     int actual_batch)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_pvpq;
-    const int k   = tid % n_pvpq;
+    const int b   = tid / n_theta;
+    const int k   = tid % n_theta;
     if (b >= actual_batch) return;
 
-    const int bus = pvpq[k];
+    const int bus = theta_buses[k];
+    const int col = theta_cols[k];
     const cudaComplexType V = d_V[b * n_bus + bus];
     const cuda_real_type vm = CudaFunHelper::my_cuCabs(V);
     const cuda_real_type va = CudaFunHelper::my_atan2(
         CudaFunHelper::my_cuCimag(V),
-        CudaFunHelper::my_cuCreal(V)) + d_dx[b * dim_J + k];
+        CudaFunHelper::my_cuCreal(V)) + d_dx[b * dim_J + col];
 
     d_V[b * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
         vm * CudaFunHelper::my_cos(va),
@@ -307,22 +312,23 @@ __global__ void update_Va_kernel(
 __global__ void update_Vm_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,
-    const int*             __restrict__ pq_idx,
-    int n_pvpq,
-    int n_pq,
+    const int*             __restrict__ vm_buses,
+    const int*             __restrict__ vm_cols,
+    int n_vm,
     int n_bus,
     int dim_J,
     int actual_batch)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_pq;
-    const int k   = tid % n_pq;
+    const int b   = tid / n_vm;
+    const int k   = tid % n_vm;
     if (b >= actual_batch) return;
 
-    const int bus = pq_idx[k];
+    const int bus = vm_buses[k];
+    const int col = vm_cols[k];
     const cudaComplexType V = d_V[b * n_bus + bus];
-    // Vm_new = Vm_old + dx[n_pvpq + k];  Va unchanged (already updated)
-    const cuda_real_type vm = CudaFunHelper::my_cuCabs(V) + d_dx[b * dim_J + n_pvpq + k];
+    // Vm_new = Vm_old + dx[vm col];  Va unchanged (already updated)
+    const cuda_real_type vm = CudaFunHelper::my_cuCabs(V) + d_dx[b * dim_J + col];
     const cuda_real_type va = CudaFunHelper::my_atan2(
         CudaFunHelper::my_cuCimag(V),
         CudaFunHelper::my_cuCreal(V));
@@ -330,6 +336,53 @@ __global__ void update_Vm_kernel(
     d_V[b * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
         vm * CudaFunHelper::my_cos(va),
         vm * CudaFunHelper::my_sin(va));
+}
+
+// =============================================================================
+// MultiSlack kernels (Phase 2)
+// =============================================================================
+__global__ void adjust_slack_mismatch_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_slack_absorbed,
+    const int*            __restrict__ d_slack_prow,
+    const cuda_real_type* __restrict__ d_slack_w,
+    int n_slack,
+    int dim_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_slack;
+    const int k   = tid % n_slack;
+    if (b >= actual_batch) return;
+    // mis += sa·weight  ⇒  residual d_F = −real(mis) gains −sa·weight
+    d_F[b * dim_J + d_slack_prow[k]] -= d_slack_absorbed[b] * d_slack_w[k];
+}
+
+__global__ void fill_slack_feature_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*            __restrict__ d_slack_feat_pos,
+    const cuda_real_type* __restrict__ d_slack_w,
+    int n_slack,
+    int nnz_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_slack;
+    const int k   = tid % n_slack;
+    if (b >= actual_batch) return;
+    d_J_values[b * nnz_J + d_slack_feat_pos[k]] = d_slack_w[k];
+}
+
+__global__ void update_slack_absorbed_kernel(
+          cuda_real_type* __restrict__ d_slack_absorbed,
+    const cuda_real_type* __restrict__ d_dx,
+    int slack_col,
+    int dim_J,
+    int actual_batch)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= actual_batch) return;
+    d_slack_absorbed[b] += d_dx[b * dim_J + slack_col];
 }
 
 // =============================================================================

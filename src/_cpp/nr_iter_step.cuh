@@ -40,7 +40,7 @@ static constexpr int BS = 256;   // block size for all NR kernels
 //   d_V[b * n_bus + i],  d_F[b * dim_J + k],  etc.
 //
 // Shared single-system fields have no b-stride (same arrays for all systems):
-//   d_Ybus_outer, d_Ybus_inner, d_map_j*, d_pvpq, d_pq, d_Sbus.
+//   d_Ybus_outer, d_Ybus_inner, d_map_j*, ledger pair lists, d_Sbus.
 // -----------------------------------------------------------------------------
 struct NrIterBuffers {
     // per-batch — written by kernels
@@ -60,8 +60,24 @@ struct NrIterBuffers {
     const int*             d_map_j12;
     const int*             d_map_j21;
     const int*             d_map_j22;
-    const int*             d_pvpq;
-    const int*             d_pq;
+
+    // NRLedger pair lists (shared single-system) — drive the augmented J fill_F
+    // and update_V kernels. (bus, row/col) pairs in registration order; counts
+    // may exceed n_pvpq/n_pq once extensions add equations/unknowns. Feature-free:
+    //   p/theta == sorted(pvpq) @ rows/cols [0, n_pvpq);
+    //   q/vm    == pq           @ rows/cols [n_pvpq, n_pvpq + n_pq).
+    const int*             d_p_buses;
+    const int*             d_p_rows;
+    int                    n_p;
+    const int*             d_q_buses;
+    const int*             d_q_rows;
+    int                    n_q;
+    const int*             d_theta_buses;
+    const int*             d_theta_cols;
+    int                    n_theta;
+    const int*             d_vm_buses;
+    const int*             d_vm_cols;
+    int                    n_vm;
 
     // Sbus pointer + stride control (see acpf_nr_kernels.cuh):
     //   sbus_stride = 0     → d_Sbus is a single-system (n_bus,) buffer
@@ -70,6 +86,17 @@ struct NrIterBuffers {
     //                         layout indexed as d_Sbus[b * n_bus + bus]
     const cudaComplexType* d_Sbus;
     int                    sbus_stride;
+
+    // ---- MultiSlack (distributed slack) — inactive when slack_col < 0 --------
+    // d_slack_absorbed is the only MUTABLE per-batch-slot state ([actual_batch]);
+    // the rest are shared single-system arrays of length n_slack. All nullptr /
+    // slack_col=-1 when the extension is absent (kernels then skipped entirely).
+    int                    slack_col   = -1;
+    int                    n_slack     = 0;
+    const int*             d_slack_prow     = nullptr;   // [n_slack] P row of each slack
+    const cuda_real_type*  d_slack_w        = nullptr;   // [n_slack] slack weight
+    const int*             d_slack_feat_pos = nullptr;   // [n_slack] J pos of (p_row, slack_col)
+    cuda_real_type*        d_slack_absorbed = nullptr;   // [actual_batch] running state
 };
 
 // -----------------------------------------------------------------------------
@@ -124,14 +151,18 @@ inline void nr_iter_step(
     spmv.spmv();
     t.t_spmv += timer.stop_ms();
 
-    // ②  Fill F: −[ΔP(pvpq), ΔQ(pq)]
+    // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
     timer.start();
-    fill_FP_kernel<<<(actual_batch * n_pvpq + BS - 1) / BS, BS, 0, cs>>>(
-        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_pvpq,
-        n_pvpq, n_bus, dim_J, actual_batch, buf.sbus_stride);
-    fill_FQ_kernel<<<(actual_batch * n_pq + BS - 1) / BS, BS, 0, cs>>>(
-        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_pq,
-        n_pvpq, n_pq, n_bus, dim_J, actual_batch, buf.sbus_stride);
+    fill_FP_kernel<<<(actual_batch * buf.n_p + BS - 1) / BS, BS, 0, cs>>>(
+        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
+        buf.n_p, n_bus, dim_J, actual_batch, buf.sbus_stride);
+    fill_FQ_kernel<<<(actual_batch * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
+        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
+        buf.n_q, n_bus, dim_J, actual_batch, buf.sbus_stride);
+    if (buf.slack_col >= 0)
+        adjust_slack_mismatch_kernel<<<(actual_batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_slack_absorbed, buf.d_slack_prow, buf.d_slack_w,
+            buf.n_slack, dim_J, actual_batch);
     t.t_fill_F += timer.stop_ms();
 
     // ③  Fill J values; notify cuDSS that the values pointer changed
@@ -141,6 +172,10 @@ inline void nr_iter_step(
         buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
         n_bus, nnz_Y, nnz_J, actual_batch);
+    if (buf.slack_col >= 0)
+        fill_slack_feature_kernel<<<(actual_batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w,
+            buf.n_slack, nnz_J, actual_batch);
     dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 
@@ -160,12 +195,15 @@ inline void nr_iter_step(
     //     Both kernels run on cs — CUDA stream ordering serialises them without
     //     an explicit CPU-side event.
     timer.start();
-    update_Va_kernel<<<(actual_batch * n_pvpq + BS - 1) / BS, BS, 0, cs>>>(
-        buf.d_V, buf.d_dx, buf.d_pvpq,
-        n_pvpq, n_bus, dim_J, actual_batch);
-    update_Vm_kernel<<<(actual_batch * n_pq + BS - 1) / BS, BS, 0, cs>>>(
-        buf.d_V, buf.d_dx, buf.d_pq,
-        n_pvpq, n_pq, n_bus, dim_J, actual_batch);
+    update_Va_kernel<<<(actual_batch * buf.n_theta + BS - 1) / BS, BS, 0, cs>>>(
+        buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
+        buf.n_theta, n_bus, dim_J, actual_batch);
+    update_Vm_kernel<<<(actual_batch * buf.n_vm + BS - 1) / BS, BS, 0, cs>>>(
+        buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
+        buf.n_vm, n_bus, dim_J, actual_batch);
+    if (buf.slack_col >= 0)
+        update_slack_absorbed_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_slack_absorbed, buf.d_dx, buf.slack_col, dim_J, actual_batch);
     t.t_update_V += timer.stop_ms();
 }
 

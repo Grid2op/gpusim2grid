@@ -442,8 +442,18 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         thrust::raw_pointer_cast(base.d_map_j12.data()),
         thrust::raw_pointer_cast(base.d_map_j21.data()),
         thrust::raw_pointer_cast(base.d_map_j22.data()),
-        thrust::raw_pointer_cast(base.d_pvpq.data()),
-        thrust::raw_pointer_cast(base.d_pq.data()),
+        thrust::raw_pointer_cast(base.d_p_buses.data()),
+        thrust::raw_pointer_cast(base.d_p_rows.data()),
+        base.n_p,
+        thrust::raw_pointer_cast(base.d_q_buses.data()),
+        thrust::raw_pointer_cast(base.d_q_rows.data()),
+        base.n_q,
+        thrust::raw_pointer_cast(base.d_theta_buses.data()),
+        thrust::raw_pointer_cast(base.d_theta_cols.data()),
+        base.n_theta,
+        thrust::raw_pointer_cast(base.d_vm_buses.data()),
+        thrust::raw_pointer_cast(base.d_vm_cols.data()),
+        base.n_vm,
         d_Sbus_for_NR,
         sbus_stride,
     };
@@ -466,21 +476,23 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 
         if (actual_batch > 0) {
             fill_FP_kernel<<<
-                (actual_batch * n_pvpq + BS - 1) / BS, BS, 0, cs>>>(
+                (actual_batch * base.n_p + BS - 1) / BS, BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
                 d_Sbus_for_NR,
-                thrust::raw_pointer_cast(base.d_pvpq.data()),
-                n_pvpq, n_bus, dim_J, actual_batch, sbus_stride);
+                thrust::raw_pointer_cast(base.d_p_buses.data()),
+                thrust::raw_pointer_cast(base.d_p_rows.data()),
+                base.n_p, n_bus, dim_J, actual_batch, sbus_stride);
             fill_FQ_kernel<<<
-                (actual_batch * n_pq + BS - 1) / BS, BS, 0, cs>>>(
+                (actual_batch * base.n_q + BS - 1) / BS, BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
                 d_Sbus_for_NR,
-                thrust::raw_pointer_cast(base.d_pq.data()),
-                n_pvpq, n_pq, n_bus, dim_J, actual_batch, sbus_stride);
+                thrust::raw_pointer_cast(base.d_q_buses.data()),
+                thrust::raw_pointer_cast(base.d_q_rows.data()),
+                base.n_q, n_bus, dim_J, actual_batch, sbus_stride);
 
             compute_residuals_kernel<<<
                 actual_batch, BS,

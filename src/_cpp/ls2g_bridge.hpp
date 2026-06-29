@@ -30,6 +30,23 @@
 
 #include "contingency_analysis_session.hpp"
 #include "injection_sweep_session.hpp"
+#include "acpf_nr.hpp"      // AcPfNrSession
+#include "ledger_data.hpp"  // LedgerData
+
+// Build a LedgerData (augmented-J description) from a solved LSGrid: the J
+// sparsity skeleton (get_J_solver), the NRLedger row/col maps, and the
+// MultiSlack slack_col + slack weights. All in solver bus numbering. Empty /
+// slack_col=-1 reproduces the feature-free system.
+LedgerData extract_ledger_data(const ls2g::LSGrid& grid);
+
+// Build a single-system AcPfNrSession from a solved LSGrid, solving the same
+// augmented system lightsim2grid does (distributed slack / future extensions).
+std::shared_ptr<AcPfNrSession>
+make_acpf_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    max_iter,
+    double tol,
+    int    device);
 
 // Build a ContingencyAnalysisSession from a solved LSGrid (branch data set).
 std::shared_ptr<ContingencyAnalysisSession>

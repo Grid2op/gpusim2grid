@@ -678,6 +678,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "Build an InjectionSweepSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy). Branch data is set automatically when requested.");
 
+    m.def("_make_acpf_session_from_lsgrid",
+        [](pybind11::object grid_py, int max_iter, double tol, int device) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_acpf_session_from_lsgrid(grid, max_iter, tol, device);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("max_iter") = 10,
+        pybind11::arg("tol")      = 1e-8,
+        pybind11::arg("device")   = -1,
+        "Build a single-system AcPfNrSession from a solved lightsim2grid LSGrid, "
+        "solving the same augmented system (distributed slack / extensions) via "
+        "the NRLedger read off the C++ object.");
+
     m.attr("have_ls2g_bridge") = true;
 #else
     m.attr("have_ls2g_bridge") = false;

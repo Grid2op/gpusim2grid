@@ -90,14 +90,14 @@ inline void run_nr_loop(
         spmv.spmv();
         step.t_spmv = timer.stop_ms();
 
-        // ②  Fill F: −[ΔP(pvpq), ΔQ(pq)]
+        // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
         timer.start();
-        fill_FP_kernel<<<(batch_size * n_pvpq + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_pvpq,
-            n_pvpq, n_bus, dim_J, batch_size, buf.sbus_stride);
-        fill_FQ_kernel<<<(batch_size * n_pq + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_pq,
-            n_pvpq, n_pq, n_bus, dim_J, batch_size, buf.sbus_stride);
+        fill_FP_kernel<<<(batch_size * buf.n_p + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
+            buf.n_p, n_bus, dim_J, batch_size, buf.sbus_stride);
+        fill_FQ_kernel<<<(batch_size * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
+            buf.n_q, n_bus, dim_J, batch_size, buf.sbus_stride);
         step.t_fill_F = timer.stop_ms();
 
         // ③  Fill J (policy-conditional via if constexpr)
@@ -138,12 +138,12 @@ inline void run_nr_loop(
         // ⑤  Update V: Va (pvpq) then Vm (pq) — both on cs, CUDA stream ordering
         //     serialises them without an explicit CPU event.
         timer.start();
-        update_Va_kernel<<<(batch_size * n_pvpq + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_V, buf.d_dx, buf.d_pvpq,
-            n_pvpq, n_bus, dim_J, batch_size);
-        update_Vm_kernel<<<(batch_size * n_pq + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_V, buf.d_dx, buf.d_pq,
-            n_pvpq, n_pq, n_bus, dim_J, batch_size);
+        update_Va_kernel<<<(batch_size * buf.n_theta + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
+            buf.n_theta, n_bus, dim_J, batch_size);
+        update_Vm_kernel<<<(batch_size * buf.n_vm + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
+            buf.n_vm, n_bus, dim_J, batch_size);
         step.t_update_V = timer.stop_ms();
 
         // Accumulate per-iteration timings into per-chunk totals.

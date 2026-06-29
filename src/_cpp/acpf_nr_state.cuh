@@ -48,6 +48,8 @@
 #include "cu_complex_utils.h" // cudaComplexType, CudaFunHelper, CUDA_C_TYPE …
 #include "timing_utils.hpp"   // AcPfTimings, TimingEntry
 
+struct LedgerData;            // ledger_data.hpp (host); optional augmented-J input
+
 // =============================================================================
 // AcPfNrState
 // =============================================================================
@@ -85,6 +87,34 @@ struct AcPfNrState {
     // -------------------------------------------------------------------------
     thrust::device_vector<int> d_pvpq;   // sorted pvpq bus indices
     thrust::device_vector<int> d_pq;     // pq bus indices
+
+    // -------------------------------------------------------------------------
+    // NRLedger pair lists (device) — define the augmented Jacobian layout.
+    //   Each (bus, row/col) pair: which solver bus owns the equation/unknown and
+    //   its J row/column. Built once (trivial ledger from pv/pq for a feature-free
+    //   grid; the augmented ledger from lightsim2grid once extensions are active)
+    //   and shared, single-system, across every batch slot — exactly like the
+    //   scatter maps. Counts n_p/n_q/n_theta/n_vm may exceed n_pvpq/n_pq when an
+    //   extension adds rows/columns.
+    // -------------------------------------------------------------------------
+    int n_p = 0, n_q = 0, n_theta = 0, n_vm = 0;
+    thrust::device_vector<int> d_p_buses,     d_p_rows;      // P equations
+    thrust::device_vector<int> d_q_buses,     d_q_rows;      // Q equations
+    thrust::device_vector<int> d_theta_buses, d_theta_cols;  // theta unknowns
+    thrust::device_vector<int> d_vm_buses,    d_vm_cols;     // vm unknowns
+
+    // -------------------------------------------------------------------------
+    // MultiSlack (distributed slack in the Jacobian) — slack_col < 0 when absent.
+    //   d_slack_absorbed is the per-batch-slot running state (size 1 for the
+    //   single-system base solve; tiled to batch_size by the batch driver).
+    //   The other arrays are shared single-system (length n_slack).
+    // -------------------------------------------------------------------------
+    int slack_col = -1;
+    int n_slack   = 0;
+    thrust::device_vector<int>            d_slack_prow;       // [n_slack] P row of each slack
+    thrust::device_vector<cuda_real_type> d_slack_w;          // [n_slack] slack weight
+    thrust::device_vector<int>            d_slack_feat_pos;   // [n_slack] J pos (p_row, slack_col)
+    thrust::device_vector<cuda_real_type> d_slack_absorbed;   // [1] base-solve running state
 
     // -------------------------------------------------------------------------
     // Ybus CSR (device, complex cuda_real_type)
@@ -194,7 +224,10 @@ struct AcPfNrState {
         Eigen::Ref<const Eigen::VectorXi>           pq,
         int                                         max_iter,
         eigen_real_type                             tol,
-        int                                         device = -1
+        int                                         device = -1,
+        // Optional augmented-J description read off a solved lightsim2grid grid.
+        // nullptr → build the trivial feature-free ledger from pv/pq (Phase 1).
+        const LedgerData*                           ledger = nullptr
     );
 
     // =========================================================================

@@ -80,7 +80,70 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid)
     return bd;
 }
 
+// Convert an ls2g IntVect (Eigen) to a std::vector<int>.
+std::vector<int> to_int_vector(const ls2g::IntVect& v)
+{
+    return std::vector<int>(v.data(), v.data() + v.size());
+}
+
 }  // namespace
+
+LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
+{
+    LedgerData ld;
+
+    // Augmented J sparsity skeleton in RowMajor CSR (structure only). get_J_solver
+    // returns the solved augmented J in lightsim2grid's default (ColMajor) storage;
+    // convert to RowMajor so outer = row (gpusim2grid's CSR convention).
+    Eigen::SparseMatrix<eigen_real_type>                  J_cm = grid.get_J_solver();
+    Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J    = J_cm;
+    J.makeCompressed();
+    ld.dim_J = static_cast<int>(J.rows());
+    ld.J_outer.assign(J.outerIndexPtr(), J.outerIndexPtr() + ld.dim_J + 1);
+    ld.J_inner.assign(J.innerIndexPtr(), J.innerIndexPtr() + J.nonZeros());
+
+    // NRLedger bus→row/col maps (solver numbering, size n_bus, -1 absent).
+    ld.p_row_of_bus     = to_int_vector(grid.get_p_to_J_row_solver());
+    ld.q_row_of_bus     = to_int_vector(grid.get_q_to_J_row_solver());
+    ld.theta_col_of_bus = to_int_vector(grid.get_theta_to_J_col_solver());
+    ld.vm_col_of_bus    = to_int_vector(grid.get_vm_to_J_col_solver());
+    ld.n_bus            = static_cast<int>(ld.p_row_of_bus.size());
+
+    // MultiSlack: slack_col (-1 when distributed slack inactive) + slack weights.
+    ld.slack_col = grid.get_slack_col_solver();
+    if (ld.slack_col >= 0) {
+        ls2g::RealVect sw = grid.get_slack_weights_solver();
+        ld.slack_weights.assign(sw.data(), sw.data() + sw.size());
+    }
+    return ld;
+}
+
+std::shared_ptr<AcPfNrSession>
+make_acpf_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    max_iter,
+    double tol,
+    int    device)
+{
+    auto& g = const_cast<ls2g::LSGrid&>(grid);
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
+    if (Ybus.rows() == 0)
+        throw std::runtime_error(
+            "make_acpf_session_from_lsgrid: empty Ybus — has the grid been solved "
+            "(ac_pf) before being handed to gpusim2grid?");
+
+    CplxVect        V0    = grid.get_V_solver();
+    CplxVect        Sbus  = grid.get_Sbus_solver();
+    Eigen::VectorXi slack = grid.get_slack_ids_solver_numpy();
+    RealVect        sw    = grid.get_slack_weights_solver();
+    Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
+    Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
+
+    LedgerData ledger = extract_ledger_data(grid);
+
+    return std::make_shared<AcPfNrSession>(
+        Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger);
+}
 
 std::shared_ptr<ContingencyAnalysisSession>
 make_ca_session_from_lsgrid(

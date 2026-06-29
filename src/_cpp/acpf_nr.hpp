@@ -18,6 +18,7 @@
 #include <vector>
 
 struct AcPfNrState;  // complete type in acpf_nr_state.cuh (nvcc only)
+struct LedgerData;   // complete type in ledger_data.hpp (augmented-J description)
 
 AcPfTimings acpf_nr_gpu(
     Eigen::Ref<CplxVect> out,
@@ -51,7 +52,8 @@ struct AcPfNrSession {
         Eigen::Ref<const Eigen::VectorXi>           pq,
         int                                         max_iter,
         eigen_real_type                             tol,
-        int                                         device = -1
+        int                                         device = -1,
+        const LedgerData*                           ledger = nullptr
     );
 
     AcPfTimings timings() const;
