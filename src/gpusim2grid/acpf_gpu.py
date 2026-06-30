@@ -4,6 +4,7 @@
 
 """Single AC power flow on the GPU, driven from a lightsim2grid grid."""
 
+from . import _gpusim2grid as _cpp
 from ._gpusim2grid import AcPfNrSession as _AcPfNrSession
 from ._ls2g_utils import (
     extract_grid_arrays,
@@ -13,6 +14,10 @@ from ._ls2g_utils import (
 from .contingency_analysis import _normalize_device
 
 __all__ = ["AcPfGPU"]
+
+
+def _have_bridge():
+    return getattr(_cpp, "have_ls2g_bridge", False)
 
 
 class AcPfGPU:
@@ -36,13 +41,24 @@ class AcPfGPU:
     """
 
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
-                 device=None):
+                 device=None, use_bridge=None):
         _validate_precision(precision)
-        d = extract_grid_arrays(grid, max_iter=max_iter, tol=tol)
-        self._s = _AcPfNrSession(
-            d["Ybus"], d["v_converged"], d["Sbus"],
-            d["slack"], d["slack_weights"], d["pv"], d["pq"],
-            int(max_iter), float(tol), _normalize_device(device))
+        if use_bridge is None:
+            use_bridge = _have_bridge()
+        if use_bridge:
+            # Zero-copy C++ bridge: solve the SAME augmented system lightsim2grid
+            # does (distributed slack / future extensions), reading the NRLedger +
+            # J skeleton off the solved grid. The grid must already be ac-solved.
+            self._s = _cpp._make_acpf_session_from_lsgrid(
+                grid, int(max_iter), float(tol), _normalize_device(device))
+        else:
+            # Python extraction fallback: bare [pvpq|pq] system (no distributed
+            # slack in the Jacobian).
+            d = extract_grid_arrays(grid, max_iter=max_iter, tol=tol)
+            self._s = _AcPfNrSession(
+                d["Ybus"], d["v_converged"], d["Sbus"],
+                d["slack"], d["slack_weights"], d["pv"], d["pq"],
+                int(max_iter), float(tol), _normalize_device(device))
 
     def solve(self):
         """Return the solved complex voltage vector (host copy)."""
