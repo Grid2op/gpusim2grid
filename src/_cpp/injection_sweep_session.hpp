@@ -45,6 +45,7 @@
 
 // Forward-declare CUDA-dependent types.
 struct AcPfNrState;
+struct LedgerData;
 struct InjectionBatch;
 template <typename BatchSource> struct BatchPfDriver;
 using InjectionSweepSolver = BatchPfDriver<InjectionBatch>;
@@ -121,7 +122,8 @@ struct InjectionSweepSession {
         int    nb_iter,
         int    max_iter_base = 10,
         double tol_base      = 1e-6,
-        int    device        = -1
+        int    device        = -1,
+        const LedgerData* ledger = nullptr   // augmented-J description (bridge path)
     );
 
     // =========================================================================

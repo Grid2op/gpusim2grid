@@ -50,6 +50,7 @@
 // std::unique_ptr<ContingencyAnalysisSolver> since the destructor is defined
 // in the .cu where the complete type is visible.
 struct AcPfNrState;
+struct LedgerData;
 struct ContingencyBatch;
 template <typename BatchSource> struct BatchPfDriver;
 using ContingencyAnalysisSolver = BatchPfDriver<ContingencyBatch>;
@@ -121,7 +122,8 @@ struct ContingencyAnalysisSession {
         int    nb_iter,
         int    max_iter_base = 10,
         double tol_base      = 1e-6,
-        int    device        = -1
+        int    device        = -1,
+        const LedgerData* ledger = nullptr   // augmented-J description (bridge path)
     );
 
     // =========================================================================

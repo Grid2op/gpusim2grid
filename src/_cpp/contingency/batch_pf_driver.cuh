@@ -133,6 +133,12 @@ struct BatchPfDriver {
     thrust::device_vector<cuda_real_type>  d_dx_batch;
     thrust::device_vector<cuda_real_type>  d_J_values_batch;
 
+    // Per-batch-slot augmented-feature running state (empty when the feature is
+    // inactive). The shared single-system feature data (slack weights, HVDC/VC
+    // arrays, feature positions) lives on `base` and is pointed to directly.
+    thrust::device_vector<cuda_real_type>  d_slack_absorbed_batch;  // [batch_size]
+    thrust::device_vector<cuda_real_type>  d_vc_q_batch;            // [batch_size * n_vc_ctrl]
+
     // -------------------------------------------------------------------------
     // Full result buffers
     // -------------------------------------------------------------------------

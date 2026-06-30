@@ -224,9 +224,10 @@ make_ca_session_from_lsgrid(
 
     const int base_iters = init_from_n_powerflow ? 1 : max_iter_base;
 
+    LedgerData ledger = extract_ledger_data(grid);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
-        batch_size, nb_iter, base_iters, tol_base, device);
+        batch_size, nb_iter, base_iters, tol_base, device, &ledger);
 
     BranchData bd = extract_branch_data(grid);
     session->set_branch_data(bd.branch_from, bd.branch_to,
@@ -262,9 +263,10 @@ make_is_session_from_lsgrid(
 
     const int base_iters = init_from_n_powerflow ? 1 : max_iter_base;
 
+    LedgerData ledger = extract_ledger_data(grid);
     auto session = std::make_shared<InjectionSweepSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
-        batch_size, nb_iter, base_iters, tol_base, device);
+        batch_size, nb_iter, base_iters, tol_base, device, &ledger);
 
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid);

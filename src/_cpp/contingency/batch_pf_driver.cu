@@ -137,6 +137,12 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         d_dx_batch.resize(static_cast<size_t>(batch_size_) * dim_J);
         d_J_values_batch.resize(static_cast<size_t>(batch_size_) * nnz_J);
 
+        // Per-slot augmented-feature running state (allocated only when active).
+        if (base.slack_col >= 0)
+            d_slack_absorbed_batch.resize(batch_size_);
+        if (base.n_vc_ctrl > 0)
+            d_vc_q_batch.resize(static_cast<size_t>(batch_size_) * base.n_vc_ctrl);
+
         d_V_results.resize(static_cast<size_t>(n_contingencies) * n_bus);
         d_residuals.resize(n_contingencies, cuda_real_type(0));
 
@@ -456,7 +462,66 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         base.n_vm,
         d_Sbus_for_NR,
         sbus_stride,
+        // ---- MultiSlack (shared feature data on base; per-slot state here) ----
+        base.slack_col,
+        base.n_slack,
+        thrust::raw_pointer_cast(base.d_slack_prow.data()),
+        thrust::raw_pointer_cast(base.d_slack_w.data()),
+        thrust::raw_pointer_cast(base.d_slack_feat_pos.data()),
+        thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
+        // ---- HVDC angle-droop (all shared on base) ----
+        base.n_hvdc,
+        /*zero_J_before_fill=*/(base.n_hvdc > 0),
+        thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_status.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_k.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_r.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_prow1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_prow2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h11.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h12.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h21.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h22.data()),
+        // ---- VoltageControl (shared feature data on base; per-slot q here) ----
+        base.n_vc_ctrl,
+        base.n_vc_grp,
+        base.n_vc_share,
+        base.n_vc_feat,
+        thrust::raw_pointer_cast(base.d_vc_qrow.data()),
+        thrust::raw_pointer_cast(base.d_vc_qcol.data()),
+        thrust::raw_pointer_cast(base.d_vc_slope.data()),
+        thrust::raw_pointer_cast(base.d_vc_reg_bus.data()),
+        thrust::raw_pointer_cast(base.d_vc_vrow.data()),
+        thrust::raw_pointer_cast(base.d_vc_grp_start.data()),
+        thrust::raw_pointer_cast(base.d_vc_grp_count.data()),
+        thrust::raw_pointer_cast(base.d_vc_vset.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_row.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_first.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_other.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_wfirst.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_wother.data()),
+        thrust::raw_pointer_cast(base.d_vc_feat_pos.data()),
+        thrust::raw_pointer_cast(base.d_vc_feat_val.data()),
+        thrust::raw_pointer_cast(d_vc_q_batch.data()),
     };
+
+    // Re-initialise the per-slot feature state for this chunk (slack_absorbed =
+    // Re(Σ Sbus_slot); controller reactive injection = 0). The NR loop runs over
+    // the full padded batch, so initialise batch_size_ slots.
+    if (base.slack_col >= 0)
+        init_slack_absorbed_kernel<<<(batch_size_ + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
+            d_Sbus_for_NR, sbus_stride, n_bus, batch_size_);
+    if (base.n_vc_ctrl > 0)
+        CHK_CUDA_BPF(cudaMemsetAsync(
+            thrust::raw_pointer_cast(d_vc_q_batch.data()), 0,
+            d_vc_q_batch.size() * sizeof(cuda_real_type), cs));
 
     std::visit([&](auto& policy) {
         run_nr_loop(
@@ -493,6 +558,9 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
                 thrust::raw_pointer_cast(base.d_q_buses.data()),
                 thrust::raw_pointer_cast(base.d_q_rows.data()),
                 base.n_q, n_bus, dim_J, actual_batch, sbus_stride);
+            // Augmented-feature contributions to the final residual (slack /
+            // HVDC mismatch + VC bordered custom rows), using the converged state.
+            nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
 
             compute_residuals_kernel<<<
                 actual_batch, BS,

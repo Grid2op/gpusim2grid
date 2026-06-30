@@ -394,6 +394,21 @@ __global__ void fill_slack_feature_kernel(
     d_J_values[b * nnz_J + d_slack_feat_pos[k]] = d_slack_w[k];
 }
 
+__global__ void init_slack_absorbed_kernel(
+          cuda_real_type*  __restrict__ d_slack_absorbed,
+    const cudaComplexType* __restrict__ d_Sbus,
+    int sbus_stride,
+    int n_bus,
+    int actual_batch)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= actual_batch) return;
+    const cudaComplexType* sb = d_Sbus + static_cast<size_t>(b) * sbus_stride;
+    cuda_real_type s = static_cast<cuda_real_type>(0.);
+    for (int i = 0; i < n_bus; ++i) s += CudaFunHelper::my_cuCreal(sb[i]);
+    d_slack_absorbed[b] = s;
+}
+
 __global__ void update_slack_absorbed_kernel(
           cuda_real_type* __restrict__ d_slack_absorbed,
     const cuda_real_type* __restrict__ d_dx,

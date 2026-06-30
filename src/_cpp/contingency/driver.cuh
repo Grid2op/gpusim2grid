@@ -98,6 +98,7 @@ inline void run_nr_loop(
         fill_FQ_kernel<<<(batch_size * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
             buf.n_q, n_bus, dim_J, batch_size, buf.sbus_stride);
+        nr_feature_mismatch(buf, n_bus, dim_J, batch_size, cs);
         step.t_fill_F = timer.stop_ms();
 
         // ③  Fill J (policy-conditional via if constexpr)
@@ -107,20 +108,24 @@ inline void run_nr_loop(
         //   both false                   → never fill (policy reuses base factors)
         if constexpr (Policy::needs_fresh_jacobian) {
             timer.start();
+            nr_feature_zero_J(buf, nnz_J, batch_size, cs);
             fill_J_kernel<<<(batch_size * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
                 buf.d_J_values, buf.d_V, buf.d_Ibus,
                 buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
                 buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
                 n_bus, nnz_Y, nnz_J, batch_size);
+            nr_feature_fill_J(buf, n_bus, nnz_J, batch_size, cs);
             step.t_fill_J = timer.stop_ms();
         } else if constexpr (Policy::needs_iter0_jacobian) {
             if (iter == 0) {
                 timer.start();
+                nr_feature_zero_J(buf, nnz_J, batch_size, cs);
                 fill_J_kernel<<<(batch_size * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
                     buf.d_J_values, buf.d_V, buf.d_Ibus,
                     buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
                     buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
                     n_bus, nnz_Y, nnz_J, batch_size);
+                nr_feature_fill_J(buf, n_bus, nnz_J, batch_size, cs);
                 step.t_fill_J = timer.stop_ms();
             }
         }
@@ -144,6 +149,7 @@ inline void run_nr_loop(
         update_Vm_kernel<<<(batch_size * buf.n_vm + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
             buf.n_vm, n_bus, dim_J, batch_size);
+        nr_feature_update(buf, dim_J, batch_size, cs);
         step.t_update_V = timer.stop_ms();
 
         // Accumulate per-iteration timings into per-chunk totals.

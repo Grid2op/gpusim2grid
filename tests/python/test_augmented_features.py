@@ -126,6 +126,48 @@ def test_acpf_gpu_hvdc_droop_matches(solver_atol):
     np.testing.assert_allclose(V_gpu, V_ref, atol=10 * solver_atol)
 
 
+@requires_gpu
+@needs_bridge
+def test_injection_sweep_distributed_slack_base_case(solver_atol):
+    """Batched InjectionSweep on a distributed-slack grid: a single scenario equal
+    to the base case reproduces lightsim2grid's V (augmented batch path)."""
+    from gpusim2grid import InjectionSweepGPU
+
+    grid = _solved_multislack_grid()
+    n_bus = grid.get_Ybus_solver().shape[0]
+    sn = grid.get_sn_mva()
+    Sbus = grid.get_Sbus_solver()
+    p_mw = (Sbus.real * sn).reshape(1, n_bus)
+    q_mvar = (Sbus.imag * sn).reshape(1, n_bus)
+
+    sweep = InjectionSweepGPU(grid, nb_iter=12)
+    sweep.set_injections(p_mw, q_mvar, sn)
+    sweep.compute(batch_size=4)
+
+    V = sweep.V_results.to_numpy().reshape(1, n_bus)
+    assert sweep.last_residuals()[0] < 10 * solver_atol
+    np.testing.assert_allclose(np.abs(V[0]), np.abs(grid.get_V_solver()),
+                               atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_contingency_distributed_slack_converges(solver_atol):
+    """Batched N-1 contingency on a distributed-slack grid converges (augmented
+    system solved under Ybus patching)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid = _solved_multislack_grid()
+    ca = ContingencyAnalysisGPU(grid, init_from_n_powerflow=True, nb_iter=12)
+    n_ctg = min(5, len(grid.get_lines()))
+    ca.add_contingencies_by_branch_id([[c] for c in range(n_ctg)])
+    ca.compute(batch_size=8)
+
+    res = ca.last_residuals()
+    finite = res[np.isfinite(res)]
+    assert finite.size > 0 and np.all(finite < 1e3 * solver_atol)
+
+
 def _solve_with_fallback(model, nb_bus):
     """Solve with NR_KLU; fall back to NRSing_SparseLU if a flat start diverges
     (NR_KLU can struggle to start an SVC from a flat profile)."""

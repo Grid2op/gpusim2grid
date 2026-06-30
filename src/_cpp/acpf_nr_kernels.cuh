@@ -252,6 +252,16 @@ __global__ void fill_slack_feature_kernel(
     int nnz_J,
     int actual_batch);
 
+// Per-batch-slot slack_absorbed initial value = Re(Σ Sbus_slot) (one thread per
+// slot). sbus_stride=0 → shared Sbus (every slot sums the same base injection);
+// sbus_stride=n_bus → per-scenario Sbus row. Mirrors MultiSlack::update_state.
+__global__ void init_slack_absorbed_kernel(
+          cuda_real_type*  __restrict__ d_slack_absorbed,  // [actual_batch]
+    const cudaComplexType* __restrict__ d_Sbus,
+    int sbus_stride,
+    int n_bus,
+    int actual_batch);
+
 // slack_absorbed[b] += dx[b*dim_J + slack_col]   (one thread per batch slot)
 __global__ void update_slack_absorbed_kernel(
           cuda_real_type* __restrict__ d_slack_absorbed,   // [actual_batch]

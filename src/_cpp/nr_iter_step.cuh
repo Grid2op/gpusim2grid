@@ -160,6 +160,79 @@ struct NrIterTimings {
 };
 
 // -----------------------------------------------------------------------------
+// Augmented-feature launch helpers — shared by the single-system nr_iter_step
+// and the batched run_nr_loop / post-loop residual, so the extension wiring
+// lives in ONE place. Each is a no-op when its extension is inactive.
+//   nr_feature_mismatch : run AFTER fill_FP/FQ (MultiSlack/HVDC/VC mismatch +
+//                         VC bordered custom rows).
+//   nr_feature_zero_J   : zero J before the dS fill_J when an additive feature
+//                         (HVDC) is active.
+//   nr_feature_fill_J   : run AFTER fill_J (MultiSlack/HVDC/VC feature entries).
+//   nr_feature_update   : run AFTER update_Va/Vm (slack_absorbed + VC q states).
+// -----------------------------------------------------------------------------
+inline void nr_feature_mismatch(const NrIterBuffers& buf,
+                                int n_bus, int dim_J, int batch, cudaStream_t cs)
+{
+    if (buf.slack_col >= 0)
+        adjust_slack_mismatch_kernel<<<(batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_slack_absorbed, buf.d_slack_prow, buf.d_slack_w,
+            buf.n_slack, dim_J, batch);
+    if (buf.n_hvdc > 0)
+        hvdc_adjust_mismatch_kernel<<<(batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
+            buf.d_hvdc_pmax12, buf.d_hvdc_pmax21, buf.d_hvdc_prow1, buf.d_hvdc_prow2,
+            buf.n_hvdc, n_bus, dim_J, batch);
+    if (buf.n_vc_ctrl > 0) {
+        vc_adjust_mismatch_kernel<<<(batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
+        vc_vrow_kernel<<<(batch * buf.n_vc_grp + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
+            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
+            buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, batch);
+        if (buf.n_vc_share > 0)
+            vc_share_kernel<<<(batch * buf.n_vc_share + BS - 1) / BS, BS, 0, cs>>>(
+                buf.d_F, buf.d_vc_q, buf.d_vc_sh_row, buf.d_vc_sh_first, buf.d_vc_sh_other,
+                buf.d_vc_sh_wfirst, buf.d_vc_sh_wother, buf.n_vc_share, buf.n_vc_ctrl,
+                dim_J, batch);
+    }
+}
+
+inline void nr_feature_zero_J(const NrIterBuffers& buf, int nnz_J, int batch, cudaStream_t cs)
+{
+    if (buf.zero_J_before_fill)
+        cudaMemsetAsync(buf.d_J_values, 0,
+                        static_cast<size_t>(batch) * nnz_J * sizeof(cuda_real_type), cs);
+}
+
+inline void nr_feature_fill_J(const NrIterBuffers& buf,
+                              int n_bus, int nnz_J, int batch, cudaStream_t cs)
+{
+    if (buf.slack_col >= 0)
+        fill_slack_feature_kernel<<<(batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w, buf.n_slack, nnz_J, batch);
+    if (buf.n_hvdc > 0)
+        hvdc_fill_feature_kernel<<<(batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
+            buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
+            buf.n_hvdc, n_bus, nnz_J, batch);
+    if (buf.n_vc_feat > 0)
+        fill_slack_feature_kernel<<<(batch * buf.n_vc_feat + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val, buf.n_vc_feat, nnz_J, batch);
+}
+
+inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cudaStream_t cs)
+{
+    if (buf.slack_col >= 0)
+        update_slack_absorbed_kernel<<<(batch + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_slack_absorbed, buf.d_dx, buf.slack_col, dim_J, batch);
+    if (buf.n_vc_ctrl > 0)
+        vc_apply_step_kernel<<<(batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, batch);
+}
+
+// -----------------------------------------------------------------------------
 // nr_iter_step
 //
 // Executes one Newton-Raphson iteration on stream cs:
@@ -203,58 +276,20 @@ inline void nr_iter_step(
     fill_FQ_kernel<<<(actual_batch * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
         buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
         buf.n_q, n_bus, dim_J, actual_batch, buf.sbus_stride);
-    if (buf.slack_col >= 0)
-        adjust_slack_mismatch_kernel<<<(actual_batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_F, buf.d_slack_absorbed, buf.d_slack_prow, buf.d_slack_w,
-            buf.n_slack, dim_J, actual_batch);
-    if (buf.n_hvdc > 0)
-        hvdc_adjust_mismatch_kernel<<<(actual_batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
-            buf.d_hvdc_pmax12, buf.d_hvdc_pmax21, buf.d_hvdc_prow1, buf.d_hvdc_prow2,
-            buf.n_hvdc, n_bus, dim_J, actual_batch);
-    if (buf.n_vc_ctrl > 0) {
-        vc_adjust_mismatch_kernel<<<(actual_batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, actual_batch);
-        vc_vrow_kernel<<<(actual_batch * buf.n_vc_grp + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
-            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
-            buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, actual_batch);
-        if (buf.n_vc_share > 0)
-            vc_share_kernel<<<(actual_batch * buf.n_vc_share + BS - 1) / BS, BS, 0, cs>>>(
-                buf.d_F, buf.d_vc_q, buf.d_vc_sh_row, buf.d_vc_sh_first, buf.d_vc_sh_other,
-                buf.d_vc_sh_wfirst, buf.d_vc_sh_wother, buf.n_vc_share, buf.n_vc_ctrl,
-                dim_J, actual_batch);
-    }
+    nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
     t.t_fill_F += timer.stop_ms();
 
     // ③  Fill J values; notify cuDSS that the values pointer changed.
     //     When an additive feature (HVDC droop) is active, J must be zeroed first
     //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
-    if (buf.zero_J_before_fill)
-        cudaMemsetAsync(buf.d_J_values, 0,
-                        static_cast<size_t>(actual_batch) * nnz_J * sizeof(cuda_real_type), cs);
+    nr_feature_zero_J(buf, nnz_J, actual_batch, cs);
     fill_J_kernel<<<(actual_batch * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
         buf.d_J_values, buf.d_V, buf.d_Ibus,
         buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
         n_bus, nnz_Y, nnz_J, actual_batch);
-    if (buf.slack_col >= 0)
-        fill_slack_feature_kernel<<<(actual_batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w,
-            buf.n_slack, nnz_J, actual_batch);
-    if (buf.n_hvdc > 0)
-        hvdc_fill_feature_kernel<<<(actual_batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
-            buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
-            buf.n_hvdc, n_bus, nnz_J, actual_batch);
-    // VoltageControl: constant bordered-block entries (flat pos/value pairs).
-    if (buf.n_vc_feat > 0)
-        fill_slack_feature_kernel<<<(actual_batch * buf.n_vc_feat + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val,
-            buf.n_vc_feat, nnz_J, actual_batch);
+    nr_feature_fill_J(buf, n_bus, nnz_J, actual_batch, cs);
     dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 
@@ -280,12 +315,7 @@ inline void nr_iter_step(
     update_Vm_kernel<<<(actual_batch * buf.n_vm + BS - 1) / BS, BS, 0, cs>>>(
         buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
         buf.n_vm, n_bus, dim_J, actual_batch);
-    if (buf.slack_col >= 0)
-        update_slack_absorbed_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_slack_absorbed, buf.d_dx, buf.slack_col, dim_J, actual_batch);
-    if (buf.n_vc_ctrl > 0)
-        vc_apply_step_kernel<<<(actual_batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, actual_batch);
+    nr_feature_update(buf, dim_J, actual_batch, cs);
     t.t_update_V += timer.stop_ms();
 }
 

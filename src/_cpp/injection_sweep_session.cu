@@ -45,7 +45,8 @@ InjectionSweepSession::InjectionSweepSession(
     int    nb_iter,
     int    max_iter_base,
     double tol_base,
-    int    device)
+    int    device,
+    const LedgerData* ledger)
     : Ybus_rm_(Ybus)
     , batch_size_(batch_size)
     , nb_iter_(nb_iter)
@@ -58,7 +59,7 @@ InjectionSweepSession::InjectionSweepSession(
         Ybus, Vinit, Sbus, pv, pq,
         max_iter_base,
         static_cast<eigen_real_type>(tol_base),
-        device);
+        device, ledger);
     t_base_case_ms_ = ms_since(t_base_start);
 }
 
