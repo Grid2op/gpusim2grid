@@ -79,6 +79,13 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
 class ContingencyAnalysisGPU:
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
+    By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
+    bridge) every contingency is solved on the **same augmented system
+    lightsim2grid poses** — distributed slack, HVDC angle-droop, SVC, and remote
+    generator voltage control are carried through the Jacobian under the Ybus
+    patch. When the bridge is unavailable (or ``use_bridge=False``) the
+    Python-array fallback solves only the bare ``[pvpq | pq]`` system.
+
     Parameters
     ----------
     grid : lightsim2grid GridModel / LSGrid

@@ -197,7 +197,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Number of REFACTORIZATION calls (n_chunks × nb_iter − 1)")
         .def_readonly("n_disconnected",  &BatchTimings::n_disconnected,
                       "Contingencies skipped because they would disconnect the Ybus graph; "
-                      "their residuals are set to NaN in the output")
+                      "their residuals are set to NaN in the output. With "
+                      "handle_disconnected_grid enabled this counts only the splits that "
+                      "strand the angle reference or a controller bus (the rest are solved "
+                      "on their largest connected component, not skipped).")
         // --- computed properties ---
         .def_property_readonly("t_chunks_total_wall_ms",
                       [](const BatchTimings& t) { return t.t_chunks_total_wall_ms(); },
@@ -489,7 +492,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "set_branch_data() first.")
     .def("run",   &ContingencyAnalysisSession::run,
          "Solve all contingencies. Fills the device-side voltage and residual "
-         "buffers; contingencies that would disconnect the graph get NaN residuals.")
+         "buffers; contingencies that would disconnect the graph get NaN residuals "
+         "(unless handle_disconnected_grid is set, in which case only those "
+         "stranding the angle reference or a controller bus are left as NaN).")
     .def("compute_flows", &ContingencyAnalysisSession::compute_flows,
          "Compute per-branch ampere flows for every contingency from the stored "
          "voltages (tripped branches zeroed). Requires run() and set_branch_data().")
@@ -663,7 +668,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("device")                = -1,
         "Build a ContingencyAnalysisSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy: Ybus/Sbus/V/pv/pq/slack + branch admittances are "
-        "read off the C++ object). Branch data is set automatically.");
+        "read off the C++ object). Branch data is set automatically. Solves the "
+        "same augmented system lightsim2grid poses (distributed slack / HVDC "
+        "droop / SVC / remote voltage control) via the NRLedger read off the grid.");
 
     m.def("_make_is_session_from_lsgrid",
         [](pybind11::object grid_py, bool init_from_n_powerflow,
@@ -683,7 +690,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("device")                = -1,
         pybind11::arg("with_branch_data")      = true,
         "Build an InjectionSweepSession directly from a solved lightsim2grid "
-        "LSGrid (zero-copy). Branch data is set automatically when requested.");
+        "LSGrid (zero-copy). Branch data is set automatically when requested. "
+        "Solves the same augmented system lightsim2grid poses (distributed slack / "
+        "HVDC droop / SVC / remote voltage control) via the NRLedger read off the "
+        "grid.");
 
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device) {

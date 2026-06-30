@@ -25,6 +25,29 @@ factorization, and reports convergence statistics and timing.
 .. literalinclude:: ../examples/case6515rte_screen.py
    :language: python
 
+Largest-component solve of a split grid
+---------------------------------------
+
+Screens every N-1 and, for the contingency that disconnects an island, solves
+the largest connected component (reporting the islanded buses as ``NaN``) instead
+of skipping it — via the ``ContingencyAnalysisGPU`` facade and
+``handle_disconnected_grid``.
+
+.. literalinclude:: ../examples/handle_disconnected.py
+   :language: python
+
+Augmented solve: distributed slack
+----------------------------------
+
+Adds a second weighted slack to the IEEE 14-bus case so the active-power slack
+is genuinely shared, then solves the **same augmented Newton-Raphson system
+lightsim2grid poses** on the GPU (via the C++ bridge) and matches the CPU
+reference. The same path also covers HVDC angle-droop, SVC, and remote
+generator voltage control.
+
+.. literalinclude:: ../examples/distributed_slack.py
+   :language: python
+
 Differentiable power flow (alpha)
 ---------------------------------
 

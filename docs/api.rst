@@ -6,6 +6,24 @@ CUDA bindings (``gpusim2grid._gpusim2grid``) are documented at the bottom and ar
 only fully rendered when the docs are built on a machine where the compiled
 extension is importable.
 
+GPU facades (lightsim2grid-driven)
+----------------------------------
+
+These are the top-level entry points exported from the ``gpusim2grid`` package.
+They are seeded directly from a solved lightsim2grid grid and run the batched
+solve on the GPU.
+
+.. autoclass:: gpusim2grid.ContingencyAnalysisGPU
+   :members:
+
+.. autoclass:: gpusim2grid.InjectionSweepGPU
+   :members:
+
+.. autoclass:: gpusim2grid.AcPfGPU
+   :members:
+
+.. autofunction:: gpusim2grid.optimize_reference_slack
+
 Contingency analysis
 --------------------
 

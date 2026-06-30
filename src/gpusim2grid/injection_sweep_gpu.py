@@ -28,6 +28,13 @@ def _have_bridge():
 class InjectionSweepGPU:
     """Batch injection sweep on the GPU, seeded from a CPU base-case solve.
 
+    By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
+    bridge) every scenario is solved on the **same augmented system lightsim2grid
+    poses** — distributed slack, HVDC angle-droop, SVC, and remote generator
+    voltage control are carried through the Jacobian as Sbus varies. When the
+    bridge is unavailable (or ``use_bridge=False``) the Python-array fallback
+    solves only the bare ``[pvpq | pq]`` system.
+
     Parameters
     ----------
     grid : lightsim2grid GridModel / LSGrid

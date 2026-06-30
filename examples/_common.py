@@ -24,14 +24,14 @@ def load_case(name="case14"):
     v_init (DC warm-start), v_ref (AC reference from lightsim2grid).
     """
     import pandapower.networks as pn
-    from lightsim2grid.gridmodel import init_from_pandapower
-    from lightsim2grid.solver import SolverType
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
 
     if not hasattr(pn, name):
         raise ValueError(f"{name!r} is not a pandapower.networks factory")
 
     grid = init_from_pandapower(getattr(pn, name)())
-    grid.change_solver(SolverType.KLU)
+    grid.change_algorithm(AlgorithmType.NR_KLU)
 
     n_bus = grid.get_bus_vn_kv().shape[0]
 
@@ -40,13 +40,14 @@ def load_case(name="case14"):
     v_init = grid.dc_pf(v_init_dc.copy(), 1, 1e-6)
     v_ref = grid.ac_pf(v_init.copy(), 20, 1e-8)
 
+    # Solver-numbered arrays, consistent with get_Ybus_solver().
     Ybus: csr_matrix = grid.get_Ybus_solver().copy()
     Sbus: np.ndarray = grid.get_Sbus_solver().copy()
-    pv = grid.get_pv()
-    pq = grid.get_pq()
-    slack = grid.get_slack_ids()
-    slack_weights = np.zeros(n_bus, dtype=float)
-    slack_weights[slack] = 1.0 / slack.shape[0]
+    pv = grid.get_pv_solver()
+    pq = grid.get_pq_solver()
+    slack = grid.get_slack_ids_solver()
+    # (n_bus,) distributed-slack weights, summing to 1 over the slack buses.
+    slack_weights = grid.get_slack_weights_solver().copy()
 
     return {
         "grid": grid,

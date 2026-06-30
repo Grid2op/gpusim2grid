@@ -26,12 +26,25 @@ class AcPfGPU:
     Seeds the GPU solver with lightsim2grid's CPU-converged voltage so the
     base-case factorization is computed at the correct operating point.
 
+    By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
+    bridge) this solves the **same augmented system lightsim2grid poses**: the
+    in-Jacobian power-system controls — distributed slack, HVDC angle-droop, SVC,
+    and remote generator voltage control — are reproduced bit-for-bit from the
+    NRLedger read off the solved grid. When the bridge is unavailable (or
+    ``use_bridge=False``) it falls back to extracting the grid arrays in Python
+    and solving only the bare ``[pvpq | pq]`` system (no distributed slack in the
+    Jacobian).
+
     Parameters
     ----------
     grid : lightsim2grid GridModel / LSGrid
     precision : {"fp64", "fp32", None}, default "fp64"
     max_iter, tol : int, float
     device : None | int | "cuda" | "cuda:N"
+    use_bridge : bool or None, default None
+        Force (``True``) or disable (``False``) the zero-copy lightsim2grid C++
+        bridge. ``None`` auto-detects it. Only the bridge path solves the
+        augmented system; the Python-array fallback solves the bare system.
 
     Examples
     --------

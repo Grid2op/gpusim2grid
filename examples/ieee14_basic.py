@@ -15,7 +15,7 @@ from gpusim2grid.compilation_options import is_fp32
 
 
 def main():
-    print(f"gpusim2grid precision: {'FP32' if is_fp32() else 'FP64'}")
+    print(f"gpusim2grid precision: {'FP32' if is_fp32 else 'FP64'}")
     d = load_case("case14")
 
     # Output voltage vector, written in place by the solver.

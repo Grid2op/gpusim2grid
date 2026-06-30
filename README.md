@@ -32,6 +32,21 @@ In order of maturity:
 Both single (FP32) and double (FP64) precision are supported and work well; the
 precision is selectable at build time (see the documentation).
 
+When seeded from a `lightsim2grid` grid — the default path for the `AcPfGPU`,
+`ContingencyAnalysisGPU` and `InjectionSweepGPU` facades — gpusim2grid solves the
+**same augmented Newton-Raphson system that lightsim2grid poses**, including the
+in-Jacobian power-system controls modelled there:
+
+- **distributed slack** (slack mismatch shared across weighted slack buses),
+- **HVDC angle-droop**,
+- **SVC** (static var compensator, voltage mode with optional slope),
+- **remote generator voltage control** (a generator regulating a non-local bus).
+
+These match the lightsim2grid CPU solution bit-for-bit, on both the single solve
+and the batched contingency / injection-sweep paths. The low-level array entry
+points (`acpf_nr_gpu`, the `*Session` classes constructed from raw NumPy/SciPy
+arrays) solve only the bare `[pvpq | pq]` system without these controls.
+
 ## Alpha features
 
 These work today but are early and **subject to change**:
@@ -51,11 +66,14 @@ Coming soon:
 ## ⚠️ Important warning
 
 **This is a raw Newton-Raphson solver. There is no outer loop.** It does not enforce
-reactive power limits, adjust tap / phase-shifter control, apply distributed slack, or
-perform any other outer-loop correction. Voltages are the solution of the bare AC
-equations as posed. If your problem relies on outer-loop behaviour, results will
-differ from a full load-flow tool. See [`DISCLAIMER.md`](DISCLAIMER.md) for the full
-list of limitations and for pointers to other open-source tools that cover them.
+reactive-power limits (no PV→PQ switching), adjust tap / phase-shifter setpoints, or
+perform any other outer-loop correction. The *in-Jacobian* controls that
+lightsim2grid models — distributed slack, HVDC angle-droop, SVC, and remote
+generator voltage control — **are** solved when you go through the lightsim2grid
+bridge (the default facade path), and then match lightsim2grid. But if your problem
+relies on outer-loop behaviour (Q limits, tap changing, …), results will differ from
+a full load-flow tool. See [`DISCLAIMER.md`](DISCLAIMER.md) for the full list of
+limitations and for pointers to other open-source tools that cover them.
 
 ## Requirements
 
@@ -90,40 +108,62 @@ page in the [documentation](#building-the-docs).
 ## Quickstart
 
 ```python
+import numpy as np
 import gpusim2grid as g2g
+from lightsim2grid.network import init_from_pandapower
+import pandapower.networks as pn
 
-# Base case solved to convergence on CPU via lightsim2grid,
-# then the batched scenarios are solved on the GPU.
-solver = g2g.ContingencyAnalysisSolver(...)
+# Solve the base case on the CPU via lightsim2grid, then screen the
+# contingencies on the GPU reusing that single base-case factorization.
+grid = init_from_pandapower(pn.case14())
+grid.ac_pf(np.ones(grid.get_bus_vn_kv().shape[0], dtype=complex), 10, 1e-8)
 
-results = solver.run(
-    contingencies=...,   # list[list[tuple[row, col, val]]]
-    batch_size=...,
-    nb_iter=...,         # fixed iteration count, no convergence stop
-)
+ca = g2g.ContingencyAnalysisGPU(grid, nb_iter=4)
+ca.add_contingencies_by_branch_id([[12], [40], [12, 40]])  # branch ids, lines-then-trafos
 
-V = results.voltages          # on GPU
-residuals = results.residuals # per-scenario ‖F‖∞
-timings = results.timings     # ContingencyTimings, per-phase
+V = ca.compute(batch_size=512)   # DLPack capsule, shape (n_ctg, n_bus), complex
+residuals = ca.last_residuals()  # per-contingency ‖F‖∞ (NaN = skipped)
+timings = ca.timings             # BatchTimings, per-phase breakdown
 ```
 
-Zero-copy export to PyTorch:
+When an N-k contingency splits the grid, opt into solving the largest connected
+component (islanded buses reported as ``NaN``) instead of skipping it:
+
+```python
+# Pick the angle-reference slack stranded by the fewest contingencies and
+# re-solve the base case with it (minimises skips), then enable the masking.
+cont = [[c] for c in range(ca.n_branches)]
+g2g.optimize_reference_slack(grid, cont)
+ca = g2g.ContingencyAnalysisGPU(grid, handle_disconnected_grid=True, nb_iter=4)
+```
+
+Zero-copy export to PyTorch (the capsule aliases live GPU memory — clone it
+before the next ``compute()`` if you need a snapshot):
 
 ```python
 import torch
-V_torch = torch.from_dlpack(results.voltages_dlpack())
+V_torch = torch.from_dlpack(ca.compute(batch_size=512))
 ```
 
 See [`examples/`](examples/):
 
 - `ieee14_basic.py` — end-to-end AC power flow on the IEEE 14-bus case.
 - `case6515rte_screen.py` — batched contingency screen with residuals.
+- `handle_disconnected.py` — solve the largest component of a grid-splitting contingency.
+- `distributed_slack.py` — augmented solve (distributed slack in the Jacobian) via the lightsim2grid bridge.
 - `differentiable_pf.py` — derivatives through a single power flow via the adjoint method.
 
 ## How it works
 
-[2-3 sentence overview: base-case solve, chunked batch loop with absolute Ybus
-patches, amortized symbolic factorization, post-loop residual.]
+The base case is solved once (on the CPU via lightsim2grid, or on the GPU) to
+get the converged voltages and the Jacobian sparsity pattern. The batch is then
+processed in GPU chunks: each scenario starts from the base-case voltages, its
+Ybus is patched in place (contingencies subtract the tripped-branch admittances;
+injection sweeps vary Sbus), and a fixed number of Newton-Raphson iterations run
+in parallel over the block-diagonal system. The cuDSS symbolic factorization is
+computed **once** and reused across the whole batch — only numeric
+refactorization/solve happen per iteration. A post-loop residual pass reports the
+final ‖F‖∞ per scenario.
 
 See the [API documentation](https://gpusim2grid.readthedocs.io) for the full design.
 
