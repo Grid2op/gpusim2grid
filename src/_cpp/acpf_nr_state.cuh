@@ -104,6 +104,21 @@ struct AcPfNrState {
     thrust::device_vector<int> d_vm_buses,    d_vm_cols;     // vm unknowns
 
     // -------------------------------------------------------------------------
+    // Host-side masking tables (handle_disconnected_grid). Built once in the
+    // ctor from the ledger pair lists + the J skeleton. All size n_bus, -1 when
+    // the bus owns no such row/col.
+    //   h_theta_col_of_bus : angle column of each bus (-1 ⇒ angle reference)
+    //   h_p_row_of_bus / h_q_row_of_bus : the bus' P / Q equation rows
+    //   h_p_diag_pos / h_q_diag_pos : nnz index of the (p_row, theta_col) /
+    //                                 (q_row, vm_col) diagonal in the J skeleton,
+    //                                 used to write the identity entry when the
+    //                                 bus is masked out (largest-component solve).
+    // -------------------------------------------------------------------------
+    std::vector<int> h_theta_col_of_bus;
+    std::vector<int> h_p_row_of_bus, h_q_row_of_bus;
+    std::vector<int> h_p_diag_pos,   h_q_diag_pos;
+
+    // -------------------------------------------------------------------------
     // MultiSlack (distributed slack in the Jacobian) — slack_col < 0 when absent.
     //   d_slack_absorbed is the per-batch-slot running state (size 1 for the
     //   single-system base solve; tiled to batch_size by the batch driver).

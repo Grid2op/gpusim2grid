@@ -13,12 +13,13 @@ try:  # pragma: no cover - environment dependent
 except ImportError:
     pass
 
-from .contingency_analysis_gpu import ContingencyAnalysisGPU
+from .contingency_analysis_gpu import ContingencyAnalysisGPU, optimize_reference_slack
 from .injection_sweep_gpu import InjectionSweepGPU
 from .acpf_gpu import AcPfGPU
 
 __all__ = [
     "ContingencyAnalysisGPU",
+    "optimize_reference_slack",
     "InjectionSweepGPU",
     "AcPfGPU",
 ]

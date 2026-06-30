@@ -104,6 +104,55 @@ __global__ void scatter_V_results_kernel(
 }
 
 // =============================================================================
+// apply_bus_mask_kernel
+// =============================================================================
+__global__ void apply_bus_mask_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+          cuda_real_type* __restrict__ d_F,
+    const int*           __restrict__ d_mask_slot,
+    const int*           __restrict__ d_mask_row,
+    const int*           __restrict__ d_mask_diag,
+    const int*           __restrict__ d_J_outer,
+    int nnz_J,
+    int dim_J,
+    int n_entries)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_entries) return;
+
+    const int slot = d_mask_slot[tid];
+    const int row  = d_mask_row[tid];
+    const int diag = d_mask_diag[tid];
+
+    cuda_real_type* J = d_J_values + static_cast<ptrdiff_t>(slot) * nnz_J;
+    const int row_beg = d_J_outer[row];
+    const int row_end = d_J_outer[row + 1];
+    for (int k = row_beg; k < row_end; ++k) J[k] = cuda_real_type(0);
+    if (diag >= 0) J[diag] = cuda_real_type(1);
+
+    d_F[static_cast<ptrdiff_t>(slot) * dim_J + row] = cuda_real_type(0);
+}
+
+// =============================================================================
+// mask_V_nan_kernel
+// =============================================================================
+__global__ void mask_V_nan_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ d_maskv_slot,
+    const int*             __restrict__ d_maskv_bus,
+    cuda_real_type nan_val,
+    int n_bus,
+    int n_entries)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_entries) return;
+    const int slot = d_maskv_slot[tid];
+    const int bus  = d_maskv_bus[tid];
+    d_V[static_cast<ptrdiff_t>(slot) * n_bus + bus] =
+        CudaFunHelper::my_make_cuComplex(nan_val, nan_val);
+}
+
+// =============================================================================
 // zero_branch_flows_kernel
 // =============================================================================
 __global__ void zero_branch_flows_kernel(

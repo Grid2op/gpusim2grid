@@ -521,6 +521,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &ContingencyAnalysisSession::strategy_type_,
                    "Linear-solve strategy (ContingencySolverType enum; takes effect on the next run())")
+    .def_readwrite("handle_disconnected_grid",
+                   &ContingencyAnalysisSession::handle_disconnected_grid_,
+                   "When True, a contingency that splits the grid is solved on its "
+                   "largest connected component (the rest reported as NaN) instead "
+                   "of being skipped; contingencies stranding the angle reference or "
+                   "a controller bus are still skipped. Incompatible with the "
+                   "'direct_base_case_factors' strategy. Takes effect on the next run().")
     // -------------------------------------------------------------------
     // Zero-copy DLPack exporters.
     // The returned capsule aliases live device memory; calling run() again

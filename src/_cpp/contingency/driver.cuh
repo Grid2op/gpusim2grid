@@ -99,6 +99,9 @@ inline void run_nr_loop(
             buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
             buf.n_q, n_bus, dim_J, batch_size, buf.sbus_stride);
         nr_feature_mismatch(buf, n_bus, dim_J, batch_size, cs);
+        // handle_disconnected_grid: zero the masked rows of F (the J rows are
+        // masked below). No-op when the mode is off.
+        nr_apply_bus_mask(buf, nnz_J, dim_J, batch_size, cs);
         step.t_fill_F = timer.stop_ms();
 
         // ③  Fill J (policy-conditional via if constexpr)
@@ -115,6 +118,8 @@ inline void run_nr_loop(
                 buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
                 n_bus, nnz_Y, nnz_J, batch_size);
             nr_feature_fill_J(buf, n_bus, nnz_J, batch_size, cs);
+            // Mask AFTER the feature stamps so the masked rows win.
+            nr_apply_bus_mask(buf, nnz_J, dim_J, batch_size, cs);
             step.t_fill_J = timer.stop_ms();
         } else if constexpr (Policy::needs_iter0_jacobian) {
             if (iter == 0) {
@@ -126,6 +131,8 @@ inline void run_nr_loop(
                     buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
                     n_bus, nnz_Y, nnz_J, batch_size);
                 nr_feature_fill_J(buf, n_bus, nnz_J, batch_size, cs);
+                // Mask AFTER the feature stamps so the masked rows win.
+                nr_apply_bus_mask(buf, nnz_J, dim_J, batch_size, cs);
                 step.t_fill_J = timer.stop_ms();
             }
         }

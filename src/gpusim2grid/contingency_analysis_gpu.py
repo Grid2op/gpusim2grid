@@ -21,11 +21,59 @@ from ._ls2g_utils import (
 )
 from . import _gpusim2grid as _cpp
 
-__all__ = ["ContingencyAnalysisGPU"]
+__all__ = ["ContingencyAnalysisGPU", "optimize_reference_slack"]
 
 
 def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
+
+
+def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
+                             max_iter=30, tol=1e-10):
+    """Choose the angle-reference slack that minimises skipped contingencies, set
+    it on the grid, and re-solve the base AC power flow (CPU, in lightsim2grid).
+
+    For ``handle_disconnected_grid`` the reference slack is fixed for the whole
+    GPU batch, and any contingency that strands it is skipped (NaN). lightsim2grid
+    can pick the slack stranded by the *fewest* of the given contingencies and
+    re-solve the base case with it as the angle reference; the GPU companion then
+    inherits that reference (read off the solved grid) and skips as few split
+    contingencies as possible. Call this **before** building a
+    :class:`ContingencyAnalysisGPU` (bridge / multi-slack path).
+
+    Requires a lightsim2grid whose ``ContingencyAnalysisCPP`` exposes
+    ``pick_reference_slack`` and whose grid exposes ``set_reference_slack_bus``.
+
+    Parameters
+    ----------
+    grid : lightsim2grid LSGrid
+        Grid to re-solve in place (its slack ordering is updated).
+    contingency_branch_ids : list[list[int]]
+        Branch-removal contingencies (lines-then-trafos), as passed to
+        :meth:`ContingencyAnalysisGPU.add_contingencies_by_branch_id`.
+    Vinit : (n_bus,) complex, optional
+        Base-case warm start; defaults to a flat 1.0 start.
+    max_iter, tol : int, float
+        Base-case AC solve settings.
+
+    Returns
+    -------
+    int
+        The chosen reference bus id (gridmodel numbering), or -1 if the grid has
+        no slack to choose from.
+    """
+    from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
+
+    ca = ContingencyAnalysisCPP(grid)
+    for ids in contingency_branch_ids:
+        ca.add_nk([int(i) for i in ids])
+    ref = ca.pick_reference_slack()
+    if ref is not None and ref >= 0:
+        grid.set_reference_slack_bus(int(ref))
+        n_bus = grid.get_bus_vn_kv().shape[0]
+        v = Vinit if Vinit is not None else np.ones(n_bus, dtype=complex)
+        grid.ac_pf(v, int(max_iter), float(tol))
+    return ref
 
 
 class ContingencyAnalysisGPU:
@@ -65,7 +113,7 @@ class ContingencyAnalysisGPU:
 
     def __init__(self, grid, *, init_from_n_powerflow=True, precision="fp64",
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
-                 use_bridge=None):
+                 use_bridge=None, handle_disconnected_grid=False):
         _validate_precision(precision)
 
         if use_bridge is None:
@@ -100,6 +148,11 @@ class ContingencyAnalysisGPU:
             branch_args, _, _ = extract_branch_data(grid)
             self._inner.set_branch_data(*branch_args)
             self._n_branches = len(branch_args[0])
+
+        # Solve the largest connected component of a split grid (masking the rest
+        # as NaN) instead of skipping such contingencies. Works on both the bridge
+        # and the array path (mutable property on the underlying session).
+        self._inner.handle_disconnected_grid = bool(handle_disconnected_grid)
 
         self._nb_iter = int(nb_iter)
         self._init_from_n_powerflow = bool(init_from_n_powerflow)

@@ -44,6 +44,7 @@
 #include "../../acpf_nr_state.cuh"
 
 struct BatchPfDriverContext;
+struct NrIterBuffers;
 
 inline double ib_ms_since(const std::chrono::steady_clock::time_point& start)
 {
@@ -138,6 +139,12 @@ struct InjectionBatch {
     // -------------------------------------------------------------------------
     int        n_active()     const { return n_scenarios_; }
     const int* d_result_map() const { return nullptr; }
+
+    // BatchSource concept: the injection sweep never masks buses (topology is
+    // fixed), so this is a no-op that leaves the NrIterBuffers mask fields at
+    // their off defaults.
+    void fill_mask_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/,
+                           const int* /*d_J_outer*/) const {}
 
     double cpu_preprocess_ms() const { return t_preprocess_ms; }
 };

@@ -31,6 +31,8 @@
 #include "dtypes.hpp"
 #include "cu_complex_utils.h"
 
+#include <limits>
+
 static constexpr int BS = 256;   // block size for all NR kernels
 
 // -----------------------------------------------------------------------------
@@ -141,6 +143,20 @@ struct NrIterBuffers {
     const int*             d_vc_feat_pos  = nullptr;
     const cuda_real_type*  d_vc_feat_val  = nullptr;
     cuda_real_type*        d_vc_q         = nullptr;   // [actual_batch * n_vc_ctrl] running state
+
+    // ---- handle_disconnected_grid masking (per-chunk slice) -----------------
+    // Identity-row entries (slot, J row, diag nnz pos) freeze the masked buses'
+    // NR equations; masked-voltage entries (slot, bus) flag NaN reporting. All
+    // null / counts 0 when the mode is off → the masking launches are skipped
+    // and the feature-free / legacy path stays bit-identical.
+    const int*             d_J_outer_mask = nullptr;   // [dim_J+1] shared J skeleton outer
+    const int*             d_mask_slot    = nullptr;   // [n_mask_rows]
+    const int*             d_mask_row     = nullptr;   // [n_mask_rows]
+    const int*             d_mask_diag    = nullptr;   // [n_mask_rows]
+    int                    n_mask_rows    = 0;
+    const int*             d_maskv_slot   = nullptr;   // [n_mask_v]
+    const int*             d_maskv_bus    = nullptr;   // [n_mask_v]
+    int                    n_mask_v       = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -230,6 +246,31 @@ inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cu
     if (buf.n_vc_ctrl > 0)
         vc_apply_step_kernel<<<(batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, batch);
+}
+
+// -----------------------------------------------------------------------------
+// handle_disconnected_grid launch helpers (no-ops when the mode is off).
+//   nr_apply_bus_mask : freeze masked buses' J rows to identity + zero their F.
+//                       Must run AFTER fill_F / fill_J + all feature stamps.
+//   nr_mask_v_nan     : overwrite masked buses' voltages with NaN before store.
+// -----------------------------------------------------------------------------
+inline void nr_apply_bus_mask(const NrIterBuffers& buf,
+                              int nnz_J, int dim_J, int batch, cudaStream_t cs)
+{
+    (void)batch;
+    if (buf.n_mask_rows > 0)
+        apply_bus_mask_kernel<<<(buf.n_mask_rows + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_F, buf.d_mask_slot, buf.d_mask_row, buf.d_mask_diag,
+            buf.d_J_outer_mask, nnz_J, dim_J, buf.n_mask_rows);
+}
+
+inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
+{
+    if (buf.n_mask_v > 0) {
+        const cuda_real_type nan_val = std::numeric_limits<cuda_real_type>::quiet_NaN();
+        mask_V_nan_kernel<<<(buf.n_mask_v + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_V, buf.d_maskv_slot, buf.d_maskv_bus, nan_val, n_bus, buf.n_mask_v);
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -79,6 +79,14 @@ struct ContingencyAnalysisSession {
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_   = ContingencySolverType::DirectRefactorEvery;
 
+    // handle_disconnected_grid: when true, a contingency that splits the grid is
+    // solved on its largest connected component (the rest is frozen and reported
+    // as NaN) instead of being skipped — unless it strands the angle reference or
+    // a controller bus, which is still skipped. Mutable; takes effect on the next
+    // run(). mask_cfg_ is built once in the ctor from the base case + ledger.
+    bool       handle_disconnected_grid_ = false;
+    MaskConfig mask_cfg_;
+
     // =========================================================================
     // Host branch data (stored for compute_flows() and build_contingencies())
     // =========================================================================

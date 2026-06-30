@@ -12,6 +12,7 @@
 #include "contingency/batch_sources/contingency_batch.cuh"
 #include "acpf_nr_kernels.cuh"
 #include "contingency_analysis_helper.hpp"
+#include "ledger_data.hpp"
 #include "cuda_utils.h"
 
 #include <thrust/device_vector.h>
@@ -62,6 +63,37 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
         static_cast<eigen_real_type>(tol_base),
         device, ledger);
     t_base_case_ms_ = ms_since(t_base_start);
+
+    // Build the handle_disconnected_grid mask configuration once from the base
+    // case (per-bus identity-row metadata + angle reference) and the ledger
+    // (controller buses → skip-if-stranded). Cheap; only consulted by run() when
+    // handle_disconnected_grid_ is enabled.
+    {
+        const int n_bus = base_state_->n_bus;
+        mask_cfg_.row_info.p_row      = base_state_->h_p_row_of_bus;
+        mask_cfg_.row_info.q_row      = base_state_->h_q_row_of_bus;
+        mask_cfg_.row_info.p_diag_pos = base_state_->h_p_diag_pos;
+        mask_cfg_.row_info.q_diag_pos = base_state_->h_q_diag_pos;
+
+        // Angle reference(s): the bus(es) with no theta column anchor the angle
+        // and cannot be frozen; stranding one means the island is unsolvable.
+        mask_cfg_.is_reference_bus.assign(static_cast<size_t>(n_bus), 0);
+        for (int b = 0; b < n_bus; ++b)
+            if (base_state_->h_theta_col_of_bus[static_cast<size_t>(b)] < 0)
+                mask_cfg_.is_reference_bus[static_cast<size_t>(b)] = 1;
+
+        // Controller buses (HVDC ends / voltage-control gen & regulated buses):
+        // their feature equations reference the live block, so a contingency that
+        // strands one is conservatively skipped (no GPU per-scenario disabling).
+        mask_cfg_.is_controller_bus.assign(static_cast<size_t>(n_bus), 0);
+        if (ledger != nullptr) {
+            auto mark = [&](int b){ if (b >= 0 && b < n_bus) mask_cfg_.is_controller_bus[static_cast<size_t>(b)] = 1; };
+            for (int b : ledger->hvdc_bus1)  mark(b);
+            for (int b : ledger->hvdc_bus2)  mark(b);
+            for (int b : ledger->vc_bus)     mark(b);
+            for (int b : ledger->vc_reg_bus) mark(b);
+        }
+    }
 }
 
 // =============================================================================
@@ -141,7 +173,23 @@ void ContingencyAnalysisSession::run()
         throw std::runtime_error(
             "ContingencyAnalysisSession: call build_contingencies() before run()");
 
-    // Host preprocessing (resolve_indices + check_connectivity + build_flat_patches)
+    if (handle_disconnected_grid_ &&
+        strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: handle_disconnected_grid is incompatible "
+            "with the 'direct_base_case_factors' strategy (it reuses the unmasked "
+            "base-case factors). Use 'direct_refactor_every' (default), "
+            "'direct_iter0_only', or 'direct_refactor_every_n'.");
+
+    // Reset any masking flags set on a previous run() (the contingency list is
+    // mutated in place across runs; compute_component_masks / check_connectivity
+    // expect to start from a clean state).
+    for (auto& ctg : contingencies_) {
+        ctg.disconnected = false;
+        ctg.masked_buses.clear();
+    }
+
+    // Host preprocessing (resolve_indices + connectivity/masking + build_flat_patches)
     // captured by the BatchSource; mutates contingencies_ in-place so that
     // disconnected flags are observable below for the disconnected count.
     // The source rebalances the chunk size over the ACTIVE (simulated) count;
@@ -151,7 +199,8 @@ void ContingencyAnalysisSession::run()
         Ybus_rm_.outerIndexPtr(),
         Ybus_rm_.innerIndexPtr(),
         Ybus_rm_,
-        batch_size_);
+        batch_size_,
+        handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
     used_batch_size_ = source.used_batch_size();
 
     // (Re-)construct the solver — allows run() to be called multiple times.

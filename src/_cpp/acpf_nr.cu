@@ -348,6 +348,37 @@ AcPfNrState::AcPfNrState(
     }
     n_p = (int)p_buses.size(); n_q = (int)q_buses.size();
     n_theta = (int)theta_buses.size(); n_vm = (int)vm_buses.size();
+
+    // Host-side masking tables for the handle_disconnected_grid mode (solve the
+    // largest connected component, mask the rest). Reconstruct the bus→row/col
+    // maps from the ledger pair lists and resolve the identity-diagonal nnz
+    // position of each bus' (p_row, theta_col) / (q_row, vm_col) against the J
+    // skeleton just assembled. Cheap (size n_bus) and always built.
+    {
+        h_theta_col_of_bus.assign(n_bus, -1);
+        h_p_row_of_bus.assign(n_bus, -1);
+        h_q_row_of_bus.assign(n_bus, -1);
+        h_p_diag_pos.assign(n_bus, -1);
+        h_q_diag_pos.assign(n_bus, -1);
+        std::vector<int> vm_col_of_bus(n_bus, -1);
+        for (int i = 0; i < n_theta; ++i) h_theta_col_of_bus[theta_buses[i]] = theta_cols[i];
+        for (int i = 0; i < n_vm;    ++i) vm_col_of_bus[vm_buses[i]]         = vm_cols[i];
+        for (int i = 0; i < n_p;     ++i) h_p_row_of_bus[p_buses[i]]         = p_rows[i];
+        for (int i = 0; i < n_q;     ++i) h_q_row_of_bus[q_buses[i]]         = q_rows[i];
+        auto find_J_pos = [&](int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* inner = J_inner_h.data();
+            const int* it = std::lower_bound(inner + s, inner + e, col);
+            if (it == inner + e || *it != col) return -1;
+            return static_cast<int>(it - inner);
+        };
+        for (int bus = 0; bus < n_bus; ++bus) {
+            h_p_diag_pos[bus] = find_J_pos(h_p_row_of_bus[bus], h_theta_col_of_bus[bus]);
+            h_q_diag_pos[bus] = find_J_pos(h_q_row_of_bus[bus], vm_col_of_bus[bus]);
+        }
+    }
+
     timings.t_build_J_ms = ms_since(t_wall_start);
 
     // =========================================================================

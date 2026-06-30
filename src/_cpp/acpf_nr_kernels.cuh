@@ -390,6 +390,54 @@ __global__ void vc_apply_step_kernel(
     int actual_batch);
 
 // ---------------------------------------------------------------------------
+// apply_bus_mask_kernel  (handle_disconnected_grid mode)
+//
+// Forces the masked buses' Newton-Raphson equations to identity rows so the
+// largest connected component can be solved while the rest of the (split) grid
+// is "frozen". One thread per (slot, row) identity entry:
+//   • zero every J value in that row's nnz range  [J_outer[row], J_outer[row+1])
+//   • write 1 at diag_nnz_pos (the (row, own-col) position)  [skipped if < 0]
+//   • zero the RHS  d_F[slot * dim_J + row]
+// so the linear solve returns dx = 0 for the masked unknowns and the live block
+// is left untouched (cross-couplings to masked columns are ≈ 0 after the cut).
+//
+// Must run AFTER fill_F / fill_J and all feature stamps so it overrides them.
+// Reused (J writes harmless) in the post-loop to zero masked F rows before the
+// residual reduction. No-op when n_entries == 0 (mode off → bit-identical).
+//
+// d_J_values : [actual_batch * nnz_J]
+// d_F        : [actual_batch * dim_J]
+// d_mask_slot/d_mask_row/d_mask_diag : [n_entries] — batch slot, J row, diag pos
+// d_J_outer  : [dim_J + 1] — shared single-system J skeleton row pointers
+// ---------------------------------------------------------------------------
+__global__ void apply_bus_mask_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+          cuda_real_type* __restrict__ d_F,
+    const int*           __restrict__ d_mask_slot,
+    const int*           __restrict__ d_mask_row,
+    const int*           __restrict__ d_mask_diag,
+    const int*           __restrict__ d_J_outer,
+    int nnz_J,
+    int dim_J,
+    int n_entries);
+
+// ---------------------------------------------------------------------------
+// mask_V_nan_kernel  (handle_disconnected_grid mode)
+//
+// Overwrites the voltage of every masked (frozen) bus with NaN+NaNj so the
+// reported result distinguishes the unsolved component. One thread per
+// (slot, bus) entry. Launched after the residual reduction, before the result
+// store. No-op when n_entries == 0.
+// ---------------------------------------------------------------------------
+__global__ void mask_V_nan_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ d_maskv_slot,
+    const int*             __restrict__ d_maskv_bus,
+    cuda_real_type nan_val,
+    int n_bus,
+    int n_entries);
+
+// ---------------------------------------------------------------------------
 // compute_residuals_kernel
 //
 // After the final SpMV + fill_F pass, computes ‖F‖∞ for each contingency

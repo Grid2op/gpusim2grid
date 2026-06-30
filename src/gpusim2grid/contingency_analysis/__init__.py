@@ -139,7 +139,7 @@ class ContingencyAnalysisSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None):
+                 device=None, handle_disconnected_grid=False):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -147,6 +147,7 @@ class ContingencyAnalysisSolver:
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
             _normalize_device(device))
+        self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -192,6 +193,18 @@ class ContingencyAnalysisSolver:
                 f"Choose from: {list(_STRATEGY_MAP)}")
         self._strategy = value
         self._s.strategy_type = _STRATEGY_MAP[value]
+
+    @property
+    def handle_disconnected_grid(self):
+        """bool: solve the largest connected component of a split grid (masking the
+        rest as NaN) instead of skipping the contingency. Contingencies that strand
+        the angle reference or a controller bus are still skipped. Incompatible with
+        the 'direct_base_case_factors' strategy. Takes effect on the next run()."""
+        return self._s.handle_disconnected_grid
+
+    @handle_disconnected_grid.setter
+    def handle_disconnected_grid(self, value):
+        self._s.handle_disconnected_grid = bool(value)
 
     @property
     def refactor_period(self):

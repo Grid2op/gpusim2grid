@@ -435,7 +435,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     const cudaComplexType* d_Sbus_for_NR = source_.d_Sbus_ptr(ctx);
     const int sbus_stride = BatchSource::sbus_stride(n_bus);
 
-    const NrIterBuffers buf {
+    NrIterBuffers buf {
         thrust::raw_pointer_cast(d_J_values_batch.data()),
         thrust::raw_pointer_cast(d_V_batch.data()),
         thrust::raw_pointer_cast(d_Ibus_batch.data()),
@@ -511,6 +511,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         thrust::raw_pointer_cast(d_vc_q_batch.data()),
     };
 
+    // handle_disconnected_grid: attach this chunk's mask slice (no-op for the
+    // injection sweep / when the mode is off). d_J_outer is the shared skeleton.
+    source_.fill_mask_buffers(buf, chunk, thrust::raw_pointer_cast(base.d_J_outer.data()));
+
     // Re-initialise the per-slot feature state for this chunk (slack_absorbed =
     // Re(Σ Sbus_slot); controller reactive injection = 0). The NR loop runs over
     // the full padded batch, so initialise batch_size_ slots.
@@ -561,6 +565,9 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             // Augmented-feature contributions to the final residual (slack /
             // HVDC mismatch + VC bordered custom rows), using the converged state.
             nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
+            // handle_disconnected_grid: zero the masked rows of F so the frozen
+            // component does not pollute the ‖F‖∞ residual of the solved one.
+            nr_apply_bus_mask(buf, nnz_J, dim_J, actual_batch, cs);
 
             compute_residuals_kernel<<<
                 actual_batch, BS,
@@ -579,6 +586,9 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // -------------------------------------------------------------------------
     timer.start();
     if (actual_batch > 0) {
+        // handle_disconnected_grid: report the frozen (masked) buses' voltages as
+        // NaN before the result store (no-op when the mode is off).
+        nr_mask_v_nan(buf, n_bus, cs);
         if (d_result_map) {
             const int total = actual_batch * n_bus;
             scatter_V_results_kernel<<<(total + BS - 1) / BS, BS, 0, cs>>>(

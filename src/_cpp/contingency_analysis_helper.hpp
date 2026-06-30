@@ -87,6 +87,16 @@ struct Triplet {
 struct Contingency {
     std::vector<Triplet> triplets;
     bool disconnected = false;
+
+    // handle_disconnected_grid mode (see compute_component_masks):
+    //   masked_buses — solver bus ids OUTSIDE the largest connected component
+    //                  of the patched graph (empty when the grid stays connected).
+    //                  Those buses are frozen; the largest component is solved.
+    //   In this mode `disconnected` is reused to mean "still skipped": it is set
+    //   only when the contingency strands the angle reference or a controller
+    //   bus (an island we cannot solve), so it is compacted out → NaN, exactly
+    //   like a fully-disconnecting contingency in the legacy path.
+    std::vector<int> masked_buses;
 };
 
 // ---------------------------------------------------------------------------
@@ -249,5 +259,76 @@ void build_blockdiag_csr(
 void check_connectivity(
     std::vector<Contingency>&                                          contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&      Ybus_rm);
+
+// ---------------------------------------------------------------------------
+// MaskRowInfo
+//   Per-bus identity-masking metadata, indexed by solver bus id. Built once
+//   from the base AcPfNrState (p/q rows + the diagonal nnz positions in the J
+//   skeleton). Used by build_mask_entries to emit identity-row entries.
+//   *_row < 0 ⇒ the bus owns no such equation (e.g. PV bus has no Q row).
+// ---------------------------------------------------------------------------
+struct MaskRowInfo {
+    std::vector<int> p_row;      // P equation row of each bus (-1 if none)
+    std::vector<int> q_row;      // Q equation row of each bus (-1 if none)
+    std::vector<int> p_diag_pos; // nnz pos of (p_row, theta_col) (-1 if none)
+    std::vector<int> q_diag_pos; // nnz pos of (q_row, vm_col)   (-1 if none)
+};
+
+// ---------------------------------------------------------------------------
+// MaskConfig
+//   Everything ContingencyBatch needs to run the handle_disconnected_grid
+//   preprocessing: which buses anchor the angle reference / host controllers
+//   (skip-if-stranded), and the per-bus identity-row metadata. Built once by
+//   the session from the base AcPfNrState + ledger. A null MaskConfig selects
+//   the legacy check_connectivity (skip-if-split) path.
+// ---------------------------------------------------------------------------
+struct MaskConfig {
+    std::vector<char> is_reference_bus;   // size n_bus
+    std::vector<char> is_controller_bus;  // size n_bus
+    MaskRowInfo       row_info;
+};
+
+// ---------------------------------------------------------------------------
+// compute_component_masks  (handle_disconnected_grid mode)
+//
+// For each contingency, labels the connected components of the patched Ybus
+// graph (same removed-edge logic as check_connectivity), keeps the largest by
+// bus count, and records every other bus in Contingency::masked_buses. A
+// contingency is marked `disconnected` (→ skipped/NaN) when its masked set
+// contains the angle reference (is_reference_bus) or any controller bus
+// (is_controller_bus: HVDC/SVC/remote-gen) — those islands cannot be solved on
+// the GPU's fixed structure. Connected contingencies get masked_buses == empty.
+//
+// is_reference_bus / is_controller_bus : size n_bus, 1 ⇒ bus is of that kind.
+// ---------------------------------------------------------------------------
+void compute_component_masks(
+    std::vector<Contingency>&                                     contingencies,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
+    const std::vector<char>&                                      is_reference_bus,
+    const std::vector<char>&                                      is_controller_bus);
+
+// ---------------------------------------------------------------------------
+// build_mask_entries  (handle_disconnected_grid mode)
+//
+// Converts the per-contingency masked bus sets into flat, chunk-sliced device
+// upload arrays, mirroring build_flat_patches' layout (chunk-relative slot ids,
+// one ChunkPatchRange per chunk). Two parallel streams are produced:
+//   • identity-row entries (slot, row, diag_pos) — one per masked P/Q row;
+//   • masked-voltage entries (slot, bus)         — one per masked bus (NaN out).
+// active_to_orig / batch_size must match the values used by build_flat_patches
+// so the per-chunk ranges line up with the contingency batch chunks.
+// ---------------------------------------------------------------------------
+void build_mask_entries(
+    const std::vector<Contingency>& contingencies,
+    const std::vector<int>&         active_to_orig,
+    int                             batch_size,
+    const MaskRowInfo&              row_info,
+    std::vector<int>&               h_mask_slot,
+    std::vector<int>&               h_mask_row,
+    std::vector<int>&               h_mask_diag,
+    std::vector<ChunkPatchRange>&   mask_row_ranges,
+    std::vector<int>&               h_maskv_slot,
+    std::vector<int>&               h_maskv_bus,
+    std::vector<ChunkPatchRange>&   maskv_ranges);
 
 #endif // CONTINGENCY_ANALYSIS_HELPER_HPP
