@@ -260,6 +260,64 @@ __global__ void update_slack_absorbed_kernel(
     int dim_J,
     int actual_batch);
 
+// ===========================================================================
+// HVDC angle-droop ("AC emulation") — Phase 3
+//
+// The extension claims no row/column. Per connected droop line it adds, on the
+// GPU (mirroring lightsim2grid's Hvdc extension):
+//   • hvdc_adjust_mismatch_kernel : the theta-dependent droop flows leaving each
+//       end bus into the HVDC  ⇒  d_F[p_row(end)] -= p_flow
+//   • hvdc_fill_feature_kernel    : the (piecewise-constant) dP/dtheta slopes
+//       ADDED onto the four (p_row(end), theta_col(end)) J positions.
+//
+// Two lines may share an end bus / J position, so both kernels use atomicAdd.
+// Because the feature slopes ACCUMULATE onto (and some HVDC-only positions are
+// NOT covered by) the dS fill, d_J_values must be zeroed before fill_J whenever
+// HVDC is active (NrIterBuffers::zero_J_before_fill).
+//
+// Per-line arrays (length n_hvdc, shared single-system); the regime `status` is
+// frozen (0 linear, +1 sat 1→2, -1 sat 2→1). h11/h12/h21/h22 and prow1/prow2 are
+// -1 when the corresponding row/column does not exist (a slack end).
+// ===========================================================================
+__global__ void hvdc_adjust_mismatch_kernel(
+          cuda_real_type*  __restrict__ d_F,
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ bus1,
+    const int*             __restrict__ bus2,
+    const int*             __restrict__ status,
+    const cuda_real_type*  __restrict__ p0,
+    const cuda_real_type*  __restrict__ k,
+    const cuda_real_type*  __restrict__ lf1,
+    const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
+    const cuda_real_type*  __restrict__ pmax12,
+    const cuda_real_type*  __restrict__ pmax21,
+    const int*             __restrict__ prow1,
+    const int*             __restrict__ prow2,
+    int n_hvdc,
+    int n_bus,
+    int dim_J,
+    int actual_batch);
+
+__global__ void hvdc_fill_feature_kernel(
+          cuda_real_type*  __restrict__ d_J_values,
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ bus1,
+    const int*             __restrict__ bus2,
+    const int*             __restrict__ status,
+    const cuda_real_type*  __restrict__ p0,
+    const cuda_real_type*  __restrict__ k,
+    const cuda_real_type*  __restrict__ lf1,
+    const cuda_real_type*  __restrict__ lf2,
+    const int*             __restrict__ h11,
+    const int*             __restrict__ h12,
+    const int*             __restrict__ h21,
+    const int*             __restrict__ h22,
+    int n_hvdc,
+    int n_bus,
+    int nnz_J,
+    int actual_batch);
+
 // ---------------------------------------------------------------------------
 // compute_residuals_kernel
 //

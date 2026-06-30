@@ -115,6 +115,32 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
         ls2g::RealVect sw = grid.get_slack_weights_solver();
         ld.slack_weights.assign(sw.data(), sw.data() + sw.size());
     }
+
+    // HVDC angle-droop: pull the connected droop lines (solver numbering, pu) via
+    // the same path the NRSystem's Hvdc extension uses. Empty when none.
+    {
+        ls2g::HvdcDroopSolverData h;
+        ls2g::fill_hvdc_droop_data_from_grid(&grid, h, /*ac=*/true);
+        const int nh = h.size();
+        auto to_iv = [](const Eigen::VectorXi& v) {
+            return std::vector<int>(v.data(), v.data() + v.size());
+        };
+        auto to_dv = [](const ls2g::RealVect& v) {
+            return std::vector<double>(v.data(), v.data() + v.size());
+        };
+        if (nh > 0) {
+            ld.hvdc_bus1   = to_iv(h.bus1);
+            ld.hvdc_bus2   = to_iv(h.bus2);
+            ld.hvdc_status = to_iv(h.status);
+            ld.hvdc_p0     = to_dv(h.p0);
+            ld.hvdc_k      = to_dv(h.k);
+            ld.hvdc_lf1    = to_dv(h.lf1);
+            ld.hvdc_lf2    = to_dv(h.lf2);
+            ld.hvdc_r      = to_dv(h.r);
+            ld.hvdc_pmax12 = to_dv(h.pmax12);
+            ld.hvdc_pmax21 = to_dv(h.pmax21);
+        }
+    }
     return ld;
 }
 

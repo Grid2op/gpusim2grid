@@ -419,6 +419,56 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_slack_absorbed, h_sa.data(), 1, cs);
     }
 
+    // HVDC angle-droop: per-line raw data + the end P rows / theta-col feature J
+    // positions derived from the ledger maps + skeleton. (mirrors Hvdc::register_in
+    // / declare_feature_entries; an end at a slack drops the missing row/col.)
+    if (ledger != nullptr && ledger->has_hvdc()) {
+        n_hvdc = ledger->n_hvdc();
+        auto to_real = [](const std::vector<double>& v) {
+            return std::vector<cuda_real_type>(v.begin(), v.end());
+        };
+        upload_h2d(d_hvdc_bus1,   ledger->hvdc_bus1.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_bus2,   ledger->hvdc_bus2.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_status, ledger->hvdc_status.data(), n_hvdc, cs);
+        std::vector<cuda_real_type> p0=to_real(ledger->hvdc_p0), kk=to_real(ledger->hvdc_k),
+            lf1=to_real(ledger->hvdc_lf1), lf2=to_real(ledger->hvdc_lf2),
+            rr=to_real(ledger->hvdc_r), pm12=to_real(ledger->hvdc_pmax12),
+            pm21=to_real(ledger->hvdc_pmax21);
+        upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
+        upload_h2d(d_hvdc_lf2,    lf2.data(),  n_hvdc, cs);
+        upload_h2d(d_hvdc_r,      rr.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_pmax12, pm12.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_pmax21, pm21.data(), n_hvdc, cs);
+
+        auto find_J_pos = [&](int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* in = J_inner_h.data();
+            auto it = std::lower_bound(in + s, in + e, col);
+            return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
+        };
+        std::vector<int> prow1(n_hvdc), prow2(n_hvdc),
+                         h11(n_hvdc), h12(n_hvdc), h21(n_hvdc), h22(n_hvdc);
+        for (int e = 0; e < n_hvdc; ++e) {
+            const int b1 = ledger->hvdc_bus1[e], b2 = ledger->hvdc_bus2[e];
+            const int pr1 = ledger->p_row_of_bus[b1], pr2 = ledger->p_row_of_bus[b2];
+            const int tc1 = ledger->theta_col_of_bus[b1], tc2 = ledger->theta_col_of_bus[b2];
+            prow1[e] = pr1; prow2[e] = pr2;
+            h11[e] = find_J_pos(pr1, tc1);
+            h12[e] = find_J_pos(pr1, tc2);
+            h21[e] = find_J_pos(pr2, tc1);
+            h22[e] = find_J_pos(pr2, tc2);
+        }
+        upload_h2d(d_hvdc_prow1, prow1.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_prow2, prow2.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h11, h11.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h12, h12.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h21, h21.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h22, h22.data(), n_hvdc, cs);
+    }
+
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)
     {
         thrust::host_vector<cudaComplexType> h_yv(nnz_Y);
@@ -582,6 +632,25 @@ AcPfNrState::AcPfNrState(
         thrust::raw_pointer_cast(d_slack_w.data()),
         thrust::raw_pointer_cast(d_slack_feat_pos.data()),
         thrust::raw_pointer_cast(d_slack_absorbed.data()),
+        // HVDC angle-droop (inactive when n_hvdc==0; kernels + J-zeroing skipped)
+        n_hvdc,
+        /*zero_J_before_fill=*/(n_hvdc > 0),
+        thrust::raw_pointer_cast(d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(d_hvdc_status.data()),
+        thrust::raw_pointer_cast(d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(d_hvdc_k.data()),
+        thrust::raw_pointer_cast(d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(d_hvdc_r.data()),
+        thrust::raw_pointer_cast(d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(d_hvdc_pmax21.data()),
+        thrust::raw_pointer_cast(d_hvdc_prow1.data()),
+        thrust::raw_pointer_cast(d_hvdc_prow2.data()),
+        thrust::raw_pointer_cast(d_hvdc_h11.data()),
+        thrust::raw_pointer_cast(d_hvdc_h12.data()),
+        thrust::raw_pointer_cast(d_hvdc_h21.data()),
+        thrust::raw_pointer_cast(d_hvdc_h22.data()),
     };
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs

@@ -10,6 +10,27 @@
 
 static constexpr int BS = 256;   // block size for all kernels in this file
 
+// Portable real atomic add (the device default arch may predate hardware double
+// atomicAdd). Native atomicAdd for float and for double on SM >= 6.0; a 64-bit
+// CAS fallback for double on older targets. Used by the HVDC droop kernels,
+// whose contributions can overlap onto shared J positions / mismatch rows.
+__device__ __forceinline__ void atomic_add_real(float* addr, float val) {
+    atomicAdd(addr, val);
+}
+__device__ __forceinline__ void atomic_add_real(double* addr, double val) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+    atomicAdd(addr, val);
+#else
+    unsigned long long int* p = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = *p, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(p, assumed,
+            __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+#endif
+}
+
 // =============================================================================
 // compute_branch_flows_kernel
 // =============================================================================
@@ -383,6 +404,131 @@ __global__ void update_slack_absorbed_kernel(
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= actual_batch) return;
     d_slack_absorbed[b] += d_dx[b * dim_J + slack_col];
+}
+
+// =============================================================================
+// HVDC angle-droop kernels (Phase 3)
+// =============================================================================
+
+// Active power received by the non-controller side (HvdcDroopSolverData::recv_pu)
+__device__ __forceinline__ cuda_real_type hvdc_recv_pu(
+    cuda_real_type p_ctrl_abs, bool side1_ctrl,
+    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r)
+{
+    const cuda_real_type lf_ctrl = side1_ctrl ? lf1 : lf2;
+    const cuda_real_type lf_recv = side1_ctrl ? lf2 : lf1;
+    const cuda_real_type line_in = (static_cast<cuda_real_type>(1.) - lf_ctrl) * p_ctrl_abs;
+    return (static_cast<cuda_real_type>(1.) - lf_recv) * (line_in - r * line_in * line_in);
+}
+
+// The two active flows leaving the AC buses into the HVDC (HvdcDroopSolverData::flows_pu)
+__device__ __forceinline__ void hvdc_flows_pu(
+    int st, cuda_real_type raw,
+    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r,
+    cuda_real_type pmax12, cuda_real_type pmax21,
+    cuda_real_type& p1_flow, cuda_real_type& p2_flow)
+{
+    if (st == 0) {
+        if (raw >= static_cast<cuda_real_type>(0.)) {
+            p1_flow =  raw;
+            p2_flow = -hvdc_recv_pu(raw, true, lf1, lf2, r);
+        } else {
+            p1_flow = -hvdc_recv_pu(-raw, false, lf1, lf2, r);
+            p2_flow = -raw;
+        }
+    } else if (st > 0) {
+        p1_flow =  pmax12;
+        p2_flow = -hvdc_recv_pu(pmax12, true, lf1, lf2, r);
+    } else {
+        p1_flow = -hvdc_recv_pu(pmax21, false, lf1, lf2, r);
+        p2_flow =  pmax21;
+    }
+}
+
+__global__ void hvdc_adjust_mismatch_kernel(
+          cuda_real_type*  __restrict__ d_F,
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ bus1,
+    const int*             __restrict__ bus2,
+    const int*             __restrict__ status,
+    const cuda_real_type*  __restrict__ p0,
+    const cuda_real_type*  __restrict__ k,
+    const cuda_real_type*  __restrict__ lf1,
+    const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
+    const cuda_real_type*  __restrict__ pmax12,
+    const cuda_real_type*  __restrict__ pmax21,
+    const int*             __restrict__ prow1,
+    const int*             __restrict__ prow2,
+    int n_hvdc,
+    int n_bus,
+    int dim_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_hvdc;
+    const int e   = tid % n_hvdc;
+    if (b >= actual_batch) return;
+
+    const cudaComplexType V1 = d_V[b * n_bus + bus1[e]];
+    const cudaComplexType V2 = d_V[b * n_bus + bus2[e]];
+    const cuda_real_type th1 = CudaFunHelper::my_atan2(
+        CudaFunHelper::my_cuCimag(V1), CudaFunHelper::my_cuCreal(V1));
+    const cuda_real_type th2 = CudaFunHelper::my_atan2(
+        CudaFunHelper::my_cuCimag(V2), CudaFunHelper::my_cuCreal(V2));
+    const cuda_real_type raw = p0[e] + k[e] * (th1 - th2);
+
+    cuda_real_type p1_flow, p2_flow;
+    hvdc_flows_pu(status[e], raw, lf1[e], lf2[e], r[e], pmax12[e], pmax21[e],
+                  p1_flow, p2_flow);
+
+    // mis(bus) += p_flow  ⇒  residual d_F[p_row] -= p_flow
+    if (prow1[e] >= 0) atomic_add_real(&d_F[b * dim_J + prow1[e]], -p1_flow);
+    if (prow2[e] >= 0) atomic_add_real(&d_F[b * dim_J + prow2[e]], -p2_flow);
+}
+
+__global__ void hvdc_fill_feature_kernel(
+          cuda_real_type*  __restrict__ d_J_values,
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ bus1,
+    const int*             __restrict__ bus2,
+    const int*             __restrict__ status,
+    const cuda_real_type*  __restrict__ p0,
+    const cuda_real_type*  __restrict__ k,
+    const cuda_real_type*  __restrict__ lf1,
+    const cuda_real_type*  __restrict__ lf2,
+    const int*             __restrict__ h11,
+    const int*             __restrict__ h12,
+    const int*             __restrict__ h21,
+    const int*             __restrict__ h22,
+    int n_hvdc,
+    int n_bus,
+    int nnz_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_hvdc;
+    const int e   = tid % n_hvdc;
+    if (b >= actual_batch) return;
+    if (status[e] != 0) return;   // saturated: constant injection, zero slopes
+
+    const cudaComplexType V1 = d_V[b * n_bus + bus1[e]];
+    const cudaComplexType V2 = d_V[b * n_bus + bus2[e]];
+    const cuda_real_type th1 = CudaFunHelper::my_atan2(
+        CudaFunHelper::my_cuCimag(V1), CudaFunHelper::my_cuCreal(V1));
+    const cuda_real_type th2 = CudaFunHelper::my_atan2(
+        CudaFunHelper::my_cuCimag(V2), CudaFunHelper::my_cuCreal(V2));
+    const cuda_real_type raw = p0[e] + k[e] * (th1 - th2);
+    const cuda_real_type loss_mult =
+        (static_cast<cuda_real_type>(1.) - lf1[e]) * (static_cast<cuda_real_type>(1.) - lf2[e]);
+    // dp1 = dp_side1/dtheta1, dp2 = dp_side2/dtheta1; d/dtheta2 = -d/dtheta1
+    const cuda_real_type dp1 = (raw >= static_cast<cuda_real_type>(0.)) ? k[e] : k[e] * loss_mult;
+    const cuda_real_type dp2 = (raw <  static_cast<cuda_real_type>(0.)) ? -k[e] : -k[e] * loss_mult;
+
+    if (h11[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h11[e]],  dp1);
+    if (h12[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h12[e]], -dp1);
+    if (h21[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h21[e]],  dp2);
+    if (h22[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h22[e]], -dp2);
 }
 
 // =============================================================================

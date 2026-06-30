@@ -97,6 +97,28 @@ struct NrIterBuffers {
     const cuda_real_type*  d_slack_w        = nullptr;   // [n_slack] slack weight
     const int*             d_slack_feat_pos = nullptr;   // [n_slack] J pos of (p_row, slack_col)
     cuda_real_type*        d_slack_absorbed = nullptr;   // [actual_batch] running state
+
+    // ---- HVDC angle-droop — inactive when n_hvdc == 0 -----------------------
+    // When active the J value array is zeroed before each fill_J (the droop
+    // slopes accumulate onto / beside the dS entries), hence zero_J_before_fill.
+    int                    n_hvdc      = 0;
+    bool                   zero_J_before_fill = false;
+    const int*             d_hvdc_bus1  = nullptr;
+    const int*             d_hvdc_bus2  = nullptr;
+    const int*             d_hvdc_status= nullptr;
+    const cuda_real_type*  d_hvdc_p0    = nullptr;
+    const cuda_real_type*  d_hvdc_k     = nullptr;
+    const cuda_real_type*  d_hvdc_lf1   = nullptr;
+    const cuda_real_type*  d_hvdc_lf2   = nullptr;
+    const cuda_real_type*  d_hvdc_r     = nullptr;
+    const cuda_real_type*  d_hvdc_pmax12= nullptr;
+    const cuda_real_type*  d_hvdc_pmax21= nullptr;
+    const int*             d_hvdc_prow1 = nullptr;
+    const int*             d_hvdc_prow2 = nullptr;
+    const int*             d_hvdc_h11   = nullptr;
+    const int*             d_hvdc_h12   = nullptr;
+    const int*             d_hvdc_h21   = nullptr;
+    const int*             d_hvdc_h22   = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -163,10 +185,21 @@ inline void nr_iter_step(
         adjust_slack_mismatch_kernel<<<(actual_batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_F, buf.d_slack_absorbed, buf.d_slack_prow, buf.d_slack_w,
             buf.n_slack, dim_J, actual_batch);
+    if (buf.n_hvdc > 0)
+        hvdc_adjust_mismatch_kernel<<<(actual_batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
+            buf.d_hvdc_pmax12, buf.d_hvdc_pmax21, buf.d_hvdc_prow1, buf.d_hvdc_prow2,
+            buf.n_hvdc, n_bus, dim_J, actual_batch);
     t.t_fill_F += timer.stop_ms();
 
-    // ③  Fill J values; notify cuDSS that the values pointer changed
+    // ③  Fill J values; notify cuDSS that the values pointer changed.
+    //     When an additive feature (HVDC droop) is active, J must be zeroed first
+    //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
+    if (buf.zero_J_before_fill)
+        cudaMemsetAsync(buf.d_J_values, 0,
+                        static_cast<size_t>(actual_batch) * nnz_J * sizeof(cuda_real_type), cs);
     fill_J_kernel<<<(actual_batch * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
         buf.d_J_values, buf.d_V, buf.d_Ibus,
         buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
@@ -176,6 +209,12 @@ inline void nr_iter_step(
         fill_slack_feature_kernel<<<(actual_batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w,
             buf.n_slack, nnz_J, actual_batch);
+    if (buf.n_hvdc > 0)
+        hvdc_fill_feature_kernel<<<(actual_batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
+            buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
+            buf.n_hvdc, n_bus, nnz_J, actual_batch);
     dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 

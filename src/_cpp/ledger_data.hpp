@@ -49,6 +49,19 @@ struct LedgerData {
 
     bool has_multislack() const { return slack_col >= 0; }
     int  nnz_J()          const { return static_cast<int>(J_inner.size()); }
+
+    // ---- HVDC angle-droop ("AC emulation") — optional ------------------------
+    // Per CONNECTED droop-enabled HVDC line, in solver bus numbering and per-unit
+    // (HvdcDroopSolverData read off the grid via fill_hvdc_droop_data_from_grid).
+    // status is the frozen saturation regime (0 linear, +1 sat 1→2, -1 sat 2→1).
+    // The extension claims no row/column; AcPfNrState derives the end P rows /
+    // theta columns / feature J positions from the ledger maps + skeleton.
+    std::vector<int>    hvdc_bus1, hvdc_bus2, hvdc_status;
+    std::vector<double> hvdc_p0, hvdc_k, hvdc_lf1, hvdc_lf2, hvdc_r,
+                        hvdc_pmax12, hvdc_pmax21;
+
+    int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
+    bool has_hvdc()     const { return !hvdc_bus1.empty(); }
 };
 
 #endif  // LEDGER_DATA_HPP
