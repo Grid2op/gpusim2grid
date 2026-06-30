@@ -38,6 +38,7 @@ struct LedgerData {
     std::vector<int> q_row_of_bus;
     std::vector<int> theta_col_of_bus;
     std::vector<int> vm_col_of_bus;
+    std::vector<int> q_col_of_bus;     // controller reactive-unknown columns (VoltageControl)
 
     // ---- MultiSlack (distributed slack in the Jacobian) — optional -----------
     // slack_col >= 0 enables the extension. slack_weights has size n_bus, sums to
@@ -62,6 +63,23 @@ struct LedgerData {
 
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }
+
+    // ---- VoltageControl (remote gen + SVC) — optional ------------------------
+    // Bordered formulation (VoltageControlSolverData, solver numbering, pu). Per
+    // group of N controllers regulating reg_bus at v_set: N q-unknown columns,
+    // 1 voltage-constraint custom row, N-1 reactive-sharing custom rows. Only the
+    // physics is carried here; AcPfNrState reconstructs the claimed columns
+    // (q_col/vm_col from the ledger maps) and the custom rows (the last
+    // n_controllers rows, allocated v_row then share_rows per group) + feature
+    // J positions. kind: 0 = GEN, 1 = SVC (sloped).
+    std::vector<int>    vc_bus, vc_kind, vc_group;       // per controller
+    std::vector<double> vc_slope, vc_weight;             // per controller
+    std::vector<int>    vc_reg_bus, vc_grp_start, vc_grp_count;  // per group
+    std::vector<double> vc_v_set;                        // per group
+
+    int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
+    int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }
+    bool has_voltage_control() const { return !vc_bus.empty(); }
 };
 
 #endif  // LEDGER_DATA_HPP

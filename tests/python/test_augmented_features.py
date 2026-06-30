@@ -126,6 +126,75 @@ def test_acpf_gpu_hvdc_droop_matches(solver_atol):
     np.testing.assert_allclose(V_gpu, V_ref, atol=10 * solver_atol)
 
 
+def _solve_with_fallback(model, nb_bus):
+    """Solve with NR_KLU; fall back to NRSing_SparseLU if a flat start diverges
+    (NR_KLU can struggle to start an SVC from a flat profile)."""
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+    model.change_algorithm(AlgorithmType.NR_KLU)
+    V = model.ac_pf(np.ones(nb_bus, dtype=complex), 40, 1e-11)
+    if V.shape[0] == 0:
+        model.tell_solver_need_reset()
+        model.change_algorithm(AlgorithmType.NRSing_SparseLU)
+        V = model.ac_pf(np.ones(nb_bus, dtype=complex), 40, 1e-11)
+    assert V.shape[0] > 0, "lightsim2grid diverged"
+
+
+@requires_gpu
+@needs_bridge
+def test_acpf_gpu_remote_gen_voltage_control_matches(solver_atol):
+    """Remote-regulating generator (bordered VoltageControl): gen on bus 7
+    regulating remote bus 9. The augmented J gains a q-column + voltage row."""
+    from gpusim2grid import AcPfGPU
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.gridmodel import init_from_pandapower
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        model = init_from_pandapower(net)
+        if not hasattr(model, "set_gen_regulated_bus"):
+            pytest.skip("this lightsim2grid build has no set_gen_regulated_bus")
+        model.set_gen_regulated_bus(3, 9)   # gen 3 (bus 7) regulates bus 9
+        model.tell_solver_need_reset()
+        _solve_with_fallback(model, net.bus.shape[0])
+
+    n_pv = model.get_pv().shape[0]
+    n_pq = model.get_pq().shape[0]
+    V_ref = model.get_V_solver()
+    ac = AcPfGPU(model, max_iter=50, tol=1e-11)
+    assert ac.session.dim_J > n_pv + 2 * n_pq   # bordered columns/rows added
+    np.testing.assert_allclose(ac.solve(), V_ref, atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+@pytest.mark.parametrize("slope_pu,reg_bus", [(0.0, 9), (0.02, 9)])
+def test_acpf_gpu_svc_matches(solver_atol, slope_pu, reg_bus):
+    """Voltage-mode SVC (a sloped SVC exercises the (v_row, q_col)=slope feature)."""
+    from gpusim2grid import AcPfGPU
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.gridmodel import init_from_pandapower
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        model = init_from_pandapower(net)
+        if not hasattr(model, "init_svcs"):
+            pytest.skip("this lightsim2grid build has no init_svcs")
+        model.init_svcs([1], np.array([1.03]), np.array([0.0]), np.array([slope_pu]),
+                        np.array([-100.0]), np.array([100.0]),
+                        np.array([reg_bus], dtype=np.int32),
+                        np.array([10], dtype=np.int32))   # SVC on bus 10
+        model.tell_solver_need_reset()
+        _solve_with_fallback(model, net.bus.shape[0])
+
+    V_ref = model.get_V_solver()
+    ac = AcPfGPU(model, max_iter=50, tol=1e-11)
+    np.testing.assert_allclose(ac.solve(), V_ref, atol=10 * solver_atol)
+
+
 @requires_gpu
 @needs_bridge
 def test_acpf_gpu_distributed_slack_matches(solver_atol):

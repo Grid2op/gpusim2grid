@@ -130,6 +130,24 @@ struct AcPfNrState {
     thrust::device_vector<int>            d_hvdc_h11, d_hvdc_h12, d_hvdc_h21, d_hvdc_h22;  // feature J pos
 
     // -------------------------------------------------------------------------
+    // VoltageControl (remote gen + SVC) — n_vc_ctrl == 0 when inactive.
+    //   d_vc_q is the per-batch-slot running reactive injection (size n_vc_ctrl
+    //   for the base solve). The feature entries are flattened (pos, value) pairs
+    //   assigned via fill_slack_feature_kernel.
+    // -------------------------------------------------------------------------
+    int n_vc_ctrl = 0, n_vc_grp = 0, n_vc_share = 0, n_vc_feat = 0;
+    thrust::device_vector<int>            d_vc_qrow, d_vc_qcol;                 // per controller
+    thrust::device_vector<cuda_real_type> d_vc_slope;                          // per controller
+    thrust::device_vector<int>            d_vc_reg_bus, d_vc_vrow,
+                                          d_vc_grp_start, d_vc_grp_count;       // per group
+    thrust::device_vector<cuda_real_type> d_vc_vset;                           // per group
+    thrust::device_vector<int>            d_vc_sh_row, d_vc_sh_first, d_vc_sh_other;  // per sharing row
+    thrust::device_vector<cuda_real_type> d_vc_sh_wfirst, d_vc_sh_wother;      // per sharing row
+    thrust::device_vector<int>            d_vc_feat_pos;                        // flat feature J pos
+    thrust::device_vector<cuda_real_type> d_vc_feat_val;                       // flat feature value
+    thrust::device_vector<cuda_real_type> d_vc_q;                              // [n_vc_ctrl] running state
+
+    // -------------------------------------------------------------------------
     // Ybus CSR (device, complex cuda_real_type)
     // -------------------------------------------------------------------------
     thrust::device_vector<int>             d_Ybus_outer;   // size n_bus+1

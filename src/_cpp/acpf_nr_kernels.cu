@@ -532,6 +532,96 @@ __global__ void hvdc_fill_feature_kernel(
 }
 
 // =============================================================================
+// VoltageControl kernels (Phase 4)
+// =============================================================================
+__global__ void vc_adjust_mismatch_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,
+    const int*            __restrict__ d_vc_qrow,
+    int n_ctrl,
+    int dim_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_ctrl;
+    const int j   = tid % n_ctrl;
+    if (b >= actual_batch) return;
+    // mis(c.bus) -= i·Q_c  ⇒  residual d_F[q_row] += Q_c
+    atomic_add_real(&d_F[b * dim_J + d_vc_qrow[j]], d_vc_q[b * n_ctrl + j]);
+}
+
+__global__ void vc_vrow_kernel(
+          cuda_real_type*  __restrict__ d_F,
+    const cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_vc_q,
+    const cuda_real_type*  __restrict__ d_vc_slope,
+    const int*             __restrict__ d_vc_reg_bus,
+    const int*             __restrict__ d_vc_vrow,
+    const int*             __restrict__ d_vc_grp_start,
+    const int*             __restrict__ d_vc_grp_count,
+    const cuda_real_type*  __restrict__ d_vc_vset,
+    int n_grp,
+    int n_ctrl,
+    int n_bus,
+    int dim_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_grp;
+    const int g   = tid % n_grp;
+    if (b >= actual_batch) return;
+
+    const cudaComplexType Vr = d_V[b * n_bus + d_vc_reg_bus[g]];
+    const cuda_real_type vm  = CudaFunHelper::my_cuCabs(Vr);
+    cuda_real_type slope_term = static_cast<cuda_real_type>(0.);
+    const int first = d_vc_grp_start[g], cnt = d_vc_grp_count[g];
+    for (int off = 0; off < cnt; ++off) {
+        const int j = first + off;
+        slope_term += d_vc_slope[j] * d_vc_q[b * n_ctrl + j];
+    }
+    // F_v = Vm(reg) + Σ s_c·Q_c − v_set ;  residual d_F = −F_v (custom row: assign)
+    d_F[b * dim_J + d_vc_vrow[g]] = -(vm + slope_term - d_vc_vset[g]);
+}
+
+__global__ void vc_share_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,
+    const int*            __restrict__ d_sh_row,
+    const int*            __restrict__ d_sh_first,
+    const int*            __restrict__ d_sh_other,
+    const cuda_real_type* __restrict__ d_sh_wfirst,
+    const cuda_real_type* __restrict__ d_sh_wother,
+    int n_share,
+    int n_ctrl,
+    int dim_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_share;
+    const int s   = tid % n_share;
+    if (b >= actual_batch) return;
+    const cuda_real_type q_first = d_vc_q[b * n_ctrl + d_sh_first[s]];
+    const cuda_real_type q_other = d_vc_q[b * n_ctrl + d_sh_other[s]];
+    // F_k = w_1·Q_{k+1} − w_{k+1}·Q_1 ;  residual d_F = −F_k (custom row: assign)
+    d_F[b * dim_J + d_sh_row[s]] = -(d_sh_wfirst[s] * q_other - d_sh_wother[s] * q_first);
+}
+
+__global__ void vc_apply_step_kernel(
+          cuda_real_type* __restrict__ d_vc_q,
+    const cuda_real_type* __restrict__ d_dx,
+    const int*            __restrict__ d_vc_qcol,
+    int n_ctrl,
+    int dim_J,
+    int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / n_ctrl;
+    const int j   = tid % n_ctrl;
+    if (b >= actual_batch) return;
+    d_vc_q[b * n_ctrl + j] += d_dx[b * dim_J + d_vc_qcol[j]];
+}
+
+// =============================================================================
 // compute_residuals_kernel
 //
 // One block per contingency; threads in the block cooperate to find ‖F_b‖∞

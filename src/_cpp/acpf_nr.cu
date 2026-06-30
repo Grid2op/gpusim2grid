@@ -469,6 +469,101 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_hvdc_h22, h22.data(), n_hvdc, cs);
     }
 
+    // VoltageControl (remote gen + SVC), bordered formulation. The q columns and
+    // q/vm rows come from the ledger maps; the custom rows (1 voltage + N-1 sharing
+    // per group) are the LAST n_controllers rows, allocated v_row then share_rows
+    // per group (the only custom-row source, registered last). Feature entries are
+    // constant → flattened to (pos, value) pairs stamped each fill_J.
+    if (ledger != nullptr && ledger->has_voltage_control()) {
+        n_vc_ctrl  = ledger->vc_n_controllers();
+        n_vc_grp   = ledger->vc_n_groups();
+        n_vc_share = n_vc_ctrl - n_vc_grp;
+
+        auto find_J_pos = [&](int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* in = J_inner_h.data();
+            auto it = std::lower_bound(in + s, in + e, col);
+            return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
+        };
+
+        // per-controller q row / q col (from the ledger) and slope
+        std::vector<int> qrow(n_vc_ctrl), qcol(n_vc_ctrl);
+        std::vector<cuda_real_type> slope(n_vc_ctrl);
+        for (int j = 0; j < n_vc_ctrl; ++j) {
+            const int bus = ledger->vc_bus[j];
+            qrow[j] = ledger->q_row_of_bus[bus];
+            qcol[j] = ledger->q_col_of_bus[bus];
+            slope[j] = static_cast<cuda_real_type>(ledger->vc_slope[j]);
+        }
+
+        // reconstruct the custom rows: contiguous block [dim_J - n_vc_ctrl, dim_J),
+        // ordered per group (v_row, then count-1 sharing rows).
+        std::vector<int> vrow(n_vc_grp);
+        std::vector<std::vector<int> > share(n_vc_grp);
+        int cursor = dim_J - n_vc_ctrl;
+        for (int g = 0; g < n_vc_grp; ++g) {
+            vrow[g] = cursor++;
+            const int cnt = ledger->vc_grp_count[g];
+            for (int k = 0; k < cnt - 1; ++k) share[g].push_back(cursor++);
+        }
+
+        // per-group device arrays
+        std::vector<cuda_real_type> vset(n_vc_grp);
+        for (int g = 0; g < n_vc_grp; ++g) vset[g] = static_cast<cuda_real_type>(ledger->vc_v_set[g]);
+        upload_h2d(d_vc_qrow,      qrow.data(),                 n_vc_ctrl, cs);
+        upload_h2d(d_vc_qcol,      qcol.data(),                 n_vc_ctrl, cs);
+        upload_h2d(d_vc_slope,     slope.data(),                n_vc_ctrl, cs);
+        upload_h2d(d_vc_reg_bus,   ledger->vc_reg_bus.data(),   n_vc_grp,  cs);
+        upload_h2d(d_vc_vrow,      vrow.data(),                 n_vc_grp,  cs);
+        upload_h2d(d_vc_grp_start, ledger->vc_grp_start.data(), n_vc_grp,  cs);
+        upload_h2d(d_vc_grp_count, ledger->vc_grp_count.data(), n_vc_grp,  cs);
+        upload_h2d(d_vc_vset,      vset.data(),                 n_vc_grp,  cs);
+
+        // per-sharing-row device arrays + constant feature (pos, value) pairs
+        std::vector<int> sh_row, sh_first, sh_other;
+        std::vector<cuda_real_type> sh_wfirst, sh_wother;
+        std::vector<int> feat_pos;
+        std::vector<cuda_real_type> feat_val;
+        auto push_feat = [&](int pos, cuda_real_type val) {
+            if (pos >= 0) { feat_pos.push_back(pos); feat_val.push_back(val); }
+        };
+        for (int j = 0; j < n_vc_ctrl; ++j) {
+            push_feat(find_J_pos(qrow[j], qcol[j]), static_cast<cuda_real_type>(-1.));  // (q_row, q_col)
+            if (ledger->vc_kind[j] == 1)  // SVC slope coupling (v_row, q_col)
+                push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]), slope[j]);
+        }
+        for (int g = 0; g < n_vc_grp; ++g) {
+            const int vmcol = ledger->vm_col_of_bus[ledger->vc_reg_bus[g]];
+            push_feat(find_J_pos(vrow[g], vmcol), static_cast<cuda_real_type>(1.));      // (v_row, vm_col)
+            const int first = ledger->vc_grp_start[g];
+            const cuda_real_type w_first = static_cast<cuda_real_type>(ledger->vc_weight[first]);
+            for (int k = 0; k < ledger->vc_grp_count[g] - 1; ++k) {
+                const int other = first + (k + 1);
+                const cuda_real_type w_other = static_cast<cuda_real_type>(ledger->vc_weight[other]);
+                const int row = share[g][k];
+                sh_row.push_back(row); sh_first.push_back(first); sh_other.push_back(other);
+                sh_wfirst.push_back(w_first); sh_wother.push_back(w_other);
+                push_feat(find_J_pos(row, qcol[other]), w_first);   // (share_row, q_col_{k+1})
+                push_feat(find_J_pos(row, qcol[first]), -w_other);  // (share_row, q_col_1)
+            }
+        }
+        n_vc_feat = static_cast<int>(feat_pos.size());
+        if (n_vc_share > 0) {
+            upload_h2d(d_vc_sh_row,    sh_row.data(),    n_vc_share, cs);
+            upload_h2d(d_vc_sh_first,  sh_first.data(),  n_vc_share, cs);
+            upload_h2d(d_vc_sh_other,  sh_other.data(),  n_vc_share, cs);
+            upload_h2d(d_vc_sh_wfirst, sh_wfirst.data(), n_vc_share, cs);
+            upload_h2d(d_vc_sh_wother, sh_wother.data(), n_vc_share, cs);
+        }
+        upload_h2d(d_vc_feat_pos, feat_pos.data(), n_vc_feat, cs);
+        upload_h2d(d_vc_feat_val, feat_val.data(), n_vc_feat, cs);
+
+        // running reactive injection per controller, reset to 0 each solve
+        d_vc_q.resize(n_vc_ctrl);
+        zero_d(d_vc_q, cs);
+    }
+
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)
     {
         thrust::host_vector<cudaComplexType> h_yv(nnz_Y);
@@ -651,6 +746,27 @@ AcPfNrState::AcPfNrState(
         thrust::raw_pointer_cast(d_hvdc_h12.data()),
         thrust::raw_pointer_cast(d_hvdc_h21.data()),
         thrust::raw_pointer_cast(d_hvdc_h22.data()),
+        // VoltageControl (inactive when n_vc_ctrl==0; kernels skipped)
+        n_vc_ctrl,
+        n_vc_grp,
+        n_vc_share,
+        n_vc_feat,
+        thrust::raw_pointer_cast(d_vc_qrow.data()),
+        thrust::raw_pointer_cast(d_vc_qcol.data()),
+        thrust::raw_pointer_cast(d_vc_slope.data()),
+        thrust::raw_pointer_cast(d_vc_reg_bus.data()),
+        thrust::raw_pointer_cast(d_vc_vrow.data()),
+        thrust::raw_pointer_cast(d_vc_grp_start.data()),
+        thrust::raw_pointer_cast(d_vc_grp_count.data()),
+        thrust::raw_pointer_cast(d_vc_vset.data()),
+        thrust::raw_pointer_cast(d_vc_sh_row.data()),
+        thrust::raw_pointer_cast(d_vc_sh_first.data()),
+        thrust::raw_pointer_cast(d_vc_sh_other.data()),
+        thrust::raw_pointer_cast(d_vc_sh_wfirst.data()),
+        thrust::raw_pointer_cast(d_vc_sh_wother.data()),
+        thrust::raw_pointer_cast(d_vc_feat_pos.data()),
+        thrust::raw_pointer_cast(d_vc_feat_val.data()),
+        thrust::raw_pointer_cast(d_vc_q.data()),
     };
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs

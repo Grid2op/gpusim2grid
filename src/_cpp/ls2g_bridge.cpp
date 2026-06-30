@@ -107,6 +107,7 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
     ld.q_row_of_bus     = to_int_vector(grid.get_q_to_J_row_solver());
     ld.theta_col_of_bus = to_int_vector(grid.get_theta_to_J_col_solver());
     ld.vm_col_of_bus    = to_int_vector(grid.get_vm_to_J_col_solver());
+    ld.q_col_of_bus     = to_int_vector(grid.get_q_to_J_col_solver());
     ld.n_bus            = static_cast<int>(ld.p_row_of_bus.size());
 
     // MultiSlack: slack_col (-1 when distributed slack inactive) + slack weights.
@@ -139,6 +140,30 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
             ld.hvdc_r      = to_dv(h.r);
             ld.hvdc_pmax12 = to_dv(h.pmax12);
             ld.hvdc_pmax21 = to_dv(h.pmax21);
+        }
+    }
+
+    // VoltageControl (remote-regulating generators + voltage-mode SVCs): pull the
+    // bordered-block physics (solver numbering, pu). Empty when none active.
+    {
+        ls2g::VoltageControlSolverData v;
+        grid.fill_voltage_control_solver_data(v, /*ac=*/true);
+        auto to_iv = [](const Eigen::VectorXi& a) {
+            return std::vector<int>(a.data(), a.data() + a.size());
+        };
+        auto to_dv = [](const ls2g::RealVect& a) {
+            return std::vector<double>(a.data(), a.data() + a.size());
+        };
+        if (v.n_controllers() > 0) {
+            ld.vc_bus       = to_iv(v.bus);
+            ld.vc_kind      = to_iv(v.kind);
+            ld.vc_group     = to_iv(v.group);
+            ld.vc_slope     = to_dv(v.slope);
+            ld.vc_weight    = to_dv(v.weight);
+            ld.vc_reg_bus   = to_iv(v.reg_bus);
+            ld.vc_grp_start = to_iv(v.grp_start);
+            ld.vc_grp_count = to_iv(v.grp_count);
+            ld.vc_v_set     = to_dv(v.v_set);
         }
     }
     return ld;

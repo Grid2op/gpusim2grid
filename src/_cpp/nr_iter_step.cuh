@@ -119,6 +119,28 @@ struct NrIterBuffers {
     const int*             d_hvdc_h12   = nullptr;
     const int*             d_hvdc_h21   = nullptr;
     const int*             d_hvdc_h22   = nullptr;
+
+    // ---- VoltageControl (remote gen + SVC) — inactive when n_vc_ctrl == 0 ----
+    int                    n_vc_ctrl   = 0;
+    int                    n_vc_grp    = 0;
+    int                    n_vc_share  = 0;
+    int                    n_vc_feat   = 0;
+    const int*             d_vc_qrow      = nullptr;
+    const int*             d_vc_qcol      = nullptr;
+    const cuda_real_type*  d_vc_slope     = nullptr;
+    const int*             d_vc_reg_bus   = nullptr;
+    const int*             d_vc_vrow      = nullptr;
+    const int*             d_vc_grp_start = nullptr;
+    const int*             d_vc_grp_count = nullptr;
+    const cuda_real_type*  d_vc_vset      = nullptr;
+    const int*             d_vc_sh_row    = nullptr;
+    const int*             d_vc_sh_first  = nullptr;
+    const int*             d_vc_sh_other  = nullptr;
+    const cuda_real_type*  d_vc_sh_wfirst = nullptr;
+    const cuda_real_type*  d_vc_sh_wother = nullptr;
+    const int*             d_vc_feat_pos  = nullptr;
+    const cuda_real_type*  d_vc_feat_val  = nullptr;
+    cuda_real_type*        d_vc_q         = nullptr;   // [actual_batch * n_vc_ctrl] running state
 };
 
 // -----------------------------------------------------------------------------
@@ -191,6 +213,19 @@ inline void nr_iter_step(
             buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_pmax12, buf.d_hvdc_pmax21, buf.d_hvdc_prow1, buf.d_hvdc_prow2,
             buf.n_hvdc, n_bus, dim_J, actual_batch);
+    if (buf.n_vc_ctrl > 0) {
+        vc_adjust_mismatch_kernel<<<(actual_batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, actual_batch);
+        vc_vrow_kernel<<<(actual_batch * buf.n_vc_grp + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
+            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
+            buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, actual_batch);
+        if (buf.n_vc_share > 0)
+            vc_share_kernel<<<(actual_batch * buf.n_vc_share + BS - 1) / BS, BS, 0, cs>>>(
+                buf.d_F, buf.d_vc_q, buf.d_vc_sh_row, buf.d_vc_sh_first, buf.d_vc_sh_other,
+                buf.d_vc_sh_wfirst, buf.d_vc_sh_wother, buf.n_vc_share, buf.n_vc_ctrl,
+                dim_J, actual_batch);
+    }
     t.t_fill_F += timer.stop_ms();
 
     // ③  Fill J values; notify cuDSS that the values pointer changed.
@@ -215,6 +250,11 @@ inline void nr_iter_step(
             buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
             buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
             buf.n_hvdc, n_bus, nnz_J, actual_batch);
+    // VoltageControl: constant bordered-block entries (flat pos/value pairs).
+    if (buf.n_vc_feat > 0)
+        fill_slack_feature_kernel<<<(actual_batch * buf.n_vc_feat + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val,
+            buf.n_vc_feat, nnz_J, actual_batch);
     dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 
@@ -243,6 +283,9 @@ inline void nr_iter_step(
     if (buf.slack_col >= 0)
         update_slack_absorbed_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_slack_absorbed, buf.d_dx, buf.slack_col, dim_J, actual_batch);
+    if (buf.n_vc_ctrl > 0)
+        vc_apply_step_kernel<<<(actual_batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, actual_batch);
     t.t_update_V += timer.stop_ms();
 }
 

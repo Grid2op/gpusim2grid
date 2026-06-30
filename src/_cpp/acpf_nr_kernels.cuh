@@ -318,6 +318,67 @@ __global__ void hvdc_fill_feature_kernel(
     int nnz_J,
     int actual_batch);
 
+// ===========================================================================
+// VoltageControl (remote gen + SVC) — Phase 4 (bordered formulation)
+//
+// Per group of N controllers regulating reg_bus at v_set: N reactive-injection
+// columns Q_c, 1 voltage-constraint custom row, N-1 reactive-sharing custom rows.
+// Controllers / regulated bus stay PQ. The (constant) Jacobian feature entries
+// are stamped via the shared fill_slack_feature_kernel (flat pos/value pairs).
+// These kernels implement adjust_mismatch / fill_custom_rows / apply_step:
+//   • vc_adjust_mismatch_kernel : d_F[q_row(c)] += Q_c   (reactive injection)
+//   • vc_vrow_kernel            : d_F[v_row]  = -(Vm(reg) + Σ s_c·Q_c − v_set)
+//   • vc_share_kernel           : d_F[sh_row] = -(w_1·Q_{k+1} − w_{k+1}·Q_1)
+//   • vc_apply_step_kernel      : Q_c += dx[q_col(c)]
+// All VC feature positions are feature-only (no dS overlap), and the custom rows
+// are not bus rows, so the kernels assign (custom rows) / atomic-add (q rows).
+// d_vc_q is the per-batch-slot running reactive injection (gen convention).
+// ===========================================================================
+__global__ void vc_adjust_mismatch_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,     // [actual_batch * n_ctrl]
+    const int*            __restrict__ d_vc_qrow,  // [n_ctrl]
+    int n_ctrl,
+    int dim_J,
+    int actual_batch);
+
+__global__ void vc_vrow_kernel(
+          cuda_real_type*  __restrict__ d_F,
+    const cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_vc_q,        // [actual_batch * n_ctrl]
+    const cuda_real_type*  __restrict__ d_vc_slope,    // [n_ctrl]
+    const int*             __restrict__ d_vc_reg_bus,  // [n_grp]
+    const int*             __restrict__ d_vc_vrow,     // [n_grp]
+    const int*             __restrict__ d_vc_grp_start,// [n_grp]
+    const int*             __restrict__ d_vc_grp_count,// [n_grp]
+    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp]
+    int n_grp,
+    int n_ctrl,
+    int n_bus,
+    int dim_J,
+    int actual_batch);
+
+__global__ void vc_share_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,        // [actual_batch * n_ctrl]
+    const int*            __restrict__ d_sh_row,      // [n_share]
+    const int*            __restrict__ d_sh_first,    // [n_share] controller idx (group ref)
+    const int*            __restrict__ d_sh_other,    // [n_share] controller idx (k+1)
+    const cuda_real_type* __restrict__ d_sh_wfirst,   // [n_share] w of ref
+    const cuda_real_type* __restrict__ d_sh_wother,   // [n_share] w of (k+1)
+    int n_share,
+    int n_ctrl,
+    int dim_J,
+    int actual_batch);
+
+__global__ void vc_apply_step_kernel(
+          cuda_real_type* __restrict__ d_vc_q,       // [actual_batch * n_ctrl]
+    const cuda_real_type* __restrict__ d_dx,         // [actual_batch * dim_J]
+    const int*            __restrict__ d_vc_qcol,    // [n_ctrl]
+    int n_ctrl,
+    int dim_J,
+    int actual_batch);
+
 // ---------------------------------------------------------------------------
 // compute_residuals_kernel
 //
