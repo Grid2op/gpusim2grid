@@ -1,0 +1,9 @@
+# Documentation build dependencies (used by Read the Docs).
+# The package itself is NOT installed here: the compiled CUDA extension cannot be
+# built on a CPU-only runner. conf.py adds ../src to sys.path and mocks the
+# extension, so only these doc tools are required.
+sphinx>=7
+sphinx-rtd-theme>=2
+myst-parser>=2
+numpy
+scipy
