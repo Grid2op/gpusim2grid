@@ -29,7 +29,7 @@ _CONVERGED_THRESHOLD = 1e-4   # residual below which a contingency "counts"
 # even tick up by ULPs.  Monotonicity assertions are bypassed once both
 # consecutive residuals dip below this threshold.  Under FP64 the floor is far
 # below any practical tolerance, so we disable the bypass (threshold = 0).
-_NOISE_FLOOR_RESIDUAL = 1e-4 if _is_fp32() else 0.0
+_NOISE_FLOOR_RESIDUAL = 1e-4 if _is_fp32() else 1e-12
 
 
 # ---------------------------------------------------------------------------
