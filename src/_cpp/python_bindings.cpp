@@ -314,6 +314,69 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "at construction -- a second run() reusing the same base case will still "
                       "report it, overstating that call's true incremental wall time by roughly "
                       "that amount.")
+        // --- to_dict: nested dict view of the coarse buckets and what they're made of ---
+        .def("to_dict", [](const BatchTimings& t) {
+            namespace py = pybind11;
+
+            auto entry_dict = [](const TimingEntry& e) {
+                py::dict d;
+                d["wall_ms"] = e.wall_ms;
+                d["gpu_ms"]  = e.gpu_ms;
+                return d;
+            };
+
+            py::dict cpu_preproc;
+            cpu_preproc["total"]         = t.t_cpu_preprocess_ms();
+            cpu_preproc["preprocess_ms"] = t.t_preprocess_ms;
+
+            py::dict h2d;
+            h2d["total"]                 = t.t_host_to_device_ms();
+            h2d["alloc_ms"]               = t.t_alloc_ms;
+            h2d["source_init_ms"]         = t.t_source_init_ms;
+            h2d["branch_data_upload_ms"]  = t.t_branch_data_upload_ms;
+            h2d["violation_setup_ms"]     = t.t_violation_setup_ms;
+
+            py::dict gpu_compute;
+            gpu_compute["total"]                    = t.t_gpu_compute_ms();
+            gpu_compute["base_case_solve_only_ms"]  = t.t_base_case_solve_only_ms;
+            gpu_compute["analysis_ms"]              = t.t_analysis_ms;
+            gpu_compute["tile_V"]            = entry_dict(t.t_tile_V);
+            gpu_compute["tile_Ybus"]         = entry_dict(t.t_tile_Ybus);
+            gpu_compute["patch_Ybus"]        = entry_dict(t.t_patch_Ybus);
+            gpu_compute["tile_Sbus"]         = entry_dict(t.t_tile_Sbus);
+            gpu_compute["spmv"]              = entry_dict(t.t_spmv);
+            gpu_compute["fill_F"]            = entry_dict(t.t_fill_F);
+            gpu_compute["fill_J"]            = entry_dict(t.t_fill_J);
+            gpu_compute["first_factorize"]   = entry_dict(t.t_first_factorize);
+            gpu_compute["refactorize"]       = entry_dict(t.t_refactorize);
+            gpu_compute["solve"]             = entry_dict(t.t_solve);
+            gpu_compute["update_V"]          = entry_dict(t.t_update_V);
+            gpu_compute["residual"]          = entry_dict(t.t_residual);
+            gpu_compute["store_V"]           = entry_dict(t.t_store_V);
+            gpu_compute["violation_check"]   = entry_dict(t.t_violation_check);
+            gpu_compute["flow_computation"]  = entry_dict(t.t_flow_computation);
+
+            py::dict d2h;
+            d2h["total"]                      = t.t_device_to_host_ms();
+            d2h["copy_flows_to_host_ms"]      = t.t_copy_flows_to_host_ms;
+            d2h["copy_V_to_host_ms"]          = t.t_copy_V_to_host_ms;
+            d2h["copy_residuals_to_host_ms"]  = t.t_copy_residuals_to_host_ms;
+            d2h["copy_violations_to_host_ms"] = t.t_copy_violations_to_host_ms;
+
+            py::dict result;
+            result["total"]       = t.t_grand_total_ms();
+            result["cpu_preproc"] = cpu_preproc;
+            result["h2d"]         = h2d;
+            result["gpu_compute"] = gpu_compute;
+            result["d2h"]         = d2h;
+            return result;
+        }, "Nested dict view of the coarse timing buckets: "
+           "{'total': ms, 'cpu_preproc': {'total': ms, ...}, 'h2d': {'total': ms, ...}, "
+           "'gpu_compute': {'total': ms, ...}, 'd2h': {'total': ms, ...}}. Each bucket's "
+           "'total' matches its t_*_ms coarse property; the remaining keys are the "
+           "fine-grained fields it's composed of. Fine fields that are TimingEntry in C++ "
+           "(the per-chunk fields under 'gpu_compute') become nested "
+           "{'wall_ms': ms, 'gpu_ms': ms} dicts; plain-double fields stay scalars.")
         // --- repr ---
         .def("__repr__", [](const BatchTimings& t) {
             return std::string("BatchTimings(")

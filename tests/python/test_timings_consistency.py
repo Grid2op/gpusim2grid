@@ -66,6 +66,37 @@ def _check_batch_aggregation(t):
         + t.t_gpu_compute_ms + t.t_device_to_host_ms, abs=1e-9)
 
 
+def _check_to_dict(t):
+    d = t.to_dict()
+    assert d["total"] == pytest.approx(t.t_grand_total_ms, abs=1e-9)
+
+    assert d["cpu_preproc"]["total"] == pytest.approx(t.t_cpu_preprocess_ms, abs=1e-9)
+    assert d["cpu_preproc"]["preprocess_ms"] == pytest.approx(t.t_preprocess_ms, abs=1e-9)
+
+    assert d["h2d"]["total"] == pytest.approx(t.t_host_to_device_ms, abs=1e-9)
+    assert d["h2d"]["alloc_ms"] == pytest.approx(t.t_alloc_ms, abs=1e-9)
+    assert d["h2d"]["source_init_ms"] == pytest.approx(t.t_source_init_ms, abs=1e-9)
+    assert d["h2d"]["branch_data_upload_ms"] == pytest.approx(t.t_branch_data_upload_ms, abs=1e-9)
+    assert d["h2d"]["violation_setup_ms"] == pytest.approx(t.t_violation_setup_ms, abs=1e-9)
+
+    assert d["gpu_compute"]["total"] == pytest.approx(t.t_gpu_compute_ms, abs=1e-9)
+    assert d["gpu_compute"]["base_case_solve_only_ms"] == pytest.approx(
+        t.t_base_case_solve_only_ms, abs=1e-9)
+    assert d["gpu_compute"]["analysis_ms"] == pytest.approx(t.t_analysis_ms, abs=1e-9)
+    assert d["gpu_compute"]["spmv"]["wall_ms"] == pytest.approx(t.t_spmv.wall_ms, abs=1e-9)
+    assert d["gpu_compute"]["spmv"]["gpu_ms"] == pytest.approx(t.t_spmv.gpu_ms, abs=1e-9)
+    assert d["gpu_compute"]["fill_J"]["wall_ms"] == pytest.approx(t.t_fill_J.wall_ms, abs=1e-9)
+    assert d["gpu_compute"]["fill_J"]["gpu_ms"] == pytest.approx(t.t_fill_J.gpu_ms, abs=1e-9)
+
+    assert d["d2h"]["total"] == pytest.approx(t.t_device_to_host_ms, abs=1e-9)
+    assert d["d2h"]["copy_flows_to_host_ms"] == pytest.approx(t.t_copy_flows_to_host_ms, abs=1e-9)
+    assert d["d2h"]["copy_V_to_host_ms"] == pytest.approx(t.t_copy_V_to_host_ms, abs=1e-9)
+    assert d["d2h"]["copy_residuals_to_host_ms"] == pytest.approx(
+        t.t_copy_residuals_to_host_ms, abs=1e-9)
+    assert d["d2h"]["copy_violations_to_host_ms"] == pytest.approx(
+        t.t_copy_violations_to_host_ms, abs=1e-9)
+
+
 def _check_acpf_aggregation(t):
     # t_build_J_ms / t_upload_ms aren't exposed to Python (only their
     # t_cpu_preprocess_ms / t_host_to_device_ms aliases are) -- their
@@ -160,6 +191,7 @@ class TestContingencyTimingsConsistency:
 
         t = solver.timings
         _check_batch_aggregation(t)
+        _check_to_dict(t)
         _assert_bracket(external_ms, t.t_grand_total_ms)
 
         # compute_limit_violations was never enabled in this run -- these
@@ -221,6 +253,7 @@ class TestContingencyViolationTimingsConsistency:
 
         t = solver.timings
         _check_batch_aggregation(t)
+        _check_to_dict(t)
         _assert_bracket(external_ms, t.t_grand_total_ms)
 
         assert t.t_violation_setup_ms > 0.0
@@ -274,4 +307,5 @@ class TestInjectionTimingsConsistency:
 
         t = solver.timings
         _check_batch_aggregation(t)
+        _check_to_dict(t)
         _assert_bracket(external_ms, t.t_grand_total_ms)
