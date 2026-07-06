@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-__version__ = "0.0.0-dev11"
+__version__ = "0.1.0"
 
 # Import lightsim2grid first so liblightsim2grid_core.so is loaded into the
 # process: the compiled _gpusim2grid extension links against it (the zero-copy
