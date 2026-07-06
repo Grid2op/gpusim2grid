@@ -2,9 +2,9 @@ import argparse
 import subprocess
 import numpy as np
 from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
-from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+from gpusim2grid import ContingencyAnalysisGPU
 from gpusim2grid.compilation_options import is_fp32
-from _grid_setup import load_grid, extract_ac_data
+from _grid_setup import load_grid
 
 
 def get_parser():
@@ -41,9 +41,7 @@ def main(args):
         raise ValueError(f"nb_max_cont_cpu(={nb_max_cont_cpu}) should be <= nb_max_cont_gpu(={nb_max_cont_gpu}) ")
 
     max_cont = max(nb_max_cont_cpu, nb_max_cont_gpu)
-    ac_Ybus, acSbus_init, pv_index, pq_index, slack_index, slack_weights, sn_mva, max_iter, tol = extract_ac_data(grid)
-    
-    
+
     lines = grid.get_lines()
     trafos = grid.get_trafos()
     n_lines = len(lines)
@@ -90,15 +88,6 @@ def main(args):
         "pf /s, "
         f"{1000.*( computer.total_time() + computer.amps_computation_time()) / computer.nb_solved():.3f} ms / pf)")
 
-    # --- Branch parameter arrays (lines then trafos) ---
-
-    branch_from = np.concat((grid.get_lines().get_bus_id_side_1(), grid.get_trafos().get_bus_id_side_1()))
-    branch_to   = np.concat((grid.get_lines().get_bus_id_side_2(), grid.get_trafos().get_bus_id_side_2()))
-    yff         = np.concat((grid.get_lines().get_yac_eff_11().copy(), grid.get_trafos().get_yac_eff_11()))
-    yft         = np.concat((grid.get_lines().get_yac_eff_12().copy(), grid.get_trafos().get_yac_eff_12()))
-    ytf         = np.concat((grid.get_lines().get_yac_eff_21().copy(), grid.get_trafos().get_yac_eff_21()))
-    ytt         = np.concat((grid.get_lines().get_yac_eff_22().copy(), grid.get_trafos().get_yac_eff_22()))
-
     print(f"Grid: {n_sub} buses, {n_lines} lines, {n_trafos} trafos → {n_branches} N-1 possible contingencies")
 
     # Each contingency disconnects exactly one branch (N-1).
@@ -116,42 +105,37 @@ def main(args):
 
     # --- Build and run GPU solver ---
     # batch_size and nb_iter can also be changed after construction via
-    # solver.batch_size = N or solver.nb_iter = N before calling run().
+    # ca.batch_size = N or ca.nb_iter = N before calling compute().
     batch_size = args.batch_size
     nb_iter    = args.nb_iter
 
     print(f"\nRunning contingency analysis on GPU (strategy={args.strategy}, batch_size={batch_size}, nb_iter={nb_iter}, n cont = {n_conts_simul}) ...")
-    solver = ContingencyAnalysisSolver(
-        ac_Ybus, v_init, acSbus_init,
-        slack_index, slack_weights, pv_index, pq_index,
-        batch_size=batch_size, nb_iter=nb_iter,
-        max_iter_base=max_iter, tol_base=tol)
-    # Equivalent minimal form using defaults (batch_size=100, nb_iter=4):
-    #   solver = ContingencyAnalysisSolver(ac_Ybus, v_init, acSbus_init,
-    #                                      slack_index, slack_weights, pv_index, pq_index)
+    ca = ContingencyAnalysisGPU(
+        grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6)
+    # branch data (needed for compute_flows) is extracted automatically from
+    # `grid` -- call ca.set_branch_data(...) only in explicit-array mode.
 
-    solver.strategy = args.strategy
+    ca.strategy = args.strategy
     if args.strategy == 'direct_refactor_every_n':
-        solver.refactor_period = args.refactor_period
-    solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
-    solver.build_contingencies(n_conts_id_simul)
+        ca.solver.refactor_period = args.refactor_period
+    ca.add_contingencies_by_branch_id(n_conts_id_simul)
 
-    solver.run()
-    print(f"Effective batch size used: {solver.used_batch_size}")
+    ca.compute(batch_size=batch_size)
+    print(f"Effective batch size used: {ca.solver.used_batch_size}")
 
-    V_results = solver.V_results.to_numpy().reshape(n_conts_simul, n_sub)[:nb_max_cont_cpu, :]
-    residuals = solver.residuals.to_numpy()
+    V_results = ca.V_results.to_numpy().reshape(n_conts_simul, n_sub)[:nb_max_cont_cpu, :]
+    residuals = ca.last_residuals()
 
     # --- Flow results ---
-    solver.compute_flows()
-    or_amps = solver.or_amps.to_numpy().reshape(n_conts_simul, n_branches)[:nb_max_cont_cpu, :]
-    # ex_amps = solver.ex_amps.to_numpy().reshape(n_conts_simul, n_branches)
-    timings = solver.timings   # full timings after compute_flows()
+    ca.compute_flows()
+    or_amps = ca.or_amps.to_numpy().reshape(n_conts_simul, n_branches)[:nb_max_cont_cpu, :]
+    # ex_amps = ca.ex_amps.to_numpy().reshape(n_conts_simul, n_branches)
+    timings = ca.timings   # full timings after compute_flows()
     
     # --- Validate voltages against reference ---
     has_error = False
     for c_id in range(nb_max_cont_cpu):
-        diff_ = np.abs(V_results[c_id] - V_ref[c_id][:ac_Ybus.shape[0]]).max()
+        diff_ = np.abs(V_results[c_id] - V_ref[c_id][:ca.n_bus]).max()
         l_or_t = "line" if (cont_ids_both[c_id] if cont_ids_both is not None else c_id) < n_lines else "trafo"
         has_converged = np.abs(residuals[c_id]).max() < tol_conv
         has_conv_ref = np.abs(V_ref[c_id]).max() > tol_conv

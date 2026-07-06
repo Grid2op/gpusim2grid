@@ -2,7 +2,6 @@
 
 import numpy as np
 import warnings
-from scipy.sparse import csr_matrix
 import grid2op
 import pandapower.networks as pn
 from lightsim2grid import LightSimBackend
@@ -78,21 +77,3 @@ def _load_pandapower(case_name):
     v_init_ca = 1. * v_init
     vn_kv =  grid.get_bus_vn_kv().copy()
     return grid, v_init, v_res, n_sub, v_init_ca, vn_kv
-
-
-def extract_ac_data(grid, max_iter=10, tol=1e-6):
-    """Extract AC solver inputs from a lightsim2grid GridModel.
-
-    Returns
-    -------
-    ac_Ybus, acSbus_init, pv_index, pq_index, slack_index, slack_weights, sn_mva, max_iter, tol
-    """
-    ac_Ybus: csr_matrix = grid.get_Ybus_solver().copy()
-    acSbus_init = grid.get_Sbus_solver().copy()
-    pv_index = grid.get_pv()
-    pq_index = grid.get_pq()
-    slack_index = grid.get_slack_ids()
-    slack_weights = np.zeros(shape=ac_Ybus.shape[0], dtype=float)
-    slack_weights[slack_index] = 1.0 / slack_index.shape[0]
-    sn_mva = grid.get_sn_mva()
-    return ac_Ybus, acSbus_init, pv_index, pq_index, slack_index, slack_weights, sn_mva, max_iter, tol

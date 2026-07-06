@@ -27,6 +27,38 @@ From source
    source env_compile.sh   # exports CUDAToolkit_ROOT, cudss_ROOT, LD_LIBRARY_PATH — edit for your machine
    pip install .
 
+The lightsim2grid C++ bridge
+-----------------------------
+
+Extracting a ``lightsim2grid`` grid into the GPU solver has two paths:
+
+* a **zero-copy C++ bridge** (``lightsim2grid_core``), used when
+  ``gpusim2grid._gpusim2grid`` exposes ``_make_ca_session_from_lsgrid`` and
+  friends;
+* a **Python fallback** (``_ls2g_utils.py``), used otherwise.
+
+The C++ bridge is built automatically: at configure time, CMake asks the
+Python interpreter it is building against for
+``lightsim2grid.get_cmake_dir()`` and locates ``lightsim2grid_core`` from
+there. Since ``lightsim2grid`` is a build-system requirement (see
+``pyproject.toml``), this works out of the box with a plain
+``pip install .`` / ``uv pip install .`` — no ``CMAKE_ARGS`` needed.
+
+If you need the bridge to build against a *different* ``lightsim2grid``
+install than the one importable by that interpreter, override the
+detection explicitly:
+
+.. code-block:: bash
+
+   CMAKE_ARGS="-DLIGHTSIM2GRID_CMAKE_DIR=$(python -c \
+     'import lightsim2grid; print(lightsim2grid.get_cmake_dir())')" \
+     pip install .
+
+When ``lightsim2grid_core`` cannot be found (bridge disabled), the build
+falls back to the vendored Eigen copy (``src/eigen/``) and the Python
+fallback path is used at runtime instead — everything still works, just
+without the zero-copy fast path.
+
 Selecting floating-point precision
 ----------------------------------
 

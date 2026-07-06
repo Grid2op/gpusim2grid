@@ -101,6 +101,13 @@ cd gpusim2grid
 pip install .
 ```
 
+This automatically builds the zero-copy C++ bridge to `lightsim2grid`
+(`lightsim2grid_core`) — CMake locates it via the Python interpreter it is
+building against, since `lightsim2grid` is a build-system requirement. No
+`CMAKE_ARGS` needed for the common case; see the
+[installation docs](#building-the-docs) if you need to point at a different
+`lightsim2grid` install.
+
 For detailed installation options — selecting float precision, linking against a
 specific CUDA version, and other build customization — see the dedicated installation
 page in the [documentation](#building-the-docs).
