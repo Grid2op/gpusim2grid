@@ -108,13 +108,18 @@ struct AcPfNrState {
     // ctor from the ledger pair lists + the J skeleton. All size n_bus, -1 when
     // the bus owns no such row/col.
     //   h_theta_col_of_bus : angle column of each bus (-1 ⇒ angle reference)
+    //   h_vm_col_of_bus : the bus' Vm (voltage magnitude) unknown column
     //   h_p_row_of_bus / h_q_row_of_bus : the bus' P / Q equation rows
     //   h_p_diag_pos / h_q_diag_pos : nnz index of the (p_row, theta_col) /
     //                                 (q_row, vm_col) diagonal in the J skeleton,
     //                                 used to write the identity entry when the
     //                                 bus is masked out (largest-component solve).
+    //
+    // Also exposed to Python (AcPfNrSession accessors) so the differentiable
+    // adjoint path can project/scatter gradients bus-by-bus instead of
+    // assuming the trivial bare-system pvpq/pq positional layout.
     // -------------------------------------------------------------------------
-    std::vector<int> h_theta_col_of_bus;
+    std::vector<int> h_theta_col_of_bus, h_vm_col_of_bus;
     std::vector<int> h_p_row_of_bus, h_q_row_of_bus;
     std::vector<int> h_p_diag_pos,   h_q_diag_pos;
 
@@ -246,9 +251,11 @@ struct AcPfNrState {
     CudssDescriptor dss_xT;  // dense solution descriptor
 
     // -------------------------------------------------------------------------
-    // Timings captured during construction
+    // Timings captured during construction.  Mutable so the const
+    // copy_V_to_host() accessor can record its own D→H transfer time
+    // (t_copy_v_to_host_ms) without relaxing its constness.
     // -------------------------------------------------------------------------
-    AcPfTimings timings;
+    mutable AcPfTimings timings;
 
     // =========================================================================
     // Constructor
@@ -273,7 +280,13 @@ struct AcPfNrState {
         int                                         device = -1,
         // Optional augmented-J description read off a solved lightsim2grid grid.
         // nullptr → build the trivial feature-free ledger from pv/pq (Phase 1).
-        const LedgerData*                           ledger = nullptr
+        const LedgerData*                           ledger = nullptr,
+        // When true, Vinit is trusted to already be converged (e.g. lightsim2grid's
+        // CPU KLU solve): run one fill_F/fill_J/FACTORIZE at Vinit to validate
+        // ||F(Vinit)||_inf and prepare J's factors, but never call solve/update_V —
+        // d_V stays bit-identical to Vinit. Throws if the residual check fails.
+        // See acpf_nr.cu §4.6.
+        bool                                         presolved_v = false
     );
 
     // =========================================================================

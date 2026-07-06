@@ -17,7 +17,7 @@ Acceptance criteria (from the phase-1 plan):
      t_refactorize > 0 (REFACTORIZATION happened for subsequent calls),
      n_refactorize == n_chunks * nb_iter - 1.
 
-Driven through the public ``ContingencyAnalysisSolver`` (session) API with the
+Driven through the public ``_ContingencyAnalysisSolver`` (session) API with the
 ``direct_refactor_every`` strategy.  N-1 contingencies are built from branch IDs
 (lines first, then trafos) — the same order as lightsim2grid's ``add_all_n1()``.
 """
@@ -38,14 +38,14 @@ def _run_gpu_ca(ieee14_grid, ieee14_base_case, batch_size=5, nb_iter=10):
 
     Returns (V_2d, residuals, timings, n_ctg).
     """
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
     d = ieee14_base_case
     branch_data, n_lines, n_trafos = branch_data_arrays(ieee14_grid)
     n_ctg = n_lines + n_trafos
     cont_branch_ids = [[c] for c in range(n_ctg)]
 
-    solver = ContingencyAnalysisSolver(
+    solver = _ContingencyAnalysisSolver(
         d["Ybus"], d["v_init"].copy(), d["Sbus"],
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=batch_size, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6,

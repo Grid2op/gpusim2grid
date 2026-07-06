@@ -25,7 +25,7 @@ _RESIDUAL_CONVERGED = 1e-4
 
 
 # =============================================================================
-# Helper: run contingency analysis via the ContingencyAnalysisSolver object API
+# Helper: run contingency analysis via the _ContingencyAnalysisSolver object API
 # =============================================================================
 
 def _run_with_strategy(ieee14_base_case, ieee14_grid, branch_ids_per_ctg,
@@ -36,11 +36,11 @@ def _run_with_strategy(ieee14_base_case, ieee14_grid, branch_ids_per_ctg,
     directly.  Returns (V_2d, residuals, timings) or, when compute_flows=True,
     (V_2d, residuals, timings, or_amps) where or_amps has shape (n_ctg, n_branches).
     """
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
     d = ieee14_base_case
 
-    solver = ContingencyAnalysisSolver(
+    solver = _ContingencyAnalysisSolver(
         d["Ybus"], d["v_init"].copy(), d["Sbus"],
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=batch_size, nb_iter=nb_iter)

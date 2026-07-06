@@ -84,11 +84,13 @@ void InjectionBatch::prepare_Sbus_batch(BatchPfDriverContext& ctx,
                                         int                  chunk_idx,
                                         int                  actual_batch,
                                         cudaStream_t         cs,
-                                        CudaTimer&           /*timer*/,
-                                        BatchTimings&  /*t*/)
+                                        CudaTimer&           timer,
+                                        BatchTimings&        t)
 {
     const int n_bus     = ctx.n_bus;
     const int c_start   = chunk_idx * ctx.batch_size;
+
+    timer.start();
 
     // ②  Copy the (actual_batch × n_bus) row-slice into d_Sbus_batch.
     if (actual_batch > 0) {
@@ -120,4 +122,6 @@ void InjectionBatch::prepare_Sbus_batch(BatchPfDriverContext& ctx,
                       "Sbus phantom pad");
         }
     }
+
+    t.t_tile_Sbus += timer.stop_ms();
 }

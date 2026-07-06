@@ -7,7 +7,7 @@ voltages, independently of the solver's internal convergence tracking.
 For contingency residuals the patched Ybus (base − branch admittance) is
 assembled on the CPU for each N-1, which is correct but O(n_ctg * nnz).
 This is fine for IEEE 14 in a test context.  The GPU side is driven through
-the public ``ContingencyAnalysisSolver`` (session) API; contingency ``c`` trips
+the public ``_ContingencyAnalysisSolver`` (session) API; contingency ``c`` trips
 branch ``c`` (lines first, then trafos) — the same order as the triplet fixture,
 so ``ieee14_contingencies[c]`` is the matching patch for GPU contingency ``c``.
 """
@@ -107,18 +107,18 @@ class TestBaseResiduals:
 # ---------------------------------------------------------------------------
 
 def _run_ca(ieee14_grid, ieee14_base_case, batch_size=5, nb_iter=10):
-    """Run all N-1 contingencies via ContingencyAnalysisSolver.
+    """Run all N-1 contingencies via _ContingencyAnalysisSolver.
 
     Returns (V_flat, residuals, branch_data, n_lines, n_trafos).
     """
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
     d = ieee14_base_case
     branch_data, n_lines, n_trafos = branch_data_arrays(ieee14_grid)
     n_ctg = n_lines + n_trafos
     cont_branch_ids = [[c] for c in range(n_ctg)]
 
-    solver = ContingencyAnalysisSolver(
+    solver = _ContingencyAnalysisSolver(
         d["Ybus"], d["v_init"].copy(), d["Sbus"],
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=batch_size, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6,

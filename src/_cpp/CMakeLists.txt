@@ -18,6 +18,7 @@ pybind11_add_module(
     acpf_nr_kernels.cu
     contingency_analysis_session.cu
     contingency/batch_pf_driver.cu
+    contingency/violation_kernels.cu
     contingency/batch_sources/injection_batch.cu
     injection_sweep.cu
     injection_sweep_session.cu

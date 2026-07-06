@@ -48,7 +48,8 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
     int    max_iter_base,
     double tol_base,
     int    device,
-    const LedgerData* ledger)
+    const LedgerData* ledger,
+    bool   presolved_v)
     : Ybus_rm_(Ybus)
     , batch_size_(batch_size)
     , nb_iter_(nb_iter)
@@ -61,7 +62,7 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
         Ybus, Vinit, Sbus, pv, pq,
         max_iter_base,
         static_cast<eigen_real_type>(tol_base),
-        device, ledger);
+        device, ledger, presolved_v);
     t_base_case_ms_ = ms_since(t_base_start);
 
     // Build the handle_disconnected_grid mask configuration once from the base
@@ -140,6 +141,7 @@ void ContingencyAnalysisSession::build_contingencies(
 
     for (int c = 0; c < n_ctg; ++c) {
         Contingency ctg;
+        ctg.tripped_branches = branch_ids_per_ctg[c];   // compute_limit_violations skip list
         for (int l : branch_ids_per_ctg[c]) {
             if (l < 0 || l >= n_branches)
                 throw std::runtime_error(
@@ -215,7 +217,40 @@ void ContingencyAnalysisSession::run()
         strategy_type_,
         refactor_period_);
 
-    // Run all chunks; fills d_V_results and d_residuals on device.
+    // compute_limit_violations: the fused per-chunk kernel needs branch
+    // admittances + limits on device BEFORE solve() runs its chunk loop
+    // (unlike compute_flows(), which uploads AFTER solve() and only for
+    // callers who explicitly want full flows). This intentionally calls
+    // upload_branch_admittances() (NOT the full set_branch_data(), which
+    // would also allocate the O(n_ctg*n_branches) dense or_amps/ex_amps
+    // buffers this path is meant to avoid).
+    double t_admittance_upload_ms = 0.;
+    double t_limits_setup_ms      = 0.;
+    if (compute_limit_violations_) {
+        if (!has_branch_data_)
+            throw std::runtime_error(
+                "ContingencyAnalysisSession: compute_limit_violations requires "
+                "set_branch_data() to have been called first.");
+        if (!has_limits_)
+            throw std::runtime_error(
+                "ContingencyAnalysisSession: compute_limit_violations requires "
+                "set_limits() to have been called first.");
+
+        solver_->upload_branch_admittances(
+            h_branch_from_, h_branch_to_, h_yff_, h_yft_, h_ytf_, h_ytt_,
+            h_bus_vn_kv_, sn_mva_);
+        t_admittance_upload_ms = solver_->branch_data_upload_ms();
+
+        solver_->set_violation_limits(
+            h_bus_vmin_kv_, h_bus_vmax_kv_,
+            h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
+            violation_tol_, violation_capacity_, n_lines_);
+        t_limits_setup_ms = solver_->violation_setup_ms();
+    }
+
+    // Run all chunks; fills d_V_results and d_residuals on device (and, when
+    // compute_limit_violations_ is set, the compact violation buffers too —
+    // see check_limit_violations_kernel in _solve_chunk).
     // solve() carries preprocess/alloc/analysis timings from the ctor.
     timings_ = solver_->solve();
 
@@ -227,6 +262,21 @@ void ContingencyAnalysisSession::run()
     // CPU work and H→D transfers, not just the contingency-solver's own share.
     timings_.t_preprocess_ms += base_state_->timings.t_build_J_ms;
     timings_.t_alloc_ms      += base_state_->timings.t_upload_ms;
+    // compute_limit_violations' pre-solve() admittance upload would otherwise
+    // be clobbered by the plain `timings_ = solver_->solve()` assignment above
+    // — fold it in here, in the same neighborhood as the other one-time-setup
+    // folding above.
+    if (compute_limit_violations_) {
+        timings_.t_branch_data_upload_ms += t_admittance_upload_ms;
+        timings_.t_violation_setup_ms    += t_limits_setup_ms;
+    }
+    // Non-overlapping remainder of t_base_case_ms (cuDSS analyze + NR
+    // iterations, or the presolved_v validation step): the build_J/upload
+    // share is already folded above, so this avoids double-counting it in
+    // BatchTimings::t_gpu_compute_ms()/t_grand_total_ms().
+    timings_.t_base_case_solve_only_ms =
+        t_base_case_ms_ - base_state_->timings.t_build_J_ms
+                         - base_state_->timings.t_upload_ms;
 
     // Disconnected contingencies are compacted out of the batch by the source
     // and never solved; the driver pre-fills their result slots with NaN.  Here
@@ -238,6 +288,7 @@ void ContingencyAnalysisSession::run()
             ++n_disconnected;
 
     timings_.n_disconnected = n_disconnected;
+    has_violations_result_ = compute_limit_violations_;
 }
 
 // =============================================================================
@@ -257,6 +308,7 @@ void ContingencyAnalysisSession::compute_flows()
         h_branch_from_, h_branch_to_,
         h_yff_, h_yft_, h_ytf_, h_ytt_,
         h_bus_vn_kv_, sn_mva_);
+    timings_.t_branch_data_upload_ms += solver_->branch_data_upload_ms();
 
     // Launch one kernel over ALL contingencies using d_V_results as input.
     const int n_ctg  = solver_->n_contingencies;
@@ -265,7 +317,8 @@ void ContingencyAnalysisSession::compute_flows()
     const int total  = n_ctg * n_bra;
     const cudaStream_t cs = solver_->cs;
 
-    auto t_flow_start = std::chrono::steady_clock::now();
+    CudaTimer flow_timer(cs);
+    flow_timer.start();
 
     compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
@@ -299,10 +352,10 @@ void ContingencyAnalysisSession::compute_flows()
             n_z);
     }
 
-    solver_->cs.synchronize();
+    // stop_ms() records + synchronizes the stop event, so this also serves as
+    // the sync point that lets d_zero be safely destroyed below.
+    timings_.t_flow_computation += flow_timer.stop_ms();
     // d_zero destroyed here, after sync
-
-    timings_.t_flow_computation.wall_ms += ms_since(t_flow_start);
 
     // D→H download of flow results — timed separately.
     const int n = n_ctg * n_bra;
@@ -318,6 +371,195 @@ void ContingencyAnalysisSession::compute_flows()
         }
     }
     timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
+}
+
+// =============================================================================
+// set_limits
+// =============================================================================
+void ContingencyAnalysisSession::set_limits(
+    Eigen::Ref<const RealVect> bus_vmin_kv,
+    Eigen::Ref<const RealVect> bus_vmax_kv,
+    Eigen::Ref<const RealVect> branch_limit_a1_ka,
+    Eigen::Ref<const RealVect> branch_limit_a2_ka,
+    int n_lines)
+{
+    const int n_bus = base_state_->n_bus;
+    if (bus_vmin_kv.size() != n_bus || bus_vmax_kv.size() != n_bus)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession::set_limits: bus_vmin_kv/bus_vmax_kv "
+            "must have size n_bus");
+    if (has_branch_data_) {
+        const int n_bra = static_cast<int>(h_branch_from_.size());
+        if (branch_limit_a1_ka.size() != n_bra || branch_limit_a2_ka.size() != n_bra)
+            throw std::runtime_error(
+                "ContingencyAnalysisSession::set_limits: branch_limit_a1_ka/"
+                "branch_limit_a2_ka must have size n_branches");
+    }
+
+    h_bus_vmin_kv_ = bus_vmin_kv;
+    h_bus_vmax_kv_ = bus_vmax_kv;
+    h_branch_limit_a1_ka_ = branch_limit_a1_ka;
+    h_branch_limit_a2_ka_ = branch_limit_a2_ka;
+    n_lines_ = n_lines;
+    has_limits_ = true;
+    has_violations_result_ = false;
+}
+
+// =============================================================================
+// compute_limit_violations D→H result accessors
+// =============================================================================
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_element_type() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_element_type;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_element_id() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_element_id;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_side() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_side;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_type() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_type;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+RealVect ContingencyAnalysisSession::get_violation_value() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<cuda_real_type> h = solver_->d_viol_value;
+    RealVect out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(h[i]);
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+RealVect ContingencyAnalysisSession::get_violation_limit() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<cuda_real_type> h = solver_->d_viol_limit;
+    RealVect out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(h[i]);
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_count() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_truncated() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_truncated;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_count_low_voltage() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count_low_voltage;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_count_high_voltage() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count_high_voltage;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_violation_count_current() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count_current;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
 }
 
 // =============================================================================
@@ -348,6 +590,7 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
     if (!solver_)
         throw std::runtime_error("ContingencyAnalysisSession: call run() first");
     solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
     thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
@@ -355,6 +598,7 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
         out(i) = eigen_cplx_type(
             static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
             static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
 
@@ -363,11 +607,13 @@ RealVect ContingencyAnalysisSession::get_residuals() const
     if (!solver_)
         throw std::runtime_error("ContingencyAnalysisSession: call run() first");
     solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
     thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
     for (int i = 0; i < n; ++i)
         out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }
 

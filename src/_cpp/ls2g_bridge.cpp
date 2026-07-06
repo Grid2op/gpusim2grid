@@ -8,6 +8,7 @@
 
 #include "ls2g_bridge.hpp"
 
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -84,6 +85,68 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid)
 std::vector<int> to_int_vector(const ls2g::IntVect& v)
 {
     return std::vector<int>(v.data(), v.data() + v.size());
+}
+
+// compute_limit_violations limits pulled off the grid (lines-then-trafos for
+// branch limits; solver bus numbering for bus limits), for
+// ContingencyAnalysisSession::set_limits().
+struct LimitData {
+    RealVect bus_vmin_kv, bus_vmax_kv;    // solver numbering, size n_bus_solver
+    RealVect limit_a1_ka, limit_a2_ka;    // lines-then-trafos, size n_branches
+};
+
+// n_bus_solver is passed in (rather than re-derived from get_Ybus_solver(),
+// which is non-const and returns a full copy) since every caller already has
+// it on hand: make_ca_session_from_lsgrid from its own Ybus, and the
+// standalone pybind wrapper from the already-constructed session's n_bus().
+LimitData extract_limits(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    const auto& lines  = grid.get_powerlines_as_data();
+    const auto& trafos = grid.get_trafos_as_data();
+
+    LimitData ld;
+
+    // Branch limits: bulk C++ accessor exists (TwoSidesContainer_rxh_A::
+    // get_limit_a1_ka/a2_ka) -- straight concat, same head/tail pattern as
+    // concat_cplx above. NaN entries ("not configured") pass through as-is.
+    {
+        Eigen::Ref<const ls2g::RealVect> l1_lines  = lines.get_limit_a1_ka();
+        Eigen::Ref<const ls2g::RealVect> l1_trafos = trafos.get_limit_a1_ka();
+        ld.limit_a1_ka.resize(l1_lines.size() + l1_trafos.size());
+        ld.limit_a1_ka.head(l1_lines.size())  = l1_lines;
+        ld.limit_a1_ka.tail(l1_trafos.size()) = l1_trafos;
+
+        Eigen::Ref<const ls2g::RealVect> l2_lines  = lines.get_limit_a2_ka();
+        Eigen::Ref<const ls2g::RealVect> l2_trafos = trafos.get_limit_a2_ka();
+        ld.limit_a2_ka.resize(l2_lines.size() + l2_trafos.size());
+        ld.limit_a2_ka.head(l2_lines.size())  = l2_lines;
+        ld.limit_a2_ka.tail(l2_trafos.size()) = l2_trafos;
+    }
+
+    // Bus limits: grid.get_bus_vmin_kv()/get_bus_vmax_kv() return an EMPTY
+    // array when never configured (not a NaN-filled n_bus array) -- and are
+    // in grid-model bus numbering, requiring the same model->solver relabel
+    // ls2g_bridge.cpp already applies to branch endpoints
+    // (concat_busids_to_solver). Buses with no model-side entry at all (empty
+    // input) or isolated (negative solver id) are reported as NaN =
+    // "not configured", matching the per-element NaN convention.
+    ls2g::RealVect vmin_model = grid.get_bus_vmin_kv();
+    ls2g::RealVect vmax_model = grid.get_bus_vmax_kv();
+    std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
+
+    const eigen_real_type nan_val = std::numeric_limits<eigen_real_type>::quiet_NaN();
+    ld.bus_vmin_kv = RealVect::Constant(n_bus_solver, nan_val);
+    ld.bus_vmax_kv = RealVect::Constant(n_bus_solver, nan_val);
+    if (vmin_model.size() > 0) {
+        for (size_t grid_id = 0; grid_id < me_to_solver.size(); ++grid_id) {
+            const int solver_id = me_to_solver[grid_id];
+            if (solver_id >= 0 && solver_id < n_bus_solver) {
+                ld.bus_vmin_kv(solver_id) = vmin_model(static_cast<Eigen::Index>(grid_id));
+                ld.bus_vmax_kv(solver_id) = vmax_model(static_cast<Eigen::Index>(grid_id));
+            }
+        }
+    }
+    return ld;
 }
 
 }  // namespace
@@ -174,7 +237,8 @@ make_acpf_session_from_lsgrid(
     const ls2g::LSGrid& grid,
     int    max_iter,
     double tol,
-    int    device)
+    int    device,
+    bool   init_from_n_powerflow)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -185,6 +249,45 @@ make_acpf_session_from_lsgrid(
 
     CplxVect        V0    = grid.get_V_solver();
     CplxVect        Sbus  = grid.get_Sbus_solver();
+    Eigen::VectorXi slack = grid.get_slack_ids_solver_numpy();
+    RealVect        sw    = grid.get_slack_weights_solver();
+    Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
+    Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
+
+    LedgerData ledger = extract_ledger_data(grid);
+
+    return std::make_shared<AcPfNrSession>(
+        Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
+        /*presolved_v=*/init_from_n_powerflow);
+}
+
+std::shared_ptr<AcPfNrSession>
+make_acpf_session_from_lsgrid_with_sbus(
+    const ls2g::LSGrid& grid,
+    Eigen::Ref<const CplxVect> Sbus,
+    int    max_iter,
+    double tol,
+    int    device)
+{
+    // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
+    // (solver numbering) instead of the grid's own get_Sbus_solver(). Used by
+    // the differentiable power-flow path: the ledger's structural content
+    // (row/col maps, sparsity, HVDC/VC constant params, slack weights) depends
+    // only on topology/control configuration, not on the numeric Sbus of the
+    // solve that produced it, so it can be reused across many different Sbus
+    // values — exactly like the injection-sweep path already does.
+    auto& g = const_cast<ls2g::LSGrid&>(grid);
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
+    if (Ybus.rows() == 0)
+        throw std::runtime_error(
+            "make_acpf_session_from_lsgrid_with_sbus: empty Ybus — has the grid "
+            "been solved (ac_pf) before being handed to gpusim2grid?");
+    if (Sbus.size() != Ybus.rows())
+        throw std::runtime_error(
+            "make_acpf_session_from_lsgrid_with_sbus: Sbus size does not match "
+            "the solver bus count.");
+
+    CplxVect        V0    = grid.get_V_solver();
     Eigen::VectorXi slack = grid.get_slack_ids_solver_numpy();
     RealVect        sw    = grid.get_slack_weights_solver();
     Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
@@ -204,7 +307,8 @@ make_ca_session_from_lsgrid(
     int    nb_iter,
     int    max_iter_base,
     double tol_base,
-    int    device)
+    int    device,
+    bool   compute_limit_violations)
 {
     // get_Ybus_solver() is non-const (returns a copy) — cast away constness;
     // we only read it.
@@ -222,18 +326,32 @@ make_ca_session_from_lsgrid(
     Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
-    const int base_iters = init_from_n_powerflow ? 1 : max_iter_base;
-
     LedgerData ledger = extract_ledger_data(grid);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
-        batch_size, nb_iter, base_iters, tol_base, device, &ledger);
+        batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
+        /*presolved_v=*/init_from_n_powerflow);
 
     BranchData bd = extract_branch_data(grid);
     session->set_branch_data(bd.branch_from, bd.branch_to,
                              bd.yff, bd.yft, bd.ytf, bd.ytt,
                              bd.bus_vn_kv, bd.sn_mva);
+
+    if (compute_limit_violations) {
+        session->set_compute_limit_violations(true);
+        LimitData ld = extract_limits(grid, static_cast<int>(Ybus.rows()));
+        const int n_lines = static_cast<int>(grid.get_powerlines_as_data().nb());
+        session->set_limits(ld.bus_vmin_kv, ld.bus_vmax_kv,
+                            ld.limit_a1_ka, ld.limit_a2_ka, n_lines);
+    }
     return session;
+}
+
+std::tuple<RealVect, RealVect, RealVect, RealVect>
+extract_limits_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    LimitData ld = extract_limits(grid, n_bus_solver);
+    return std::make_tuple(ld.bus_vmin_kv, ld.bus_vmax_kv, ld.limit_a1_ka, ld.limit_a2_ka);
 }
 
 std::shared_ptr<InjectionSweepSession>
@@ -261,12 +379,11 @@ make_is_session_from_lsgrid(
     Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
-    const int base_iters = init_from_n_powerflow ? 1 : max_iter_base;
-
     LedgerData ledger = extract_ledger_data(grid);
     auto session = std::make_shared<InjectionSweepSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
-        batch_size, nb_iter, base_iters, tol_base, device, &ledger);
+        batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
+        /*presolved_v=*/init_from_n_powerflow);
 
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid);

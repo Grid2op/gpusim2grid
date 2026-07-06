@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core", "pybind11"]
+requires = ["scikit-build-core", "pybind11", "lightsim2grid>=1.0.0rc1"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -37,7 +37,7 @@ classifiers = [
 dependencies = [
   "numpy",
   "scipy",
-  "lightsim2grid",
+  "lightsim2grid>=1.0.0rc1",
 ]
 
 [project.optional-dependencies]

@@ -46,7 +46,8 @@ InjectionSweepSession::InjectionSweepSession(
     int    max_iter_base,
     double tol_base,
     int    device,
-    const LedgerData* ledger)
+    const LedgerData* ledger,
+    bool   presolved_v)
     : Ybus_rm_(Ybus)
     , batch_size_(batch_size)
     , nb_iter_(nb_iter)
@@ -59,7 +60,7 @@ InjectionSweepSession::InjectionSweepSession(
         Ybus, Vinit, Sbus, pv, pq,
         max_iter_base,
         static_cast<eigen_real_type>(tol_base),
-        device, ledger);
+        device, ledger, presolved_v);
     t_base_case_ms_ = ms_since(t_base_start);
 }
 
@@ -147,6 +148,13 @@ void InjectionSweepSession::run()
     timings_.t_base_case_ms  = t_base_case_ms_;
     timings_.t_preprocess_ms += base_state_->timings.t_build_J_ms;
     timings_.t_alloc_ms      += base_state_->timings.t_upload_ms;
+    // Non-overlapping remainder of t_base_case_ms (cuDSS analyze + NR
+    // iterations, or the presolved_v validation step): the build_J/upload
+    // share is already folded above, so this avoids double-counting it in
+    // BatchTimings::t_gpu_compute_ms()/t_grand_total_ms().
+    timings_.t_base_case_solve_only_ms =
+        t_base_case_ms_ - base_state_->timings.t_build_J_ms
+                         - base_state_->timings.t_upload_ms;
     timings_.n_disconnected   = 0;
 
     solver_->cs.synchronize();
@@ -193,6 +201,7 @@ void InjectionSweepSession::compute_flows()
         h_branch_from_, h_branch_to_,
         h_yff_, h_yft_, h_ytf_, h_ytt_,
         h_bus_vn_kv_, sn_mva_);
+    timings_.t_branch_data_upload_ms += solver_->branch_data_upload_ms();
 
     // Launch one kernel over ALL scenarios using d_V_results as input.
     // No tripped branches to zero — unlike contingency analysis, every
@@ -203,7 +212,8 @@ void InjectionSweepSession::compute_flows()
     const int total  = n_scen * n_bra;
     const cudaStream_t cs = solver_->cs;
 
-    auto t_flow_start = std::chrono::steady_clock::now();
+    CudaTimer flow_timer(cs);
+    flow_timer.start();
 
     compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
@@ -218,8 +228,8 @@ void InjectionSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_scen, /*d_result_map=*/nullptr);
 
-    solver_->cs.synchronize();
-    timings_.t_flow_computation.wall_ms += ms_since(t_flow_start);
+    // stop_ms() records + synchronizes the stop event.
+    timings_.t_flow_computation += flow_timer.stop_ms();
 
     // D→H download of flow results — timed separately.
     const int n = n_scen * n_bra;
@@ -264,6 +274,7 @@ CplxVect InjectionSweepSession::get_V_results() const
     if (!solver_)
         throw std::runtime_error("InjectionSweepSession: call run() first");
     solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
     thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
@@ -271,6 +282,7 @@ CplxVect InjectionSweepSession::get_V_results() const
         out(i) = eigen_cplx_type(
             static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
             static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
 
@@ -279,11 +291,13 @@ RealVect InjectionSweepSession::get_residuals() const
     if (!solver_)
         throw std::runtime_error("InjectionSweepSession: call run() first");
     solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
     thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
     for (int i = 0; i < n; ++i)
         out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }
 

@@ -25,6 +25,15 @@ factorization, and reports convergence statistics and timing.
 .. literalinclude:: ../examples/case6515rte_screen.py
    :language: python
 
+Batched injection sweep
+------------------------
+
+Sweeps a load-scaling factor across every bus (same Ybus, varying Sbus),
+solving the whole batch on the GPU reusing a single base-case factorization.
+
+.. literalinclude:: ../examples/injection_sweep_scan.py
+   :language: python
+
 Largest-component solve of a split grid
 ---------------------------------------
 
@@ -34,6 +43,20 @@ of skipping it — via the ``ContingencyAnalysisGPU`` facade and
 ``handle_disconnected_grid``.
 
 .. literalinclude:: ../examples/handle_disconnected.py
+   :language: python
+
+N-1 screen with limit violations
+---------------------------------
+
+Configures a bus voltage / branch thermal envelope on the grid, then screens
+every N-1 with ``compute_limit_violations=True``: the check runs fused into
+each chunk of the GPU solve, writing only a bounded per-contingency record
+buffer (never the full dense voltage / current arrays), and folds
+non-convergence into the same per-contingency violation list as a
+``DIVERGED`` entry. Mirrors lightsim2grid's own
+``ContingencyAnalysis.compute_limit_violations`` flag.
+
+.. literalinclude:: ../examples/limit_violations.py
    :language: python
 
 Augmented solve: distributed slack

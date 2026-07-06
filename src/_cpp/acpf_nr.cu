@@ -59,8 +59,9 @@
 
 #include <Eigen/SparseCore>
 
-#include <algorithm>   // std::sort, std::lower_bound
+#include <algorithm>   // std::sort, std::lower_bound, std::max
 #include <stdexcept>
+#include <string>      // std::to_string
 #include <chrono>
 #include <iostream>
 #include <vector>
@@ -253,8 +254,17 @@ AcPfNrState::AcPfNrState(
     int                                         max_iter,
     eigen_real_type                             tol,
     int                                         device,
-    const LedgerData*                           ledger)
+    const LedgerData*                           ledger,
+    bool                                         presolved_v)
 {
+    // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
+    // because the work is heterogeneous (CPU preprocessing + device uploads +
+    // ANALYSIS launch). Started BEFORE device selection: cudaGetDevice() below
+    // is typically the first CUDA driver call in a process, which triggers
+    // lazy CUDA context creation -- an expensive (up to ~1s) one-time cost
+    // that would otherwise land entirely outside any timed region.
+    auto t_wall_start = std::chrono::steady_clock::now();
+
     // =========================================================================
     // Device selection — must happen before any stream/allocation.
     // =========================================================================
@@ -268,11 +278,6 @@ AcPfNrState::AcPfNrState(
         CHK_CUDA_AC(cudaSetDevice(device));
     }
     CHK_CUDA_AC(cudaGetDevice(&device_id_));
-
-    // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
-    // because the work is heterogeneous (CPU preprocessing + device uploads +
-    // ANALYSIS launch).
-    auto t_wall_start = std::chrono::steady_clock::now();
 
     // =========================================================================
     // 4.1  Scalar dimensions
@@ -356,13 +361,13 @@ AcPfNrState::AcPfNrState(
     // skeleton just assembled. Cheap (size n_bus) and always built.
     {
         h_theta_col_of_bus.assign(n_bus, -1);
+        h_vm_col_of_bus.assign(n_bus, -1);
         h_p_row_of_bus.assign(n_bus, -1);
         h_q_row_of_bus.assign(n_bus, -1);
         h_p_diag_pos.assign(n_bus, -1);
         h_q_diag_pos.assign(n_bus, -1);
-        std::vector<int> vm_col_of_bus(n_bus, -1);
         for (int i = 0; i < n_theta; ++i) h_theta_col_of_bus[theta_buses[i]] = theta_cols[i];
-        for (int i = 0; i < n_vm;    ++i) vm_col_of_bus[vm_buses[i]]         = vm_cols[i];
+        for (int i = 0; i < n_vm;    ++i) h_vm_col_of_bus[vm_buses[i]]       = vm_cols[i];
         for (int i = 0; i < n_p;     ++i) h_p_row_of_bus[p_buses[i]]         = p_rows[i];
         for (int i = 0; i < n_q;     ++i) h_q_row_of_bus[q_buses[i]]         = q_rows[i];
         auto find_J_pos = [&](int row, int col) -> int {
@@ -375,7 +380,7 @@ AcPfNrState::AcPfNrState(
         };
         for (int bus = 0; bus < n_bus; ++bus) {
             h_p_diag_pos[bus] = find_J_pos(h_p_row_of_bus[bus], h_theta_col_of_bus[bus]);
-            h_q_diag_pos[bus] = find_J_pos(h_q_row_of_bus[bus], vm_col_of_bus[bus]);
+            h_q_diag_pos[bus] = find_J_pos(h_q_row_of_bus[bus], h_vm_col_of_bus[bus]);
         }
     }
 
@@ -639,7 +644,6 @@ AcPfNrState::AcPfNrState(
     d_J_values.resize(nnz_J);  zero_d(d_J_values, cs);
 
     timings.t_upload_ms = ms_since(t_upload_start);
-    timings.t_init_ms   = ms_since(t_wall_start);
 
     // =========================================================================
     // 4.4  cuSPARSE SpMV descriptor  (Ybus · d_V → d_Ibus)
@@ -698,12 +702,22 @@ AcPfNrState::AcPfNrState(
     dss_x.create_dn(dim_J, thrust::raw_pointer_cast(d_dx.data()));
     dss_b.create_dn(dim_J, thrust::raw_pointer_cast(d_F.data()));
 
+    // t_init_ms captured HERE (not right after the H→D uploads above): it must
+    // also cover the cuSPARSE SpMV descriptor and cuDSS handle/config/data/
+    // matrix-descriptor creation just above -- on a process' first CUDA call
+    // these dlopen + PTX-JIT the cuSPARSE/cuDSS backends, which can dominate
+    // total wall time and would otherwise land in a completely untimed gap.
+    timings.t_init_ms = ms_since(t_wall_start);
+
     // ANALYSIS: reordering + symbolic factorisation.
     // Wall-clock timing via chrono (mixed CPU/GPU work; a CUDA event pair
-    // would only capture the GPU tail).
+    // would only capture the GPU tail). analyze() runs on stream cs, so
+    // synchronize before sampling the end time -- otherwise the wall-clock
+    // could stop while ANALYSIS is still in flight on the GPU.
     {
         auto t_analyse = std::chrono::steady_clock::now();
         dss.analyze(dss_A, dss_x, dss_b);
+        cs.synchronize();
         timings.t_analyze_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_analyse).count();
     }
@@ -802,28 +816,61 @@ AcPfNrState::AcPfNrState(
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
 
-    for (int iter = 0; iter < max_iter; ++iter)
-    {
-        timings.nb_iter++;
-
+    if (presolved_v) {
+        // =====================================================================
+        // Presolved-V fast path (init_from_n_powerflow)
+        //
+        //   Vinit is trusted to already be converged (e.g. lightsim2grid's CPU
+        //   KLU solve). Run steps ①-④ once at Vinit — fill_F/fill_J/FACTORIZE —
+        //   to validate ‖F(Vinit)‖∞ and prepare J's factors for prepare_JT() /
+        //   the direct_base_case_factors batch strategy. d_V itself is NEVER
+        //   touched by update_Va/update_Vm in this branch: it stays bit-identical
+        //   to the caller-supplied Vinit instead of being perturbed by the
+        //   needless solve+update_V the max_iter=1 path used to always perform
+        //   (see the trade-off note above nr_iter_step's normal loop below).
+        //
+        //   Caveat -- extension running state: MultiSlack (slack_absorbed) and
+        //   VoltageControl (vc_q) hold state that is NOT a function of V alone
+        //   (e.g. a distributed-slack participant's P row measures how much
+        //   power the slack must additionally supply beyond its scheduled
+        //   Sbus -- that quantity is itself an unknown, not implied by V). This
+        //   state defaults to zero, which is generally wrong even when V0 is
+        //   electrically exact, so a fill_F at (Vinit, state=0) can show a large
+        //   residual purely from the stale state. When such an extension is
+        //   active we derive the correct state with ONE linear solve (mirroring
+        //   exactly how lightsim2grid's own NR loop updates slack_absorbed/vc_q
+        //   each iteration: `state += dx(state_col)`), but apply ONLY the
+        //   feature-state kernels (nr_feature_update) -- never
+        //   update_Va_kernel/update_Vm_kernel -- so V still never moves.
+        // =====================================================================
         NrIterTimings step;
-        nr_iter_step(spmv, dss, dss_A, dss_x, dss_b, buf,
-                     n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
-                     /*actual_batch=*/1, cs, timer,
-                     /*first_factorize=*/(iter == 0), step);
+        nr_iter_step_prepare(spmv, dss, dss_A, dss_x, dss_b, buf,
+                             n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
+                             /*actual_batch=*/1, cs, timer,
+                             /*first_factorize=*/true, step);
         timings.t_spmv            += step.t_spmv;
         timings.t_fill_F          += step.t_fill_F;
         timings.t_fill_J          += step.t_fill_J;
         timings.t_first_factorize += step.t_first_factorize;
-        timings.t_refactorize     += step.t_refactorize;
-        if (iter > 0) timings.n_refactorize++;
-        timings.t_solve           += step.t_solve;
-        timings.t_update_V        += step.t_update_V;
 
-        // ‖F‖∞ convergence check on the mismatch left by nr_iter_step.
-        // d_F holds −[ΔP, ΔQ] of the just-updated V; no extra SpMV needed.
+        const bool has_ext_state = (slack_col >= 0) || (n_vc_ctrl > 0);
+        if (has_ext_state) {
+            timer.start();
+            dss.solve(dss_A, dss_x, dss_b);
+            timings.t_solve += timer.stop_ms();
+
+            timer.start();
+            nr_feature_update(buf, dim_J, /*batch=*/1, cs);
+            timings.t_update_V += timer.stop_ms();  // feature-state only; d_V untouched
+
+            // Ibus is unchanged (V didn't move): refresh F with the corrected
+            // feature state without redoing SpMV/fill_J/factorize.
+            nr_iter_step_fill_F(buf, n_bus, dim_J, /*actual_batch=*/1, cs, timer, step);
+            timings.t_fill_F += step.t_fill_F;
+        }
+
         timer.start();
-        cuda_real_type norm_F = thrust::transform_reduce(
+        cuda_real_type norm_F0 = thrust::transform_reduce(
             thrust::cuda::par.on(cs),
             d_F.begin(), d_F.end(),
             AbsFunctor{},
@@ -831,14 +878,70 @@ AcPfNrState::AcPfNrState(
             thrust::maximum<cuda_real_type>());
         timings.t_mismatch += timer.stop_ms();
 
-        if (norm_F < static_cast<cuda_real_type>(tol)) {
-            timings.converged = true;
-            break;
+        // Guard against tol being tuned for lightsim2grid's FP64 CPU check
+        // while the GPU build is FP32 — casting V0 to complex64 alone can push
+        // the FP32 residual above a tight FP64 tol even though nothing is wrong.
+#ifdef GPUSIM2GRID_REAL_FLOAT
+        constexpr cuda_real_type kPresolvedFloor = 1e-4f;
+#else
+        constexpr cuda_real_type kPresolvedFloor = 1e-10;
+#endif
+        const cuda_real_type effective_tol =
+            std::max(static_cast<cuda_real_type>(tol), kPresolvedFloor);
+
+        timings.nb_iter = 0;
+        timings.converged = (norm_F0 < effective_tol);
+        if (!timings.converged) {
+            throw std::runtime_error(
+                "[acpf_nr] presolved_v=true (init_from_n_powerflow) but "
+                "||F(V0)||_inf = " + std::to_string(norm_F0) +
+                " exceeds effective_tol = " + std::to_string(effective_tol) +
+                " (tol=" + std::to_string(tol) + "). The supplied voltage is "
+                "not converged for this Ybus/Sbus/ledger -- disable "
+                "init_from_n_powerflow or re-check the CPU base-case solve.");
         }
+        // d_V left untouched at Vinit; d_J_values holds J(Vinit), already
+        // factorized via dss -- ready for prepare_JT() and the
+        // direct_base_case_factors batch strategy.
+    } else {
+        for (int iter = 0; iter < max_iter; ++iter)
+        {
+            timings.nb_iter++;
+
+            NrIterTimings step;
+            nr_iter_step(spmv, dss, dss_A, dss_x, dss_b, buf,
+                         n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
+                         /*actual_batch=*/1, cs, timer,
+                         /*first_factorize=*/(iter == 0), step);
+            timings.t_spmv            += step.t_spmv;
+            timings.t_fill_F          += step.t_fill_F;
+            timings.t_fill_J          += step.t_fill_J;
+            timings.t_first_factorize += step.t_first_factorize;
+            timings.t_refactorize     += step.t_refactorize;
+            if (iter > 0) timings.n_refactorize++;
+            timings.t_solve           += step.t_solve;
+            timings.t_update_V        += step.t_update_V;
+
+            // ‖F‖∞ convergence check on the mismatch left by nr_iter_step.
+            // d_F holds −[ΔP, ΔQ] of the just-updated V; no extra SpMV needed.
+            timer.start();
+            cuda_real_type norm_F = thrust::transform_reduce(
+                thrust::cuda::par.on(cs),
+                d_F.begin(), d_F.end(),
+                AbsFunctor{},
+                cuda_real_type(0.),
+                thrust::maximum<cuda_real_type>());
+            timings.t_mismatch += timer.stop_ms();
+
+            if (norm_F < static_cast<cuda_real_type>(tol)) {
+                timings.converged = true;
+                break;
+            }
+        }
+        // §4.8 (post-loop final check) is no longer needed: nr_iter_step always
+        // recomputes d_F before the convergence test above, so timings.converged
+        // is accurate whether the loop exited via break or by exhausting max_iter.
     }
-    // §4.8 (post-loop final check) is no longer needed: nr_iter_step always
-    // recomputes d_F before the convergence test above, so timings.converged
-    // is accurate whether the loop exited via break or by exhausting max_iter.
 
     // =========================================================================
     // 4.9  Snapshot base-case solution (D→D, on cs)
@@ -868,12 +971,14 @@ void AcPfNrState::copy_V_to_host(Eigen::Ref<CplxVect> V_out) const
     // of any pending work on cs and read stale device data.
     cs.synchronize();
 
+    auto t_copy_start = std::chrono::steady_clock::now();
     thrust::host_vector<cudaComplexType> h_V = d_V;   // D→H, default stream
     V_out.resize(n_bus);
     for (int i = 0; i < n_bus; ++i)
         V_out(i) = eigen_cplx_type(
             static_cast<eigen_real_type>(h_V[i].x),
             static_cast<eigen_real_type>(h_V[i].y));
+    timings.t_copy_v_to_host_ms = ms_since(t_copy_start);
 }
 
 // =============================================================================
@@ -918,13 +1023,15 @@ AcPfNrSession::AcPfNrSession(
     int                                         max_iter,
     eigen_real_type                             tol,
     int                                         device,
-    const LedgerData*                           ledger
+    const LedgerData*                           ledger,
+    bool                                         presolved_v
 )
 {
     (void)slack_ids;
     (void)slack_weights;
     state_ = std::make_shared<AcPfNrState>(Ybus, Vinit, Sbus, pv, pq,
-                                            max_iter, tol, device, ledger);
+                                            max_iter, tol, device, ledger,
+                                            presolved_v);
 }
 
 // =============================================================================
@@ -941,6 +1048,13 @@ AcPfNrSession::AcPfNrSession(
 
 void AcPfNrState::prepare_JT()
 {
+    // Wall-clock timing via chrono (mixed CPU/GPU work: cusparseCsr2cscEx2 +
+    // a full cuDSS analyze+factorize on the transposed system). Synchronize
+    // before sampling the end time so the GPU work is actually complete --
+    // this call was previously entirely untimed, hiding a one-time cost
+    // comparable to t_analyze_ms + t_first_factorize combined.
+    auto t_prep_start = std::chrono::steady_clock::now();
+
     // Allocate device storage for Jᵀ CSR and work vectors
     d_JT_outer.resize(dim_J + 1);
     d_JT_inner.resize(nnz_J);
@@ -1018,6 +1132,9 @@ void AcPfNrState::prepare_JT()
 
     dss_T.analyze(dss_AT, dss_xT, dss_bT);
     dss_T.factorize(dss_AT, dss_xT, dss_bT);
+
+    cs.synchronize();
+    timings.t_prepare_jt_ms = ms_since(t_prep_start);
 }
 
 void AcPfNrState::solve_JT(const cuda_real_type* d_rhs, cuda_real_type* d_sol)
@@ -1069,3 +1186,8 @@ std::vector<int> AcPfNrSession::pq() const {
     thrust::host_vector<int> h(state_->d_pq);
     return std::vector<int>(h.begin(), h.end());
 }
+
+std::vector<int> AcPfNrSession::p_row_of_bus()     const { return state_->h_p_row_of_bus; }
+std::vector<int> AcPfNrSession::q_row_of_bus()     const { return state_->h_q_row_of_bus; }
+std::vector<int> AcPfNrSession::theta_col_of_bus() const { return state_->h_theta_col_of_bus; }
+std::vector<int> AcPfNrSession::vm_col_of_bus()    const { return state_->h_vm_col_of_bus; }

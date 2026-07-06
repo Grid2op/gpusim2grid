@@ -274,23 +274,52 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 }
 
 // -----------------------------------------------------------------------------
-// nr_iter_step
+// nr_iter_step_fill_F
 //
-// Executes one Newton-Raphson iteration on stream cs:
+// Step ② alone: −[ΔP(pvpq), ΔQ(pq)] scattered into the ledger P/Q rows, at
+// whatever d_V/d_Ibus/feature-state (d_slack_absorbed, d_vc_q) currently hold.
+// Extracted so a caller that already has a valid d_Ibus (V unchanged since the
+// last SpMV) can refresh d_F after updating feature state alone — e.g. the
+// presolved-V fast path, after seeding slack_absorbed/vc_q via one linear
+// solve without moving V (see nr_iter_step_prepare's fast-path note below).
+// -----------------------------------------------------------------------------
+inline void nr_iter_step_fill_F(
+    const NrIterBuffers& buf,
+    int n_bus, int dim_J,
+    int actual_batch,
+    cudaStream_t cs,
+    CudaTimer&   timer,
+    NrIterTimings& t)
+{
+    timer.start();
+    fill_FP_kernel<<<(actual_batch * buf.n_p + BS - 1) / BS, BS, 0, cs>>>(
+        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
+        buf.n_p, n_bus, dim_J, actual_batch, buf.sbus_stride);
+    fill_FQ_kernel<<<(actual_batch * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
+        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
+        buf.n_q, n_bus, dim_J, actual_batch, buf.sbus_stride);
+    nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
+    t.t_fill_F += timer.stop_ms();
+}
+
+// -----------------------------------------------------------------------------
+// nr_iter_step_prepare
+//
+// Steps ①-④ of one Newton-Raphson iteration on stream cs:
 //   ①  SpMV:        d_Ibus = Ybus · d_V
-//   ②  Fill F:      −[ΔP(pvpq), ΔQ(pq)]
-//   ③  Fill J:      Jacobian numeric values from V, Ibus, Ybus
+//   ②  Fill F:      −[ΔP(pvpq), ΔQ(pq)]   (residual AT THE CURRENT d_V)
+//   ③  Fill J:      Jacobian numeric values from V, Ibus, Ybus (AT THE CURRENT d_V)
 //   ④  Factorize:   full (first_factorize=true) or numeric-only refactorize
-//   ⑤  Solve:       d_dx = J⁻¹ · d_F
-//   ⑥  Update V:    Va (pvpq) then Vm (pq) in-place
+//
+// Leaves d_F holding the mismatch at the current d_V and dss_A holding the
+// factorized J at that same d_V — both ready either for nr_iter_step_correct
+// (the normal path) or for a caller that wants to stop here (the presolved-V
+// fast path: validate ‖F‖, keep V exactly as supplied, never call solve/update).
 //
 // first_factorize=true  → dss.factorize()   (CUDSS_PHASE_FACTORIZATION)
 // first_factorize=false → dss.refactorize() (CUDSS_PHASE_REFACTORIZATION)
-//
-// Both update kernels are launched on the same stream and are therefore
-// serialised by CUDA without any explicit event.
 // -----------------------------------------------------------------------------
-inline void nr_iter_step(
+inline void nr_iter_step_prepare(
     CuSpMV&          spmv,
     CudssContext&    dss,
     CudssDescriptor& dss_A,
@@ -304,21 +333,15 @@ inline void nr_iter_step(
     bool         first_factorize,
     NrIterTimings& t)
 {
+    (void)n_pvpq; (void)n_pq;
+
     // ①  SpMV: d_Ibus = Ybus · d_V
     timer.start();
     spmv.spmv();
     t.t_spmv += timer.stop_ms();
 
     // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
-    timer.start();
-    fill_FP_kernel<<<(actual_batch * buf.n_p + BS - 1) / BS, BS, 0, cs>>>(
-        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
-        buf.n_p, n_bus, dim_J, actual_batch, buf.sbus_stride);
-    fill_FQ_kernel<<<(actual_batch * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
-        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
-        buf.n_q, n_bus, dim_J, actual_batch, buf.sbus_stride);
-    nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
-    t.t_fill_F += timer.stop_ms();
+    nr_iter_step_fill_F(buf, n_bus, dim_J, actual_batch, cs, timer, t);
 
     // ③  Fill J values; notify cuDSS that the values pointer changed.
     //     When an additive feature (HVDC droop) is active, J must be zeroed first
@@ -340,7 +363,33 @@ inline void nr_iter_step(
     else                 dss.refactorize(dss_A, dss_x, dss_b);
     if (first_factorize) t.t_first_factorize += timer.stop_ms();
     else                 t.t_refactorize     += timer.stop_ms();
+}
 
+// -----------------------------------------------------------------------------
+// nr_iter_step_correct
+//
+// Steps ⑤-⑥ of one Newton-Raphson iteration on stream cs:
+//   ⑤  Solve:       d_dx = J⁻¹ · d_F
+//   ⑥  Update V:    Va (pvpq) then Vm (pq) in-place
+//
+// Requires nr_iter_step_prepare to have just been called (dss_A factorized,
+// d_F holding the mismatch at the pre-update d_V).
+//
+// Both update kernels are launched on the same stream and are therefore
+// serialised by CUDA without any explicit event.
+// -----------------------------------------------------------------------------
+inline void nr_iter_step_correct(
+    CudssContext&    dss,
+    CudssDescriptor& dss_A,
+    CudssDescriptor& dss_x,
+    CudssDescriptor& dss_b,
+    const NrIterBuffers& buf,
+    int n_bus, int dim_J,
+    int actual_batch,
+    cudaStream_t cs,
+    CudaTimer&   timer,
+    NrIterTimings& t)
+{
     // ⑤  Solve: d_dx = J⁻¹ · d_F
     timer.start();
     dss.solve(dss_A, dss_x, dss_b);
@@ -358,6 +407,35 @@ inline void nr_iter_step(
         buf.n_vm, n_bus, dim_J, actual_batch);
     nr_feature_update(buf, dim_J, actual_batch, cs);
     t.t_update_V += timer.stop_ms();
+}
+
+// -----------------------------------------------------------------------------
+// nr_iter_step
+//
+// Executes one full Newton-Raphson iteration: nr_iter_step_prepare() followed
+// by nr_iter_step_correct(). Thin wrapper kept so existing call sites
+// (acpf_nr.cu's normal loop, contingency/batch_pf_driver.cuh's per-chunk loop)
+// are unchanged.
+// -----------------------------------------------------------------------------
+inline void nr_iter_step(
+    CuSpMV&          spmv,
+    CudssContext&    dss,
+    CudssDescriptor& dss_A,
+    CudssDescriptor& dss_x,
+    CudssDescriptor& dss_b,
+    const NrIterBuffers& buf,
+    int n_bus, int n_pvpq, int n_pq, int dim_J, int nnz_Y, int nnz_J,
+    int actual_batch,
+    cudaStream_t cs,
+    CudaTimer&   timer,
+    bool         first_factorize,
+    NrIterTimings& t)
+{
+    nr_iter_step_prepare(spmv, dss, dss_A, dss_x, dss_b, buf,
+                         n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
+                         actual_batch, cs, timer, first_factorize, t);
+    nr_iter_step_correct(dss, dss_A, dss_x, dss_b, buf,
+                         n_bus, dim_J, actual_batch, cs, timer, t);
 }
 
 #endif  // NR_ITER_STEP_CUH

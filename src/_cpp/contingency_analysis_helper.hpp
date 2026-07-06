@@ -97,6 +97,16 @@ struct Contingency {
     //   bus (an island we cannot solve), so it is compacted out → NaN, exactly
     //   like a fully-disconnecting contingency in the legacy path.
     std::vector<int> masked_buses;
+
+    // Branch ids (lines-then-trafos) tripped by this contingency, populated
+    // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.
+    // Used ONLY by compute_limit_violations' fused per-contingency current
+    // check (see build_tripped_branch_table below) to skip branches whose
+    // Ybus coefficients were patched but whose own yff/yft/ytf/ytt are
+    // unchanged (they would otherwise report a phantom nonzero current). This
+    // is a second, independent index space from Triplet::k (CSR flat index
+    // into Ybus) — no interaction with resolve_indices()/build_flat_patches().
+    std::vector<int> tripped_branches;
 };
 
 // ---------------------------------------------------------------------------
@@ -330,5 +340,33 @@ void build_mask_entries(
     std::vector<int>&               h_maskv_slot,
     std::vector<int>&               h_maskv_bus,
     std::vector<ChunkPatchRange>&   maskv_ranges);
+
+// ---------------------------------------------------------------------------
+// build_tripped_branch_table  (compute_limit_violations)
+//
+// Per-ACTIVE-SLOT (global, not per-chunk) flat lookup: for active slot s, the
+// branches tripped by contingency active_to_orig[s] live at
+// h_trip_branch_flat[h_trip_start[s] .. h_trip_start[s]+h_trip_count[s]).
+// Independent of chunk_size/chunking — chunking is just a contiguous slice of
+// the active-slot index space, so a chunk-relative kernel thread just uses
+// c_start + local_c to index these arrays directly, no chunk-relative rebuild
+// needed (unlike build_flat_patches/build_mask_entries's chunk-sliced layout).
+//
+// Parameters
+// ----------
+// contingencies      : contingencies with tripped_branches populated
+//                       (build_contingencies() does this verbatim)
+// active_to_orig     : [n_active] active-slot index -> original contingency
+//                       index (same array build_flat_patches() produces)
+// h_trip_branch_flat : output, concatenated tripped branch ids
+// h_trip_start       : output, [n_active] start offset into h_trip_branch_flat
+// h_trip_count       : output, [n_active] number of tripped branches
+// ---------------------------------------------------------------------------
+void build_tripped_branch_table(
+    const std::vector<Contingency>& contingencies,
+    const std::vector<int>&         active_to_orig,
+    std::vector<int>&               h_trip_branch_flat,
+    std::vector<int>&               h_trip_start,
+    std::vector<int>&               h_trip_count);
 
 #endif // CONTINGENCY_ANALYSIS_HELPER_HPP

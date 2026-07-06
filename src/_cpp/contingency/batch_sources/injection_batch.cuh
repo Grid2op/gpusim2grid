@@ -42,6 +42,7 @@
 #include "../../cu_complex_utils.h"
 #include "../../timing_utils.hpp"
 #include "../../acpf_nr_state.cuh"
+#include "../tripped_branch_table.hpp"    // TrippedBranchTable
 
 struct BatchPfDriverContext;
 struct NrIterBuffers;
@@ -145,6 +146,11 @@ struct InjectionBatch {
     // their off defaults.
     void fill_mask_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/,
                            const int* /*d_J_outer*/) const {}
+
+    // BatchSource concept: the injection sweep never trips branches (topology
+    // is fixed) — compute_limit_violations is scoped to contingency analysis
+    // only, so this trivial all-nullptr table is never actually consulted.
+    TrippedBranchTable tripped_branch_table() const { return TrippedBranchTable{nullptr, nullptr, nullptr}; }
 
     double cpu_preprocess_ms() const { return t_preprocess_ms; }
 };

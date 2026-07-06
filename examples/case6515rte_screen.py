@@ -14,35 +14,39 @@ import sys
 
 import numpy as np
 
-from _common import load_case, branch_data
-from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+from _common import load_case, print_batch_timings
+from gpusim2grid import ContingencyAnalysisGPU
 
 _RESIDUAL_CONVERGED = 1e-4
 
 
-def main(case="case6515rte", batch_size=256):
+def main(case="case6515rte", batch_size=256, handle_disconnected_grid=True):
     print(f"Loading {case} and solving the base case on the CPU ...")
     d = load_case(case)
-    branch_args, n_lines, n_trafos = branch_data(d["grid"])
+    grid = d["grid"]
+    n_lines = len(grid.get_lines())
+    n_trafos = len(grid.get_trafos())
     n_ctg = n_lines + n_trafos
     print(f"  n_bus={d['n_bus']}, branches={n_ctg} ({n_lines} lines, {n_trafos} trafos)")
 
     # One N-1 per branch.
     contingencies = [[c] for c in range(n_ctg)]
 
-    solver = ContingencyAnalysisSolver(
-        d["Ybus"], d["v_init"].copy(), d["Sbus"],
-        d["slack"], d["slack_weights"], d["pv"], d["pq"],
-        batch_size=batch_size, nb_iter=10, max_iter_base=10, tol_base=1e-6,
+    ca = ContingencyAnalysisGPU(
+        grid,
+        nb_iter=10,
+        max_iter_base=10,
+        tol_base=1e-6,
+        handle_disconnected_grid=handle_disconnected_grid,
     )
-    solver.set_branch_data(*branch_args)
-    solver.build_contingencies(contingencies)
+    ca.add_contingencies_by_branch_id(contingencies)
 
     print(f"Screening {n_ctg} contingencies on the GPU (batch_size={batch_size}) ...")
-    solver.run()
+    ca.compute(batch_size=batch_size)
+    ca.compute_flows()
 
-    residuals = solver.residuals.to_numpy()
-    timings = solver.timings
+    residuals = ca.last_residuals()
+    timings = ca.timings
 
     finite = np.isfinite(residuals)
     converged = finite & (np.abs(residuals) < _RESIDUAL_CONVERGED)
@@ -50,9 +54,8 @@ def main(case="case6515rte", batch_size=256):
 
     print(f"  converged           : {n_conv}/{n_ctg} ({n_conv / n_ctg:.1%})")
     print(f"  disconnecting (NaN) : {int((~finite).sum())}")
-    print(f"  chunks              : {timings.n_chunks}")
-    print(f"  total chunk time    : {timings.t_chunks_total_wall_ms:.1f} ms")
-    print(f"  per contingency     : {timings.t_per_contingency_ms:.4f} ms")
+    print()
+    print_batch_timings(timings, unit="contingency", unit_plural="contingencies")
 
     # Show the worst (largest finite residual) non-trivial contingencies.
     order = np.argsort(np.where(finite, np.abs(residuals), -np.inf))[::-1]

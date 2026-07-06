@@ -423,7 +423,7 @@ class TestInjectionSweepFacade:
 
 
 # ---------------------------------------------------------------------------
-# Stateful solver — InjectionSweepSolver
+# Stateful solver — _InjectionSweepSolver
 #
 # Validates that the stateful wrapper reuses the base case across runs and
 # produces results identical to the one-shot entry point.
@@ -431,9 +431,9 @@ class TestInjectionSweepFacade:
 
 class TestInjectionSweepSolver:
     def _make_solver(self, ieee14_base_case, batch_size=5, nb_iter=10):
-        from gpusim2grid.injection_sweep import InjectionSweepSolver
+        from gpusim2grid.injection_sweep import _InjectionSweepSolver
         d = ieee14_base_case
-        return InjectionSweepSolver(
+        return _InjectionSweepSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=batch_size, nb_iter=nb_iter,

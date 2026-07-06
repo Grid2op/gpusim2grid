@@ -155,7 +155,7 @@ def branch_triplets(gridmodel, branch_id: int, *, is_powerline: bool = True):
 
 
 def branch_data_arrays(grid):
-    """ContingencyAnalysisSolver.set_branch_data args (effective π-model
+    """_ContingencyAnalysisSolver.set_branch_data args (effective π-model
     admittances) plus (n_lines, n_trafos).
 
     Branch index c < n_lines is line c; c >= n_lines is trafo (c - n_lines) —
@@ -179,7 +179,7 @@ def branch_data_arrays(grid):
 def branch_eff_triplet(branch_data, c):
     """The four (row, col, yr, yi) Ybus entries for branch c, built from the
     effective admittances in branch_data.  Subtracting them from Ybus removes
-    branch c — matching the patch ContingencyAnalysisSolver applies internally.
+    branch c — matching the patch _ContingencyAnalysisSolver applies internally.
     """
     branch_from, branch_to, yff, yft, ytf, ytt = branch_data[:6]
     i, j = int(branch_from[c]), int(branch_to[c])
@@ -235,12 +235,12 @@ def ieee14_cpu_n1_reference(ieee14_grid, ieee14_base_case):
 
 
 # ---------------------------------------------------------------------------
-# ContingencyAnalysisSolver with branch flows (session-scoped)
+# _ContingencyAnalysisSolver with branch flows (session-scoped)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
 def ieee14_solver_with_flows(ieee14_grid, ieee14_base_case):
-    """Run ContingencyAnalysisSolver on IEEE 14 and compute branch flows.
+    """Run _ContingencyAnalysisSolver on IEEE 14 and compute branch flows.
 
     Returns a dict with:
       or_amps       — shape (n_ctg, n_branches), ampere flows at origin side
@@ -249,7 +249,7 @@ def ieee14_solver_with_flows(ieee14_grid, ieee14_base_case):
                         for lid < n_lines, trafo for lid >= n_lines)
       n_lines, n_trafos, n_branches
     """
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
     grid = ieee14_grid
     d = ieee14_base_case
@@ -271,7 +271,7 @@ def ieee14_solver_with_flows(ieee14_grid, ieee14_base_case):
 
     cont_branch_ids = [[l] for l in range(n_lines)] + [[n_lines + t] for t in range(n_trafos)]
 
-    solver = ContingencyAnalysisSolver(
+    solver = _ContingencyAnalysisSolver(
         d["Ybus"], d["v_init"].copy(), d["Sbus"],
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=5, nb_iter=10, max_iter_base=10, tol_base=1e-6,

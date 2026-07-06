@@ -37,6 +37,7 @@
 #include "../../acpf_nr_state.cuh"
 #include "../../contingency_analysis_helper.hpp"
 #include "../../nr_iter_step.cuh"         // BS
+#include "../tripped_branch_table.hpp"    // TrippedBranchTable
 
 // Forward declaration to avoid circular include.
 struct BatchPfDriverContext;
@@ -101,6 +102,15 @@ struct ContingencyBatch {
     thrust::device_vector<int>   d_mask_slot, d_mask_row, d_mask_diag;
     thrust::device_vector<int>   d_maskv_slot, d_maskv_bus;
 
+    // -------------------------------------------------------------------------
+    // compute_limit_violations: per-active-slot (global, not per-chunk)
+    // tripped-branch lookup table — see build_tripped_branch_table. Built
+    // unconditionally (cheap: O(n_active + total_trips) ints) so it costs
+    // nothing when nobody enables compute_limit_violations.
+    // -------------------------------------------------------------------------
+    std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
+    thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
+
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
 
@@ -159,6 +169,9 @@ struct ContingencyBatch {
                                h_mask_slot_, h_mask_row_, h_mask_diag_, mask_row_ranges_,
                                h_maskv_slot_, h_maskv_bus_, maskv_ranges_);
 
+        build_tripped_branch_table(contingencies, active_to_orig_,
+                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+
         t_preprocess_ms = cb_ms_since(t_start);
     }
 
@@ -195,6 +208,18 @@ struct ContingencyBatch {
         if (!h_maskv_slot_.empty()) {
             upload_h2d(d_maskv_slot, h_maskv_slot_.data(), h_maskv_slot_.size(), cs);
             upload_h2d(d_maskv_bus,  h_maskv_bus_.data(),  h_maskv_bus_.size(),  cs);
+        }
+
+        // compute_limit_violations tripped-branch table (see the ctor's
+        // build_tripped_branch_table call). h_trip_start_/h_trip_count_ are
+        // always sized n_active (possibly all-zero counts); h_trip_branch_flat_
+        // may be empty when no contingency in this batch trips any branch.
+        if (!h_trip_start_.empty()) {
+            upload_h2d(d_trip_start, h_trip_start_.data(), h_trip_start_.size(), cs);
+            upload_h2d(d_trip_count, h_trip_count_.data(), h_trip_count_.size(), cs);
+            if (!h_trip_branch_flat_.empty())
+                upload_h2d(d_trip_branch_flat, h_trip_branch_flat_.data(),
+                           h_trip_branch_flat_.size(), cs);
         }
     }
 
@@ -242,6 +267,19 @@ struct ContingencyBatch {
                 && !d_active_to_orig.empty())
                ? thrust::raw_pointer_cast(d_active_to_orig.data())
                : nullptr;
+    }
+
+    // -------------------------------------------------------------------------
+    // tripped_branch_table — device pointers into this batch's tripped-branch
+    // lookup table, indexed by GLOBAL active-slot id (see
+    // build_tripped_branch_table). Consumed by check_limit_violations_kernel
+    // to skip branches tripped by the contingency it is currently checking.
+    // -------------------------------------------------------------------------
+    TrippedBranchTable tripped_branch_table() const {
+        return TrippedBranchTable{
+            thrust::raw_pointer_cast(d_trip_start.data()),
+            thrust::raw_pointer_cast(d_trip_count.data()),
+            thrust::raw_pointer_cast(d_trip_branch_flat.data())};
     }
 
     // -------------------------------------------------------------------------

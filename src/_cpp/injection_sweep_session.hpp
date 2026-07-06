@@ -104,8 +104,11 @@ struct InjectionSweepSession {
     // Host-side preprocessing time for the per-unit Sbus build (run()).
     double t_sbus_build_ms_ = 0.;
 
-    // Timings from the most recent run().
-    BatchTimings timings_;
+    // Timings from the most recent run(). Mutable so the const
+    // get_V_results()/get_residuals() accessors can record their own D→H
+    // transfer time (t_copy_V_to_host_ms / t_copy_residuals_to_host_ms)
+    // without relaxing their constness.
+    mutable BatchTimings timings_;
 
     // =========================================================================
     // Constructor — runs base-case NR to convergence (AcPfNrState construction).
@@ -123,7 +126,8 @@ struct InjectionSweepSession {
         int    max_iter_base = 10,
         double tol_base      = 1e-6,
         int    device        = -1,
-        const LedgerData* ledger = nullptr   // augmented-J description (bridge path)
+        const LedgerData* ledger = nullptr,  // augmented-J description (bridge path)
+        bool   presolved_v   = false  // trust Vinit as already converged; see AcPfNrState
     );
 
     // =========================================================================

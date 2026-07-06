@@ -368,6 +368,29 @@ void build_mask_entries(
 }
 
 // ---------------------------------------------------------------------------
+// build_tripped_branch_table
+// ---------------------------------------------------------------------------
+void build_tripped_branch_table(
+    const std::vector<Contingency>& contingencies,
+    const std::vector<int>&         active_to_orig,
+    std::vector<int>&               h_trip_branch_flat,
+    std::vector<int>&               h_trip_start,
+    std::vector<int>&               h_trip_count)
+{
+    const int n_active = static_cast<int>(active_to_orig.size());
+    h_trip_start.resize(static_cast<size_t>(n_active));
+    h_trip_count.resize(static_cast<size_t>(n_active));
+    h_trip_branch_flat.clear();
+
+    for (int slot = 0; slot < n_active; ++slot) {
+        const auto& tb = contingencies[static_cast<size_t>(active_to_orig[slot])].tripped_branches;
+        h_trip_start[static_cast<size_t>(slot)] = static_cast<int>(h_trip_branch_flat.size());
+        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size());
+        h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_blockdiag_csr
 // ---------------------------------------------------------------------------
 void build_blockdiag_csr(

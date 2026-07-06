@@ -201,15 +201,106 @@ def test_dlpack_round_trip(ieee14_grid):
 
 
 # ---------------------------------------------------------------------------
+# Presolved-V fast path (init_from_n_powerflow skips the GPU NR loop entirely)
+# ---------------------------------------------------------------------------
+
+@requires_gpu
+def test_acpf_gpu_presolved_v_bit_identical(ieee14_grid, ieee14_base_case):
+    """AcPfGPU(init_from_n_powerflow=True) never perturbs V: bit-identical to
+    lightsim2grid's own converged voltage."""
+    from gpusim2grid import AcPfGPU
+
+    grid = ieee14_grid
+    V_cpu = grid.get_V_solver()
+
+    ac = AcPfGPU(grid, init_from_n_powerflow=True)
+    V = ac.solve()
+
+    assert np.array_equal(V, V_cpu), "presolved V must be bit-identical to V0"
+    assert ac.timings.nb_iter == 0
+    assert ac.timings.converged is True
+
+
+@requires_gpu
+def test_acpf_gpu_presolved_v_false_matches_reference(
+        ieee14_grid, ieee14_base_case, solver_atol):
+    """init_from_n_powerflow=False still converges to the same voltage (it just
+    doesn't skip the GPU NR loop)."""
+    from gpusim2grid import AcPfGPU
+
+    ac = AcPfGPU(ieee14_grid, init_from_n_powerflow=False, max_iter=10, tol=1e-8)
+    V = ac.solve()
+    np.testing.assert_allclose(
+        np.abs(V), np.abs(ieee14_base_case["v_ref"]), atol=10 * solver_atol)
+
+
+@requires_gpu
+def test_acpf_gpu_presolved_v_raises_when_not_converged():
+    """init_from_n_powerflow=True must fail loudly if V0 is not actually
+    converged for the given Ybus/Sbus/ledger (stale grid, wrong tol_base, ...)."""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+    from gpusim2grid import AcPfGPU
+
+    grid = init_from_pandapower(pn.case14())
+    grid.change_algorithm(AlgorithmType.NR_KLU)
+    n_bus = grid.get_bus_vn_kv().shape[0]
+    # Force an early stop (1 iteration, huge tolerance) so V0 is not converged.
+    grid.ac_pf(np.ones(n_bus, dtype=complex), 1, 1e10)
+
+    with pytest.raises(RuntimeError):
+        AcPfGPU(grid, init_from_n_powerflow=True)
+
+
+@requires_gpu
+def test_contingency_gpu_presolved_v_base_matches_cpu(ieee14_grid, ieee14_base_case):
+    """The base case tiled across the contingency batch is bit-identical to V0
+    (not perturbed by a needless NR correction), via the DLPack base-voltage
+    export."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("torch CUDA not available")
+
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid = ieee14_grid
+    V_cpu = grid.get_V_solver()
+
+    ca = ContingencyAnalysisGPU(grid, init_from_n_powerflow=True, nb_iter=4)
+    capsule = ca.solver.v_base_dlpack()
+    V_base = torch.from_dlpack(capsule).cpu().numpy()
+
+    np.testing.assert_array_equal(V_base, V_cpu)
+
+
+@requires_gpu
+def test_acpf_nr_session_presolved_v_low_level(ieee14_base_case):
+    """The low-level (non-bridge, raw-array) AcPfNrSession also supports
+    presolved_v, for parity between the bridge and Python-extraction paths."""
+    from gpusim2grid._gpusim2grid import AcPfNrSession
+
+    d = ieee14_base_case
+    sess = AcPfNrSession(
+        d["Ybus"], d["v_ref"], d["Sbus"],
+        d["slack"], d["slack_weights"], d["pv"], d["pq"],
+        10, 1e-8, -1, presolved_v=True)
+
+    assert np.array_equal(sess.get_v(), d["v_ref"])
+    assert sess.timings.nb_iter == 0
+    assert sess.timings.converged is True
+
+
+# ---------------------------------------------------------------------------
 # Backward compatibility
 # ---------------------------------------------------------------------------
 
 @requires_gpu
 def test_backward_compat_solver_imports():
     """The original low-level wrappers remain importable and constructible."""
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
-    from gpusim2grid.injection_sweep import InjectionSweepSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
+    from gpusim2grid.injection_sweep import _InjectionSweepSolver
     from gpusim2grid.acpf_nr import AcPfNrSession  # noqa: F401
 
-    assert ContingencyAnalysisSolver is not None
-    assert InjectionSweepSolver is not None
+    assert _ContingencyAnalysisSolver is not None
+    assert _InjectionSweepSolver is not None
