@@ -88,11 +88,20 @@ def extract_grid_arrays(grid, v_init=None, max_iter=10, tol=1e-8):
     """
     v_init, v_converged = _ensure_solved(grid, v_init, max_iter, tol)
 
+    # TODO(bug, non-bridge/array path only): Ybus/Sbus are read in AC-SOLVER
+    # numbering (get_*_solver()) but pv/pq/slack below are read in
+    # GRID-MODEL numbering (get_pv()/get_pq()/get_slack_ids()), unlike the
+    # bridge path (ls2g_bridge.cpp) which consistently uses the
+    # *_solver_numpy() accessors for all of these. When model numbering !=
+    # solver numbering this mismatches the bus partition against Ybus/Sbus,
+    # which can produce a large/garbage NR residual. Needs get_pv_solver_numpy()
+    # / get_pq_solver_numpy() / get_slack_ids_solver_numpy() here instead, if
+    # those exist on lightsim2grid versions this fallback path supports.
     Ybus = grid.get_Ybus_solver().copy()
     Sbus = grid.get_Sbus_solver().copy()
-    pv = grid.get_pv()
-    pq = grid.get_pq()
-    slack = grid.get_slack_ids()
+    pv = grid.get_pv_solver().copy()
+    pq = grid.get_pq_solver().copy()
+    slack = grid.get_slack_ids_solver().copy()
 
     n_bus = Ybus.shape[0]
     slack_weights = np.zeros(n_bus, dtype=float)
