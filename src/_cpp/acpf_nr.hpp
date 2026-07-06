@@ -18,6 +18,7 @@
 #include <vector>
 
 struct AcPfNrState;  // complete type in acpf_nr_state.cuh (nvcc only)
+struct LedgerData;   // complete type in ledger_data.hpp (augmented-J description)
 
 AcPfTimings acpf_nr_gpu(
     Eigen::Ref<CplxVect> out,
@@ -51,7 +52,9 @@ struct AcPfNrSession {
         Eigen::Ref<const Eigen::VectorXi>           pq,
         int                                         max_iter,
         eigen_real_type                             tol,
-        int                                         device = -1
+        int                                         device = -1,
+        const LedgerData*                           ledger = nullptr,
+        bool                                         presolved_v = false
     );
 
     AcPfTimings timings() const;
@@ -65,6 +68,15 @@ struct AcPfNrSession {
     int dim_J()  const;
     std::vector<int> pvpq() const;  // D→H copy of sorted pvpq indices
     std::vector<int> pq()   const;  // D→H copy of pq indices
+
+    // Bus-indexed NRLedger maps (host, size n_bus, -1 sentinel when the bus
+    // owns no such row/col). Used by the differentiable adjoint path to
+    // project/scatter gradients per-bus instead of assuming the trivial
+    // bare-system pvpq/pq positional layout — see ledger_data.hpp.
+    std::vector<int> p_row_of_bus()     const;
+    std::vector<int> q_row_of_bus()     const;
+    std::vector<int> theta_col_of_bus() const;
+    std::vector<int> vm_col_of_bus()    const;
 };
 
 #endif  // ACPFNR_H

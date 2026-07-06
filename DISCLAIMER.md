@@ -23,12 +23,17 @@ It is not meant to be used as an independent tool for power-system-focused analy
 In particular, **it implements a raw Newton-Raphson with no outer loop.**
 Some of its limitations include, but are not limited to:
 
-- it does not enforce reactive power limits on generators
-- it does not model AC/DC converters
+- it does not enforce reactive power limits on generators (no PV→PQ switching)
 - transformers have fixed tap ratio (though it can be changed at initialization of the solver)
 - shunts have fixed tap during the Newton-Raphson algorithm (though it can be changed at the initialization of the solver)
-- it does not apply distributed slack or other outer-loop corrections
+- it does not apply any outer-loop correction (Q limits, tap changing, …)
 - only powerflow ("steady state") can be performed
+
+The *in-Jacobian* power-system controls that lightsim2grid models — distributed
+slack, HVDC angle-droop, SVC, and remote generator voltage control — **are**
+solved (and match lightsim2grid) when the solver is seeded from a lightsim2grid
+grid, which is the default path. They are not solved on the low-level path that
+takes raw NumPy/SciPy arrays.
 
 It also requires a CUDA-capable NVIDIA GPU and cannot run on CPU-only machines or on
 non-NVIDIA accelerators.

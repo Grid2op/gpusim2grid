@@ -15,6 +15,7 @@
 #include "driver.cuh"                       // run_nr_loop<Policy>
 #include "../acpf_nr_kernels.cuh"
 #include "../nr_iter_step.cuh"              // NrIterBuffers, BS
+#include "violation_kernels.cuh"            // check_limit_violations_kernel
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -119,16 +120,15 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     t_preprocess_ms_ += bpf_ms_since(t_cpu_start);
 
     // -------------------------------------------------------------------------
-    // Upload block-diagonal structure
-    // -------------------------------------------------------------------------
-    upload_h2d(d_Ybus_batch_outer, h_batch_outer.data(), h_batch_outer.size(), cs);
-    upload_h2d(d_Ybus_batch_inner, h_batch_inner.data(), h_batch_inner.size(), cs);
-
-    // -------------------------------------------------------------------------
-    // Allocate chunk-sized working buffers
+    // Upload block-diagonal structure + allocate chunk-sized working buffers.
+    // Both folded under the same t_alloc_ms_ wall-clock window (the upload
+    // used to fall in a dead zone between t_preprocess_ms_ and t_alloc_ms_).
     // -------------------------------------------------------------------------
     {
         auto t_alloc_start = std::chrono::steady_clock::now();
+
+        upload_h2d(d_Ybus_batch_outer, h_batch_outer.data(), h_batch_outer.size(), cs);
+        upload_h2d(d_Ybus_batch_inner, h_batch_inner.data(), h_batch_inner.size(), cs);
 
         d_V_batch.resize(static_cast<size_t>(batch_size_) * n_bus);
         d_Ybus_values_batch.resize(static_cast<size_t>(batch_size_) * nnz_Y);
@@ -136,6 +136,12 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         d_F_batch.resize(static_cast<size_t>(batch_size_) * dim_J);
         d_dx_batch.resize(static_cast<size_t>(batch_size_) * dim_J);
         d_J_values_batch.resize(static_cast<size_t>(batch_size_) * nnz_J);
+
+        // Per-slot augmented-feature running state (allocated only when active).
+        if (base.slack_col >= 0)
+            d_slack_absorbed_batch.resize(batch_size_);
+        if (base.n_vc_ctrl > 0)
+            d_vc_q_batch.resize(static_cast<size_t>(batch_size_) * base.n_vc_ctrl);
 
         d_V_results.resize(static_cast<size_t>(n_contingencies) * n_bus);
         d_residuals.resize(n_contingencies, cuda_real_type(0));
@@ -192,7 +198,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     }
 
     // -------------------------------------------------------------------------
-    // cuDSS uniform-batch context + ANALYSIS + policy init + source init
+    // cuDSS uniform-batch context + ANALYSIS + policy init
     // -------------------------------------------------------------------------
     auto t_cudss_start = std::chrono::steady_clock::now();
 
@@ -213,14 +219,22 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
             batch_size_, nnz_J, cs);
     }, policy_);
 
-    // Source-specific one-time setup (e.g. InjectionBatch tiles base Ybus here).
+    cs.synchronize();
+    t_analysis_ms_ = bpf_ms_since(t_cudss_start);
+
+    // -------------------------------------------------------------------------
+    // Source-specific one-time setup (flat-patch/mask H→D upload for
+    // ContingencyBatch; full Sbus_all H→D upload + one-time Ybus D→D tiling
+    // for InjectionBatch). Timed separately from cuDSS ANALYSIS above so
+    // t_analysis_ms_ isn't a mix of unrelated GPU compute + transfer.
+    // -------------------------------------------------------------------------
+    auto t_source_start = std::chrono::steady_clock::now();
     {
         BatchPfDriverContext ctx = make_context();
         source_.initialize(ctx, cs);
     }
-
     cs.synchronize();
-    t_analysis_ms_ = bpf_ms_since(t_cudss_start);
+    t_source_init_ms_ = bpf_ms_since(t_source_start);
 }
 
 // =============================================================================
@@ -263,10 +277,10 @@ void BatchPfDriver<BatchSource>::copy_results_to_host(
 }
 
 // =============================================================================
-// set_branch_data  /  copy_flow_results_to_host
+// upload_branch_admittances  /  set_branch_data  /  copy_flow_results_to_host
 // =============================================================================
 template <typename BatchSource>
-void BatchPfDriver<BatchSource>::set_branch_data(
+void BatchPfDriver<BatchSource>::upload_branch_admittances(
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
     Eigen::Ref<const CplxVect>        yff,
@@ -278,6 +292,7 @@ void BatchPfDriver<BatchSource>::set_branch_data(
 {
     n_branches_ = static_cast<int>(branch_from.size());
 
+    auto t_upload_start = std::chrono::steady_clock::now();
     {
         std::vector<int> h_from(n_branches_), h_to(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
@@ -320,12 +335,99 @@ void BatchPfDriver<BatchSource>::set_branch_data(
         upload_h2d(d_ytt, h_ytt.data(), n_branches_, cs);
     }
 
+    // Full per-bus nominal kV (distinct from the per-branch-endpoint use above
+    // folded into d_base_current_A): needed by the fused compute_limit_violations
+    // kernel's bus-voltage check, which visits every bus, not just branch ends.
+    {
+        const int n_bus = base.n_bus;
+        std::vector<cuda_real_type> h_bus_vn(n_bus);
+        for (int b = 0; b < n_bus; ++b)
+            h_bus_vn[b] = static_cast<cuda_real_type>(bus_vn_kv(b));
+        upload_h2d(d_bus_vn_kv, h_bus_vn.data(), n_bus, cs);
+    }
+
+    cs.synchronize();
+    t_branch_data_upload_ms_ = bpf_ms_since(t_upload_start);
+    _has_branch_admittances = true;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::set_branch_data(
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect>        yff,
+    Eigen::Ref<const CplxVect>        yft,
+    Eigen::Ref<const CplxVect>        ytf,
+    Eigen::Ref<const CplxVect>        ytt,
+    Eigen::Ref<const RealVect>        bus_vn_kv,
+    double                            sn_mva)
+{
+    upload_branch_admittances(branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva);
+
     d_or_amps_results.assign(
         static_cast<size_t>(n_contingencies) * n_branches_, cuda_real_type(0));
     d_ex_amps_results.assign(
         static_cast<size_t>(n_contingencies) * n_branches_, cuda_real_type(0));
 
     _has_branch_data = true;
+}
+
+// =============================================================================
+// set_violation_limits  (compute_limit_violations)
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::set_violation_limits(
+    Eigen::Ref<const RealVect> bus_vmin_kv,
+    Eigen::Ref<const RealVect> bus_vmax_kv,
+    Eigen::Ref<const RealVect> branch_limit_a1_ka,
+    Eigen::Ref<const RealVect> branch_limit_a2_ka,
+    double tol,
+    int    K,
+    int    n_lines)
+{
+    if (!_has_branch_admittances)
+        throw std::runtime_error(
+            "BatchPfDriver::set_violation_limits: call upload_branch_admittances "
+            "(via ContingencyAnalysisSession::set_branch_data) before enabling "
+            "compute_limit_violations.");
+
+    auto t_setup_start = std::chrono::steady_clock::now();
+
+    const int n_bus = base.n_bus;
+    auto to_dev = [&](thrust::device_vector<cuda_real_type>& d,
+                       Eigen::Ref<const RealVect> h, int n) {
+        std::vector<cuda_real_type> tmp(n);
+        for (int i = 0; i < n; ++i) tmp[i] = static_cast<cuda_real_type>(h(i));
+        upload_h2d(d, tmp.data(), n, cs);
+    };
+    to_dev(d_bus_vmin_kv, bus_vmin_kv, n_bus);
+    to_dev(d_bus_vmax_kv, bus_vmax_kv, n_bus);
+    to_dev(d_branch_limit_a1_ka, branch_limit_a1_ka, n_branches_);
+    to_dev(d_branch_limit_a2_ka, branch_limit_a2_ka, n_branches_);
+
+    violation_tol_      = static_cast<cuda_real_type>(tol);
+    violation_capacity_ = K;
+    n_lines_            = n_lines;
+
+    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K);
+    d_viol_element_type.assign(n_out, 0);
+    d_viol_element_id.assign(n_out, 0);
+    d_viol_side.assign(n_out, 0);
+    d_viol_type.assign(n_out, 0);
+    d_viol_value.assign(n_out, cuda_real_type(0));
+    d_viol_limit.assign(n_out, cuda_real_type(0));
+    // -1 sentinel: "not yet simulated" (overwritten by every active slot's own
+    // chunk write; slots never revisited by _solve_chunk -- e.g. disconnected/
+    // masked-skip contingencies excluded from the active set -- keep -1).
+    d_violation_count.assign(static_cast<size_t>(n_contingencies), -1);
+    d_violation_truncated.assign(static_cast<size_t>(n_contingencies), 0);
+    d_violation_count_low_voltage.assign(static_cast<size_t>(n_contingencies), -1);
+    d_violation_count_high_voltage.assign(static_cast<size_t>(n_contingencies), -1);
+    d_violation_count_current.assign(static_cast<size_t>(n_contingencies), -1);
+
+    cs.synchronize();
+    t_violation_setup_ms_ = bpf_ms_since(t_setup_start);
+    _fused_violations_enabled = true;
 }
 
 template <typename BatchSource>
@@ -365,6 +467,7 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.t_preprocess_ms  = t_preprocess_ms_;
     t.t_alloc_ms       = t_alloc_ms_;
     t.t_analysis_ms    = t_analysis_ms_;
+    t.t_source_init_ms = t_source_init_ms_;
 
     // When the source has compacted disconnected contingencies out of the batch
     // (n_active_ < n_contingencies), the chunk loop only writes the connected
@@ -429,7 +532,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     const cudaComplexType* d_Sbus_for_NR = source_.d_Sbus_ptr(ctx);
     const int sbus_stride = BatchSource::sbus_stride(n_bus);
 
-    const NrIterBuffers buf {
+    NrIterBuffers buf {
         thrust::raw_pointer_cast(d_J_values_batch.data()),
         thrust::raw_pointer_cast(d_V_batch.data()),
         thrust::raw_pointer_cast(d_Ibus_batch.data()),
@@ -442,11 +545,84 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         thrust::raw_pointer_cast(base.d_map_j12.data()),
         thrust::raw_pointer_cast(base.d_map_j21.data()),
         thrust::raw_pointer_cast(base.d_map_j22.data()),
-        thrust::raw_pointer_cast(base.d_pvpq.data()),
-        thrust::raw_pointer_cast(base.d_pq.data()),
+        thrust::raw_pointer_cast(base.d_p_buses.data()),
+        thrust::raw_pointer_cast(base.d_p_rows.data()),
+        base.n_p,
+        thrust::raw_pointer_cast(base.d_q_buses.data()),
+        thrust::raw_pointer_cast(base.d_q_rows.data()),
+        base.n_q,
+        thrust::raw_pointer_cast(base.d_theta_buses.data()),
+        thrust::raw_pointer_cast(base.d_theta_cols.data()),
+        base.n_theta,
+        thrust::raw_pointer_cast(base.d_vm_buses.data()),
+        thrust::raw_pointer_cast(base.d_vm_cols.data()),
+        base.n_vm,
         d_Sbus_for_NR,
         sbus_stride,
+        // ---- MultiSlack (shared feature data on base; per-slot state here) ----
+        base.slack_col,
+        base.n_slack,
+        thrust::raw_pointer_cast(base.d_slack_prow.data()),
+        thrust::raw_pointer_cast(base.d_slack_w.data()),
+        thrust::raw_pointer_cast(base.d_slack_feat_pos.data()),
+        thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
+        // ---- HVDC angle-droop (all shared on base) ----
+        base.n_hvdc,
+        /*zero_J_before_fill=*/(base.n_hvdc > 0),
+        thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_status.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_k.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_r.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_prow1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_prow2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h11.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h12.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h21.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_h22.data()),
+        // ---- VoltageControl (shared feature data on base; per-slot q here) ----
+        base.n_vc_ctrl,
+        base.n_vc_grp,
+        base.n_vc_share,
+        base.n_vc_feat,
+        thrust::raw_pointer_cast(base.d_vc_qrow.data()),
+        thrust::raw_pointer_cast(base.d_vc_qcol.data()),
+        thrust::raw_pointer_cast(base.d_vc_slope.data()),
+        thrust::raw_pointer_cast(base.d_vc_reg_bus.data()),
+        thrust::raw_pointer_cast(base.d_vc_vrow.data()),
+        thrust::raw_pointer_cast(base.d_vc_grp_start.data()),
+        thrust::raw_pointer_cast(base.d_vc_grp_count.data()),
+        thrust::raw_pointer_cast(base.d_vc_vset.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_row.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_first.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_other.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_wfirst.data()),
+        thrust::raw_pointer_cast(base.d_vc_sh_wother.data()),
+        thrust::raw_pointer_cast(base.d_vc_feat_pos.data()),
+        thrust::raw_pointer_cast(base.d_vc_feat_val.data()),
+        thrust::raw_pointer_cast(d_vc_q_batch.data()),
     };
+
+    // handle_disconnected_grid: attach this chunk's mask slice (no-op for the
+    // injection sweep / when the mode is off). d_J_outer is the shared skeleton.
+    source_.fill_mask_buffers(buf, chunk, thrust::raw_pointer_cast(base.d_J_outer.data()));
+
+    // Re-initialise the per-slot feature state for this chunk (slack_absorbed =
+    // Re(Σ Sbus_slot); controller reactive injection = 0). The NR loop runs over
+    // the full padded batch, so initialise batch_size_ slots.
+    if (base.slack_col >= 0)
+        init_slack_absorbed_kernel<<<(batch_size_ + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
+            d_Sbus_for_NR, sbus_stride, n_bus, batch_size_);
+    if (base.n_vc_ctrl > 0)
+        CHK_CUDA_BPF(cudaMemsetAsync(
+            thrust::raw_pointer_cast(d_vc_q_batch.data()), 0,
+            d_vc_q_batch.size() * sizeof(cuda_real_type), cs));
 
     std::visit([&](auto& policy) {
         run_nr_loop(
@@ -466,21 +642,29 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 
         if (actual_batch > 0) {
             fill_FP_kernel<<<
-                (actual_batch * n_pvpq + BS - 1) / BS, BS, 0, cs>>>(
+                (actual_batch * base.n_p + BS - 1) / BS, BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
                 d_Sbus_for_NR,
-                thrust::raw_pointer_cast(base.d_pvpq.data()),
-                n_pvpq, n_bus, dim_J, actual_batch, sbus_stride);
+                thrust::raw_pointer_cast(base.d_p_buses.data()),
+                thrust::raw_pointer_cast(base.d_p_rows.data()),
+                base.n_p, n_bus, dim_J, actual_batch, sbus_stride);
             fill_FQ_kernel<<<
-                (actual_batch * n_pq + BS - 1) / BS, BS, 0, cs>>>(
+                (actual_batch * base.n_q + BS - 1) / BS, BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
                 d_Sbus_for_NR,
-                thrust::raw_pointer_cast(base.d_pq.data()),
-                n_pvpq, n_pq, n_bus, dim_J, actual_batch, sbus_stride);
+                thrust::raw_pointer_cast(base.d_q_buses.data()),
+                thrust::raw_pointer_cast(base.d_q_rows.data()),
+                base.n_q, n_bus, dim_J, actual_batch, sbus_stride);
+            // Augmented-feature contributions to the final residual (slack /
+            // HVDC mismatch + VC bordered custom rows), using the converged state.
+            nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
+            // handle_disconnected_grid: zero the masked rows of F so the frozen
+            // component does not pollute the ‖F‖∞ residual of the solved one.
+            nr_apply_bus_mask(buf, nnz_J, dim_J, actual_batch, cs);
 
             compute_residuals_kernel<<<
                 actual_batch, BS,
@@ -497,6 +681,59 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     //     to result indices (single D→D memcpy).  With compaction the original
     //     indices are non-contiguous, so scatter through d_result_map instead.
     // -------------------------------------------------------------------------
+    timer.start();
+    if (actual_batch > 0) {
+        // handle_disconnected_grid: report the frozen (masked) buses' voltages as
+        // NaN before the result store (no-op when the mode is off).
+        nr_mask_v_nan(buf, n_bus, cs);
+    }
+    t.t_store_V += timer.stop_ms();
+
+    // compute_limit_violations: fused per-contingency voltage/current/
+    // divergence check, reading d_V_batch (chunk-local, post mask-NaN)
+    // directly -- never touches d_V_results or any O(actual_batch*n_branches)
+    // buffer. d_residuals already holds this chunk's just-written residuals
+    // (step ④ above). No-op (skipped entirely) unless set_violation_limits()
+    // was called -- timed separately into t_violation_check so it isn't
+    // folded into t_store_V's "D→D copy" cost.
+    if (actual_batch > 0 && _fused_violations_enabled) {
+        timer.start();
+        const TrippedBranchTable trip = source_.tripped_branch_table();
+        check_limit_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()),
+            thrust::raw_pointer_cast(d_residuals.data()),
+            violation_tol_,
+            thrust::raw_pointer_cast(d_bus_vn_kv.data()),
+            thrust::raw_pointer_cast(d_bus_vmin_kv.data()),
+            thrust::raw_pointer_cast(d_bus_vmax_kv.data()),
+            thrust::raw_pointer_cast(d_branch_from.data()),
+            thrust::raw_pointer_cast(d_branch_to.data()),
+            thrust::raw_pointer_cast(d_yff.data()),
+            thrust::raw_pointer_cast(d_yft.data()),
+            thrust::raw_pointer_cast(d_ytf.data()),
+            thrust::raw_pointer_cast(d_ytt.data()),
+            thrust::raw_pointer_cast(d_base_current_A.data()),
+            thrust::raw_pointer_cast(d_branch_limit_a1_ka.data()),
+            thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
+            trip.d_start, trip.d_count, trip.d_branch_flat,
+            n_bus, n_branches_, n_lines_,
+            c_start, actual_batch, violation_capacity_,
+            d_result_map,
+            thrust::raw_pointer_cast(d_viol_element_type.data()),
+            thrust::raw_pointer_cast(d_viol_element_id.data()),
+            thrust::raw_pointer_cast(d_viol_side.data()),
+            thrust::raw_pointer_cast(d_viol_type.data()),
+            thrust::raw_pointer_cast(d_viol_value.data()),
+            thrust::raw_pointer_cast(d_viol_limit.data()),
+            thrust::raw_pointer_cast(d_violation_count.data()),
+            thrust::raw_pointer_cast(d_violation_truncated.data()),
+            thrust::raw_pointer_cast(d_violation_count_low_voltage.data()),
+            thrust::raw_pointer_cast(d_violation_count_high_voltage.data()),
+            thrust::raw_pointer_cast(d_violation_count_current.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
+        t.t_violation_check += timer.stop_ms();
+    }
+
     timer.start();
     if (actual_batch > 0) {
         if (d_result_map) {

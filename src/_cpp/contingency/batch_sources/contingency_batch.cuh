@@ -37,6 +37,7 @@
 #include "../../acpf_nr_state.cuh"
 #include "../../contingency_analysis_helper.hpp"
 #include "../../nr_iter_step.cuh"         // BS
+#include "../tripped_branch_table.hpp"    // TrippedBranchTable
 
 // Forward declaration to avoid circular include.
 struct BatchPfDriverContext;
@@ -88,6 +89,28 @@ struct ContingencyBatch {
     thrust::device_vector<cuda_real_type> d_flat_delta_re;
     thrust::device_vector<cuda_real_type> d_flat_delta_im;
 
+    // -------------------------------------------------------------------------
+    // handle_disconnected_grid masking data (empty / no-op when the mode is off).
+    // Identity-row entries and masked-voltage entries, flat over chunks with a
+    // ChunkPatchRange per chunk (same chunking as h_flat_*).
+    // -------------------------------------------------------------------------
+    bool                         mask_mode_ = false;
+    std::vector<int>             h_mask_slot_, h_mask_row_, h_mask_diag_;
+    std::vector<ChunkPatchRange> mask_row_ranges_;
+    std::vector<int>             h_maskv_slot_, h_maskv_bus_;
+    std::vector<ChunkPatchRange> maskv_ranges_;
+    thrust::device_vector<int>   d_mask_slot, d_mask_row, d_mask_diag;
+    thrust::device_vector<int>   d_maskv_slot, d_maskv_bus;
+
+    // -------------------------------------------------------------------------
+    // compute_limit_violations: per-active-slot (global, not per-chunk)
+    // tripped-branch lookup table — see build_tripped_branch_table. Built
+    // unconditionally (cheap: O(n_active + total_trips) ints) so it costs
+    // nothing when nobody enables compute_limit_violations.
+    // -------------------------------------------------------------------------
+    std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
+    thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
+
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
 
@@ -106,17 +129,29 @@ struct ContingencyBatch {
                      const int*                Ybus_rm_outer,
                      const int*                Ybus_rm_inner,
                      const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
-                     int                       max_batch_size)
+                     int                       max_batch_size,
+                     const MaskConfig*         mask_cfg = nullptr)
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
         resolve_indices(contingencies, Ybus_rm_outer, Ybus_rm_inner);
-        check_connectivity(contingencies, Ybus_rm);
 
-        // Rebalance the chunk size over the ACTIVE (connected) contingencies —
-        // the ones actually simulated — rather than the full input count.  This
+        // handle_disconnected_grid: largest-component masking (mask the split-off
+        // buses, only skip when the reference / a controller is stranded). Legacy
+        // path: skip any contingency that disconnects the graph.
+        mask_mode_ = (mask_cfg != nullptr);
+        if (mask_mode_)
+            compute_component_masks(contingencies, Ybus_rm,
+                                    mask_cfg->is_reference_bus,
+                                    mask_cfg->is_controller_bus);
+        else
+            check_connectivity(contingencies, Ybus_rm);
+
+        // Rebalance the chunk size over the ACTIVE (simulated) contingencies —
+        // the ones actually solved — rather than the full input count.  This
         // keeps the per-chunk buffers no larger than needed and the chunks
-        // evenly filled when many contingencies are dropped as disconnected.
+        // evenly filled when many contingencies are dropped (disconnected /
+        // reference-stranding).
         int n_active = 0;
         for (const auto& ctg : contingencies)
             if (!ctg.disconnected) ++n_active;
@@ -127,6 +162,16 @@ struct ContingencyBatch {
                            h_flat_ctg_id_, h_flat_k_,
                            h_flat_delta_re_, h_flat_delta_im_,
                            chunk_ranges_, active_to_orig_);
+
+        if (mask_mode_)
+            build_mask_entries(contingencies, active_to_orig_, used_batch_size_,
+                               mask_cfg->row_info,
+                               h_mask_slot_, h_mask_row_, h_mask_diag_, mask_row_ranges_,
+                               h_maskv_slot_, h_maskv_bus_, maskv_ranges_);
+
+        build_tripped_branch_table(contingencies, active_to_orig_,
+                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+
         t_preprocess_ms = cb_ms_since(t_start);
     }
 
@@ -153,6 +198,59 @@ struct ContingencyBatch {
                 && static_cast<int>(active_to_orig_.size()) < n_total_)
             upload_h2d(d_active_to_orig, active_to_orig_.data(),
                        active_to_orig_.size(), cs);
+
+        // handle_disconnected_grid masking entries (only when any bus is masked).
+        if (!h_mask_slot_.empty()) {
+            upload_h2d(d_mask_slot, h_mask_slot_.data(), h_mask_slot_.size(), cs);
+            upload_h2d(d_mask_row,  h_mask_row_.data(),  h_mask_row_.size(),  cs);
+            upload_h2d(d_mask_diag, h_mask_diag_.data(), h_mask_diag_.size(), cs);
+        }
+        if (!h_maskv_slot_.empty()) {
+            upload_h2d(d_maskv_slot, h_maskv_slot_.data(), h_maskv_slot_.size(), cs);
+            upload_h2d(d_maskv_bus,  h_maskv_bus_.data(),  h_maskv_bus_.size(),  cs);
+        }
+
+        // compute_limit_violations tripped-branch table (see the ctor's
+        // build_tripped_branch_table call). h_trip_start_/h_trip_count_ are
+        // always sized n_active (possibly all-zero counts); h_trip_branch_flat_
+        // may be empty when no contingency in this batch trips any branch.
+        if (!h_trip_start_.empty()) {
+            upload_h2d(d_trip_start, h_trip_start_.data(), h_trip_start_.size(), cs);
+            upload_h2d(d_trip_count, h_trip_count_.data(), h_trip_count_.size(), cs);
+            if (!h_trip_branch_flat_.empty())
+                upload_h2d(d_trip_branch_flat, h_trip_branch_flat_.data(),
+                           h_trip_branch_flat_.size(), cs);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // fill_mask_buffers — write this chunk's handle_disconnected_grid mask slice
+    // into the NrIterBuffers. Sets null / 0 when the mode is off or the chunk
+    // masks nothing, leaving the masking launches as no-ops. d_J_outer is the
+    // shared base-case J skeleton row-pointer array (used by the mask kernel).
+    // -------------------------------------------------------------------------
+    void fill_mask_buffers(NrIterBuffers& buf, int chunk_idx, const int* d_J_outer) const
+    {
+        if (!mask_mode_) return;
+        buf.d_J_outer_mask = d_J_outer;
+
+        if (chunk_idx < static_cast<int>(mask_row_ranges_.size())) {
+            const ChunkPatchRange& r = mask_row_ranges_[static_cast<size_t>(chunk_idx)];
+            if (r.count > 0) {
+                buf.d_mask_slot = thrust::raw_pointer_cast(d_mask_slot.data()) + r.start;
+                buf.d_mask_row  = thrust::raw_pointer_cast(d_mask_row.data())  + r.start;
+                buf.d_mask_diag = thrust::raw_pointer_cast(d_mask_diag.data()) + r.start;
+                buf.n_mask_rows = r.count;
+            }
+        }
+        if (chunk_idx < static_cast<int>(maskv_ranges_.size())) {
+            const ChunkPatchRange& r = maskv_ranges_[static_cast<size_t>(chunk_idx)];
+            if (r.count > 0) {
+                buf.d_maskv_slot = thrust::raw_pointer_cast(d_maskv_slot.data()) + r.start;
+                buf.d_maskv_bus  = thrust::raw_pointer_cast(d_maskv_bus.data())  + r.start;
+                buf.n_mask_v     = r.count;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -169,6 +267,19 @@ struct ContingencyBatch {
                 && !d_active_to_orig.empty())
                ? thrust::raw_pointer_cast(d_active_to_orig.data())
                : nullptr;
+    }
+
+    // -------------------------------------------------------------------------
+    // tripped_branch_table — device pointers into this batch's tripped-branch
+    // lookup table, indexed by GLOBAL active-slot id (see
+    // build_tripped_branch_table). Consumed by check_limit_violations_kernel
+    // to skip branches tripped by the contingency it is currently checking.
+    // -------------------------------------------------------------------------
+    TrippedBranchTable tripped_branch_table() const {
+        return TrippedBranchTable{
+            thrust::raw_pointer_cast(d_trip_start.data()),
+            thrust::raw_pointer_cast(d_trip_count.data()),
+            thrust::raw_pointer_cast(d_trip_branch_flat.data())};
     }
 
     // -------------------------------------------------------------------------

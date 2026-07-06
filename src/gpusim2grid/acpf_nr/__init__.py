@@ -21,3 +21,7 @@ from .._gpusim2grid import (
     acpf_nr_gpu,
     AcPfNrSession,
     )
+
+# Not in __all__: documented separately as gpusim2grid.AcPfGPU (see docs/api.rst)
+# to avoid duplicate autodoc entries for the same class.
+from .gpu_facade import AcPfGPU

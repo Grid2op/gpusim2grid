@@ -6,7 +6,7 @@ Tests validate:
   2. Voltage agreement with the lightsim2grid ContingencyAnalysisCPP CPU reference.
   3. Batch-size independence: results must be identical regardless of chunk size.
 
-Driven through the public ``ContingencyAnalysisSolver`` (session) API.  N-1
+Driven through the public ``_ContingencyAnalysisSolver`` (session) API.  N-1
 contingencies are built from branch IDs: id ``c`` trips line ``c`` for
 ``c < n_lines`` and trafo ``c - n_lines`` otherwise — the same lines-then-trafos
 order used by the triplet fixture and lightsim2grid's ``add_all_n1()``.
@@ -30,18 +30,18 @@ _RESIDUAL_CONVERGED    = 1e-4   # threshold used to call a contingency "converge
 
 
 def _run_ca(ieee14_grid, ieee14_base_case, batch_size, nb_iter=10):
-    """Run GPU contingency analysis via ContingencyAnalysisSolver.
+    """Run GPU contingency analysis via _ContingencyAnalysisSolver.
 
     Returns (V_2d, residuals, timings, n_lines, n_trafos).
     """
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
     d = ieee14_base_case
     branch_data, n_lines, n_trafos = branch_data_arrays(ieee14_grid)
     n_ctg = n_lines + n_trafos
     cont_branch_ids = [[c] for c in range(n_ctg)]
 
-    solver = ContingencyAnalysisSolver(
+    solver = _ContingencyAnalysisSolver(
         d["Ybus"], d["v_init"].copy(), d["Sbus"],
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=batch_size, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6,

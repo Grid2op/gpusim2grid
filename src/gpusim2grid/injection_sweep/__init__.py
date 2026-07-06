@@ -35,7 +35,6 @@ or the raw ``ContingencySolverType`` enum value.
 __all__ = [
     "acpf_nr_gpu_injection",
     "run_injection_sweep_gpu",
-    "InjectionSweepSolver",
 ]
 
 import numpy as np
@@ -161,7 +160,7 @@ class _DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class InjectionSweepSolver:
+class _InjectionSweepSolver:
     """Stateful GPU batched-injection power flow solver.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -190,7 +189,7 @@ class InjectionSweepSolver:
     --------
     .. code-block:: python
 
-        solver = InjectionSweepSolver(Ybus, Vinit, Sbus,
+        solver = _InjectionSweepSolver(Ybus, Vinit, Sbus,
                                       slack_ids, slack_weights, pv, pq)
         solver.set_injections(p_mw, q_mvar, sn_mva)   # (n_scen, n_bus) MW / MVAr
         solver.run()
@@ -206,14 +205,14 @@ class InjectionSweepSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None):
+                 device=None, presolved_v=False):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
         self._s = _InjectionSweepSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
-            _normalize_device(device))
+            _normalize_device(device), presolved_v=bool(presolved_v))
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -271,7 +270,7 @@ class InjectionSweepSolver:
                         bus_vn_kv, sn_mva):
         """Store π-model branch admittances.  Required before compute_flows().
 
-        Parameters match ContingencyAnalysisSolver.set_branch_data() exactly:
+        Parameters match _ContingencyAnalysisSolver.set_branch_data() exactly:
         branch_from, branch_to : (n_branches,) int
         yff, yft, ytf, ytt     : (n_branches,) complex — π-model admittances
         bus_vn_kv              : (n_bus,) float — nominal voltage in kV per bus
@@ -371,3 +370,8 @@ class InjectionSweepSolver:
     @property
     def n_bus(self):
         return self._s.n_bus
+
+
+# Not in __all__: documented separately as gpusim2grid.InjectionSweepGPU (see
+# docs/api.rst) to avoid duplicate autodoc entries for the same class.
+from .gpu_facade import InjectionSweepGPU

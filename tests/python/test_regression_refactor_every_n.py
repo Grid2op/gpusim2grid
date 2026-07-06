@@ -36,11 +36,11 @@ def _run(ieee14_base_case, ieee14_grid, branch_ids_per_ctg,
          strategy, refactor_period=1, batch_size=_BATCH_SIZE, nb_iter=_NB_ITER,
          compute_flows=False):
     """Run GPU contingency analysis and return (V_2d, residuals, timings[, or_amps])."""
-    from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+    from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
     d = ieee14_base_case
 
-    solver = ContingencyAnalysisSolver(
+    solver = _ContingencyAnalysisSolver(
         d["Ybus"], d["v_init"].copy(), d["Sbus"],
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=batch_size, nb_iter=nb_iter)
@@ -112,9 +112,9 @@ class TestDirectRefactorEveryN:
 
     def test_default_refactor_period(self, ieee14_base_case, ieee14_grid, n1_branch_ids):
         """refactor_period defaults to 1."""
-        from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+        from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
         d = ieee14_base_case
-        solver = ContingencyAnalysisSolver(
+        solver = _ContingencyAnalysisSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=_BATCH_SIZE, nb_iter=_NB_ITER)
@@ -122,9 +122,9 @@ class TestDirectRefactorEveryN:
 
     def test_refactor_period_setter(self, ieee14_base_case, ieee14_grid, n1_branch_ids):
         """refactor_period setter stores the value."""
-        from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+        from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
         d = ieee14_base_case
-        solver = ContingencyAnalysisSolver(
+        solver = _ContingencyAnalysisSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=_BATCH_SIZE, nb_iter=_NB_ITER)
@@ -278,7 +278,7 @@ class TestDirectRefactorEveryN:
     def test_refactor_period_mutable_between_runs(
             self, ieee14_base_case, ieee14_grid, n1_branch_ids):
         """Changing refactor_period between run() calls takes effect immediately."""
-        from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+        from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
         d = ieee14_base_case
         lines  = ieee14_grid.get_lines()
@@ -293,7 +293,7 @@ class TestDirectRefactorEveryN:
         ytt = np.array([b.yac_22 for b in all_branches], dtype=complex)
         bus_vn_kv = ieee14_grid.get_bus_vn_kv().astype(float)
 
-        solver = ContingencyAnalysisSolver(
+        solver = _ContingencyAnalysisSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=_BATCH_SIZE, nb_iter=_NB_ITER)

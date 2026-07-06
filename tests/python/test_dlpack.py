@@ -3,7 +3,7 @@ test_dlpack.py — Zero-copy DLPack tensor export.
 
 Tests v_base_dlpack() and v_results_dlpack() on both the raw C++ bindings
 (ContingencyAnalysisSession / InjectionSweepSession) and the Python wrappers
-(ContingencyAnalysisSolver / InjectionSweepSolver).
+(_ContingencyAnalysisSolver / _InjectionSweepSolver).
 
 For each path, asserts:
   - shape is correct
@@ -144,17 +144,17 @@ class TestContingencySessionDLPack:
 
 
 # ---------------------------------------------------------------------------
-# ContingencyAnalysisSolver — Python wrapper
+# _ContingencyAnalysisSolver — Python wrapper
 # ---------------------------------------------------------------------------
 
 class TestContingencyWrapperDLPack:
     @pytest.fixture(scope="class")
     def solver(self, ieee14_base_case, branch_data):
-        from gpusim2grid.contingency_analysis import ContingencyAnalysisSolver
+        from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 
         d = ieee14_base_case
         b = branch_data
-        s = ContingencyAnalysisSolver(
+        s = _ContingencyAnalysisSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=b["n_branches"], nb_iter=4,
@@ -219,13 +219,13 @@ class TestInjectionSessionDLPack:
 
 
 # ---------------------------------------------------------------------------
-# InjectionSweepSolver — Python wrapper
+# _InjectionSweepSolver — Python wrapper
 # ---------------------------------------------------------------------------
 
 class TestInjectionWrapperDLPack:
     @pytest.fixture(scope="class")
     def solver(self, ieee14_base_case):
-        from gpusim2grid.injection_sweep import InjectionSweepSolver
+        from gpusim2grid.injection_sweep import _InjectionSweepSolver
 
         d = ieee14_base_case
         n_bus       = d["n_bus"]
@@ -235,7 +235,7 @@ class TestInjectionWrapperDLPack:
         p_mw        = rng.uniform(-30, 30, (n_scenarios, n_bus))
         q_mvar      = rng.uniform(-10, 10, (n_scenarios, n_bus))
 
-        s = InjectionSweepSolver(
+        s = _InjectionSweepSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=n_scenarios, nb_iter=4,

@@ -45,6 +45,7 @@
 #include "acpf_nr.hpp"
 #include "acpf_nr_kernels.cuh"
 #include "nr_iter_step.cuh"
+#include "ledger_data.hpp"
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -58,8 +59,9 @@
 
 #include <Eigen/SparseCore>
 
-#include <algorithm>   // std::sort, std::lower_bound
+#include <algorithm>   // std::sort, std::lower_bound, std::max
 #include <stdexcept>
+#include <string>      // std::to_string
 #include <chrono>
 #include <iostream>
 #include <vector>
@@ -183,6 +185,63 @@ static void build_J_structure(
 }
 
 // =============================================================================
+// §2b  CPU helper: build_scatter_maps_aug
+//   Augmented-Jacobian counterpart of build_J_structure: the J sparsity skeleton
+//   is GIVEN (read off lightsim2grid's solved NRSystem, RowMajor CSR), and the
+//   four dS scatter maps are resolved against it using the NRLedger bus→row/col
+//   maps. Each Ybus(i,j) contributes up to four entries:
+//     J(p_row(i), theta_col(j)) ← Re(dS/dVa)   [map_j11]
+//     J(p_row(i), vm_col(j))    ← Re(dS/dVm)   [map_j12]
+//     J(q_row(i), theta_col(j)) ← Im(dS/dVa)   [map_j21]
+//     J(q_row(i), vm_col(j))    ← Im(dS/dVm)   [map_j22]
+//   A -1 in any ledger map drops that contribution (e.g. the reference slack has
+//   no theta column). Mirrors NRSystem::build_J_sparsity's generic dS pass.
+// =============================================================================
+static void build_scatter_maps_aug(
+    std::vector<int>& map_j11,
+    std::vector<int>& map_j12,
+    std::vector<int>& map_j21,
+    std::vector<int>& map_j22,
+    const std::vector<int>& J_outer,
+    const std::vector<int>& J_inner,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus,
+    const std::vector<int>& p_row_of_bus,
+    const std::vector<int>& q_row_of_bus,
+    const std::vector<int>& theta_col_of_bus,
+    const std::vector<int>& vm_col_of_bus)
+{
+    const int nnz_Y = Ybus.nonZeros();
+    map_j11.assign(nnz_Y, -1);
+    map_j12.assign(nnz_Y, -1);
+    map_j21.assign(nnz_Y, -1);
+    map_j22.assign(nnz_Y, -1);
+
+    auto find_J_pos = [&](int row, int col) -> int {
+        const int start = J_outer[row];
+        const int end   = J_outer[row + 1];
+        const int* inner = J_inner.data();
+        auto it = std::lower_bound(inner + start, inner + end, col);
+        if (it == inner + end || *it != col) return -1;
+        return static_cast<int>(it - inner);
+    };
+
+    int k = 0;
+    for (int outer = 0; outer < Ybus.outerSize(); ++outer) {
+        for (Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>::InnerIterator
+             it(Ybus, outer); it; ++it, ++k)
+        {
+            const int i = (int)it.row(), j = (int)it.col();
+            const int ri = p_row_of_bus[i], rq = q_row_of_bus[i];
+            const int ci = theta_col_of_bus[j], cq = vm_col_of_bus[j];
+            if (ri >= 0 && ci >= 0) map_j11[k] = find_J_pos(ri, ci);
+            if (ri >= 0 && cq >= 0) map_j12[k] = find_J_pos(ri, cq);
+            if (rq >= 0 && ci >= 0) map_j21[k] = find_J_pos(rq, ci);
+            if (rq >= 0 && cq >= 0) map_j22[k] = find_J_pos(rq, cq);
+        }
+    }
+}
+
+// =============================================================================
 // §4  AcPfNrState constructor
 // =============================================================================
 
@@ -194,8 +253,18 @@ AcPfNrState::AcPfNrState(
     Eigen::Ref<const Eigen::VectorXi>           pq_in,
     int                                         max_iter,
     eigen_real_type                             tol,
-    int                                         device)
+    int                                         device,
+    const LedgerData*                           ledger,
+    bool                                         presolved_v)
 {
+    // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
+    // because the work is heterogeneous (CPU preprocessing + device uploads +
+    // ANALYSIS launch). Started BEFORE device selection: cudaGetDevice() below
+    // is typically the first CUDA driver call in a process, which triggers
+    // lazy CUDA context creation -- an expensive (up to ~1s) one-time cost
+    // that would otherwise land entirely outside any timed region.
+    auto t_wall_start = std::chrono::steady_clock::now();
+
     // =========================================================================
     // Device selection — must happen before any stream/allocation.
     // =========================================================================
@@ -209,11 +278,6 @@ AcPfNrState::AcPfNrState(
         CHK_CUDA_AC(cudaSetDevice(device));
     }
     CHK_CUDA_AC(cudaGetDevice(&device_id_));
-
-    // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
-    // because the work is heterogeneous (CPU preprocessing + device uploads +
-    // ANALYSIS launch).
-    auto t_wall_start = std::chrono::steady_clock::now();
 
     // =========================================================================
     // 4.1  Scalar dimensions
@@ -240,11 +304,86 @@ AcPfNrState::AcPfNrState(
     // previously by introducing Ybus_rm).
     Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm = Ybus;
 
-    Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J_csr;
+    // Augmented J skeleton (RowMajor CSR) + dS scatter maps + NRLedger pair lists.
+    // Two sources:
+    //   • ledger == nullptr → trivial feature-free ledger built from pv/pq (the
+    //     skeleton is derived from Ybus by build_J_structure; legacy layout).
+    //   • ledger != nullptr → the augmented skeleton + ledger maps read off a
+    //     solved lightsim2grid grid; the dS maps are resolved against it.
     std::vector<int> h_map_j11, h_map_j12, h_map_j21, h_map_j22;
-    build_J_structure(J_csr, h_map_j11, h_map_j12, h_map_j21, h_map_j22,
-                      Ybus_rm, pvpq_host, pq_in);
-    nnz_J = J_csr.nonZeros();
+    std::vector<int> J_outer_h, J_inner_h;
+    std::vector<int> p_buses, p_rows, q_buses, q_rows;
+    std::vector<int> theta_buses, theta_cols, vm_buses, vm_cols;
+
+    if (ledger == nullptr) {
+        Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J_csr;
+        build_J_structure(J_csr, h_map_j11, h_map_j12, h_map_j21, h_map_j22,
+                          Ybus_rm, pvpq_host, pq_in);
+        dim_J = n_pvpq + n_pq;
+        nnz_J = J_csr.nonZeros();
+        J_outer_h.assign(J_csr.outerIndexPtr(), J_csr.outerIndexPtr() + dim_J + 1);
+        J_inner_h.assign(J_csr.innerIndexPtr(), J_csr.innerIndexPtr() + nnz_J);
+
+        // Trivial ledger pair lists: P/theta on sorted(pvpq) at rows/cols
+        // [0,n_pvpq); Q/vm on pq (input order) at [n_pvpq, dim_J).
+        p_buses.resize(n_pvpq); p_rows.resize(n_pvpq);
+        q_buses.resize(n_pq);   q_rows.resize(n_pq);
+        for (int i = 0; i < n_pvpq; ++i) { p_buses[i] = pvpq_host(i); p_rows[i] = i; }
+        for (int i = 0; i < n_pq;   ++i) { q_buses[i] = pq_in(i);     q_rows[i] = n_pvpq + i; }
+        theta_buses = p_buses; theta_cols = p_rows;   // theta == P buses (feature-free)
+        vm_buses    = q_buses; vm_cols    = q_rows;   // vm    == Q buses
+    } else {
+        dim_J     = ledger->dim_J;
+        J_outer_h = ledger->J_outer;
+        J_inner_h = ledger->J_inner;
+        nnz_J     = static_cast<int>(J_inner_h.size());
+        build_scatter_maps_aug(h_map_j11, h_map_j12, h_map_j21, h_map_j22,
+                               J_outer_h, J_inner_h, Ybus_rm,
+                               ledger->p_row_of_bus, ledger->q_row_of_bus,
+                               ledger->theta_col_of_bus, ledger->vm_col_of_bus);
+
+        // Derive the ledger pair lists from the bus→row/col maps (order is
+        // irrelevant: each pair is an independent scatter target).
+        for (int bus = 0; bus < n_bus; ++bus) {
+            if (ledger->p_row_of_bus[bus]     >= 0) { p_buses.push_back(bus);     p_rows.push_back(ledger->p_row_of_bus[bus]); }
+            if (ledger->q_row_of_bus[bus]     >= 0) { q_buses.push_back(bus);     q_rows.push_back(ledger->q_row_of_bus[bus]); }
+            if (ledger->theta_col_of_bus[bus] >= 0) { theta_buses.push_back(bus); theta_cols.push_back(ledger->theta_col_of_bus[bus]); }
+            if (ledger->vm_col_of_bus[bus]    >= 0) { vm_buses.push_back(bus);    vm_cols.push_back(ledger->vm_col_of_bus[bus]); }
+        }
+    }
+    n_p = (int)p_buses.size(); n_q = (int)q_buses.size();
+    n_theta = (int)theta_buses.size(); n_vm = (int)vm_buses.size();
+
+    // Host-side masking tables for the handle_disconnected_grid mode (solve the
+    // largest connected component, mask the rest). Reconstruct the bus→row/col
+    // maps from the ledger pair lists and resolve the identity-diagonal nnz
+    // position of each bus' (p_row, theta_col) / (q_row, vm_col) against the J
+    // skeleton just assembled. Cheap (size n_bus) and always built.
+    {
+        h_theta_col_of_bus.assign(n_bus, -1);
+        h_vm_col_of_bus.assign(n_bus, -1);
+        h_p_row_of_bus.assign(n_bus, -1);
+        h_q_row_of_bus.assign(n_bus, -1);
+        h_p_diag_pos.assign(n_bus, -1);
+        h_q_diag_pos.assign(n_bus, -1);
+        for (int i = 0; i < n_theta; ++i) h_theta_col_of_bus[theta_buses[i]] = theta_cols[i];
+        for (int i = 0; i < n_vm;    ++i) h_vm_col_of_bus[vm_buses[i]]       = vm_cols[i];
+        for (int i = 0; i < n_p;     ++i) h_p_row_of_bus[p_buses[i]]         = p_rows[i];
+        for (int i = 0; i < n_q;     ++i) h_q_row_of_bus[q_buses[i]]         = q_rows[i];
+        auto find_J_pos = [&](int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* inner = J_inner_h.data();
+            const int* it = std::lower_bound(inner + s, inner + e, col);
+            if (it == inner + e || *it != col) return -1;
+            return static_cast<int>(it - inner);
+        };
+        for (int bus = 0; bus < n_bus; ++bus) {
+            h_p_diag_pos[bus] = find_J_pos(h_p_row_of_bus[bus], h_theta_col_of_bus[bus]);
+            h_q_diag_pos[bus] = find_J_pos(h_q_row_of_bus[bus], h_vm_col_of_bus[bus]);
+        }
+    }
+
     timings.t_build_J_ms = ms_since(t_wall_start);
 
     // =========================================================================
@@ -264,11 +403,202 @@ AcPfNrState::AcPfNrState(
     upload_h2d(d_pvpq, pvpq_host.data(),       n_pvpq, cs);
     upload_h2d(d_pq,   pq_in.data(),           n_pq,   cs);
 
+    // NRLedger pair lists (H→D)
+    upload_h2d(d_p_buses,     p_buses.data(),     n_p,     cs);
+    upload_h2d(d_p_rows,      p_rows.data(),      n_p,     cs);
+    upload_h2d(d_q_buses,     q_buses.data(),     n_q,     cs);
+    upload_h2d(d_q_rows,      q_rows.data(),      n_q,     cs);
+    upload_h2d(d_theta_buses, theta_buses.data(), n_theta, cs);
+    upload_h2d(d_theta_cols,  theta_cols.data(),  n_theta, cs);
+    upload_h2d(d_vm_buses,    vm_buses.data(),    n_vm,    cs);
+    upload_h2d(d_vm_cols,     vm_cols.data(),     n_vm,    cs);
+
     // Scatter maps (H→D)
     upload_h2d(d_map_j11, h_map_j11.data(), nnz_Y, cs);
     upload_h2d(d_map_j12, h_map_j12.data(), nnz_Y, cs);
     upload_h2d(d_map_j21, h_map_j21.data(), nnz_Y, cs);
     upload_h2d(d_map_j22, h_map_j22.data(), nnz_Y, cs);
+
+    // MultiSlack feature data (distributed slack in the Jacobian). Slack
+    // participants are the buses with a nonzero slack weight; each owns a P row
+    // in the augmented ledger. We stamp J(slack_p_row, slack_col) = weight and
+    // adjust the P mismatch by slack_absorbed·weight (see the MultiSlack kernels).
+    if (ledger != nullptr && ledger->has_multislack()) {
+        slack_col = ledger->slack_col;
+        std::vector<int>            h_prow, h_feat_pos;
+        std::vector<cuda_real_type> h_w;
+        // resolve a feature position via lower_bound on the (RowMajor) skeleton
+        auto find_J_pos = [&](int row, int col) -> int {
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* in = J_inner_h.data();
+            auto it = std::lower_bound(in + s, in + e, col);
+            return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
+        };
+        for (int bus = 0; bus < n_bus; ++bus) {
+            const double w = ledger->slack_weights[bus];
+            if (w == 0.0) continue;
+            const int prow = ledger->p_row_of_bus[bus];
+            if (prow < 0) continue;   // defensive: a weighted bus must own a P row
+            h_prow.push_back(prow);
+            h_w.push_back(static_cast<cuda_real_type>(w));
+            h_feat_pos.push_back(find_J_pos(prow, slack_col));
+        }
+        n_slack = static_cast<int>(h_prow.size());
+        upload_h2d(d_slack_prow,     h_prow.data(),     n_slack, cs);
+        upload_h2d(d_slack_w,        h_w.data(),        n_slack, cs);
+        upload_h2d(d_slack_feat_pos, h_feat_pos.data(), n_slack, cs);
+
+        // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
+        cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
+        for (int i = 0; i < n_bus; ++i) sa0 += static_cast<cuda_real_type>(Sbus_host(i).real());
+        std::vector<cuda_real_type> h_sa(1, sa0);
+        upload_h2d(d_slack_absorbed, h_sa.data(), 1, cs);
+    }
+
+    // HVDC angle-droop: per-line raw data + the end P rows / theta-col feature J
+    // positions derived from the ledger maps + skeleton. (mirrors Hvdc::register_in
+    // / declare_feature_entries; an end at a slack drops the missing row/col.)
+    if (ledger != nullptr && ledger->has_hvdc()) {
+        n_hvdc = ledger->n_hvdc();
+        auto to_real = [](const std::vector<double>& v) {
+            return std::vector<cuda_real_type>(v.begin(), v.end());
+        };
+        upload_h2d(d_hvdc_bus1,   ledger->hvdc_bus1.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_bus2,   ledger->hvdc_bus2.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_status, ledger->hvdc_status.data(), n_hvdc, cs);
+        std::vector<cuda_real_type> p0=to_real(ledger->hvdc_p0), kk=to_real(ledger->hvdc_k),
+            lf1=to_real(ledger->hvdc_lf1), lf2=to_real(ledger->hvdc_lf2),
+            rr=to_real(ledger->hvdc_r), pm12=to_real(ledger->hvdc_pmax12),
+            pm21=to_real(ledger->hvdc_pmax21);
+        upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
+        upload_h2d(d_hvdc_lf2,    lf2.data(),  n_hvdc, cs);
+        upload_h2d(d_hvdc_r,      rr.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_pmax12, pm12.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_pmax21, pm21.data(), n_hvdc, cs);
+
+        auto find_J_pos = [&](int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* in = J_inner_h.data();
+            auto it = std::lower_bound(in + s, in + e, col);
+            return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
+        };
+        std::vector<int> prow1(n_hvdc), prow2(n_hvdc),
+                         h11(n_hvdc), h12(n_hvdc), h21(n_hvdc), h22(n_hvdc);
+        for (int e = 0; e < n_hvdc; ++e) {
+            const int b1 = ledger->hvdc_bus1[e], b2 = ledger->hvdc_bus2[e];
+            const int pr1 = ledger->p_row_of_bus[b1], pr2 = ledger->p_row_of_bus[b2];
+            const int tc1 = ledger->theta_col_of_bus[b1], tc2 = ledger->theta_col_of_bus[b2];
+            prow1[e] = pr1; prow2[e] = pr2;
+            h11[e] = find_J_pos(pr1, tc1);
+            h12[e] = find_J_pos(pr1, tc2);
+            h21[e] = find_J_pos(pr2, tc1);
+            h22[e] = find_J_pos(pr2, tc2);
+        }
+        upload_h2d(d_hvdc_prow1, prow1.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_prow2, prow2.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h11, h11.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h12, h12.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h21, h21.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_h22, h22.data(), n_hvdc, cs);
+    }
+
+    // VoltageControl (remote gen + SVC), bordered formulation. The q columns and
+    // q/vm rows come from the ledger maps; the custom rows (1 voltage + N-1 sharing
+    // per group) are the LAST n_controllers rows, allocated v_row then share_rows
+    // per group (the only custom-row source, registered last). Feature entries are
+    // constant → flattened to (pos, value) pairs stamped each fill_J.
+    if (ledger != nullptr && ledger->has_voltage_control()) {
+        n_vc_ctrl  = ledger->vc_n_controllers();
+        n_vc_grp   = ledger->vc_n_groups();
+        n_vc_share = n_vc_ctrl - n_vc_grp;
+
+        auto find_J_pos = [&](int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int s = J_outer_h[row], e = J_outer_h[row + 1];
+            const int* in = J_inner_h.data();
+            auto it = std::lower_bound(in + s, in + e, col);
+            return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
+        };
+
+        // per-controller q row / q col (from the ledger) and slope
+        std::vector<int> qrow(n_vc_ctrl), qcol(n_vc_ctrl);
+        std::vector<cuda_real_type> slope(n_vc_ctrl);
+        for (int j = 0; j < n_vc_ctrl; ++j) {
+            const int bus = ledger->vc_bus[j];
+            qrow[j] = ledger->q_row_of_bus[bus];
+            qcol[j] = ledger->q_col_of_bus[bus];
+            slope[j] = static_cast<cuda_real_type>(ledger->vc_slope[j]);
+        }
+
+        // reconstruct the custom rows: contiguous block [dim_J - n_vc_ctrl, dim_J),
+        // ordered per group (v_row, then count-1 sharing rows).
+        std::vector<int> vrow(n_vc_grp);
+        std::vector<std::vector<int> > share(n_vc_grp);
+        int cursor = dim_J - n_vc_ctrl;
+        for (int g = 0; g < n_vc_grp; ++g) {
+            vrow[g] = cursor++;
+            const int cnt = ledger->vc_grp_count[g];
+            for (int k = 0; k < cnt - 1; ++k) share[g].push_back(cursor++);
+        }
+
+        // per-group device arrays
+        std::vector<cuda_real_type> vset(n_vc_grp);
+        for (int g = 0; g < n_vc_grp; ++g) vset[g] = static_cast<cuda_real_type>(ledger->vc_v_set[g]);
+        upload_h2d(d_vc_qrow,      qrow.data(),                 n_vc_ctrl, cs);
+        upload_h2d(d_vc_qcol,      qcol.data(),                 n_vc_ctrl, cs);
+        upload_h2d(d_vc_slope,     slope.data(),                n_vc_ctrl, cs);
+        upload_h2d(d_vc_reg_bus,   ledger->vc_reg_bus.data(),   n_vc_grp,  cs);
+        upload_h2d(d_vc_vrow,      vrow.data(),                 n_vc_grp,  cs);
+        upload_h2d(d_vc_grp_start, ledger->vc_grp_start.data(), n_vc_grp,  cs);
+        upload_h2d(d_vc_grp_count, ledger->vc_grp_count.data(), n_vc_grp,  cs);
+        upload_h2d(d_vc_vset,      vset.data(),                 n_vc_grp,  cs);
+
+        // per-sharing-row device arrays + constant feature (pos, value) pairs
+        std::vector<int> sh_row, sh_first, sh_other;
+        std::vector<cuda_real_type> sh_wfirst, sh_wother;
+        std::vector<int> feat_pos;
+        std::vector<cuda_real_type> feat_val;
+        auto push_feat = [&](int pos, cuda_real_type val) {
+            if (pos >= 0) { feat_pos.push_back(pos); feat_val.push_back(val); }
+        };
+        for (int j = 0; j < n_vc_ctrl; ++j) {
+            push_feat(find_J_pos(qrow[j], qcol[j]), static_cast<cuda_real_type>(-1.));  // (q_row, q_col)
+            if (ledger->vc_kind[j] == 1)  // SVC slope coupling (v_row, q_col)
+                push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]), slope[j]);
+        }
+        for (int g = 0; g < n_vc_grp; ++g) {
+            const int vmcol = ledger->vm_col_of_bus[ledger->vc_reg_bus[g]];
+            push_feat(find_J_pos(vrow[g], vmcol), static_cast<cuda_real_type>(1.));      // (v_row, vm_col)
+            const int first = ledger->vc_grp_start[g];
+            const cuda_real_type w_first = static_cast<cuda_real_type>(ledger->vc_weight[first]);
+            for (int k = 0; k < ledger->vc_grp_count[g] - 1; ++k) {
+                const int other = first + (k + 1);
+                const cuda_real_type w_other = static_cast<cuda_real_type>(ledger->vc_weight[other]);
+                const int row = share[g][k];
+                sh_row.push_back(row); sh_first.push_back(first); sh_other.push_back(other);
+                sh_wfirst.push_back(w_first); sh_wother.push_back(w_other);
+                push_feat(find_J_pos(row, qcol[other]), w_first);   // (share_row, q_col_{k+1})
+                push_feat(find_J_pos(row, qcol[first]), -w_other);  // (share_row, q_col_1)
+            }
+        }
+        n_vc_feat = static_cast<int>(feat_pos.size());
+        if (n_vc_share > 0) {
+            upload_h2d(d_vc_sh_row,    sh_row.data(),    n_vc_share, cs);
+            upload_h2d(d_vc_sh_first,  sh_first.data(),  n_vc_share, cs);
+            upload_h2d(d_vc_sh_other,  sh_other.data(),  n_vc_share, cs);
+            upload_h2d(d_vc_sh_wfirst, sh_wfirst.data(), n_vc_share, cs);
+            upload_h2d(d_vc_sh_wother, sh_wother.data(), n_vc_share, cs);
+        }
+        upload_h2d(d_vc_feat_pos, feat_pos.data(), n_vc_feat, cs);
+        upload_h2d(d_vc_feat_val, feat_val.data(), n_vc_feat, cs);
+
+        // running reactive injection per controller, reset to 0 each solve
+        d_vc_q.resize(n_vc_ctrl);
+        zero_d(d_vc_q, cs);
+    }
 
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)
     {
@@ -308,13 +638,12 @@ AcPfNrState::AcPfNrState(
     d_F.resize(dim_J);   zero_d(d_F,  cs);
     d_dx.resize(dim_J);  zero_d(d_dx, cs);
 
-    // Jacobian skeleton (H→D)
-    upload_h2d(d_J_outer, J_csr.outerIndexPtr(), J_csr.outerSize() + 1, cs);
-    upload_h2d(d_J_inner, J_csr.innerIndexPtr(), nnz_J,                 cs);
+    // Jacobian skeleton (H→D) — augmented or trivial, both in J_outer_h/J_inner_h
+    upload_h2d(d_J_outer, J_outer_h.data(), dim_J + 1, cs);
+    upload_h2d(d_J_inner, J_inner_h.data(), nnz_J,     cs);
     d_J_values.resize(nnz_J);  zero_d(d_J_values, cs);
 
     timings.t_upload_ms = ms_since(t_upload_start);
-    timings.t_init_ms   = ms_since(t_wall_start);
 
     // =========================================================================
     // 4.4  cuSPARSE SpMV descriptor  (Ybus · d_V → d_Ibus)
@@ -373,12 +702,22 @@ AcPfNrState::AcPfNrState(
     dss_x.create_dn(dim_J, thrust::raw_pointer_cast(d_dx.data()));
     dss_b.create_dn(dim_J, thrust::raw_pointer_cast(d_F.data()));
 
+    // t_init_ms captured HERE (not right after the H→D uploads above): it must
+    // also cover the cuSPARSE SpMV descriptor and cuDSS handle/config/data/
+    // matrix-descriptor creation just above -- on a process' first CUDA call
+    // these dlopen + PTX-JIT the cuSPARSE/cuDSS backends, which can dominate
+    // total wall time and would otherwise land in a completely untimed gap.
+    timings.t_init_ms = ms_since(t_wall_start);
+
     // ANALYSIS: reordering + symbolic factorisation.
     // Wall-clock timing via chrono (mixed CPU/GPU work; a CUDA event pair
-    // would only capture the GPU tail).
+    // would only capture the GPU tail). analyze() runs on stream cs, so
+    // synchronize before sampling the end time -- otherwise the wall-clock
+    // could stop while ANALYSIS is still in flight on the GPU.
     {
         auto t_analyse = std::chrono::steady_clock::now();
         dss.analyze(dss_A, dss_x, dss_b);
+        cs.synchronize();
         timings.t_analyze_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_analyse).count();
     }
@@ -412,36 +751,126 @@ AcPfNrState::AcPfNrState(
         thrust::raw_pointer_cast(d_map_j12.data()),
         thrust::raw_pointer_cast(d_map_j21.data()),
         thrust::raw_pointer_cast(d_map_j22.data()),
-        thrust::raw_pointer_cast(d_pvpq.data()),
-        thrust::raw_pointer_cast(d_pq.data()),
+        thrust::raw_pointer_cast(d_p_buses.data()),
+        thrust::raw_pointer_cast(d_p_rows.data()),
+        n_p,
+        thrust::raw_pointer_cast(d_q_buses.data()),
+        thrust::raw_pointer_cast(d_q_rows.data()),
+        n_q,
+        thrust::raw_pointer_cast(d_theta_buses.data()),
+        thrust::raw_pointer_cast(d_theta_cols.data()),
+        n_theta,
+        thrust::raw_pointer_cast(d_vm_buses.data()),
+        thrust::raw_pointer_cast(d_vm_cols.data()),
+        n_vm,
         thrust::raw_pointer_cast(d_Sbus.data()),
         /*sbus_stride=*/0,   // single-system NR: shared Sbus
+        // MultiSlack (inactive: slack_col=-1, empty vectors → nullptr; kernels skipped)
+        slack_col,
+        n_slack,
+        thrust::raw_pointer_cast(d_slack_prow.data()),
+        thrust::raw_pointer_cast(d_slack_w.data()),
+        thrust::raw_pointer_cast(d_slack_feat_pos.data()),
+        thrust::raw_pointer_cast(d_slack_absorbed.data()),
+        // HVDC angle-droop (inactive when n_hvdc==0; kernels + J-zeroing skipped)
+        n_hvdc,
+        /*zero_J_before_fill=*/(n_hvdc > 0),
+        thrust::raw_pointer_cast(d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(d_hvdc_status.data()),
+        thrust::raw_pointer_cast(d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(d_hvdc_k.data()),
+        thrust::raw_pointer_cast(d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(d_hvdc_r.data()),
+        thrust::raw_pointer_cast(d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(d_hvdc_pmax21.data()),
+        thrust::raw_pointer_cast(d_hvdc_prow1.data()),
+        thrust::raw_pointer_cast(d_hvdc_prow2.data()),
+        thrust::raw_pointer_cast(d_hvdc_h11.data()),
+        thrust::raw_pointer_cast(d_hvdc_h12.data()),
+        thrust::raw_pointer_cast(d_hvdc_h21.data()),
+        thrust::raw_pointer_cast(d_hvdc_h22.data()),
+        // VoltageControl (inactive when n_vc_ctrl==0; kernels skipped)
+        n_vc_ctrl,
+        n_vc_grp,
+        n_vc_share,
+        n_vc_feat,
+        thrust::raw_pointer_cast(d_vc_qrow.data()),
+        thrust::raw_pointer_cast(d_vc_qcol.data()),
+        thrust::raw_pointer_cast(d_vc_slope.data()),
+        thrust::raw_pointer_cast(d_vc_reg_bus.data()),
+        thrust::raw_pointer_cast(d_vc_vrow.data()),
+        thrust::raw_pointer_cast(d_vc_grp_start.data()),
+        thrust::raw_pointer_cast(d_vc_grp_count.data()),
+        thrust::raw_pointer_cast(d_vc_vset.data()),
+        thrust::raw_pointer_cast(d_vc_sh_row.data()),
+        thrust::raw_pointer_cast(d_vc_sh_first.data()),
+        thrust::raw_pointer_cast(d_vc_sh_other.data()),
+        thrust::raw_pointer_cast(d_vc_sh_wfirst.data()),
+        thrust::raw_pointer_cast(d_vc_sh_wother.data()),
+        thrust::raw_pointer_cast(d_vc_feat_pos.data()),
+        thrust::raw_pointer_cast(d_vc_feat_val.data()),
+        thrust::raw_pointer_cast(d_vc_q.data()),
     };
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
 
-    for (int iter = 0; iter < max_iter; ++iter)
-    {
-        timings.nb_iter++;
-
+    if (presolved_v) {
+        // =====================================================================
+        // Presolved-V fast path (init_from_n_powerflow)
+        //
+        //   Vinit is trusted to already be converged (e.g. lightsim2grid's CPU
+        //   KLU solve). Run steps ①-④ once at Vinit — fill_F/fill_J/FACTORIZE —
+        //   to validate ‖F(Vinit)‖∞ and prepare J's factors for prepare_JT() /
+        //   the direct_base_case_factors batch strategy. d_V itself is NEVER
+        //   touched by update_Va/update_Vm in this branch: it stays bit-identical
+        //   to the caller-supplied Vinit instead of being perturbed by the
+        //   needless solve+update_V the max_iter=1 path used to always perform
+        //   (see the trade-off note above nr_iter_step's normal loop below).
+        //
+        //   Caveat -- extension running state: MultiSlack (slack_absorbed) and
+        //   VoltageControl (vc_q) hold state that is NOT a function of V alone
+        //   (e.g. a distributed-slack participant's P row measures how much
+        //   power the slack must additionally supply beyond its scheduled
+        //   Sbus -- that quantity is itself an unknown, not implied by V). This
+        //   state defaults to zero, which is generally wrong even when V0 is
+        //   electrically exact, so a fill_F at (Vinit, state=0) can show a large
+        //   residual purely from the stale state. When such an extension is
+        //   active we derive the correct state with ONE linear solve (mirroring
+        //   exactly how lightsim2grid's own NR loop updates slack_absorbed/vc_q
+        //   each iteration: `state += dx(state_col)`), but apply ONLY the
+        //   feature-state kernels (nr_feature_update) -- never
+        //   update_Va_kernel/update_Vm_kernel -- so V still never moves.
+        // =====================================================================
         NrIterTimings step;
-        nr_iter_step(spmv, dss, dss_A, dss_x, dss_b, buf,
-                     n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
-                     /*actual_batch=*/1, cs, timer,
-                     /*first_factorize=*/(iter == 0), step);
+        nr_iter_step_prepare(spmv, dss, dss_A, dss_x, dss_b, buf,
+                             n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
+                             /*actual_batch=*/1, cs, timer,
+                             /*first_factorize=*/true, step);
         timings.t_spmv            += step.t_spmv;
         timings.t_fill_F          += step.t_fill_F;
         timings.t_fill_J          += step.t_fill_J;
         timings.t_first_factorize += step.t_first_factorize;
-        timings.t_refactorize     += step.t_refactorize;
-        if (iter > 0) timings.n_refactorize++;
-        timings.t_solve           += step.t_solve;
-        timings.t_update_V        += step.t_update_V;
 
-        // ‖F‖∞ convergence check on the mismatch left by nr_iter_step.
-        // d_F holds −[ΔP, ΔQ] of the just-updated V; no extra SpMV needed.
+        const bool has_ext_state = (slack_col >= 0) || (n_vc_ctrl > 0);
+        if (has_ext_state) {
+            timer.start();
+            dss.solve(dss_A, dss_x, dss_b);
+            timings.t_solve += timer.stop_ms();
+
+            timer.start();
+            nr_feature_update(buf, dim_J, /*batch=*/1, cs);
+            timings.t_update_V += timer.stop_ms();  // feature-state only; d_V untouched
+
+            // Ibus is unchanged (V didn't move): refresh F with the corrected
+            // feature state without redoing SpMV/fill_J/factorize.
+            nr_iter_step_fill_F(buf, n_bus, dim_J, /*actual_batch=*/1, cs, timer, step);
+            timings.t_fill_F += step.t_fill_F;
+        }
+
         timer.start();
-        cuda_real_type norm_F = thrust::transform_reduce(
+        cuda_real_type norm_F0 = thrust::transform_reduce(
             thrust::cuda::par.on(cs),
             d_F.begin(), d_F.end(),
             AbsFunctor{},
@@ -449,14 +878,70 @@ AcPfNrState::AcPfNrState(
             thrust::maximum<cuda_real_type>());
         timings.t_mismatch += timer.stop_ms();
 
-        if (norm_F < static_cast<cuda_real_type>(tol)) {
-            timings.converged = true;
-            break;
+        // Guard against tol being tuned for lightsim2grid's FP64 CPU check
+        // while the GPU build is FP32 — casting V0 to complex64 alone can push
+        // the FP32 residual above a tight FP64 tol even though nothing is wrong.
+#ifdef GPUSIM2GRID_REAL_FLOAT
+        constexpr cuda_real_type kPresolvedFloor = 1e-4f;
+#else
+        constexpr cuda_real_type kPresolvedFloor = 1e-10;
+#endif
+        const cuda_real_type effective_tol =
+            std::max(static_cast<cuda_real_type>(tol), kPresolvedFloor);
+
+        timings.nb_iter = 0;
+        timings.converged = (norm_F0 < effective_tol);
+        if (!timings.converged) {
+            throw std::runtime_error(
+                "[acpf_nr] presolved_v=true (init_from_n_powerflow) but "
+                "||F(V0)||_inf = " + std::to_string(norm_F0) +
+                " exceeds effective_tol = " + std::to_string(effective_tol) +
+                " (tol=" + std::to_string(tol) + "). The supplied voltage is "
+                "not converged for this Ybus/Sbus/ledger -- disable "
+                "init_from_n_powerflow or re-check the CPU base-case solve.");
         }
+        // d_V left untouched at Vinit; d_J_values holds J(Vinit), already
+        // factorized via dss -- ready for prepare_JT() and the
+        // direct_base_case_factors batch strategy.
+    } else {
+        for (int iter = 0; iter < max_iter; ++iter)
+        {
+            timings.nb_iter++;
+
+            NrIterTimings step;
+            nr_iter_step(spmv, dss, dss_A, dss_x, dss_b, buf,
+                         n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
+                         /*actual_batch=*/1, cs, timer,
+                         /*first_factorize=*/(iter == 0), step);
+            timings.t_spmv            += step.t_spmv;
+            timings.t_fill_F          += step.t_fill_F;
+            timings.t_fill_J          += step.t_fill_J;
+            timings.t_first_factorize += step.t_first_factorize;
+            timings.t_refactorize     += step.t_refactorize;
+            if (iter > 0) timings.n_refactorize++;
+            timings.t_solve           += step.t_solve;
+            timings.t_update_V        += step.t_update_V;
+
+            // ‖F‖∞ convergence check on the mismatch left by nr_iter_step.
+            // d_F holds −[ΔP, ΔQ] of the just-updated V; no extra SpMV needed.
+            timer.start();
+            cuda_real_type norm_F = thrust::transform_reduce(
+                thrust::cuda::par.on(cs),
+                d_F.begin(), d_F.end(),
+                AbsFunctor{},
+                cuda_real_type(0.),
+                thrust::maximum<cuda_real_type>());
+            timings.t_mismatch += timer.stop_ms();
+
+            if (norm_F < static_cast<cuda_real_type>(tol)) {
+                timings.converged = true;
+                break;
+            }
+        }
+        // §4.8 (post-loop final check) is no longer needed: nr_iter_step always
+        // recomputes d_F before the convergence test above, so timings.converged
+        // is accurate whether the loop exited via break or by exhausting max_iter.
     }
-    // §4.8 (post-loop final check) is no longer needed: nr_iter_step always
-    // recomputes d_F before the convergence test above, so timings.converged
-    // is accurate whether the loop exited via break or by exhausting max_iter.
 
     // =========================================================================
     // 4.9  Snapshot base-case solution (D→D, on cs)
@@ -486,12 +971,14 @@ void AcPfNrState::copy_V_to_host(Eigen::Ref<CplxVect> V_out) const
     // of any pending work on cs and read stale device data.
     cs.synchronize();
 
+    auto t_copy_start = std::chrono::steady_clock::now();
     thrust::host_vector<cudaComplexType> h_V = d_V;   // D→H, default stream
     V_out.resize(n_bus);
     for (int i = 0; i < n_bus; ++i)
         V_out(i) = eigen_cplx_type(
             static_cast<eigen_real_type>(h_V[i].x),
             static_cast<eigen_real_type>(h_V[i].y));
+    timings.t_copy_v_to_host_ms = ms_since(t_copy_start);
 }
 
 // =============================================================================
@@ -535,13 +1022,16 @@ AcPfNrSession::AcPfNrSession(
     Eigen::Ref<const Eigen::VectorXi>           pq,
     int                                         max_iter,
     eigen_real_type                             tol,
-    int                                         device
+    int                                         device,
+    const LedgerData*                           ledger,
+    bool                                         presolved_v
 )
 {
     (void)slack_ids;
     (void)slack_weights;
     state_ = std::make_shared<AcPfNrState>(Ybus, Vinit, Sbus, pv, pq,
-                                            max_iter, tol, device);
+                                            max_iter, tol, device, ledger,
+                                            presolved_v);
 }
 
 // =============================================================================
@@ -558,6 +1048,13 @@ AcPfNrSession::AcPfNrSession(
 
 void AcPfNrState::prepare_JT()
 {
+    // Wall-clock timing via chrono (mixed CPU/GPU work: cusparseCsr2cscEx2 +
+    // a full cuDSS analyze+factorize on the transposed system). Synchronize
+    // before sampling the end time so the GPU work is actually complete --
+    // this call was previously entirely untimed, hiding a one-time cost
+    // comparable to t_analyze_ms + t_first_factorize combined.
+    auto t_prep_start = std::chrono::steady_clock::now();
+
     // Allocate device storage for Jᵀ CSR and work vectors
     d_JT_outer.resize(dim_J + 1);
     d_JT_inner.resize(nnz_J);
@@ -635,6 +1132,9 @@ void AcPfNrState::prepare_JT()
 
     dss_T.analyze(dss_AT, dss_xT, dss_bT);
     dss_T.factorize(dss_AT, dss_xT, dss_bT);
+
+    cs.synchronize();
+    timings.t_prepare_jt_ms = ms_since(t_prep_start);
 }
 
 void AcPfNrState::solve_JT(const cuda_real_type* d_rhs, cuda_real_type* d_sol)
@@ -686,3 +1186,8 @@ std::vector<int> AcPfNrSession::pq() const {
     thrust::host_vector<int> h(state_->d_pq);
     return std::vector<int>(h.begin(), h.end());
 }
+
+std::vector<int> AcPfNrSession::p_row_of_bus()     const { return state_->h_p_row_of_bus; }
+std::vector<int> AcPfNrSession::q_row_of_bus()     const { return state_->h_q_row_of_bus; }
+std::vector<int> AcPfNrSession::theta_col_of_bus() const { return state_->h_theta_col_of_bus; }
+std::vector<int> AcPfNrSession::vm_col_of_bus()    const { return state_->h_vm_col_of_bus; }

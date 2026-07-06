@@ -3,13 +3,17 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 __all__ = [
-    "ContingencyAnalysisSolver",
+    "ViolationElementType",
+    "LimitViolationType",
+    "LimitViolation",
 ]
 
 from .._gpusim2grid import (
     ContingencyAnalysisSession as _ContingencyAnalysisSession,
     ContingencySolverType as _ContingencySolverType,
 )
+
+from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -64,7 +68,7 @@ class DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class ContingencyAnalysisSolver:
+class _ContingencyAnalysisSolver:
     """Stateful GPU N-k contingency analysis solver.
 
     Parameters
@@ -96,6 +100,12 @@ class ContingencyAnalysisSolver:
     tol_base : float, optional
         Convergence tolerance ‖F‖∞ for the base-case solve (default: 1e-6).
         Only used at construction time.
+    presolved_v : bool, optional
+        If True, ``Vinit`` is trusted as already converged (e.g. lightsim2grid's
+        CPU solve): the GPU base-case NR loop is skipped entirely after a single
+        validation ``‖F(Vinit)‖∞`` check (raises ``RuntimeError`` if it fails).
+        ``max_iter_base`` is then only used for reference/introspection, not to
+        drive an iteration count. Default False.
 
     Notes
     -----
@@ -111,12 +121,16 @@ class ContingencyAnalysisSolver:
       (default 1, equivalent to ``'direct_refactor_every'``).
     - ``max_iter_base``, ``tol_base``: Stored for reference only; do not
       rerun the base case.
+    - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
+      divergence check (see :meth:`set_limits`). Default False.
+    - ``violation_tol`` (*float*), ``violation_capacity`` (*int*): DIVERGED
+      tolerance and max records kept per contingency (default 16).
 
     Examples
     --------
     .. code-block:: python
 
-        solver = ContingencyAnalysisSolver(Ybus, Vinit, Sbus,
+        solver = _ContingencyAnalysisSolver(Ybus, Vinit, Sbus,
                                            slack_ids, slack_weights, pv, pq)
         solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt,
                                bus_vn_kv, sn_mva)
@@ -139,14 +153,15 @@ class ContingencyAnalysisSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None):
+                 device=None, handle_disconnected_grid=False, presolved_v=False):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
         self._s = _ContingencyAnalysisSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
-            _normalize_device(device))
+            _normalize_device(device), presolved_v=bool(presolved_v))
+        self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -192,6 +207,18 @@ class ContingencyAnalysisSolver:
                 f"Choose from: {list(_STRATEGY_MAP)}")
         self._strategy = value
         self._s.strategy_type = _STRATEGY_MAP[value]
+
+    @property
+    def handle_disconnected_grid(self):
+        """bool: solve the largest connected component of a split grid (masking the
+        rest as NaN) instead of skipping the contingency. Contingencies that strand
+        the angle reference or a controller bus are still skipped. Incompatible with
+        the 'direct_base_case_factors' strategy. Takes effect on the next run()."""
+        return self._s.handle_disconnected_grid
+
+    @handle_disconnected_grid.setter
+    def handle_disconnected_grid(self, value):
+        self._s.handle_disconnected_grid = bool(value)
 
     @property
     def refactor_period(self):
@@ -254,6 +281,120 @@ class ContingencyAnalysisSolver:
         self._s.compute_flows()
 
     @property
+    def compute_limit_violations(self):
+        """bool: fused per-chunk voltage/current/divergence check (see
+        set_limits()). Mirrors lightsim2grid's ContingencyAnalysis flag of the
+        same name. Writes only a bounded compact buffer -- never the full
+        dense V_results/or_amps/ex_amps. Changing this clears any previously
+        computed violation results. Default False. Takes effect on the next
+        run()."""
+        return self._s.compute_limit_violations
+
+    @compute_limit_violations.setter
+    def compute_limit_violations(self, value):
+        self._s.compute_limit_violations = bool(value)   # C++ setter handles the clear-on-change
+
+    def set_limits(self, bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka, branch_limit_a2_ka, n_lines):
+        """Configure per-bus voltage (kV) / per-branch current (kA) limits.
+
+        NaN = not configured for that element (matches lightsim2grid's
+        convention). Required before run() when compute_limit_violations is
+        True. n_lines splits the lines-then-trafos branch ordering for
+        LimitViolation.element_type/element_id de-concatenation.
+        """
+        self._s.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
+                           branch_limit_a2_ka, int(n_lines))
+
+    @property
+    def violation_tol(self):
+        """float: residual tolerance for the DIVERGED check, independent of
+        tol_base. Takes effect on the next run()."""
+        return self._s.violation_tol
+
+    @violation_tol.setter
+    def violation_tol(self, value):
+        self._s.violation_tol = float(value)
+
+    @property
+    def violation_capacity(self):
+        """int: max violation records kept per contingency (K). Bounds the
+        compact output at n_contingencies * K regardless of grid size. Takes
+        effect on the next run(); default 16."""
+        return self._s.violation_capacity
+
+    @violation_capacity.setter
+    def violation_capacity(self, value):
+        self._s.violation_capacity = int(value)
+
+    def get_violations(self):
+        """list[list[LimitViolation]]: one entry per contingency (row order
+        matches build_contingencies()'s input list). [] for a not-simulated
+        (disconnected / masked-skip) contingency; a non-converged one gets a
+        single DIVERGED entry and nothing else. Requires run() with
+        compute_limit_violations=True."""
+        if not self.compute_limit_violations:
+            raise RuntimeError(
+                "get_violations() requires compute_limit_violations=True "
+                "(set solver.compute_limit_violations = True before run()).")
+        counts = self._s.get_violation_count()
+        etype  = self._s.get_violation_element_type()
+        eid    = self._s.get_violation_element_id()
+        side   = self._s.get_violation_side()
+        vtype  = self._s.get_violation_type()
+        value  = self._s.get_violation_value()
+        limit  = self._s.get_violation_limit()
+        K = self.violation_capacity
+        out = []
+        for c, cnt in enumerate(counts):
+            if cnt < 0:
+                out.append([])
+                continue
+            base = c * K
+            out.append([
+                LimitViolation(ViolationElementType(int(etype[base + i])), int(eid[base + i]),
+                               int(side[base + i]), LimitViolationType(int(vtype[base + i])),
+                               float(value[base + i]), float(limit[base + i]))
+                for i in range(cnt)
+            ])
+        return out
+
+    def get_violations_truncated(self):
+        """(n_contingencies,) bool ndarray: True where more than
+        violation_capacity violations were found for that contingency
+        (clamped -- raise violation_capacity if this matters for your use
+        case). Requires run() with compute_limit_violations=True."""
+        return self._s.get_violation_truncated().astype(bool)
+
+    def get_violation_counts(self):
+        """dict of (n_contingencies,) int ndarrays with keys 'low_voltage',
+        'high_voltage', 'current': the TRUE, uncapped count of violations of
+        each type per contingency, -1 for a not-simulated (disconnected /
+        masked-skip) contingency.
+
+        Unlike get_violations()'s per-violation records (capped at
+        violation_capacity), these totals are always exact -- they keep
+        counting past the cap, so they remain reliable even when
+        get_violations_truncated() is True for a contingency. Requires run()
+        with compute_limit_violations=True."""
+        if not self.compute_limit_violations:
+            raise RuntimeError(
+                "get_violation_counts() requires compute_limit_violations=True "
+                "(set solver.compute_limit_violations = True before run()).")
+        return {
+            "low_voltage":  self._s.get_violation_count_low_voltage(),
+            "high_voltage": self._s.get_violation_count_high_voltage(),
+            "current":      self._s.get_violation_count_current(),
+        }
+
+    def converged(self, tol=None):
+        """(n_contingencies,) bool ndarray: residual <= tol (defaults to
+        violation_tol). Independent of compute_limit_violations -- residuals
+        are always O(n_contingencies) and always computed (see residuals);
+        this does not require compute_limit_violations to be enabled."""
+        t = self.violation_tol if tol is None else tol
+        return self.residuals.to_numpy() <= t
+
+    @property
     def V_results(self):
         """DeviceBuffer: (n_contingencies * n_bus,) complex voltages."""
         n_ctg = self._s.n_contingencies
@@ -302,3 +443,9 @@ class ContingencyAnalysisSolver:
         tensor before a subsequent ``run()`` if a snapshot is needed.
         """
         return self._s.v_results_dlpack()
+
+
+# Not in __all__: documented separately as gpusim2grid.ContingencyAnalysisGPU /
+# gpusim2grid.optimize_reference_slack (see docs/api.rst) to avoid duplicate
+# autodoc entries for the same classes/functions.
+from .gpu_facade import ContingencyAnalysisGPU, optimize_reference_slack

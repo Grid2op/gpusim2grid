@@ -48,6 +48,8 @@
 #include "cu_complex_utils.h" // cudaComplexType, CudaFunHelper, CUDA_C_TYPE …
 #include "timing_utils.hpp"   // AcPfTimings, TimingEntry
 
+struct LedgerData;            // ledger_data.hpp (host); optional augmented-J input
+
 // =============================================================================
 // AcPfNrState
 // =============================================================================
@@ -85,6 +87,85 @@ struct AcPfNrState {
     // -------------------------------------------------------------------------
     thrust::device_vector<int> d_pvpq;   // sorted pvpq bus indices
     thrust::device_vector<int> d_pq;     // pq bus indices
+
+    // -------------------------------------------------------------------------
+    // NRLedger pair lists (device) — define the augmented Jacobian layout.
+    //   Each (bus, row/col) pair: which solver bus owns the equation/unknown and
+    //   its J row/column. Built once (trivial ledger from pv/pq for a feature-free
+    //   grid; the augmented ledger from lightsim2grid once extensions are active)
+    //   and shared, single-system, across every batch slot — exactly like the
+    //   scatter maps. Counts n_p/n_q/n_theta/n_vm may exceed n_pvpq/n_pq when an
+    //   extension adds rows/columns.
+    // -------------------------------------------------------------------------
+    int n_p = 0, n_q = 0, n_theta = 0, n_vm = 0;
+    thrust::device_vector<int> d_p_buses,     d_p_rows;      // P equations
+    thrust::device_vector<int> d_q_buses,     d_q_rows;      // Q equations
+    thrust::device_vector<int> d_theta_buses, d_theta_cols;  // theta unknowns
+    thrust::device_vector<int> d_vm_buses,    d_vm_cols;     // vm unknowns
+
+    // -------------------------------------------------------------------------
+    // Host-side masking tables (handle_disconnected_grid). Built once in the
+    // ctor from the ledger pair lists + the J skeleton. All size n_bus, -1 when
+    // the bus owns no such row/col.
+    //   h_theta_col_of_bus : angle column of each bus (-1 ⇒ angle reference)
+    //   h_vm_col_of_bus : the bus' Vm (voltage magnitude) unknown column
+    //   h_p_row_of_bus / h_q_row_of_bus : the bus' P / Q equation rows
+    //   h_p_diag_pos / h_q_diag_pos : nnz index of the (p_row, theta_col) /
+    //                                 (q_row, vm_col) diagonal in the J skeleton,
+    //                                 used to write the identity entry when the
+    //                                 bus is masked out (largest-component solve).
+    //
+    // Also exposed to Python (AcPfNrSession accessors) so the differentiable
+    // adjoint path can project/scatter gradients bus-by-bus instead of
+    // assuming the trivial bare-system pvpq/pq positional layout.
+    // -------------------------------------------------------------------------
+    std::vector<int> h_theta_col_of_bus, h_vm_col_of_bus;
+    std::vector<int> h_p_row_of_bus, h_q_row_of_bus;
+    std::vector<int> h_p_diag_pos,   h_q_diag_pos;
+
+    // -------------------------------------------------------------------------
+    // MultiSlack (distributed slack in the Jacobian) — slack_col < 0 when absent.
+    //   d_slack_absorbed is the per-batch-slot running state (size 1 for the
+    //   single-system base solve; tiled to batch_size by the batch driver).
+    //   The other arrays are shared single-system (length n_slack).
+    // -------------------------------------------------------------------------
+    int slack_col = -1;
+    int n_slack   = 0;
+    thrust::device_vector<int>            d_slack_prow;       // [n_slack] P row of each slack
+    thrust::device_vector<cuda_real_type> d_slack_w;          // [n_slack] slack weight
+    thrust::device_vector<int>            d_slack_feat_pos;   // [n_slack] J pos (p_row, slack_col)
+    thrust::device_vector<cuda_real_type> d_slack_absorbed;   // [1] base-solve running state
+
+    // -------------------------------------------------------------------------
+    // HVDC angle-droop — n_hvdc == 0 when no connected droop line. Per-line
+    // arrays (solver numbering, pu) + the derived end P rows / theta-col feature
+    // J positions (-1 when an end is a slack). The slopes accumulate onto J, so
+    // the J value array must be zeroed before each fill_J when HVDC is active.
+    // -------------------------------------------------------------------------
+    int n_hvdc = 0;
+    thrust::device_vector<int>            d_hvdc_bus1, d_hvdc_bus2, d_hvdc_status;
+    thrust::device_vector<cuda_real_type> d_hvdc_p0, d_hvdc_k, d_hvdc_lf1, d_hvdc_lf2,
+                                          d_hvdc_r, d_hvdc_pmax12, d_hvdc_pmax21;
+    thrust::device_vector<int>            d_hvdc_prow1, d_hvdc_prow2;          // end P rows
+    thrust::device_vector<int>            d_hvdc_h11, d_hvdc_h12, d_hvdc_h21, d_hvdc_h22;  // feature J pos
+
+    // -------------------------------------------------------------------------
+    // VoltageControl (remote gen + SVC) — n_vc_ctrl == 0 when inactive.
+    //   d_vc_q is the per-batch-slot running reactive injection (size n_vc_ctrl
+    //   for the base solve). The feature entries are flattened (pos, value) pairs
+    //   assigned via fill_slack_feature_kernel.
+    // -------------------------------------------------------------------------
+    int n_vc_ctrl = 0, n_vc_grp = 0, n_vc_share = 0, n_vc_feat = 0;
+    thrust::device_vector<int>            d_vc_qrow, d_vc_qcol;                 // per controller
+    thrust::device_vector<cuda_real_type> d_vc_slope;                          // per controller
+    thrust::device_vector<int>            d_vc_reg_bus, d_vc_vrow,
+                                          d_vc_grp_start, d_vc_grp_count;       // per group
+    thrust::device_vector<cuda_real_type> d_vc_vset;                           // per group
+    thrust::device_vector<int>            d_vc_sh_row, d_vc_sh_first, d_vc_sh_other;  // per sharing row
+    thrust::device_vector<cuda_real_type> d_vc_sh_wfirst, d_vc_sh_wother;      // per sharing row
+    thrust::device_vector<int>            d_vc_feat_pos;                        // flat feature J pos
+    thrust::device_vector<cuda_real_type> d_vc_feat_val;                       // flat feature value
+    thrust::device_vector<cuda_real_type> d_vc_q;                              // [n_vc_ctrl] running state
 
     // -------------------------------------------------------------------------
     // Ybus CSR (device, complex cuda_real_type)
@@ -170,9 +251,11 @@ struct AcPfNrState {
     CudssDescriptor dss_xT;  // dense solution descriptor
 
     // -------------------------------------------------------------------------
-    // Timings captured during construction
+    // Timings captured during construction.  Mutable so the const
+    // copy_V_to_host() accessor can record its own D→H transfer time
+    // (t_copy_v_to_host_ms) without relaxing its constness.
     // -------------------------------------------------------------------------
-    AcPfTimings timings;
+    mutable AcPfTimings timings;
 
     // =========================================================================
     // Constructor
@@ -194,7 +277,16 @@ struct AcPfNrState {
         Eigen::Ref<const Eigen::VectorXi>           pq,
         int                                         max_iter,
         eigen_real_type                             tol,
-        int                                         device = -1
+        int                                         device = -1,
+        // Optional augmented-J description read off a solved lightsim2grid grid.
+        // nullptr → build the trivial feature-free ledger from pv/pq (Phase 1).
+        const LedgerData*                           ledger = nullptr,
+        // When true, Vinit is trusted to already be converged (e.g. lightsim2grid's
+        // CPU KLU solve): run one fill_F/fill_J/FACTORIZE at Vinit to validate
+        // ||F(Vinit)||_inf and prepare J's factors, but never call solve/update_V —
+        // d_V stays bit-identical to Vinit. Throws if the residual check fails.
+        // See acpf_nr.cu §4.6.
+        bool                                         presolved_v = false
     );
 
     // =========================================================================

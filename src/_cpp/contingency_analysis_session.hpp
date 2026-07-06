@@ -50,6 +50,7 @@
 // std::unique_ptr<ContingencyAnalysisSolver> since the destructor is defined
 // in the .cu where the complete type is visible.
 struct AcPfNrState;
+struct LedgerData;
 struct ContingencyBatch;
 template <typename BatchSource> struct BatchPfDriver;
 using ContingencyAnalysisSolver = BatchPfDriver<ContingencyBatch>;
@@ -78,6 +79,14 @@ struct ContingencyAnalysisSession {
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_   = ContingencySolverType::DirectRefactorEvery;
 
+    // handle_disconnected_grid: when true, a contingency that splits the grid is
+    // solved on its largest connected component (the rest is frozen and reported
+    // as NaN) instead of being skipped — unless it strands the angle reference or
+    // a controller bus, which is still skipped. Mutable; takes effect on the next
+    // run(). mask_cfg_ is built once in the ctor from the base case + ledger.
+    bool       handle_disconnected_grid_ = false;
+    MaskConfig mask_cfg_;
+
     // =========================================================================
     // Host branch data (stored for compute_flows() and build_contingencies())
     // =========================================================================
@@ -93,6 +102,21 @@ struct ContingencyAnalysisSession {
     RealVect h_ex_amps_;
 
     // =========================================================================
+    // compute_limit_violations (opt-in; fused on-device per-chunk check --
+    // see set_compute_limit_violations()/set_limits()/run()).
+    // =========================================================================
+    bool     compute_limit_violations_ = false;
+    double   violation_tol_            = 1e-6;   // dedicated; independent of tol_base
+    int      violation_capacity_       = 16;     // K; bounds memory at n_ctg*K regardless
+                                                  // of n_bus/n_branches -- see set_limits()
+    bool     has_limits_               = false;
+    bool     has_violations_result_    = false;
+    int      n_lines_                  = 0;      // branch ordering split (lines-then-trafos)
+
+    RealVect h_bus_vmin_kv_, h_bus_vmax_kv_;               // [n_bus], solver numbering
+    RealVect h_branch_limit_a1_ka_, h_branch_limit_a2_ka_; // [n_branches], lines-then-trafos
+
+    // =========================================================================
     // Contingency data (populated by build_contingencies())
     // =========================================================================
     std::vector<Contingency>      contingencies_;
@@ -102,8 +126,11 @@ struct ContingencyAnalysisSession {
     // Base-case NR time captured at construction (before run() is called).
     double t_base_case_ms_ = 0.;
 
-    // Timings accumulated across run() + compute_flows().
-    BatchTimings timings_;
+    // Timings accumulated across run() + compute_flows(). Mutable so the const
+    // get_V_results()/get_residuals() accessors can record their own D→H
+    // transfer time (t_copy_V_to_host_ms / t_copy_residuals_to_host_ms)
+    // without relaxing their constness.
+    mutable BatchTimings timings_;
 
     // =========================================================================
     // Constructor
@@ -121,7 +148,9 @@ struct ContingencyAnalysisSession {
         int    nb_iter,
         int    max_iter_base = 10,
         double tol_base      = 1e-6,
-        int    device        = -1
+        int    device        = -1,
+        const LedgerData* ledger = nullptr,  // augmented-J description (bridge path)
+        bool   presolved_v   = false  // trust Vinit as already converged; see AcPfNrState
     );
 
     // =========================================================================
@@ -166,6 +195,42 @@ struct ContingencyAnalysisSession {
     void compute_flows();
 
     // =========================================================================
+    // compute_limit_violations
+    // Opt-in fused per-chunk voltage/current/divergence check (mirrors
+    // lightsim2grid's ContingencyAnalysis.compute_limit_violations flag/name).
+    // When enabled, requires set_branch_data() and set_limits() to have been
+    // called before run(); the check then runs on-device, per chunk, writing
+    // only a bounded O(n_contingencies * violation_capacity) compact buffer --
+    // the full dense d_V_results/d_or_amps_results/d_ex_amps_results are never
+    // required for this path (though set_branch_data()/compute_flows() remain
+    // available, unchanged, for callers who also want full flows).
+    // Changing the flag is a no-op if unchanged; otherwise it clears any
+    // previously computed violation results (mirrors lightsim2grid exactly).
+    // =========================================================================
+    bool get_compute_limit_violations() const { return compute_limit_violations_; }
+    void set_compute_limit_violations(bool val) {
+        if (val == compute_limit_violations_) return;
+        compute_limit_violations_ = val;
+        has_violations_result_ = false;
+    }
+
+    // =========================================================================
+    // set_limits
+    // Configure per-bus voltage (kV, solver numbering) and per-branch current
+    // (kA, lines-then-trafos) limits for compute_limit_violations. NaN = not
+    // configured for that element (matches lightsim2grid's convention).
+    // n_lines splits the lines-then-trafos branch ordering for
+    // LimitViolation.element_type/element_id de-concatenation. Required
+    // before run() when compute_limit_violations is True.
+    // =========================================================================
+    void set_limits(
+        Eigen::Ref<const RealVect> bus_vmin_kv,
+        Eigen::Ref<const RealVect> bus_vmax_kv,
+        Eigen::Ref<const RealVect> branch_limit_a1_ka,
+        Eigen::Ref<const RealVect> branch_limit_a2_ka,
+        int n_lines);
+
+    // =========================================================================
     // Metadata accessors
     // =========================================================================
     int n_contingencies() const;
@@ -180,6 +245,28 @@ struct ContingencyAnalysisSession {
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
+
+    // =========================================================================
+    // compute_limit_violations result accessors — synchronous D→H copy on
+    // demand, all cheap (O(n_contingencies * violation_capacity) or
+    // O(n_contingencies)). Throw if run() hasn't been called with
+    // compute_limit_violations=True.
+    // =========================================================================
+    Eigen::VectorXi get_violation_element_type() const;
+    Eigen::VectorXi get_violation_element_id()   const;
+    Eigen::VectorXi get_violation_side()         const;
+    Eigen::VectorXi get_violation_type()         const;
+    RealVect        get_violation_value()        const;
+    RealVect        get_violation_limit()        const;
+    Eigen::VectorXi get_violation_count()        const;
+    Eigen::VectorXi get_violation_truncated()    const;
+
+    // TRUE, uncapped per-type violation totals (independent of
+    // violation_capacity/K, unlike get_violation_count() above which is
+    // capped at K): -1 = not simulated, else the exact count.
+    Eigen::VectorXi get_violation_count_low_voltage()  const;
+    Eigen::VectorXi get_violation_count_high_voltage() const;
+    Eigen::VectorXi get_violation_count_current()      const;
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ContingencyAnalysisSession(const ContingencyAnalysisSession&)            = delete;

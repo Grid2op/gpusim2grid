@@ -112,10 +112,18 @@ struct BatchPfDriver {
 
     // -------------------------------------------------------------------------
     // One-time construction timings (wall-clock ms)
+    //
+    //   t_analysis_ms_    — cuDSS init + ANALYSIS + policy init ONLY.
+    //   t_source_init_ms_ — source-specific one-time GPU setup (split out of
+    //                       what used to be bundled into t_analysis_ms_): see
+    //                       BatchSource::initialize().
     // -------------------------------------------------------------------------
-    double t_preprocess_ms_ = 0.;
-    double t_alloc_ms_      = 0.;
-    double t_analysis_ms_   = 0.;
+    double t_preprocess_ms_       = 0.;
+    double t_alloc_ms_            = 0.;
+    double t_analysis_ms_         = 0.;
+    double t_source_init_ms_      = 0.;
+    double t_branch_data_upload_ms_ = 0.;   // set by set_branch_data()
+    double t_violation_setup_ms_    = 0.;   // set by set_violation_limits()
 
     // -------------------------------------------------------------------------
     // Block-diagonal Ybus structure (outer/inner only — values tiled per chunk)
@@ -133,6 +141,12 @@ struct BatchPfDriver {
     thrust::device_vector<cuda_real_type>  d_dx_batch;
     thrust::device_vector<cuda_real_type>  d_J_values_batch;
 
+    // Per-batch-slot augmented-feature running state (empty when the feature is
+    // inactive). The shared single-system feature data (slack weights, HVDC/VC
+    // arrays, feature positions) lives on `base` and is pointed to directly.
+    thrust::device_vector<cuda_real_type>  d_slack_absorbed_batch;  // [batch_size]
+    thrust::device_vector<cuda_real_type>  d_vc_q_batch;            // [batch_size * n_vc_ctrl]
+
     // -------------------------------------------------------------------------
     // Full result buffers
     // -------------------------------------------------------------------------
@@ -143,8 +157,19 @@ struct BatchPfDriver {
     // Optional branch-flow outputs (only meaningful for contingency-style
     // features that mutate topology).  Both InjectionBatch and ContingencyBatch
     // can co-exist with this: InjectionBatch simply never calls set_branch_data.
+    //
+    // _has_branch_admittances : the O(n_branches) admittance arrays below
+    //                           (+ d_bus_vn_kv) are uploaded and ready. Set by
+    //                           upload_branch_admittances(); enough for the
+    //                           fused compute_limit_violations kernel.
+    // _has_branch_data        : ALSO the dense O(n_contingencies*n_branches)
+    //                           d_or_amps_results/d_ex_amps_results are
+    //                           allocated (set_branch_data() only). Gates step
+    //                           ⑥'s full-batch flow kernel in _solve_chunk —
+    //                           unchanged meaning from before this split.
     // -------------------------------------------------------------------------
-    bool _has_branch_data = false;
+    bool _has_branch_admittances = false;
+    bool _has_branch_data        = false;
     int  n_branches_      = 0;
 
     thrust::device_vector<int>             d_branch_from;
@@ -154,9 +179,45 @@ struct BatchPfDriver {
     thrust::device_vector<cudaComplexType> d_ytf;
     thrust::device_vector<cudaComplexType> d_ytt;
     thrust::device_vector<cuda_real_type>  d_base_current_A;
+    thrust::device_vector<cuda_real_type>  d_bus_vn_kv;   // [n_bus], per-bus nominal kV
 
     thrust::device_vector<cuda_real_type>  d_or_amps_results;
     thrust::device_vector<cuda_real_type>  d_ex_amps_results;
+
+    // -------------------------------------------------------------------------
+    // compute_limit_violations (opt-in; fused per-chunk voltage/current check).
+    // All sized O(n_contingencies) or O(n_contingencies * K) — bounded, never
+    // O(n_contingencies * n_branches) or O(n_contingencies * n_bus). Allocated
+    // only by set_violation_limits(); untouched (empty) otherwise.
+    // -------------------------------------------------------------------------
+    bool           _fused_violations_enabled = false;
+    int            violation_capacity_       = 0;   // K
+    cuda_real_type violation_tol_            = 0;
+    int            n_lines_                  = 0;   // branch ordering split (lines-then-trafos)
+
+    thrust::device_vector<cuda_real_type> d_bus_vmin_kv;         // [n_bus]
+    thrust::device_vector<cuda_real_type> d_bus_vmax_kv;         // [n_bus]
+    thrust::device_vector<cuda_real_type> d_branch_limit_a1_ka;  // [n_branches]
+    thrust::device_vector<cuda_real_type> d_branch_limit_a2_ka;  // [n_branches]
+
+    // Compact per-contingency output, size n_contingencies * K (SoA, matching
+    // this file's convention of separate typed device vectors over a packed
+    // struct array).
+    thrust::device_vector<int>            d_viol_element_type;
+    thrust::device_vector<int>            d_viol_element_id;
+    thrust::device_vector<int>            d_viol_side;
+    thrust::device_vector<int>            d_viol_type;
+    thrust::device_vector<cuda_real_type> d_viol_value;
+    thrust::device_vector<cuda_real_type> d_viol_limit;
+    thrust::device_vector<int>            d_violation_count;      // [n_contingencies]; -1 = not simulated, else 0..K
+    thrust::device_vector<int>            d_violation_truncated;  // [n_contingencies]; 0/1
+
+    // TRUE, uncapped per-type violation totals -- [n_contingencies]; -1 = not
+    // simulated, else the exact count (independent of violation_capacity/K,
+    // unlike d_violation_count above which is capped at K).
+    thrust::device_vector<int>            d_violation_count_low_voltage;
+    thrust::device_vector<int>            d_violation_count_high_voltage;
+    thrust::device_vector<int>            d_violation_count_current;
 
     // -------------------------------------------------------------------------
     // cuSPARSE batched SpMV
@@ -212,7 +273,26 @@ struct BatchPfDriver {
 
     // -------------------------------------------------------------------------
     // Branch-flow data  (no-op for features that do not call it)
+    //
+    // upload_branch_admittances : uploads ONLY the O(n_branches) admittance
+    //   arrays (+ d_bus_vn_kv). Sets _has_branch_admittances. Used by
+    //   ContingencyAnalysisSession::run() to make branch data available to the
+    //   fused compute_limit_violations kernel BEFORE solve() runs its chunk
+    //   loop, without allocating the dense flow-result buffers.
+    // set_branch_data : calls upload_branch_admittances(), then also allocates
+    //   d_or_amps_results/d_ex_amps_results and sets _has_branch_data. Public
+    //   signature/behavior unchanged from before this split.
     // -------------------------------------------------------------------------
+    void upload_branch_admittances(
+        Eigen::Ref<const Eigen::VectorXi> branch_from,
+        Eigen::Ref<const Eigen::VectorXi> branch_to,
+        Eigen::Ref<const CplxVect>        yff,
+        Eigen::Ref<const CplxVect>        yft,
+        Eigen::Ref<const CplxVect>        ytf,
+        Eigen::Ref<const CplxVect>        ytt,
+        Eigen::Ref<const RealVect>        bus_vn_kv,
+        double                            sn_mva);
+
     void set_branch_data(
         Eigen::Ref<const Eigen::VectorXi> branch_from,
         Eigen::Ref<const Eigen::VectorXi> branch_to,
@@ -227,6 +307,22 @@ struct BatchPfDriver {
                                     RealVect& ex_amps_out) const;
 
     // -------------------------------------------------------------------------
+    // compute_limit_violations: configure per-bus voltage (kV) / per-branch
+    // current (kA) limits and the fused kernel's DIVERGED tolerance + output
+    // capacity K. Requires upload_branch_admittances() (directly, or via
+    // set_branch_data()) to have already run. NaN = "not configured" for that
+    // element (matches lightsim2grid's convention).
+    // -------------------------------------------------------------------------
+    void set_violation_limits(
+        Eigen::Ref<const RealVect> bus_vmin_kv,
+        Eigen::Ref<const RealVect> bus_vmax_kv,
+        Eigen::Ref<const RealVect> branch_limit_a1_ka,
+        Eigen::Ref<const RealVect> branch_limit_a2_ka,
+        double tol,
+        int    K,
+        int    n_lines);
+
+    // -------------------------------------------------------------------------
     // DLPack / zero-copy accessors
     // -------------------------------------------------------------------------
     const cudaComplexType* d_V_results_ptr() const {
@@ -236,6 +332,14 @@ struct BatchPfDriver {
     int  device_id()        const { return base.device_id_; }
     int  n_contingencies_() const { return n_contingencies; }
     void synchronize()            { cs.synchronize(); }
+
+    // H→D branch-admittance upload time from the most recent set_branch_data()
+    // call (read back by the sessions into BatchTimings::t_branch_data_upload_ms).
+    double branch_data_upload_ms() const { return t_branch_data_upload_ms_; }
+
+    // H→D limits-upload + buffer-allocation time from the most recent
+    // set_violation_limits() call (read back into BatchTimings::t_violation_setup_ms).
+    double violation_setup_ms() const { return t_violation_setup_ms_; }
 
     // Non-copyable, non-movable
     BatchPfDriver(const BatchPfDriver&)            = delete;

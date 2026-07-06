@@ -23,7 +23,7 @@ def main():
 
     if not torch.cuda.is_available():
         raise SystemExit("This example requires a CUDA-capable PyTorch build.")
-    if is_fp32():
+    if is_fp32:
         print("NOTE: gpusim2grid was built in FP32; gradients use FP64 internally "
               "and are most accurate against an FP64 build.")
 

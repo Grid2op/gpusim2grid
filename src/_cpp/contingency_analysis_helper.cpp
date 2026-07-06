@@ -227,6 +227,170 @@ void check_connectivity(
 }
 
 // ---------------------------------------------------------------------------
+// compute_component_masks
+// ---------------------------------------------------------------------------
+void compute_component_masks(
+    std::vector<Contingency>&                                     contingencies,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
+    const std::vector<char>&                                      is_reference_bus,
+    const std::vector<char>&                                      is_controller_bus)
+{
+    const int  n_bus = Ybus_rm.rows();
+    const int* outer = Ybus_rm.outerIndexPtr();
+    const int* inner = Ybus_rm.innerIndexPtr();
+
+    // Adjacency over off-diagonal Ybus non-zeros (bus, flat CSR index), reused
+    // across contingencies — identical construction to check_connectivity.
+    std::vector<std::vector<std::pair<int, int> > > adj(static_cast<size_t>(n_bus));
+    for (int u = 0; u < n_bus; ++u)
+        for (int idx = outer[u]; idx < outer[u + 1]; ++idx)
+            if (inner[idx] != u)
+                adj[static_cast<size_t>(u)].push_back(std::make_pair(inner[idx], idx));
+
+    const double eps = 1e-10;
+    const eigen_cplx_type* values = Ybus_rm.valuePtr();
+
+    std::vector<int> comp(static_cast<size_t>(n_bus), -1);
+    std::queue<int>  q;
+
+    for (auto& ctg : contingencies) {
+        ctg.masked_buses.clear();
+
+        // Edges removed by this contingency (off-diagonal entries → ~0).
+        std::unordered_set<int> removed;
+        for (const auto& t : ctg.triplets) {
+            if (t.row == t.col) continue;
+            const eigen_cplx_type new_val =
+                values[t.k] - eigen_cplx_type(t.delta_re, t.delta_im);
+            if (std::abs(new_val) < eps) removed.insert(t.k);
+        }
+        if (removed.empty()) continue;   // graph untouched → nothing masked
+
+        // Label connected components (BFS, skipping removed edges).
+        std::fill(comp.begin(), comp.end(), -1);
+        int nb_comp = 0;
+        for (int start = 0; start < n_bus; ++start) {
+            if (comp[static_cast<size_t>(start)] != -1) continue;
+            comp[static_cast<size_t>(start)] = nb_comp;
+            q.push(start);
+            while (!q.empty()) {
+                const int u = q.front(); q.pop();
+                const auto& nbrs = adj[static_cast<size_t>(u)];
+                for (size_t i = 0; i < nbrs.size(); ++i) {
+                    const int v = nbrs[i].first, flat_k = nbrs[i].second;
+                    if (comp[static_cast<size_t>(v)] == -1 && removed.count(flat_k) == 0) {
+                        comp[static_cast<size_t>(v)] = nb_comp;
+                        q.push(v);
+                    }
+                }
+            }
+            ++nb_comp;
+        }
+        if (nb_comp <= 1) continue;   // still connected → nothing masked
+
+        // Largest component by bus count.
+        std::vector<int> count(static_cast<size_t>(nb_comp), 0);
+        for (int b = 0; b < n_bus; ++b) ++count[static_cast<size_t>(comp[static_cast<size_t>(b)])];
+        const int main_comp = static_cast<int>(std::distance(
+            count.begin(), std::max_element(count.begin(), count.end())));
+
+        // Every bus outside the main component is masked. If the masked set
+        // strands the angle reference or a controller bus, we cannot solve it on
+        // the fixed batch structure → skip the contingency (NaN), reusing the
+        // `disconnected` compaction path.
+        bool skip = false;
+        for (int b = 0; b < n_bus; ++b) {
+            if (comp[static_cast<size_t>(b)] == main_comp) continue;
+            ctg.masked_buses.push_back(b);
+            if ((!is_reference_bus.empty()  && is_reference_bus[static_cast<size_t>(b)]) ||
+                (!is_controller_bus.empty() && is_controller_bus[static_cast<size_t>(b)]))
+                skip = true;
+        }
+        if (skip) { ctg.disconnected = true; ctg.masked_buses.clear(); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// build_mask_entries
+// ---------------------------------------------------------------------------
+void build_mask_entries(
+    const std::vector<Contingency>& contingencies,
+    const std::vector<int>&         active_to_orig,
+    int                             batch_size,
+    const MaskRowInfo&              row_info,
+    std::vector<int>&               h_mask_slot,
+    std::vector<int>&               h_mask_row,
+    std::vector<int>&               h_mask_diag,
+    std::vector<ChunkPatchRange>&   mask_row_ranges,
+    std::vector<int>&               h_maskv_slot,
+    std::vector<int>&               h_maskv_bus,
+    std::vector<ChunkPatchRange>&   maskv_ranges)
+{
+    h_mask_slot.clear();  h_mask_row.clear();  h_mask_diag.clear();
+    h_maskv_slot.clear(); h_maskv_bus.clear();
+
+    const int n_active = static_cast<int>(active_to_orig.size());
+    const int n_chunks = batch_size > 0 ? (n_active + batch_size - 1) / batch_size : 0;
+    mask_row_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    maskv_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int a_start      = chunk * batch_size;
+        const int a_end        = std::min(a_start + batch_size, n_active);
+        const int row_start    = static_cast<int>(h_mask_slot.size());
+        const int v_start       = static_cast<int>(h_maskv_slot.size());
+
+        for (int local_c = 0; local_c < a_end - a_start; ++local_c) {
+            const Contingency& ctg = contingencies[active_to_orig[a_start + local_c]];
+            for (int bus : ctg.masked_buses) {
+                // Identity-row entries for this bus' P and Q equations.
+                if (row_info.p_row[static_cast<size_t>(bus)] >= 0) {
+                    h_mask_slot.push_back(local_c);
+                    h_mask_row.push_back(row_info.p_row[static_cast<size_t>(bus)]);
+                    h_mask_diag.push_back(row_info.p_diag_pos[static_cast<size_t>(bus)]);
+                }
+                if (row_info.q_row[static_cast<size_t>(bus)] >= 0) {
+                    h_mask_slot.push_back(local_c);
+                    h_mask_row.push_back(row_info.q_row[static_cast<size_t>(bus)]);
+                    h_mask_diag.push_back(row_info.q_diag_pos[static_cast<size_t>(bus)]);
+                }
+                // Masked-voltage entry (reported as NaN).
+                h_maskv_slot.push_back(local_c);
+                h_maskv_bus.push_back(bus);
+            }
+        }
+
+        mask_row_ranges[static_cast<size_t>(chunk)] =
+            {row_start, static_cast<int>(h_mask_slot.size()) - row_start};
+        maskv_ranges[static_cast<size_t>(chunk)] =
+            {v_start, static_cast<int>(h_maskv_slot.size()) - v_start};
+    }
+}
+
+// ---------------------------------------------------------------------------
+// build_tripped_branch_table
+// ---------------------------------------------------------------------------
+void build_tripped_branch_table(
+    const std::vector<Contingency>& contingencies,
+    const std::vector<int>&         active_to_orig,
+    std::vector<int>&               h_trip_branch_flat,
+    std::vector<int>&               h_trip_start,
+    std::vector<int>&               h_trip_count)
+{
+    const int n_active = static_cast<int>(active_to_orig.size());
+    h_trip_start.resize(static_cast<size_t>(n_active));
+    h_trip_count.resize(static_cast<size_t>(n_active));
+    h_trip_branch_flat.clear();
+
+    for (int slot = 0; slot < n_active; ++slot) {
+        const auto& tb = contingencies[static_cast<size_t>(active_to_orig[slot])].tripped_branches;
+        h_trip_start[static_cast<size_t>(slot)] = static_cast<int>(h_trip_branch_flat.size());
+        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size());
+        h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_blockdiag_csr
 // ---------------------------------------------------------------------------
 void build_blockdiag_csr(
