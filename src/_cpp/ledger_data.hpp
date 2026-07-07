@@ -40,6 +40,20 @@ struct LedgerData {
     std::vector<int> vm_col_of_bus;
     std::vector<int> q_col_of_bus;     // controller reactive-unknown columns (VoltageControl)
 
+    // NRLedger compact (bus, row/col) registration pair lists -- the row/col
+    // counterpart of the bus-keyed maps above, but preserving EVERY
+    // registration in order (a bus may appear more than once, or be absent
+    // from a bus-keyed map's CURRENT value if a later registration shadowed
+    // it there -- e.g. a MultiSlack "free_vm_slack" participant bus that a
+    // VoltageControl controller/regulated bus subsequently reuses). NRSystem's
+    // own residual assembly iterates these, not the bus-keyed maps, so any
+    // scatter-map / residual reconstruction MUST use these to reproduce every
+    // contribution. Same length within each (buses[k], rows_or_cols[k]) pair.
+    std::vector<int> p_buses,     p_rows;
+    std::vector<int> q_buses,     q_rows;
+    std::vector<int> theta_buses, theta_cols;
+    std::vector<int> vm_buses,    vm_cols;
+
     // ---- MultiSlack (distributed slack in the Jacobian) — optional -----------
     // slack_col >= 0 enables the extension. slack_weights has size n_bus, sums to
     // 1, and is nonzero only at slack participant buses (each of which owns a P
@@ -60,6 +74,15 @@ struct LedgerData {
     std::vector<int>    hvdc_bus1, hvdc_bus2, hvdc_status;
     std::vector<double> hvdc_p0, hvdc_k, hvdc_lf1, hvdc_lf2, hvdc_r,
                         hvdc_pmax12, hvdc_pmax21;
+    // Per-side connectivity (1/0). A droop line kept in this list should
+    // normally have BOTH true -- lightsim2grid's own disconnect_if_not_in_
+    // main_component disables droop_enabled_ (dropping the line from this
+    // list entirely) as soon as either side goes half-open, since the
+    // theta-dependent flow formula is meaningless across an open converter
+    // (the remote angle is unknown/unsolved). Kept here as a defensive
+    // cross-check, not something normally expected to be false -- see
+    // HvdcDroopSolverData::connected1/connected2 in lightsim2grid.
+    std::vector<int>    hvdc_connected1, hvdc_connected2;
 
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }

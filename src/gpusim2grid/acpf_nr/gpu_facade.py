@@ -11,7 +11,7 @@ from .._ls2g_utils import (
     grid_from_pandapower,
     _validate_precision,
 )
-from ..contingency_analysis import _normalize_device
+from ..contingency_analysis import _normalize_device, _resolve_reordering_alg
 
 __all__ = ["AcPfGPU"]
 
@@ -55,6 +55,12 @@ class AcPfGPU:
         Force (``True``) or disable (``False``) the zero-copy lightsim2grid C++
         bridge. ``None`` auto-detects it. Only the bridge path solves the
         augmented system; the Python-array fallback solves the bare system.
+    reordering_alg : str, default "default"
+        cuDSS ``CUDSS_CONFIG_REORDERING_ALG`` choice for the (once-only) cuDSS
+        ANALYSIS phase. One of ``"default"``, ``"btf_colamd"``, ``"colamd"``,
+        ``"amd"``, ``"nested_dissection"``, ``"none"``. Construction-time only
+        — unlike the batch workloads, ``AcPfGPU`` never reruns ANALYSIS, so
+        this cannot be changed after construction.
 
     Examples
     --------
@@ -69,8 +75,10 @@ class AcPfGPU:
     """
 
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
-                 device=None, init_from_n_powerflow=True, use_bridge=None):
+                 device=None, init_from_n_powerflow=True, use_bridge=None,
+                 reordering_alg="default"):
         _validate_precision(precision)
+        reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
 
         if isinstance(grid, (tuple, list)):
             if use_bridge:
@@ -81,7 +89,8 @@ class AcPfGPU:
             self._s = _AcPfNrSession(
                 Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                 int(max_iter), float(tol), _normalize_device(device),
-                presolved_v=bool(init_from_n_powerflow))
+                presolved_v=bool(init_from_n_powerflow),
+                reordering_alg=reordering_alg_enum)
             return
 
         if use_bridge is None:
@@ -92,7 +101,8 @@ class AcPfGPU:
             # J skeleton off the solved grid. The grid must already be ac-solved.
             self._s = _cpp._make_acpf_session_from_lsgrid(
                 grid, int(max_iter), float(tol), _normalize_device(device),
-                bool(init_from_n_powerflow))
+                bool(init_from_n_powerflow),
+                reordering_alg=reordering_alg_enum)
         else:
             # Python extraction fallback: bare [pvpq|pq] system (no distributed
             # slack in the Jacobian).
@@ -101,7 +111,8 @@ class AcPfGPU:
                 d["Ybus"], d["v_converged"], d["Sbus"],
                 d["slack"], d["slack_weights"], d["pv"], d["pq"],
                 int(max_iter), float(tol), _normalize_device(device),
-                presolved_v=bool(init_from_n_powerflow))
+                presolved_v=bool(init_from_n_powerflow),
+                reordering_alg=reordering_alg_enum)
 
     def solve(self):
         """Return the solved complex voltage vector (host copy)."""

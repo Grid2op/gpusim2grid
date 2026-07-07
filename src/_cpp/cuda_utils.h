@@ -3,6 +3,7 @@
 
 #include "cu_complex_utils.h"
 #include "timing_utils.hpp"
+#include "reordering_alg.hpp"
 
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <stdio.h>            // printf
@@ -220,6 +221,21 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Maps the CUDA-free ReorderingAlg (reordering_alg.hpp) to the real cuDSS
+// enum. Default matches cuDSS's own implicit default (nothing set) exactly.
+// ---------------------------------------------------------------------------
+inline cudssReorderingAlg_t to_cudss_reordering_alg(ReorderingAlg alg) {
+    switch (alg) {
+        case ReorderingAlg::BtfColamd:        return CUDSS_REORDERING_ALG_BTF_COLAMD;
+        case ReorderingAlg::Colamd:           return CUDSS_REORDERING_ALG_COLAMD;
+        case ReorderingAlg::Amd:              return CUDSS_REORDERING_ALG_AMD;
+        case ReorderingAlg::NestedDissection: return CUDSS_REORDERING_ALG_NESTED_DISSECTION;
+        case ReorderingAlg::None:             return CUDSS_REORDERING_ALG_NONE;
+        default:                              return CUDSS_REORDERING_ALG_DEFAULT;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RAII wrapper for the cudss solver context: handle, config and data.
 // ---------------------------------------------------------------------------
 struct CudssContext {
@@ -253,10 +269,25 @@ struct CudssContext {
         return *this;
     }
 
+    // Must be called after cudssConfigCreate() and before analyze() to take
+    // effect (CUDSS_CONFIG_REORDERING_ALG is read during CUDSS_PHASE_ANALYSIS).
+    void set_reordering_alg(ReorderingAlg alg) {
+        cudssReorderingAlg_t v = to_cudss_reordering_alg(alg);
+        cudssStatus_t s = cudssConfigSet(config, CUDSS_CONFIG_REORDERING_ALG,
+                                         &v, sizeof(v));
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(
+                std::string("CudssContext::set_reordering_alg failed: status=")
+                + std::to_string(static_cast<int>(s)));
+    }
+
     void analyze(const CudssDescriptor& A, const CudssDescriptor& x, const CudssDescriptor& b) {
-        _execute(CUDSS_PHASE_REORDERING,            A, x, b, "analyze(reordering)");
-        _execute(CUDSS_PHASE_SYMBOLIC_FACTORIZATION, A, x, b, "analyze(symbolic_factorization)");
-        _execute(CUDSS_PHASE_ANALYSIS,              A, x, b, "analyze(analysis)");
+        // CUDSS_PHASE_ANALYSIS == CUDSS_PHASE_REORDERING | CUDSS_PHASE_SYMBOLIC_FACTORIZATION
+        // (cudss_data_types.h). A single combined call is cuDSS's documented usage
+        // (see cudss_reordering_phase.cpp); executing the two sub-phases separately
+        // and then the combined phase on top redundantly reorders+symbolic-factorizes
+        // twice, which can leave workspace sizing / permutation state inconsistent.
+        _execute(CUDSS_PHASE_ANALYSIS, A, x, b, "analyze");
     }
     void factorize(const CudssDescriptor& A, const CudssDescriptor& x, const CudssDescriptor& b) {
         _execute(CUDSS_PHASE_FACTORIZATION, A, x, b, "factorize");

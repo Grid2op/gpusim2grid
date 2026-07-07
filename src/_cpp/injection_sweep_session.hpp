@@ -37,6 +37,7 @@
 #include "dtypes.hpp"
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType
+#include "reordering_alg.hpp"
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -72,6 +73,7 @@ struct InjectionSweepSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
+    ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
 
     // =========================================================================
     // Host injection data (stored by set_injections(), consumed by run())

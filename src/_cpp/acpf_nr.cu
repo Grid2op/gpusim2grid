@@ -255,8 +255,12 @@ AcPfNrState::AcPfNrState(
     eigen_real_type                             tol,
     int                                         device,
     const LedgerData*                           ledger,
-    bool                                         presolved_v)
+    bool                                         presolved_v,
+    bool                                         diag_stop_before_state_correction,
+    ReorderingAlg                                reordering_alg)
 {
+    reordering_alg_ = reordering_alg;
+
     // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
     // because the work is heterogeneous (CPU preprocessing + device uploads +
     // ANALYSIS launch). Started BEFORE device selection: cudaGetDevice() below
@@ -342,14 +346,20 @@ AcPfNrState::AcPfNrState(
                                ledger->p_row_of_bus, ledger->q_row_of_bus,
                                ledger->theta_col_of_bus, ledger->vm_col_of_bus);
 
-        // Derive the ledger pair lists from the bus→row/col maps (order is
-        // irrelevant: each pair is an independent scatter target).
-        for (int bus = 0; bus < n_bus; ++bus) {
-            if (ledger->p_row_of_bus[bus]     >= 0) { p_buses.push_back(bus);     p_rows.push_back(ledger->p_row_of_bus[bus]); }
-            if (ledger->q_row_of_bus[bus]     >= 0) { q_buses.push_back(bus);     q_rows.push_back(ledger->q_row_of_bus[bus]); }
-            if (ledger->theta_col_of_bus[bus] >= 0) { theta_buses.push_back(bus); theta_cols.push_back(ledger->theta_col_of_bus[bus]); }
-            if (ledger->vm_col_of_bus[bus]    >= 0) { vm_buses.push_back(bus);    vm_cols.push_back(ledger->vm_col_of_bus[bus]); }
-        }
+        // Ledger pair lists, taken DIRECTLY from NRLedger's compact (bus, row/col)
+        // registration lists -- NOT reconstructed from the bus-keyed maps. The
+        // bus-keyed maps only ever hold the LAST registration per bus ("last
+        // registration wins"), so reconstructing pair lists from them silently
+        // drops any row/col that was registered but later shadowed there (e.g. a
+        // MultiSlack "free_vm_slack" participant bus reused by another
+        // extension). lightsim2grid's own NRSystem::_residual() /
+        // _compute_trial_V() iterate these exact compact lists, so this must
+        // match to reproduce every contribution (see NRLedger's "Multiplicity
+        // rules").
+        p_buses = ledger->p_buses;         p_rows = ledger->p_rows;
+        q_buses = ledger->q_buses;         q_rows = ledger->q_rows;
+        theta_buses = ledger->theta_buses; theta_cols = ledger->theta_cols;
+        vm_buses = ledger->vm_buses;       vm_cols = ledger->vm_cols;
     }
     n_p = (int)p_buses.size(); n_q = (int)q_buses.size();
     n_theta = (int)theta_buses.size(); n_vm = (int)vm_buses.size();
@@ -459,17 +469,47 @@ AcPfNrState::AcPfNrState(
     // positions derived from the ledger maps + skeleton. (mirrors Hvdc::register_in
     // / declare_feature_entries; an end at a slack drops the missing row/col.)
     if (ledger != nullptr && ledger->has_hvdc()) {
-        n_hvdc = ledger->n_hvdc();
+        // Defensive filter: a droop line should NEVER reach here with either
+        // side individually open -- lightsim2grid's own
+        // disconnect_if_not_in_main_component clears droop_enabled_ (dropping
+        // the line from the ledger entirely) as soon as one converter leaves
+        // the main synchronous component, since theta1/theta2 across an open
+        // converter is meaningless (the remote angle is unknown/unsolved).
+        // Still, exclude any line that fails this invariant rather than
+        // silently computing a garbage theta-dependent injection on a
+        // perfectly good in-main bus -- see HvdcDroopSolverData::connected1/2
+        // in lightsim2grid. Empty connected1/connected2 (older ledger
+        // sources) means "not checked" -- keep all lines, unfiltered.
+        const int nh_raw = ledger->n_hvdc();
+        std::vector<int> keep;
+        keep.reserve(nh_raw);
+        const bool have_connectivity = (static_cast<int>(ledger->hvdc_connected1.size()) == nh_raw) &&
+                                       (static_cast<int>(ledger->hvdc_connected2.size()) == nh_raw);
+        for (int e = 0; e < nh_raw; ++e) {
+            if (have_connectivity && (!ledger->hvdc_connected1[e] || !ledger->hvdc_connected2[e])) continue;
+            keep.push_back(e);
+        }
+        n_hvdc = static_cast<int>(keep.size());
+        if (n_hvdc > 0) {
         auto to_real = [](const std::vector<double>& v) {
             return std::vector<cuda_real_type>(v.begin(), v.end());
         };
-        upload_h2d(d_hvdc_bus1,   ledger->hvdc_bus1.data(),   n_hvdc, cs);
-        upload_h2d(d_hvdc_bus2,   ledger->hvdc_bus2.data(),   n_hvdc, cs);
-        upload_h2d(d_hvdc_status, ledger->hvdc_status.data(), n_hvdc, cs);
-        std::vector<cuda_real_type> p0=to_real(ledger->hvdc_p0), kk=to_real(ledger->hvdc_k),
-            lf1=to_real(ledger->hvdc_lf1), lf2=to_real(ledger->hvdc_lf2),
-            rr=to_real(ledger->hvdc_r), pm12=to_real(ledger->hvdc_pmax12),
-            pm21=to_real(ledger->hvdc_pmax21);
+        std::vector<cuda_real_type> p0_all=to_real(ledger->hvdc_p0), kk_all=to_real(ledger->hvdc_k),
+            lf1_all=to_real(ledger->hvdc_lf1), lf2_all=to_real(ledger->hvdc_lf2),
+            rr_all=to_real(ledger->hvdc_r), pm12_all=to_real(ledger->hvdc_pmax12),
+            pm21_all=to_real(ledger->hvdc_pmax21);
+        std::vector<int> bus1(n_hvdc), bus2(n_hvdc), status(n_hvdc);
+        std::vector<cuda_real_type> p0(n_hvdc), kk(n_hvdc), lf1(n_hvdc), lf2(n_hvdc),
+            rr(n_hvdc), pm12(n_hvdc), pm21(n_hvdc);
+        for (int i = 0; i < n_hvdc; ++i) {
+            const int e = keep[i];
+            bus1[i] = ledger->hvdc_bus1[e]; bus2[i] = ledger->hvdc_bus2[e]; status[i] = ledger->hvdc_status[e];
+            p0[i] = p0_all[e]; kk[i] = kk_all[e]; lf1[i] = lf1_all[e]; lf2[i] = lf2_all[e];
+            rr[i] = rr_all[e]; pm12[i] = pm12_all[e]; pm21[i] = pm21_all[e];
+        }
+        upload_h2d(d_hvdc_bus1,   bus1.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
@@ -487,15 +527,15 @@ AcPfNrState::AcPfNrState(
         };
         std::vector<int> prow1(n_hvdc), prow2(n_hvdc),
                          h11(n_hvdc), h12(n_hvdc), h21(n_hvdc), h22(n_hvdc);
-        for (int e = 0; e < n_hvdc; ++e) {
-            const int b1 = ledger->hvdc_bus1[e], b2 = ledger->hvdc_bus2[e];
+        for (int i = 0; i < n_hvdc; ++i) {
+            const int b1 = bus1[i], b2 = bus2[i];
             const int pr1 = ledger->p_row_of_bus[b1], pr2 = ledger->p_row_of_bus[b2];
             const int tc1 = ledger->theta_col_of_bus[b1], tc2 = ledger->theta_col_of_bus[b2];
-            prow1[e] = pr1; prow2[e] = pr2;
-            h11[e] = find_J_pos(pr1, tc1);
-            h12[e] = find_J_pos(pr1, tc2);
-            h21[e] = find_J_pos(pr2, tc1);
-            h22[e] = find_J_pos(pr2, tc2);
+            prow1[i] = pr1; prow2[i] = pr2;
+            h11[i] = find_J_pos(pr1, tc1);
+            h12[i] = find_J_pos(pr1, tc2);
+            h21[i] = find_J_pos(pr2, tc1);
+            h22[i] = find_J_pos(pr2, tc2);
         }
         upload_h2d(d_hvdc_prow1, prow1.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_prow2, prow2.data(), n_hvdc, cs);
@@ -503,6 +543,7 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_hvdc_h12, h12.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_h21, h21.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_h22, h22.data(), n_hvdc, cs);
+        }
     }
 
     // VoltageControl (remote gen + SVC), bordered formulation. The q columns and
@@ -690,6 +731,7 @@ AcPfNrState::AcPfNrState(
     CHK_DSS_AC(cudssSetStream(dss.handle, cs));  // bind to our stream
     CHK_DSS_AC(cudssConfigCreate(&dss.config));
     CHK_DSS_AC(cudssDataCreate(dss.handle, &dss.data));
+    dss.set_reordering_alg(reordering_alg_);
 
     // Sparse J descriptor — values pointer is updated each iteration via
     // cudssMatrixSetValues(); the shape and structure pointers are fixed.
@@ -852,6 +894,17 @@ AcPfNrState::AcPfNrState(
         timings.t_fill_F          += step.t_fill_F;
         timings.t_fill_J          += step.t_fill_J;
         timings.t_first_factorize += step.t_first_factorize;
+
+        if (diag_stop_before_state_correction) {
+            // d_F = F(Vinit, state=0), d_J_values = J(Vinit): both already
+            // fully populated by nr_iter_step_prepare above. Return without
+            // running the cuDSS-based state correction or the throwing
+            // residual check -- get_F()/get_J() expose these for an external
+            // (e.g. scipy) solve of the SAME linear system.
+            timings.nb_iter = 0;
+            timings.converged = true;  // not actually checked in this mode
+            return;
+        }
 
         const bool has_ext_state = (slack_col >= 0) || (n_vc_ctrl > 0);
         if (has_ext_state) {
@@ -1024,14 +1077,17 @@ AcPfNrSession::AcPfNrSession(
     eigen_real_type                             tol,
     int                                         device,
     const LedgerData*                           ledger,
-    bool                                         presolved_v
+    bool                                         presolved_v,
+    bool                                         diag_stop_before_state_correction,
+    ReorderingAlg                                reordering_alg
 )
 {
     (void)slack_ids;
     (void)slack_weights;
     state_ = std::make_shared<AcPfNrState>(Ybus, Vinit, Sbus, pv, pq,
                                             max_iter, tol, device, ledger,
-                                            presolved_v);
+                                            presolved_v, diag_stop_before_state_correction,
+                                            reordering_alg);
 }
 
 // =============================================================================
@@ -1119,6 +1175,7 @@ void AcPfNrState::prepare_JT()
     CHK_DSS_AC(cudssSetStream(dss_T.handle, cs));
     CHK_DSS_AC(cudssConfigCreate(&dss_T.config));
     CHK_DSS_AC(cudssDataCreate(dss_T.handle, &dss_T.data));
+    dss_T.set_reordering_alg(reordering_alg_);
 
     dss_AT.create_csr(static_cast<int64_t>(dim_J),
                       static_cast<int64_t>(nnz_J),
@@ -1191,3 +1248,50 @@ std::vector<int> AcPfNrSession::p_row_of_bus()     const { return state_->h_p_ro
 std::vector<int> AcPfNrSession::q_row_of_bus()     const { return state_->h_q_row_of_bus; }
 std::vector<int> AcPfNrSession::theta_col_of_bus() const { return state_->h_theta_col_of_bus; }
 std::vector<int> AcPfNrSession::vm_col_of_bus()    const { return state_->h_vm_col_of_bus; }
+
+std::vector<double> AcPfNrSession::get_F() const {
+    thrust::host_vector<cuda_real_type> h_F(state_->d_F);
+    return std::vector<double>(h_F.begin(), h_F.end());
+}
+
+std::vector<double> AcPfNrSession::solve_cudss(const std::vector<double>& rhs) const {
+    auto& s = *state_;
+    if (static_cast<int>(rhs.size()) != s.dim_J)
+        throw std::runtime_error(
+            "solve_cudss: rhs size (" + std::to_string(rhs.size()) +
+            ") must equal dim_J (" + std::to_string(s.dim_J) + ")");
+    std::vector<cuda_real_type> h_rhs(rhs.begin(), rhs.end());
+    upload_h2d(s.d_F, h_rhs.data(), s.dim_J, s.cs);
+    s.dss.solve(s.dss_A, s.dss_x, s.dss_b);
+    thrust::host_vector<cuda_real_type> h_dx(s.d_dx);
+    return std::vector<double>(h_dx.begin(), h_dx.end());
+}
+
+std::vector<double> AcPfNrSession::residual(const std::vector<double>& dx,
+                                            const std::vector<double>& rhs) const {
+    auto& s = *state_;
+    if (static_cast<int>(dx.size()) != s.dim_J || static_cast<int>(rhs.size()) != s.dim_J)
+        throw std::runtime_error("residual: dx and rhs must both have length dim_J");
+    thrust::host_vector<int>            h_outer(s.d_J_outer);
+    thrust::host_vector<int>            h_inner(s.d_J_inner);
+    thrust::host_vector<cuda_real_type> h_vals(s.d_J_values);
+    std::vector<double> res(s.dim_J, 0.0);
+    for (int row = 0; row < s.dim_J; ++row) {
+        double acc = 0.0;
+        for (int p = h_outer[row]; p < h_outer[row + 1]; ++p)
+            acc += static_cast<double>(h_vals[p]) * dx[h_inner[p]];
+        res[row] = acc - rhs[row];
+    }
+    return res;
+}
+
+std::tuple<std::vector<int>, std::vector<int>, std::vector<double>> AcPfNrSession::get_J() const {
+    thrust::host_vector<int>            h_outer(state_->d_J_outer);
+    thrust::host_vector<int>            h_inner(state_->d_J_inner);
+    thrust::host_vector<cuda_real_type> h_vals(state_->d_J_values);
+    return {
+        std::vector<int>(h_outer.begin(), h_outer.end()),
+        std::vector<int>(h_inner.begin(), h_inner.end()),
+        std::vector<double>(h_vals.begin(), h_vals.end())
+    };
+}

@@ -11,6 +11,7 @@ __all__ = [
 from .._gpusim2grid import (
     ContingencyAnalysisSession as _ContingencyAnalysisSession,
     ContingencySolverType as _ContingencySolverType,
+    ReorderingAlg as _ReorderingAlg,
 )
 
 from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
@@ -42,6 +43,36 @@ _STRATEGY_MAP = {
     'direct_iter0_only':        _ContingencySolverType.DirectIter0Only,
     'direct_refactor_every_n':  _ContingencySolverType.DirectRefactorEveryN,
 }
+
+
+# Shared with injection_sweep/__init__.py and acpf_nr/gpu_facade.py (imported
+# from here, same as _normalize_device) rather than duplicated per-module like
+# _STRATEGY_MAP above: CUDSS_CONFIG_REORDERING_ALG is a solver-wide concept,
+# not specific to the batch/contingency workload.
+_REORDERING_ALG_MAP = {
+    'default':           _ReorderingAlg.Default,
+    'btf_colamd':        _ReorderingAlg.BtfColamd,
+    'colamd':            _ReorderingAlg.Colamd,
+    'amd':               _ReorderingAlg.Amd,
+    'nested_dissection': _ReorderingAlg.NestedDissection,
+    'none':              _ReorderingAlg.NoReordering,
+}
+
+
+def _resolve_reordering_alg(value):
+    """Accept either a string (mapped via _REORDERING_ALG_MAP) or a raw
+    ReorderingAlg value."""
+    if isinstance(value, _ReorderingAlg):
+        return value
+    if isinstance(value, str):
+        try:
+            return _REORDERING_ALG_MAP[value]
+        except KeyError:
+            raise ValueError(
+                f"Unknown reordering_alg {value!r}. "
+                f"Choose from: {list(_REORDERING_ALG_MAP)}")
+    raise TypeError(
+        f"reordering_alg must be a str or ReorderingAlg, got {type(value).__name__}")
 
 
 class DeviceBuffer:
@@ -119,6 +150,11 @@ class _ContingencyAnalysisSolver:
       ``'direct_iter0_only'``, ``'direct_refactor_every_n'``.
     - ``refactor_period`` (*int*): Period N for ``'direct_refactor_every_n'``
       (default 1, equivalent to ``'direct_refactor_every'``).
+    - ``reordering_alg`` (*str*): cuDSS ``CUDSS_CONFIG_REORDERING_ALG`` choice.
+      One of ``'default'`` (default), ``'amd'``, ``'nested_dissection'``,
+      ``'none'``. ``'btf_colamd'``/``'colamd'`` are also accepted but cuDSS
+      rejects them (``CUDSS_STATUS_NOT_SUPPORTED``) in this session's
+      uniform-batch mode; they only work on ``AcPfGPU``'s single-system solve.
     - ``max_iter_base``, ``tol_base``: Stored for reference only; do not
       rerun the base case.
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
@@ -157,6 +193,7 @@ class _ContingencyAnalysisSolver:
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
+        self._reordering_alg = 'default'
         self._s = _ContingencyAnalysisSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
@@ -165,7 +202,7 @@ class _ContingencyAnalysisSolver:
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
-                      strategy='direct_refactor_every'):
+                      strategy='direct_refactor_every', reordering_alg='default'):
         """Wrap an already-constructed C++ ContingencyAnalysisSession.
 
         Used by the zero-copy lightsim2grid bridge, which builds the session in
@@ -176,6 +213,7 @@ class _ContingencyAnalysisSolver:
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = strategy
+        self._reordering_alg = reordering_alg
         return self
 
     @property
@@ -207,6 +245,24 @@ class _ContingencyAnalysisSolver:
                 f"Choose from: {list(_STRATEGY_MAP)}")
         self._strategy = value
         self._s.strategy_type = _STRATEGY_MAP[value]
+
+    @property
+    def reordering_alg(self):
+        """CUDSS_CONFIG_REORDERING_ALG choice (str or ReorderingAlg). Takes
+        effect on the next run() (which always reruns cuDSS ANALYSIS).
+        One of 'default' (default), 'btf_colamd', 'colamd', 'amd',
+        'nested_dissection', 'none'.
+
+        NOTE: cuDSS rejects 'btf_colamd'/'colamd' with CUDSS_STATUS_NOT_SUPPORTED
+        in this session's uniform-batch mode -- only 'default', 'amd',
+        'nested_dissection', 'none' are supported here. 'btf_colamd'/'colamd'
+        work only on AcPfGPU's single-system solve."""
+        return self._reordering_alg
+
+    @reordering_alg.setter
+    def reordering_alg(self, value):
+        self._reordering_alg = value
+        self._s.reordering_alg = _resolve_reordering_alg(value)
 
     @property
     def handle_disconnected_grid(self):

@@ -56,7 +56,17 @@ make_acpf_session_from_lsgrid(
     int    max_iter,
     double tol,
     int    device,
-    bool   init_from_n_powerflow = true);
+    bool   init_from_n_powerflow = true,
+    // DEBUG ONLY -- see AcPfNrState's own doc (acpf_nr_state.cuh). No-op
+    // unless init_from_n_powerflow=true. Returns a session whose get_J()/
+    // get_F() expose J(V0) and the RAW F(V0, state=0) (no cuDSS-based state
+    // correction, no throwing residual check), for an external solver to
+    // redo that correction step independently of cuDSS on the exact same
+    // data.
+    bool   diag_stop_before_state_correction = false,
+    // CUDSS_CONFIG_REORDERING_ALG choice; see AcPfNrState's own doc.
+    // Ctor-time only -- ANALYSIS runs once and is never rerun for this session.
+    ReorderingAlg reordering_alg = ReorderingAlg::Default);
 
 // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
 // (solver numbering) instead of the grid's own Sbus. The ledger structure is
@@ -68,7 +78,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     Eigen::Ref<const CplxVect> Sbus,
     int    max_iter,
     double tol,
-    int    device);
+    int    device,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default);
 
 // Build a ContingencyAnalysisSession from a solved LSGrid (branch data set).
 // When compute_limit_violations=true, also pulls bus/branch limits off the

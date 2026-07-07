@@ -45,6 +45,10 @@ from .._gpusim2grid import (
     InjectionSweepSession as _InjectionSweepSession,
 )
 
+# Shared with contingency_analysis/__init__.py (single source of truth for
+# the reordering-alg string↔enum map, same as _normalize_device).
+from ..contingency_analysis import _resolve_reordering_alg
+
 
 _STRATEGY_MAP = {
     'direct_refactor_every':    _ContingencySolverType.DirectRefactorEvery,
@@ -183,7 +187,7 @@ class _InjectionSweepSolver:
     -----
     The following properties are **mutable** and take effect on the next
     :meth:`run` call: ``batch_size``, ``nb_iter``, ``strategy``,
-    ``refactor_period``.
+    ``refactor_period``, ``reordering_alg``.
 
     Examples
     --------
@@ -209,6 +213,7 @@ class _InjectionSweepSolver:
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
+        self._reordering_alg = 'default'
         self._s = _InjectionSweepSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
@@ -216,7 +221,7 @@ class _InjectionSweepSolver:
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
-                      strategy='direct_refactor_every'):
+                      strategy='direct_refactor_every', reordering_alg='default'):
         """Wrap an already-constructed C++ InjectionSweepSession (zero-copy
         lightsim2grid bridge). Reuses all wrapper ergonomics."""
         self = cls.__new__(cls)
@@ -224,6 +229,7 @@ class _InjectionSweepSolver:
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = strategy
+        self._reordering_alg = reordering_alg
         return self
 
     # --- mutable config ---
@@ -252,6 +258,22 @@ class _InjectionSweepSolver:
     def strategy(self, value):
         self._s.strategy_type = _resolve_strategy(value)
         self._strategy = value if isinstance(value, str) else str(value)
+
+    @property
+    def reordering_alg(self):
+        """CUDSS_CONFIG_REORDERING_ALG choice (str or ReorderingAlg). Takes
+        effect on the next run() (which always reruns cuDSS ANALYSIS).
+
+        NOTE: cuDSS rejects 'btf_colamd'/'colamd' with CUDSS_STATUS_NOT_SUPPORTED
+        in this session's uniform-batch mode -- only 'default', 'amd',
+        'nested_dissection', 'none' are supported here. 'btf_colamd'/'colamd'
+        work only on AcPfGPU's single-system solve."""
+        return self._reordering_alg
+
+    @reordering_alg.setter
+    def reordering_alg(self, value):
+        self._s.reordering_alg = _resolve_reordering_alg(value)
+        self._reordering_alg = value if isinstance(value, str) else str(value)
 
     @property
     def refactor_period(self):

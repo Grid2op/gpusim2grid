@@ -215,7 +215,8 @@ void ContingencyAnalysisSession::run()
         used_batch_size_,
         nb_iter_,
         strategy_type_,
-        refactor_period_);
+        refactor_period_,
+        reordering_alg_);
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop

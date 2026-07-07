@@ -72,6 +72,14 @@ struct AcPfNrState {
     int device_id_ = 0;
 
     // -------------------------------------------------------------------------
+    // cuDSS CUDSS_CONFIG_REORDERING_ALG choice, set once at construction and
+    // applied to BOTH dss (forward J, in the ctor) and dss_T (transpose Jᵀ,
+    // in prepare_JT()) -- they are independent CudssContexts, each running
+    // its own CUDSS_PHASE_ANALYSIS, so neither inherits the other's setting.
+    // -------------------------------------------------------------------------
+    ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
+
+    // -------------------------------------------------------------------------
     // Scalar dimensions  (CPU-side, set in constructor, never modified)
     // -------------------------------------------------------------------------
     int n_bus  = 0;
@@ -286,7 +294,20 @@ struct AcPfNrState {
         // ||F(Vinit)||_inf and prepare J's factors, but never call solve/update_V —
         // d_V stays bit-identical to Vinit. Throws if the residual check fails.
         // See acpf_nr.cu §4.6.
-        bool                                         presolved_v = false
+        bool                                         presolved_v = false,
+        // DEBUG ONLY (presolved_v=true path): return immediately after
+        // fill_F/fill_J/FACTORIZE, BEFORE the has_ext_state one-shot cuDSS
+        // correction and BEFORE the ||F||_inf throwing check. Leaves d_F
+        // holding the raw F(Vinit, state=0) and d_J_values holding J(Vinit),
+        // both queryable via get_F()/get_J(), so a Python caller can solve
+        // J*dx=F itself (e.g. with scipy) to check the cuDSS call against a
+        // reference solver on the EXACT SAME data gpusim2grid built -- see
+        // the VC+MultiSlack singular-solve investigation. No-op when
+        // presolved_v=false.
+        bool                                         diag_stop_before_state_correction = false,
+        // CUDSS_CONFIG_REORDERING_ALG choice for BOTH dss and dss_T's
+        // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
+        ReorderingAlg                                reordering_alg = ReorderingAlg::Default
     );
 
     // =========================================================================

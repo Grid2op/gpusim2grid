@@ -247,6 +247,7 @@ struct BatchPfDriver {
     //   nb_iter          — fixed NR iterations per chunk.
     //   strategy_type    — selects which Policy alternative emplaces into policy_.
     //   refactor_period  — for DirectRefactorEveryN.
+    //   reordering_alg   — CUDSS_CONFIG_REORDERING_ALG for the batch ANALYSIS.
     // -------------------------------------------------------------------------
     BatchPfDriver(
         AcPfNrState&              base_state,
@@ -257,7 +258,8 @@ struct BatchPfDriver {
         int                       batch_size,
         int                       nb_iter,
         ContingencySolverType     strategy_type   = ContingencySolverType::DirectRefactorEvery,
-        int                       refactor_period = 1);
+        int                       refactor_period = 1,
+        ReorderingAlg             reordering_alg  = ReorderingAlg::Default);
 
     ~BatchPfDriver() = default;
 

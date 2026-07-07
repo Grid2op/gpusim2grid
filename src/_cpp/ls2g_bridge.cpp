@@ -181,6 +181,19 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
     ld.q_col_of_bus     = to_int_vector(grid.get_q_to_J_col_solver());
     ld.n_bus            = static_cast<int>(ld.p_row_of_bus.size());
 
+    // NRLedger compact (bus, row/col) registration pair lists -- preserve every
+    // registration (unlike the bus-keyed maps above, "last registration wins").
+    // NRSystem's own residual assembly iterates these; the augmented-Jacobian
+    // scatter/residual reconstruction below must match it exactly.
+    ld.p_buses     = to_int_vector(grid.get_p_buses_solver());
+    ld.p_rows      = to_int_vector(grid.get_p_rows_solver());
+    ld.q_buses     = to_int_vector(grid.get_q_buses_solver());
+    ld.q_rows      = to_int_vector(grid.get_q_rows_solver());
+    ld.theta_buses = to_int_vector(grid.get_theta_buses_solver());
+    ld.theta_cols  = to_int_vector(grid.get_theta_cols_solver());
+    ld.vm_buses    = to_int_vector(grid.get_vm_buses_solver());
+    ld.vm_cols     = to_int_vector(grid.get_vm_cols_solver());
+
     // MultiSlack: slack_col (-1 when distributed slack inactive) + slack weights.
     ld.slack_col = grid.get_slack_col_solver();
     if (ld.slack_col >= 0) {
@@ -211,6 +224,8 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
             ld.hvdc_r      = to_dv(h.r);
             ld.hvdc_pmax12 = to_dv(h.pmax12);
             ld.hvdc_pmax21 = to_dv(h.pmax21);
+            ld.hvdc_connected1.assign(h.connected1.begin(), h.connected1.end());
+            ld.hvdc_connected2.assign(h.connected2.begin(), h.connected2.end());
         }
     }
 
@@ -246,7 +261,9 @@ make_acpf_session_from_lsgrid(
     int    max_iter,
     double tol,
     int    device,
-    bool   init_from_n_powerflow)
+    bool   init_from_n_powerflow,
+    bool   diag_stop_before_state_correction,
+    ReorderingAlg reordering_alg)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -266,7 +283,9 @@ make_acpf_session_from_lsgrid(
 
     return std::make_shared<AcPfNrSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
-        /*presolved_v=*/init_from_n_powerflow);
+        /*presolved_v=*/init_from_n_powerflow,
+        diag_stop_before_state_correction,
+        reordering_alg);
 }
 
 std::shared_ptr<AcPfNrSession>
@@ -275,7 +294,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     Eigen::Ref<const CplxVect> Sbus,
     int    max_iter,
     double tol,
-    int    device)
+    int    device,
+    ReorderingAlg reordering_alg)
 {
     // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
     // (solver numbering) instead of the grid's own get_Sbus_solver(). Used by
@@ -304,7 +324,9 @@ make_acpf_session_from_lsgrid_with_sbus(
     LedgerData ledger = extract_ledger_data(grid);
 
     return std::make_shared<AcPfNrSession>(
-        Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger);
+        Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
+        /*presolved_v=*/false, /*diag_stop_before_state_correction=*/false,
+        reordering_alg);
 }
 
 std::shared_ptr<ContingencyAnalysisSession>

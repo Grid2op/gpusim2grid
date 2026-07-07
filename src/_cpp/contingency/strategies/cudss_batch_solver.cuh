@@ -72,6 +72,7 @@ struct CudssBatchSolver {
     //   d_F_batch         — F (RHS) batch buffer  (ubatch_size * dim_J)
     //   d_dx_batch        — dx (solution) batch buffer (ubatch_size * dim_J)
     //   cs                — CUDA stream on which cuDSS will be bound
+    //   reordering_alg    — CUDSS_CONFIG_REORDERING_ALG choice (default: cuDSS's own default)
     //
     // Async: ANALYSIS is launched on cs; the caller must synchronize cs after
     // this call (or before consuming any results).
@@ -82,7 +83,8 @@ struct CudssBatchSolver {
                     cuda_real_type* d_J_values_batch,
                     cuda_real_type* d_F_batch,
                     cuda_real_type* d_dx_batch,
-                    cudaStream_t    cs)
+                    cudaStream_t    cs,
+                    ReorderingAlg   reordering_alg = ReorderingAlg::Default)
     {
         auto chk = [](cudssStatus_t s, const char* msg) {
             if (s != CUDSS_STATUS_SUCCESS)
@@ -102,6 +104,7 @@ struct CudssBatchSolver {
 
         chk(cudssConfigSet(dss_.config, CUDSS_CONFIG_UBATCH_SIZE,
                            &ubatch_size, sizeof(ubatch_size)), "cudssConfigSet");
+        dss_.set_reordering_alg(reordering_alg);
 
         dss_.analyze(dss_A_, dss_x_, dss_b_);
     }

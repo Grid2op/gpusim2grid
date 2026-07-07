@@ -142,7 +142,8 @@ void InjectionSweepSession::run()
         used_batch_size_,
         nb_iter_,
         strategy_type_,
-        refactor_period_);
+        refactor_period_,
+        reordering_alg_);
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms  = t_base_case_ms_;

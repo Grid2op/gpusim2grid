@@ -59,6 +59,25 @@ falls back to the vendored Eigen copy (``src/eigen/``) and the Python
 fallback path is used at runtime instead — everything still works, just
 without the zero-copy fast path.
 
+SuiteSparse headers for the bridge
+-----------------------------------
+
+When the bridge is enabled, ``LSGrid.hpp`` transitively pulls in KLU headers
+(``cs.h``, ``klu.h``, ``amd.h``, ``colamd.h``, ``btf.h``,
+``SuiteSparse_config.h``) that the installed ``lightsim2grid_core`` package
+does not ship. CMake looks for them in order:
+
+1. A system SuiteSparse dev package (e.g. Debian/Ubuntu's
+   ``libsuitesparse-dev``), auto-detected via ``find_path``. Set
+   ``SUITESPARSE_INCLUDE_DIR`` (env var or ``-D``) if it's installed
+   somewhere non-standard.
+2. A SuiteSparse *source checkout*'s per-module ``Include/`` layout, via
+   ``-DGPUSIM2GRID_SUITESPARSE_DIR=/path/to/SuiteSparse``.
+
+If neither is found, configuration prints a warning and the bridge may fail
+to compile with a ``cs.h``/``klu.h`` not found error — install
+``libsuitesparse-dev`` (or point at a checkout) to fix it.
+
 Selecting floating-point precision
 ----------------------------------
 

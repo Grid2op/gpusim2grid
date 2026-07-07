@@ -182,6 +182,19 @@ class InjectionSweepGPU:
         self._inner.strategy = value
 
     @property
+    def reordering_alg(self):
+        """cuDSS CUDSS_CONFIG_REORDERING_ALG choice (str). Takes effect on the
+        next compute() (which always reruns cuDSS ANALYSIS). One of 'default'
+        (default), 'amd', 'nested_dissection', 'none'. 'btf_colamd'/'colamd'
+        are rejected by cuDSS (CUDSS_STATUS_NOT_SUPPORTED) in this class's
+        uniform-batch mode -- they only work on AcPfGPU's single-system solve."""
+        return self._inner.reordering_alg
+
+    @reordering_alg.setter
+    def reordering_alg(self, value):
+        self._inner.reordering_alg = value
+
+    @property
     def timings(self):
         return self._inner.timings
 

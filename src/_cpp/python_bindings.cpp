@@ -9,6 +9,7 @@
 #include "injection_sweep.hpp"               // run_injection_sweep_gpu
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
+#include "raw_cudss_solve.hpp"               // solve_cudss_raw
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
@@ -426,6 +427,26 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "device: CUDA device ordinal (-1 = current device).");
 
   // -----------------------------------------------------------------
+  // ReorderingAlg enum — selects CUDSS_CONFIG_REORDERING_ALG ahead of
+  // CUDSS_PHASE_ANALYSIS. Registered BEFORE any binding that uses it as a
+  // default argument (e.g. AcPfNrSession's reordering_alg kwarg just below),
+  // same rationale as ContingencySolverType further down.
+  // -----------------------------------------------------------------
+  pybind11::enum_<ReorderingAlg>(m, "ReorderingAlg")
+      .value("Default", ReorderingAlg::Default,
+             "cuDSS's own default reordering heuristic.")
+      .value("BtfColamd", ReorderingAlg::BtfColamd,
+             "Block Triangular Form + COLAMD.")
+      .value("Colamd", ReorderingAlg::Colamd,
+             "Column Approximate Minimum Degree.")
+      .value("Amd", ReorderingAlg::Amd,
+             "Approximate Minimum Degree.")
+      .value("NestedDissection", ReorderingAlg::NestedDissection,
+             "Nested dissection.")
+      .value("NoReordering", ReorderingAlg::None,
+             "Natural (identity) ordering — no reordering applied.");
+
+  // -----------------------------------------------------------------
   // AcPfNrSession — stateful single-system NR solver.
   // Keeps the voltage vector on device so it can be exported via DLPack
   // without a host copy.  Use v_dlpack() for zero-copy PyTorch/JAX interop
@@ -448,10 +469,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
               Eigen::Ref<const Eigen::VectorXi>           pv,
               Eigen::Ref<const Eigen::VectorXi>           pq,
               int max_iter, eigen_real_type tol, int device,
-              bool presolved_v) {
+              bool presolved_v, ReorderingAlg reordering_alg) {
                return std::make_shared<AcPfNrSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
-                   max_iter, tol, device, /*ledger=*/nullptr, presolved_v);
+                   max_iter, tol, device, /*ledger=*/nullptr, presolved_v,
+                   /*diag_stop_before_state_correction=*/false, reordering_alg);
            }),
          pybind11::arg("Ybus"),
          pybind11::arg("Vinit"),
@@ -464,6 +486,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("tol"),
          pybind11::arg("device") = -1,
          pybind11::arg("presolved_v") = false,
+         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
          "Construct and immediately solve the base-case AC power flow.\n\n"
          "Ybus          : scipy.sparse complex (n_bus x n_bus) admittance matrix.\n"
          "Vinit         : (n_bus,) complex128 warm-start voltages.\n"
@@ -476,11 +499,44 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "device        : CUDA device ordinal (-1 = current device).\n"
          "presolved_v   : if True, Vinit is trusted as already converged -- "
          "validate ||F(Vinit)||inf once and skip the NR loop entirely "
-         "(raises if the residual check fails).")
+         "(raises if the residual check fails).\n"
+         "reordering_alg: ReorderingAlg, CUDSS_CONFIG_REORDERING_ALG choice for "
+         "the (once-only) cuDSS ANALYSIS phase, applied to both the forward and "
+         "the adjoint (transpose) factorization. Default: cuDSS's own default.")
     .def_property_readonly("timings", &AcPfNrSession::timings,
          "AcPfTimings struct with per-phase timing breakdowns.")
     .def("get_v", &AcPfNrSession::get_v,
          "Copy the voltage vector from device to a NumPy array (one D→H transfer).")
+    .def("get_F", &AcPfNrSession::get_F,
+         "The mismatch RHS gpusim2grid actually computed on the GPU (D->H copy "
+         "of d_F, widened to float64). Normally F after any has_ext_state "
+         "correction; if the session was built with "
+         "diag_stop_before_state_correction=True, this is the RAW "
+         "F(Vinit, state=0) instead, letting an external solver (e.g. "
+         "scipy.sparse.linalg.spsolve on get_J()) redo the correction step "
+         "independently of cuDSS on the exact same data.")
+    .def("solve_cudss", &AcPfNrSession::solve_cudss,
+         pybind11::arg("rhs"),
+         "DEBUG: solve J*dx = rhs using gpusim2grid's OWN cuDSS context and "
+         "the SAME factorization of J already computed at construction (J "
+         "itself is not re-uploaded/re-factorized). rhs must have length "
+         "dim_J. Returns dx (float64). Compare directly against "
+         "scipy.sparse.linalg.spsolve(J, rhs) built from get_J() on the exact "
+         "same rhs -- e.g.:\n"
+         "  indptr, indices, data = session.get_J()\n"
+         "  J = scipy.sparse.csr_matrix((data, indices, indptr), shape=(session.dim_J,)*2)\n"
+         "  dx_scipy = scipy.sparse.linalg.spsolve(J.tocsc(), F)\n"
+         "  dx_cudss = session.solve_cudss(F)")
+    .def("residual", &AcPfNrSession::residual,
+         pybind11::arg("dx"), pybind11::arg("rhs"),
+         "DEBUG: close the loop on solve_cudss()/scipy -- compute J*dx - rhs "
+         "as a plain host-side CSR matvec (get_J()'s own sparsity/values, no "
+         "GPU/cuSPARSE involved) and return the residual (float64, length "
+         "dim_J). A correct dx (e.g. from scipy) gives ~0 everywhere; cuDSS's "
+         "own (broken) dx on this system does not. Call with BOTH "
+         "dx_scipy and dx_cudss (same rhs) to see the contrast:\n"
+         "  session.residual(dx_scipy, F)  # -> ~0\n"
+         "  session.residual(dx_cudss, F)  # -> huge")
     .def("v_dlpack", &export_v_acpfnr_dlpack,
          "Export the voltage vector as a DLPack capsule, shape [n_bus].\n"
          "Zero-copy: the tensor aliases live GPU memory owned by this session.\n"
@@ -516,7 +572,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "angle reference bus (solver numbering).")
     .def_property_readonly("vm_col_of_bus", &AcPfNrSession::vm_col_of_bus,
         "Voltage-magnitude (Vm) unknown J column of each bus, length n_bus, -1 "
-        "for PV/slack buses (solver numbering).");
+        "for PV/slack buses (solver numbering).")
+    .def("get_J", &AcPfNrSession::get_J,
+        "The augmented Jacobian gpusim2grid actually built and factorized on "
+        "the GPU (D->H copy), as (indptr, indices, data) in RowMajor CSR "
+        "convention. Rebuild in Python with:\n"
+        "  from scipy.sparse import csr_matrix\n"
+        "  indptr, indices, data = session.get_J()\n"
+        "  J = csr_matrix((data, indices, indptr), shape=(session.dim_J, session.dim_J))\n"
+        "Values are widened to float64 regardless of the FP32/FP64 build.");
 
   // -----------------------------------------------------------------
   // ContingencySolverType enum — selects the linear-solve strategy.
@@ -729,6 +793,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &ContingencyAnalysisSession::strategy_type_,
                    "Linear-solve strategy (ContingencySolverType enum; takes effect on the next run())")
+    .def_readwrite("reordering_alg", &ContingencyAnalysisSession::reordering_alg_,
+                   "CUDSS_CONFIG_REORDERING_ALG choice for the batch cuDSS ANALYSIS "
+                   "(ReorderingAlg enum; takes effect on the next run(), which always "
+                   "reruns ANALYSIS). NOTE: cuDSS rejects BtfColamd/Colamd with "
+                   "CUDSS_STATUS_NOT_SUPPORTED when CUDSS_CONFIG_UBATCH_SIZE is also "
+                   "set (this session's batch mode) -- only Default/Amd/"
+                   "NestedDissection/NoReordering are supported here; BtfColamd/Colamd "
+                   "work only on AcPfNrSession's single-system solve.")
     .def_readwrite("handle_disconnected_grid",
                    &ContingencyAnalysisSession::handle_disconnected_grid_,
                    "When True, a contingency that splits the grid is solved on its "
@@ -909,6 +981,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &InjectionSweepSession::strategy_type_,
                    "Linear-solve strategy (ContingencySolverType enum; takes effect on the next run())")
+    .def_readwrite("reordering_alg", &InjectionSweepSession::reordering_alg_,
+                   "CUDSS_CONFIG_REORDERING_ALG choice for the batch cuDSS ANALYSIS "
+                   "(ReorderingAlg enum; takes effect on the next run(), which always "
+                   "reruns ANALYSIS). NOTE: cuDSS rejects BtfColamd/Colamd with "
+                   "CUDSS_STATUS_NOT_SUPPORTED when CUDSS_CONFIG_UBATCH_SIZE is also "
+                   "set (this session's batch mode) -- only Default/Amd/"
+                   "NestedDissection/NoReordering are supported here; BtfColamd/Colamd "
+                   "work only on AcPfNrSession's single-system solve.")
     // -------------------------------------------------------------------
     // Zero-copy DLPack exporters.
     // -------------------------------------------------------------------
@@ -986,36 +1066,49 @@ PYBIND11_MODULE(_gpusim2grid, m)
 
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device,
-           bool init_from_n_powerflow) {
+           bool init_from_n_powerflow, bool diag_stop_before_state_correction,
+           ReorderingAlg reordering_alg) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid(
-                grid, max_iter, tol, device, init_from_n_powerflow);
+                grid, max_iter, tol, device, init_from_n_powerflow,
+                diag_stop_before_state_correction, reordering_alg);
         },
         pybind11::arg("grid"),
         pybind11::arg("max_iter") = 10,
         pybind11::arg("tol")      = 1e-8,
         pybind11::arg("device")   = -1,
         pybind11::arg("init_from_n_powerflow") = true,
+        pybind11::arg("diag_stop_before_state_correction") = false,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         "Build a single-system AcPfNrSession from a solved lightsim2grid LSGrid, "
         "solving the same augmented system (distributed slack / extensions) via "
         "the NRLedger read off the C++ object. With init_from_n_powerflow=True "
         "(default), the CPU-converged V (get_V_solver()) is trusted as already "
         "solved: the GPU NR loop is skipped entirely (one validation fill_F/"
         "fill_J/FACTORIZE only). With False, the GPU runs up to max_iter "
-        "iterations from that same V0 seed.");
+        "iterations from that same V0 seed.\n"
+        "diag_stop_before_state_correction (DEBUG, default False): only "
+        "meaningful with init_from_n_powerflow=True. Returns right after fill_F/"
+        "fill_J/FACTORIZE, BEFORE the cuDSS-based has_ext_state correction and "
+        "BEFORE the ||F||_inf residual check (so it never throws). "
+        "session.get_J() / session.get_F() then expose J(V0) and the RAW "
+        "F(V0, state=0) so an external solver (e.g. scipy.sparse.linalg.spsolve) "
+        "can redo the state-correction linear solve independently of cuDSS, on "
+        "the exact same data.");
 
     m.def("_make_acpf_session_from_lsgrid_with_sbus",
         [](pybind11::object grid_py, Eigen::Ref<const CplxVect> Sbus,
-           int max_iter, double tol, int device) {
+           int max_iter, double tol, int device, ReorderingAlg reordering_alg) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid_with_sbus(
-                grid, Sbus, max_iter, tol, device);
+                grid, Sbus, max_iter, tol, device, reordering_alg);
         },
         pybind11::arg("grid"),
         pybind11::arg("Sbus"),
         pybind11::arg("max_iter") = 10,
         pybind11::arg("tol")      = 1e-8,
         pybind11::arg("device")   = -1,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         "Same as _make_acpf_session_from_lsgrid, but with a caller-supplied "
         "complex Sbus (solver numbering) instead of the grid's own Sbus. The "
         "augmented ledger structure is still read off the (previously solved) "
@@ -1026,6 +1119,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
 #else
     m.attr("have_ls2g_bridge") = false;
 #endif
+
+    m.def("solve_cudss_raw", &solve_cudss_raw,
+        pybind11::arg("dim"),
+        pybind11::arg("indptr"),
+        pybind11::arg("indices"),
+        pybind11::arg("data"),
+        pybind11::arg("rhs"),
+        pybind11::arg("device") = -1,
+        "Solve J*dx = rhs via gpusim2grid's own cuDSS wrapper (analyze -> "
+        "factorize -> solve), completely decoupled from any grid/power-flow "
+        "construction: J is supplied directly as CSR (indptr, indices, data). "
+        "For validating cuDSS on an arbitrary dumped (J, F) pair (e.g. from "
+        "AcPfNrSession::get_J()/get_F()), see repro_cudss_bug_standalone.py.");
 
     // -----------------------------------------------------------------
     // Compilation options — queryable at runtime
