@@ -187,6 +187,14 @@ class ContingencyAnalysisGPU:
                     session, max_iter_base=max_iter_base, tol_base=tol_base)
                 self._n_branches = self._inner._s.n_branches
             else:
+                # TODO(bug): no v_init= forwarded here, so extract_grid_arrays()
+                # / _ensure_solved() always re-solves from its own DC warm-start
+                # with (max_iter_base, tol_base), silently discarding/overriding
+                # any Vinit + solver settings the caller already used in a prior
+                # grid.ac_pf() call on this same grid object (array/non-bridge
+                # path only -- the bridge path has no such re-solve, see
+                # ls2g_bridge.cpp). See also the pv/pq/slack numbering TODO in
+                # extract_grid_arrays() (_ls2g_utils.py).
                 d = extract_grid_arrays(grid, max_iter=max_iter_base, tol=tol_base)
                 # Seed from the CPU base-case solution and either trust it as already
                 # converged (presolved_v, no GPU NR loop) or run the full GPU base

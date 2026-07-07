@@ -150,6 +150,16 @@ def extract_branch_data(grid):
         (lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
     ytt = np.concatenate(
         (lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
+    # TODO(bug): vn_kv is left in grid-MODEL bus numbering, unlike
+    # branch_from/branch_to above (whatever numbering lines.get_bus_id_side_*
+    # already returns -- solver numbering per the ls2g_bridge.cpp analog) and
+    # unlike bus_vmin_kv/bus_vmax_kv in gpu_facade.py's _extract_limits_arrays
+    # (explicitly relabeled via id_me_to_ac_solver()). Whenever the grid's
+    # model->solver bus map isn't the identity (e.g. isolated buses excluded
+    # under KLU/the augmented multi-slack system), this mismatches V in size
+    # (crash in get_violations_n) or silently pairs the wrong nominal voltage
+    # with the wrong bus. Needs the same id_me_to_ac_solver() remap as
+    # _extract_limits_arrays.
     vn_kv = grid.get_bus_vn_kv().copy()
     sn_mva = grid.get_sn_mva()
     args = (branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)

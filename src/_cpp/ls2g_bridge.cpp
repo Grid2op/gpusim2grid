@@ -76,6 +76,14 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid)
     bd.yft = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
     bd.ytf = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
     bd.ytt = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
+    // TODO(bug): bus_vn_kv is left in grid-MODEL bus numbering, unlike
+    // branch_from/branch_to just above (relabeled via me_to_solver) and unlike
+    // bus_vmin_kv/bus_vmax_kv in extract_limits() (also relabeled). Whenever
+    // id_me_to_ac_solver is not the identity -- e.g. isolated buses excluded
+    // under KLU/the augmented multi-slack system -- this mismatches V/
+    // branch_from in size (crash) or, if sizes coincide, silently pairs the
+    // wrong nominal voltage with the wrong bus in compute_branch_flows_cpu /
+    // get_violations_n. Needs the same me_to_solver remap applied here.
     bd.bus_vn_kv = grid.get_bus_vn_kv();
     bd.sn_mva    = const_cast<ls2g::LSGrid&>(grid).get_sn_mva();
     return bd;
