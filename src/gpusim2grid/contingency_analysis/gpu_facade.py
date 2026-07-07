@@ -447,6 +447,18 @@ class ContingencyAnalysisGPU:
         self._inner.reordering_alg = value
 
     @property
+    def matching_alg(self):
+        """cuDSS CUDSS_CONFIG_MATCHING_ALG choice (str). Takes effect on the
+        next compute() (which always reruns cuDSS ANALYSIS). 'none' (default)
+        is the only value cuDSS accepts in this class's uniform-batch mode --
+        every other value raises RuntimeError (CUDSS_STATUS_NOT_SUPPORTED)."""
+        return self._inner.matching_alg
+
+    @matching_alg.setter
+    def matching_alg(self, value):
+        self._inner.matching_alg = value
+
+    @property
     def timings(self):
         """BatchTimings from the most recent compute() / compute_flows()."""
         return self._inner.timings

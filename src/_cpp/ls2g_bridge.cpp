@@ -263,7 +263,8 @@ make_acpf_session_from_lsgrid(
     int    device,
     bool   init_from_n_powerflow,
     bool   diag_stop_before_state_correction,
-    ReorderingAlg reordering_alg)
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -285,7 +286,7 @@ make_acpf_session_from_lsgrid(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
         diag_stop_before_state_correction,
-        reordering_alg);
+        reordering_alg, matching_alg);
 }
 
 std::shared_ptr<AcPfNrSession>
@@ -295,7 +296,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     int    max_iter,
     double tol,
     int    device,
-    ReorderingAlg reordering_alg)
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg)
 {
     // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
     // (solver numbering) instead of the grid's own get_Sbus_solver(). Used by
@@ -326,7 +328,7 @@ make_acpf_session_from_lsgrid_with_sbus(
     return std::make_shared<AcPfNrSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
         /*presolved_v=*/false, /*diag_stop_before_state_correction=*/false,
-        reordering_alg);
+        reordering_alg, matching_alg);
 }
 
 std::shared_ptr<ContingencyAnalysisSession>

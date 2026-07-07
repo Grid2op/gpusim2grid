@@ -4,6 +4,7 @@
 #include "cu_complex_utils.h"
 #include "timing_utils.hpp"
 #include "reordering_alg.hpp"
+#include "matching_alg.hpp"
 
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <stdio.h>            // printf
@@ -236,6 +237,22 @@ inline cudssReorderingAlg_t to_cudss_reordering_alg(ReorderingAlg alg) {
 }
 
 // ---------------------------------------------------------------------------
+// Maps the CUDA-free MatchingAlg (matching_alg.hpp) to the real cuDSS enum.
+// MatchingAlg::None matches cuDSS's own default (matching disabled) exactly.
+// ---------------------------------------------------------------------------
+inline cudssMatchingAlg_t to_cudss_matching_alg(MatchingAlg alg) {
+    switch (alg) {
+        case MatchingAlg::MaxDiagCount:   return CUDSS_MATCHING_ALG_MAX_DIAG_COUNT;
+        case MatchingAlg::MaxMinDiag:     return CUDSS_MATCHING_ALG_MAX_MIN_DIAG;
+        case MatchingAlg::MaxMinDiagAlt:  return CUDSS_MATCHING_ALG_MAX_MIN_DIAG_ALT;
+        case MatchingAlg::MaxDiagSum:     return CUDSS_MATCHING_ALG_MAX_DIAG_SUM;
+        case MatchingAlg::MaxDiagProduct: return CUDSS_MATCHING_ALG_MAX_DIAG_PRODUCT;
+        case MatchingAlg::Auto:           return CUDSS_MATCHING_ALG_AUTO;
+        default:                          return CUDSS_MATCHING_ALG_NONE;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RAII wrapper for the cudss solver context: handle, config and data.
 // ---------------------------------------------------------------------------
 struct CudssContext {
@@ -278,6 +295,18 @@ struct CudssContext {
         if (s != CUDSS_STATUS_SUCCESS)
             throw std::runtime_error(
                 std::string("CudssContext::set_reordering_alg failed: status=")
+                + std::to_string(static_cast<int>(s)));
+    }
+
+    // Must be called after cudssConfigCreate() and before analyze() to take
+    // effect (CUDSS_CONFIG_MATCHING_ALG is read during CUDSS_PHASE_ANALYSIS).
+    void set_matching_alg(MatchingAlg alg) {
+        cudssMatchingAlg_t v = to_cudss_matching_alg(alg);
+        cudssStatus_t s = cudssConfigSet(config, CUDSS_CONFIG_MATCHING_ALG,
+                                         &v, sizeof(v));
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(
+                std::string("CudssContext::set_matching_alg failed: status=")
                 + std::to_string(static_cast<int>(s)));
     }
 

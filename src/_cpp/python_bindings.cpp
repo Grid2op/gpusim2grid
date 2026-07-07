@@ -447,6 +447,28 @@ PYBIND11_MODULE(_gpusim2grid, m)
              "Natural (identity) ordering — no reordering applied.");
 
   // -----------------------------------------------------------------
+  // MatchingAlg enum — selects CUDSS_CONFIG_MATCHING_ALG ahead of
+  // CUDSS_PHASE_ANALYSIS. Registered BEFORE any binding that uses it as a
+  // default argument (e.g. AcPfNrSession's matching_alg kwarg just below),
+  // same rationale as ReorderingAlg above.
+  // -----------------------------------------------------------------
+  pybind11::enum_<MatchingAlg>(m, "MatchingAlg")
+      .value("NoMatching", MatchingAlg::None,
+             "Matching disabled (cuDSS's own default).")
+      .value("MaxDiagCount", MatchingAlg::MaxDiagCount,
+             "Maximize the number of nonzero diagonal entries.")
+      .value("MaxMinDiag", MatchingAlg::MaxMinDiag,
+             "Maximize the smallest diagonal entry.")
+      .value("MaxMinDiagAlt", MatchingAlg::MaxMinDiagAlt,
+             "Alternative algorithm maximizing the smallest diagonal entry.")
+      .value("MaxDiagSum", MatchingAlg::MaxDiagSum,
+             "Maximize the sum of the diagonal entries.")
+      .value("MaxDiagProduct", MatchingAlg::MaxDiagProduct,
+             "Maximize the product of the diagonal entries.")
+      .value("Auto", MatchingAlg::Auto,
+             "cuDSS selects the matching algorithm to apply.");
+
+  // -----------------------------------------------------------------
   // AcPfNrSession — stateful single-system NR solver.
   // Keeps the voltage vector on device so it can be exported via DLPack
   // without a host copy.  Use v_dlpack() for zero-copy PyTorch/JAX interop
@@ -469,11 +491,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
               Eigen::Ref<const Eigen::VectorXi>           pv,
               Eigen::Ref<const Eigen::VectorXi>           pq,
               int max_iter, eigen_real_type tol, int device,
-              bool presolved_v, ReorderingAlg reordering_alg) {
+              bool presolved_v, ReorderingAlg reordering_alg,
+              MatchingAlg matching_alg) {
                return std::make_shared<AcPfNrSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    max_iter, tol, device, /*ledger=*/nullptr, presolved_v,
-                   /*diag_stop_before_state_correction=*/false, reordering_alg);
+                   /*diag_stop_before_state_correction=*/false, reordering_alg,
+                   matching_alg);
            }),
          pybind11::arg("Ybus"),
          pybind11::arg("Vinit"),
@@ -487,6 +511,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("device") = -1,
          pybind11::arg("presolved_v") = false,
          pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+         pybind11::arg("matching_alg") = MatchingAlg::None,
          "Construct and immediately solve the base-case AC power flow.\n\n"
          "Ybus          : scipy.sparse complex (n_bus x n_bus) admittance matrix.\n"
          "Vinit         : (n_bus,) complex128 warm-start voltages.\n"
@@ -502,7 +527,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "(raises if the residual check fails).\n"
          "reordering_alg: ReorderingAlg, CUDSS_CONFIG_REORDERING_ALG choice for "
          "the (once-only) cuDSS ANALYSIS phase, applied to both the forward and "
-         "the adjoint (transpose) factorization. Default: cuDSS's own default.")
+         "the adjoint (transpose) factorization. Default: cuDSS's own default.\n"
+         "matching_alg  : MatchingAlg, CUDSS_CONFIG_MATCHING_ALG choice, same "
+         "scope as reordering_alg. Default (NoMatching): cuDSS's own default "
+         "(matching off). WARNING: MaxDiagProduct and Auto have been observed "
+         "to silently produce NaN voltages on real power-flow Jacobians while "
+         "AcPfTimings.converged still reports True (the ||F||_inf check does "
+         "not catch NaN) -- do not use them without independently checking "
+         "np.isnan(V) yourself. NoMatching/MaxDiagCount/MaxMinDiag/"
+         "MaxMinDiagAlt/MaxDiagSum have been verified to reproduce the "
+         "reference solution.")
     .def_property_readonly("timings", &AcPfNrSession::timings,
          "AcPfTimings struct with per-phase timing breakdowns.")
     .def("get_v", &AcPfNrSession::get_v,
@@ -801,6 +835,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "set (this session's batch mode) -- only Default/Amd/"
                    "NestedDissection/NoReordering are supported here; BtfColamd/Colamd "
                    "work only on AcPfNrSession's single-system solve.")
+    .def_readwrite("matching_alg", &ContingencyAnalysisSession::matching_alg_,
+                   "CUDSS_CONFIG_MATCHING_ALG choice for the batch cuDSS ANALYSIS "
+                   "(MatchingAlg enum; takes effect on the next run(), which always "
+                   "reruns ANALYSIS). NOTE: cuDSS rejects EVERY non-default value "
+                   "(CUDSS_STATUS_NOT_SUPPORTED) when CUDSS_CONFIG_UBATCH_SIZE is "
+                   "also set (this session's batch mode) -- only NoMatching (the "
+                   "default) works here. The other values only work on "
+                   "AcPfNrSession's single-system solve, and even there "
+                   "MaxDiagProduct/Auto have been observed to silently produce NaN.")
     .def_readwrite("handle_disconnected_grid",
                    &ContingencyAnalysisSession::handle_disconnected_grid_,
                    "When True, a contingency that splits the grid is solved on its "
@@ -989,6 +1032,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "set (this session's batch mode) -- only Default/Amd/"
                    "NestedDissection/NoReordering are supported here; BtfColamd/Colamd "
                    "work only on AcPfNrSession's single-system solve.")
+    .def_readwrite("matching_alg", &InjectionSweepSession::matching_alg_,
+                   "CUDSS_CONFIG_MATCHING_ALG choice for the batch cuDSS ANALYSIS "
+                   "(MatchingAlg enum; takes effect on the next run(), which always "
+                   "reruns ANALYSIS). NOTE: cuDSS rejects EVERY non-default value "
+                   "(CUDSS_STATUS_NOT_SUPPORTED) when CUDSS_CONFIG_UBATCH_SIZE is "
+                   "also set (this session's batch mode) -- only NoMatching (the "
+                   "default) works here. The other values only work on "
+                   "AcPfNrSession's single-system solve, and even there "
+                   "MaxDiagProduct/Auto have been observed to silently produce NaN.")
     // -------------------------------------------------------------------
     // Zero-copy DLPack exporters.
     // -------------------------------------------------------------------
@@ -1067,11 +1119,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device,
            bool init_from_n_powerflow, bool diag_stop_before_state_correction,
-           ReorderingAlg reordering_alg) {
+           ReorderingAlg reordering_alg, MatchingAlg matching_alg) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid(
                 grid, max_iter, tol, device, init_from_n_powerflow,
-                diag_stop_before_state_correction, reordering_alg);
+                diag_stop_before_state_correction, reordering_alg, matching_alg);
         },
         pybind11::arg("grid"),
         pybind11::arg("max_iter") = 10,
@@ -1080,6 +1132,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("init_from_n_powerflow") = true,
         pybind11::arg("diag_stop_before_state_correction") = false,
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
         "Build a single-system AcPfNrSession from a solved lightsim2grid LSGrid, "
         "solving the same augmented system (distributed slack / extensions) via "
         "the NRLedger read off the C++ object. With init_from_n_powerflow=True "
@@ -1098,10 +1151,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
 
     m.def("_make_acpf_session_from_lsgrid_with_sbus",
         [](pybind11::object grid_py, Eigen::Ref<const CplxVect> Sbus,
-           int max_iter, double tol, int device, ReorderingAlg reordering_alg) {
+           int max_iter, double tol, int device, ReorderingAlg reordering_alg,
+           MatchingAlg matching_alg) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid_with_sbus(
-                grid, Sbus, max_iter, tol, device, reordering_alg);
+                grid, Sbus, max_iter, tol, device, reordering_alg, matching_alg);
         },
         pybind11::arg("grid"),
         pybind11::arg("Sbus"),
@@ -1109,6 +1163,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("tol")      = 1e-8,
         pybind11::arg("device")   = -1,
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
         "Same as _make_acpf_session_from_lsgrid, but with a caller-supplied "
         "complex Sbus (solver numbering) instead of the grid's own Sbus. The "
         "augmented ledger structure is still read off the (previously solved) "
@@ -1127,9 +1182,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("data"),
         pybind11::arg("rhs"),
         pybind11::arg("device") = -1,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         "Solve J*dx = rhs via gpusim2grid's own cuDSS wrapper (analyze -> "
         "factorize -> solve), completely decoupled from any grid/power-flow "
         "construction: J is supplied directly as CSR (indptr, indices, data). "
+        "reordering_alg: ReorderingAlg, CUDSS_CONFIG_REORDERING_ALG choice for "
+        "the ANALYSIS phase. "
         "For validating cuDSS on an arbitrary dumped (J, F) pair (e.g. from "
         "AcPfNrSession::get_J()/get_F()), see repro_cudss_bug_standalone.py.");
 

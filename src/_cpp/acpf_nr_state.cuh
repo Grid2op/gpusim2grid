@@ -80,6 +80,12 @@ struct AcPfNrState {
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
 
     // -------------------------------------------------------------------------
+    // cuDSS CUDSS_CONFIG_MATCHING_ALG choice; same treatment as reordering_alg_
+    // above (applied to both dss and dss_T, set once at construction).
+    // -------------------------------------------------------------------------
+    MatchingAlg matching_alg_ = MatchingAlg::None;
+
+    // -------------------------------------------------------------------------
     // Scalar dimensions  (CPU-side, set in constructor, never modified)
     // -------------------------------------------------------------------------
     int n_bus  = 0;
@@ -307,7 +313,11 @@ struct AcPfNrState {
         bool                                         diag_stop_before_state_correction = false,
         // CUDSS_CONFIG_REORDERING_ALG choice for BOTH dss and dss_T's
         // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
-        ReorderingAlg                                reordering_alg = ReorderingAlg::Default
+        ReorderingAlg                                reordering_alg = ReorderingAlg::Default,
+        // CUDSS_CONFIG_MATCHING_ALG choice for BOTH dss and dss_T's
+        // CUDSS_PHASE_ANALYSIS. Default (None) matches cuDSS's own default
+        // (matching disabled).
+        MatchingAlg                                   matching_alg = MatchingAlg::None
     );
 
     // =========================================================================

@@ -73,7 +73,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     int                   nb_iter,
     ContingencySolverType strategy_type,
     int                   refactor_period,
-    ReorderingAlg         reordering_alg)
+    ReorderingAlg         reordering_alg,
+    MatchingAlg           matching_alg)
     : base(base_state)
     , source_(std::move(source))
     , n_contingencies(n_contingencies_in)
@@ -212,7 +213,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         thrust::raw_pointer_cast(d_F_batch.data()),
         thrust::raw_pointer_cast(d_dx_batch.data()),
         cs,
-        reordering_alg);
+        reordering_alg,
+        matching_alg);
 
     std::visit([&](auto& policy) {
         policy.initialize_from_base(

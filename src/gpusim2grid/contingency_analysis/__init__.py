@@ -12,6 +12,7 @@ from .._gpusim2grid import (
     ContingencyAnalysisSession as _ContingencyAnalysisSession,
     ContingencySolverType as _ContingencySolverType,
     ReorderingAlg as _ReorderingAlg,
+    MatchingAlg as _MatchingAlg,
 )
 
 from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
@@ -73,6 +74,36 @@ def _resolve_reordering_alg(value):
                 f"Choose from: {list(_REORDERING_ALG_MAP)}")
     raise TypeError(
         f"reordering_alg must be a str or ReorderingAlg, got {type(value).__name__}")
+
+
+# Shared with injection_sweep/__init__.py and acpf_nr/gpu_facade.py, same
+# rationale as _REORDERING_ALG_MAP above: CUDSS_CONFIG_MATCHING_ALG is also a
+# solver-wide concept, not specific to the batch/contingency workload.
+_MATCHING_ALG_MAP = {
+    'none':              _MatchingAlg.NoMatching,
+    'max_diag_count':    _MatchingAlg.MaxDiagCount,
+    'max_min_diag':      _MatchingAlg.MaxMinDiag,
+    'max_min_diag_alt':  _MatchingAlg.MaxMinDiagAlt,
+    'max_diag_sum':      _MatchingAlg.MaxDiagSum,
+    'max_diag_product':  _MatchingAlg.MaxDiagProduct,
+    'auto':              _MatchingAlg.Auto,
+}
+
+
+def _resolve_matching_alg(value):
+    """Accept either a string (mapped via _MATCHING_ALG_MAP) or a raw
+    MatchingAlg value."""
+    if isinstance(value, _MatchingAlg):
+        return value
+    if isinstance(value, str):
+        try:
+            return _MATCHING_ALG_MAP[value]
+        except KeyError:
+            raise ValueError(
+                f"Unknown matching_alg {value!r}. "
+                f"Choose from: {list(_MATCHING_ALG_MAP)}")
+    raise TypeError(
+        f"matching_alg must be a str or MatchingAlg, got {type(value).__name__}")
 
 
 class DeviceBuffer:
@@ -155,6 +186,14 @@ class _ContingencyAnalysisSolver:
       ``'none'``. ``'btf_colamd'``/``'colamd'`` are also accepted but cuDSS
       rejects them (``CUDSS_STATUS_NOT_SUPPORTED``) in this session's
       uniform-batch mode; they only work on ``AcPfGPU``'s single-system solve.
+    - ``matching_alg`` (*str*): cuDSS ``CUDSS_CONFIG_MATCHING_ALG`` choice.
+      ``'none'`` (default) is the only value cuDSS accepts in this session's
+      uniform-batch mode -- every other value (``'max_diag_count'``,
+      ``'max_min_diag'``, ``'max_min_diag_alt'``, ``'max_diag_sum'``,
+      ``'max_diag_product'``, ``'auto'``) raises ``RuntimeError``
+      (``CUDSS_STATUS_NOT_SUPPORTED``). They only work on ``AcPfGPU``'s
+      single-system solve, and even there ``'max_diag_product'``/``'auto'``
+      have been observed to silently produce NaN voltages.
     - ``max_iter_base``, ``tol_base``: Stored for reference only; do not
       rerun the base case.
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
@@ -194,6 +233,7 @@ class _ContingencyAnalysisSolver:
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
         self._reordering_alg = 'default'
+        self._matching_alg = 'none'
         self._s = _ContingencyAnalysisSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
@@ -202,7 +242,8 @@ class _ContingencyAnalysisSolver:
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
-                      strategy='direct_refactor_every', reordering_alg='default'):
+                      strategy='direct_refactor_every', reordering_alg='default',
+                      matching_alg='none'):
         """Wrap an already-constructed C++ ContingencyAnalysisSession.
 
         Used by the zero-copy lightsim2grid bridge, which builds the session in
@@ -214,6 +255,7 @@ class _ContingencyAnalysisSolver:
         self._tol_base = float(tol_base)
         self._strategy = strategy
         self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
         return self
 
     @property
@@ -263,6 +305,23 @@ class _ContingencyAnalysisSolver:
     def reordering_alg(self, value):
         self._reordering_alg = value
         self._s.reordering_alg = _resolve_reordering_alg(value)
+
+    @property
+    def matching_alg(self):
+        """CUDSS_CONFIG_MATCHING_ALG choice (str or MatchingAlg). Takes effect
+        on the next run() (which always reruns cuDSS ANALYSIS).
+
+        NOTE: 'none' (default) is the only value cuDSS accepts in this
+        session's uniform-batch mode -- every other value raises RuntimeError
+        (CUDSS_STATUS_NOT_SUPPORTED). They only work on AcPfGPU's
+        single-system solve, and even there 'max_diag_product'/'auto' have
+        been observed to silently produce NaN voltages."""
+        return self._matching_alg
+
+    @matching_alg.setter
+    def matching_alg(self, value):
+        self._matching_alg = value
+        self._s.matching_alg = _resolve_matching_alg(value)
 
     @property
     def handle_disconnected_grid(self):

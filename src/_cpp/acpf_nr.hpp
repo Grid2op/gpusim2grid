@@ -13,6 +13,7 @@
 #include "dtypes.hpp"
 #include "timing_utils.hpp"
 #include "reordering_alg.hpp"
+#include "matching_alg.hpp"
 
 #include <memory>
 #include <iostream>
@@ -60,7 +61,9 @@ struct AcPfNrSession {
         // DEBUG ONLY -- see AcPfNrState's own doc. No-op unless presolved_v=true.
         bool                                         diag_stop_before_state_correction = false,
         // CUDSS_CONFIG_REORDERING_ALG choice; see AcPfNrState's own doc.
-        ReorderingAlg                                reordering_alg = ReorderingAlg::Default
+        ReorderingAlg                                reordering_alg = ReorderingAlg::Default,
+        // CUDSS_CONFIG_MATCHING_ALG choice; see AcPfNrState's own doc.
+        MatchingAlg                                  matching_alg = MatchingAlg::None
     );
 
     AcPfTimings timings() const;

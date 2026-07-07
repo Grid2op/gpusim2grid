@@ -7,6 +7,8 @@
 
 #include <vector>
 
+#include "reordering_alg.hpp"
+
 // Solve J*dx = rhs with gpusim2grid's own cuDSS wrapper (analyze -> factorize
 // -> solve, CudssContext/CudssDescriptor from cuda_utils.h), completely
 // decoupled from any power-flow/grid construction: J is supplied directly as
@@ -15,13 +17,14 @@
 // get_F() -- without rebuilding a grid/session at all. See
 // repro_cudss_bug_standalone.py.
 //
-//   dim      matrix dimension (J is dim x dim)
-//   indptr   CSR row pointer, size dim+1
-//   indices  CSR column indices, size nnz
-//   data     CSR values, size nnz (narrowed to cuda_real_type internally,
-//            same as the rest of the codebase)
-//   rhs      right-hand side, size dim
-//   device   CUDA device ordinal, or -1 to use the current device
+//   dim            matrix dimension (J is dim x dim)
+//   indptr         CSR row pointer, size dim+1
+//   indices        CSR column indices, size nnz
+//   data           CSR values, size nnz (narrowed to cuda_real_type internally,
+//                  same as the rest of the codebase)
+//   rhs            right-hand side, size dim
+//   device         CUDA device ordinal, or -1 to use the current device
+//   reordering_alg CUDSS_CONFIG_REORDERING_ALG choice for the ANALYSIS phase
 //
 // Returns dx (host, double), size dim.
 std::vector<double> solve_cudss_raw(
@@ -30,6 +33,7 @@ std::vector<double> solve_cudss_raw(
     const std::vector<int>& indices,
     const std::vector<double>& data,
     const std::vector<double>& rhs,
-    int device = -1);
+    int device = -1,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default);
 
 #endif  // RAW_CUDSS_SOLVE_H

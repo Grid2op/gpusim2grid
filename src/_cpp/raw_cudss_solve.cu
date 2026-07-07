@@ -38,7 +38,8 @@ std::vector<double> solve_cudss_raw(
     const std::vector<int>& indices,
     const std::vector<double>& data,
     const std::vector<double>& rhs,
-    int device)
+    int device,
+    ReorderingAlg reordering_alg)
 {
     if (dim <= 0)
         throw std::runtime_error("solve_cudss_raw: dim must be > 0");
@@ -78,6 +79,7 @@ std::vector<double> solve_cudss_raw(
     CHK_DSS_RAW(cudssSetStream(dss.handle, cs));
     CHK_DSS_RAW(cudssConfigCreate(&dss.config));
     CHK_DSS_RAW(cudssDataCreate(dss.handle, &dss.data));
+    dss.set_reordering_alg(reordering_alg);
 
     CudssDescriptor dss_A, dss_x, dss_b;
     dss_A.create_csr(dim, nnz,
