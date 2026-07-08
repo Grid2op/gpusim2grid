@@ -39,7 +39,9 @@ std::vector<double> solve_cudss_raw(
     const std::vector<double>& data,
     const std::vector<double>& rhs,
     int device,
-    ReorderingAlg reordering_alg)
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg)
 {
     if (dim <= 0)
         throw std::runtime_error("solve_cudss_raw: dim must be > 0");
@@ -80,6 +82,8 @@ std::vector<double> solve_cudss_raw(
     CHK_DSS_RAW(cudssConfigCreate(&dss.config));
     CHK_DSS_RAW(cudssDataCreate(dss.handle, &dss.data));
     dss.set_reordering_alg(reordering_alg);
+    dss.set_matching_alg(matching_alg);
+    dss.set_pivot_epsilon_alg(pivot_epsilon_alg);
 
     CudssDescriptor dss_A, dss_x, dss_b;
     dss_A.create_csr(dim, nnz,

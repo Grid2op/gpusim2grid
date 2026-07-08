@@ -5,6 +5,7 @@
 #include "timing_utils.hpp"
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
+#include "pivot_epsilon_alg.hpp"
 
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <stdio.h>            // printf
@@ -253,6 +254,19 @@ inline cudssMatchingAlg_t to_cudss_matching_alg(MatchingAlg alg) {
 }
 
 // ---------------------------------------------------------------------------
+// Maps the CUDA-free PivotEpsilonAlg (pivot_epsilon_alg.hpp) to the real
+// cuDSS enum. Default matches cuDSS's own implicit default (nothing set)
+// exactly.
+// ---------------------------------------------------------------------------
+inline cudssPivotEpsilonAlg_t to_cudss_pivot_epsilon_alg(PivotEpsilonAlg alg) {
+    switch (alg) {
+        case PivotEpsilonAlg::Scaled: return CUDSS_PIVOT_EPSILON_ALG_SCALED;
+        case PivotEpsilonAlg::Static: return CUDSS_PIVOT_EPSILON_ALG_STATIC;
+        default:                     return CUDSS_PIVOT_EPSILON_ALG_DEFAULT;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RAII wrapper for the cudss solver context: handle, config and data.
 // ---------------------------------------------------------------------------
 struct CudssContext {
@@ -307,6 +321,18 @@ struct CudssContext {
         if (s != CUDSS_STATUS_SUCCESS)
             throw std::runtime_error(
                 std::string("CudssContext::set_matching_alg failed: status=")
+                + std::to_string(static_cast<int>(s)));
+    }
+
+    // Must be called after cudssConfigCreate() and before analyze() to take
+    // effect (CUDSS_CONFIG_PIVOT_EPSILON_ALG is read during CUDSS_PHASE_ANALYSIS).
+    void set_pivot_epsilon_alg(PivotEpsilonAlg alg) {
+        cudssPivotEpsilonAlg_t v = to_cudss_pivot_epsilon_alg(alg);
+        cudssStatus_t s = cudssConfigSet(config, CUDSS_CONFIG_PIVOT_EPSILON_ALG,
+                                         &v, sizeof(v));
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(
+                std::string("CudssContext::set_pivot_epsilon_alg failed: status=")
                 + std::to_string(static_cast<int>(s)));
     }
 

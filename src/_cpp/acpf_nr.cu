@@ -258,10 +258,12 @@ AcPfNrState::AcPfNrState(
     bool                                         presolved_v,
     bool                                         diag_stop_before_state_correction,
     ReorderingAlg                                reordering_alg,
-    MatchingAlg                                  matching_alg)
+    MatchingAlg                                  matching_alg,
+    PivotEpsilonAlg                              pivot_epsilon_alg)
 {
-    reordering_alg_ = reordering_alg;
-    matching_alg_   = matching_alg;
+    reordering_alg_    = reordering_alg;
+    matching_alg_      = matching_alg;
+    pivot_epsilon_alg_ = pivot_epsilon_alg;
 
     // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
     // because the work is heterogeneous (CPU preprocessing + device uploads +
@@ -735,6 +737,7 @@ AcPfNrState::AcPfNrState(
     CHK_DSS_AC(cudssDataCreate(dss.handle, &dss.data));
     dss.set_reordering_alg(reordering_alg_);
     dss.set_matching_alg(matching_alg_);
+    dss.set_pivot_epsilon_alg(pivot_epsilon_alg_);
 
     // Sparse J descriptor — values pointer is updated each iteration via
     // cudssMatrixSetValues(); the shape and structure pointers are fixed.
@@ -1083,7 +1086,8 @@ AcPfNrSession::AcPfNrSession(
     bool                                         presolved_v,
     bool                                         diag_stop_before_state_correction,
     ReorderingAlg                                reordering_alg,
-    MatchingAlg                                  matching_alg
+    MatchingAlg                                  matching_alg,
+    PivotEpsilonAlg                              pivot_epsilon_alg
 )
 {
     (void)slack_ids;
@@ -1091,7 +1095,8 @@ AcPfNrSession::AcPfNrSession(
     state_ = std::make_shared<AcPfNrState>(Ybus, Vinit, Sbus, pv, pq,
                                             max_iter, tol, device, ledger,
                                             presolved_v, diag_stop_before_state_correction,
-                                            reordering_alg, matching_alg);
+                                            reordering_alg, matching_alg,
+                                            pivot_epsilon_alg);
 }
 
 // =============================================================================
@@ -1181,6 +1186,7 @@ void AcPfNrState::prepare_JT()
     CHK_DSS_AC(cudssDataCreate(dss_T.handle, &dss_T.data));
     dss_T.set_reordering_alg(reordering_alg_);
     dss_T.set_matching_alg(matching_alg_);
+    dss_T.set_pivot_epsilon_alg(pivot_epsilon_alg_);
 
     dss_AT.create_csr(static_cast<int64_t>(dim_J),
                       static_cast<int64_t>(nnz_J),

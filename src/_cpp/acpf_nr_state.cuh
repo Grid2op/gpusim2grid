@@ -86,6 +86,13 @@ struct AcPfNrState {
     MatchingAlg matching_alg_ = MatchingAlg::None;
 
     // -------------------------------------------------------------------------
+    // cuDSS CUDSS_CONFIG_PIVOT_EPSILON_ALG choice; same treatment as
+    // reordering_alg_/matching_alg_ above (applied to both dss and dss_T, set
+    // once at construction).
+    // -------------------------------------------------------------------------
+    PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+
+    // -------------------------------------------------------------------------
     // Scalar dimensions  (CPU-side, set in constructor, never modified)
     // -------------------------------------------------------------------------
     int n_bus  = 0;
@@ -317,7 +324,10 @@ struct AcPfNrState {
         // CUDSS_CONFIG_MATCHING_ALG choice for BOTH dss and dss_T's
         // CUDSS_PHASE_ANALYSIS. Default (None) matches cuDSS's own default
         // (matching disabled).
-        MatchingAlg                                   matching_alg = MatchingAlg::None
+        MatchingAlg                                   matching_alg = MatchingAlg::None,
+        // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for BOTH dss and dss_T's
+        // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
+        PivotEpsilonAlg                               pivot_epsilon_alg = PivotEpsilonAlg::Default
     );
 
     // =========================================================================

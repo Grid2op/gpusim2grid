@@ -13,6 +13,7 @@ from .._gpusim2grid import (
     ContingencySolverType as _ContingencySolverType,
     ReorderingAlg as _ReorderingAlg,
     MatchingAlg as _MatchingAlg,
+    PivotEpsilonAlg as _PivotEpsilonAlg,
 )
 
 from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
@@ -106,6 +107,34 @@ def _resolve_matching_alg(value):
         f"matching_alg must be a str or MatchingAlg, got {type(value).__name__}")
 
 
+# Shared with injection_sweep/__init__.py and acpf_nr/gpu_facade.py, same
+# rationale as _REORDERING_ALG_MAP/_MATCHING_ALG_MAP above:
+# CUDSS_CONFIG_PIVOT_EPSILON_ALG is also a solver-wide concept, not specific
+# to the batch/contingency workload.
+_PIVOT_EPSILON_ALG_MAP = {
+    'default': _PivotEpsilonAlg.Default,
+    'scaled':  _PivotEpsilonAlg.Scaled,
+    'static':  _PivotEpsilonAlg.Static,
+}
+
+
+def _resolve_pivot_epsilon_alg(value):
+    """Accept either a string (mapped via _PIVOT_EPSILON_ALG_MAP) or a raw
+    PivotEpsilonAlg value."""
+    if isinstance(value, _PivotEpsilonAlg):
+        return value
+    if isinstance(value, str):
+        try:
+            return _PIVOT_EPSILON_ALG_MAP[value]
+        except KeyError:
+            raise ValueError(
+                f"Unknown pivot_epsilon_alg {value!r}. "
+                f"Choose from: {list(_PIVOT_EPSILON_ALG_MAP)}")
+    raise TypeError(
+        f"pivot_epsilon_alg must be a str or PivotEpsilonAlg, got "
+        f"{type(value).__name__}")
+
+
 class DeviceBuffer:
     """Handle to GPU-resident data; transfers to host on demand via to_numpy()."""
 
@@ -194,6 +223,8 @@ class _ContingencyAnalysisSolver:
       (``CUDSS_STATUS_NOT_SUPPORTED``). They only work on ``AcPfGPU``'s
       single-system solve, and even there ``'max_diag_product'``/``'auto'``
       have been observed to silently produce NaN voltages.
+    - ``pivot_epsilon_alg`` (*str*): cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG``
+      choice. One of ``'default'`` (default), ``'scaled'``, ``'static'``.
     - ``max_iter_base``, ``tol_base``: Stored for reference only; do not
       rerun the base case.
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
@@ -234,6 +265,7 @@ class _ContingencyAnalysisSolver:
         self._strategy = 'direct_refactor_every'
         self._reordering_alg = 'default'
         self._matching_alg = 'none'
+        self._pivot_epsilon_alg = 'default'
         self._s = _ContingencyAnalysisSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
@@ -243,7 +275,7 @@ class _ContingencyAnalysisSolver:
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
                       strategy='direct_refactor_every', reordering_alg='default',
-                      matching_alg='none'):
+                      matching_alg='none', pivot_epsilon_alg='default'):
         """Wrap an already-constructed C++ ContingencyAnalysisSession.
 
         Used by the zero-copy lightsim2grid bridge, which builds the session in
@@ -256,6 +288,7 @@ class _ContingencyAnalysisSolver:
         self._strategy = strategy
         self._reordering_alg = reordering_alg
         self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
         return self
 
     @property
@@ -322,6 +355,18 @@ class _ContingencyAnalysisSolver:
     def matching_alg(self, value):
         self._matching_alg = value
         self._s.matching_alg = _resolve_matching_alg(value)
+
+    @property
+    def pivot_epsilon_alg(self):
+        """CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str or PivotEpsilonAlg).
+        Takes effect on the next run() (which always reruns cuDSS ANALYSIS).
+        One of 'default' (default), 'scaled', 'static'."""
+        return self._pivot_epsilon_alg
+
+    @pivot_epsilon_alg.setter
+    def pivot_epsilon_alg(self, value):
+        self._pivot_epsilon_alg = value
+        self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
 
     @property
     def handle_disconnected_grid(self):

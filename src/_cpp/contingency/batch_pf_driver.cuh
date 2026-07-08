@@ -249,6 +249,7 @@ struct BatchPfDriver {
     //   refactor_period  — for DirectRefactorEveryN.
     //   reordering_alg   — CUDSS_CONFIG_REORDERING_ALG for the batch ANALYSIS.
     //   matching_alg     — CUDSS_CONFIG_MATCHING_ALG for the batch ANALYSIS.
+    //   pivot_epsilon_alg — CUDSS_CONFIG_PIVOT_EPSILON_ALG for the batch ANALYSIS.
     // -------------------------------------------------------------------------
     BatchPfDriver(
         AcPfNrState&              base_state,
@@ -261,7 +262,8 @@ struct BatchPfDriver {
         ContingencySolverType     strategy_type   = ContingencySolverType::DirectRefactorEvery,
         int                       refactor_period = 1,
         ReorderingAlg             reordering_alg  = ReorderingAlg::Default,
-        MatchingAlg               matching_alg    = MatchingAlg::None);
+        MatchingAlg               matching_alg    = MatchingAlg::None,
+        PivotEpsilonAlg           pivot_epsilon_alg = PivotEpsilonAlg::Default);
 
     ~BatchPfDriver() = default;
 

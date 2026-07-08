@@ -64,11 +64,13 @@ make_acpf_session_from_lsgrid(
     // redo that correction step independently of cuDSS on the exact same
     // data.
     bool   diag_stop_before_state_correction = false,
-    // CUDSS_CONFIG_REORDERING_ALG / CUDSS_CONFIG_MATCHING_ALG choices; see
-    // AcPfNrState's own doc. Ctor-time only -- ANALYSIS runs once and is
-    // never rerun for this session.
+    // CUDSS_CONFIG_REORDERING_ALG / CUDSS_CONFIG_MATCHING_ALG /
+    // CUDSS_CONFIG_PIVOT_EPSILON_ALG choices; see AcPfNrState's own doc.
+    // Ctor-time only -- ANALYSIS runs once and is never rerun for this
+    // session.
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
-    MatchingAlg matching_alg = MatchingAlg::None);
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
 
 // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
 // (solver numbering) instead of the grid's own Sbus. The ledger structure is
@@ -82,7 +84,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     double tol,
     int    device,
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
-    MatchingAlg matching_alg = MatchingAlg::None);
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
 
 // Build a ContingencyAnalysisSession from a solved LSGrid (branch data set).
 // When compute_limit_violations=true, also pulls bus/branch limits off the

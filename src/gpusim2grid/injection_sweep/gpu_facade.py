@@ -207,6 +207,17 @@ class InjectionSweepGPU:
         self._inner.matching_alg = value
 
     @property
+    def pivot_epsilon_alg(self):
+        """cuDSS CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str). Takes effect on
+        the next compute() (which always reruns cuDSS ANALYSIS). One of
+        'default' (default), 'scaled', 'static'."""
+        return self._inner.pivot_epsilon_alg
+
+    @pivot_epsilon_alg.setter
+    def pivot_epsilon_alg(self, value):
+        self._inner.pivot_epsilon_alg = value
+
+    @property
     def timings(self):
         return self._inner.timings
 

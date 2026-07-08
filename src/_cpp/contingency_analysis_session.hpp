@@ -37,6 +37,7 @@
 #include "contingency_analysis_helper.hpp"
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
+#include "pivot_epsilon_alg.hpp"
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -82,6 +83,7 @@ struct ContingencyAnalysisSession {
     ContingencySolverType strategy_type_   = ContingencySolverType::DirectRefactorEvery;
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
+    PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
 
     // handle_disconnected_grid: when true, a contingency that splits the grid is
     // solved on its largest connected component (the rest is frozen and reported

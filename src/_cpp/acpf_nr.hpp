@@ -14,6 +14,7 @@
 #include "timing_utils.hpp"
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
+#include "pivot_epsilon_alg.hpp"
 
 #include <memory>
 #include <iostream>
@@ -63,7 +64,9 @@ struct AcPfNrSession {
         // CUDSS_CONFIG_REORDERING_ALG choice; see AcPfNrState's own doc.
         ReorderingAlg                                reordering_alg = ReorderingAlg::Default,
         // CUDSS_CONFIG_MATCHING_ALG choice; see AcPfNrState's own doc.
-        MatchingAlg                                  matching_alg = MatchingAlg::None
+        MatchingAlg                                  matching_alg = MatchingAlg::None,
+        // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice; see AcPfNrState's own doc.
+        PivotEpsilonAlg                              pivot_epsilon_alg = PivotEpsilonAlg::Default
     );
 
     AcPfTimings timings() const;

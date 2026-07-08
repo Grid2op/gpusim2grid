@@ -47,7 +47,11 @@ from .._gpusim2grid import (
 
 # Shared with contingency_analysis/__init__.py (single source of truth for
 # the reordering-alg string↔enum map, same as _normalize_device).
-from ..contingency_analysis import _resolve_reordering_alg, _resolve_matching_alg
+from ..contingency_analysis import (
+    _resolve_reordering_alg,
+    _resolve_matching_alg,
+    _resolve_pivot_epsilon_alg,
+)
 
 
 _STRATEGY_MAP = {
@@ -187,7 +191,8 @@ class _InjectionSweepSolver:
     -----
     The following properties are **mutable** and take effect on the next
     :meth:`run` call: ``batch_size``, ``nb_iter``, ``strategy``,
-    ``refactor_period``, ``reordering_alg``, ``matching_alg``.
+    ``refactor_period``, ``reordering_alg``, ``matching_alg``,
+    ``pivot_epsilon_alg``.
 
     Examples
     --------
@@ -215,6 +220,7 @@ class _InjectionSweepSolver:
         self._strategy = 'direct_refactor_every'
         self._reordering_alg = 'default'
         self._matching_alg = 'none'
+        self._pivot_epsilon_alg = 'default'
         self._s = _InjectionSweepSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
@@ -223,7 +229,7 @@ class _InjectionSweepSolver:
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
                       strategy='direct_refactor_every', reordering_alg='default',
-                      matching_alg='none'):
+                      matching_alg='none', pivot_epsilon_alg='default'):
         """Wrap an already-constructed C++ InjectionSweepSession (zero-copy
         lightsim2grid bridge). Reuses all wrapper ergonomics."""
         self = cls.__new__(cls)
@@ -233,6 +239,7 @@ class _InjectionSweepSolver:
         self._strategy = strategy
         self._reordering_alg = reordering_alg
         self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
         return self
 
     # --- mutable config ---
@@ -294,6 +301,18 @@ class _InjectionSweepSolver:
     def matching_alg(self, value):
         self._s.matching_alg = _resolve_matching_alg(value)
         self._matching_alg = value if isinstance(value, str) else str(value)
+
+    @property
+    def pivot_epsilon_alg(self):
+        """CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str or PivotEpsilonAlg).
+        Takes effect on the next run() (which always reruns cuDSS ANALYSIS).
+        One of 'default' (default), 'scaled', 'static'."""
+        return self._pivot_epsilon_alg
+
+    @pivot_epsilon_alg.setter
+    def pivot_epsilon_alg(self, value):
+        self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
+        self._pivot_epsilon_alg = value if isinstance(value, str) else str(value)
 
     @property
     def refactor_period(self):

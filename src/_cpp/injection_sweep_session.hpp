@@ -39,6 +39,7 @@
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
+#include "pivot_epsilon_alg.hpp"
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -76,6 +77,7 @@ struct InjectionSweepSession {
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
+    PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
 
     // =========================================================================
     // Host injection data (stored by set_injections(), consumed by run())

@@ -15,6 +15,7 @@ from ..contingency_analysis import (
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
+    _resolve_pivot_epsilon_alg,
 )
 
 __all__ = ["AcPfGPU"]
@@ -78,6 +79,11 @@ class AcPfGPU:
         them. ``"none"``/``"max_diag_count"``/``"max_min_diag"``/
         ``"max_min_diag_alt"``/``"max_diag_sum"`` have been verified to
         reproduce the reference solution.
+    pivot_epsilon_alg : str, default "default"
+        cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG`` choice for the same
+        (once-only) cuDSS ANALYSIS phase. One of ``"default"``, ``"scaled"``,
+        ``"static"``. Construction-time only, same reason as
+        ``reordering_alg``.
 
     Examples
     --------
@@ -93,10 +99,12 @@ class AcPfGPU:
 
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
                  device=None, init_from_n_powerflow=True, use_bridge=None,
-                 reordering_alg="default", matching_alg="none"):
+                 reordering_alg="default", matching_alg="none",
+                 pivot_epsilon_alg="default"):
         _validate_precision(precision)
         reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
         matching_alg_enum = _resolve_matching_alg(matching_alg)
+        pivot_epsilon_alg_enum = _resolve_pivot_epsilon_alg(pivot_epsilon_alg)
 
         if isinstance(grid, (tuple, list)):
             if use_bridge:
@@ -109,7 +117,8 @@ class AcPfGPU:
                 int(max_iter), float(tol), _normalize_device(device),
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=reordering_alg_enum,
-                matching_alg=matching_alg_enum)
+                matching_alg=matching_alg_enum,
+                pivot_epsilon_alg=pivot_epsilon_alg_enum)
             return
 
         if use_bridge is None:
@@ -122,7 +131,8 @@ class AcPfGPU:
                 grid, int(max_iter), float(tol), _normalize_device(device),
                 bool(init_from_n_powerflow),
                 reordering_alg=reordering_alg_enum,
-                matching_alg=matching_alg_enum)
+                matching_alg=matching_alg_enum,
+                pivot_epsilon_alg=pivot_epsilon_alg_enum)
         else:
             # Python extraction fallback: bare [pvpq|pq] system (no distributed
             # slack in the Jacobian).
@@ -133,7 +143,8 @@ class AcPfGPU:
                 int(max_iter), float(tol), _normalize_device(device),
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=reordering_alg_enum,
-                matching_alg=matching_alg_enum)
+                matching_alg=matching_alg_enum,
+                pivot_epsilon_alg=pivot_epsilon_alg_enum)
 
     def solve(self):
         """Return the solved complex voltage vector (host copy)."""

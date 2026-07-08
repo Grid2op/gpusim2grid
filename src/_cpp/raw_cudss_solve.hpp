@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "reordering_alg.hpp"
+#include "matching_alg.hpp"
+#include "pivot_epsilon_alg.hpp"
 
 // Solve J*dx = rhs with gpusim2grid's own cuDSS wrapper (analyze -> factorize
 // -> solve, CudssContext/CudssDescriptor from cuda_utils.h), completely
@@ -25,6 +27,8 @@
 //   rhs            right-hand side, size dim
 //   device         CUDA device ordinal, or -1 to use the current device
 //   reordering_alg CUDSS_CONFIG_REORDERING_ALG choice for the ANALYSIS phase
+//   matching_alg   CUDSS_CONFIG_MATCHING_ALG choice for the ANALYSIS phase
+//   pivot_epsilon_alg CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the ANALYSIS phase
 //
 // Returns dx (host, double), size dim.
 std::vector<double> solve_cudss_raw(
@@ -34,6 +38,8 @@ std::vector<double> solve_cudss_raw(
     const std::vector<double>& data,
     const std::vector<double>& rhs,
     int device = -1,
-    ReorderingAlg reordering_alg = ReorderingAlg::Default);
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
 
 #endif  // RAW_CUDSS_SOLVE_H
