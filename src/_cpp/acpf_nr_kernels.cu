@@ -56,18 +56,28 @@ __global__ void compute_branch_flows_kernel(
     const int l   = tid % n_branches;   // branch index
     if (b >= actual_batch) return;
 
-    const cudaComplexType Vi = d_V[b * n_bus + d_branch_from[l]];
-    const cudaComplexType Vj = d_V[b * n_bus + d_branch_to[l]];
+    // branch_from/branch_to are in AC-solver bus numbering (see
+    // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
+    // Kron-reduced away (isolated / half-open line, keep_half_open_lines) is
+    // relabeled to -1. That bus has no voltage in the solved system -- treat
+    // it as V=0 -- and no terminal current on that side to report -- 0, not
+    // computed from the pi-model formula, since the terminal itself doesn't
+    // exist. Reading d_V[... + (-1)] without this guard is an out-of-bounds
+    // read (confirmed via compute-sanitizer on a real half-open-line grid).
+    const int bf = d_branch_from[l];
+    const int bt = d_branch_to[l];
+    const cudaComplexType Vi = (bf >= 0) ? d_V[b * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType Vj = (bt >= 0) ? d_V[b * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // I_or = yff * Vi + yft * Vj  (origin / from-bus terminal current)
-    const cudaComplexType I_or = CudaFunHelper::my_cuCadd(
+    const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
         CudaFunHelper::my_cuCmul(d_yff[l], Vi),
-        CudaFunHelper::my_cuCmul(d_yft[l], Vj));
+        CudaFunHelper::my_cuCmul(d_yft[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // I_ex = ytf * Vi + ytt * Vj  (extremity / to-bus terminal current)
-    const cudaComplexType I_ex = CudaFunHelper::my_cuCadd(
+    const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
         CudaFunHelper::my_cuCmul(d_ytf[l], Vi),
-        CudaFunHelper::my_cuCmul(d_ytt[l], Vj));
+        CudaFunHelper::my_cuCmul(d_ytt[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // Map the chunk-relative slot to its original result index (identity when
     // d_result_map is null, e.g. the full-batch session call or injection).

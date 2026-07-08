@@ -760,14 +760,14 @@ AcPfNrState::AcPfNrState(
     //                   policy_base_case_factors.cuh).
     // =========================================================================
     const bool has_ext_state = (slack_col >= 0) || (n_vc_ctrl > 0);
-    bool ledger_has_gt = (ledger != nullptr) && ledger->has_ext_state_ground_truth;
-    if (ledger_has_gt && n_vc_ctrl > 0 &&
-        static_cast<int>(ledger->vc_q_gt.size()) != n_vc_ctrl) {
-        throw std::runtime_error(
-            "[acpf_nr] DIAGNOSTIC: ledger->vc_q_gt.size()=" +
-            std::to_string(ledger->vc_q_gt.size()) + " != n_vc_ctrl=" +
-            std::to_string(n_vc_ctrl));
-    }
+    // Defensive: only trust vc_q_gt as ground truth if its size actually
+    // matches n_vc_ctrl (both ultimately derived from the same ledger, so
+    // this should always hold -- see LedgerData's own doc -- but a device
+    // upload sized from a mismatched host vector would silently corrupt
+    // adjacent GPU memory instead of failing loudly, so this is cheap
+    // insurance, not just a diagnostic).
+    const bool ledger_has_gt = (ledger != nullptr) && ledger->has_ext_state_ground_truth &&
+        (n_vc_ctrl == 0 || static_cast<int>(ledger->vc_q_gt.size()) == n_vc_ctrl);
     const bool need_solve    = has_ext_state && (debug_base_case_ || !ledger_has_gt);
     const bool need_cudss    = !presolved_v || !base_case_only_ || need_solve;
 
