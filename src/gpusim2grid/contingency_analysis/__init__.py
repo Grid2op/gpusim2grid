@@ -197,6 +197,19 @@ class _ContingencyAnalysisSolver:
         validation ``‖F(Vinit)‖∞`` check (raises ``RuntimeError`` if it fails).
         ``max_iter_base`` is then only used for reference/introspection, not to
         drive an iteration count. Default False.
+    reordering_alg, matching_alg, pivot_epsilon_alg : str, optional
+        cuDSS config, applied ONCE at construction to BOTH the base-case solve
+        above and the batch solver's own copy (consumed by :meth:`run`) --
+        single source of truth. The mutable properties of the same name only
+        ever affect the latter afterward (the base-case solve is fixed once
+        built). Defaults ``'default'``, ``'none'``, ``'default'``.
+    debug_base_case : bool, optional
+        Only meaningful with ``presolved_v=True`` and a MultiSlack/
+        VoltageControl extension active (bridge/lightsim2grid ledger). Forces
+        the pre-ground-truth cuDSS-solve derivation of the extension's running
+        state for the base-case solve, even when lightsim2grid's own converged
+        values are available -- an opt-in diagnostic (e.g. to keep testing
+        cuDSS config choices in isolation). Default False.
 
     Notes
     -----
@@ -259,17 +272,28 @@ class _ContingencyAnalysisSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None, handle_disconnected_grid=False, presolved_v=False):
+                 device=None, handle_disconnected_grid=False, presolved_v=False,
+                 reordering_alg='default', matching_alg='none',
+                 pivot_epsilon_alg='default', debug_base_case=False):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
-        self._reordering_alg = 'default'
-        self._matching_alg = 'none'
-        self._pivot_epsilon_alg = 'default'
+        self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
+        # Single source of truth, set once at construction: forwarded to BOTH
+        # the base-case solve (this call) AND the batch solver's own members
+        # (consumed by run() -- see the reordering_alg/matching_alg/
+        # pivot_epsilon_alg property setters below, which only ever affect
+        # the latter, going forward).
         self._s = _ContingencyAnalysisSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
-            _normalize_device(device), presolved_v=bool(presolved_v))
+            _normalize_device(device), presolved_v=bool(presolved_v),
+            reordering_alg=_resolve_reordering_alg(reordering_alg),
+            matching_alg=_resolve_matching_alg(matching_alg),
+            pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            debug_base_case=bool(debug_base_case))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
 
     @classmethod
@@ -280,6 +304,10 @@ class _ContingencyAnalysisSolver:
 
         Used by the zero-copy lightsim2grid bridge, which builds the session in
         C++ directly from a solved LSGrid. Reuses all wrapper ergonomics.
+        reordering_alg/matching_alg/pivot_epsilon_alg here are bookkeeping only
+        (what the caller already passed to the C++ builder at construction) --
+        purely so the Python-side property getters below report the truth;
+        they do NOT re-apply these to the (already-built) session.
         """
         self = cls.__new__(cls)
         self._s = session

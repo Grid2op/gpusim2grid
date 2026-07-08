@@ -318,6 +318,13 @@ inline void nr_iter_step_fill_F(
 //
 // first_factorize=true  → dss.factorize()   (CUDSS_PHASE_FACTORIZATION)
 // first_factorize=false → dss.refactorize() (CUDSS_PHASE_REFACTORIZATION)
+//
+// use_cudss=false skips BOTH dss_A.set_values() and factorize/refactorize --
+// used by AcPfNrState's presolved_v fast path when this instance has no
+// cuDSS context at all (base_case_only_ + ground-truth extension seeding, no
+// debug override; see acpf_nr.cu). d_J_values itself is still populated
+// (steps ①-③ always run), since direct_base_case_factors only ever needs the
+// raw values, never a factorization of this particular context.
 // -----------------------------------------------------------------------------
 inline void nr_iter_step_prepare(
     CuSpMV&          spmv,
@@ -331,7 +338,8 @@ inline void nr_iter_step_prepare(
     cudaStream_t cs,
     CudaTimer&   timer,
     bool         first_factorize,
-    NrIterTimings& t)
+    NrIterTimings& t,
+    bool         use_cudss = true)
 {
     (void)n_pvpq; (void)n_pq;
 
@@ -343,7 +351,8 @@ inline void nr_iter_step_prepare(
     // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
     nr_iter_step_fill_F(buf, n_bus, dim_J, actual_batch, cs, timer, t);
 
-    // ③  Fill J values; notify cuDSS that the values pointer changed.
+    // ③  Fill J values; notify cuDSS that the values pointer changed (skipped
+    //     when use_cudss=false -- no cuDSS context/descriptor exists to notify).
     //     When an additive feature (HVDC droop) is active, J must be zeroed first
     //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
@@ -354,15 +363,17 @@ inline void nr_iter_step_prepare(
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
         n_bus, nnz_Y, nnz_J, actual_batch);
     nr_feature_fill_J(buf, n_bus, nnz_J, actual_batch, cs);
-    dss_A.set_values(buf.d_J_values);
+    if (use_cudss) dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 
-    // ④  Factorize / refactorize
-    timer.start();
-    if (first_factorize) dss.factorize(dss_A, dss_x, dss_b);
-    else                 dss.refactorize(dss_A, dss_x, dss_b);
-    if (first_factorize) t.t_first_factorize += timer.stop_ms();
-    else                 t.t_refactorize     += timer.stop_ms();
+    // ④  Factorize / refactorize (skipped entirely when use_cudss=false)
+    if (use_cudss) {
+        timer.start();
+        if (first_factorize) dss.factorize(dss_A, dss_x, dss_b);
+        else                 dss.refactorize(dss_A, dss_x, dss_b);
+        if (first_factorize) t.t_first_factorize += timer.stop_ms();
+        else                 t.t_refactorize     += timer.stop_ms();
+    }
 }
 
 // -----------------------------------------------------------------------------

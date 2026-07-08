@@ -66,7 +66,12 @@ struct AcPfNrSession {
         // CUDSS_CONFIG_MATCHING_ALG choice; see AcPfNrState's own doc.
         MatchingAlg                                  matching_alg = MatchingAlg::None,
         // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice; see AcPfNrState's own doc.
-        PivotEpsilonAlg                              pivot_epsilon_alg = PivotEpsilonAlg::Default
+        PivotEpsilonAlg                              pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // Opt-in diagnostic (presolved_v path only): force the pre-ground-truth
+        // cuDSS-solve derivation of MultiSlack slack_absorbed / VoltageControl
+        // vc_q, even when lightsim2grid's own converged values are available.
+        // See AcPfNrState's own doc. Default false (prefer ground truth).
+        bool                                          debug_base_case = false
     );
 
     AcPfTimings timings() const;

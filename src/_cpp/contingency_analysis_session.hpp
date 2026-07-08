@@ -156,7 +156,19 @@ struct ContingencyAnalysisSession {
         double tol_base      = 1e-6,
         int    device        = -1,
         const LedgerData* ledger = nullptr,  // augmented-J description (bridge path)
-        bool   presolved_v   = false  // trust Vinit as already converged; see AcPfNrState
+        bool   presolved_v   = false,  // trust Vinit as already converged; see AcPfNrState
+        // cuDSS alg choices, forwarded to BOTH base_state_'s AcPfNrState AND
+        // this session's own reordering_alg_/matching_alg_/pivot_epsilon_alg_
+        // members (used by the batch solver in run()) -- single source of
+        // truth set once at construction; see AcPfNrState's own doc.
+        ReorderingAlg reordering_alg = ReorderingAlg::Default,
+        MatchingAlg matching_alg = MatchingAlg::None,
+        PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // Opt-in diagnostic forwarded to base_state_ (see AcPfNrState's own
+        // doc): force the pre-ground-truth cuDSS-solve derivation of
+        // slack_absorbed/vc_q even when lightsim2grid's own converged values
+        // are available. Default false (prefer ground truth).
+        bool   debug_base_case = false
     );
 
     // =========================================================================

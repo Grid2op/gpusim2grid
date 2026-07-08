@@ -40,7 +40,21 @@
 // sparsity skeleton (get_J_solver), the NRLedger row/col maps, and the
 // MultiSlack slack_col + slack weights. All in solver bus numbering. Empty /
 // slack_col=-1 reproduces the feature-free system.
-LedgerData extract_ledger_data(const ls2g::LSGrid& grid);
+//
+// When presolved_v is true (the caller is about to trust the grid's own V as
+// already converged -- init_from_n_powerflow), this ALSO:
+//   1. Verifies the grid is actually solved via LSGrid::check_solution() on
+//      its own get_V_solver() -- throws std::runtime_error if the Kirchhoff
+//      mismatch's inf-norm exceeds tol. Runs unconditionally whenever
+//      presolved_v is requested, regardless of whether any extension is
+//      active; timed into the returned LedgerData::t_ground_truth_check_ms.
+//   2. If MultiSlack and/or VoltageControl is active, populates
+//      slack_absorbed_gt/vc_q_gt from LSGrid::get_slack_absorbed_solver()/
+//      get_controller_q_solver() -- lightsim2grid's own converged extension
+//      state, letting AcPfNrState's presolved_v fast path seed it directly
+//      instead of deriving it via a cuDSS solve.
+LedgerData extract_ledger_data(const ls2g::LSGrid& grid,
+                               bool presolved_v = false, double tol = 0.0);
 
 // Build a single-system AcPfNrSession from a solved LSGrid, solving the same
 // augmented system lightsim2grid does (distributed slack / future extensions).
@@ -70,7 +84,11 @@ make_acpf_session_from_lsgrid(
     // session.
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
-    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic (see AcPfNrState's own doc): force the pre-ground-truth
+    // cuDSS-solve derivation of slack_absorbed/vc_q even when lightsim2grid's
+    // own converged values are available. No-op unless init_from_n_powerflow.
+    bool   debug_base_case = false);
 
 // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
 // (solver numbering) instead of the grid's own Sbus. The ledger structure is
@@ -100,7 +118,14 @@ make_ca_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
-    bool   compute_limit_violations = false);
+    bool   compute_limit_violations = false,
+    // Single source of truth for base_state_'s AND the batch solver's cuDSS
+    // config (see ContingencyAnalysisSession's own doc).
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
+    bool   debug_base_case = false);
 
 // Extract compute_limit_violations limits off a solved LSGrid: bus voltage
 // limits (kV, relabeled from grid-model to AC-solver bus numbering via
@@ -125,6 +150,13 @@ make_is_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
-    bool   with_branch_data);
+    bool   with_branch_data,
+    // Single source of truth for base_state_'s AND the batch solver's cuDSS
+    // config (see InjectionSweepSession's own doc).
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
+    bool   debug_base_case = false);
 
 #endif  // LS2G_BRIDGE_HPP

@@ -9,7 +9,13 @@ re-solves the network on the GPU for many (P, Q) injection profiles in parallel.
 It is a thin facade over :class:`_InjectionSweepSolver`.
 """
 
-from . import _InjectionSweepSolver, _normalize_device
+from . import (
+    _InjectionSweepSolver,
+    _normalize_device,
+    _resolve_reordering_alg,
+    _resolve_matching_alg,
+    _resolve_pivot_epsilon_alg,
+)
 from .._ls2g_utils import (
     extract_grid_arrays,
     extract_branch_data,
@@ -57,6 +63,31 @@ class InjectionSweepGPU:
     auto_branch_data : bool, default True
         Extract and store π-model branch admittances so :meth:`compute_flows`
         works without a manual ``set_branch_data`` call.
+    reordering_alg : str, optional
+        cuDSS ``CUDSS_CONFIG_REORDERING_ALG`` choice, applied ONCE at
+        construction to BOTH the base-case solve AND the batch solver used by
+        :meth:`compute` -- single source of truth. ``None`` (default) leaves
+        it at the session's own default (``'default'``). The
+        :attr:`reordering_alg` mutable property can still be changed
+        afterward, but only ever affects the batch solver on the next
+        :meth:`compute` (the base-case solve is fixed once built).
+    matching_alg : str, optional
+        cuDSS ``CUDSS_CONFIG_MATCHING_ALG`` choice, same construction-time
+        scope as ``reordering_alg`` above; ``None`` (default) leaves it at
+        ``'none'``.
+    pivot_epsilon_alg : str, optional
+        cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG`` choice, same construction-time
+        scope as ``reordering_alg`` above; ``None`` (default) leaves it at
+        ``'default'``.
+    debug_base_case : bool, default False
+        Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
+        VoltageControl extension active (bridge path). By default, that
+        extension's running state is seeded directly from lightsim2grid's own
+        converged values, needing no cuDSS solve at all for the base case.
+        Setting this True forces the pre-ground-truth cuDSS-solve derivation
+        instead -- an opt-in diagnostic (e.g. to keep testing
+        ``reordering_alg``/``matching_alg``/``pivot_epsilon_alg`` choices in
+        isolation).
 
     Examples
     --------
@@ -77,8 +108,18 @@ class InjectionSweepGPU:
 
     def __init__(self, grid, *, init_from_n_powerflow=True, precision="fp64",
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
-                 auto_branch_data=True, use_bridge=None):
+                 auto_branch_data=True, use_bridge=None, reordering_alg=None,
+                 matching_alg=None, pivot_epsilon_alg=None,
+                 debug_base_case=False):
         _validate_precision(precision)
+
+        # Single source of truth, resolved once here and applied at
+        # construction time to BOTH the base-case solve and the batch solver
+        # (see _InjectionSweepSolver's identical-shaped ctor) -- None
+        # (default) leaves each at the session's own default.
+        _reordering_alg = 'default' if reordering_alg is None else reordering_alg
+        _matching_alg = 'none' if matching_alg is None else matching_alg
+        _pivot_epsilon_alg = 'default' if pivot_epsilon_alg is None else pivot_epsilon_alg
 
         if isinstance(grid, (tuple, list)):
             # Explicit-array mode: no grid to seed/extract branch data from.
@@ -91,7 +132,10 @@ class InjectionSweepGPU:
                 Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                 batch_size=100, nb_iter=nb_iter,
                 max_iter_base=max_iter_base, tol_base=tol_base, device=device,
-                presolved_v=bool(init_from_n_powerflow))
+                presolved_v=bool(init_from_n_powerflow),
+                reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                pivot_epsilon_alg=_pivot_epsilon_alg,
+                debug_base_case=bool(debug_base_case))
             # No grid to auto-extract branch data from: call set_branch_data()
             # manually if compute_flows() is needed.
         else:
@@ -102,9 +146,15 @@ class InjectionSweepGPU:
                 session = _cpp._make_is_session_from_lsgrid(
                     grid, bool(init_from_n_powerflow), 100, int(nb_iter),
                     int(max_iter_base), float(tol_base), _normalize_device(device),
-                    bool(auto_branch_data))
+                    bool(auto_branch_data),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    debug_base_case=bool(debug_base_case))
                 self._inner = _InjectionSweepSolver._wrap_session(
-                    session, max_iter_base=max_iter_base, tol_base=tol_base)
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
             else:
                 d = extract_grid_arrays(grid, max_iter=max_iter_base, tol=tol_base)
                 vinit = d["v_converged"] if init_from_n_powerflow else d["v_init"]
@@ -114,7 +164,10 @@ class InjectionSweepGPU:
                     d["slack"], d["slack_weights"], d["pv"], d["pq"],
                     batch_size=100, nb_iter=nb_iter,
                     max_iter_base=max_iter_base, tol_base=tol_base, device=device,
-                    presolved_v=init_from_n_powerflow)
+                    presolved_v=init_from_n_powerflow,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg,
+                    debug_base_case=bool(debug_base_case))
 
                 if auto_branch_data:
                     branch_args, _, _ = extract_branch_data(grid)

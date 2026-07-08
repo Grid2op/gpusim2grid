@@ -7,7 +7,9 @@
 // =============================================================================
 
 #include "ls2g_bridge.hpp"
+#include "timing_utils.hpp"   // ms_since
 
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -159,7 +161,7 @@ LimitData extract_limits(const ls2g::LSGrid& grid, int n_bus_solver)
 
 }  // namespace
 
-LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
+LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, double tol)
 {
     LedgerData ld;
 
@@ -252,6 +254,66 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid)
             ld.vc_v_set     = to_dv(v.v_set);
         }
     }
+
+    // presolved_v (init_from_n_powerflow) precondition: verify the grid is
+    // actually solved before trusting anything derived from its converged
+    // state, and (when an extension is active) pull lightsim2grid's own
+    // converged extension state as ground truth for AcPfNrState's
+    // presolved_v fast path to seed slack_absorbed/vc_q from directly,
+    // instead of deriving them via a cuDSS solve. Mandatory and unconditional
+    // whenever presolved_v is requested -- regardless of whether an
+    // extension happens to be active.
+    if (presolved_v) {
+        auto& g = const_cast<ls2g::LSGrid&>(grid);
+        auto t0 = std::chrono::steady_clock::now();
+        // check_solution(V, check_q_limits=false): "check the kirchoff law"
+        // against the CALLER-supplied V as-is, without lightsim2grid's own
+        // NR-initialization heuristics (see LSGrid.hpp).
+        //
+        // MUST be grid-model (original) bus numbering -- get_V(), NOT
+        // get_V_solver(). check_solution() internally calls pre_process_solver()
+        // with V_proposed.size() as the ORIGINAL bus count and rebuilds its own
+        // id_me_to_ac_solver_ mapping from it; passing the already-reduced
+        // solver-numbering vector (get_V_solver(), size == n_bus_solver, smaller
+        // whenever any bus is isolated/disconnected) makes that mapping too
+        // small, and later bus-id lookups (e.g. fill_hvdc_droop_solver_data)
+        // index past the end of it -- heap corruption ("free(): corrupted
+        // unsorted chunks"), confirmed via gdb on a real ~47k-bus / 7270-solver-
+        // bus grid with distributed slack + SVCs + HVDC droop (reproduces with
+        // plain lightsim2grid alone, no gpusim2grid involved). get_V() relabels
+        // back to the full original numbering LSGrid.cpp's own check_solution()
+        // comment already warns about this exact class of bug.
+        ls2g::CplxVect mismatch = g.check_solution(grid.get_V(), false);
+        ld.t_ground_truth_check_ms = ms_since(t0);
+
+        // check_solution() scales its result by sn_mva_ into physical (MW/MVAr)
+        // units (LSGrid.cpp: "if (sn_mva_ != 1) res *= sn_mva_"), but `tol`/
+        // `tol_base` is a per-unit ||F||_inf tolerance everywhere else in this
+        // codebase (the GPU-side check, ac_pf's own convergence criterion, ...).
+        // Undo that scaling before comparing so both sides are the same unit.
+        const double sn_mva = static_cast<double>(g.get_sn_mva());
+        const double norm_inf_pu = (mismatch.size() > 0
+            ? mismatch.cwiseAbs().maxCoeff() : 0.0) / (sn_mva > 0. ? sn_mva : 1.);
+        if (norm_inf_pu > tol) {
+            throw std::runtime_error(
+                "extract_ledger_data: presolved_v/init_from_n_powerflow requested "
+                "but LSGrid::check_solution() reports ||mismatch||_inf (per-unit) = " +
+                std::to_string(norm_inf_pu) + " exceeds tol = " + std::to_string(tol) +
+                ". The grid is not actually solved for its own Ybus/Sbus (or was "
+                "mutated since its last ac_pf()) -- re-solve before trusting Vinit, "
+                "or disable init_from_n_powerflow.");
+        }
+
+        if (ld.slack_col >= 0) {
+            ld.slack_absorbed_gt = static_cast<double>(g.get_slack_absorbed_solver());
+            ld.has_ext_state_ground_truth = true;
+        }
+        if (!ld.vc_bus.empty()) {
+            ls2g::RealVect qgt = g.get_controller_q_solver();
+            ld.vc_q_gt.assign(qgt.data(), qgt.data() + qgt.size());
+            ld.has_ext_state_ground_truth = true;
+        }
+    }
     return ld;
 }
 
@@ -265,7 +327,8 @@ make_acpf_session_from_lsgrid(
     bool   diag_stop_before_state_correction,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg)
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   debug_base_case)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -281,13 +344,13 @@ make_acpf_session_from_lsgrid(
     Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
-    LedgerData ledger = extract_ledger_data(grid);
+    LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol);
 
     return std::make_shared<AcPfNrSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
         diag_stop_before_state_correction,
-        reordering_alg, matching_alg, pivot_epsilon_alg);
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
 }
 
 std::shared_ptr<AcPfNrSession>
@@ -342,7 +405,11 @@ make_ca_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
-    bool   compute_limit_violations)
+    bool   compute_limit_violations,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   debug_base_case)
 {
     // get_Ybus_solver() is non-const (returns a copy) — cast away constness;
     // we only read it.
@@ -360,11 +427,12 @@ make_ca_session_from_lsgrid(
     Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
-    LedgerData ledger = extract_ledger_data(grid);
+    LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
-        /*presolved_v=*/init_from_n_powerflow);
+        /*presolved_v=*/init_from_n_powerflow,
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
 
     BranchData bd = extract_branch_data(grid);
     session->set_branch_data(bd.branch_from, bd.branch_to,
@@ -397,7 +465,11 @@ make_is_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
-    bool   with_branch_data)
+    bool   with_branch_data,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   debug_base_case)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -413,11 +485,12 @@ make_is_session_from_lsgrid(
     Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
-    LedgerData ledger = extract_ledger_data(grid);
+    LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
     auto session = std::make_shared<InjectionSweepSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
-        /*presolved_v=*/init_from_n_powerflow);
+        /*presolved_v=*/init_from_n_powerflow,
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
 
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid);

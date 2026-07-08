@@ -12,7 +12,13 @@ It is a thin, batch-oriented facade over :class:`_ContingencyAnalysisSolver`.
 
 import numpy as np
 
-from . import _ContingencyAnalysisSolver, _normalize_device
+from . import (
+    _ContingencyAnalysisSolver,
+    _normalize_device,
+    _resolve_reordering_alg,
+    _resolve_matching_alg,
+    _resolve_pivot_epsilon_alg,
+)
 from .._ls2g_utils import (
     extract_grid_arrays,
     extract_branch_data,
@@ -118,6 +124,32 @@ class ContingencyAnalysisGPU:
         voltage / branch current limits are extracted from ``grid`` (via
         the bridge, or :meth:`set_limits_from_grid` for the array path).
         See :meth:`get_violations` / :meth:`converged`.
+    reordering_alg : str, optional
+        cuDSS ``CUDSS_CONFIG_REORDERING_ALG`` choice, applied ONCE at
+        construction to BOTH the base-case solve AND the batch solver used by
+        :meth:`compute` -- single source of truth. ``None`` (default) leaves
+        it at the session's own default (``'default'``). The
+        :attr:`reordering_alg` mutable property can still be changed
+        afterward, but only ever affects the batch solver on the next
+        :meth:`compute` (the base-case solve is fixed once built).
+    matching_alg : str, optional
+        cuDSS ``CUDSS_CONFIG_MATCHING_ALG`` choice, same construction-time
+        scope as ``reordering_alg`` above; ``None`` (default) leaves it at
+        ``'none'``.
+    pivot_epsilon_alg : str, optional
+        cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG`` choice, same construction-time
+        scope as ``reordering_alg`` above; ``None`` (default) leaves it at
+        ``'default'``.
+    debug_base_case : bool, default False
+        Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
+        VoltageControl extension active (bridge path). By default, that
+        extension's running state (e.g. distributed-slack ``slack_absorbed``)
+        is seeded directly from lightsim2grid's own converged values, needing
+        no cuDSS solve at all for the base case. Setting this True forces the
+        pre-ground-truth cuDSS-solve derivation instead -- an opt-in
+        diagnostic (e.g. to keep testing ``reordering_alg``/``matching_alg``/
+        ``pivot_epsilon_alg`` choices in isolation, or to cross-validate the
+        GPU's own Newton-derived state against lightsim2grid's).
 
     Examples
     --------
@@ -140,8 +172,18 @@ class ContingencyAnalysisGPU:
     def __init__(self, grid, *, init_from_n_powerflow=True, precision="fp64",
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
                  use_bridge=None, handle_disconnected_grid=False,
-                 compute_limit_violations=False):
+                 compute_limit_violations=False, reordering_alg=None,
+                 matching_alg=None, pivot_epsilon_alg=None,
+                 debug_base_case=False):
         _validate_precision(precision)
+
+        # Single source of truth, resolved once here and applied at
+        # construction time to BOTH the base-case solve and the batch solver
+        # (see _ContingencyAnalysisSolver's identical-shaped ctor) -- None
+        # (default) leaves each at the session's own default.
+        _reordering_alg = 'default' if reordering_alg is None else reordering_alg
+        _matching_alg = 'none' if matching_alg is None else matching_alg
+        _pivot_epsilon_alg = 'default' if pivot_epsilon_alg is None else pivot_epsilon_alg
 
         if isinstance(grid, (tuple, list)):
             # Explicit-array mode: no lightsim2grid grid to seed from, extract
@@ -156,7 +198,10 @@ class ContingencyAnalysisGPU:
                 Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                 batch_size=100, nb_iter=nb_iter,
                 max_iter_base=max_iter_base, tol_base=tol_base, device=device,
-                presolved_v=bool(init_from_n_powerflow))
+                presolved_v=bool(init_from_n_powerflow),
+                reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                pivot_epsilon_alg=_pivot_epsilon_alg,
+                debug_base_case=bool(debug_base_case))
             # No grid to auto-extract branch/limit data from: the caller must
             # call set_branch_data() (and set_limits() before compute() when
             # compute_limit_violations is wanted).
@@ -182,9 +227,15 @@ class ContingencyAnalysisGPU:
                 session = _cpp._make_ca_session_from_lsgrid(
                     grid, bool(init_from_n_powerflow), 100, int(nb_iter),
                     int(max_iter_base), float(tol_base), _normalize_device(device),
-                    bool(compute_limit_violations))
+                    bool(compute_limit_violations),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    debug_base_case=bool(debug_base_case))
                 self._inner = _ContingencyAnalysisSolver._wrap_session(
-                    session, max_iter_base=max_iter_base, tol_base=tol_base)
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
                 self._n_branches = self._inner._s.n_branches
             else:
                 # TODO(bug): no v_init= forwarded here, so extract_grid_arrays()
@@ -206,7 +257,10 @@ class ContingencyAnalysisGPU:
                     d["slack"], d["slack_weights"], d["pv"], d["pq"],
                     batch_size=100, nb_iter=nb_iter,
                     max_iter_base=max_iter_base, tol_base=tol_base, device=device,
-                    presolved_v=init_from_n_powerflow)
+                    presolved_v=init_from_n_powerflow,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg,
+                    debug_base_case=bool(debug_base_case))
 
                 # Branch admittances come straight from lightsim2grid (never
                 # recomputed) so branch-removal contingencies become exact Ybus

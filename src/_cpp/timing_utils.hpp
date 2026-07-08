@@ -101,7 +101,8 @@ struct TimingEntry {
 // presolved_v fast path vs. spread across every NR iteration otherwise).
 //
 // Aggregation (read-only, computed — no new state):
-//   t_cpu_preprocess_ms() — alias for t_build_J_ms (already pure CPU).
+//   t_cpu_preprocess_ms() — t_build_J_ms + t_ground_truth_check_ms (both pure
+//                           CPU; see t_ground_truth_check_ms's own doc above).
 //   t_host_to_device_ms() — alias for t_upload_ms (already pure H→D).
 //   t_device_to_host_ms() — alias for t_copy_v_to_host_ms.
 //   t_gpu_compute_ms()    — t_analyze_ms + all per-iteration GPU-phase wall time.
@@ -115,6 +116,14 @@ struct AcPfTimings {
     double t_upload_ms  = 0.;   // sub-phase: H→D data transfers
     double t_analyze_ms = 0.;   // cuDSS symbolic analysis
     double t_prepare_jt_ms = 0.;   // Jᵀ transpose + cuDSS analyze/factorize (adjoint setup)
+    // Wall time of LSGrid::check_solution(), copied in from LedgerData. This
+    // work happens BEFORE the C++ constructor's own t_wall_start (inside
+    // extract_ledger_data(), ls2g_bridge.cpp) but is still CPU preprocessing
+    // within the same caller-facing construction call (e.g. a single
+    // `ContingencyAnalysisGPU(grid, ...)`), so it's folded into
+    // t_cpu_preprocess_ms()/t_grand_total_ms() below rather than excluded.
+    // Zero when built without a ledger, or without presolved_v.
+    double t_ground_truth_check_ms = 0.;
 
     // --- per-iteration totals (GPU + wall) ---
     TimingEntry t_spmv;
@@ -155,13 +164,17 @@ struct AcPfTimings {
     // performed during construction.
 
     // --- coarse aggregation (read-only; see note above) ---
-    double t_cpu_preprocess_ms() const { return t_build_J_ms; }
+    // t_build_J_ms + t_ground_truth_check_ms: the latter is CPU work that
+    // happened before t_init_ms's own span started (see its doc above), so
+    // t_cpu_preprocess_ms() + t_host_to_device_ms() == t_init_ms +
+    // t_ground_truth_check_ms (not == t_init_ms alone) -- t_grand_total_ms()
+    // below adds it in exactly once via this bucket.
+    double t_cpu_preprocess_ms() const { return t_build_J_ms + t_ground_truth_check_ms; }
     // t_init_ms - t_build_J_ms rather than a plain alias for t_upload_ms:
     // t_init_ms is one continuous wall-clock span covering build_J + upload
     // + cuSPARSE/cuDSS handle & descriptor creation (the last of which has no
     // dedicated field), so this is the exact non-overlapping remainder after
-    // CPU preprocessing -- keeping t_cpu_preprocess_ms() + t_host_to_device_ms()
-    // == t_init_ms exactly, which t_grand_total_ms() below relies on.
+    // CPU preprocessing.
     double t_host_to_device_ms() const { return t_init_ms - t_build_J_ms; }
     double t_device_to_host_ms() const { return t_copy_v_to_host_ms; }
 
@@ -255,7 +268,10 @@ struct AcPfTimings {
 //   nb_iter          — fixed NR iterations per chunk
 //
 // Coarse aggregation (read-only, computed — no new state):
-//   t_cpu_preprocess_ms() — alias for t_preprocess_ms (already pure CPU).
+//   t_cpu_preprocess_ms() — t_preprocess_ms + t_ground_truth_check_ms (both pure
+//                           CPU; the latter precedes t_preprocess_ms itself but
+//                           is still part of the same caller-facing construction
+//                           call -- see AcPfTimings::t_ground_truth_check_ms).
 //   t_host_to_device_ms() — t_alloc_ms + t_source_init_ms + t_branch_data_upload_ms.
 //                           Approximate: t_source_init_ms includes a D→D Ybus
 //                           tile for the injection sweep (not host-touching),
@@ -284,6 +300,11 @@ struct BatchTimings {
     double t_source_init_ms       = 0.;
     double t_branch_data_upload_ms = 0.;
     double t_base_case_solve_only_ms = 0.;
+    // See AcPfTimings::t_ground_truth_check_ms -- folded in here from
+    // base_state_->timings, and folded into t_cpu_preprocess_ms()/
+    // t_grand_total_ms() below (CPU work within the same caller-facing
+    // construction call, even though it precedes any session object).
+    double t_ground_truth_check_ms = 0.;
     double t_copy_flows_to_host_ms = 0.;
     double t_copy_V_to_host_ms     = 0.;
     double t_copy_residuals_to_host_ms = 0.;
@@ -340,7 +361,7 @@ struct BatchTimings {
     }
 
     // --- coarse aggregation (read-only; see note above) ---
-    double t_cpu_preprocess_ms() const { return t_preprocess_ms; }
+    double t_cpu_preprocess_ms() const { return t_preprocess_ms + t_ground_truth_check_ms; }
 
     double t_host_to_device_ms() const {
         return t_alloc_ms + t_source_init_ms + t_branch_data_upload_ms

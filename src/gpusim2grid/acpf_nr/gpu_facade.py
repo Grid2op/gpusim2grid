@@ -84,6 +84,14 @@ class AcPfGPU:
         (once-only) cuDSS ANALYSIS phase. One of ``"default"``, ``"scaled"``,
         ``"static"``. Construction-time only, same reason as
         ``reordering_alg``.
+    debug_base_case : bool, default False
+        Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
+        VoltageControl extension active (bridge path). By default, that
+        extension's running state is seeded directly from lightsim2grid's own
+        converged values, needing no extra cuDSS solve. Setting this True
+        forces the pre-ground-truth cuDSS-solve derivation instead -- an
+        opt-in diagnostic (e.g. to keep testing ``reordering_alg``/
+        ``matching_alg``/``pivot_epsilon_alg`` choices in isolation).
 
     Examples
     --------
@@ -100,7 +108,7 @@ class AcPfGPU:
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
                  device=None, init_from_n_powerflow=True, use_bridge=None,
                  reordering_alg="default", matching_alg="none",
-                 pivot_epsilon_alg="default"):
+                 pivot_epsilon_alg="default", debug_base_case=False):
         _validate_precision(precision)
         reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
         matching_alg_enum = _resolve_matching_alg(matching_alg)
@@ -118,7 +126,8 @@ class AcPfGPU:
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
-                pivot_epsilon_alg=pivot_epsilon_alg_enum)
+                pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                debug_base_case=bool(debug_base_case))
             return
 
         if use_bridge is None:
@@ -132,7 +141,8 @@ class AcPfGPU:
                 bool(init_from_n_powerflow),
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
-                pivot_epsilon_alg=pivot_epsilon_alg_enum)
+                pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                debug_base_case=bool(debug_base_case))
         else:
             # Python extraction fallback: bare [pvpq|pq] system (no distributed
             # slack in the Jacobian).
@@ -144,7 +154,8 @@ class AcPfGPU:
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
-                pivot_epsilon_alg=pivot_epsilon_alg_enum)
+                pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                debug_base_case=bool(debug_base_case))
 
     def solve(self):
         """Return the solved complex voltage vector (host copy)."""

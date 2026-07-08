@@ -93,6 +93,27 @@ struct AcPfNrState {
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
 
     // -------------------------------------------------------------------------
+    // debug_base_case_: opt-in diagnostic (presolved_v path only). When true,
+    // always derive MultiSlack slack_absorbed / VoltageControl vc_q via the
+    // one-shot cuDSS solve, even when lightsim2grid's own converged ground
+    // truth (LedgerData::has_ext_state_ground_truth) is available -- e.g. to
+    // cross-validate the GPU's own Newton-derived state against ground truth,
+    // or to keep testing cuDSS config choices in isolation. Default false
+    // (prefer ground truth whenever available).
+    //
+    // base_case_only_: true only for ContingencyAnalysisSession's/
+    // InjectionSweepSession's internal base_state_ (set via their own
+    // constructors) -- never for AcPfNrSession, which IS the production
+    // solver and must always keep a valid cuDSS context alive for its own
+    // run()/prepare_JT(). When true AND the presolved_v ground-truth path
+    // applies (no debug override, extension state available from the
+    // ledger), this instance skips its cuDSS context (handle/config/data/
+    // ANALYSIS/FACTORIZATION) entirely -- see need_cudss in acpf_nr.cu.
+    // -------------------------------------------------------------------------
+    bool debug_base_case_ = false;
+    bool base_case_only_  = false;
+
+    // -------------------------------------------------------------------------
     // Scalar dimensions  (CPU-side, set in constructor, never modified)
     // -------------------------------------------------------------------------
     int n_bus  = 0;
@@ -327,7 +348,15 @@ struct AcPfNrState {
         MatchingAlg                                   matching_alg = MatchingAlg::None,
         // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for BOTH dss and dss_T's
         // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
-        PivotEpsilonAlg                               pivot_epsilon_alg = PivotEpsilonAlg::Default
+        PivotEpsilonAlg                               pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // Opt-in diagnostic (presolved_v path only): force the cuDSS-solve
+        // derivation of slack_absorbed/vc_q even when ledger ground truth is
+        // available. See debug_base_case_ above. Default false.
+        bool                                          debug_base_case = false,
+        // Internal wiring flag: true only for ContingencyAnalysisSession's/
+        // InjectionSweepSession's base_state_. See base_case_only_ above.
+        // Default false (AcPfNrSession / the standalone acpf_nr_gpu()).
+        bool                                          base_case_only = false
     );
 
     // =========================================================================

@@ -103,6 +103,20 @@ struct LedgerData {
     int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
     int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }
     bool has_voltage_control() const { return !vc_bus.empty(); }
+
+    // ---- Ground-truth extension state (optional) -----------------------------
+    // Populated ONLY by extract_ledger_data() (ls2g_bridge.cpp) when the caller
+    // requested presolved_v/init_from_n_powerflow, after verifying the grid is
+    // actually solved (LSGrid::check_solution) -- never by the array/tuple,
+    // no-lsgrid path. Lets AcPfNrState's presolved_v fast path seed
+    // slack_absorbed/vc_q directly from lightsim2grid's own converged NR state
+    // (LSGrid::get_slack_absorbed_solver()/get_controller_q_solver()) instead of
+    // deriving them via an extra GPU linear solve. vc_q_gt is in the same
+    // controller-registration order as vc_bus/vc_kind/vc_group above.
+    bool                 has_ext_state_ground_truth = false;
+    double               slack_absorbed_gt = 0.0;   // valid iff has_ext_state_ground_truth && slack_col>=0
+    std::vector<double>  vc_q_gt;                    // size vc_n_controllers(); valid iff has_ext_state_ground_truth
+    double               t_ground_truth_check_ms = 0.0;  // check_solution() wall time
 };
 
 #endif  // LEDGER_DATA_HPP

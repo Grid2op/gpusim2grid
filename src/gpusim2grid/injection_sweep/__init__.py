@@ -214,24 +214,39 @@ class _InjectionSweepSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None, presolved_v=False):
+                 device=None, presolved_v=False, reordering_alg='default',
+                 matching_alg='none', pivot_epsilon_alg='default',
+                 debug_base_case=False):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
-        self._reordering_alg = 'default'
-        self._matching_alg = 'none'
-        self._pivot_epsilon_alg = 'default'
+        self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
+        # Single source of truth, set once at construction: forwarded to BOTH
+        # the base-case solve (this call) AND the batch solver's own members
+        # (consumed by run()); see contingency_analysis's identical pattern.
         self._s = _InjectionSweepSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
-            _normalize_device(device), presolved_v=bool(presolved_v))
+            _normalize_device(device), presolved_v=bool(presolved_v),
+            reordering_alg=_resolve_reordering_alg(reordering_alg),
+            matching_alg=_resolve_matching_alg(matching_alg),
+            pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            debug_base_case=bool(debug_base_case))
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
                       strategy='direct_refactor_every', reordering_alg='default',
                       matching_alg='none', pivot_epsilon_alg='default'):
         """Wrap an already-constructed C++ InjectionSweepSession (zero-copy
-        lightsim2grid bridge). Reuses all wrapper ergonomics."""
+        lightsim2grid bridge). Reuses all wrapper ergonomics.
+
+        reordering_alg/matching_alg/pivot_epsilon_alg here are bookkeeping
+        only (what the caller already passed to the C++ builder at
+        construction) -- purely so the Python-side property getters report
+        the truth; they do NOT re-apply these to the (already-built) session.
+        """
         self = cls.__new__(cls)
         self._s = session
         self._max_iter_base = int(max_iter_base)
