@@ -242,7 +242,7 @@ class _ContingencyAnalysisSolver:
       rerun the base case.
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
       divergence check (see :meth:`set_limits`). Default False.
-    - ``violation_tol`` (*float*), ``violation_capacity`` (*int*): DIVERGED
+    - ``violation_tol`` (*float*), ``violation_capacity`` (*int*): DIVERGENCE
       tolerance and max records kept per contingency (default 16).
 
     Examples
@@ -533,7 +533,7 @@ class _ContingencyAnalysisSolver:
 
     @property
     def violation_tol(self):
-        """float: residual tolerance for the DIVERGED check, independent of
+        """float: residual tolerance for the DIVERGENCE check, independent of
         tol_base. Takes effect on the next run()."""
         return self._s.violation_tol
 
@@ -554,9 +554,13 @@ class _ContingencyAnalysisSolver:
 
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per contingency (row order
-        matches build_contingencies()'s input list). [] for a not-simulated
-        (disconnected / masked-skip) contingency; a non-converged one gets a
-        single DIVERGED entry and nothing else. Requires run() with
+        matches build_contingencies()'s input list). A not-simulated
+        (disconnected / masked-skip) contingency gets a single GRID/
+        NOT_SIMULATED entry (value=limit=nan -- the solver was never
+        invoked, there is no residual to report); a non-converged one gets a
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        Both mirror lightsim2grid's own ViolationElementType.GRID /
+        LimitViolationType.{NOT_SIMULATED,DIVERGENCE}. Requires run() with
         compute_limit_violations=True."""
         if not self.compute_limit_violations:
             raise RuntimeError(
@@ -573,7 +577,13 @@ class _ContingencyAnalysisSolver:
         out = []
         for c, cnt in enumerate(counts):
             if cnt < 0:
-                out.append([])
+                # Pre-check (graph connectivity) dropped this contingency
+                # before it ever reached check_limit_violations_kernel -- the
+                # solver was never invoked (BatchPfDriver's d_violation_count
+                # -1 sentinel). Never written by the kernel itself.
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.NOT_SIMULATED,
+                                            float('nan'), float('nan'))])
                 continue
             base = c * K
             out.append([

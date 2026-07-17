@@ -328,7 +328,7 @@ struct BatchPfDriver {
 
     // -------------------------------------------------------------------------
     // compute_limit_violations: configure per-bus voltage (kV) / per-branch
-    // current (kA) limits and the fused kernel's DIVERGED tolerance + output
+    // current (kA) limits and the fused kernel's DIVERGENCE tolerance + output
     // capacity K. Requires upload_branch_admittances() (directly, or via
     // set_branch_data()) to have already run. NaN = "not configured" for that
     // element (matches lightsim2grid's convention).

@@ -17,8 +17,9 @@ arrays just to threshold-compare them away. This mirrors lightsim2grid's own
 ``ContingencyAnalysis.compute_limit_violations`` flag.
 
 A non-convergent contingency also shows up in the same per-contingency
-violation list (as a ``DIVERGED`` entry) instead of needing a separate
-convergence check.
+violation list (as a ``GRID``/``DIVERGENCE`` entry, or ``GRID``/
+``NOT_SIMULATED`` if the pre-check dropped it before it was ever solved)
+instead of needing a separate convergence check.
 
 This example configures a simple, illustrative operating envelope (±voltage
 band around nominal; thermal limits derived from the worst-case loading seen

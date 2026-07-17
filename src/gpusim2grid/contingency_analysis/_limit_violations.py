@@ -26,22 +26,38 @@ import numpy as np
 
 
 class ViolationElementType(IntEnum):
-    """Mirrors lightsim2grid's ls2g::ViolationElementType exactly."""
+    """Mirrors lightsim2grid's ls2g::ViolationElementType exactly (including
+    GRID, added on lightsim2grid's improve_const_ref branch)."""
     BUS = 0
     LINE = 1
     TRAFO = 2
+    GRID = 3  # the whole grid/contingency, not a specific element
 
 
 class LimitViolationType(IntEnum):
-    """Mirrors lightsim2grid's ls2g::LimitViolationType (0-2); DIVERGED (3)
-    is a gpusim2grid-only extension -- the fused GPU kernel already computes
-    a per-contingency residual check as a precondition to trusting V for the
-    other checks, so folding a DIVERGED record into the same compact output
-    avoids a second round trip for callers of get_violations()."""
+    """Mirrors lightsim2grid's ls2g::LimitViolationType exactly, including
+    NOT_SIMULATED/DIVERGENCE (added on lightsim2grid's improve_const_ref
+    branch, alongside ViolationElementType.GRID). Both are written under
+    element_type=GRID, but from two different layers:
+
+    - DIVERGENCE is written by the fused GPU kernel itself
+      (check_limit_violations_kernel) for a contingency it actually ran the
+      solver on but whose residual is NaN or exceeds violation_tol -- V is
+      unreliable, so folding this into the same compact output avoids a
+      second round trip to get_residuals() for callers of get_violations().
+    - NOT_SIMULATED is written by the Python session layer (get_violations())
+      for a contingency the pre-check dropped before it ever reached that
+      kernel (graph connectivity; see BatchPfDriver's d_violation_count -1
+      sentinel) -- the solver was never invoked at all.
+
+    gpusim2grid additionally populates value/limit with the actual
+    residual/tol for DIVERGENCE entries; lightsim2grid's own convention
+    leaves value/limit NaN/unused for both GRID violation types."""
     LOW_VOLTAGE = 0
     HIGH_VOLTAGE = 1
     CURRENT = 2
-    DIVERGED = 3
+    NOT_SIMULATED = 3
+    DIVERGENCE = 4
 
 
 @dataclass(frozen=True)
@@ -52,13 +68,15 @@ class LimitViolation:
         of contingency_analysis/gpu_facade.py for the numbering caveat) for BUS;
         LOCAL (own-type, 0-based) id for LINE/TRAFO -- i.e. de-concatenated
         from gpusim2grid's lines-then-trafos branch numbering, NOT the same
-        as the branch_ids_per_ctg index. -1 for the DIVERGED sentinel
-        (whole-system, no specific element).
-    side : 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO (1 = origin/"or"
+        as the branch_ids_per_ctg index. -1 for GRID (NOT_SIMULATED /
+        DIVERGENCE; whole-system, no specific element).
+    side : 0 for BUS/GRID; 1 or 2 for LINE/TRAFO (1 = origin/"or"
         terminal, matching limit_a1_ka/or_amps; 2 = extremity/"ex" terminal,
         matching limit_a2_ka/ex_amps).
-    value / limit : kV for LOW_VOLTAGE/HIGH_VOLTAGE, kA for CURRENT,
-        residual/tol for DIVERGED.
+    value / limit : kV for LOW_VOLTAGE/HIGH_VOLTAGE, kA for CURRENT; for
+        GRID (NOT_SIMULATED / DIVERGENCE), gpusim2grid populates
+        residual/tol (lightsim2grid's own convention leaves these NaN/unused
+        for GRID).
     """
     element_type: ViolationElementType
     element_id: int
@@ -95,9 +113,12 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
         Splits the lines-then-trafos branch ordering for element_type/
         element_id de-concatenation.
     residual, tol : float or None
-        If both given and residual > tol, a single DIVERGED entry is
-        returned and no other check is run (V is assumed unreliable),
-        mirroring the fused kernel's behavior for the batch case.
+        If both given and isnan(residual) or residual > tol, a single GRID/
+        DIVERGENCE entry is returned and no other check is run (V is assumed
+        unreliable), mirroring the fused kernel's behavior for the batch
+        case. There is no NOT_SIMULATED equivalent here -- unlike the batch
+        (contingency) case, the pre-contingency "n" power flow this helper
+        checks is always actually run, never pre-check-dropped.
 
     Returns
     -------
@@ -107,9 +128,9 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
 
     out = []
 
-    if residual is not None and tol is not None and residual > tol:
-        out.append(LimitViolation(ViolationElementType.BUS, -1, 0,
-                                   LimitViolationType.DIVERGED,
+    if residual is not None and tol is not None and (np.isnan(residual) or residual > tol):
+        out.append(LimitViolation(ViolationElementType.GRID, -1, 0,
+                                   LimitViolationType.DIVERGENCE,
                                    float(residual), float(tol)))
         return out
 
