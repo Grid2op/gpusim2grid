@@ -222,11 +222,19 @@ class AcPfGPU:
 
     def ac_pf(self, Vinit, max_iter, tol):
         """Run an *independent* GPU power flow with the same call signature
-        as lightsim2grid's ``LSGrid.ac_pf(Vinit, max_iter, tol)`` -- ``Vinit``
-        is in **grid-model** bus numbering, exactly like lightsim2grid
-        (gpusim2grid's own arrays, e.g. on the explicit-array tuple
-        constructor, are solver-numbered internally; this method hides that
-        relabeling on the way in). ``Vinit`` is not modified in place.
+        as lightsim2grid's ``LSGrid.ac_pf(Vinit, max_iter, tol)`` -- but,
+        unlike ``LSGrid.ac_pf``, ``Vinit`` (and the return value) here are in
+        **AC-solver** bus numbering, not grid-model numbering: ``Vinit`` is
+        only ``n_bus_solver`` long, covering active/connected buses only, in
+        the same solver order as ``AcPfGPU.solve()``'s own return value (see
+        the warning below). ``Vinit`` is not modified in place -- it is
+        copied (``Vinit_gpu = np.array(Vinit, dtype=complex)``) before being
+        scattered into the grid-model-sized ``V_init_ls`` via
+        ``self._id_ac_solver_to_me``, and it's that scattered copy,
+        ``V_init_ls``, which gets handed to (and modified in place by,
+        matching lightsim2grid's own convention) the zero-iteration
+        ``self._grid.ac_pf(V_init_ls, 0, tol)`` seeding call below -- not
+        ``Vinit`` itself.
 
         This is deliberately NOT "solve on the CPU, then hand the GPU the
         converged answer to validate": both solvers are given the exact same
@@ -238,14 +246,14 @@ class AcPfGPU:
         Only valid when this instance was built from a lightsim2grid grid
         (not the explicit-array tuple constructor). The grid's solver-side
         structures (Ybus/ledger) come from lightsim2grid itself -- gpusim2grid
-        never builds them from scratch -- so this seeds them with a
-        zero-iteration ``ac_pf(Vinit, 0, tol)`` call first (sets up the
+        never builds them from scratch -- so this seeds them with the
+        zero-iteration ``ac_pf(V_init_ls, 0, tol)`` call above (sets up the
         solver bus numbering / ledger and leaves ``get_V_solver()`` exactly
-        equal to ``Vinit``, no CPU Newton steps taken) before the CPU
-        reference run so the CPU doesn't get a head start.
+        equal to ``Vinit`` on the active buses, no CPU Newton steps taken)
+        before the CPU reference run so the CPU doesn't get a head start.
 
-        Returns ``v_gpu_solver``, the GPU's own converged voltage, in
-        **AC-solver** bus numbering (unlike ``Vinit``) -- or an empty array if
+        Returns ``v_gpu_solver``, the GPU's own converged voltage, in the
+        same **AC-solver** bus numbering as ``Vinit`` -- or an empty array if
         the GPU didn't converge, matching ``ac_pf()``'s own convergence-failure
         convention. This does not currently run or return the CPU comparison
         solve, nor remap the result back to grid-model numbering; both were
@@ -253,13 +261,13 @@ class AcPfGPU:
         expected to run its own CPU reference and relabel if it needs one.
 
         .. warning::
-            Vinit here is for gpusim2grid, so only covers the active buses
-            of the lightsim2grid grid.
-            
-            running directly LSGrid.ac_pf(Vinit, max_iter, tol) will fail 
-            because the size mismatch (this later call require to feed
-            complex voltages even for disconnected buses).
-            
+            ``Vinit`` here is gpusim2grid's own AC-solver numbering, so it
+            only covers the active buses of the lightsim2grid grid -- it is
+            NOT the grid-model-numbered array ``LSGrid.ac_pf`` itself takes.
+
+            Passing it directly to ``LSGrid.ac_pf(Vinit, max_iter, tol)``
+            will fail because of the size mismatch (that call requires a
+            complex voltage for every bus, including disconnected ones).
         """
         if self._grid is None:
             raise RuntimeError(
