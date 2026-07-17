@@ -108,6 +108,20 @@ building against, since `lightsim2grid` is a build-system requirement. No
 [installation docs](#building-the-docs) if you need to point at a different
 `lightsim2grid` install.
 
+> **`lightsim2grid` should also be built from source.** The PyPI wheel does
+> not ship the C++ headers (`LSGrid.hpp` and friends) the bridge needs, only
+> the compiled extension — so build it yourself first, with
+> `--no-build-isolation` so it's built against the same environment
+> gpusim2grid will use:
+> ```bash
+> git clone https://github.com/Grid2op/lightsim2grid.git
+> cd lightsim2grid
+> pip install --no-build-isolation .
+> ```
+> (or the equivalent `uv pip install --no-build-isolation .`). See the
+> [installation docs](#building-the-docs) for details on matching Eigen /
+> SuiteSparse versions between the two builds.
+
 For detailed installation options — selecting float precision, linking against a
 specific CUDA version, and other build customization — see the dedicated installation
 page in the [documentation](#building-the-docs).

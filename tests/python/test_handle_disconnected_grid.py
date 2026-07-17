@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 """handle_disconnected_grid: solve the largest connected component of a split grid.
 
 When an N-k contingency disconnects the grid, gpusim2grid can (opt-in) solve the

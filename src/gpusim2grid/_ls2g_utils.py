@@ -88,15 +88,6 @@ def extract_grid_arrays(grid, v_init=None, max_iter=10, tol=1e-8):
     """
     v_init, v_converged = _ensure_solved(grid, v_init, max_iter, tol)
 
-    # TODO(bug, non-bridge/array path only): Ybus/Sbus are read in AC-SOLVER
-    # numbering (get_*_solver()) but pv/pq/slack below are read in
-    # GRID-MODEL numbering (get_pv()/get_pq()/get_slack_ids()), unlike the
-    # bridge path (ls2g_bridge.cpp) which consistently uses the
-    # *_solver_numpy() accessors for all of these. When model numbering !=
-    # solver numbering this mismatches the bus partition against Ybus/Sbus,
-    # which can produce a large/garbage NR residual. Needs get_pv_solver_numpy()
-    # / get_pq_solver_numpy() / get_slack_ids_solver_numpy() here instead, if
-    # those exist on lightsim2grid versions this fallback path supports.
     Ybus = grid.get_Ybus_solver().copy()
     Sbus = grid.get_Sbus_solver().copy()
     pv = grid.get_pv_solver().copy()
@@ -151,6 +142,11 @@ def extract_branch_data(grid):
     # the wrong bus -- whenever the grid's model->solver bus map isn't the
     # identity (e.g. isolated buses excluded under KLU/the augmented
     # multi-slack system, or half-open lines).
+    # Branch endpoints come in as arbitrary model-bus ids, so relabeling them
+    # needs the forward map (model id -> solver id, or -1): id_me_to_ac_solver().
+    # The inverse map id_ac_solver_to_me() (used below for vn_kv, where every
+    # solver slot needs filling) doesn't help here -- it would have to be
+    # inverted back into a forward map first, which is more work, not less.
     me_to_solver = np.asarray(grid.id_me_to_ac_solver())
 
     def _relabel_to_solver(global_ids):
@@ -174,14 +170,15 @@ def extract_branch_data(grid):
         (lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
     ytt = np.concatenate(
         (lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
+    # Unlike branch endpoints above, every solver slot needs a vn_kv value, so
+    # this is a straight gather through the inverse map (solver id -> model
+    # id) instead of a scatter through the forward one.
     vn_kv_model = grid.get_bus_vn_kv().copy()
-    if me_to_solver.size == 0:
+    solver_to_me = np.asarray(grid.id_ac_solver_to_me())
+    if solver_to_me.size == 0:
         vn_kv = vn_kv_model   # identity numbering
     else:
-        n_bus_solver = int((me_to_solver >= 0).sum())
-        vn_kv = np.zeros(n_bus_solver, dtype=vn_kv_model.dtype)
-        solver_mask = me_to_solver >= 0
-        vn_kv[me_to_solver[solver_mask]] = vn_kv_model[solver_mask]
+        vn_kv = vn_kv_model[solver_to_me]
     sn_mva = grid.get_sn_mva()
     args = (branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
     return args, len(lines), len(trafos)

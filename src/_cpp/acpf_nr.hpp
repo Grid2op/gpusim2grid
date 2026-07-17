@@ -81,8 +81,8 @@ struct AcPfNrSession {
         // make_acpf_session_from_lsgrid). max_dVa/max_dVm default to
         // lightsim2grid's own MaxVoltageChangeScalingPolicy defaults.
         bool                                          scaling_max_voltage_change = false,
-        double                                        max_dVa = 0.5,
-        double                                        max_dVm = 0.1
+        double                                        max_dVa = 0.5,   // radians
+        double                                        max_dVm = 0.1    // per-unit
     );
 
     AcPfTimings timings() const;
