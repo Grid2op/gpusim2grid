@@ -55,7 +55,9 @@ never required just to compute violations, which keeps both device memory use
 and the eventual host transfer independent of grid/batch size — the point of
 running this on GPU in the first place. A contingency that fails to converge
 (``residual > violation_tol``) is folded into the same per-contingency list as
-a ``DIVERGED`` entry instead of needing a separate convergence check.
+a ``GRID``/``DIVERGENCE`` entry instead of needing a separate convergence
+check; one the pre-check dropped before it was ever solved gets a ``GRID``/
+``NOT_SIMULATED`` entry instead.
 
 Per contingency, branch current is checked **before** bus voltage (thermal
 violations are generally a first-order operational concern, voltage a

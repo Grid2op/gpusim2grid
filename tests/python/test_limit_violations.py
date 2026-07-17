@@ -74,16 +74,31 @@ def test_compute_violations_n_classification():
     cur = next(v for v in violations if v.violation_type == LimitViolationType.CURRENT)
     assert cur.element_id == 0 and cur.side == 1
 
-    # DIVERGED short-circuits everything else.
+    # DIVERGENCE (finite residual > tol) short-circuits everything else.
     diverged = compute_violations_n(
         V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
         branch_from, branch_to, yff, yft, ytf, ytt,
         limit_a1_ka, limit_a2_ka, sn_mva, n_lines=1,
         residual=1.0, tol=1e-6)
     assert len(diverged) == 1
-    assert diverged[0].violation_type == LimitViolationType.DIVERGED
+    assert diverged[0].element_type == ViolationElementType.GRID
+    assert diverged[0].violation_type == LimitViolationType.DIVERGENCE
     assert diverged[0].element_id == -1
     assert diverged[0].value == 1.0 and diverged[0].limit == 1e-6
+
+    # A NaN residual (solver ran but the result is unusable) is ALSO
+    # DIVERGENCE, not silently dropped -- there is no NOT_SIMULATED path for
+    # compute_violations_n (see its own docstring).
+    nan_residual = compute_violations_n(
+        V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
+        branch_from, branch_to, yff, yft, ytf, ytt,
+        limit_a1_ka, limit_a2_ka, sn_mva, n_lines=1,
+        residual=np.nan, tol=1e-6)
+    assert len(nan_residual) == 1
+    assert nan_residual[0].element_type == ViolationElementType.GRID
+    assert nan_residual[0].violation_type == LimitViolationType.DIVERGENCE
+    assert nan_residual[0].element_id == -1
+    assert np.isnan(nan_residual[0].value) and nan_residual[0].limit == 1e-6
 
     # None limits (nothing configured at all) -> no violations, no crash.
     empty = compute_violations_n(
@@ -146,8 +161,11 @@ def test_no_limits_configured_gives_empty_violations(ieee14_grid, ieee14_base_ca
         if converged[c]:
             assert violations[c] == []
         else:
+            # Either genuinely diverged (solved, residual > tol) or dropped
+            # by the pre-check before ever being solved (residual == NaN) --
+            # IEEE14 single-line trips may hit either, so accept both.
             assert len(violations[c]) == 1
-            assert violations[c][0].violation_type.name == "DIVERGED"
+            assert violations[c][0].violation_type.name in ("DIVERGENCE", "NOT_SIMULATED")
 
 
 @requires_gpu
@@ -232,9 +250,11 @@ def test_tight_limits_reproduce_low_high_voltage_and_current(ieee14_grid, ieee14
 @requires_gpu
 def test_diverged_via_tight_violation_tol(ieee14_grid, ieee14_base_case):
     """An absurdly tight violation_tol turns every (otherwise converged)
-    contingency into a single DIVERGED entry -- isolates the divergence path
-    from actual solver (non-)convergence, precision-agnostic."""
-    from gpusim2grid.contingency_analysis._limit_violations import LimitViolationType
+    contingency into a single GRID/DIVERGENCE entry -- isolates the
+    divergence path from actual solver (non-)convergence, precision-agnostic."""
+    from gpusim2grid.contingency_analysis._limit_violations import (
+        LimitViolationType, ViolationElementType,
+    )
 
     cont_branch_ids = [[0], [1]]
     solver, n_lines, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids,
@@ -251,7 +271,8 @@ def test_diverged_via_tight_violation_tol(ieee14_grid, ieee14_base_case):
     for c in range(len(cont_branch_ids)):
         assert len(violations[c]) == 1
         v = violations[c][0]
-        assert v.violation_type == LimitViolationType.DIVERGED
+        assert v.element_type == ViolationElementType.GRID
+        assert v.violation_type == LimitViolationType.DIVERGENCE
         assert v.element_id == -1
         np.testing.assert_allclose(v.value, residuals[c], rtol=1e-6)
         assert v.limit == pytest.approx(1e-30)
@@ -372,4 +393,46 @@ def test_handle_disconnected_grid_masks_excluded_from_violations(solver_atol):
     # Every OTHER bus legitimately violates the absurd vmin.
     other_buses = {v.element_id for v in violations if v.violation_type.name == "LOW_VOLTAGE"}
     assert spur_bus not in other_buses
+
+
+@requires_gpu
+def test_not_simulated_contingency_reports_grid_entry():
+    """With handle_disconnected_grid OFF (default), a contingency that would
+    disconnect the grid is dropped by the pre-check before ever reaching
+    check_limit_violations_kernel (residual/V stay NaN -- see
+    test_handle_disconnected_grid.test_flag_off_skips_the_contingency).
+    get_violations() must surface this as a single GRID/NOT_SIMULATED entry
+    (value=limit=nan, the solver was never invoked), not silently as []."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid._gpusim2grid import have_ls2g_bridge
+    from gpusim2grid.contingency_analysis._limit_violations import (
+        LimitViolationType, ViolationElementType,
+    )
+    from test_handle_disconnected_grid import _solved_spur_grid
+
+    if not have_ls2g_bridge:
+        pytest.skip("this setup needs the lightsim2grid C++ bridge")
+
+    grid, n_bus, spur_line_id, _ = _solved_spur_grid(distributed_slack=False)
+
+    ca = ContingencyAnalysisGPU(grid, handle_disconnected_grid=False,
+                                precision=None, nb_iter=15, tol_base=1e-10)
+    n_lines = len(grid.get_lines())
+    n_branches = ca.n_branches
+    ca.solver._s.set_limits(np.full(n_bus, np.nan), np.full(n_bus, np.nan),
+                            np.full(n_branches, np.nan), np.full(n_branches, np.nan),
+                            n_lines)
+    ca.compute_limit_violations = True
+
+    ca.add_contingencies_by_branch_id([[int(spur_line_id)]])
+    ca.compute(batch_size=8)
+
+    assert np.isnan(ca.last_residuals()[0]), "contingency must be pre-check-dropped, not solved"
+    violations = ca.get_violations()[0]
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.element_type == ViolationElementType.GRID
+    assert v.violation_type == LimitViolationType.NOT_SIMULATED
+    assert v.element_id == -1
+    assert np.isnan(v.value) and np.isnan(v.limit)
     assert len(other_buses) >= 1
