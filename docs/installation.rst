@@ -56,8 +56,11 @@ detection explicitly:
 
 When ``lightsim2grid_core`` cannot be found (bridge disabled), the build
 falls back to the vendored Eigen copy (``src/eigen/``) and the Python
-fallback path is used at runtime instead — everything still works, just
-without the zero-copy fast path.
+fallback path is used at runtime instead — the Python fallback is exercised
+against the bridge path for parity in ``tests/python/test_new_api.py``
+(``use_bridge=False`` vs ``use_bridge=True``), but this project has no CI
+yet, so that comparison is only ever run by hand, not automatically on
+every change.
 
 SuiteSparse headers for the bridge
 -----------------------------------
@@ -77,6 +80,18 @@ does not ship. CMake looks for them in order:
 If neither is found, configuration prints a warning and the bridge may fail
 to compile with a ``cs.h``/``klu.h`` not found error — install
 ``libsuitesparse-dev`` (or point at a checkout) to fix it.
+
+It's best to build against the **same Eigen and SuiteSparse** (same
+versions, same compile flags) that your ``lightsim2grid`` build used —
+mismatched ABI/struct layouts between the two can fail silently rather than
+at compile time. The only configuration currently exercised and known to
+work is:
+
+* ``lightsim2grid`` installed from source (``pip install --no-build-isolation .``),
+* ``gpusim2grid`` installed from source the same way.
+
+Other configurations (prebuilt ``lightsim2grid`` wheel, mixed Eigen/SuiteSparse
+versions, ...) may work but are not tested.
 
 Selecting floating-point precision
 ----------------------------------

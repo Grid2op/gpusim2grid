@@ -31,10 +31,20 @@ __device__ __forceinline__ void atomic_add_real(double* addr, double val) {
 #endif
 }
 
-// Portable atomic max for NON-NEGATIVE floats/doubles (CAS loop, works on all
-// compute capabilities -- IEEE754 bit-pattern ordering matches integer
-// ordering for non-negative values, so comparing the reinterpreted bits is
-// safe). Used by reduce_step_norms_kernel, which only ever feeds it fabs(dx).
+// CUDA has no built-in atomicMax for float/double (only for integer types),
+// so this reimplements it as a compare-and-swap loop: read the current value,
+// bail out if it's already >= val, otherwise try to swap in val and retry on
+// contention. This is just "atomicMax", specialized to NON-NEGATIVE
+// floats/doubles -- for those, comparing the bit pattern as if it were an
+// integer gives the same ordering as comparing the float/double value
+// itself (true only when the sign bit is always 0), so the integer
+// atomicCAS above can drive the whole loop. Works on all compute
+// capabilities, unlike the native double atomicAdd this file also needs a
+// fallback for. Used by reduce_step_norms_kernel below, which only ever
+// feeds it fabs(dx) (always non-negative) to find, per batch slot, the
+// largest |dtheta|/|dvm| step any bus is about to take -- the max-voltage-
+// change step-scaling feature needs that per-slot maximum to compute how
+// much to shrink the whole Newton step by.
 __device__ __forceinline__ void atomic_max_nonneg(float* addr, float val) {
     int* p = reinterpret_cast<int*>(addr);
     int old = *p, assumed;

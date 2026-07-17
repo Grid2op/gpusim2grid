@@ -223,11 +223,10 @@ class AcPfGPU:
     def ac_pf(self, Vinit, max_iter, tol):
         """Run an *independent* GPU power flow with the same call signature
         as lightsim2grid's ``LSGrid.ac_pf(Vinit, max_iter, tol)`` -- ``Vinit``
-        and the return value are in **grid-model** bus numbering, exactly
-        like lightsim2grid (gpusim2grid's own arrays, e.g. on the
-        explicit-array tuple constructor, are solver-numbered internally;
-        this method hides that relabeling). Unlike ``ac_pf()``, ``Vinit`` is
-        not modified in place.
+        is in **grid-model** bus numbering, exactly like lightsim2grid
+        (gpusim2grid's own arrays, e.g. on the explicit-array tuple
+        constructor, are solver-numbered internally; this method hides that
+        relabeling on the way in). ``Vinit`` is not modified in place.
 
         This is deliberately NOT "solve on the CPU, then hand the GPU the
         converged answer to validate": both solvers are given the exact same
@@ -245,10 +244,14 @@ class AcPfGPU:
         equal to ``Vinit``, no CPU Newton steps taken) before the CPU
         reference run so the CPU doesn't get a head start.
 
-        Returns ``(V_cpu, V_gpu)``, both grid-model-numbered complex arrays
-        (or empty, matching ``ac_pf()``'s own convergence-failure
-        convention, for whichever side didn't converge).
-        
+        Returns ``v_gpu_solver``, the GPU's own converged voltage, in
+        **AC-solver** bus numbering (unlike ``Vinit``) -- or an empty array if
+        the GPU didn't converge, matching ``ac_pf()``'s own convergence-failure
+        convention. This does not currently run or return the CPU comparison
+        solve, nor remap the result back to grid-model numbering; both were
+        dropped for now (see the commented-out code below) and the caller is
+        expected to run its own CPU reference and relabel if it needs one.
+
         .. warning::
             Vinit here is for gpusim2grid, so only covers the active buses
             of the lightsim2grid grid.
