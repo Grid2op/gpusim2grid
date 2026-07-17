@@ -211,6 +211,48 @@ def test_acpf_gpu_remote_gen_voltage_control_matches(solver_atol):
 
 @requires_gpu
 @needs_bridge
+def test_acpf_gpu_voltage_control_shared_bus_matches(solver_atol):
+    """Two controllers CO-LOCATED at the same bus, sharing reactive power to
+    regulate one remote bus (a bordered VoltageControl group with N=2, both
+    members at the same vc_bus). Their J columns must stay distinct: the
+    ledger's bus-keyed q_to_J_col map only keeps the LAST controller
+    registered at a bus (NRLedger::add_q_unknown's own doc), so deriving qcol
+    from it aliases the two controllers onto one column and corrupts the
+    sharing equations (regression: this used to blow up ||dx||_inf to ~1e11
+    and freeze the iterative NR loop on a real ~7000-bus RTE grid with grouped
+    voltage control -- gen 3 and a co-located gen both regulating bus 9 here
+    reproduces the same structural collision at IEEE 14-bus scale)."""
+    from gpusim2grid import AcPfGPU
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.gridmodel import init_from_pandapower
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        # co-locate a second controllable generator on bus 7 (same bus as gen 3)
+        pp.create_gen(net, bus=7, p_mw=0.0, vm_pu=1.09, controllable=True,
+                      min_q_mvar=-50., max_q_mvar=50.)
+        net.gen.loc[3, ["min_q_mvar", "max_q_mvar"]] = [-50., 50.]
+        model = init_from_pandapower(net)
+        if not hasattr(model, "set_gen_regulated_bus"):
+            pytest.skip("this lightsim2grid build has no set_gen_regulated_bus")
+        model.set_gen_regulated_bus(3, 9)   # gen 3 (bus 7) regulates bus 9
+        model.set_gen_regulated_bus(4, 9)   # gen 4 (ALSO bus 7) regulates bus 9 too
+        model.tell_solver_need_reset()
+        _solve_with_fallback(model, net.bus.shape[0])
+
+    qcol = model.get_controller_q_col_solver()
+    assert qcol.shape[0] == 2
+    assert qcol[0] != qcol[1], "co-located controllers must get distinct J columns"
+
+    V_ref = model.get_V_solver()
+    ac = AcPfGPU(model, max_iter=50, tol=1e-11)
+    np.testing.assert_allclose(ac.solve(), V_ref, atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
 @pytest.mark.parametrize("slope_pu,reg_bus", [(0.0, 9), (0.02, 9)])
 def test_acpf_gpu_svc_matches(solver_atol, slope_pu, reg_bus):
     """Voltage-mode SVC (a sloped SVC exercises the (v_row, q_col)=slope feature)."""

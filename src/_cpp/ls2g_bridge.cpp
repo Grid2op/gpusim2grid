@@ -252,6 +252,10 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             ld.vc_grp_start = to_iv(v.grp_start);
             ld.vc_grp_count = to_iv(v.grp_count);
             ld.vc_v_set     = to_dv(v.v_set);
+            // Per-controller Q column -- NOT ledger.q_col_of_bus (bus-keyed,
+            // collides whenever two controllers share a bus). See LedgerData::
+            // vc_q_col's own doc.
+            ld.vc_q_col     = to_iv(grid.get_controller_q_col_solver());
         }
     }
 

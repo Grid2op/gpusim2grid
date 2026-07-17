@@ -572,13 +572,18 @@ AcPfNrState::AcPfNrState(
             return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
         };
 
-        // per-controller q row / q col (from the ledger) and slope
+        // per-controller q row / q col and slope. qrow is correctly shared via
+        // the bus-keyed map (one physical Q-balance equation per bus); qcol
+        // MUST come from the per-controller vc_q_col (NOT the bus-keyed
+        // q_col_of_bus, which only keeps the LAST controller registered at a
+        // given bus and silently collides whenever two controllers regulate
+        // reactive power from the same bus -- see LedgerData::vc_q_col's doc).
         std::vector<int> qrow(n_vc_ctrl), qcol(n_vc_ctrl);
         std::vector<cuda_real_type> slope(n_vc_ctrl);
         for (int j = 0; j < n_vc_ctrl; ++j) {
             const int bus = ledger->vc_bus[j];
             qrow[j] = ledger->q_row_of_bus[bus];
-            qcol[j] = ledger->q_col_of_bus[bus];
+            qcol[j] = ledger->vc_q_col[j];
             slope[j] = static_cast<cuda_real_type>(ledger->vc_slope[j]);
         }
 

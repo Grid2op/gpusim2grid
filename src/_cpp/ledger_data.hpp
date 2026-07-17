@@ -97,6 +97,15 @@ struct LedgerData {
     // J positions. kind: 0 = GEN, 1 = SVC (sloped).
     std::vector<int>    vc_bus, vc_kind, vc_group;       // per controller
     std::vector<double> vc_slope, vc_weight;             // per controller
+    // J column of each controller's own Q unknown (controller-registration
+    // order, from LSGrid::get_controller_q_col_solver() -- NOT the bus-keyed
+    // q_col_of_bus map: that map collides whenever two controllers regulate
+    // reactive power from the same bus, since it only keeps the LAST
+    // controller registered there. Two co-located controllers legitimately
+    // get two distinct q-unknown columns; qrow (q_row_of_bus, below) is
+    // correctly shared between them -- there is only one physical nodal
+    // Q-balance equation per bus.
+    std::vector<int>    vc_q_col;                        // per controller
     std::vector<int>    vc_reg_bus, vc_grp_start, vc_grp_count;  // per group
     std::vector<double> vc_v_set;                        // per group
 
