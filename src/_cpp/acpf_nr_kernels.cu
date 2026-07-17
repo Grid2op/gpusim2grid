@@ -14,6 +14,23 @@ static constexpr int BS = 256;   // block size for all kernels in this file
 // atomicAdd). Native atomicAdd for float and for double on SM >= 6.0; a 64-bit
 // CAS fallback for double on older targets. Used by the HVDC droop kernels,
 // whose contributions can overlap onto shared J positions / mismatch rows.
+//
+// Bit-reinterpretation note (applies to every CAS-based function in this
+// file): __double_as_longlong/__longlong_as_double/__float_as_int/
+// __int_as_float are dedicated CUDA intrinsics for exactly this
+// bit-for-bit reinterpretation -- well-defined, not UB (the CUDA
+// equivalent of memcpy/std::bit_cast). atomicCAS() itself, though, has no
+// float/double overload, so it can only be driven through a
+// reinterpret_cast<unsigned long long int*>/reinterpret_cast<int*> of the
+// double*/float* address -- that pointer-cast-and-dereference is classic
+// strict-aliasing type punning, UB by the letter of the C++ standard CUDA
+// C++ inherits. It's the exact idiom NVIDIA's own CUDA C++ Programming
+// Guide uses for this same double-atomicAdd fallback, and nvcc does not
+// do the aliasing-based reordering that would break it in device code --
+// but it is not standard-legal, only a de facto-safe, universally-used
+// CUDA idiom. The initial reads below go through the intrinsics on
+// *addr (the correctly-typed pointer) specifically to avoid adding a
+// second, avoidable instance of that same punned dereference.
 __device__ __forceinline__ void atomic_add_real(float* addr, float val) {
     atomicAdd(addr, val);
 }
@@ -22,7 +39,7 @@ __device__ __forceinline__ void atomic_add_real(double* addr, double val) {
     atomicAdd(addr, val);
 #else
     unsigned long long int* p = reinterpret_cast<unsigned long long int*>(addr);
-    unsigned long long int old = *p, assumed;
+    unsigned long long int old = __double_as_longlong(*addr), assumed;
     do {
         assumed = old;
         old = atomicCAS(p, assumed,
@@ -47,7 +64,7 @@ __device__ __forceinline__ void atomic_add_real(double* addr, double val) {
 // much to shrink the whole Newton step by.
 __device__ __forceinline__ void atomic_max_nonneg(float* addr, float val) {
     int* p = reinterpret_cast<int*>(addr);
-    int old = *p, assumed;
+    int old = __float_as_int(*addr), assumed;
     do {
         assumed = old;
         if (__int_as_float(assumed) >= val) break;
@@ -56,7 +73,7 @@ __device__ __forceinline__ void atomic_max_nonneg(float* addr, float val) {
 }
 __device__ __forceinline__ void atomic_max_nonneg(double* addr, double val) {
     unsigned long long int* p = reinterpret_cast<unsigned long long int*>(addr);
-    unsigned long long int old = *p, assumed;
+    unsigned long long int old = __double_as_longlong(*addr), assumed;
     do {
         assumed = old;
         if (__longlong_as_double(assumed) >= val) break;
