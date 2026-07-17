@@ -274,7 +274,8 @@ class _ContingencyAnalysisSolver:
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
                  device=None, handle_disconnected_grid=False, presolved_v=False,
                  reordering_alg='default', matching_alg='none',
-                 pivot_epsilon_alg='default', debug_base_case=False):
+                 pivot_epsilon_alg='default', debug_base_case=False,
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -293,7 +294,9 @@ class _ContingencyAnalysisSolver:
             reordering_alg=_resolve_reordering_alg(reordering_alg),
             matching_alg=_resolve_matching_alg(matching_alg),
             pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
-            debug_base_case=bool(debug_base_case))
+            debug_base_case=bool(debug_base_case),
+            scaling_max_voltage_change=bool(scaling_max_voltage_change),
+            max_dVa=float(max_dVa), max_dVm=float(max_dVm))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
 
     @classmethod
@@ -307,7 +310,10 @@ class _ContingencyAnalysisSolver:
         reordering_alg/matching_alg/pivot_epsilon_alg here are bookkeeping only
         (what the caller already passed to the C++ builder at construction) --
         purely so the Python-side property getters below report the truth;
-        they do NOT re-apply these to the (already-built) session.
+        they do NOT re-apply these to the (already-built) session. Same for
+        scaling_max_voltage_change/max_dVa/max_dVm -- no bookkeeping needed
+        for those since they're read straight off self._s (a plain bool/float
+        pair, unlike reordering_alg's str<->enum resolution).
         """
         self = cls.__new__(cls)
         self._s = session
@@ -334,6 +340,38 @@ class _ContingencyAnalysisSolver:
     @nb_iter.setter
     def nb_iter(self, value):
         self._s.nb_iter = int(value)
+
+    @property
+    def scaling_max_voltage_change(self):
+        """NR step-scaling (mirrors lightsim2grid's own
+        MaxVoltageChangeScalingPolicy); bool, takes effect on the next run().
+        Each batch slot gets its own alpha from its own max|dtheta|/max|dvm|.
+        """
+        return self._s.scaling_max_voltage_change
+
+    @scaling_max_voltage_change.setter
+    def scaling_max_voltage_change(self, value):
+        self._s.scaling_max_voltage_change = bool(value)
+
+    @property
+    def max_dVa(self):
+        """MaxVoltageChangeScalingPolicy max angle step (rad); only
+        meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVa
+
+    @max_dVa.setter
+    def max_dVa(self, value):
+        self._s.max_dVa = float(value)
+
+    @property
+    def max_dVm(self):
+        """MaxVoltageChangeScalingPolicy max voltage-magnitude step (pu);
+        only meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVm
+
+    @max_dVm.setter
+    def max_dVm(self, value):
+        self._s.max_dVm = float(value)
 
     @property
     def strategy(self):

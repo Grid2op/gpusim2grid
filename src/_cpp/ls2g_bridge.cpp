@@ -12,6 +12,7 @@
 #include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -24,6 +25,35 @@ CplxVect concat_cplx(Eigen::Ref<const ls2g::CplxVect> a,
     out.head(a.size()) = a;
     out.tail(b.size()) = b;
     return out;
+}
+
+// Resolve the (scaling_max_voltage_change, max_dVa, max_dVm) triple to hand to
+// AcPfNrState. By default (all three *_override args at their sentinel: -1
+// for the tri-state bool, negative for the doubles) this mirrors whatever the
+// grid's OWN get_ac_algo_config() already has set -- opt-in, and it inherits
+// lightsim2grid's own configured values rather than introducing a separate
+// gpusim2grid-level default. A caller (the Python facades) can force it on/off
+// or override max_dVa/max_dVm regardless of what the grid itself is
+// configured with. int_params[0]==1 is ls2g::ScalingPolicyType::MaxVoltageChange
+// (ScalingPolicies.hpp) -- not named via the enum here to avoid depending on
+// ScalingPolicies.hpp being transitively visible from this translation unit.
+std::tuple<bool, double, double> resolve_scaling_policy(
+    const ls2g::LSGrid& grid,
+    int scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
+{
+    const ls2g::AlgoConfig cfg = grid.get_ac_algo_config();
+    const bool grid_max_vchange =
+        !cfg.int_params.empty() && cfg.int_params[0] == 1;
+    const double grid_max_dVa = cfg.real_params.size() > 0 ? cfg.real_params[0] : 0.5;
+    const double grid_max_dVm = cfg.real_params.size() > 1 ? cfg.real_params[1] : 0.1;
+
+    const bool scaling = (scaling_max_voltage_change_override >= 0)
+        ? (scaling_max_voltage_change_override == 1) : grid_max_vchange;
+    const double max_dVa = (max_dVa_override >= 0.0) ? max_dVa_override : grid_max_dVa;
+    const double max_dVm = (max_dVm_override >= 0.0) ? max_dVm_override : grid_max_dVm;
+    return {scaling, max_dVa, max_dVm};
 }
 
 // Concatenate two branch bus-id vectors (global ids), relabeling each to the
@@ -332,7 +362,10 @@ make_acpf_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
-    bool   debug_base_case)
+    bool   debug_base_case,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -350,11 +383,15 @@ make_acpf_session_from_lsgrid(
 
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol);
 
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+
     return std::make_shared<AcPfNrSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
         diag_stop_before_state_correction,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        scaling, max_dVa, max_dVm);
 }
 
 std::shared_ptr<AcPfNrSession>
@@ -413,7 +450,10 @@ make_ca_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
-    bool   debug_base_case)
+    bool   debug_base_case,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     // get_Ybus_solver() is non-const (returns a copy) — cast away constness;
     // we only read it.
@@ -432,11 +472,14 @@ make_ca_session_from_lsgrid(
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        scaling, max_dVa, max_dVm);
 
     BranchData bd = extract_branch_data(grid);
     session->set_branch_data(bd.branch_from, bd.branch_to,
@@ -473,7 +516,10 @@ make_is_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
-    bool   debug_base_case)
+    bool   debug_base_case,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -490,11 +536,14 @@ make_is_session_from_lsgrid(
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<InjectionSweepSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        scaling, max_dVa, max_dVm);
 
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid);

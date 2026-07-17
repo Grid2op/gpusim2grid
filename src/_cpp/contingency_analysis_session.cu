@@ -53,13 +53,19 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
-    bool   debug_base_case)
+    bool   debug_base_case,
+    bool   scaling_max_voltage_change,
+    double max_dVa,
+    double max_dVm)
     : Ybus_rm_(Ybus)
     , batch_size_(batch_size)
     , nb_iter_(nb_iter)
     , reordering_alg_(reordering_alg)
     , matching_alg_(matching_alg)
     , pivot_epsilon_alg_(pivot_epsilon_alg)
+    , scaling_max_voltage_change_(scaling_max_voltage_change)
+    , max_dVa_(max_dVa)
+    , max_dVm_(max_dVm)
 {
     (void)slack_ids;
     (void)slack_weights;
@@ -72,7 +78,8 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
         device, ledger, presolved_v,
         /*diag_stop_before_state_correction=*/false,
         reordering_alg, matching_alg, pivot_epsilon_alg,
-        debug_base_case, /*base_case_only=*/true);
+        debug_base_case, /*base_case_only=*/true,
+        scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
 
     // Build the handle_disconnected_grid mask configuration once from the base
@@ -228,7 +235,10 @@ void ContingencyAnalysisSession::run()
         refactor_period_,
         reordering_alg_,
         matching_alg_,
-        pivot_epsilon_alg_);
+        pivot_epsilon_alg_,
+        scaling_max_voltage_change_,
+        max_dVa_,
+        max_dVm_);
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop

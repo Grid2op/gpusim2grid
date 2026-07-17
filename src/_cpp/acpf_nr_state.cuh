@@ -226,6 +226,11 @@ struct AcPfNrState {
     thrust::device_vector<cuda_real_type>  d_F;     // mismatch RHS,  size dim_J
     thrust::device_vector<cuda_real_type>  d_dx;    // NR correction, size dim_J
 
+    // NR step-scaling (MaxVoltageChange) scratch, size 1 (single-system) --
+    // unused (empty) unless scaling_max_voltage_change is enabled.
+    thrust::device_vector<cuda_real_type>  d_scale_max_dtheta;
+    thrust::device_vector<cuda_real_type>  d_scale_max_dvm;
+
     // -------------------------------------------------------------------------
     // Jacobian CSR skeleton (device, real cuda_real_type)
     //   Sparsity pattern is FIXED across all NR iterations and contingencies.
@@ -356,7 +361,24 @@ struct AcPfNrState {
         // Internal wiring flag: true only for ContingencyAnalysisSession's/
         // InjectionSweepSession's base_state_. See base_case_only_ above.
         // Default false (AcPfNrSession / the standalone acpf_nr_gpu()).
-        bool                                          base_case_only = false
+        bool                                          base_case_only = false,
+        // NR step-scaling (mirrors lightsim2grid's own MaxVoltageChangeScalingPolicy,
+        // ScalingPolicies.hpp): after solving J*dx=F, scale the WHOLE dx by
+        // alpha<=1 so max|dtheta|<=max_dVa and max|dvm|<=max_dVm BEFORE applying
+        // it anywhere (Va/Vm and any extension state columns), exactly matching
+        // lightsim2grid's own apply_step(coeff * F). Off by default -- an
+        // opt-in knob, not activated unless requested (the ls2g bridge path
+        // resolves this from the grid's OWN get_ac_algo_config() by default,
+        // letting the caller override it; the explicit-array/tuple path has no
+        // grid to inherit from, so it starts off unless explicitly enabled
+        // here). Without it, an undamped GPU Newton step can converge onto a
+        // different (sometimes spurious) root than lightsim2grid's own damped
+        // trajectory when seeded far from the solution (e.g. a flat/DC start)
+        // -- observed on real RTE grids. max_dVa/max_dVm default to
+        // lightsim2grid's own MaxVoltageChangeScalingPolicy defaults.
+        bool                                          scaling_max_voltage_change = false,
+        double                                        max_dVa = 0.5,
+        double                                        max_dVm = 0.1
     );
 
     // =========================================================================

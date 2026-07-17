@@ -94,6 +94,28 @@ class AcPfGPU:
         forces the pre-ground-truth cuDSS-solve derivation instead -- an
         opt-in diagnostic (e.g. to keep testing ``reordering_alg``/
         ``matching_alg``/``pivot_epsilon_alg`` choices in isolation).
+    scaling_max_voltage_change : bool or None, default None
+        NR step-scaling, mirrors lightsim2grid's own
+        ``MaxVoltageChangeScalingPolicy``: after solving for the Newton step,
+        scale the WHOLE step by ``alpha <= 1`` so ``max|dtheta| <= max_dVa``
+        and ``max|dVm| <= max_dVm`` before applying it anywhere -- matching
+        lightsim2grid's own damped trajectory instead of taking the full raw
+        step every iteration. Only takes effect with ``init_from_n_powerflow=
+        False`` (the GPU actually iterates) and the bridge path. ``None``
+        (default) is opt-in by inheritance: mirrors whatever the ``grid``'s
+        own ``get_ac_algo_config()`` is already set to (e.g. via
+        lightsim2grid's ``set_ac_algo_config``), so behavior only changes for
+        grids the caller explicitly configured with damping -- everything
+        else stays bit-for-bit as before. Pass ``True``/``False`` to force it
+        on/off regardless of the grid's own config. Without it, an undamped
+        GPU Newton step can converge onto a different (sometimes spurious)
+        root than lightsim2grid's own when seeded far from the solution
+        (e.g. a flat/DC start) -- observed on real RTE grids.
+    max_dVa, max_dVm : float or None, default None
+        ``MaxVoltageChangeScalingPolicy`` thresholds (radians / pu). ``None``
+        inherits the grid's own configured values (or lightsim2grid's own
+        defaults, 0.5 / 0.1, if forcing ``scaling_max_voltage_change=True``
+        with no grid to inherit from). Ignored unless step-scaling is active.
 
     Examples
     --------
@@ -110,7 +132,8 @@ class AcPfGPU:
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
                  device=None, init_from_n_powerflow=True, use_bridge=None,
                  reordering_alg="default", matching_alg="none",
-                 pivot_epsilon_alg="default", debug_base_case=False):
+                 pivot_epsilon_alg="default", debug_base_case=False,
+                 scaling_max_voltage_change=None, max_dVa=None, max_dVm=None):
         _validate_precision(precision)
         reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
         matching_alg_enum = _resolve_matching_alg(matching_alg)
@@ -128,7 +151,9 @@ class AcPfGPU:
         self._ctor_kwargs = dict(
             precision=precision, device=device, use_bridge=use_bridge,
             reordering_alg=reordering_alg, matching_alg=matching_alg,
-            pivot_epsilon_alg=pivot_epsilon_alg)
+            pivot_epsilon_alg=pivot_epsilon_alg,
+            scaling_max_voltage_change=scaling_max_voltage_change,
+            max_dVa=max_dVa, max_dVm=max_dVm)
 
         if isinstance(grid, (tuple, list)):
             if use_bridge:
@@ -143,7 +168,11 @@ class AcPfGPU:
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
                 pivot_epsilon_alg=pivot_epsilon_alg_enum,
-                debug_base_case=bool(debug_base_case))
+                debug_base_case=bool(debug_base_case),
+                # No grid to inherit a scaling policy from -- None means off.
+                scaling_max_voltage_change=bool(scaling_max_voltage_change),
+                max_dVa=0.5 if max_dVa is None else float(max_dVa),
+                max_dVm=0.1 if max_dVm is None else float(max_dVm))
             return
 
         if use_bridge is None:
@@ -158,7 +187,16 @@ class AcPfGPU:
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
                 pivot_epsilon_alg=pivot_epsilon_alg_enum,
-                debug_base_case=bool(debug_base_case))
+                debug_base_case=bool(debug_base_case),
+                # None => -1/-1.0 sentinels: inherit the grid's own
+                # get_ac_algo_config() (opt-in by construction). True/False
+                # force it on/off regardless of what the grid is configured
+                # with; an explicit max_dVa/max_dVm overrides just that value.
+                scaling_max_voltage_change_override=(
+                    -1 if scaling_max_voltage_change is None
+                    else int(bool(scaling_max_voltage_change))),
+                max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
         else:
             # Python extraction fallback: bare [pvpq|pq] system (no distributed
             # slack in the Jacobian).
@@ -171,7 +209,12 @@ class AcPfGPU:
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
                 pivot_epsilon_alg=pivot_epsilon_alg_enum,
-                debug_base_case=bool(debug_base_case))
+                debug_base_case=bool(debug_base_case),
+                # No grid config to inherit here either (Python-side fallback,
+                # not the bridge) -- None means off.
+                scaling_max_voltage_change=bool(scaling_max_voltage_change),
+                max_dVa=0.5 if max_dVa is None else float(max_dVa),
+                max_dVm=0.1 if max_dVm is None else float(max_dVm))
 
     def solve(self):
         """Return the solved complex voltage vector (host copy)."""

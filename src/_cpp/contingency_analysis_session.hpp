@@ -85,6 +85,16 @@ struct ContingencyAnalysisSession {
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
 
+    // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
+    // AcPfNrState AND the batch driver used by run() -- see AcPfNrState's own
+    // doc. Computed PER BATCH SLOT (each contingency/scenario gets its own
+    // alpha from its own max|dtheta|/max|dvm|, not a single alpha shared
+    // across the whole chunk) -- a "hard" scenario is damped on its own
+    // terms without over-damping the easy ones sharing its chunk.
+    bool   scaling_max_voltage_change_ = false;
+    double max_dVa_ = 0.5;
+    double max_dVm_ = 0.1;
+
     // handle_disconnected_grid: when true, a contingency that splits the grid is
     // solved on its largest connected component (the rest is frozen and reported
     // as NaN) instead of being skipped — unless it strands the angle reference or
@@ -168,7 +178,14 @@ struct ContingencyAnalysisSession {
         // doc): force the pre-ground-truth cuDSS-solve derivation of
         // slack_absorbed/vc_q even when lightsim2grid's own converged values
         // are available. Default false (prefer ground truth).
-        bool   debug_base_case = false
+        bool   debug_base_case = false,
+        // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
+        // AcPfNrState AND scaling_max_voltage_change_/max_dVa_/max_dVm_ (used
+        // by the batch solver in run(), computed per batch slot -- see the
+        // members' own doc). Off by default; see AcPfNrState's own doc.
+        bool   scaling_max_voltage_change = false,
+        double max_dVa = 0.5,
+        double max_dVm = 0.1
     );
 
     // =========================================================================

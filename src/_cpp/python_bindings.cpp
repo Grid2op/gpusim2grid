@@ -521,12 +521,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
               int max_iter, eigen_real_type tol, int device,
               bool presolved_v, ReorderingAlg reordering_alg,
               MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
-              bool debug_base_case) {
+              bool debug_base_case, bool scaling_max_voltage_change,
+              double max_dVa, double max_dVm) {
                return std::make_shared<AcPfNrSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    max_iter, tol, device, /*ledger=*/nullptr, presolved_v,
                    /*diag_stop_before_state_correction=*/false, reordering_alg,
-                   matching_alg, pivot_epsilon_alg, debug_base_case);
+                   matching_alg, pivot_epsilon_alg, debug_base_case,
+                   scaling_max_voltage_change, max_dVa, max_dVm);
            }),
          pybind11::arg("Ybus"),
          pybind11::arg("Vinit"),
@@ -543,6 +545,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
          pybind11::arg("debug_base_case") = false,
+         pybind11::arg("scaling_max_voltage_change") = false,
+         pybind11::arg("max_dVa") = 0.5,
+         pybind11::arg("max_dVm") = 0.1,
          "Construct and immediately solve the base-case AC power flow.\n\n"
          "Ybus          : scipy.sparse complex (n_bus x n_bus) admittance matrix.\n"
          "Vinit         : (n_bus,) complex128 warm-start voltages.\n"
@@ -575,7 +580,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "pre-ground-truth cuDSS-solve derivation of slack_absorbed/vc_q even "
          "when lightsim2grid's own converged values are available -- an "
          "opt-in diagnostic, e.g. to keep testing cuDSS config choices in "
-         "isolation.")
+         "isolation.\n"
+         "scaling_max_voltage_change / max_dVa / max_dVm (default False / 0.5 / "
+         "0.1): NR step-scaling, mirrors lightsim2grid's own "
+         "MaxVoltageChangeScalingPolicy -- after solving J*dx=F, scale the WHOLE "
+         "step by alpha<=1 so max|dtheta|<=max_dVa and max|dvm|<=max_dVm before "
+         "applying it anywhere. Off by default (this constructor has no grid to "
+         "inherit a policy from -- see _make_acpf_session_from_lsgrid for the "
+         "grid-inheriting bridge path). Only meaningful with presolved_v=False "
+         "(the GPU actually iterates); without it, an undamped GPU Newton step "
+         "can converge onto a different (sometimes spurious) root than "
+         "lightsim2grid's own damped trajectory when seeded far from the "
+         "solution (e.g. a flat/DC start).")
     .def_property_readonly("timings", &AcPfNrSession::timings,
          "AcPfTimings struct with per-phase timing breakdowns.")
     .def("get_v", &AcPfNrSession::get_v,
@@ -782,13 +798,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
               int batch_size, int nb_iter, int max_iter_base, double tol_base,
               int device, bool presolved_v, ReorderingAlg reordering_alg,
               MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
-              bool debug_base_case) {
+              bool debug_base_case, bool scaling_max_voltage_change,
+              double max_dVa, double max_dVm) {
                return std::make_shared<ContingencyAnalysisSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    batch_size, nb_iter, max_iter_base, tol_base, device,
                    /*ledger=*/nullptr, presolved_v,
                    reordering_alg, matching_alg, pivot_epsilon_alg,
-                   debug_base_case);
+                   debug_base_case,
+                   scaling_max_voltage_change, max_dVa, max_dVm);
            }),
          pybind11::arg("Ybus"),
          pybind11::arg("Vinit"),
@@ -807,6 +825,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
          pybind11::arg("debug_base_case") = false,
+         pybind11::arg("scaling_max_voltage_change") = false,
+         pybind11::arg("max_dVa") = 0.5,
+         pybind11::arg("max_dVm") = 0.1,
          "Construct and solve the base case.\n\n"
          "Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq : grid arrays "
          "(same convention as AcPfNrSession).\n"
@@ -903,6 +924,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the batch cuDSS "
                    "ANALYSIS (PivotEpsilonAlg enum; takes effect on the next "
                    "run(), which always reruns ANALYSIS).")
+    .def_readwrite("scaling_max_voltage_change",
+                   &ContingencyAnalysisSession::scaling_max_voltage_change_,
+                   "NR step-scaling (mirrors lightsim2grid's own "
+                   "MaxVoltageChangeScalingPolicy); takes effect on the next "
+                   "run(). Each batch slot (contingency/scenario) gets its own "
+                   "alpha from its own max|dtheta|/max|dvm|, not one alpha "
+                   "shared across the whole chunk -- a 'hard' scenario is "
+                   "damped on its own terms. Off by default.")
+    .def_readwrite("max_dVa", &ContingencyAnalysisSession::max_dVa_,
+                   "MaxVoltageChangeScalingPolicy max angle step (rad); only "
+                   "meaningful with scaling_max_voltage_change=True.")
+    .def_readwrite("max_dVm", &ContingencyAnalysisSession::max_dVm_,
+                   "MaxVoltageChangeScalingPolicy max voltage-magnitude step "
+                   "(pu); only meaningful with scaling_max_voltage_change=True.")
     .def_readwrite("handle_disconnected_grid",
                    &ContingencyAnalysisSession::handle_disconnected_grid_,
                    "When True, a contingency that splits the grid is solved on its "
@@ -1011,13 +1046,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
               int batch_size, int nb_iter, int max_iter_base, double tol_base,
               int device, bool presolved_v, ReorderingAlg reordering_alg,
               MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
-              bool debug_base_case) {
+              bool debug_base_case, bool scaling_max_voltage_change,
+              double max_dVa, double max_dVm) {
                return std::make_shared<InjectionSweepSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    batch_size, nb_iter, max_iter_base, tol_base, device,
                    /*ledger=*/nullptr, presolved_v,
                    reordering_alg, matching_alg, pivot_epsilon_alg,
-                   debug_base_case);
+                   debug_base_case,
+                   scaling_max_voltage_change, max_dVa, max_dVm);
            }),
          pybind11::arg("Ybus"),
          pybind11::arg("Vinit"),
@@ -1036,6 +1073,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
          pybind11::arg("debug_base_case") = false,
+         pybind11::arg("scaling_max_voltage_change") = false,
+         pybind11::arg("max_dVa") = 0.5,
+         pybind11::arg("max_dVm") = 0.1,
          "Construct and solve the base case. Arguments match "
          "ContingencyAnalysisSession, except batch_size counts injection "
          "scenarios per GPU chunk.")
@@ -1112,6 +1152,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the batch cuDSS "
                    "ANALYSIS (PivotEpsilonAlg enum; takes effect on the next "
                    "run(), which always reruns ANALYSIS).")
+    .def_readwrite("scaling_max_voltage_change",
+                   &InjectionSweepSession::scaling_max_voltage_change_,
+                   "NR step-scaling (mirrors lightsim2grid's own "
+                   "MaxVoltageChangeScalingPolicy); takes effect on the next "
+                   "run(). Each batch slot (scenario) gets its own alpha from "
+                   "its own max|dtheta|/max|dvm|, not one alpha shared across "
+                   "the whole chunk. Off by default.")
+    .def_readwrite("max_dVa", &InjectionSweepSession::max_dVa_,
+                   "MaxVoltageChangeScalingPolicy max angle step (rad); only "
+                   "meaningful with scaling_max_voltage_change=True.")
+    .def_readwrite("max_dVm", &InjectionSweepSession::max_dVm_,
+                   "MaxVoltageChangeScalingPolicy max voltage-magnitude step "
+                   "(pu); only meaningful with scaling_max_voltage_change=True.")
     // -------------------------------------------------------------------
     // Zero-copy DLPack exporters.
     // -------------------------------------------------------------------
@@ -1132,12 +1185,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            int batch_size, int nb_iter, int max_iter_base, double tol_base,
            int device, bool compute_limit_violations,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case) {
+           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           int scaling_max_voltage_change_override,
+           double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ca_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, compute_limit_violations,
-                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
+                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("init_from_n_powerflow")   = true,
@@ -1151,6 +1207,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
         pybind11::arg("debug_base_case") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "Build a ContingencyAnalysisSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy: Ybus/Sbus/V/pv/pq/slack + branch admittances are "
         "read off the C++ object). Branch data is set automatically. Solves the "
@@ -1163,7 +1222,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "run() (single source of truth). debug_base_case (default False): opt-in "
         "diagnostic -- see AcPfNrState's own doc. When init_from_n_powerflow=True, "
         "the grid's own solved state is verified via LSGrid::check_solution() "
-        "before being trusted (raises RuntimeError if it fails).");
+        "before being trusted (raises RuntimeError if it fails).\n"
+        "scaling_max_voltage_change_override / max_dVa_override / "
+        "max_dVm_override: NR step-scaling (mirrors lightsim2grid's own "
+        "MaxVoltageChangeScalingPolicy), same sentinel convention as "
+        "_make_acpf_session_from_lsgrid (-1/negative = inherit the grid's own "
+        "get_ac_algo_config()). init_from_n_powerflow only gates the BASE-CASE "
+        "solve's own presolved-vs-iterative choice; the per-contingency/"
+        "scenario batch loop that run() drives always iterates regardless, so "
+        "this is meaningful there either way. Each batch slot gets its own "
+        "alpha from its own max|dtheta|/max|dvm|, not one alpha shared across "
+        "the whole chunk.");
 
     m.def("_extract_limits_from_lsgrid",
         [](pybind11::object grid_py, int n_bus_solver) {
@@ -1182,12 +1251,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            int batch_size, int nb_iter, int max_iter_base, double tol_base,
            int device, bool with_branch_data,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case) {
+           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           int scaling_max_voltage_change_override,
+           double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_is_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, with_branch_data,
-                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case);
+                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("init_from_n_powerflow") = true,
@@ -1201,6 +1273,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
         pybind11::arg("debug_base_case") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "Build an InjectionSweepSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy). Branch data is set automatically when requested. "
         "Solves the same augmented system lightsim2grid poses (distributed slack / "
@@ -1211,18 +1286,29 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "(default False): opt-in diagnostic -- see AcPfNrState's own doc. When "
         "init_from_n_powerflow=True, the grid's own solved state is verified "
         "via LSGrid::check_solution() before being trusted (raises "
-        "RuntimeError if it fails).");
+        "RuntimeError if it fails).\n"
+        "scaling_max_voltage_change_override / max_dVa_override / "
+        "max_dVm_override: NR step-scaling (mirrors lightsim2grid's own "
+        "MaxVoltageChangeScalingPolicy), same sentinel convention as "
+        "_make_acpf_session_from_lsgrid (-1/negative = inherit the grid's own "
+        "get_ac_algo_config()). Applied to BOTH the base-case solve and the "
+        "batch solver used by run() -- each scenario gets its own alpha from "
+        "its own max|dtheta|/max|dvm|, not one alpha shared across the whole "
+        "chunk.");
 
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device,
            bool init_from_n_powerflow, bool diag_stop_before_state_correction,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case) {
+           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           int scaling_max_voltage_change_override,
+           double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid(
                 grid, max_iter, tol, device, init_from_n_powerflow,
                 diag_stop_before_state_correction, reordering_alg, matching_alg,
-                pivot_epsilon_alg, debug_base_case);
+                pivot_epsilon_alg, debug_base_case,
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("max_iter") = 10,
@@ -1234,6 +1320,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
         pybind11::arg("debug_base_case") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "Build a single-system AcPfNrSession from a solved lightsim2grid LSGrid, "
         "solving the same augmented system (distributed slack / extensions) via "
         "the NRLedger read off the C++ object. With init_from_n_powerflow=True "
@@ -1255,7 +1344,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "active. Forces the pre-ground-truth cuDSS-solve derivation of "
         "slack_absorbed/vc_q even when lightsim2grid's own converged values are "
         "available -- an opt-in diagnostic, e.g. to keep testing cuDSS config "
-        "choices in isolation.");
+        "choices in isolation.\n"
+        "scaling_max_voltage_change_override / max_dVa_override / "
+        "max_dVm_override: NR step-scaling (mirrors lightsim2grid's own "
+        "MaxVoltageChangeScalingPolicy). By default (-1 / negative sentinels) "
+        "mirrors whatever the grid's OWN get_ac_algo_config() has set -- opt-in, "
+        "inheriting lightsim2grid's own configured policy. Pass 0/1 to force it "
+        "off/on regardless of the grid's own config, and/or a non-negative "
+        "max_dVa/max_dVm to override those specifically. Only meaningful when "
+        "init_from_n_powerflow=False (the GPU actually iterates); without it, an "
+        "undamped GPU Newton step can converge onto a different (sometimes "
+        "spurious) root than lightsim2grid's own damped trajectory when seeded "
+        "far from the solution (e.g. a flat/DC start).");
 
     m.def("_make_acpf_session_from_lsgrid_with_sbus",
         [](pybind11::object grid_py, Eigen::Ref<const CplxVect> Sbus,

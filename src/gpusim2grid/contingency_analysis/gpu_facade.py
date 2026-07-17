@@ -150,6 +150,30 @@ class ContingencyAnalysisGPU:
         diagnostic (e.g. to keep testing ``reordering_alg``/``matching_alg``/
         ``pivot_epsilon_alg`` choices in isolation, or to cross-validate the
         GPU's own Newton-derived state against lightsim2grid's).
+    scaling_max_voltage_change : bool or None, default None
+        NR step-scaling, mirrors lightsim2grid's own
+        ``MaxVoltageChangeScalingPolicy``: after solving for the Newton step,
+        scale it by ``alpha <= 1`` so ``max|dtheta| <= max_dVa`` and
+        ``max|dVm| <= max_dVm`` before applying it anywhere. Applied to BOTH
+        the base-case solve AND the batch solver used by :meth:`compute` --
+        each contingency/scenario in the batch gets its OWN alpha from its
+        own max step, not one alpha shared across the whole chunk (a "hard"
+        contingency is damped on its own terms). ``None`` (default) is
+        opt-in by inheritance: mirrors whatever ``grid``'s own
+        ``get_ac_algo_config()`` is already set to, so behavior only changes
+        for grids the caller explicitly configured with damping. Pass
+        ``True``/``False`` to force it on/off regardless of the grid's own
+        config. Without it, an undamped GPU Newton step can converge onto a
+        different (sometimes spurious) root when seeded far from the
+        solution (e.g. ``init_from_n_powerflow=False`` from a DC warm-start)
+        -- observed on real RTE grids. The mutable ``scaling_max_voltage_change``/
+        ``max_dVa``/``max_dVm`` properties on the returned object only ever
+        affect the batch solver afterward (same scope as ``reordering_alg``).
+    max_dVa, max_dVm : float or None, default None
+        ``MaxVoltageChangeScalingPolicy`` thresholds (radians / pu). ``None``
+        inherits the grid's own configured values (or lightsim2grid's own
+        defaults, 0.5 / 0.1, if forcing ``scaling_max_voltage_change=True``
+        with no grid to inherit from). Ignored unless step-scaling is active.
 
     Examples
     --------
@@ -174,7 +198,8 @@ class ContingencyAnalysisGPU:
                  use_bridge=None, handle_disconnected_grid=False,
                  compute_limit_violations=False, reordering_alg=None,
                  matching_alg=None, pivot_epsilon_alg=None,
-                 debug_base_case=False):
+                 debug_base_case=False,
+                 scaling_max_voltage_change=None, max_dVa=None, max_dVm=None):
         _validate_precision(precision)
 
         # Single source of truth, resolved once here and applied at
@@ -201,7 +226,11 @@ class ContingencyAnalysisGPU:
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                 pivot_epsilon_alg=_pivot_epsilon_alg,
-                debug_base_case=bool(debug_base_case))
+                debug_base_case=bool(debug_base_case),
+                # No grid to inherit a scaling policy from -- None means off.
+                scaling_max_voltage_change=bool(scaling_max_voltage_change),
+                max_dVa=0.5 if max_dVa is None else float(max_dVa),
+                max_dVm=0.1 if max_dVm is None else float(max_dVm))
             # No grid to auto-extract branch/limit data from: the caller must
             # call set_branch_data() (and set_limits() before compute() when
             # compute_limit_violations is wanted).
@@ -231,7 +260,15 @@ class ContingencyAnalysisGPU:
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
-                    debug_base_case=bool(debug_base_case))
+                    debug_base_case=bool(debug_base_case),
+                    # None => -1/-1.0 sentinels: inherit the grid's own
+                    # get_ac_algo_config() (opt-in by construction). See
+                    # AcPfGPU's identical pattern.
+                    scaling_max_voltage_change_override=(
+                        -1 if scaling_max_voltage_change is None
+                        else int(bool(scaling_max_voltage_change))),
+                    max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
                 self._inner = _ContingencyAnalysisSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
@@ -260,7 +297,12 @@ class ContingencyAnalysisGPU:
                     presolved_v=init_from_n_powerflow,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                     pivot_epsilon_alg=_pivot_epsilon_alg,
-                    debug_base_case=bool(debug_base_case))
+                    debug_base_case=bool(debug_base_case),
+                    # Python-array fallback: no C++ bridge to inherit the
+                    # grid's algo config through, same as the tuple path.
+                    scaling_max_voltage_change=bool(scaling_max_voltage_change),
+                    max_dVa=0.5 if max_dVa is None else float(max_dVa),
+                    max_dVm=0.1 if max_dVm is None else float(max_dVm))
 
                 # Branch admittances come straight from lightsim2grid (never
                 # recomputed) so branch-removal contingencies become exact Ybus

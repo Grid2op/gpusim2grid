@@ -75,7 +75,10 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     int                   refactor_period,
     ReorderingAlg         reordering_alg,
     MatchingAlg           matching_alg,
-    PivotEpsilonAlg       pivot_epsilon_alg)
+    PivotEpsilonAlg       pivot_epsilon_alg,
+    bool                  scaling_max_voltage_change,
+    double                max_dVa,
+    double                max_dVm)
     : base(base_state)
     , source_(std::move(source))
     , n_contingencies(n_contingencies_in)
@@ -85,6 +88,9 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
       // Chunks are formed over the ACTIVE set: disconnected contingencies are
       // compacted out by the source and never occupy a batch slot.
     , n_chunks_((source_.n_active() + batch_size - 1) / batch_size)
+    , scaling_max_voltage_change_(scaling_max_voltage_change)
+    , max_dVa_(static_cast<cuda_real_type>(max_dVa))
+    , max_dVm_(static_cast<cuda_real_type>(max_dVm))
 {
     // Pin this driver's stream and allocations to the same device as base.
     CHK_CUDA_BPF(cudaSetDevice(base.device_id_));
@@ -145,6 +151,12 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
             d_slack_absorbed_batch.resize(batch_size_);
         if (base.n_vc_ctrl > 0)
             d_vc_q_batch.resize(static_cast<size_t>(batch_size_) * base.n_vc_ctrl);
+
+        // NR step-scaling scratch (one max|dtheta|/max|dvm| pair per slot).
+        if (scaling_max_voltage_change_) {
+            d_scale_max_dtheta_batch.resize(batch_size_);
+            d_scale_max_dvm_batch.resize(batch_size_);
+        }
 
         d_V_results.resize(static_cast<size_t>(n_contingencies) * n_bus);
         d_residuals.resize(n_contingencies, cuda_real_type(0));
@@ -613,6 +625,16 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         thrust::raw_pointer_cast(base.d_vc_feat_val.data()),
         thrust::raw_pointer_cast(d_vc_q_batch.data()),
     };
+
+    // NR step-scaling (MaxVoltageChange) -- off (nullptr scratch) unless
+    // enabled, matching every other opt-in extension above.
+    buf.scaling_max_voltage_change = scaling_max_voltage_change_;
+    buf.max_dVa = max_dVa_;
+    buf.max_dVm = max_dVm_;
+    if (scaling_max_voltage_change_) {
+        buf.d_scale_max_dtheta = thrust::raw_pointer_cast(d_scale_max_dtheta_batch.data());
+        buf.d_scale_max_dvm    = thrust::raw_pointer_cast(d_scale_max_dvm_batch.data());
+    }
 
     // handle_disconnected_grid: attach this chunk's mask slice (no-op for the
     // injection sweep / when the mode is off). d_J_outer is the shared skeleton.

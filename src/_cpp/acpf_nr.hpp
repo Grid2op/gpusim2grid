@@ -71,7 +71,18 @@ struct AcPfNrSession {
         // cuDSS-solve derivation of MultiSlack slack_absorbed / VoltageControl
         // vc_q, even when lightsim2grid's own converged values are available.
         // See AcPfNrState's own doc. Default false (prefer ground truth).
-        bool                                          debug_base_case = false
+        bool                                          debug_base_case = false,
+        // NR step-scaling (mirrors lightsim2grid's own MaxVoltageChangeScalingPolicy,
+        // ScalingPolicies.hpp): after solving J*dx=F, scale the WHOLE dx by
+        // alpha<=1 so max|dtheta|<=max_dVa and max|dvm|<=max_dVm BEFORE applying
+        // it anywhere. See AcPfNrState's own doc. Off by default -- opt-in only,
+        // this constructor has no grid to inherit a policy from (that
+        // inheritance happens in the ls2g bridge path -- see
+        // make_acpf_session_from_lsgrid). max_dVa/max_dVm default to
+        // lightsim2grid's own MaxVoltageChangeScalingPolicy defaults.
+        bool                                          scaling_max_voltage_change = false,
+        double                                        max_dVa = 0.5,
+        double                                        max_dVm = 0.1
     );
 
     AcPfTimings timings() const;

@@ -234,6 +234,169 @@ def test_acpf_gpu_presolved_v_false_matches_reference(
         np.abs(V), np.abs(ieee14_base_case["v_ref"]), atol=10 * solver_atol)
 
 
+def _case14_grid_and_poor_seed():
+    """Fresh (not the shared session-scoped fixture -- this test mutates the
+    grid's algo config and solver-side V) case14 grid, its AC reference
+    voltage from a flat start, and a deliberately rough seed (magnitude 0.85,
+    angles perturbed +/-0.4 rad) far enough from the solution that an
+    undamped GPU Newton step genuinely fails to converge on it (verified:
+    still hasn't converged after 200 iterations, error growing rather than
+    shrinking -- not just "needs more iterations")."""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+    grid = init_from_pandapower(pn.case14())
+    grid.change_algorithm(AlgorithmType.NR_KLU)
+    n_bus = grid.get_bus_vn_kv().shape[0]
+
+    v_flat = np.ones(n_bus, dtype=complex)
+    v_ref = grid.ac_pf(v_flat.copy(), 20, 1e-10)
+    assert v_ref.shape[0] == n_bus, "reference AC solve diverged"
+
+    rng = np.random.RandomState(0)
+    v_poor = (0.85 * np.exp(1j * rng.uniform(-0.4, 0.4, n_bus))).astype(complex)
+    return grid, v_ref, v_poor
+
+
+def _seed_v_solver(grid, v_seed, tol):
+    """Set get_V_solver() to v_seed untouched (0 CPU Newton iterations), so
+    the GPU bridge (which always reads V0 from get_V_solver()) sees the exact
+    rough seed instead of a CPU-converged answer. See AcPfGPU.ac_pf's own doc
+    for why this trick works."""
+    grid.ac_pf(v_seed.copy(), 0, tol)
+
+
+@requires_gpu
+def test_acpf_gpu_step_scaling_recovers_convergence(solver_atol):
+    """scaling_max_voltage_change=True (MaxVoltageChangeScalingPolicy, mirrors
+    lightsim2grid's own damping) lets the GPU's own iterative NR loop
+    (init_from_n_powerflow=False) converge to the correct answer from a rough
+    seed where the undamped full-Newton-step GPU loop genuinely fails --
+    exactly the failure mode observed on real RTE grids with grouped
+    VoltageControl (see the vc_shared_bus_qcol_bug / DC-seed sweep
+    investigation): an undamped step can converge onto a different root, or
+    not converge at all, when started far from the solution."""
+    from gpusim2grid import AcPfGPU
+
+    grid, v_ref, v_poor = _case14_grid_and_poor_seed()
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    ac_unscaled = AcPfGPU(grid, init_from_n_powerflow=False, max_iter=50, tol=1e-10,
+                          scaling_max_voltage_change=False)
+    V_unscaled = ac_unscaled.solve()
+    assert not ac_unscaled.timings.converged, "test seed should defeat the undamped GPU loop"
+    assert not np.allclose(np.abs(V_unscaled), np.abs(v_ref), atol=1e-3)
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    ac_scaled = AcPfGPU(grid, init_from_n_powerflow=False, max_iter=50, tol=1e-10,
+                        scaling_max_voltage_change=True, max_dVa=0.02, max_dVm=0.01)
+    V_scaled = ac_scaled.solve()
+    assert ac_scaled.timings.converged
+    np.testing.assert_allclose(
+        np.abs(V_scaled), np.abs(v_ref), atol=10 * solver_atol)
+
+
+@requires_gpu
+def test_acpf_gpu_step_scaling_inherits_grid_config(solver_atol):
+    """scaling_max_voltage_change=None (the default) mirrors whatever the
+    lightsim2grid grid's OWN get_ac_algo_config() is set to -- opt-in by
+    inheritance, not a separate gpusim2grid-level default. Explicitly forcing
+    it False overrides that inherited config back off, even on the exact same
+    grid/seed."""
+    from lightsim2grid.lightsim2grid_cpp import ScalingPolicyType
+    from gpusim2grid import AcPfGPU
+
+    grid, v_ref, v_poor = _case14_grid_and_poor_seed()
+
+    cfg = grid.get_ac_algo_config()
+    ip = list(cfg.int_params)
+    ip[0] = int(ScalingPolicyType.MaxVoltageChange)
+    cfg.int_params = ip
+    rp = list(cfg.real_params)
+    rp[0] = 0.02  # max_dVa
+    rp[1] = 0.01  # max_dVm
+    cfg.real_params = rp
+    grid.set_ac_algo_config(cfg)
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    ac_default = AcPfGPU(grid, init_from_n_powerflow=False, max_iter=100, tol=1e-10)
+    V_default = ac_default.solve()
+    assert ac_default.timings.converged, "should inherit the grid's own MaxVoltageChange config"
+    np.testing.assert_allclose(
+        np.abs(V_default), np.abs(v_ref), atol=10 * solver_atol)
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    ac_forced_off = AcPfGPU(grid, init_from_n_powerflow=False, max_iter=100, tol=1e-10,
+                            scaling_max_voltage_change=False)
+    ac_forced_off.solve()
+    assert not ac_forced_off.timings.converged, (
+        "explicit override should take priority over the grid's own config")
+
+
+@requires_gpu
+def test_contingency_gpu_step_scaling_recovers_convergence():
+    """Same step-scaling mechanism as test_acpf_gpu_step_scaling_recovers_
+    convergence, but through ContingencyAnalysisGPU's BATCH driver -- each
+    contingency in the batch gets its own alpha from its own max|dtheta|/
+    max|dvm|, not one shared across the chunk (see BatchPfDriver's own doc).
+    Without scaling, the batch NR loop from the rough seed blows up (residuals
+    in the tens to hundreds); with it, every contingency converges to machine
+    precision."""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid, _, v_poor = _case14_grid_and_poor_seed()
+    n_lines = min(5, len(grid.get_lines()))
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    ca_unscaled = ContingencyAnalysisGPU(
+        grid, init_from_n_powerflow=False, nb_iter=50, max_iter_base=1,
+        scaling_max_voltage_change=False)
+    ca_unscaled.add_contingencies_by_branch_id([[c] for c in range(n_lines)])
+    ca_unscaled.compute(batch_size=8)
+    assert np.all(ca_unscaled.last_residuals() > 1.0), (
+        "test seed should defeat the undamped batch NR loop")
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    ca_scaled = ContingencyAnalysisGPU(
+        grid, init_from_n_powerflow=False, nb_iter=100, max_iter_base=1,
+        scaling_max_voltage_change=True, max_dVa=0.02, max_dVm=0.01)
+    ca_scaled.add_contingencies_by_branch_id([[c] for c in range(n_lines)])
+    ca_scaled.compute(batch_size=8)
+    np.testing.assert_array_less(ca_scaled.last_residuals(), 1e-8)
+
+
+@requires_gpu
+def test_injection_sweep_gpu_step_scaling_recovers_convergence():
+    """Same as test_contingency_gpu_step_scaling_recovers_convergence, through
+    InjectionSweepGPU's batch driver (each scenario gets its own alpha)."""
+    from gpusim2grid import InjectionSweepGPU
+
+    grid, _, v_poor = _case14_grid_and_poor_seed()
+    n_bus = grid.get_bus_vn_kv().shape[0]
+    sn = grid.get_sn_mva()
+    Sbus = grid.get_Sbus_solver()
+    p_mw = np.tile(Sbus.real * sn, (3, 1))
+    q_mvar = np.tile(Sbus.imag * sn, (3, 1))
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    is_unscaled = InjectionSweepGPU(
+        grid, init_from_n_powerflow=False, nb_iter=50, max_iter_base=1,
+        scaling_max_voltage_change=False)
+    is_unscaled.set_injections(p_mw, q_mvar, sn)
+    is_unscaled.compute(batch_size=4)
+    assert np.all(is_unscaled.last_residuals() > 1.0), (
+        "test seed should defeat the undamped batch NR loop")
+
+    _seed_v_solver(grid, v_poor, 1e-10)
+    is_scaled = InjectionSweepGPU(
+        grid, init_from_n_powerflow=False, nb_iter=100, max_iter_base=1,
+        scaling_max_voltage_change=True, max_dVa=0.02, max_dVm=0.01)
+    is_scaled.set_injections(p_mw, q_mvar, sn)
+    is_scaled.compute(batch_size=4)
+    np.testing.assert_array_less(is_scaled.last_residuals(), 1e-8)
+
+
 @requires_gpu
 def test_acpf_gpu_presolved_v_raises_when_not_converged():
     """init_from_n_powerflow=True must fail loudly if V0 is not actually

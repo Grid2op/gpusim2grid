@@ -147,6 +147,25 @@ inline void run_nr_loop(
         const bool did_refactor = policy.solve_iter(
             linear_solver, buf.d_J_values, cs, timer, step);
 
+        // ④b Step-scaling (MaxVoltageChange), if enabled -- rescale each
+        //     batch slot's dx BEFORE applying it anywhere, so Va/Vm and any
+        //     extension state move together, exactly like lightsim2grid's own
+        //     apply_step(coeff*F). Computed PER SLOT (own max|dtheta|/max|dvm|,
+        //     own alpha) -- a "hard" contingency in the batch gets damped on
+        //     its own terms, not by whatever the worst slot in the batch needs.
+        //     Folded into the same t.t_solve bucket (no new timing field).
+        if (buf.scaling_max_voltage_change) {
+            cudaMemsetAsync(buf.d_scale_max_dtheta, 0, batch_size * sizeof(cuda_real_type), cs);
+            cudaMemsetAsync(buf.d_scale_max_dvm,    0, batch_size * sizeof(cuda_real_type), cs);
+            const int total = buf.n_theta + buf.n_vm;
+            reduce_step_norms_kernel<<<(batch_size * total + BS - 1) / BS, BS, 0, cs>>>(
+                buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
+                dim_J, batch_size, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
+            apply_step_scale_kernel<<<(batch_size * dim_J + BS - 1) / BS, BS, 0, cs>>>(
+                buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
+                buf.max_dVa, buf.max_dVm, dim_J, batch_size);
+        }
+
         // ⑤  Update V: Va (pvpq) then Vm (pq) — both on cs, CUDA stream ordering
         //     serialises them without an explicit CPU event.
         timer.start();

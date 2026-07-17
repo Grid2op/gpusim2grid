@@ -88,7 +88,16 @@ make_acpf_session_from_lsgrid(
     // Opt-in diagnostic (see AcPfNrState's own doc): force the pre-ground-truth
     // cuDSS-solve derivation of slack_absorbed/vc_q even when lightsim2grid's
     // own converged values are available. No-op unless init_from_n_powerflow.
-    bool   debug_base_case = false);
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange): by default (-1 / negative sentinels)
+    // this mirrors whatever the grid's OWN get_ac_algo_config() has set --
+    // opt-in, inheriting lightsim2grid's own configured policy rather than a
+    // separate gpusim2grid-level default. Pass 0/1 to force it off/on
+    // regardless of the grid's own config, and/or a non-negative max_dVa/
+    // max_dVm to override those specifically. See AcPfNrState's own doc.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0);
 
 // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
 // (solver numbering) instead of the grid's own Sbus. The ledger structure is
@@ -125,7 +134,16 @@ make_ca_session_from_lsgrid(
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
-    bool   debug_base_case = false);
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange): by default (-1 / negative sentinels)
+    // mirrors the grid's OWN get_ac_algo_config() -- see
+    // make_acpf_session_from_lsgrid's own doc for the sentinel convention.
+    // Applied to BOTH base_state_'s AcPfNrState and the batch driver used by
+    // run() (computed PER BATCH SLOT there -- see ContingencyAnalysisSession's
+    // own doc), same single-source-of-truth pattern as reordering_alg.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0);
 
 // Extract compute_limit_violations limits off a solved LSGrid: bus voltage
 // limits (kV, relabeled from grid-model to AC-solver bus numbering via
@@ -157,6 +175,11 @@ make_is_session_from_lsgrid(
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
-    bool   debug_base_case = false);
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
+    // own doc.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0);
 
 #endif  // LS2G_BRIDGE_HPP

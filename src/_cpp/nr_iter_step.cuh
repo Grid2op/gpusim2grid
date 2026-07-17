@@ -157,6 +157,22 @@ struct NrIterBuffers {
     const int*             d_maskv_slot   = nullptr;   // [n_mask_v]
     const int*             d_maskv_bus    = nullptr;   // [n_mask_v]
     int                    n_mask_v       = 0;
+
+    // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
+    // launched) unless enabled. Mirrors lightsim2grid's own
+    // MaxVoltageChangeScalingPolicy: after solving J*dx=F, scale dx by
+    // alpha<=1 so max|dtheta|<=max_dVa and max|dvm|<=max_dVm BEFORE applying
+    // it anywhere (Va/Vm AND any extension state columns), matching
+    // NRAlgo.tpp's apply_step(coeff * F). See LedgerData::
+    // scaling_max_voltage_change's own doc for why this exists: an undamped
+    // full Newton step can converge onto a different (sometimes spurious)
+    // root than lightsim2grid's own damped trajectory when seeded far from
+    // the solution.
+    bool                   scaling_max_voltage_change = false;
+    cuda_real_type         max_dVa = static_cast<cuda_real_type>(0.5);
+    cuda_real_type         max_dVm = static_cast<cuda_real_type>(0.1);
+    cuda_real_type*        d_scale_max_dtheta = nullptr;  // [actual_batch] scratch, zeroed each call
+    cuda_real_type*        d_scale_max_dvm    = nullptr;  // [actual_batch] scratch, zeroed each call
 };
 
 // -----------------------------------------------------------------------------
@@ -405,6 +421,22 @@ inline void nr_iter_step_correct(
     timer.start();
     dss.solve(dss_A, dss_x, dss_b);
     t.t_solve += timer.stop_ms();
+
+    // ⑤b Step-scaling (MaxVoltageChange), if enabled -- rescale the WHOLE dx
+    //     vector BEFORE applying it anywhere, so Va/Vm and any extension state
+    //     move together, exactly like lightsim2grid's own apply_step(coeff*F).
+    //     Folded into the same t.t_solve bucket (no new timing field).
+    if (buf.scaling_max_voltage_change) {
+        cudaMemsetAsync(buf.d_scale_max_dtheta, 0, actual_batch * sizeof(cuda_real_type), cs);
+        cudaMemsetAsync(buf.d_scale_max_dvm,    0, actual_batch * sizeof(cuda_real_type), cs);
+        const int total = buf.n_theta + buf.n_vm;
+        reduce_step_norms_kernel<<<(actual_batch * total + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
+            dim_J, actual_batch, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
+        apply_step_scale_kernel<<<(actual_batch * dim_J + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
+            buf.max_dVa, buf.max_dVm, dim_J, actual_batch);
+    }
 
     // ⑥  Update V in-place: Va first, then Vm.
     //     Both kernels run on cs — CUDA stream ordering serialises them without

@@ -31,6 +31,29 @@ __device__ __forceinline__ void atomic_add_real(double* addr, double val) {
 #endif
 }
 
+// Portable atomic max for NON-NEGATIVE floats/doubles (CAS loop, works on all
+// compute capabilities -- IEEE754 bit-pattern ordering matches integer
+// ordering for non-negative values, so comparing the reinterpreted bits is
+// safe). Used by reduce_step_norms_kernel, which only ever feeds it fabs(dx).
+__device__ __forceinline__ void atomic_max_nonneg(float* addr, float val) {
+    int* p = reinterpret_cast<int*>(addr);
+    int old = *p, assumed;
+    do {
+        assumed = old;
+        if (__int_as_float(assumed) >= val) break;
+        old = atomicCAS(p, assumed, __float_as_int(val));
+    } while (assumed != old);
+}
+__device__ __forceinline__ void atomic_max_nonneg(double* addr, double val) {
+    unsigned long long int* p = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = *p, assumed;
+    do {
+        assumed = old;
+        if (__longlong_as_double(assumed) >= val) break;
+        old = atomicCAS(p, assumed, __double_as_longlong(val));
+    } while (assumed != old);
+}
+
 // =============================================================================
 // compute_branch_flows_kernel
 // =============================================================================
@@ -353,6 +376,65 @@ __global__ void fill_J_kernel(
     if (d_map_j12[k] >= 0) d_J_values[J_base + d_map_j12[k]] = CudaFunHelper::my_cuCreal(dSdVm);
     if (d_map_j21[k] >= 0) d_J_values[J_base + d_map_j21[k]] = CudaFunHelper::my_cuCimag(dSdVa);
     if (d_map_j22[k] >= 0) d_J_values[J_base + d_map_j22[k]] = CudaFunHelper::my_cuCimag(dSdVm);
+}
+
+// =============================================================================
+// NR step-scaling (MaxVoltageChange), mirrors lightsim2grid's own
+// MaxVoltageChangeScalingPolicy (ScalingPolicies.hpp): after solving J*dx=F,
+// scale the WHOLE dx vector by alpha<=1 so max|dtheta|<=max_dVa and
+// max|dvm|<=max_dVm BEFORE applying it anywhere (Va/Vm and any extension
+// state columns), exactly matching NRAlgo.tpp's apply_step(coeff * F). Two
+// passes, both no-ops unless the caller enables scaling (see NrIterBuffers'
+// own doc):
+//   reduce_step_norms_kernel : per-batch-slot max|dx| restricted to the
+//                              theta/vm columns (CAS-based atomic max --
+//                              values are always non-negative so the plain
+//                              bit-pattern comparison in atomic_max_nonneg is
+//                              safe).
+//   apply_step_scale_kernel  : rescales dx in place from those two maxima.
+// =============================================================================
+__global__ void reduce_step_norms_kernel(
+    const cuda_real_type* __restrict__ d_dx,
+    const int*             __restrict__ theta_cols,
+    const int*             __restrict__ vm_cols,
+    int n_theta, int n_vm,
+    int dim_J, int actual_batch,
+    cuda_real_type* __restrict__ d_max_dtheta,   // [actual_batch], zeroed before launch
+    cuda_real_type* __restrict__ d_max_dvm)      // [actual_batch], zeroed before launch
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_theta + n_vm;
+    const int b = tid / total;
+    if (b >= actual_batch) return;
+    const int k = tid % total;
+    if (k < n_theta) {
+        const cuda_real_type v = d_dx[b * dim_J + theta_cols[k]];
+        atomic_max_nonneg(&d_max_dtheta[b], v < 0 ? -v : v);
+    } else {
+        const cuda_real_type v = d_dx[b * dim_J + vm_cols[k - n_theta]];
+        atomic_max_nonneg(&d_max_dvm[b], v < 0 ? -v : v);
+    }
+}
+
+__global__ void apply_step_scale_kernel(
+          cuda_real_type* __restrict__ d_dx,
+    const cuda_real_type* __restrict__ d_max_dtheta,
+    const cuda_real_type* __restrict__ d_max_dvm,
+    cuda_real_type max_dVa, cuda_real_type max_dVm,
+    int dim_J, int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / dim_J;
+    if (b >= actual_batch) return;
+    const int j = tid % dim_J;
+
+    cuda_real_type alpha = static_cast<cuda_real_type>(1.);
+    const cuda_real_type mdt = d_max_dtheta[b];
+    if (mdt > max_dVa) alpha = alpha < (max_dVa / mdt) ? alpha : (max_dVa / mdt);
+    const cuda_real_type mdv = d_max_dvm[b];
+    if (mdv > max_dVm) alpha = alpha < (max_dVm / mdv) ? alpha : (max_dVm / mdv);
+
+    d_dx[b * dim_J + j] *= alpha;
 }
 
 // =============================================================================

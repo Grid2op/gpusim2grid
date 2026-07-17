@@ -216,7 +216,8 @@ class _InjectionSweepSolver:
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
                  device=None, presolved_v=False, reordering_alg='default',
                  matching_alg='none', pivot_epsilon_alg='default',
-                 debug_base_case=False):
+                 debug_base_case=False,
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -233,7 +234,9 @@ class _InjectionSweepSolver:
             reordering_alg=_resolve_reordering_alg(reordering_alg),
             matching_alg=_resolve_matching_alg(matching_alg),
             pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
-            debug_base_case=bool(debug_base_case))
+            debug_base_case=bool(debug_base_case),
+            scaling_max_voltage_change=bool(scaling_max_voltage_change),
+            max_dVa=float(max_dVa), max_dVm=float(max_dVm))
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -273,6 +276,38 @@ class _InjectionSweepSolver:
     @nb_iter.setter
     def nb_iter(self, value):
         self._s.nb_iter = int(value)
+
+    @property
+    def scaling_max_voltage_change(self):
+        """NR step-scaling (mirrors lightsim2grid's own
+        MaxVoltageChangeScalingPolicy); bool, takes effect on the next run().
+        Each batch slot gets its own alpha from its own max|dtheta|/max|dvm|.
+        """
+        return self._s.scaling_max_voltage_change
+
+    @scaling_max_voltage_change.setter
+    def scaling_max_voltage_change(self, value):
+        self._s.scaling_max_voltage_change = bool(value)
+
+    @property
+    def max_dVa(self):
+        """MaxVoltageChangeScalingPolicy max angle step (rad); only
+        meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVa
+
+    @max_dVa.setter
+    def max_dVa(self, value):
+        self._s.max_dVa = float(value)
+
+    @property
+    def max_dVm(self):
+        """MaxVoltageChangeScalingPolicy max voltage-magnitude step (pu);
+        only meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVm
+
+    @max_dVm.setter
+    def max_dVm(self, value):
+        self._s.max_dVm = float(value)
 
     @property
     def strategy(self):

@@ -176,6 +176,27 @@ __global__ void fill_J_kernel(
     int actual_batch);
 
 // ---------------------------------------------------------------------------
+// NR step-scaling (MaxVoltageChange) -- see acpf_nr_kernels.cu's own doc
+// above the definitions. Both no-ops unless the caller opts in (see
+// NrIterBuffers::scaling_max_voltage_change).
+// ---------------------------------------------------------------------------
+__global__ void reduce_step_norms_kernel(
+    const cuda_real_type* __restrict__ d_dx,
+    const int*             __restrict__ theta_cols,
+    const int*             __restrict__ vm_cols,
+    int n_theta, int n_vm,
+    int dim_J, int actual_batch,
+    cuda_real_type* __restrict__ d_max_dtheta,
+    cuda_real_type* __restrict__ d_max_dvm);
+
+__global__ void apply_step_scale_kernel(
+          cuda_real_type* __restrict__ d_dx,
+    const cuda_real_type* __restrict__ d_max_dtheta,
+    const cuda_real_type* __restrict__ d_max_dvm,
+    cuda_real_type max_dVa, cuda_real_type max_dVm,
+    int dim_J, int actual_batch);
+
+// ---------------------------------------------------------------------------
 // update_Va_kernel
 //
 // Applies angle corrections to each bus owning a theta unknown.

@@ -261,7 +261,10 @@ AcPfNrState::AcPfNrState(
     MatchingAlg                                  matching_alg,
     PivotEpsilonAlg                              pivot_epsilon_alg,
     bool                                         debug_base_case,
-    bool                                         base_case_only)
+    bool                                         base_case_only,
+    bool                                         scaling_max_voltage_change,
+    double                                       max_dVa,
+    double                                       max_dVm)
 {
     reordering_alg_    = reordering_alg;
     matching_alg_      = matching_alg;
@@ -845,7 +848,11 @@ AcPfNrState::AcPfNrState(
     // =========================================================================
 
     // Non-owning pointer bundle — views into the single-system device vectors.
-    const NrIterBuffers buf {
+    // Not const: the NR step-scaling fields are set via post-init assignment
+    // below (positional aggregate init can't skip over the trailing
+    // handle_disconnected_grid masking fields, which this single-system state
+    // never uses).
+    NrIterBuffers buf {
         thrust::raw_pointer_cast(d_J_values.data()),
         thrust::raw_pointer_cast(d_V.data()),
         thrust::raw_pointer_cast(d_Ibus.data()),
@@ -920,6 +927,20 @@ AcPfNrState::AcPfNrState(
         thrust::raw_pointer_cast(d_vc_feat_val.data()),
         thrust::raw_pointer_cast(d_vc_q.data()),
     };
+
+    // NR step-scaling (MaxVoltageChange) -- see acpf_nr_state.cuh's own doc on
+    // the constructor params. Off by default; the scratch buffers stay empty
+    // (buf.d_scale_max_d{theta,vm} stay nullptr) unless enabled, matching
+    // every other opt-in extension in this constructor.
+    buf.scaling_max_voltage_change = scaling_max_voltage_change;
+    buf.max_dVa = static_cast<cuda_real_type>(max_dVa);
+    buf.max_dVm = static_cast<cuda_real_type>(max_dVm);
+    if (scaling_max_voltage_change) {
+        d_scale_max_dtheta.resize(1);
+        d_scale_max_dvm.resize(1);
+        buf.d_scale_max_dtheta = thrust::raw_pointer_cast(d_scale_max_dtheta.data());
+        buf.d_scale_max_dvm    = thrust::raw_pointer_cast(d_scale_max_dvm.data());
+    }
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
 
@@ -1182,7 +1203,10 @@ AcPfNrSession::AcPfNrSession(
     ReorderingAlg                                reordering_alg,
     MatchingAlg                                  matching_alg,
     PivotEpsilonAlg                              pivot_epsilon_alg,
-    bool                                         debug_base_case
+    bool                                         debug_base_case,
+    bool                                         scaling_max_voltage_change,
+    double                                       max_dVa,
+    double                                       max_dVm
 )
 {
     (void)slack_ids;
@@ -1192,7 +1216,8 @@ AcPfNrSession::AcPfNrSession(
                                             presolved_v, diag_stop_before_state_correction,
                                             reordering_alg, matching_alg,
                                             pivot_epsilon_alg, debug_base_case,
-                                            /*base_case_only=*/false);
+                                            /*base_case_only=*/false,
+                                            scaling_max_voltage_change, max_dVa, max_dVm);
 }
 
 // =============================================================================
