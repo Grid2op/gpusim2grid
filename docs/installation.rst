@@ -25,7 +25,7 @@ From source
    git clone https://github.com/Grid2Op/gpusim2grid.git
    cd gpusim2grid
    source env_compile.sh   # exports CUDAToolkit_ROOT, cudss_ROOT, LD_LIBRARY_PATH — edit for your machine
-   pip install .
+   pip install --no-build-isolation .
 
 The lightsim2grid C++ bridge
 -----------------------------
@@ -42,7 +42,10 @@ Python interpreter it is building against for
 ``lightsim2grid.get_cmake_dir()`` and locates ``lightsim2grid_core`` from
 there. Since ``lightsim2grid`` is a build-system requirement (see
 ``pyproject.toml``), this works out of the box with a plain
-``pip install .`` / ``uv pip install .`` — no ``CMAKE_ARGS`` needed.
+``pip install --no-build-isolation .`` / ``uv pip install --no-build-isolation .``
+— no ``CMAKE_ARGS`` needed. ``--no-build-isolation`` is what makes the build
+see the ``lightsim2grid`` already installed in your current environment,
+instead of pip resolving a fresh, isolated one that may not match it.
 
 If you need the bridge to build against a *different* ``lightsim2grid``
 install than the one importable by that interpreter, override the
@@ -52,7 +55,7 @@ detection explicitly:
 
    CMAKE_ARGS="-DLIGHTSIM2GRID_CMAKE_DIR=$(python -c \
      'import lightsim2grid; print(lightsim2grid.get_cmake_dir())')" \
-     pip install .
+     pip install --no-build-isolation .
 
 When ``lightsim2grid_core`` cannot be found (bridge disabled), the build
 falls back to the vendored Eigen copy (``src/eigen/``) and the Python
@@ -100,9 +103,9 @@ Precision is chosen at **build time**. The default is FP64 (double).
 
 .. code-block:: bash
 
-   pip install .                      # FP64 (double), default
-   CUDA_REAL_FLOAT=1 pip install .    # FP32 (float)
-   CUDA_REAL_DOUBLE=1 pip install .   # FP64 (double), explicit
+   pip install --no-build-isolation .                      # FP64 (double), default
+   CUDA_REAL_FLOAT=1 pip install --no-build-isolation .    # FP32 (float)
+   CUDA_REAL_DOUBLE=1 pip install --no-build-isolation .   # FP64 (double), explicit
 
 Equivalently, pass ``-DUSE_FLOAT_PRECISION=ON`` to CMake. Query the compiled
 precision at runtime with :func:`gpusim2grid.compilation_options.is_fp32`.

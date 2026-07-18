@@ -16,10 +16,15 @@ Backed by cuDSS (sparse direct solver), cuSPARSE, cuBLAS/cuSOLVER, and Eigen (he
 
 ```bash
 source env_compile.sh       # exports CUDAToolkit_ROOT, cudss_ROOT, LD_LIBRARY_PATH — edit paths for your machine
-pip install .               # FP64 (double) by default
-CUDA_REAL_FLOAT=1 pip install .    # FP32 (float)
-CUDA_REAL_DOUBLE=1 pip install .   # FP64, explicit
+pip install --no-build-isolation .               # FP64 (double) by default
+CUDA_REAL_FLOAT=1 pip install --no-build-isolation .    # FP32 (float)
+CUDA_REAL_DOUBLE=1 pip install --no-build-isolation .   # FP64, explicit
 ```
+
+`--no-build-isolation` matters because gpusim2grid's C++ bridge build needs
+to see the `lightsim2grid` already installed in the current environment
+(built from source, matching Eigen/SuiteSparse/compile flags) — not a fresh
+one pip would otherwise resolve into an isolated build environment.
 
 `scikit-build-core` (pyproject.toml) → CMake → NVCC. Requires CUDA toolkit + cuDSS ≥ 0.8.0 installed and discoverable (see `env_compile.sh` for the expected layout). Precision is a **compile-time** choice (`-DUSE_FLOAT_PRECISION=ON` or the env vars above); query it at runtime via `gpusim2grid._gpusim2grid.is_fp32` or `compilation_options.is_fp32()`.
 
