@@ -255,8 +255,23 @@ AcPfNrState::AcPfNrState(
     eigen_real_type                             tol,
     int                                         device,
     const LedgerData*                           ledger,
-    bool                                         presolved_v)
+    bool                                         presolved_v,
+    bool                                         diag_stop_before_state_correction,
+    ReorderingAlg                                reordering_alg,
+    MatchingAlg                                  matching_alg,
+    PivotEpsilonAlg                              pivot_epsilon_alg,
+    bool                                         debug_base_case,
+    bool                                         base_case_only,
+    bool                                         scaling_max_voltage_change,
+    double                                       max_dVa,
+    double                                       max_dVm)
 {
+    reordering_alg_    = reordering_alg;
+    matching_alg_      = matching_alg;
+    pivot_epsilon_alg_ = pivot_epsilon_alg;
+    debug_base_case_   = debug_base_case;
+    base_case_only_    = base_case_only;
+
     // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
     // because the work is heterogeneous (CPU preprocessing + device uploads +
     // ANALYSIS launch). Started BEFORE device selection: cudaGetDevice() below
@@ -342,14 +357,20 @@ AcPfNrState::AcPfNrState(
                                ledger->p_row_of_bus, ledger->q_row_of_bus,
                                ledger->theta_col_of_bus, ledger->vm_col_of_bus);
 
-        // Derive the ledger pair lists from the bus→row/col maps (order is
-        // irrelevant: each pair is an independent scatter target).
-        for (int bus = 0; bus < n_bus; ++bus) {
-            if (ledger->p_row_of_bus[bus]     >= 0) { p_buses.push_back(bus);     p_rows.push_back(ledger->p_row_of_bus[bus]); }
-            if (ledger->q_row_of_bus[bus]     >= 0) { q_buses.push_back(bus);     q_rows.push_back(ledger->q_row_of_bus[bus]); }
-            if (ledger->theta_col_of_bus[bus] >= 0) { theta_buses.push_back(bus); theta_cols.push_back(ledger->theta_col_of_bus[bus]); }
-            if (ledger->vm_col_of_bus[bus]    >= 0) { vm_buses.push_back(bus);    vm_cols.push_back(ledger->vm_col_of_bus[bus]); }
-        }
+        // Ledger pair lists, taken DIRECTLY from NRLedger's compact (bus, row/col)
+        // registration lists -- NOT reconstructed from the bus-keyed maps. The
+        // bus-keyed maps only ever hold the LAST registration per bus ("last
+        // registration wins"), so reconstructing pair lists from them silently
+        // drops any row/col that was registered but later shadowed there (e.g. a
+        // MultiSlack "free_vm_slack" participant bus reused by another
+        // extension). lightsim2grid's own NRSystem::_residual() /
+        // _compute_trial_V() iterate these exact compact lists, so this must
+        // match to reproduce every contribution (see NRLedger's "Multiplicity
+        // rules").
+        p_buses = ledger->p_buses;         p_rows = ledger->p_rows;
+        q_buses = ledger->q_buses;         q_rows = ledger->q_rows;
+        theta_buses = ledger->theta_buses; theta_cols = ledger->theta_cols;
+        vm_buses = ledger->vm_buses;       vm_cols = ledger->vm_cols;
     }
     n_p = (int)p_buses.size(); n_q = (int)q_buses.size();
     n_theta = (int)theta_buses.size(); n_vm = (int)vm_buses.size();
@@ -459,17 +480,47 @@ AcPfNrState::AcPfNrState(
     // positions derived from the ledger maps + skeleton. (mirrors Hvdc::register_in
     // / declare_feature_entries; an end at a slack drops the missing row/col.)
     if (ledger != nullptr && ledger->has_hvdc()) {
-        n_hvdc = ledger->n_hvdc();
+        // Defensive filter: a droop line should NEVER reach here with either
+        // side individually open -- lightsim2grid's own
+        // disconnect_if_not_in_main_component clears droop_enabled_ (dropping
+        // the line from the ledger entirely) as soon as one converter leaves
+        // the main synchronous component, since theta1/theta2 across an open
+        // converter is meaningless (the remote angle is unknown/unsolved).
+        // Still, exclude any line that fails this invariant rather than
+        // silently computing a garbage theta-dependent injection on a
+        // perfectly good in-main bus -- see HvdcDroopSolverData::connected1/2
+        // in lightsim2grid. Empty connected1/connected2 (older ledger
+        // sources) means "not checked" -- keep all lines, unfiltered.
+        const int nh_raw = ledger->n_hvdc();
+        std::vector<int> keep;
+        keep.reserve(nh_raw);
+        const bool have_connectivity = (static_cast<int>(ledger->hvdc_connected1.size()) == nh_raw) &&
+                                       (static_cast<int>(ledger->hvdc_connected2.size()) == nh_raw);
+        for (int e = 0; e < nh_raw; ++e) {
+            if (have_connectivity && (!ledger->hvdc_connected1[e] || !ledger->hvdc_connected2[e])) continue;
+            keep.push_back(e);
+        }
+        n_hvdc = static_cast<int>(keep.size());
+        if (n_hvdc > 0) {
         auto to_real = [](const std::vector<double>& v) {
             return std::vector<cuda_real_type>(v.begin(), v.end());
         };
-        upload_h2d(d_hvdc_bus1,   ledger->hvdc_bus1.data(),   n_hvdc, cs);
-        upload_h2d(d_hvdc_bus2,   ledger->hvdc_bus2.data(),   n_hvdc, cs);
-        upload_h2d(d_hvdc_status, ledger->hvdc_status.data(), n_hvdc, cs);
-        std::vector<cuda_real_type> p0=to_real(ledger->hvdc_p0), kk=to_real(ledger->hvdc_k),
-            lf1=to_real(ledger->hvdc_lf1), lf2=to_real(ledger->hvdc_lf2),
-            rr=to_real(ledger->hvdc_r), pm12=to_real(ledger->hvdc_pmax12),
-            pm21=to_real(ledger->hvdc_pmax21);
+        std::vector<cuda_real_type> p0_all=to_real(ledger->hvdc_p0), kk_all=to_real(ledger->hvdc_k),
+            lf1_all=to_real(ledger->hvdc_lf1), lf2_all=to_real(ledger->hvdc_lf2),
+            rr_all=to_real(ledger->hvdc_r), pm12_all=to_real(ledger->hvdc_pmax12),
+            pm21_all=to_real(ledger->hvdc_pmax21);
+        std::vector<int> bus1(n_hvdc), bus2(n_hvdc), status(n_hvdc);
+        std::vector<cuda_real_type> p0(n_hvdc), kk(n_hvdc), lf1(n_hvdc), lf2(n_hvdc),
+            rr(n_hvdc), pm12(n_hvdc), pm21(n_hvdc);
+        for (int i = 0; i < n_hvdc; ++i) {
+            const int e = keep[i];
+            bus1[i] = ledger->hvdc_bus1[e]; bus2[i] = ledger->hvdc_bus2[e]; status[i] = ledger->hvdc_status[e];
+            p0[i] = p0_all[e]; kk[i] = kk_all[e]; lf1[i] = lf1_all[e]; lf2[i] = lf2_all[e];
+            rr[i] = rr_all[e]; pm12[i] = pm12_all[e]; pm21[i] = pm21_all[e];
+        }
+        upload_h2d(d_hvdc_bus1,   bus1.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
+        upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
@@ -487,15 +538,15 @@ AcPfNrState::AcPfNrState(
         };
         std::vector<int> prow1(n_hvdc), prow2(n_hvdc),
                          h11(n_hvdc), h12(n_hvdc), h21(n_hvdc), h22(n_hvdc);
-        for (int e = 0; e < n_hvdc; ++e) {
-            const int b1 = ledger->hvdc_bus1[e], b2 = ledger->hvdc_bus2[e];
+        for (int i = 0; i < n_hvdc; ++i) {
+            const int b1 = bus1[i], b2 = bus2[i];
             const int pr1 = ledger->p_row_of_bus[b1], pr2 = ledger->p_row_of_bus[b2];
             const int tc1 = ledger->theta_col_of_bus[b1], tc2 = ledger->theta_col_of_bus[b2];
-            prow1[e] = pr1; prow2[e] = pr2;
-            h11[e] = find_J_pos(pr1, tc1);
-            h12[e] = find_J_pos(pr1, tc2);
-            h21[e] = find_J_pos(pr2, tc1);
-            h22[e] = find_J_pos(pr2, tc2);
+            prow1[i] = pr1; prow2[i] = pr2;
+            h11[i] = find_J_pos(pr1, tc1);
+            h12[i] = find_J_pos(pr1, tc2);
+            h21[i] = find_J_pos(pr2, tc1);
+            h22[i] = find_J_pos(pr2, tc2);
         }
         upload_h2d(d_hvdc_prow1, prow1.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_prow2, prow2.data(), n_hvdc, cs);
@@ -503,6 +554,7 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_hvdc_h12, h12.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_h21, h21.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_h22, h22.data(), n_hvdc, cs);
+        }
     }
 
     // VoltageControl (remote gen + SVC), bordered formulation. The q columns and
@@ -523,13 +575,18 @@ AcPfNrState::AcPfNrState(
             return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
         };
 
-        // per-controller q row / q col (from the ledger) and slope
+        // per-controller q row / q col and slope. qrow is correctly shared via
+        // the bus-keyed map (one physical Q-balance equation per bus); qcol
+        // MUST come from the per-controller vc_q_col (NOT the bus-keyed
+        // q_col_of_bus, which only keeps the LAST controller registered at a
+        // given bus and silently collides whenever two controllers regulate
+        // reactive power from the same bus -- see LedgerData::vc_q_col's doc).
         std::vector<int> qrow(n_vc_ctrl), qcol(n_vc_ctrl);
         std::vector<cuda_real_type> slope(n_vc_ctrl);
         for (int j = 0; j < n_vc_ctrl; ++j) {
             const int bus = ledger->vc_bus[j];
             qrow[j] = ledger->q_row_of_bus[bus];
-            qcol[j] = ledger->q_col_of_bus[bus];
+            qcol[j] = ledger->vc_q_col[j];
             slope[j] = static_cast<cuda_real_type>(ledger->vc_slope[j]);
         }
 
@@ -684,43 +741,96 @@ AcPfNrState::AcPfNrState(
         CHK_CUDA_AC(cudaMalloc(&spmv.buf.ptr, spmv.buf.size));
 
     // =========================================================================
-    // 4.5  cuDSS context + ANALYSIS  (symbolic factorisation, paid once)
+    // Decide whether this construction needs a cuDSS context at all.
+    //
+    //   has_ext_state : MultiSlack and/or VoltageControl is active (slack_col/
+    //                   n_vc_ctrl are already set above from the ledger).
+    //   need_solve    : the has_ext_state one-shot correction in the
+    //                   presolved_v block below still needs an actual cuDSS
+    //                   solve -- either there's no CPU ground truth to seed
+    //                   slack_absorbed/vc_q from (array/tuple mode, or a
+    //                   ledger that simply never computed it), or the caller
+    //                   explicitly asked to bypass ground truth via
+    //                   debug_base_case_ (diagnostic: re-derive via cuDSS
+    //                   instead of trusting lightsim2grid's converged state).
+    //   need_cudss    : whether ANYTHING in this AcPfNrState needs a cuDSS
+    //                   context. Always true for the normal iterative loop
+    //                   (!presolved_v) and for AcPfNrSession (base_case_only_
+    //                   ==false -- it's the production solver and must keep a
+    //                   factorization alive for run()/prepare_JT()). For
+    //                   ContingencyAnalysisSession's/InjectionSweepSession's
+    //                   base_state_ (base_case_only_==true) under presolved_v
+    //                   with ground truth available, this is false: fill_J
+    //                   alone (no factorize) already gives d_J_values_base,
+    //                   which is all the direct_base_case_factors strategy
+    //                   ever reads from this object (it does its own
+    //                   independent factor() on the BATCH solver -- see
+    //                   policy_base_case_factors.cuh).
     // =========================================================================
-    CHK_DSS_AC(cudssCreate(&dss.handle));
-    CHK_DSS_AC(cudssSetStream(dss.handle, cs));  // bind to our stream
-    CHK_DSS_AC(cudssConfigCreate(&dss.config));
-    CHK_DSS_AC(cudssDataCreate(dss.handle, &dss.data));
+    const bool has_ext_state = (slack_col >= 0) || (n_vc_ctrl > 0);
+    // Defensive: only trust vc_q_gt as ground truth if its size actually
+    // matches n_vc_ctrl (both ultimately derived from the same ledger, so
+    // this should always hold -- see LedgerData's own doc -- but a device
+    // upload sized from a mismatched host vector would silently corrupt
+    // adjacent GPU memory instead of failing loudly, so this is cheap
+    // insurance, not just a diagnostic).
+    const bool ledger_has_gt = (ledger != nullptr) && ledger->has_ext_state_ground_truth &&
+        (n_vc_ctrl == 0 || static_cast<int>(ledger->vc_q_gt.size()) == n_vc_ctrl);
+    const bool need_solve    = has_ext_state && (debug_base_case_ || !ledger_has_gt);
+    const bool need_cudss    = !presolved_v || !base_case_only_ || need_solve;
 
-    // Sparse J descriptor — values pointer is updated each iteration via
-    // cudssMatrixSetValues(); the shape and structure pointers are fixed.
-    dss_A.create_csr(dim_J, nnz_J,
-        thrust::raw_pointer_cast(d_J_outer.data()),
-        thrust::raw_pointer_cast(d_J_inner.data()),
-        thrust::raw_pointer_cast(d_J_values.data()));
+    // =========================================================================
+    // 4.5  cuDSS context + ANALYSIS  (symbolic factorisation, paid once) --
+    //      skipped entirely when !need_cudss (see above).
+    // =========================================================================
+    if (need_cudss) {
+        CHK_DSS_AC(cudssCreate(&dss.handle));
+        CHK_DSS_AC(cudssSetStream(dss.handle, cs));  // bind to our stream
+        CHK_DSS_AC(cudssConfigCreate(&dss.config));
+        CHK_DSS_AC(cudssDataCreate(dss.handle, &dss.data));
+        dss.set_reordering_alg(reordering_alg_);
+        dss.set_matching_alg(matching_alg_);
+        dss.set_pivot_epsilon_alg(pivot_epsilon_alg_);
 
-    // Dense dx (solution) and F (RHS)
-    dss_x.create_dn(dim_J, thrust::raw_pointer_cast(d_dx.data()));
-    dss_b.create_dn(dim_J, thrust::raw_pointer_cast(d_F.data()));
+        // Sparse J descriptor — values pointer is updated each iteration via
+        // cudssMatrixSetValues(); the shape and structure pointers are fixed.
+        dss_A.create_csr(dim_J, nnz_J,
+            thrust::raw_pointer_cast(d_J_outer.data()),
+            thrust::raw_pointer_cast(d_J_inner.data()),
+            thrust::raw_pointer_cast(d_J_values.data()));
+
+        // Dense dx (solution) and F (RHS)
+        dss_x.create_dn(dim_J, thrust::raw_pointer_cast(d_dx.data()));
+        dss_b.create_dn(dim_J, thrust::raw_pointer_cast(d_F.data()));
+    }
 
     // t_init_ms captured HERE (not right after the H→D uploads above): it must
-    // also cover the cuSPARSE SpMV descriptor and cuDSS handle/config/data/
-    // matrix-descriptor creation just above -- on a process' first CUDA call
-    // these dlopen + PTX-JIT the cuSPARSE/cuDSS backends, which can dominate
-    // total wall time and would otherwise land in a completely untimed gap.
+    // also cover the cuSPARSE SpMV descriptor and, when created, the cuDSS
+    // handle/config/data/matrix-descriptor creation just above -- on a
+    // process' first CUDA call these dlopen + PTX-JIT the cuSPARSE/cuDSS
+    // backends, which can dominate total wall time and would otherwise land
+    // in a completely untimed gap.
     timings.t_init_ms = ms_since(t_wall_start);
 
-    // ANALYSIS: reordering + symbolic factorisation.
+    // ANALYSIS: reordering + symbolic factorisation. Skipped along with the
+    // rest of the cuDSS context above when !need_cudss.
     // Wall-clock timing via chrono (mixed CPU/GPU work; a CUDA event pair
     // would only capture the GPU tail). analyze() runs on stream cs, so
     // synchronize before sampling the end time -- otherwise the wall-clock
     // could stop while ANALYSIS is still in flight on the GPU.
-    {
+    if (need_cudss) {
         auto t_analyse = std::chrono::steady_clock::now();
         dss.analyze(dss_A, dss_x, dss_b);
         cs.synchronize();
         timings.t_analyze_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_analyse).count();
     }
+
+    // Ledger-extraction check_solution() timing (measured before this object
+    // even existed, in extract_ledger_data() -- see LedgerData). Copied in
+    // for visibility only; see AcPfTimings::t_ground_truth_check_ms.
+    if (ledger != nullptr)
+        timings.t_ground_truth_check_ms = ledger->t_ground_truth_check_ms;
 
     // =========================================================================
     // 4.6  Newton-Raphson loop  (all computation on cs)
@@ -738,7 +848,11 @@ AcPfNrState::AcPfNrState(
     // =========================================================================
 
     // Non-owning pointer bundle — views into the single-system device vectors.
-    const NrIterBuffers buf {
+    // Not const: the NR step-scaling fields are set via post-init assignment
+    // below (positional aggregate init can't skip over the trailing
+    // handle_disconnected_grid masking fields, which this single-system state
+    // never uses).
+    NrIterBuffers buf {
         thrust::raw_pointer_cast(d_J_values.data()),
         thrust::raw_pointer_cast(d_V.data()),
         thrust::raw_pointer_cast(d_Ibus.data()),
@@ -814,6 +928,20 @@ AcPfNrState::AcPfNrState(
         thrust::raw_pointer_cast(d_vc_q.data()),
     };
 
+    // NR step-scaling (MaxVoltageChange) -- see acpf_nr_state.cuh's own doc on
+    // the constructor params. Off by default; the scratch buffers stay empty
+    // (buf.d_scale_max_d{theta,vm} stay nullptr) unless enabled, matching
+    // every other opt-in extension in this constructor.
+    buf.scaling_max_voltage_change = scaling_max_voltage_change;
+    buf.max_dVa = static_cast<cuda_real_type>(max_dVa);
+    buf.max_dVm = static_cast<cuda_real_type>(max_dVm);
+    if (scaling_max_voltage_change) {
+        d_scale_max_dtheta.resize(1);
+        d_scale_max_dvm.resize(1);
+        buf.d_scale_max_dtheta = thrust::raw_pointer_cast(d_scale_max_dtheta.data());
+        buf.d_scale_max_dvm    = thrust::raw_pointer_cast(d_scale_max_dvm.data());
+    }
+
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
 
     if (presolved_v) {
@@ -833,28 +961,48 @@ AcPfNrState::AcPfNrState(
         //   VoltageControl (vc_q) hold state that is NOT a function of V alone
         //   (e.g. a distributed-slack participant's P row measures how much
         //   power the slack must additionally supply beyond its scheduled
-        //   Sbus -- that quantity is itself an unknown, not implied by V). This
-        //   state defaults to zero, which is generally wrong even when V0 is
-        //   electrically exact, so a fill_F at (Vinit, state=0) can show a large
-        //   residual purely from the stale state. When such an extension is
-        //   active we derive the correct state with ONE linear solve (mirroring
-        //   exactly how lightsim2grid's own NR loop updates slack_absorbed/vc_q
-        //   each iteration: `state += dx(state_col)`), but apply ONLY the
-        //   feature-state kernels (nr_feature_update) -- never
-        //   update_Va_kernel/update_Vm_kernel -- so V still never moves.
+        //   Sbus -- that quantity is itself an unknown, not implied by V).
+        //   slack_absorbed actually starts at Re(ΣSbus) (see above), vc_q at
+        //   zero -- neither is generally right even when V0 is electrically
+        //   exact, so a fill_F at (Vinit, stale state) can show a large
+        //   residual purely from that. When such an extension is active we
+        //   prefer seeding it directly from lightsim2grid's own converged
+        //   ground truth (LedgerData::slack_absorbed_gt/vc_q_gt, populated by
+        //   extract_ledger_data() after its own check_solution() precondition
+        //   -- see ls2g_bridge.cpp), needing no cuDSS at all. Only when that
+        //   ground truth isn't available (array/tuple mode) or the caller
+        //   explicitly requested debug_base_case_ do we fall back to deriving
+        //   it with ONE linear solve (mirroring exactly how lightsim2grid's
+        //   own NR loop updates slack_absorbed/vc_q each iteration:
+        //   `state += dx(state_col)`), applying ONLY the feature-state kernels
+        //   (nr_feature_update) -- never update_Va_kernel/update_Vm_kernel --
+        //   so V still never moves either way.
         // =====================================================================
         NrIterTimings step;
         nr_iter_step_prepare(spmv, dss, dss_A, dss_x, dss_b, buf,
                              n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
                              /*actual_batch=*/1, cs, timer,
-                             /*first_factorize=*/true, step);
+                             /*first_factorize=*/true, step,
+                             /*use_cudss=*/need_cudss);
         timings.t_spmv            += step.t_spmv;
         timings.t_fill_F          += step.t_fill_F;
         timings.t_fill_J          += step.t_fill_J;
         timings.t_first_factorize += step.t_first_factorize;
 
-        const bool has_ext_state = (slack_col >= 0) || (n_vc_ctrl > 0);
-        if (has_ext_state) {
+        if (diag_stop_before_state_correction) {
+            // d_F = F(Vinit, state=0), d_J_values = J(Vinit): both already
+            // fully populated by nr_iter_step_prepare above. Return without
+            // running the cuDSS-based state correction or the throwing
+            // residual check -- get_F()/get_J() expose these for an external
+            // (e.g. scipy) solve of the SAME linear system.
+            timings.nb_iter = 0;
+            timings.converged = true;  // not actually checked in this mode
+            return;
+        }
+
+        if (need_solve) {
+            // No ground truth available, or debug_base_case_ explicitly
+            // requested bypassing it: derive slack_absorbed/vc_q via cuDSS.
             timer.start();
             dss.solve(dss_A, dss_x, dss_b);
             timings.t_solve += timer.stop_ms();
@@ -867,7 +1015,29 @@ AcPfNrState::AcPfNrState(
             // feature state without redoing SpMV/fill_J/factorize.
             nr_iter_step_fill_F(buf, n_bus, dim_J, /*actual_batch=*/1, cs, timer, step);
             timings.t_fill_F += step.t_fill_F;
+        } else if (has_ext_state) {
+            // Ground truth available (from a solved lightsim2grid grid, whose
+            // own state satisfies check_solution()'s precondition) -- seed
+            // slack_absorbed/vc_q directly instead of deriving them via cuDSS.
+            // No solve, no factorize, no cuDSS context touched at all.
+            if (slack_col >= 0) {
+                std::vector<cuda_real_type> h_sa(
+                    1, static_cast<cuda_real_type>(ledger->slack_absorbed_gt));
+                upload_h2d(d_slack_absorbed, h_sa.data(), 1, cs);
+            }
+            if (n_vc_ctrl > 0) {
+                std::vector<cuda_real_type> h_vcq(
+                    ledger->vc_q_gt.begin(), ledger->vc_q_gt.end());
+                upload_h2d(d_vc_q, h_vcq.data(), n_vc_ctrl, cs);
+            }
+
+            // Ibus is unchanged (V didn't move): refresh F with the seeded
+            // feature state without redoing SpMV/fill_J/factorize.
+            nr_iter_step_fill_F(buf, n_bus, dim_J, /*actual_batch=*/1, cs, timer, step);
+            timings.t_fill_F += step.t_fill_F;
         }
+        // else: no extension active at all -- nothing to correct, d_F from
+        // nr_iter_step_prepare's own fill_F is already the right residual.
 
         timer.start();
         cuda_real_type norm_F0 = thrust::transform_reduce(
@@ -957,7 +1127,11 @@ AcPfNrState::AcPfNrState(
     //   on dss / dss_A / dss_b / dss_x, amortising ANALYSIS across the batch.
 
     // Build and factor Jᵀ for the adjoint solve (implicit function theorem).
-    prepare_JT();
+    // Skipped for base_case_only_ instances (ContingencyAnalysisSession's/
+    // InjectionSweepSession's base_state_): neither ever calls solve_JT() --
+    // only AcPfNrSession's differentiable wrapper does -- so this would be
+    // pure dead work (a full transpose build + its own cuDSS analyze/factorize).
+    if (!base_case_only_) prepare_JT();
 }
 
 // =============================================================================
@@ -1024,14 +1198,26 @@ AcPfNrSession::AcPfNrSession(
     eigen_real_type                             tol,
     int                                         device,
     const LedgerData*                           ledger,
-    bool                                         presolved_v
+    bool                                         presolved_v,
+    bool                                         diag_stop_before_state_correction,
+    ReorderingAlg                                reordering_alg,
+    MatchingAlg                                  matching_alg,
+    PivotEpsilonAlg                              pivot_epsilon_alg,
+    bool                                         debug_base_case,
+    bool                                         scaling_max_voltage_change,
+    double                                       max_dVa,
+    double                                       max_dVm
 )
 {
     (void)slack_ids;
     (void)slack_weights;
     state_ = std::make_shared<AcPfNrState>(Ybus, Vinit, Sbus, pv, pq,
                                             max_iter, tol, device, ledger,
-                                            presolved_v);
+                                            presolved_v, diag_stop_before_state_correction,
+                                            reordering_alg, matching_alg,
+                                            pivot_epsilon_alg, debug_base_case,
+                                            /*base_case_only=*/false,
+                                            scaling_max_voltage_change, max_dVa, max_dVm);
 }
 
 // =============================================================================
@@ -1119,6 +1305,9 @@ void AcPfNrState::prepare_JT()
     CHK_DSS_AC(cudssSetStream(dss_T.handle, cs));
     CHK_DSS_AC(cudssConfigCreate(&dss_T.config));
     CHK_DSS_AC(cudssDataCreate(dss_T.handle, &dss_T.data));
+    dss_T.set_reordering_alg(reordering_alg_);
+    dss_T.set_matching_alg(matching_alg_);
+    dss_T.set_pivot_epsilon_alg(pivot_epsilon_alg_);
 
     dss_AT.create_csr(static_cast<int64_t>(dim_J),
                       static_cast<int64_t>(nnz_J),
@@ -1191,3 +1380,50 @@ std::vector<int> AcPfNrSession::p_row_of_bus()     const { return state_->h_p_ro
 std::vector<int> AcPfNrSession::q_row_of_bus()     const { return state_->h_q_row_of_bus; }
 std::vector<int> AcPfNrSession::theta_col_of_bus() const { return state_->h_theta_col_of_bus; }
 std::vector<int> AcPfNrSession::vm_col_of_bus()    const { return state_->h_vm_col_of_bus; }
+
+std::vector<double> AcPfNrSession::get_F() const {
+    thrust::host_vector<cuda_real_type> h_F(state_->d_F);
+    return std::vector<double>(h_F.begin(), h_F.end());
+}
+
+std::vector<double> AcPfNrSession::solve_cudss(const std::vector<double>& rhs) const {
+    auto& s = *state_;
+    if (static_cast<int>(rhs.size()) != s.dim_J)
+        throw std::runtime_error(
+            "solve_cudss: rhs size (" + std::to_string(rhs.size()) +
+            ") must equal dim_J (" + std::to_string(s.dim_J) + ")");
+    std::vector<cuda_real_type> h_rhs(rhs.begin(), rhs.end());
+    upload_h2d(s.d_F, h_rhs.data(), s.dim_J, s.cs);
+    s.dss.solve(s.dss_A, s.dss_x, s.dss_b);
+    thrust::host_vector<cuda_real_type> h_dx(s.d_dx);
+    return std::vector<double>(h_dx.begin(), h_dx.end());
+}
+
+std::vector<double> AcPfNrSession::residual(const std::vector<double>& dx,
+                                            const std::vector<double>& rhs) const {
+    auto& s = *state_;
+    if (static_cast<int>(dx.size()) != s.dim_J || static_cast<int>(rhs.size()) != s.dim_J)
+        throw std::runtime_error("residual: dx and rhs must both have length dim_J");
+    thrust::host_vector<int>            h_outer(s.d_J_outer);
+    thrust::host_vector<int>            h_inner(s.d_J_inner);
+    thrust::host_vector<cuda_real_type> h_vals(s.d_J_values);
+    std::vector<double> res(s.dim_J, 0.0);
+    for (int row = 0; row < s.dim_J; ++row) {
+        double acc = 0.0;
+        for (int p = h_outer[row]; p < h_outer[row + 1]; ++p)
+            acc += static_cast<double>(h_vals[p]) * dx[h_inner[p]];
+        res[row] = acc - rhs[row];
+    }
+    return res;
+}
+
+std::tuple<std::vector<int>, std::vector<int>, std::vector<double>> AcPfNrSession::get_J() const {
+    thrust::host_vector<int>            h_outer(state_->d_J_outer);
+    thrust::host_vector<int>            h_inner(state_->d_J_inner);
+    thrust::host_vector<cuda_real_type> h_vals(state_->d_J_values);
+    return {
+        std::vector<int>(h_outer.begin(), h_outer.end()),
+        std::vector<int>(h_inner.begin(), h_inner.end()),
+        std::vector<double>(h_vals.begin(), h_vals.end())
+    };
+}

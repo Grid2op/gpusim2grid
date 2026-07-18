@@ -11,6 +11,9 @@ __all__ = [
 from .._gpusim2grid import (
     ContingencyAnalysisSession as _ContingencyAnalysisSession,
     ContingencySolverType as _ContingencySolverType,
+    ReorderingAlg as _ReorderingAlg,
+    MatchingAlg as _MatchingAlg,
+    PivotEpsilonAlg as _PivotEpsilonAlg,
 )
 
 from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
@@ -42,6 +45,94 @@ _STRATEGY_MAP = {
     'direct_iter0_only':        _ContingencySolverType.DirectIter0Only,
     'direct_refactor_every_n':  _ContingencySolverType.DirectRefactorEveryN,
 }
+
+
+# Shared with injection_sweep/__init__.py and acpf_nr/gpu_facade.py (imported
+# from here, same as _normalize_device) rather than duplicated per-module like
+# _STRATEGY_MAP above: CUDSS_CONFIG_REORDERING_ALG is a solver-wide concept,
+# not specific to the batch/contingency workload.
+_REORDERING_ALG_MAP = {
+    'default':           _ReorderingAlg.Default,
+    'btf_colamd':        _ReorderingAlg.BtfColamd,
+    'colamd':            _ReorderingAlg.Colamd,
+    'amd':               _ReorderingAlg.Amd,
+    'nested_dissection': _ReorderingAlg.NestedDissection,
+    'none':              _ReorderingAlg.NoReordering,
+}
+
+
+def _resolve_reordering_alg(value):
+    """Accept either a string (mapped via _REORDERING_ALG_MAP) or a raw
+    ReorderingAlg value."""
+    if isinstance(value, _ReorderingAlg):
+        return value
+    if isinstance(value, str):
+        try:
+            return _REORDERING_ALG_MAP[value]
+        except KeyError:
+            raise ValueError(
+                f"Unknown reordering_alg {value!r}. "
+                f"Choose from: {list(_REORDERING_ALG_MAP)}")
+    raise TypeError(
+        f"reordering_alg must be a str or ReorderingAlg, got {type(value).__name__}")
+
+
+# Shared with injection_sweep/__init__.py and acpf_nr/gpu_facade.py, same
+# rationale as _REORDERING_ALG_MAP above: CUDSS_CONFIG_MATCHING_ALG is also a
+# solver-wide concept, not specific to the batch/contingency workload.
+_MATCHING_ALG_MAP = {
+    'none':              _MatchingAlg.NoMatching,
+    'max_diag_count':    _MatchingAlg.MaxDiagCount,
+    'max_min_diag':      _MatchingAlg.MaxMinDiag,
+    'max_min_diag_alt':  _MatchingAlg.MaxMinDiagAlt,
+    'max_diag_sum':      _MatchingAlg.MaxDiagSum,
+    'max_diag_product':  _MatchingAlg.MaxDiagProduct,
+    'auto':              _MatchingAlg.Auto,
+}
+
+
+def _resolve_matching_alg(value):
+    """Accept either a string (mapped via _MATCHING_ALG_MAP) or a raw
+    MatchingAlg value."""
+    if isinstance(value, _MatchingAlg):
+        return value
+    if isinstance(value, str):
+        try:
+            return _MATCHING_ALG_MAP[value]
+        except KeyError:
+            raise ValueError(
+                f"Unknown matching_alg {value!r}. "
+                f"Choose from: {list(_MATCHING_ALG_MAP)}")
+    raise TypeError(
+        f"matching_alg must be a str or MatchingAlg, got {type(value).__name__}")
+
+
+# Shared with injection_sweep/__init__.py and acpf_nr/gpu_facade.py, same
+# rationale as _REORDERING_ALG_MAP/_MATCHING_ALG_MAP above:
+# CUDSS_CONFIG_PIVOT_EPSILON_ALG is also a solver-wide concept, not specific
+# to the batch/contingency workload.
+_PIVOT_EPSILON_ALG_MAP = {
+    'default': _PivotEpsilonAlg.Default,
+    'scaled':  _PivotEpsilonAlg.Scaled,
+    'static':  _PivotEpsilonAlg.Static,
+}
+
+
+def _resolve_pivot_epsilon_alg(value):
+    """Accept either a string (mapped via _PIVOT_EPSILON_ALG_MAP) or a raw
+    PivotEpsilonAlg value."""
+    if isinstance(value, _PivotEpsilonAlg):
+        return value
+    if isinstance(value, str):
+        try:
+            return _PIVOT_EPSILON_ALG_MAP[value]
+        except KeyError:
+            raise ValueError(
+                f"Unknown pivot_epsilon_alg {value!r}. "
+                f"Choose from: {list(_PIVOT_EPSILON_ALG_MAP)}")
+    raise TypeError(
+        f"pivot_epsilon_alg must be a str or PivotEpsilonAlg, got "
+        f"{type(value).__name__}")
 
 
 class DeviceBuffer:
@@ -106,6 +197,19 @@ class _ContingencyAnalysisSolver:
         validation ``‖F(Vinit)‖∞`` check (raises ``RuntimeError`` if it fails).
         ``max_iter_base`` is then only used for reference/introspection, not to
         drive an iteration count. Default False.
+    reordering_alg, matching_alg, pivot_epsilon_alg : str, optional
+        cuDSS config, applied ONCE at construction to BOTH the base-case solve
+        above and the batch solver's own copy (consumed by :meth:`run`) --
+        single source of truth. The mutable properties of the same name only
+        ever affect the latter afterward (the base-case solve is fixed once
+        built). Defaults ``'default'``, ``'none'``, ``'default'``.
+    debug_base_case : bool, optional
+        Only meaningful with ``presolved_v=True`` and a MultiSlack/
+        VoltageControl extension active (bridge/lightsim2grid ledger). Forces
+        the pre-ground-truth cuDSS-solve derivation of the extension's running
+        state for the base-case solve, even when lightsim2grid's own converged
+        values are available -- an opt-in diagnostic (e.g. to keep testing
+        cuDSS config choices in isolation). Default False.
 
     Notes
     -----
@@ -119,11 +223,26 @@ class _ContingencyAnalysisSolver:
       ``'direct_iter0_only'``, ``'direct_refactor_every_n'``.
     - ``refactor_period`` (*int*): Period N for ``'direct_refactor_every_n'``
       (default 1, equivalent to ``'direct_refactor_every'``).
+    - ``reordering_alg`` (*str*): cuDSS ``CUDSS_CONFIG_REORDERING_ALG`` choice.
+      One of ``'default'`` (default), ``'amd'``, ``'nested_dissection'``,
+      ``'none'``. ``'btf_colamd'``/``'colamd'`` are also accepted but cuDSS
+      rejects them (``CUDSS_STATUS_NOT_SUPPORTED``) in this session's
+      uniform-batch mode; they only work on ``AcPfGPU``'s single-system solve.
+    - ``matching_alg`` (*str*): cuDSS ``CUDSS_CONFIG_MATCHING_ALG`` choice.
+      ``'none'`` (default) is the only value cuDSS accepts in this session's
+      uniform-batch mode -- every other value (``'max_diag_count'``,
+      ``'max_min_diag'``, ``'max_min_diag_alt'``, ``'max_diag_sum'``,
+      ``'max_diag_product'``, ``'auto'``) raises ``RuntimeError``
+      (``CUDSS_STATUS_NOT_SUPPORTED``). They only work on ``AcPfGPU``'s
+      single-system solve, and even there ``'max_diag_product'``/``'auto'``
+      have been observed to silently produce NaN voltages.
+    - ``pivot_epsilon_alg`` (*str*): cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG``
+      choice. One of ``'default'`` (default), ``'scaled'``, ``'static'``.
     - ``max_iter_base``, ``tol_base``: Stored for reference only; do not
       rerun the base case.
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
       divergence check (see :meth:`set_limits`). Default False.
-    - ``violation_tol`` (*float*), ``violation_capacity`` (*int*): DIVERGED
+    - ``violation_tol`` (*float*), ``violation_capacity`` (*int*): DIVERGENCE
       tolerance and max records kept per contingency (default 16).
 
     Examples
@@ -153,29 +272,57 @@ class _ContingencyAnalysisSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None, handle_disconnected_grid=False, presolved_v=False):
+                 device=None, handle_disconnected_grid=False, presolved_v=False,
+                 reordering_alg='default', matching_alg='none',
+                 pivot_epsilon_alg='default', debug_base_case=False,
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
+        self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
+        # Single source of truth, set once at construction: forwarded to BOTH
+        # the base-case solve (this call) AND the batch solver's own members
+        # (consumed by run() -- see the reordering_alg/matching_alg/
+        # pivot_epsilon_alg property setters below, which only ever affect
+        # the latter, going forward).
         self._s = _ContingencyAnalysisSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
-            _normalize_device(device), presolved_v=bool(presolved_v))
+            _normalize_device(device), presolved_v=bool(presolved_v),
+            reordering_alg=_resolve_reordering_alg(reordering_alg),
+            matching_alg=_resolve_matching_alg(matching_alg),
+            pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            debug_base_case=bool(debug_base_case),
+            scaling_max_voltage_change=bool(scaling_max_voltage_change),
+            max_dVa=float(max_dVa), max_dVm=float(max_dVm))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
-                      strategy='direct_refactor_every'):
+                      strategy='direct_refactor_every', reordering_alg='default',
+                      matching_alg='none', pivot_epsilon_alg='default'):
         """Wrap an already-constructed C++ ContingencyAnalysisSession.
 
         Used by the zero-copy lightsim2grid bridge, which builds the session in
         C++ directly from a solved LSGrid. Reuses all wrapper ergonomics.
+        reordering_alg/matching_alg/pivot_epsilon_alg here are bookkeeping only
+        (what the caller already passed to the C++ builder at construction) --
+        purely so the Python-side property getters below report the truth;
+        they do NOT re-apply these to the (already-built) session. Same for
+        scaling_max_voltage_change/max_dVa/max_dVm -- no bookkeeping needed
+        for those since they're read straight off self._s (a plain bool/float
+        pair, unlike reordering_alg's str<->enum resolution).
         """
         self = cls.__new__(cls)
         self._s = session
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = strategy
+        self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
         return self
 
     @property
@@ -195,6 +342,38 @@ class _ContingencyAnalysisSolver:
         self._s.nb_iter = int(value)
 
     @property
+    def scaling_max_voltage_change(self):
+        """NR step-scaling (mirrors lightsim2grid's own
+        MaxVoltageChangeScalingPolicy); bool, takes effect on the next run().
+        Each batch slot gets its own alpha from its own max|dtheta|/max|dvm|.
+        """
+        return self._s.scaling_max_voltage_change
+
+    @scaling_max_voltage_change.setter
+    def scaling_max_voltage_change(self, value):
+        self._s.scaling_max_voltage_change = bool(value)
+
+    @property
+    def max_dVa(self):
+        """MaxVoltageChangeScalingPolicy max angle step (rad); only
+        meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVa
+
+    @max_dVa.setter
+    def max_dVa(self, value):
+        self._s.max_dVa = float(value)
+
+    @property
+    def max_dVm(self):
+        """MaxVoltageChangeScalingPolicy max voltage-magnitude step (pu);
+        only meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVm
+
+    @max_dVm.setter
+    def max_dVm(self, value):
+        self._s.max_dVm = float(value)
+
+    @property
     def strategy(self):
         """Linear-solve strategy (str). Takes effect on the next run()."""
         return self._strategy
@@ -207,6 +386,53 @@ class _ContingencyAnalysisSolver:
                 f"Choose from: {list(_STRATEGY_MAP)}")
         self._strategy = value
         self._s.strategy_type = _STRATEGY_MAP[value]
+
+    @property
+    def reordering_alg(self):
+        """CUDSS_CONFIG_REORDERING_ALG choice (str or ReorderingAlg). Takes
+        effect on the next run() (which always reruns cuDSS ANALYSIS).
+        One of 'default' (default), 'btf_colamd', 'colamd', 'amd',
+        'nested_dissection', 'none'.
+
+        NOTE: cuDSS rejects 'btf_colamd'/'colamd' with CUDSS_STATUS_NOT_SUPPORTED
+        in this session's uniform-batch mode -- only 'default', 'amd',
+        'nested_dissection', 'none' are supported here. 'btf_colamd'/'colamd'
+        work only on AcPfGPU's single-system solve."""
+        return self._reordering_alg
+
+    @reordering_alg.setter
+    def reordering_alg(self, value):
+        self._reordering_alg = value
+        self._s.reordering_alg = _resolve_reordering_alg(value)
+
+    @property
+    def matching_alg(self):
+        """CUDSS_CONFIG_MATCHING_ALG choice (str or MatchingAlg). Takes effect
+        on the next run() (which always reruns cuDSS ANALYSIS).
+
+        NOTE: 'none' (default) is the only value cuDSS accepts in this
+        session's uniform-batch mode -- every other value raises RuntimeError
+        (CUDSS_STATUS_NOT_SUPPORTED). They only work on AcPfGPU's
+        single-system solve, and even there 'max_diag_product'/'auto' have
+        been observed to silently produce NaN voltages."""
+        return self._matching_alg
+
+    @matching_alg.setter
+    def matching_alg(self, value):
+        self._matching_alg = value
+        self._s.matching_alg = _resolve_matching_alg(value)
+
+    @property
+    def pivot_epsilon_alg(self):
+        """CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str or PivotEpsilonAlg).
+        Takes effect on the next run() (which always reruns cuDSS ANALYSIS).
+        One of 'default' (default), 'scaled', 'static'."""
+        return self._pivot_epsilon_alg
+
+    @pivot_epsilon_alg.setter
+    def pivot_epsilon_alg(self, value):
+        self._pivot_epsilon_alg = value
+        self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
 
     @property
     def handle_disconnected_grid(self):
@@ -307,7 +533,7 @@ class _ContingencyAnalysisSolver:
 
     @property
     def violation_tol(self):
-        """float: residual tolerance for the DIVERGED check, independent of
+        """float: residual tolerance for the DIVERGENCE check, independent of
         tol_base. Takes effect on the next run()."""
         return self._s.violation_tol
 
@@ -328,9 +554,13 @@ class _ContingencyAnalysisSolver:
 
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per contingency (row order
-        matches build_contingencies()'s input list). [] for a not-simulated
-        (disconnected / masked-skip) contingency; a non-converged one gets a
-        single DIVERGED entry and nothing else. Requires run() with
+        matches build_contingencies()'s input list). A not-simulated
+        (disconnected / masked-skip) contingency gets a single GRID/
+        NOT_SIMULATED entry (value=limit=nan -- the solver was never
+        invoked, there is no residual to report); a non-converged one gets a
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        Both mirror lightsim2grid's own ViolationElementType.GRID /
+        LimitViolationType.{NOT_SIMULATED,DIVERGENCE}. Requires run() with
         compute_limit_violations=True."""
         if not self.compute_limit_violations:
             raise RuntimeError(
@@ -347,7 +577,13 @@ class _ContingencyAnalysisSolver:
         out = []
         for c, cnt in enumerate(counts):
             if cnt < 0:
-                out.append([])
+                # Pre-check (graph connectivity) dropped this contingency
+                # before it ever reached check_limit_violations_kernel -- the
+                # solver was never invoked (BatchPfDriver's d_violation_count
+                # -1 sentinel). Never written by the kernel itself.
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.NOT_SIMULATED,
+                                            float('nan'), float('nan'))])
                 continue
             base = c * K
             out.append([

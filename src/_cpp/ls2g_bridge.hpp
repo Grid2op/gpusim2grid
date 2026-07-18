@@ -40,7 +40,21 @@
 // sparsity skeleton (get_J_solver), the NRLedger row/col maps, and the
 // MultiSlack slack_col + slack weights. All in solver bus numbering. Empty /
 // slack_col=-1 reproduces the feature-free system.
-LedgerData extract_ledger_data(const ls2g::LSGrid& grid);
+//
+// When presolved_v is true (the caller is about to trust the grid's own V as
+// already converged -- init_from_n_powerflow), this ALSO:
+//   1. Verifies the grid is actually solved via LSGrid::check_solution() on
+//      its own get_V_solver() -- throws std::runtime_error if the Kirchhoff
+//      mismatch's inf-norm exceeds tol. Runs unconditionally whenever
+//      presolved_v is requested, regardless of whether any extension is
+//      active; timed into the returned LedgerData::t_ground_truth_check_ms.
+//   2. If MultiSlack and/or VoltageControl is active, populates
+//      slack_absorbed_gt/vc_q_gt from LSGrid::get_slack_absorbed_solver()/
+//      get_controller_q_solver() -- lightsim2grid's own converged extension
+//      state, letting AcPfNrState's presolved_v fast path seed it directly
+//      instead of deriving it via a cuDSS solve.
+LedgerData extract_ledger_data(const ls2g::LSGrid& grid,
+                               bool presolved_v = false, double tol = 0.0);
 
 // Build a single-system AcPfNrSession from a solved LSGrid, solving the same
 // augmented system lightsim2grid does (distributed slack / future extensions).
@@ -56,7 +70,34 @@ make_acpf_session_from_lsgrid(
     int    max_iter,
     double tol,
     int    device,
-    bool   init_from_n_powerflow = true);
+    bool   init_from_n_powerflow = true,
+    // DEBUG ONLY -- see AcPfNrState's own doc (acpf_nr_state.cuh). No-op
+    // unless init_from_n_powerflow=true. Returns a session whose get_J()/
+    // get_F() expose J(V0) and the RAW F(V0, state=0) (no cuDSS-based state
+    // correction, no throwing residual check), for an external solver to
+    // redo that correction step independently of cuDSS on the exact same
+    // data.
+    bool   diag_stop_before_state_correction = false,
+    // CUDSS_CONFIG_REORDERING_ALG / CUDSS_CONFIG_MATCHING_ALG /
+    // CUDSS_CONFIG_PIVOT_EPSILON_ALG choices; see AcPfNrState's own doc.
+    // Ctor-time only -- ANALYSIS runs once and is never rerun for this
+    // session.
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic (see AcPfNrState's own doc): force the pre-ground-truth
+    // cuDSS-solve derivation of slack_absorbed/vc_q even when lightsim2grid's
+    // own converged values are available. No-op unless init_from_n_powerflow.
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange): by default (-1 / negative sentinels)
+    // this mirrors whatever the grid's OWN get_ac_algo_config() has set --
+    // opt-in, inheriting lightsim2grid's own configured policy rather than a
+    // separate gpusim2grid-level default. Pass 0/1 to force it off/on
+    // regardless of the grid's own config, and/or a non-negative max_dVa/
+    // max_dVm to override those specifically. See AcPfNrState's own doc.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0);
 
 // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
 // (solver numbering) instead of the grid's own Sbus. The ledger structure is
@@ -68,7 +109,10 @@ make_acpf_session_from_lsgrid_with_sbus(
     Eigen::Ref<const CplxVect> Sbus,
     int    max_iter,
     double tol,
-    int    device);
+    int    device,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
 
 // Build a ContingencyAnalysisSession from a solved LSGrid (branch data set).
 // When compute_limit_violations=true, also pulls bus/branch limits off the
@@ -83,7 +127,23 @@ make_ca_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
-    bool   compute_limit_violations = false);
+    bool   compute_limit_violations = false,
+    // Single source of truth for base_state_'s AND the batch solver's cuDSS
+    // config (see ContingencyAnalysisSession's own doc).
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange): by default (-1 / negative sentinels)
+    // mirrors the grid's OWN get_ac_algo_config() -- see
+    // make_acpf_session_from_lsgrid's own doc for the sentinel convention.
+    // Applied to BOTH base_state_'s AcPfNrState and the batch driver used by
+    // run() (computed PER BATCH SLOT there -- see ContingencyAnalysisSession's
+    // own doc), same single-source-of-truth pattern as reordering_alg.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0);
 
 // Extract compute_limit_violations limits off a solved LSGrid: bus voltage
 // limits (kV, relabeled from grid-model to AC-solver bus numbering via
@@ -108,6 +168,18 @@ make_is_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
-    bool   with_branch_data);
+    bool   with_branch_data,
+    // Single source of truth for base_state_'s AND the batch solver's cuDSS
+    // config (see InjectionSweepSession's own doc).
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
+    // own doc.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0);
 
 #endif  // LS2G_BRIDGE_HPP

@@ -157,6 +157,22 @@ struct NrIterBuffers {
     const int*             d_maskv_slot   = nullptr;   // [n_mask_v]
     const int*             d_maskv_bus    = nullptr;   // [n_mask_v]
     int                    n_mask_v       = 0;
+
+    // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
+    // launched) unless enabled. Mirrors lightsim2grid's own
+    // MaxVoltageChangeScalingPolicy: after solving J*dx=F, scale dx by
+    // alpha<=1 so max|dtheta|<=max_dVa and max|dvm|<=max_dVm BEFORE applying
+    // it anywhere (Va/Vm AND any extension state columns), matching
+    // NRAlgo.tpp's apply_step(coeff * F). See LedgerData::
+    // scaling_max_voltage_change's own doc for why this exists: an undamped
+    // full Newton step can converge onto a different (sometimes spurious)
+    // root than lightsim2grid's own damped trajectory when seeded far from
+    // the solution.
+    bool                   scaling_max_voltage_change = false;
+    cuda_real_type         max_dVa = static_cast<cuda_real_type>(0.5);
+    cuda_real_type         max_dVm = static_cast<cuda_real_type>(0.1);
+    cuda_real_type*        d_scale_max_dtheta = nullptr;  // [actual_batch] scratch, zeroed each call
+    cuda_real_type*        d_scale_max_dvm    = nullptr;  // [actual_batch] scratch, zeroed each call
 };
 
 // -----------------------------------------------------------------------------
@@ -318,6 +334,13 @@ inline void nr_iter_step_fill_F(
 //
 // first_factorize=true  → dss.factorize()   (CUDSS_PHASE_FACTORIZATION)
 // first_factorize=false → dss.refactorize() (CUDSS_PHASE_REFACTORIZATION)
+//
+// use_cudss=false skips BOTH dss_A.set_values() and factorize/refactorize --
+// used by AcPfNrState's presolved_v fast path when this instance has no
+// cuDSS context at all (base_case_only_ + ground-truth extension seeding, no
+// debug override; see acpf_nr.cu). d_J_values itself is still populated
+// (steps ①-③ always run), since direct_base_case_factors only ever needs the
+// raw values, never a factorization of this particular context.
 // -----------------------------------------------------------------------------
 inline void nr_iter_step_prepare(
     CuSpMV&          spmv,
@@ -331,7 +354,8 @@ inline void nr_iter_step_prepare(
     cudaStream_t cs,
     CudaTimer&   timer,
     bool         first_factorize,
-    NrIterTimings& t)
+    NrIterTimings& t,
+    bool         use_cudss = true)
 {
     (void)n_pvpq; (void)n_pq;
 
@@ -343,7 +367,8 @@ inline void nr_iter_step_prepare(
     // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
     nr_iter_step_fill_F(buf, n_bus, dim_J, actual_batch, cs, timer, t);
 
-    // ③  Fill J values; notify cuDSS that the values pointer changed.
+    // ③  Fill J values; notify cuDSS that the values pointer changed (skipped
+    //     when use_cudss=false -- no cuDSS context/descriptor exists to notify).
     //     When an additive feature (HVDC droop) is active, J must be zeroed first
     //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
@@ -354,15 +379,17 @@ inline void nr_iter_step_prepare(
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
         n_bus, nnz_Y, nnz_J, actual_batch);
     nr_feature_fill_J(buf, n_bus, nnz_J, actual_batch, cs);
-    dss_A.set_values(buf.d_J_values);
+    if (use_cudss) dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 
-    // ④  Factorize / refactorize
-    timer.start();
-    if (first_factorize) dss.factorize(dss_A, dss_x, dss_b);
-    else                 dss.refactorize(dss_A, dss_x, dss_b);
-    if (first_factorize) t.t_first_factorize += timer.stop_ms();
-    else                 t.t_refactorize     += timer.stop_ms();
+    // ④  Factorize / refactorize (skipped entirely when use_cudss=false)
+    if (use_cudss) {
+        timer.start();
+        if (first_factorize) dss.factorize(dss_A, dss_x, dss_b);
+        else                 dss.refactorize(dss_A, dss_x, dss_b);
+        if (first_factorize) t.t_first_factorize += timer.stop_ms();
+        else                 t.t_refactorize     += timer.stop_ms();
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -394,6 +421,22 @@ inline void nr_iter_step_correct(
     timer.start();
     dss.solve(dss_A, dss_x, dss_b);
     t.t_solve += timer.stop_ms();
+
+    // ⑤b Step-scaling (MaxVoltageChange), if enabled -- rescale the WHOLE dx
+    //     vector BEFORE applying it anywhere, so Va/Vm and any extension state
+    //     move together, exactly like lightsim2grid's own apply_step(coeff*F).
+    //     Folded into the same t.t_solve bucket (no new timing field).
+    if (buf.scaling_max_voltage_change) {
+        cudaMemsetAsync(buf.d_scale_max_dtheta, 0, actual_batch * sizeof(cuda_real_type), cs);
+        cudaMemsetAsync(buf.d_scale_max_dvm,    0, actual_batch * sizeof(cuda_real_type), cs);
+        const int total = buf.n_theta + buf.n_vm;
+        reduce_step_norms_kernel<<<(actual_batch * total + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
+            dim_J, actual_batch, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
+        apply_step_scale_kernel<<<(actual_batch * dim_J + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
+            buf.max_dVa, buf.max_dVm, dim_J, actual_batch);
+    }
 
     // ⑥  Update V in-place: Va first, then Vm.
     //     Both kernels run on cs — CUDA stream ordering serialises them without

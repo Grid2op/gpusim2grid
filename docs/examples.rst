@@ -53,7 +53,8 @@ every N-1 with ``compute_limit_violations=True``: the check runs fused into
 each chunk of the GPU solve, writing only a bounded per-contingency record
 buffer (never the full dense voltage / current arrays), and folds
 non-convergence into the same per-contingency violation list as a
-``DIVERGED`` entry. Mirrors lightsim2grid's own
+``GRID``/``DIVERGENCE`` (or ``GRID``/``NOT_SIMULATED``, if the pre-check
+dropped it before it was ever solved) entry. Mirrors lightsim2grid's own
 ``ContingencyAnalysis.compute_limit_violations`` flag.
 
 .. literalinclude:: ../examples/limit_violations.py

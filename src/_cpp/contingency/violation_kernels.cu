@@ -19,11 +19,16 @@ namespace {
 constexpr int ELEM_BUS   = 0;
 constexpr int ELEM_LINE  = 1;
 constexpr int ELEM_TRAFO = 2;
+constexpr int ELEM_GRID  = 3;
 
 constexpr int VIOL_LOW_VOLTAGE  = 0;
 constexpr int VIOL_HIGH_VOLTAGE = 1;
 constexpr int VIOL_CURRENT      = 2;
-constexpr int VIOL_DIVERGED     = 3;
+// VIOL_NOT_SIMULATED (=3) is never written by this kernel -- it's reserved
+// for contingencies the pre-check dropped before the chunk loop ever reached
+// this kernel at all; see get_violations() (contingency_analysis/__init__.py)
+// and BatchPfDriver's d_violation_count -1 sentinel.
+constexpr int VIOL_DIVERGENCE   = 4;
 
 }  // namespace
 
@@ -89,11 +94,18 @@ __global__ void check_limit_violations_kernel(
         ++cnt;
     };
 
-    // ---- 1. DIVERGED ---------------------------------------------------
+    // ---- 1. DIVERGENCE --------------------------------------------------
     // V is unreliable for a diverged system; do not scan buses/branches on it.
+    // isnan(residual) is included alongside residual > tol: this kernel only
+    // ever runs for a contingency that WAS actually solved (NR iterations
+    // executed in _solve_chunk), so any unusable residual here -- whether a
+    // large finite value or NaN -- means the solver ran and failed, i.e.
+    // DIVERGENCE, never NOT_SIMULATED (that code covers a contingency
+    // dropped before it ever reached this kernel, handled at the Python
+    // session layer instead -- see this file's own top-of-file note).
     const cuda_real_type residual = d_residuals[out_c];
-    if (residual > tol) {
-        push(ELEM_BUS, -1, 0, VIOL_DIVERGED, residual, tol);
+    if (isnan(residual) || residual > tol) {
+        push(ELEM_GRID, -1, 0, VIOL_DIVERGENCE, residual, tol);
         d_out_count[out_c]              = cnt;
         d_out_truncated[out_c]          = 0;
         d_out_count_low_voltage[out_c]  = 0;
@@ -118,12 +130,25 @@ __global__ void check_limit_violations_kernel(
         const cuda_real_type lim2 = d_branch_limit_a2_ka[l];
         if (isnan(lim1) && isnan(lim2)) continue;   // no limit configured for this branch
 
-        const cudaComplexType Vi = d_V[local_c * n_bus + d_branch_from[l]];
-        const cudaComplexType Vj = d_V[local_c * n_bus + d_branch_to[l]];
-        const cudaComplexType I_or = CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_yff[l], Vi), CudaFunHelper::my_cuCmul(d_yft[l], Vj));
-        const cudaComplexType I_ex = CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_ytf[l], Vi), CudaFunHelper::my_cuCmul(d_ytt[l], Vj));
+        // branch_from/branch_to are in AC-solver bus numbering (see
+        // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
+        // Kron-reduced away (isolated / half-open line, keep_half_open_lines)
+        // is relabeled to -1. That bus has no voltage in the solved system --
+        // treat it as V=0 -- and no terminal current on that side to report --
+        // 0, not computed from the pi-model formula, since the terminal
+        // itself doesn't exist. Reading d_V[... + (-1)] without this guard is
+        // an out-of-bounds read (confirmed via compute-sanitizer on a real
+        // half-open-line grid).
+        const int bf = d_branch_from[l];
+        const int bt = d_branch_to[l];
+        const cudaComplexType Vi = (bf >= 0) ? d_V[local_c * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
+        const cudaComplexType Vj = (bt >= 0) ? d_V[local_c * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
+        const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
+            CudaFunHelper::my_cuCmul(d_yff[l], Vi), CudaFunHelper::my_cuCmul(d_yft[l], Vj))
+            : CudaFunHelper::my_make_cuComplex(0., 0.);
+        const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
+            CudaFunHelper::my_cuCmul(d_ytf[l], Vi), CudaFunHelper::my_cuCmul(d_ytt[l], Vj))
+            : CudaFunHelper::my_make_cuComplex(0., 0.);
         // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
         const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l] * cuda_real_type(0.001);
         const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_A[l] * cuda_real_type(0.001);

@@ -14,6 +14,23 @@ static constexpr int BS = 256;   // block size for all kernels in this file
 // atomicAdd). Native atomicAdd for float and for double on SM >= 6.0; a 64-bit
 // CAS fallback for double on older targets. Used by the HVDC droop kernels,
 // whose contributions can overlap onto shared J positions / mismatch rows.
+//
+// Bit-reinterpretation note (applies to every CAS-based function in this
+// file): __double_as_longlong/__longlong_as_double/__float_as_int/
+// __int_as_float are dedicated CUDA intrinsics for exactly this
+// bit-for-bit reinterpretation -- well-defined, not UB (the CUDA
+// equivalent of memcpy/std::bit_cast). atomicCAS() itself, though, has no
+// float/double overload, so it can only be driven through a
+// reinterpret_cast<unsigned long long int*>/reinterpret_cast<int*> of the
+// double*/float* address -- that pointer-cast-and-dereference is classic
+// strict-aliasing type punning, UB by the letter of the C++ standard CUDA
+// C++ inherits. It's the exact idiom NVIDIA's own CUDA C++ Programming
+// Guide uses for this same double-atomicAdd fallback, and nvcc does not
+// do the aliasing-based reordering that would break it in device code --
+// but it is not standard-legal, only a de facto-safe, universally-used
+// CUDA idiom. The initial reads below go through the intrinsics on
+// *addr (the correctly-typed pointer) specifically to avoid adding a
+// second, avoidable instance of that same punned dereference.
 __device__ __forceinline__ void atomic_add_real(float* addr, float val) {
     atomicAdd(addr, val);
 }
@@ -22,13 +39,46 @@ __device__ __forceinline__ void atomic_add_real(double* addr, double val) {
     atomicAdd(addr, val);
 #else
     unsigned long long int* p = reinterpret_cast<unsigned long long int*>(addr);
-    unsigned long long int old = *p, assumed;
+    unsigned long long int old = __double_as_longlong(*addr), assumed;
     do {
         assumed = old;
         old = atomicCAS(p, assumed,
             __double_as_longlong(val + __longlong_as_double(assumed)));
     } while (assumed != old);
 #endif
+}
+
+// CUDA has no built-in atomicMax for float/double (only for integer types),
+// so this reimplements it as a compare-and-swap loop: read the current value,
+// bail out if it's already >= val, otherwise try to swap in val and retry on
+// contention. This is just "atomicMax", specialized to NON-NEGATIVE
+// floats/doubles -- for those, comparing the bit pattern as if it were an
+// integer gives the same ordering as comparing the float/double value
+// itself (true only when the sign bit is always 0), so the integer
+// atomicCAS above can drive the whole loop. Works on all compute
+// capabilities, unlike the native double atomicAdd this file also needs a
+// fallback for. Used by reduce_step_norms_kernel below, which only ever
+// feeds it fabs(dx) (always non-negative) to find, per batch slot, the
+// largest |dtheta|/|dvm| step any bus is about to take -- the max-voltage-
+// change step-scaling feature needs that per-slot maximum to compute how
+// much to shrink the whole Newton step by.
+__device__ __forceinline__ void atomic_max_nonneg(float* addr, float val) {
+    int* p = reinterpret_cast<int*>(addr);
+    int old = __float_as_int(*addr), assumed;
+    do {
+        assumed = old;
+        if (__int_as_float(assumed) >= val) break;
+        old = atomicCAS(p, assumed, __float_as_int(val));
+    } while (assumed != old);
+}
+__device__ __forceinline__ void atomic_max_nonneg(double* addr, double val) {
+    unsigned long long int* p = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = __double_as_longlong(*addr), assumed;
+    do {
+        assumed = old;
+        if (__longlong_as_double(assumed) >= val) break;
+        old = atomicCAS(p, assumed, __double_as_longlong(val));
+    } while (assumed != old);
 }
 
 // =============================================================================
@@ -56,18 +106,28 @@ __global__ void compute_branch_flows_kernel(
     const int l   = tid % n_branches;   // branch index
     if (b >= actual_batch) return;
 
-    const cudaComplexType Vi = d_V[b * n_bus + d_branch_from[l]];
-    const cudaComplexType Vj = d_V[b * n_bus + d_branch_to[l]];
+    // branch_from/branch_to are in AC-solver bus numbering (see
+    // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
+    // Kron-reduced away (isolated / half-open line, keep_half_open_lines) is
+    // relabeled to -1. That bus has no voltage in the solved system -- treat
+    // it as V=0 -- and no terminal current on that side to report -- 0, not
+    // computed from the pi-model formula, since the terminal itself doesn't
+    // exist. Reading d_V[... + (-1)] without this guard is an out-of-bounds
+    // read (confirmed via compute-sanitizer on a real half-open-line grid).
+    const int bf = d_branch_from[l];
+    const int bt = d_branch_to[l];
+    const cudaComplexType Vi = (bf >= 0) ? d_V[b * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType Vj = (bt >= 0) ? d_V[b * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // I_or = yff * Vi + yft * Vj  (origin / from-bus terminal current)
-    const cudaComplexType I_or = CudaFunHelper::my_cuCadd(
+    const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
         CudaFunHelper::my_cuCmul(d_yff[l], Vi),
-        CudaFunHelper::my_cuCmul(d_yft[l], Vj));
+        CudaFunHelper::my_cuCmul(d_yft[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // I_ex = ytf * Vi + ytt * Vj  (extremity / to-bus terminal current)
-    const cudaComplexType I_ex = CudaFunHelper::my_cuCadd(
+    const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
         CudaFunHelper::my_cuCmul(d_ytf[l], Vi),
-        CudaFunHelper::my_cuCmul(d_ytt[l], Vj));
+        CudaFunHelper::my_cuCmul(d_ytt[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // Map the chunk-relative slot to its original result index (identity when
     // d_result_map is null, e.g. the full-batch session call or injection).
@@ -343,6 +403,65 @@ __global__ void fill_J_kernel(
     if (d_map_j12[k] >= 0) d_J_values[J_base + d_map_j12[k]] = CudaFunHelper::my_cuCreal(dSdVm);
     if (d_map_j21[k] >= 0) d_J_values[J_base + d_map_j21[k]] = CudaFunHelper::my_cuCimag(dSdVa);
     if (d_map_j22[k] >= 0) d_J_values[J_base + d_map_j22[k]] = CudaFunHelper::my_cuCimag(dSdVm);
+}
+
+// =============================================================================
+// NR step-scaling (MaxVoltageChange), mirrors lightsim2grid's own
+// MaxVoltageChangeScalingPolicy (ScalingPolicies.hpp): after solving J*dx=F,
+// scale the WHOLE dx vector by alpha<=1 so max|dtheta|<=max_dVa and
+// max|dvm|<=max_dVm BEFORE applying it anywhere (Va/Vm and any extension
+// state columns), exactly matching NRAlgo.tpp's apply_step(coeff * F). Two
+// passes, both no-ops unless the caller enables scaling (see NrIterBuffers'
+// own doc):
+//   reduce_step_norms_kernel : per-batch-slot max|dx| restricted to the
+//                              theta/vm columns (CAS-based atomic max --
+//                              values are always non-negative so the plain
+//                              bit-pattern comparison in atomic_max_nonneg is
+//                              safe).
+//   apply_step_scale_kernel  : rescales dx in place from those two maxima.
+// =============================================================================
+__global__ void reduce_step_norms_kernel(
+    const cuda_real_type* __restrict__ d_dx,
+    const int*             __restrict__ theta_cols,
+    const int*             __restrict__ vm_cols,
+    int n_theta, int n_vm,
+    int dim_J, int actual_batch,
+    cuda_real_type* __restrict__ d_max_dtheta,   // [actual_batch], zeroed before launch
+    cuda_real_type* __restrict__ d_max_dvm)      // [actual_batch], zeroed before launch
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_theta + n_vm;
+    const int b = tid / total;
+    if (b >= actual_batch) return;
+    const int k = tid % total;
+    if (k < n_theta) {
+        const cuda_real_type v = d_dx[b * dim_J + theta_cols[k]];
+        atomic_max_nonneg(&d_max_dtheta[b], v < 0 ? -v : v);
+    } else {
+        const cuda_real_type v = d_dx[b * dim_J + vm_cols[k - n_theta]];
+        atomic_max_nonneg(&d_max_dvm[b], v < 0 ? -v : v);
+    }
+}
+
+__global__ void apply_step_scale_kernel(
+          cuda_real_type* __restrict__ d_dx,
+    const cuda_real_type* __restrict__ d_max_dtheta,
+    const cuda_real_type* __restrict__ d_max_dvm,
+    cuda_real_type max_dVa, cuda_real_type max_dVm,
+    int dim_J, int actual_batch)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b   = tid / dim_J;
+    if (b >= actual_batch) return;
+    const int j = tid % dim_J;
+
+    cuda_real_type alpha = static_cast<cuda_real_type>(1.);
+    const cuda_real_type mdt = d_max_dtheta[b];
+    if (mdt > max_dVa) alpha = alpha < (max_dVa / mdt) ? alpha : (max_dVa / mdt);
+    const cuda_real_type mdv = d_max_dvm[b];
+    if (mdv > max_dVm) alpha = alpha < (max_dVm / mdv) ? alpha : (max_dVm / mdv);
+
+    d_dx[b * dim_J + j] *= alpha;
 }
 
 // =============================================================================

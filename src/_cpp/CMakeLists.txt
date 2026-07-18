@@ -23,6 +23,7 @@ pybind11_add_module(
     injection_sweep.cu
     injection_sweep_session.cu
     dlpack_export.cu
+    raw_cudss_solve.cu
     ${_gpusim2grid_ls2g_sources})
 target_link_libraries(_gpusim2grid PRIVATE CUDA::cusparse cudss)
 
@@ -49,15 +50,59 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
     # (cs.h, klu.h, amd.h, colamd.h, btf.h, SuiteSparse_config.h), which the
     # installed lightsim2grid_core package does NOT ship. We must compile the
     # bridge *with* KLU_SOLVER_AVAILABLE to match the ABI of the loaded
-    # lightsim2grid_cpp module, so we point at the vendored SuiteSparse
-    # submodule. Override with -DGPUSIM2GRID_SUITESPARSE_DIR=... if needed.
+    # lightsim2grid_cpp module, so we need these headers from somewhere else.
     # (Upstream fix: lightsim2grid_core should bundle these headers or keep KLU
     #  out of its public header surface — see docs/lightsim2grid_requirements.md.)
-    if(NOT DEFINED GPUSIM2GRID_SUITESPARSE_DIR)
-        set(GPUSIM2GRID_SUITESPARSE_DIR
-            "${CMAKE_CURRENT_SOURCE_DIR}/../../_lightsim2grid/SuiteSparse")
+    #
+    # Search order (first hit wins):
+    #   1. SUITESPARSE_INCLUDE_DIR (CMake var or env var): a single directory
+    #      containing klu.h et al. directly (flat layout, as a system package
+    #      or a hand-merged include dir would produce).
+    #   2. The SuiteSparse checkout next to the lightsim2grid *source* this
+    #      Python interpreter's lightsim2grid was built from (per-module
+    #      Include/ layout, e.g. a local lightsim2grid clone's SuiteSparse
+    #      submodule). Auto-detected from `lightsim2grid.__file__`; override
+    #      with -DGPUSIM2GRID_SUITESPARSE_DIR=... if that guess is wrong.
+    #   3. The system SuiteSparse dev package (e.g. Debian/Ubuntu's
+    #      libsuitesparse-dev), headers flat under <prefix>/include/suitesparse/.
+    #   4. Nothing found: fail configure now with a clear message instead of
+    #      letting the build fail later on a bare "cs.h: No such file".
+    if(NOT DEFINED SUITESPARSE_INCLUDE_DIR AND DEFINED ENV{SUITESPARSE_INCLUDE_DIR})
+        set(SUITESPARSE_INCLUDE_DIR "$ENV{SUITESPARSE_INCLUDE_DIR}")
     endif()
-    if(EXISTS "${GPUSIM2GRID_SUITESPARSE_DIR}/KLU/Include/klu.h")
+
+    set(GPUSIM2GRID_SUITESPARSE_FOUND FALSE)
+
+    # 1. Explicit flat override.
+    if(SUITESPARSE_INCLUDE_DIR AND EXISTS "${SUITESPARSE_INCLUDE_DIR}/klu.h")
+        target_include_directories(_gpusim2grid PRIVATE "${SUITESPARSE_INCLUDE_DIR}")
+        message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
+                       "(SUITESPARSE_INCLUDE_DIR): ${SUITESPARSE_INCLUDE_DIR}")
+        set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
+    elseif(SUITESPARSE_INCLUDE_DIR)
+        message(STATUS "[gpusim2grid] SUITESPARSE_INCLUDE_DIR="
+                       "${SUITESPARSE_INCLUDE_DIR} does not contain klu.h "
+                       "directly; ignoring it and trying the next option.")
+    endif()
+
+    # 2. Auto-detect the lightsim2grid source checkout's own SuiteSparse
+    #    submodule: <dir of lightsim2grid.__file__>/../SuiteSparse. This is
+    #    where a local editable/source build of lightsim2grid keeps it, with
+    #    each module's headers under its own Include/ subdir.
+    if(NOT GPUSIM2GRID_SUITESPARSE_FOUND AND NOT DEFINED GPUSIM2GRID_SUITESPARSE_DIR)
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -c
+                    "import lightsim2grid, os; print(os.path.dirname(os.path.dirname(lightsim2grid.__file__)))"
+            OUTPUT_VARIABLE GPUSIM2GRID_LS2G_SRC_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _ls2g_src_dir_result
+            ERROR_QUIET)
+        if(_ls2g_src_dir_result EQUAL 0 AND EXISTS "${GPUSIM2GRID_LS2G_SRC_DIR}/SuiteSparse")
+            set(GPUSIM2GRID_SUITESPARSE_DIR "${GPUSIM2GRID_LS2G_SRC_DIR}/SuiteSparse")
+        endif()
+    endif()
+
+    if(NOT GPUSIM2GRID_SUITESPARSE_FOUND AND EXISTS "${GPUSIM2GRID_SUITESPARSE_DIR}/KLU/Include/klu.h")
         target_include_directories(_gpusim2grid PRIVATE
             "${GPUSIM2GRID_SUITESPARSE_DIR}/CXSparse/Include"
             "${GPUSIM2GRID_SUITESPARSE_DIR}/KLU/Include"
@@ -65,13 +110,36 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
             "${GPUSIM2GRID_SUITESPARSE_DIR}/COLAMD/Include"
             "${GPUSIM2GRID_SUITESPARSE_DIR}/BTF/Include"
             "${GPUSIM2GRID_SUITESPARSE_DIR}/SuiteSparse_config")
-        message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge: "
-                       "${GPUSIM2GRID_SUITESPARSE_DIR}")
-    else()
-        message(WARNING "[gpusim2grid] SuiteSparse headers not found at "
-                        "${GPUSIM2GRID_SUITESPARSE_DIR}; the ls2g bridge may "
-                        "fail to compile (cs.h/klu.h). Set "
-                        "-DGPUSIM2GRID_SUITESPARSE_DIR=...")
+        message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
+                       "(lightsim2grid source checkout): ${GPUSIM2GRID_SUITESPARSE_DIR}")
+        set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
+    endif()
+
+    # 3. System SuiteSparse dev package.
+    if(NOT GPUSIM2GRID_SUITESPARSE_FOUND)
+        find_path(GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR
+            NAMES klu.h
+            PATH_SUFFIXES suitesparse)
+        if(GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR)
+            target_include_directories(_gpusim2grid PRIVATE
+                "${GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR}")
+            message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
+                           "(system install): ${GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR}")
+            set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
+        endif()
+    endif()
+
+    # 4. Nothing worked: fail now rather than at compile time.
+    if(NOT GPUSIM2GRID_SUITESPARSE_FOUND)
+        message(FATAL_ERROR
+            "[gpusim2grid] SuiteSparse headers not found (cs.h/klu.h). Tried, "
+            "in order: SUITESPARSE_INCLUDE_DIR (env var or -D, flat dir "
+            "containing klu.h directly), the SuiteSparse checkout next to "
+            "the lightsim2grid this Python's lightsim2grid was built from "
+            "(auto-detected, override with -DGPUSIM2GRID_SUITESPARSE_DIR=... "
+            "at a per-module Include/ layout), and the system SuiteSparse dev "
+            "package (e.g. libsuitesparse-dev on Debian/Ubuntu). Install one "
+            "of these, or point one of the two variables above at it.")
     endif()
 endif()
 

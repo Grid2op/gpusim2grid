@@ -49,10 +49,23 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
     double tol_base,
     int    device,
     const LedgerData* ledger,
-    bool   presolved_v)
+    bool   presolved_v,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   debug_base_case,
+    bool   scaling_max_voltage_change,
+    double max_dVa,
+    double max_dVm)
     : Ybus_rm_(Ybus)
     , batch_size_(batch_size)
     , nb_iter_(nb_iter)
+    , reordering_alg_(reordering_alg)
+    , matching_alg_(matching_alg)
+    , pivot_epsilon_alg_(pivot_epsilon_alg)
+    , scaling_max_voltage_change_(scaling_max_voltage_change)
+    , max_dVa_(max_dVa)
+    , max_dVm_(max_dVm)
 {
     (void)slack_ids;
     (void)slack_weights;
@@ -62,7 +75,11 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
         Ybus, Vinit, Sbus, pv, pq,
         max_iter_base,
         static_cast<eigen_real_type>(tol_base),
-        device, ledger, presolved_v);
+        device, ledger, presolved_v,
+        /*diag_stop_before_state_correction=*/false,
+        reordering_alg, matching_alg, pivot_epsilon_alg,
+        debug_base_case, /*base_case_only=*/true,
+        scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
 
     // Build the handle_disconnected_grid mask configuration once from the base
@@ -215,7 +232,13 @@ void ContingencyAnalysisSession::run()
         used_batch_size_,
         nb_iter_,
         strategy_type_,
-        refactor_period_);
+        refactor_period_,
+        reordering_alg_,
+        matching_alg_,
+        pivot_epsilon_alg_,
+        scaling_max_voltage_change_,
+        max_dVa_,
+        max_dVm_);
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop
@@ -277,6 +300,9 @@ void ContingencyAnalysisSession::run()
     timings_.t_base_case_solve_only_ms =
         t_base_case_ms_ - base_state_->timings.t_build_J_ms
                          - base_state_->timings.t_upload_ms;
+    // Informational only (measured before base_state_ existed) -- see
+    // AcPfTimings::t_ground_truth_check_ms.
+    timings_.t_ground_truth_check_ms = base_state_->timings.t_ground_truth_check_ms;
 
     // Disconnected contingencies are compacted out of the batch by the source
     // and never solved; the driver pre-fills their result slots with NaN.  Here

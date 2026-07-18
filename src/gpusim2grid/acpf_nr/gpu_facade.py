@@ -4,6 +4,8 @@
 
 """Single AC power flow on the GPU, driven from a lightsim2grid grid."""
 
+import numpy as np
+
 from .. import _gpusim2grid as _cpp
 from .._gpusim2grid import AcPfNrSession as _AcPfNrSession
 from .._ls2g_utils import (
@@ -11,7 +13,12 @@ from .._ls2g_utils import (
     grid_from_pandapower,
     _validate_precision,
 )
-from ..contingency_analysis import _normalize_device
+from ..contingency_analysis import (
+    _normalize_device,
+    _resolve_reordering_alg,
+    _resolve_matching_alg,
+    _resolve_pivot_epsilon_alg,
+)
 
 __all__ = ["AcPfGPU"]
 
@@ -55,6 +62,60 @@ class AcPfGPU:
         Force (``True``) or disable (``False``) the zero-copy lightsim2grid C++
         bridge. ``None`` auto-detects it. Only the bridge path solves the
         augmented system; the Python-array fallback solves the bare system.
+    reordering_alg : str, default "default"
+        cuDSS ``CUDSS_CONFIG_REORDERING_ALG`` choice for the (once-only) cuDSS
+        ANALYSIS phase. One of ``"default"``, ``"btf_colamd"``, ``"colamd"``,
+        ``"amd"``, ``"nested_dissection"``, ``"none"``. Construction-time only
+        — unlike the batch workloads, ``AcPfGPU`` never reruns ANALYSIS, so
+        this cannot be changed after construction.
+    matching_alg : str, default "none"
+        cuDSS ``CUDSS_CONFIG_MATCHING_ALG`` choice for the same (once-only)
+        cuDSS ANALYSIS phase. One of ``"none"`` (cuDSS's own default),
+        ``"max_diag_count"``, ``"max_min_diag"``, ``"max_min_diag_alt"``,
+        ``"max_diag_sum"``, ``"max_diag_product"``, ``"auto"``.
+        Construction-time only, same reason as ``reordering_alg``.
+        WARNING: ``"max_diag_product"``/``"auto"`` have been observed to
+        silently produce NaN voltages on real power-flow Jacobians while
+        ``timings.converged`` still reports True (the residual check does
+        not catch NaN) — verify ``np.isnan(V).any()`` yourself if you use
+        them. ``"none"``/``"max_diag_count"``/``"max_min_diag"``/
+        ``"max_min_diag_alt"``/``"max_diag_sum"`` have been verified to
+        reproduce the reference solution.
+    pivot_epsilon_alg : str, default "default"
+        cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG`` choice for the same
+        (once-only) cuDSS ANALYSIS phase. One of ``"default"``, ``"scaled"``,
+        ``"static"``. Construction-time only, same reason as
+        ``reordering_alg``.
+    debug_base_case : bool, default False
+        Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
+        VoltageControl extension active (bridge path). By default, that
+        extension's running state is seeded directly from lightsim2grid's own
+        converged values, needing no extra cuDSS solve. Setting this True
+        forces the pre-ground-truth cuDSS-solve derivation instead -- an
+        opt-in diagnostic (e.g. to keep testing ``reordering_alg``/
+        ``matching_alg``/``pivot_epsilon_alg`` choices in isolation).
+    scaling_max_voltage_change : bool or None, default None
+        NR step-scaling, mirrors lightsim2grid's own
+        ``MaxVoltageChangeScalingPolicy``: after solving for the Newton step,
+        scale the WHOLE step by ``alpha <= 1`` so ``max|dtheta| <= max_dVa``
+        and ``max|dVm| <= max_dVm`` before applying it anywhere -- matching
+        lightsim2grid's own damped trajectory instead of taking the full raw
+        step every iteration. Only takes effect with ``init_from_n_powerflow=
+        False`` (the GPU actually iterates) and the bridge path. ``None``
+        (default) is opt-in by inheritance: mirrors whatever the ``grid``'s
+        own ``get_ac_algo_config()`` is already set to (e.g. via
+        lightsim2grid's ``set_ac_algo_config``), so behavior only changes for
+        grids the caller explicitly configured with damping -- everything
+        else stays bit-for-bit as before. Pass ``True``/``False`` to force it
+        on/off regardless of the grid's own config. Without it, an undamped
+        GPU Newton step can converge onto a different (sometimes spurious)
+        root than lightsim2grid's own when seeded far from the solution
+        (e.g. a flat/DC start) -- observed on real RTE grids.
+    max_dVa, max_dVm : float or None, default None
+        ``MaxVoltageChangeScalingPolicy`` thresholds (radians / pu). ``None``
+        inherits the grid's own configured values (or lightsim2grid's own
+        defaults, 0.5 / 0.1, if forcing ``scaling_max_voltage_change=True``
+        with no grid to inherit from). Ignored unless step-scaling is active.
 
     Examples
     --------
@@ -69,8 +130,30 @@ class AcPfGPU:
     """
 
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
-                 device=None, init_from_n_powerflow=True, use_bridge=None):
+                 device=None, init_from_n_powerflow=True, use_bridge=None,
+                 reordering_alg="default", matching_alg="none",
+                 pivot_epsilon_alg="default", debug_base_case=False,
+                 scaling_max_voltage_change=None, max_dVa=None, max_dVm=None):
         _validate_precision(precision)
+        reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
+        matching_alg_enum = _resolve_matching_alg(matching_alg)
+        pivot_epsilon_alg_enum = _resolve_pivot_epsilon_alg(pivot_epsilon_alg)
+
+        # Kept for run_ac(): the lightsim2grid grid this instance is attached
+        # to (None for the explicit-array tuple constructor, which has no
+        # CPU ac_pf() to compare against) and the cuDSS/precision choices, so
+        # a fresh session can be rebuilt at a caller-chosen (max_iter, tol)
+        # without re-specifying everything. Stored as grid.copy() so run_ac()'s
+        # own CPU ac_pf() calls (needed to seed/compare against) don't mutate
+        # the caller's own grid object out from under them.
+        self._grid = None if isinstance(grid, (tuple, list)) else grid.copy()
+        self._id_ac_solver_to_me = None if isinstance(grid, (tuple, list)) else np.asarray(grid.id_ac_solver_to_me()).copy()
+        self._ctor_kwargs = dict(
+            precision=precision, device=device, use_bridge=use_bridge,
+            reordering_alg=reordering_alg, matching_alg=matching_alg,
+            pivot_epsilon_alg=pivot_epsilon_alg,
+            scaling_max_voltage_change=scaling_max_voltage_change,
+            max_dVa=max_dVa, max_dVm=max_dVm)
 
         if isinstance(grid, (tuple, list)):
             if use_bridge:
@@ -81,7 +164,15 @@ class AcPfGPU:
             self._s = _AcPfNrSession(
                 Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                 int(max_iter), float(tol), _normalize_device(device),
-                presolved_v=bool(init_from_n_powerflow))
+                presolved_v=bool(init_from_n_powerflow),
+                reordering_alg=reordering_alg_enum,
+                matching_alg=matching_alg_enum,
+                pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                debug_base_case=bool(debug_base_case),
+                # No grid to inherit a scaling policy from -- None means off.
+                scaling_max_voltage_change=bool(scaling_max_voltage_change),
+                max_dVa=0.5 if max_dVa is None else float(max_dVa),
+                max_dVm=0.1 if max_dVm is None else float(max_dVm))
             return
 
         if use_bridge is None:
@@ -92,7 +183,20 @@ class AcPfGPU:
             # J skeleton off the solved grid. The grid must already be ac-solved.
             self._s = _cpp._make_acpf_session_from_lsgrid(
                 grid, int(max_iter), float(tol), _normalize_device(device),
-                bool(init_from_n_powerflow))
+                bool(init_from_n_powerflow),
+                reordering_alg=reordering_alg_enum,
+                matching_alg=matching_alg_enum,
+                pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                debug_base_case=bool(debug_base_case),
+                # None => -1/-1.0 sentinels: inherit the grid's own
+                # get_ac_algo_config() (opt-in by construction). True/False
+                # force it on/off regardless of what the grid is configured
+                # with; an explicit max_dVa/max_dVm overrides just that value.
+                scaling_max_voltage_change_override=(
+                    -1 if scaling_max_voltage_change is None
+                    else int(bool(scaling_max_voltage_change))),
+                max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
         else:
             # Python extraction fallback: bare [pvpq|pq] system (no distributed
             # slack in the Jacobian).
@@ -101,11 +205,107 @@ class AcPfGPU:
                 d["Ybus"], d["v_converged"], d["Sbus"],
                 d["slack"], d["slack_weights"], d["pv"], d["pq"],
                 int(max_iter), float(tol), _normalize_device(device),
-                presolved_v=bool(init_from_n_powerflow))
+                presolved_v=bool(init_from_n_powerflow),
+                reordering_alg=reordering_alg_enum,
+                matching_alg=matching_alg_enum,
+                pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                debug_base_case=bool(debug_base_case),
+                # No grid config to inherit here either (Python-side fallback,
+                # not the bridge) -- None means off.
+                scaling_max_voltage_change=bool(scaling_max_voltage_change),
+                max_dVa=0.5 if max_dVa is None else float(max_dVa),
+                max_dVm=0.1 if max_dVm is None else float(max_dVm))
 
     def solve(self):
         """Return the solved complex voltage vector (host copy)."""
         return self._s.get_v()
+
+    def ac_pf(self, Vinit, max_iter, tol):
+        """Run an *independent* GPU power flow with the same call signature
+        as lightsim2grid's ``LSGrid.ac_pf(Vinit, max_iter, tol)`` -- but,
+        unlike ``LSGrid.ac_pf``, ``Vinit`` (and the return value) here are in
+        **AC-solver** bus numbering, not grid-model numbering: ``Vinit`` is
+        only ``n_bus_solver`` long, covering active/connected buses only, in
+        the same solver order as ``AcPfGPU.solve()``'s own return value (see
+        the warning below). ``Vinit`` is not modified in place -- it is
+        copied (``Vinit_gpu = np.array(Vinit, dtype=complex)``) before being
+        scattered into the grid-model-sized ``V_init_ls`` via
+        ``self._id_ac_solver_to_me``, and it's that scattered copy,
+        ``V_init_ls``, which gets handed to (and modified in place by,
+        matching lightsim2grid's own convention) the zero-iteration
+        ``self._grid.ac_pf(V_init_ls, 0, tol)`` seeding call below -- not
+        ``Vinit`` itself.
+
+        This is deliberately NOT "solve on the CPU, then hand the GPU the
+        converged answer to validate": both solvers are given the exact same
+        ``(Vinit, max_iter, tol)`` and run their own Newton-Raphson loop from
+        there (``init_from_n_powerflow=False`` on the GPU side), so a match
+        is real evidence the GPU's own iteration is correct, not just that a
+        residual check at a known-good point passes.
+
+        Only valid when this instance was built from a lightsim2grid grid
+        (not the explicit-array tuple constructor). The grid's solver-side
+        structures (Ybus/ledger) come from lightsim2grid itself -- gpusim2grid
+        never builds them from scratch -- so this seeds them with the
+        zero-iteration ``ac_pf(V_init_ls, 0, tol)`` call above (sets up the
+        solver bus numbering / ledger and leaves ``get_V_solver()`` exactly
+        equal to ``Vinit`` on the active buses, no CPU Newton steps taken)
+        before the CPU reference run so the CPU doesn't get a head start.
+
+        Returns ``v_gpu_solver``, the GPU's own converged voltage, in the
+        same **AC-solver** bus numbering as ``Vinit`` -- or an empty array if
+        the GPU didn't converge, matching ``ac_pf()``'s own convergence-failure
+        convention. This does not currently run or return the CPU comparison
+        solve, nor remap the result back to grid-model numbering; both were
+        dropped for now (see the commented-out code below) and the caller is
+        expected to run its own CPU reference and relabel if it needs one.
+
+        .. warning::
+            ``Vinit`` here is gpusim2grid's own AC-solver numbering, so it
+            only covers the active buses of the lightsim2grid grid -- it is
+            NOT the grid-model-numbered array ``LSGrid.ac_pf`` itself takes.
+
+            Passing it directly to ``LSGrid.ac_pf(Vinit, max_iter, tol)``
+            will fail because of the size mismatch (that call requires a
+            complex voltage for every bus, including disconnected ones).
+        """
+        if self._grid is None:
+            raise RuntimeError(
+                "run_ac() needs a lightsim2grid grid (this AcPfGPU was "
+                "built from an explicit-array tuple, which has no CPU "
+                "ac_pf() to compare against).")
+
+        Vinit_gpu = np.array(Vinit, dtype=complex)
+
+        # Seed solver-side structures (bus numbering, ledger) at Vinit itself,
+        # untouched -- max_iter=0 takes no CPU Newton step (see run_ac's own
+        # doc). This must happen before the CPU reference run below, which
+        # would otherwise leave get_V_solver() at ITS OWN converged answer.
+        # self._id_ac_solver_to_me has length n_bus_solver and lists, for each
+        # solver position, its grid-model bus id -- a direct scatter, no mask
+        # needed (disconnected buses simply never appear in it and keep the
+        # np.ones() placeholder, which lightsim2grid ignores for them anyway).
+        V_init_ls = np.ones(self._grid.get_bus_vn_kv().shape[0], dtype=complex)
+        V_init_ls[self._id_ac_solver_to_me] = Vinit_gpu
+        self._grid.ac_pf(V_init_ls, 0, float(tol))
+        self._grid.unset_changes()  # speed optim is this is called multiple times
+
+        gpu = AcPfGPU(self._grid, max_iter=int(max_iter), tol=float(tol),
+                      init_from_n_powerflow=False, debug_base_case=False,
+                      **self._ctor_kwargs)
+        self._s = gpu._s
+        v_gpu_solver = gpu.solve() if gpu.timings.converged else np.zeros(0, dtype=complex)
+
+        # v_cpu = self._grid.ac_pf(Vinit.copy(), int(max_iter), float(tol))
+
+        # if v_gpu_solver.shape[0] == 0:
+        #     v_gpu_full = np.zeros(0, dtype=complex)
+        # else:
+        #     id_solver_to_me = np.asarray(self._grid.id_ac_solver_to_me(), dtype=np.int64)
+        #     v_gpu_full = np.full(v_cpu.shape[0] or Vinit.shape[0], np.nan, dtype=complex)
+        #     v_gpu_full[id_solver_to_me] = v_gpu_solver
+
+        return v_gpu_solver
 
     def v_dlpack(self):
         """Zero-copy DLPack capsule of the solved voltage, shape [n_bus]."""

@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 """Augmented Newton-Raphson features (lightsim2grid parity).
 
 These exercise gpusim2grid solving the SAME augmented system lightsim2grid does
@@ -207,6 +211,104 @@ def test_acpf_gpu_remote_gen_voltage_control_matches(solver_atol):
     ac = AcPfGPU(model, max_iter=50, tol=1e-11)
     assert ac.session.dim_J > n_pv + 2 * n_pq   # bordered columns/rows added
     np.testing.assert_allclose(ac.solve(), V_ref, atol=10 * solver_atol)
+
+
+def _solved_shared_bus_vc_grid():
+    """case14 + a 2nd controllable generator CO-LOCATED with gen 3 (bus 7),
+    both regulating remote bus 9 -- a bordered VoltageControl group with N=2
+    members sharing one vc_bus, ac-solved. Reproduces the structural collision
+    fixed in vc_q_col: the ledger's bus-keyed q_to_J_col map only keeps the
+    LAST controller registered at a bus (NRLedger::add_q_unknown's own doc),
+    so deriving qcol from it used to alias the two controllers onto one
+    column and corrupt the sharing equations (blew up ||dx||_inf to ~1e11 and
+    froze the iterative NR loop on a real ~7000-bus RTE grid with grouped
+    voltage control -- this is the same structural collision at IEEE 14-bus
+    scale)."""
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.gridmodel import init_from_pandapower
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        # co-locate a second controllable generator on bus 7 (same bus as gen 3)
+        pp.create_gen(net, bus=7, p_mw=0.0, vm_pu=1.09, controllable=True,
+                      min_q_mvar=-50., max_q_mvar=50.)
+        net.gen.loc[3, ["min_q_mvar", "max_q_mvar"]] = [-50., 50.]
+        model = init_from_pandapower(net)
+        if not hasattr(model, "set_gen_regulated_bus"):
+            pytest.skip("this lightsim2grid build has no set_gen_regulated_bus")
+        model.set_gen_regulated_bus(3, 9)   # gen 3 (bus 7) regulates bus 9
+        model.set_gen_regulated_bus(4, 9)   # gen 4 (ALSO bus 7) regulates bus 9 too
+        model.tell_solver_need_reset()
+        _solve_with_fallback(model, net.bus.shape[0])
+
+    qcol = model.get_controller_q_col_solver()
+    assert qcol.shape[0] == 2
+    assert qcol[0] != qcol[1], "co-located controllers must get distinct J columns"
+    return model
+
+
+@requires_gpu
+@needs_bridge
+def test_acpf_gpu_voltage_control_shared_bus_matches(solver_atol):
+    """Two controllers co-located at the same bus, sharing reactive power to
+    regulate one remote bus: AcPfGPU (single-system, bridge path) must match
+    lightsim2grid. See _solved_shared_bus_vc_grid's own doc for the bug this
+    guards against."""
+    from gpusim2grid import AcPfGPU
+
+    model = _solved_shared_bus_vc_grid()
+    V_ref = model.get_V_solver()
+    ac = AcPfGPU(model, max_iter=50, tol=1e-11)
+    np.testing.assert_allclose(ac.solve(), V_ref, atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_injection_sweep_voltage_control_shared_bus_base_case(solver_atol):
+    """Same shared-bus VoltageControl grid through InjectionSweepGPU: a single
+    scenario equal to the base case reproduces lightsim2grid's V. The batch
+    driver reuses the base session's d_vc_qcol (see batch_pf_driver.cu) rather
+    than rebuilding it per scenario, so this exercises that the shared-bus fix
+    actually reaches the batched path too, not just the single-system one."""
+    from gpusim2grid import InjectionSweepGPU
+
+    model = _solved_shared_bus_vc_grid()
+    n_bus = model.get_Ybus_solver().shape[0]
+    sn = model.get_sn_mva()
+    Sbus = model.get_Sbus_solver()
+    p_mw = (Sbus.real * sn).reshape(1, n_bus)
+    q_mvar = (Sbus.imag * sn).reshape(1, n_bus)
+
+    sweep = InjectionSweepGPU(model, nb_iter=12)
+    sweep.set_injections(p_mw, q_mvar, sn)
+    sweep.compute(batch_size=4)
+
+    V = sweep.V_results.to_numpy().reshape(1, n_bus)
+    assert sweep.last_residuals()[0] < 10 * solver_atol
+    np.testing.assert_allclose(np.abs(V[0]), np.abs(model.get_V_solver()),
+                               atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_contingency_voltage_control_shared_bus_converges(solver_atol):
+    """Same shared-bus VoltageControl grid through ContingencyAnalysisGPU: a
+    small N-1 batch converges (same shared-base-state d_vc_qcol reused by
+    every scenario, see test_injection_sweep_voltage_control_shared_bus_base_case's
+    own doc)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    model = _solved_shared_bus_vc_grid()
+    ca = ContingencyAnalysisGPU(model, init_from_n_powerflow=True, nb_iter=12)
+    n_ctg = min(5, len(model.get_lines()))
+    ca.add_contingencies_by_branch_id([[c] for c in range(n_ctg)])
+    ca.compute(batch_size=8)
+
+    res = ca.last_residuals()
+    finite = res[np.isfinite(res)]
+    assert finite.size > 0 and np.all(finite < 1e3 * solver_atol)
 
 
 @requires_gpu

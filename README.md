@@ -98,8 +98,33 @@ Install from source (no PyPI release yet):
 ```bash
 git clone https://github.com/Grid2Op/gpusim2grid.git
 cd gpusim2grid
-pip install .
+pip install --no-build-isolation .
 ```
+
+This automatically builds the zero-copy C++ bridge to `lightsim2grid`
+(`lightsim2grid_core`) — CMake locates it via the Python interpreter it is
+building against, since `lightsim2grid` is a build-system requirement. No
+`CMAKE_ARGS` needed for the common case; see the
+[installation docs](#building-the-docs) if you need to point at a different
+`lightsim2grid` install. `--no-build-isolation` matters here too: it makes
+gpusim2grid's own build use the `lightsim2grid` already installed in your
+current environment (matching Eigen/SuiteSparse/compile flags) instead of
+pip resolving a fresh, isolated one that may not match.
+
+> **`lightsim2grid` should also be built from source.** The PyPI wheel does
+> not ship the C++ headers (`LSGrid.hpp` and friends) the bridge needs, only
+> the compiled extension — so build it yourself first, with
+> `--no-build-isolation` so it's built against the same environment
+> gpusim2grid will use. It also needs its own submodules (SuiteSparse,
+> Eigen) checked out, or it won't compile:
+> ```bash
+> git clone --recurse-submodules https://github.com/Grid2op/lightsim2grid.git
+> cd lightsim2grid
+> pip install --no-build-isolation .
+> ```
+> (or the equivalent `uv pip install --no-build-isolation .`). See the
+> [installation docs](#building-the-docs) for details on matching Eigen /
+> SuiteSparse versions between the two builds.
 
 For detailed installation options — selecting float precision, linking against a
 specific CUDA version, and other build customization — see the dedicated installation

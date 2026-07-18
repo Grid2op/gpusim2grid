@@ -40,18 +40,27 @@
 // BEFORE bus voltage -- thermal/current violations are generally first-order
 // operational concerns, voltage second-order:
 //
-//   1. DIVERGED: if d_residuals[out_c] > tol, write ONE record
-//      {element_type=BUS(placeholder, unused), element_id=-1, side=0,
-//      violation_type=DIVERGED, value=residual, limit=tol} to slot 0, set
+//   1. DIVERGENCE: if isnan(d_residuals[out_c]) || d_residuals[out_c] > tol,
+//      write ONE record {element_type=GRID, element_id=-1, side=0,
+//      violation_type=DIVERGENCE, value=residual, limit=tol} to slot 0, set
 //      count=1, the three per-type totals to 0, and RETURN immediately -- V
 //      is unreliable for a diverged system, do not run the bus/branch loops
-//      on it. This is a gpusim2grid extension beyond lightsim2grid's own
-//      semantics (which keeps `converged()` and `get_violations()` as two
-//      separate accessors); folding it into the same compact array costs
-//      nothing extra here since the residual check is already needed as a
-//      precondition to trusting V, and it lets a caller iterating
-//      get_violations() alone see *why* a contingency has no useful data
-//      without a second round trip to get_residuals().
+//      on it. This kernel only ever runs for a contingency actually solved
+//      this chunk, so both the NaN and the large-finite-residual case mean
+//      the same thing here (solver ran, didn't converge) -- NOT_SIMULATED
+//      (the OTHER new lightsim2grid code, for a contingency the pre-check
+//      dropped before it ever reached this kernel) is written by the Python
+//      session layer instead (get_violations(), off BatchPfDriver's
+//      d_violation_count -1 sentinel), never by this kernel. Folding
+//      DIVERGENCE into the same compact array costs nothing extra here
+//      since the residual check is already needed as a precondition to
+//      trusting V, and it lets a caller iterating get_violations() alone
+//      see *why* a contingency has no useful data without a second round
+//      trip to get_residuals(). Mirrors lightsim2grid's own
+//      ViolationElementType::GRID / LimitViolationType::DIVERGENCE
+//      (LimitViolation.hpp) exactly, though gpusim2grid additionally
+//      populates value/limit with the actual residual/tol (lightsim2grid
+//      itself leaves those NaN/unused for GRID entries).
 //
 //   2. Branch current, for each branch l in [0, n_branches):
 //        skip if l appears in this active slot's tripped-branch list
@@ -96,7 +105,7 @@
 // d_V              : [actual_batch*n_bus] complex, chunk-local, post mask-NaN
 // d_residuals      : [n_contingencies] real, ORIGINAL-index space (already
 //                    written earlier this chunk by compute_residuals_kernel)
-// tol              : DIVERGED threshold (independent of tol_base)
+// tol              : DIVERGENCE threshold (independent of tol_base)
 // d_bus_vn_kv      : [n_bus] real, nominal per-bus kV
 // d_bus_vmin_kv/d_bus_vmax_kv : [n_bus] real, kV, NaN = unconfigured
 // d_branch_from/to : [n_branches] int, terminal bus indices

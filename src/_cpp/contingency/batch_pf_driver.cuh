@@ -147,6 +147,15 @@ struct BatchPfDriver {
     thrust::device_vector<cuda_real_type>  d_slack_absorbed_batch;  // [batch_size]
     thrust::device_vector<cuda_real_type>  d_vc_q_batch;            // [batch_size * n_vc_ctrl]
 
+    // NR step-scaling (MaxVoltageChange) config + per-batch-slot scratch
+    // (empty unless scaling_max_voltage_change_ is on). Each slot gets its own
+    // alpha from its own max|dtheta|/max|dvm| -- see run_nr_loop's own doc.
+    bool                                    scaling_max_voltage_change_ = false;
+    cuda_real_type                          max_dVa_ = static_cast<cuda_real_type>(0.5);
+    cuda_real_type                          max_dVm_ = static_cast<cuda_real_type>(0.1);
+    thrust::device_vector<cuda_real_type>   d_scale_max_dtheta_batch;  // [batch_size]
+    thrust::device_vector<cuda_real_type>   d_scale_max_dvm_batch;     // [batch_size]
+
     // -------------------------------------------------------------------------
     // Full result buffers
     // -------------------------------------------------------------------------
@@ -247,6 +256,9 @@ struct BatchPfDriver {
     //   nb_iter          — fixed NR iterations per chunk.
     //   strategy_type    — selects which Policy alternative emplaces into policy_.
     //   refactor_period  — for DirectRefactorEveryN.
+    //   reordering_alg   — CUDSS_CONFIG_REORDERING_ALG for the batch ANALYSIS.
+    //   matching_alg     — CUDSS_CONFIG_MATCHING_ALG for the batch ANALYSIS.
+    //   pivot_epsilon_alg — CUDSS_CONFIG_PIVOT_EPSILON_ALG for the batch ANALYSIS.
     // -------------------------------------------------------------------------
     BatchPfDriver(
         AcPfNrState&              base_state,
@@ -257,7 +269,15 @@ struct BatchPfDriver {
         int                       batch_size,
         int                       nb_iter,
         ContingencySolverType     strategy_type   = ContingencySolverType::DirectRefactorEvery,
-        int                       refactor_period = 1);
+        int                       refactor_period = 1,
+        ReorderingAlg             reordering_alg  = ReorderingAlg::Default,
+        MatchingAlg               matching_alg    = MatchingAlg::None,
+        PivotEpsilonAlg           pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // NR step-scaling (MaxVoltageChange) -- see the members' own doc. Off
+        // by default; see AcPfNrState's own doc for what this fixes.
+        bool                      scaling_max_voltage_change = false,
+        double                    max_dVa = 0.5,
+        double                    max_dVm = 0.1);
 
     ~BatchPfDriver() = default;
 
@@ -308,7 +328,7 @@ struct BatchPfDriver {
 
     // -------------------------------------------------------------------------
     // compute_limit_violations: configure per-bus voltage (kV) / per-branch
-    // current (kA) limits and the fused kernel's DIVERGED tolerance + output
+    // current (kA) limits and the fused kernel's DIVERGENCE tolerance + output
     // capacity K. Requires upload_branch_admittances() (directly, or via
     // set_branch_data()) to have already run. NaN = "not configured" for that
     // element (matches lightsim2grid's convention).

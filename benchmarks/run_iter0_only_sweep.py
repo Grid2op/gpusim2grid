@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 """Sweep runner for the direct_iter0_only strategy.
 
 Refactors the Jacobian only at iteration 0, then reuses it for all subsequent

@@ -90,9 +90,9 @@ def extract_grid_arrays(grid, v_init=None, max_iter=10, tol=1e-8):
 
     Ybus = grid.get_Ybus_solver().copy()
     Sbus = grid.get_Sbus_solver().copy()
-    pv = grid.get_pv()
-    pq = grid.get_pq()
-    slack = grid.get_slack_ids()
+    pv = grid.get_pv_solver().copy()
+    pq = grid.get_pq_solver().copy()
+    slack = grid.get_slack_ids_solver().copy()
 
     n_bus = Ybus.shape[0]
     slack_weights = np.zeros(n_bus, dtype=float)
@@ -129,10 +129,39 @@ def extract_branch_data(grid):
     """
     lines = grid.get_lines()
     trafos = grid.get_trafos()
-    branch_from = np.concatenate(
-        (lines.get_bus_id_side_1(), trafos.get_bus_id_side_1()))
-    branch_to = np.concatenate(
-        (lines.get_bus_id_side_2(), trafos.get_bus_id_side_2()))
+
+    # branch_from/branch_to/vn_kv must all be in AC-solver bus numbering (like
+    # bus_vmin_kv/bus_vmax_kv in gpu_facade.py's _extract_limits_arrays), but
+    # lines.get_bus_id_side_*() and get_bus_vn_kv() both return grid-MODEL
+    # numbering -- relabel via id_me_to_ac_solver() (-1 = isolated bus),
+    # mirroring ls2g_bridge.cpp's concat_busids_to_solver()/relabel() exactly.
+    # Left unrelabeled: branch endpoints index past V's solver-sized length
+    # (IndexError in compute_branch_flows_cpu, confirmed on a real
+    # ~47k-bus/7270-solver-bus grid) and/or vn_kv mismatches V in size (crash
+    # in get_violations_n()) or silently pairs the wrong nominal voltage with
+    # the wrong bus -- whenever the grid's model->solver bus map isn't the
+    # identity (e.g. isolated buses excluded under KLU/the augmented
+    # multi-slack system, or half-open lines).
+    # Branch endpoints come in as arbitrary model-bus ids, so relabeling them
+    # needs the forward map (model id -> solver id, or -1): id_me_to_ac_solver().
+    # The inverse map id_ac_solver_to_me() (used below for vn_kv, where every
+    # solver slot needs filling) doesn't help here -- it would have to be
+    # inverted back into a forward map first, which is more work, not less.
+    me_to_solver = np.asarray(grid.id_me_to_ac_solver())
+
+    def _relabel_to_solver(global_ids):
+        global_ids = np.asarray(global_ids)
+        if me_to_solver.size == 0:
+            return global_ids   # identity numbering
+        out = global_ids.copy()
+        valid = (global_ids >= 0) & (global_ids < me_to_solver.shape[0])
+        out[valid] = me_to_solver[global_ids[valid]]
+        return out
+
+    branch_from = _relabel_to_solver(np.concatenate(
+        (lines.get_bus_id_side_1(), trafos.get_bus_id_side_1())))
+    branch_to = _relabel_to_solver(np.concatenate(
+        (lines.get_bus_id_side_2(), trafos.get_bus_id_side_2())))
     yff = np.concatenate(
         (lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11().copy()))
     yft = np.concatenate(
@@ -141,7 +170,15 @@ def extract_branch_data(grid):
         (lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
     ytt = np.concatenate(
         (lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
-    vn_kv = grid.get_bus_vn_kv().copy()
+    # Unlike branch endpoints above, every solver slot needs a vn_kv value, so
+    # this is a straight gather through the inverse map (solver id -> model
+    # id) instead of a scatter through the forward one.
+    vn_kv_model = grid.get_bus_vn_kv().copy()
+    solver_to_me = np.asarray(grid.id_ac_solver_to_me())
+    if solver_to_me.size == 0:
+        vn_kv = vn_kv_model   # identity numbering
+    else:
+        vn_kv = vn_kv_model[solver_to_me]
     sn_mva = grid.get_sn_mva()
     args = (branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
     return args, len(lines), len(trafos)

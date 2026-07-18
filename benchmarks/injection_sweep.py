@@ -1,9 +1,13 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 """
 Benchmark: GPU batched-injection AC power flow sweep.
 
-Generates log-normal load perturbation scenarios and benchmarks the
-InjectionSweepSolver (acpf_nr_gpu_injection).  Scenario 0 is always the
-exact base case; scenarios 1..N are random log-normal perturbations.
+Generates log-normal load perturbation scenarios and benchmarks
+InjectionSweepGPU.  Scenario 0 is always the exact base case; scenarios
+1..N are random log-normal perturbations.
 
 Load buses (PQ): P and Q scaled by the same per-bus log-normal factor,
   preserving the P/Q ratio at each bus.
@@ -23,10 +27,10 @@ import argparse
 import subprocess
 import numpy as np
 
-from gpusim2grid.injection_sweep import InjectionSweepSolver
+from gpusim2grid import InjectionSweepGPU
 from gpusim2grid.acpf_nr import compute_branch_flows_cpu   # CPU reference for base-case validation
 from gpusim2grid.compilation_options import is_fp32
-from _grid_setup import load_grid, extract_ac_data
+from _grid_setup import load_grid
 
 
 _DEFAULT_SIGMA = np.log(1.05) / 1.96   # ≈ 0.0249 → 95% of multipliers in [0.95, 1.05]
@@ -112,9 +116,11 @@ def build_injection_scenarios(acSbus_init, pq_index, pv_index, sn_mva,
 def main(args):
     grid_name = args.grid_name
     grid, v_init, v_res, n_sub, _, vn_kv = load_grid(grid_name)
-    ac_Ybus, acSbus_init, pv_index, pq_index, slack_index, slack_weights, \
-        sn_mva, max_iter, tol = extract_ac_data(grid)
-    n_bus    = ac_Ybus.shape[0]
+    acSbus_init = grid.get_Sbus_solver().copy()
+    pv_index    = grid.get_pv()
+    pq_index    = grid.get_pq()
+    sn_mva      = grid.get_sn_mva()
+    n_bus       = grid.get_Ybus_solver().shape[0]
     tol_conv = float(args.tol_conv)
 
     lines   = grid.get_lines()
@@ -156,28 +162,25 @@ def main(args):
           f"(strategy={args.strategy}, batch_size={batch_size}, "
           f"nb_iter={nb_iter}, n_scenarios={n_total}) ...")
 
-    solver = InjectionSweepSolver(
-        ac_Ybus, v_init, acSbus_init,
-        slack_index, slack_weights, pv_index, pq_index,
-        batch_size=batch_size, nb_iter=nb_iter,
-        max_iter_base=max_iter, tol_base=tol)
+    sweep = InjectionSweepGPU(grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6)
+    # branch data (needed for compute_flows) is extracted automatically from
+    # `grid` -- call sweep.set_branch_data(...) only in explicit-array mode.
 
-    solver.strategy = args.strategy
+    sweep.strategy = args.strategy
     if args.strategy == 'direct_refactor_every_n':
-        solver.refactor_period = args.refactor_period
+        sweep.solver.refactor_period = args.refactor_period
 
-    solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
-    solver.set_injections(p_mw, q_mvar, sn_mva)
-    solver.run()
-    print(f"Effective batch size used: {solver.used_batch_size}")
+    sweep.set_injections(p_mw, q_mvar, sn_mva)
+    sweep.compute(batch_size=batch_size)
+    print(f"Effective batch size used: {sweep.solver.used_batch_size}")
 
     # --- Branch flows (GPU kernel, all scenarios at once) ---
-    solver.compute_flows()
-    or_amps = solver.or_amps.to_numpy().reshape(n_total, n_branches)
+    sweep.compute_flows()
+    or_amps = sweep.or_amps.to_numpy().reshape(n_total, n_branches)
 
-    V_results = solver.V_results.to_numpy().reshape(n_total, n_bus)
-    residuals  = solver.residuals.to_numpy()    # (n_total,)
-    timings    = solver.timings
+    V_results = sweep.V_results.to_numpy().reshape(n_total, n_bus)
+    residuals  = sweep.last_residuals()    # (n_total,)
+    timings    = sweep.timings
 
     # --- Base-case validation (scenario 0) ---
     diff_V = np.abs(V_results[0] - v_res[:n_bus]).max()

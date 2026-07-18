@@ -35,6 +35,9 @@
 #include "dtypes.hpp"
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"
+#include "reordering_alg.hpp"
+#include "matching_alg.hpp"
+#include "pivot_epsilon_alg.hpp"
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -78,6 +81,19 @@ struct ContingencyAnalysisSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_   = ContingencySolverType::DirectRefactorEvery;
+    ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
+    MatchingAlg matching_alg_ = MatchingAlg::None;
+    PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+
+    // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
+    // AcPfNrState AND the batch driver used by run() -- see AcPfNrState's own
+    // doc. Computed PER BATCH SLOT (each contingency/scenario gets its own
+    // alpha from its own max|dtheta|/max|dvm|, not a single alpha shared
+    // across the whole chunk) -- a "hard" scenario is damped on its own
+    // terms without over-damping the easy ones sharing its chunk.
+    bool   scaling_max_voltage_change_ = false;
+    double max_dVa_ = 0.5;
+    double max_dVm_ = 0.1;
 
     // handle_disconnected_grid: when true, a contingency that splits the grid is
     // solved on its largest connected component (the rest is frozen and reported
@@ -150,7 +166,26 @@ struct ContingencyAnalysisSession {
         double tol_base      = 1e-6,
         int    device        = -1,
         const LedgerData* ledger = nullptr,  // augmented-J description (bridge path)
-        bool   presolved_v   = false  // trust Vinit as already converged; see AcPfNrState
+        bool   presolved_v   = false,  // trust Vinit as already converged; see AcPfNrState
+        // cuDSS alg choices, forwarded to BOTH base_state_'s AcPfNrState AND
+        // this session's own reordering_alg_/matching_alg_/pivot_epsilon_alg_
+        // members (used by the batch solver in run()) -- single source of
+        // truth set once at construction; see AcPfNrState's own doc.
+        ReorderingAlg reordering_alg = ReorderingAlg::Default,
+        MatchingAlg matching_alg = MatchingAlg::None,
+        PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // Opt-in diagnostic forwarded to base_state_ (see AcPfNrState's own
+        // doc): force the pre-ground-truth cuDSS-solve derivation of
+        // slack_absorbed/vc_q even when lightsim2grid's own converged values
+        // are available. Default false (prefer ground truth).
+        bool   debug_base_case = false,
+        // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
+        // AcPfNrState AND scaling_max_voltage_change_/max_dVa_/max_dVm_ (used
+        // by the batch solver in run(), computed per batch slot -- see the
+        // members' own doc). Off by default; see AcPfNrState's own doc.
+        bool   scaling_max_voltage_change = false,
+        double max_dVa = 0.5,
+        double max_dVm = 0.1
     );
 
     // =========================================================================

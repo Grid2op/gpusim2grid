@@ -72,6 +72,48 @@ struct AcPfNrState {
     int device_id_ = 0;
 
     // -------------------------------------------------------------------------
+    // cuDSS CUDSS_CONFIG_REORDERING_ALG choice, set once at construction and
+    // applied to BOTH dss (forward J, in the ctor) and dss_T (transpose Jᵀ,
+    // in prepare_JT()) -- they are independent CudssContexts, each running
+    // its own CUDSS_PHASE_ANALYSIS, so neither inherits the other's setting.
+    // -------------------------------------------------------------------------
+    ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
+
+    // -------------------------------------------------------------------------
+    // cuDSS CUDSS_CONFIG_MATCHING_ALG choice; same treatment as reordering_alg_
+    // above (applied to both dss and dss_T, set once at construction).
+    // -------------------------------------------------------------------------
+    MatchingAlg matching_alg_ = MatchingAlg::None;
+
+    // -------------------------------------------------------------------------
+    // cuDSS CUDSS_CONFIG_PIVOT_EPSILON_ALG choice; same treatment as
+    // reordering_alg_/matching_alg_ above (applied to both dss and dss_T, set
+    // once at construction).
+    // -------------------------------------------------------------------------
+    PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+
+    // -------------------------------------------------------------------------
+    // debug_base_case_: opt-in diagnostic (presolved_v path only). When true,
+    // always derive MultiSlack slack_absorbed / VoltageControl vc_q via the
+    // one-shot cuDSS solve, even when lightsim2grid's own converged ground
+    // truth (LedgerData::has_ext_state_ground_truth) is available -- e.g. to
+    // cross-validate the GPU's own Newton-derived state against ground truth,
+    // or to keep testing cuDSS config choices in isolation. Default false
+    // (prefer ground truth whenever available).
+    //
+    // base_case_only_: true only for ContingencyAnalysisSession's/
+    // InjectionSweepSession's internal base_state_ (set via their own
+    // constructors) -- never for AcPfNrSession, which IS the production
+    // solver and must always keep a valid cuDSS context alive for its own
+    // run()/prepare_JT(). When true AND the presolved_v ground-truth path
+    // applies (no debug override, extension state available from the
+    // ledger), this instance skips its cuDSS context (handle/config/data/
+    // ANALYSIS/FACTORIZATION) entirely -- see need_cudss in acpf_nr.cu.
+    // -------------------------------------------------------------------------
+    bool debug_base_case_ = false;
+    bool base_case_only_  = false;
+
+    // -------------------------------------------------------------------------
     // Scalar dimensions  (CPU-side, set in constructor, never modified)
     // -------------------------------------------------------------------------
     int n_bus  = 0;
@@ -184,6 +226,11 @@ struct AcPfNrState {
     thrust::device_vector<cuda_real_type>  d_F;     // mismatch RHS,  size dim_J
     thrust::device_vector<cuda_real_type>  d_dx;    // NR correction, size dim_J
 
+    // NR step-scaling (MaxVoltageChange) scratch, size 1 (single-system) --
+    // unused (empty) unless scaling_max_voltage_change is enabled.
+    thrust::device_vector<cuda_real_type>  d_scale_max_dtheta;
+    thrust::device_vector<cuda_real_type>  d_scale_max_dvm;
+
     // -------------------------------------------------------------------------
     // Jacobian CSR skeleton (device, real cuda_real_type)
     //   Sparsity pattern is FIXED across all NR iterations and contingencies.
@@ -286,7 +333,52 @@ struct AcPfNrState {
         // ||F(Vinit)||_inf and prepare J's factors, but never call solve/update_V —
         // d_V stays bit-identical to Vinit. Throws if the residual check fails.
         // See acpf_nr.cu §4.6.
-        bool                                         presolved_v = false
+        bool                                         presolved_v = false,
+        // DEBUG ONLY (presolved_v=true path): return immediately after
+        // fill_F/fill_J/FACTORIZE, BEFORE the has_ext_state one-shot cuDSS
+        // correction and BEFORE the ||F||_inf throwing check. Leaves d_F
+        // holding the raw F(Vinit, state=0) and d_J_values holding J(Vinit),
+        // both queryable via get_F()/get_J(), so a Python caller can solve
+        // J*dx=F itself (e.g. with scipy) to check the cuDSS call against a
+        // reference solver on the EXACT SAME data gpusim2grid built -- see
+        // the VC+MultiSlack singular-solve investigation. No-op when
+        // presolved_v=false.
+        bool                                         diag_stop_before_state_correction = false,
+        // CUDSS_CONFIG_REORDERING_ALG choice for BOTH dss and dss_T's
+        // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
+        ReorderingAlg                                reordering_alg = ReorderingAlg::Default,
+        // CUDSS_CONFIG_MATCHING_ALG choice for BOTH dss and dss_T's
+        // CUDSS_PHASE_ANALYSIS. Default (None) matches cuDSS's own default
+        // (matching disabled).
+        MatchingAlg                                   matching_alg = MatchingAlg::None,
+        // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for BOTH dss and dss_T's
+        // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
+        PivotEpsilonAlg                               pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // Opt-in diagnostic (presolved_v path only): force the cuDSS-solve
+        // derivation of slack_absorbed/vc_q even when ledger ground truth is
+        // available. See debug_base_case_ above. Default false.
+        bool                                          debug_base_case = false,
+        // Internal wiring flag: true only for ContingencyAnalysisSession's/
+        // InjectionSweepSession's base_state_. See base_case_only_ above.
+        // Default false (AcPfNrSession / the standalone acpf_nr_gpu()).
+        bool                                          base_case_only = false,
+        // NR step-scaling (mirrors lightsim2grid's own MaxVoltageChangeScalingPolicy,
+        // ScalingPolicies.hpp): after solving J*dx=F, scale the WHOLE dx by
+        // alpha<=1 so max|dtheta|<=max_dVa and max|dvm|<=max_dVm BEFORE applying
+        // it anywhere (Va/Vm and any extension state columns), exactly matching
+        // lightsim2grid's own apply_step(coeff * F). Off by default -- an
+        // opt-in knob, not activated unless requested (the ls2g bridge path
+        // resolves this from the grid's OWN get_ac_algo_config() by default,
+        // letting the caller override it; the explicit-array/tuple path has no
+        // grid to inherit from, so it starts off unless explicitly enabled
+        // here). Without it, an undamped GPU Newton step can converge onto a
+        // different (sometimes spurious) root than lightsim2grid's own damped
+        // trajectory when seeded far from the solution (e.g. a flat/DC start)
+        // -- observed on real RTE grids. max_dVa/max_dVm default to
+        // lightsim2grid's own MaxVoltageChangeScalingPolicy defaults.
+        bool                                          scaling_max_voltage_change = false,
+        double                                        max_dVa = 0.5,
+        double                                        max_dVm = 0.1
     );
 
     // =========================================================================

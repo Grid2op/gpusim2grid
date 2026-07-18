@@ -45,6 +45,14 @@ from .._gpusim2grid import (
     InjectionSweepSession as _InjectionSweepSession,
 )
 
+# Shared with contingency_analysis/__init__.py (single source of truth for
+# the reordering-alg string↔enum map, same as _normalize_device).
+from ..contingency_analysis import (
+    _resolve_reordering_alg,
+    _resolve_matching_alg,
+    _resolve_pivot_epsilon_alg,
+)
+
 
 _STRATEGY_MAP = {
     'direct_refactor_every':    _ContingencySolverType.DirectRefactorEvery,
@@ -183,7 +191,8 @@ class _InjectionSweepSolver:
     -----
     The following properties are **mutable** and take effect on the next
     :meth:`run` call: ``batch_size``, ``nb_iter``, ``strategy``,
-    ``refactor_period``.
+    ``refactor_period``, ``reordering_alg``, ``matching_alg``,
+    ``pivot_epsilon_alg``.
 
     Examples
     --------
@@ -205,25 +214,50 @@ class _InjectionSweepSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None, presolved_v=False):
+                 device=None, presolved_v=False, reordering_alg='default',
+                 matching_alg='none', pivot_epsilon_alg='default',
+                 debug_base_case=False,
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
+        self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
+        # Single source of truth, set once at construction: forwarded to BOTH
+        # the base-case solve (this call) AND the batch solver's own members
+        # (consumed by run()); see contingency_analysis's identical pattern.
         self._s = _InjectionSweepSession(
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
             int(batch_size), int(nb_iter), self._max_iter_base, self._tol_base,
-            _normalize_device(device), presolved_v=bool(presolved_v))
+            _normalize_device(device), presolved_v=bool(presolved_v),
+            reordering_alg=_resolve_reordering_alg(reordering_alg),
+            matching_alg=_resolve_matching_alg(matching_alg),
+            pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            debug_base_case=bool(debug_base_case),
+            scaling_max_voltage_change=bool(scaling_max_voltage_change),
+            max_dVa=float(max_dVa), max_dVm=float(max_dVm))
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
-                      strategy='direct_refactor_every'):
+                      strategy='direct_refactor_every', reordering_alg='default',
+                      matching_alg='none', pivot_epsilon_alg='default'):
         """Wrap an already-constructed C++ InjectionSweepSession (zero-copy
-        lightsim2grid bridge). Reuses all wrapper ergonomics."""
+        lightsim2grid bridge). Reuses all wrapper ergonomics.
+
+        reordering_alg/matching_alg/pivot_epsilon_alg here are bookkeeping
+        only (what the caller already passed to the C++ builder at
+        construction) -- purely so the Python-side property getters report
+        the truth; they do NOT re-apply these to the (already-built) session.
+        """
         self = cls.__new__(cls)
         self._s = session
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = strategy
+        self._reordering_alg = reordering_alg
+        self._matching_alg = matching_alg
+        self._pivot_epsilon_alg = pivot_epsilon_alg
         return self
 
     # --- mutable config ---
@@ -244,6 +278,38 @@ class _InjectionSweepSolver:
         self._s.nb_iter = int(value)
 
     @property
+    def scaling_max_voltage_change(self):
+        """NR step-scaling (mirrors lightsim2grid's own
+        MaxVoltageChangeScalingPolicy); bool, takes effect on the next run().
+        Each batch slot gets its own alpha from its own max|dtheta|/max|dvm|.
+        """
+        return self._s.scaling_max_voltage_change
+
+    @scaling_max_voltage_change.setter
+    def scaling_max_voltage_change(self, value):
+        self._s.scaling_max_voltage_change = bool(value)
+
+    @property
+    def max_dVa(self):
+        """MaxVoltageChangeScalingPolicy max angle step (rad); only
+        meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVa
+
+    @max_dVa.setter
+    def max_dVa(self, value):
+        self._s.max_dVa = float(value)
+
+    @property
+    def max_dVm(self):
+        """MaxVoltageChangeScalingPolicy max voltage-magnitude step (pu);
+        only meaningful with scaling_max_voltage_change=True."""
+        return self._s.max_dVm
+
+    @max_dVm.setter
+    def max_dVm(self, value):
+        self._s.max_dVm = float(value)
+
+    @property
     def strategy(self):
         """Linear-solve strategy (str). Takes effect on the next run()."""
         return self._strategy
@@ -252,6 +318,51 @@ class _InjectionSweepSolver:
     def strategy(self, value):
         self._s.strategy_type = _resolve_strategy(value)
         self._strategy = value if isinstance(value, str) else str(value)
+
+    @property
+    def reordering_alg(self):
+        """CUDSS_CONFIG_REORDERING_ALG choice (str or ReorderingAlg). Takes
+        effect on the next run() (which always reruns cuDSS ANALYSIS).
+
+        NOTE: cuDSS rejects 'btf_colamd'/'colamd' with CUDSS_STATUS_NOT_SUPPORTED
+        in this session's uniform-batch mode -- only 'default', 'amd',
+        'nested_dissection', 'none' are supported here. 'btf_colamd'/'colamd'
+        work only on AcPfGPU's single-system solve."""
+        return self._reordering_alg
+
+    @reordering_alg.setter
+    def reordering_alg(self, value):
+        self._s.reordering_alg = _resolve_reordering_alg(value)
+        self._reordering_alg = value if isinstance(value, str) else str(value)
+
+    @property
+    def matching_alg(self):
+        """CUDSS_CONFIG_MATCHING_ALG choice (str or MatchingAlg). Takes effect
+        on the next run() (which always reruns cuDSS ANALYSIS).
+
+        NOTE: 'none' (default) is the only value cuDSS accepts in this
+        session's uniform-batch mode -- every other value raises RuntimeError
+        (CUDSS_STATUS_NOT_SUPPORTED). They only work on AcPfGPU's
+        single-system solve, and even there 'max_diag_product'/'auto' have
+        been observed to silently produce NaN voltages."""
+        return self._matching_alg
+
+    @matching_alg.setter
+    def matching_alg(self, value):
+        self._s.matching_alg = _resolve_matching_alg(value)
+        self._matching_alg = value if isinstance(value, str) else str(value)
+
+    @property
+    def pivot_epsilon_alg(self):
+        """CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str or PivotEpsilonAlg).
+        Takes effect on the next run() (which always reruns cuDSS ANALYSIS).
+        One of 'default' (default), 'scaled', 'static'."""
+        return self._pivot_epsilon_alg
+
+    @pivot_epsilon_alg.setter
+    def pivot_epsilon_alg(self, value):
+        self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
+        self._pivot_epsilon_alg = value if isinstance(value, str) else str(value)
 
     @property
     def refactor_period(self):
