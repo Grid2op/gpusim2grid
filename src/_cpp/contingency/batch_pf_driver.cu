@@ -323,9 +323,21 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
         const double sqrt3 = std::sqrt(3.0);
         std::vector<cuda_real_type> h_base(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
-            const double vn = bus_vn_kv(h_from[l]);
-            h_base[l] = static_cast<cuda_real_type>(
-                sn_mva * 1e6 / (sqrt3 * vn * 1e3));
+            // branch_from can be -1 (Kron-reduced / half-open-line endpoint,
+            // see check_limit_violations_kernel's own bf/bt>=0 guard) --
+            // bus_vn_kv(-1) is an out-of-bounds read (UB, not caught by
+            // Eigen without assertions), and if it happens to read something
+            // near zero it makes h_base[l] = +inf, which then poisons the
+            // *live* side's reported current (ka_or/ka_ex = finite * inf)
+            // into an "infinite" CURRENT violation. Fall back to the other
+            // endpoint, which is always valid when branch_from isn't (a
+            // branch can't have both ends Kron-reduced and still appear
+            // here).
+            const int vn_bus = (h_from[l] >= 0) ? h_from[l] : h_to[l];
+            const double vn = (vn_bus >= 0) ? bus_vn_kv(vn_bus) : 0.0;
+            h_base[l] = (vn_bus >= 0)
+                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn * 1e3))
+                : cuda_real_type(0);
         }
         upload_h2d(d_base_current_A, h_base.data(), n_branches_, cs);
     }

@@ -89,7 +89,7 @@ struct BranchData {
     double          sn_mva;
 };
 
-BranchData extract_branch_data(const ls2g::LSGrid& grid)
+BranchData extract_branch_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
     const auto& lines  = grid.get_powerlines_as_data();
     const auto& trafos = grid.get_trafos_as_data();
@@ -108,15 +108,24 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid)
     bd.yft = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
     bd.ytf = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
     bd.ytt = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
-    // TODO(bug): bus_vn_kv is left in grid-MODEL bus numbering, unlike
-    // branch_from/branch_to just above (relabeled via me_to_solver) and unlike
-    // bus_vmin_kv/bus_vmax_kv in extract_limits() (also relabeled). Whenever
-    // id_me_to_ac_solver is not the identity -- e.g. isolated buses excluded
-    // under KLU/the augmented multi-slack system -- this mismatches V/
-    // branch_from in size (crash) or, if sizes coincide, silently pairs the
-    // wrong nominal voltage with the wrong bus in compute_branch_flows_cpu /
-    // get_violations_n. Needs the same me_to_solver remap applied here.
-    bd.bus_vn_kv = grid.get_bus_vn_kv();
+    // bus_vn_kv must be relabeled global(model)->AC-solver the same way
+    // branch_from/branch_to above and bus_vmin_kv/bus_vmax_kv in
+    // extract_limits() are, or it silently pairs the wrong nominal voltage
+    // with the wrong bus (used below to derive d_base_current_A) whenever
+    // id_me_to_ac_solver is not the identity -- e.g. isolated/Kron-reduced
+    // buses from keep_half_open_lines or a disconnected grid. A solver bus
+    // id with no model-side entry can't happen (every solver bus originates
+    // from some model bus); left at 0 defensively.
+    {
+        ls2g::RealVect vn_model = grid.get_bus_vn_kv();
+        RealVect vn_solver = RealVect::Zero(n_bus_solver);
+        for (size_t grid_id = 0; grid_id < me_to_solver.size(); ++grid_id) {
+            const int solver_id = me_to_solver[grid_id];
+            if (solver_id >= 0 && solver_id < n_bus_solver)
+                vn_solver(solver_id) = vn_model(static_cast<Eigen::Index>(grid_id));
+        }
+        bd.bus_vn_kv = vn_solver;
+    }
     bd.sn_mva    = const_cast<ls2g::LSGrid&>(grid).get_sn_mva();
     return bd;
 }
@@ -481,7 +490,7 @@ make_ca_session_from_lsgrid(
         reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
         scaling, max_dVa, max_dVm);
 
-    BranchData bd = extract_branch_data(grid);
+    BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
     session->set_branch_data(bd.branch_from, bd.branch_to,
                              bd.yff, bd.yft, bd.ytf, bd.ytt,
                              bd.bus_vn_kv, bd.sn_mva);
@@ -546,7 +555,7 @@ make_is_session_from_lsgrid(
         scaling, max_dVa, max_dVm);
 
     if (with_branch_data) {
-        BranchData bd = extract_branch_data(grid);
+        BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
         session->set_branch_data(bd.branch_from, bd.branch_to,
                                  bd.yff, bd.yft, bd.ytf, bd.ytt,
                                  bd.bus_vn_kv, bd.sn_mva);
