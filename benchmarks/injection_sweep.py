@@ -9,11 +9,14 @@ Generates log-normal load perturbation scenarios and benchmarks
 InjectionSweepGPU.  Scenario 0 is always the exact base case; scenarios
 1..N are random log-normal perturbations.
 
-Load buses (PQ): P and Q scaled by the same per-bus log-normal factor,
-  preserving the P/Q ratio at each bus.
-Generator buses (PV, net positive P): P scaled uniformly so that
+Scenarios are expressed per *element* (as lightsim2grid's own TimeSerie does),
+not per bus, and handed to ``set_injections_from_elements``:
+
+Loads: P and Q scaled by the same per-load log-normal factor, preserving each
+  load's P/Q ratio.
+Generators (non-slack): P scaled uniformly so that
   sum(gen_P_s) / sum(gen_P_ref) = sum(load_P_s) / sum(load_P_ref).
-Slack bus: unchanged (absorbs residual imbalance).
+Slack generators: unchanged (they absorb the residual imbalance).
 
 Usage
 -----
@@ -63,7 +66,7 @@ def get_parser():
         help="refactor period N for direct_refactor_every_n (default: 1)")
     parser.add_argument(
         "--sigma", type=float, default=_DEFAULT_SIGMA,
-        help=f"log-normal σ for per-bus load scaling "
+        help=f"log-normal σ for per-load scaling "
              f"(default: {_DEFAULT_SIGMA:.4f} ≈ 95%% of multipliers in [0.95, 1.05])")
     parser.add_argument(
         "--seed", type=int, default=0,
@@ -71,54 +74,64 @@ def get_parser():
     return parser
 
 
-def build_injection_scenarios(acSbus_init, pq_index, pv_index, sn_mva,
-                               n_random, sigma, rng):
-    """Build (p_mw, q_mvar) scenario arrays of shape (n_random + 1, n_bus).
+def read_base_injections(grid):
+    """Per-element base-case injections: (load_p, load_q, gen_p, gen_is_slack).
 
-    Scenario 0 is the exact base case (row 0 = acSbus_init * sn_mva).
-    Scenarios 1..n_random apply independent per-PQ-bus log-normal factors.
+    Loads are a pure-PQ container, so lightsim2grid's *results* are exactly the
+    targets it stamped into Sbus (0 for a disconnected load) -- one vectorized
+    call gives both P and Q.  Generators are NOT symmetric: a slack gen's
+    ``res_p`` also carries the absorbed slack mismatch, so gen P must come from
+    the targets instead.
+    """
+    load_res = grid.get_loads_res_full()
+    load_p_base = np.asarray(load_res[0], dtype=float)
+    load_q_base = np.asarray(load_res[1], dtype=float)
+    gen_p_base = np.asarray(grid.get_gen_target_p(), dtype=float)
+    gen_is_slack = np.array([g.is_slack for g in grid.get_generators()], dtype=bool)
+    return load_p_base, load_q_base, gen_p_base, gen_is_slack
+
+
+def build_injection_scenarios(load_p_base, load_q_base, gen_p_base,
+                              gen_is_slack, n_random, sigma, rng):
+    """Build per-element scenario arrays of shape (n_random + 1, n_elements).
+
+    Scenario 0 is the exact base case (row 0 = the grid's own values).
+    Scenarios 1..n_random apply an independent per-load log-normal factor.
 
     Returns
     -------
-    p_mw, q_mvar : ndarray, shape (n_random + 1, n_bus), float64
-        Net active / reactive injection per bus in MW / MVAr.
+    load_p, load_q : ndarray (n_random + 1, n_loads), MW / MVAr per load.
+    gen_p : ndarray (n_random + 1, n_gens), MW per generator.
     """
-    n_bus  = acSbus_init.shape[0]
     n_total = n_random + 1
-
-    p_net_base = acSbus_init.real * sn_mva   # MW,   base-case net P per bus
-    q_net_base = acSbus_init.imag * sn_mva   # MVAr, base-case net Q per bus
+    n_load = load_p_base.shape[0]
 
     # Start all scenarios at the base case; scenario 0 stays untouched.
-    p_mw   = np.tile(p_net_base, (n_total, 1))   # (n_total, n_bus)
-    q_mvar = np.tile(q_net_base, (n_total, 1))
+    load_p = np.tile(load_p_base, (n_total, 1))   # (n_total, n_loads)
+    load_q = np.tile(load_q_base, (n_total, 1))
+    gen_p = np.tile(gen_p_base, (n_total, 1))     # (n_total, n_gens)
 
-    # Independent log-normal factor per PQ bus per random scenario.
-    eps     = rng.normal(0.0, sigma, size=(n_random, len(pq_index)))
-    factors = np.exp(eps)                          # (n_random, n_pq)
+    # Independent log-normal factor per load per random scenario.
+    factors = np.exp(rng.normal(0.0, sigma, size=(n_random, n_load)))
 
-    # Perturb PQ buses (rows 1..).  Q scales by the same factor → P/Q ratio preserved.
-    p_mw  [1:, pq_index] = p_net_base[pq_index] * factors
-    q_mvar[1:, pq_index] = q_net_base[pq_index] * factors
+    # Perturb loads (rows 1..).  Q scales by the same factor → P/Q ratio preserved.
+    load_p[1:] = load_p_base * factors
+    load_q[1:] = load_q_base * factors
 
-    # Scale PV buses with positive net P so that generation tracks load.
-    # Buses where net P < 0 at PV type (load dominates the bus) are left at base.
-    pv_gen_idx = pv_index[p_net_base[pv_index] > 0]
-    total_pq_p_ref = p_net_base[pq_index].sum()      # < 0 for net load (typical)
-    if len(pv_gen_idx) > 0 and total_pq_p_ref != 0.0:
-        total_pq_p_s = p_mw[1:, pq_index].sum(axis=1)   # (n_random,)
-        pv_scale     = total_pq_p_s / total_pq_p_ref      # > 1 when load ↑
-        p_mw[1:, pv_gen_idx] = p_net_base[pv_gen_idx] * pv_scale[:, None]
+    # Scale non-slack generation so that it tracks total load.  The slack gens
+    # are left at base and absorb whatever imbalance is left over.
+    gen_idx = np.flatnonzero((~gen_is_slack) & (gen_p_base > 0))
+    total_load_ref = load_p_base.sum()
+    if gen_idx.size > 0 and total_load_ref != 0.0:
+        gen_scale = load_p[1:].sum(axis=1) / total_load_ref   # > 1 when load ↑
+        gen_p[1:, gen_idx] = gen_p_base[gen_idx] * gen_scale[:, None]
 
-    return p_mw, q_mvar
+    return load_p, load_q, gen_p
 
 
 def main(args):
     grid_name = args.grid_name
     grid, v_init, v_res, n_sub, _, vn_kv = load_grid(grid_name)
-    acSbus_init = grid.get_Sbus_solver().copy()
-    pv_index    = grid.get_pv()
-    pq_index    = grid.get_pq()
     sn_mva      = grid.get_sn_mva()
     n_bus       = grid.get_Ybus_solver().shape[0]
     tol_conv = float(args.tol_conv)
@@ -136,7 +149,10 @@ def main(args):
     ytf = np.concat((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()))
     ytt = np.concat((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()))
 
-    print(f"Grid: {grid_name}  ({n_bus} buses, {n_lines} lines, {n_trafos} trafos)")
+    load_p_base, load_q_base, gen_p_base, gen_is_slack = read_base_injections(grid)
+
+    print(f"Grid: {grid_name}  ({n_bus} buses, {n_lines} lines, {n_trafos} trafos, "
+          f"{load_p_base.shape[0]} loads, {gen_p_base.shape[0]} gens)")
 
     # Reference branch flows from the lightsim2grid base-case solution.
     ref_or_amps, _ = compute_branch_flows_cpu(
@@ -147,8 +163,8 @@ def main(args):
     n_total  = n_random + 1      # scenario 0 = exact base case
 
     rng = np.random.default_rng(args.seed)
-    p_mw, q_mvar = build_injection_scenarios(
-        acSbus_init, pq_index, pv_index, sn_mva,
+    load_p, load_q, gen_p = build_injection_scenarios(
+        load_p_base, load_q_base, gen_p_base, gen_is_slack,
         n_random, args.sigma, rng)
 
     print(f"Generated {n_random} random scenarios "
@@ -170,7 +186,9 @@ def main(args):
     if args.strategy == 'direct_refactor_every_n':
         sweep.solver.refactor_period = args.refactor_period
 
-    sweep.set_injections(p_mw, q_mvar, sn_mva)
+    # Per-element injections: the sweep reads which solver bus each load /
+    # generator sits on and assembles Sbus itself.
+    sweep.set_injections_from_elements(load_p, load_q, gen_p)
     sweep.compute(batch_size=batch_size)
     print(f"Effective batch size used: {sweep.solver.used_batch_size}")
 
@@ -186,7 +204,7 @@ def main(args):
     diff_V = np.abs(V_results[0] - v_res[:n_bus]).max()
     diff_A = np.abs(or_amps[0] - ref_or_amps).max()
     has_error = False
-    print(f"\nBase-case scenario (scenario 0) validation:")
+    print("\nBase-case scenario (scenario 0) validation:")
     if diff_V > 1e-3:
         has_error = True
     print(f"  Max |V_gpu − V_ref|    : {diff_V:.2e} pu  "

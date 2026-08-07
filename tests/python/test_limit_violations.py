@@ -393,6 +393,9 @@ def test_handle_disconnected_grid_masks_excluded_from_violations(solver_atol):
     # Every OTHER bus legitimately violates the absurd vmin.
     other_buses = {v.element_id for v in violations if v.violation_type.name == "LOW_VOLTAGE"}
     assert spur_bus not in other_buses
+    assert len(other_buses) >= 1, \
+        "the absurd vmin must still flag the live buses -- an empty violation " \
+        "list would make the exclusion check above vacuous"
 
 
 @requires_gpu
@@ -435,4 +438,3 @@ def test_not_simulated_contingency_reports_grid_entry():
     assert v.violation_type == LimitViolationType.NOT_SIMULATED
     assert v.element_id == -1
     assert np.isnan(v.value) and np.isnan(v.limit)
-    assert len(other_buses) >= 1

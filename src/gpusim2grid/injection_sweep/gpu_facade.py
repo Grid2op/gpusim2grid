@@ -19,6 +19,8 @@ from . import (
 from .._ls2g_utils import (
     extract_grid_arrays,
     extract_branch_data,
+    extract_injection_elements,
+    build_bus_injections,
     grid_from_pandapower,
     _validate_precision,
 )
@@ -114,9 +116,15 @@ class InjectionSweepGPU:
     >>> grid = init_from_pandapower(net)
     >>> grid.ac_pf(Vinit, max_iter=10, tol=1e-8)
     >>> sweep = InjectionSweepGPU(grid, nb_iter=4)
-    >>> sweep.set_injections(p_mw, q_mvar, sn_mva)   # (n_scen, n_bus)
+    >>> sweep.set_injections_from_elements(load_p, load_q, gen_p)
+    ...                                 # (n_scen, n_load) / (n_scen, n_gen)
     >>> V_batch = sweep.compute(batch_size=512)      # DLPack (n_scen, n_bus)
     >>> residuals = sweep.last_residuals()
+
+    The per-bus form is still available for callers that already assembled
+    Sbus themselves, in AC-solver bus numbering:
+
+    >>> sweep.set_injections(p_mw, q_mvar, sn_mva)   # (n_scen, n_bus)
 
     Explicit-array path (no lightsim2grid grid available):
 
@@ -208,6 +216,18 @@ class InjectionSweepGPU:
                     branch_args, _, _ = extract_branch_data(grid)
                     self._inner.set_branch_data(*branch_args)
 
+        # Snapshot the load/gen -> solver-bus wiring so set_injections_from_
+        # elements() can assemble Sbus itself.  Taken *after* the session is
+        # built: the Python-fallback path re-solves the grid inside
+        # extract_grid_arrays(), and the constant term must be derived from the
+        # same base Sbus the session was seeded with.  We keep the snapshot
+        # rather than the grid (unlike contingency_analysis/acpf_nr, which keep
+        # `self._grid`) so the session stays independent of the grid object.
+        if isinstance(grid, (tuple, list)):
+            self._elements = None   # no loads/generators to read
+        else:
+            self._elements = extract_injection_elements(grid, self._inner.n_bus)
+
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
 
@@ -224,8 +244,56 @@ class InjectionSweepGPU:
                                     bus_vn_kv, sn_mva)
 
     def set_injections(self, p_mw, q_mvar, sn_mva):
-        """Store the (n_scenarios, n_bus) MW / MVAr injection arrays."""
+        """Store the (n_scenarios, n_bus) MW / MVAr injection arrays.
+
+        ``p_mw``/``q_mvar`` are *net per-bus* injections in **AC-solver** bus
+        numbering.  Prefer :meth:`set_injections_from_elements` when ``grid``
+        is a lightsim2grid grid — it takes per-element data and does this
+        assembly for you.
+        """
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
+
+    def set_injections_from_elements(self, load_p, load_q, gen_p):
+        """Store per-element injections, mirroring lightsim2grid's own batch API.
+
+        Same inputs as lightsim2grid's ``TimeSeries.compute_Vs``: one row per
+        step (scenario), one column per element.  Sbus is assembled here on the
+        CPU by reading which AC-solver bus each load / generator sits on, so
+        callers never touch solver bus numbering.
+
+        Parameters
+        ----------
+        load_p, load_q : (n_steps, n_loads) — MW / MVAr per load.  Loads
+            **subtract** ``P + jQ`` from their bus (lightsim2grid convention).
+        gen_p : (n_steps, n_gens) — MW per generator, **added** to its bus.
+            Generator Q is not an input: for a voltage-regulating generator it
+            is a solver output, and for a non-regulating ("PQ") one it is held
+            at the grid's own target (see Notes).
+
+        Notes
+        -----
+        Everything the three arrays do not vary — HVDC converter stations,
+        static generators, storages, REACTIVE_POWER-mode SVCs, and the Q of
+        non-regulating generators — is carried through in a constant term
+        snapshotted from the grid at construction.  Feeding the grid's own base
+        values therefore reproduces the base case exactly.
+
+        Disconnected loads / generators are ignored, whatever their column
+        holds.  A *connected* element sitting on a bus the solver dropped is an
+        error, as it is in lightsim2grid.
+
+        The wiring is snapshotted at construction: mutating the grid afterwards
+        (``change_bus_load``, ``deactivate_gen``, topology changes) does not
+        propagate — build a new ``InjectionSweepGPU`` instead.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_injections_from_elements() needs a lightsim2grid grid; "
+                "explicit-array (tuple) mode has no loads/generators to read. "
+                "Use set_injections(p_mw, q_mvar, sn_mva) instead.")
+        p_mw, q_mvar = build_bus_injections(self._elements,
+                                            load_p, load_q, gen_p)
+        self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
 
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.
@@ -320,6 +388,23 @@ class InjectionSweepGPU:
     @property
     def n_bus(self):
         return self._inner.n_bus
+
+    @property
+    def n_loads(self):
+        """Column count :meth:`set_injections_from_elements` expects for load_p/q."""
+        if self._elements is None:
+            raise RuntimeError(
+                "explicit-array (tuple) mode has no loads; n_loads is undefined.")
+        return self._elements.n_load
+
+    @property
+    def n_gens(self):
+        """Column count :meth:`set_injections_from_elements` expects for gen_p."""
+        if self._elements is None:
+            raise RuntimeError(
+                "explicit-array (tuple) mode has no generators; n_gens is "
+                "undefined.")
+        return self._elements.n_gen
 
     @property
     def solver(self):

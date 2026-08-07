@@ -165,7 +165,7 @@ def main(args):
             print(f"Flow (A) max difference for contingency {reported_id} ({l_or_t}): {max_diff_a:.4e} A")
             
     if not has_error:
-        print(f"All contingencies results match between l2g and g2g")
+        print("All contingencies results match between l2g and g2g")
 
     # validate flows
     converged_mask = residuals < tol_conv

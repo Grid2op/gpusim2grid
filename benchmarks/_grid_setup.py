@@ -9,8 +9,9 @@ import warnings
 import grid2op
 import pandapower.networks as pn
 from lightsim2grid import LightSimBackend
-from lightsim2grid.gridmodel import init_from_pandapower
-from lightsim2grid.solver import SolverType
+# Handles both the current change_algorithm("NR_KLU") API and the older
+# change_solver(SolverType.KLU) one -- single source of truth for that fallback.
+from gpusim2grid._ls2g_utils import grid_from_pandapower
 
 _GRID2OP_TEST_ENVS = set(grid2op.list_available_test_env())
 
@@ -72,8 +73,7 @@ def _load_grid2op(env_name):
 
 
 def _load_pandapower(case_name):
-    grid = init_from_pandapower(getattr(pn, case_name)())
-    grid.change_solver(SolverType.KLU)
+    grid = grid_from_pandapower(getattr(pn, case_name)())
     v_init_dc = np.ones(shape=grid.get_bus_vn_kv().shape[0], dtype=complex)
     v_init = grid.dc_pf(v_init_dc, 1, 1)
     v_res = grid.ac_pf(v_init, 10, 1e-8)
