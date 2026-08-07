@@ -171,13 +171,21 @@ void InjectionSweepSession::run()
     timings_.t_base_case_ms  = t_base_case_ms_;
     timings_.t_preprocess_ms += base_state_->timings.t_build_J_ms;
     timings_.t_alloc_ms      += base_state_->timings.t_upload_ms;
+    // The base case's own cuSPARSE/cuDSS context creation joins the batch
+    // solver's (already in t_context_init_ms from solve()) in the shared
+    // one-time-init bucket, instead of masquerading as base-case solve time:
+    // on the first session in a process this is where CUDA-context creation
+    // and the cuSPARSE/cuDSS dlopen+JIT land (tens of ms).
+    timings_.t_context_init_ms += base_state_->timings.t_context_init_ms;
     // Non-overlapping remainder of t_base_case_ms (cuDSS analyze + NR
-    // iterations, or the presolved_v validation step): the build_J/upload
-    // share is already folded above, so this avoids double-counting it in
+    // iterations, or the presolved_v validation step): the build_J/upload and
+    // context-init shares are already folded above, so this avoids
+    // double-counting them in
     // BatchTimings::t_gpu_compute_ms()/t_grand_total_ms().
     timings_.t_base_case_solve_only_ms =
         t_base_case_ms_ - base_state_->timings.t_build_J_ms
-                         - base_state_->timings.t_upload_ms;
+                         - base_state_->timings.t_upload_ms
+                         - base_state_->timings.t_context_init_ms;
     // Informational only (measured before base_state_ existed) -- see
     // AcPfTimings::t_ground_truth_check_ms.
     timings_.t_ground_truth_check_ms = base_state_->timings.t_ground_truth_check_ms;

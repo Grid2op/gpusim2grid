@@ -57,7 +57,8 @@ struct TimingEntry {
 // All durations in milliseconds.
 //
 // One-time setup fields (plain double — no GPU event available for these):
-//   t_init_ms     — wall-clock total: pvpq sort + J sparsity build + H→D uploads
+//   t_init_ms     — wall-clock total: member construction (CUDA-context creation)
+//                   + pvpq sort + J sparsity build + H→D uploads
 //                   + cuSPARSE descriptor creation.  Mixed CPU/GPU work; an event
 //                   pair would only capture the GPU tail, so chrono is used.
 //                   Sub-components (sum to ≈ t_init_ms, remainder = cuSPARSE setup):
@@ -66,6 +67,19 @@ struct TimingEntry {
 //                     (d_map_j11/12/21/22) that link Ybus nonzeros to J entries.
 //     t_upload_ms   — sub-phase: all H→D data transfers: Ybus values + CSR
 //                     indices, scatter maps, Sbus, V_init, J skeleton arrays.
+//     t_context_init_ms — sub-phase: CUDA-context creation (charged from the
+//                     first-declared ctor_clock_ member, since the CudaStream
+//                     member's cudaStreamCreate() triggers it before the
+//                     constructor body even starts) + cuSPARSE/cuDSS handle
+//                     and descriptor creation. On the FIRST solve in a process
+//                     this pays lazy context creation and the cuSPARSE/cuDSS
+//                     dlopen + PTX-JIT, which can dominate everything else
+//                     (tens of ms) and has nothing to do with grid size or
+//                     the solve itself. Split out of the "everything else in
+//                     the constructor" remainder precisely so that one-time
+//                     library warm-up is never mistaken for solve time --
+//                     call gpusim2grid.warmup() before timing anything to
+//                     move it out of the measured region entirely.
 //   t_analyze_ms  — wall-clock: cuDSS symbolic analysis / reordering (done once).
 //   t_prepare_jt_ms — wall-clock: prepare_JT() -- builds Jᵀ via cusparseCsr2cscEx2
 //                     and factorizes it with a dedicated cuDSS context, for the
@@ -104,6 +118,8 @@ struct TimingEntry {
 //   t_cpu_preprocess_ms() — t_build_J_ms + t_ground_truth_check_ms (both pure
 //                           CPU; see t_ground_truth_check_ms's own doc above).
 //   t_host_to_device_ms() — alias for t_upload_ms (already pure H→D).
+//   t_context_init_ms     — one-time CUDA/cuSPARSE/cuDSS library + context
+//                           init (its own bucket, not part of any other).
 //   t_device_to_host_ms() — alias for t_copy_v_to_host_ms.
 //   t_gpu_compute_ms()    — t_analyze_ms + all per-iteration GPU-phase wall time.
 //   t_grand_total_ms()    — everything above; should match an external
@@ -114,6 +130,7 @@ struct AcPfTimings {
     double t_init_ms    = 0.;   // total: see sub-fields below
     double t_build_J_ms = 0.;   // sub-phase: J sparsity + scatter maps (CPU)
     double t_upload_ms  = 0.;   // sub-phase: H→D data transfers
+    double t_context_init_ms = 0.;  // sub-phase: cuSPARSE/cuDSS ctx (+ first-touch CUDA init)
     double t_analyze_ms = 0.;   // cuDSS symbolic analysis
     double t_prepare_jt_ms = 0.;   // Jᵀ transpose + cuDSS analyze/factorize (adjoint setup)
     // Wall time of LSGrid::check_solution(), copied in from LedgerData. This
@@ -170,12 +187,14 @@ struct AcPfTimings {
     // t_ground_truth_check_ms (not == t_init_ms alone) -- t_grand_total_ms()
     // below adds it in exactly once via this bucket.
     double t_cpu_preprocess_ms() const { return t_build_J_ms + t_ground_truth_check_ms; }
-    // t_init_ms - t_build_J_ms rather than a plain alias for t_upload_ms:
     // t_init_ms is one continuous wall-clock span covering build_J + upload
-    // + cuSPARSE/cuDSS handle & descriptor creation (the last of which has no
-    // dedicated field), so this is the exact non-overlapping remainder after
-    // CPU preprocessing.
-    double t_host_to_device_ms() const { return t_init_ms - t_build_J_ms; }
+    // + cuSPARSE/cuDSS handle & descriptor creation; the first and last of
+    // those have their own fields, so this subtracts both and reports the
+    // exact non-overlapping H→D remainder (≈ t_upload_ms plus whatever small
+    // untimed slack sits between the sub-phases).
+    double t_host_to_device_ms() const {
+        return t_init_ms - t_build_J_ms - t_context_init_ms;
+    }
     double t_device_to_host_ms() const { return t_copy_v_to_host_ms; }
 
     double t_gpu_compute_ms() const {
@@ -222,8 +241,10 @@ struct AcPfTimings {
 //                          V_init, J skeleton (from AcPfNrState ctor)
 //                        • block-diagonal CSR structure + chunk-sized working
 //                          buffers (BatchPfDriver ctor)
-//   t_analysis_ms    — cuDSS init + ANALYSIS (symbolic factorization) + policy
-//                      init only (NOT source-specific setup — see
+//   t_analysis_ms    — cuDSS ANALYSIS (symbolic factorization) + policy
+//                      init only — the batch cuDSS context creation it used to
+//                      include is now in t_context_init_ms (NOT source-specific
+//                      setup either — see
 //                      t_source_init_ms; base-case analysis is inside
 //                      t_base_case_ms / t_base_case_solve_only_ms)
 //   t_source_init_ms — source-specific one-time GPU setup, split out of what
@@ -232,10 +253,28 @@ struct AcPfTimings {
 //                      one-time Ybus D→D tiling (injection)
 //   t_branch_data_upload_ms — H→D upload of branch admittances
 //                      (set_branch_data(), called from compute_flows())
+//   t_context_init_ms — one-time CUDA/cuSPARSE/cuDSS library + context init:
+//                      the base case's own handle/descriptor creation plus the
+//                      batch solver's cuDSS context creation, both split out of
+//                      what used to sit inside t_base_case_solve_only_ms /
+//                      t_analysis_ms. On the FIRST such call in a process this
+//                      is where CUDA-context creation and the cuSPARSE/cuDSS
+//                      dlopen + PTX-JIT land — tens of ms that scale with
+//                      nothing and vanish on every subsequent session in the
+//                      same process. Call gpusim2grid.warmup() before timing
+//                      to move it out of the measured region entirely.
+//                      Deliberately NOT part of t_gpu_compute_ms(): it is
+//                      process warm-up, not work done for this batch.
 //   t_base_case_solve_only_ms — non-overlapping remainder of t_base_case_ms:
 //                      cuDSS analyze + NR iterations (or presolved_v
 //                      validation) only, excluding the build_J/upload share
-//                      already folded into t_preprocess_ms/t_alloc_ms
+//                      already folded into t_preprocess_ms/t_alloc_ms and the
+//                      context-init share split into t_context_init_ms.
+//                      Under init_from_n_powerflow=True (presolved_v) with
+//                      lightsim2grid ground truth available there is no solve
+//                      and no cuDSS context at all, so this is ~0.2 ms — if
+//                      you see tens of ms here on a warm process, the base
+//                      case really is iterating.
 //   t_copy_flows_to_host_ms  — D→H download of or_amps/ex_amps (compute_flows())
 //   t_copy_V_to_host_ms      — D→H download behind get_V_results()/.to_numpy()
 //   t_copy_residuals_to_host_ms — D→H download behind get_residuals()/.to_numpy()
@@ -280,8 +319,9 @@ struct AcPfTimings {
 //   t_device_to_host_ms() — t_copy_flows_to_host_ms + t_copy_V_to_host_ms
 //                           + t_copy_residuals_to_host_ms (exact — pure D→H).
 //   t_gpu_compute_ms()    — t_base_case_solve_only_ms + t_analysis_ms
-//                           + t_chunks_total_wall_ms().
-//   t_grand_total_ms()    — sum of the four buckets above; should match an
+//                           + t_chunks_total_wall_ms(). Excludes
+//                           t_context_init_ms (see its doc above).
+//   t_grand_total_ms()    — sum of the five buckets above; should match an
 //                           external stopwatch wrapped around construction →
 //                           first run() → compute_flows() → .to_numpy() calls.
 //                           Caveat: t_base_case_solve_only_ms (like
@@ -299,6 +339,7 @@ struct BatchTimings {
     double t_analysis_ms          = 0.;
     double t_source_init_ms       = 0.;
     double t_branch_data_upload_ms = 0.;
+    double t_context_init_ms      = 0.;
     double t_base_case_solve_only_ms = 0.;
     // See AcPfTimings::t_ground_truth_check_ms -- folded in here from
     // base_state_->timings, and folded into t_cpu_preprocess_ms()/
@@ -379,6 +420,7 @@ struct BatchTimings {
 
     double t_grand_total_ms() const {
         return t_cpu_preprocess_ms() + t_host_to_device_ms()
+             + t_context_init_ms
              + t_gpu_compute_ms()    + t_device_to_host_ms();
     }
 };

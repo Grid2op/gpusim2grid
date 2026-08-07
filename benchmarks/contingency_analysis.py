@@ -6,7 +6,7 @@ import argparse
 import subprocess
 import numpy as np
 from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
-from gpusim2grid import ContingencyAnalysisGPU
+from gpusim2grid import ContingencyAnalysisGPU, warmup
 from gpusim2grid.compilation_options import is_fp32
 from _grid_setup import load_grid
 
@@ -113,6 +113,13 @@ def main(args):
     batch_size = args.batch_size
     nb_iter    = args.nb_iter
 
+    # Pay CUDA-context creation and the cuSPARSE/cuDSS dlopen + PTX-JIT here,
+    # before anything measured. Otherwise the first solver built in this
+    # process absorbs tens of milliseconds of one-time library init that has
+    # nothing to do with the grid or the strategy under test -- reported as
+    # t_context_init_ms, but still inside the wall-clock totals below.
+    print(f"GPU warm-up (CUDA/cuSPARSE/cuDSS init): {warmup():.1f} ms")
+
     print(f"\nRunning contingency analysis on GPU (strategy={args.strategy}, batch_size={batch_size}, nb_iter={nb_iter}, n cont = {n_conts_simul}) ...")
     ca = ContingencyAnalysisGPU(
         grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6)
@@ -198,6 +205,8 @@ def main(args):
     print(f"  CPU preprocessing      : {timings.t_preprocess_ms:.2f} ms")
     print(f"  Device allocation      : {timings.t_alloc_ms:.2f} ms")
     print(f"  cuDSS analysis         : {timings.t_analysis_ms:.2f} ms")
+    print(f"  CUDA/cuDSS ctx init    : {timings.t_context_init_ms:.2f} ms"
+          f"   (one-time process warm-up; ~0 after warmup())")
     print(f"  Source-specific init   : {timings.t_source_init_ms:.2f} ms")
     print(f"  --- per-chunk totals (all {timings.n_chunks} chunks) ---")
     print(f"  Tile V                 : {timings.t_tile_V.wall_ms:.2f} ms")
@@ -227,6 +236,7 @@ def main(args):
     print(f"Coarse aggregation:")
     print(f"  CPU preprocessing (total)  : {timings.t_cpu_preprocess_ms:.2f} ms")
     print(f"  Host->device (total)       : {timings.t_host_to_device_ms:.2f} ms")
+    print(f"  Context init (total)       : {timings.t_context_init_ms:.2f} ms")
     print(f"  GPU compute (total)        : {timings.t_gpu_compute_ms:.2f} ms")
     print(f"  Device->host (total)       : {timings.t_device_to_host_ms:.2f} ms")
     print(f"  Grand total                : {timings.t_grand_total_ms:.2f} ms")

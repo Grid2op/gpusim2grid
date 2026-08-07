@@ -113,7 +113,11 @@ struct BatchPfDriver {
     // -------------------------------------------------------------------------
     // One-time construction timings (wall-clock ms)
     //
-    //   t_analysis_ms_    — cuDSS init + ANALYSIS + policy init ONLY.
+    //   t_analysis_ms_    — cuDSS ANALYSIS + policy init ONLY.
+    //   t_context_init_ms_ — cuDSS handle/config/data creation, split out of
+    //                       t_analysis_ms_: on the first cuDSS use in a process
+    //                       this is dlopen + JIT of the backend, size-
+    //                       independent one-time cost, not analysis work.
     //   t_source_init_ms_ — source-specific one-time GPU setup (split out of
     //                       what used to be bundled into t_analysis_ms_): see
     //                       BatchSource::initialize().
@@ -121,6 +125,7 @@ struct BatchPfDriver {
     double t_preprocess_ms_       = 0.;
     double t_alloc_ms_            = 0.;
     double t_analysis_ms_         = 0.;
+    double t_context_init_ms_     = 0.;
     double t_source_init_ms_      = 0.;
     double t_branch_data_upload_ms_ = 0.;   // set by set_branch_data()
     double t_violation_setup_ms_    = 0.;   // set by set_violation_limits()

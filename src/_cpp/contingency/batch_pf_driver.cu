@@ -238,7 +238,11 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     }, policy_);
 
     cs.synchronize();
-    t_analysis_ms_ = bpf_ms_since(t_cudss_start);
+    // Split the cuDSS context creation (first-touch dlopen/JIT on the first
+    // cuDSS use in the process) out of the ANALYSIS cost -- see
+    // CudssBatchSolver::context_init_ms() and BatchTimings::t_context_init_ms.
+    t_context_init_ms_ = linear_solver_.context_init_ms();
+    t_analysis_ms_ = bpf_ms_since(t_cudss_start) - t_context_init_ms_;
 
     // -------------------------------------------------------------------------
     // Source-specific one-time setup (flat-patch/mask H→D upload for
@@ -498,6 +502,7 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.t_alloc_ms       = t_alloc_ms_;
     t.t_analysis_ms    = t_analysis_ms_;
     t.t_source_init_ms = t_source_init_ms_;
+    t.t_context_init_ms = t_context_init_ms_;
 
     // When the source has compacted disconnected contingencies out of the batch
     // (n_active_ < n_contingencies), the chunk loop only writes the connected

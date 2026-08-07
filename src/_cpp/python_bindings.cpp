@@ -10,6 +10,7 @@
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
+#include "warmup.hpp"                        // warmup
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
@@ -81,6 +82,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_upload_ms",  &AcPfTimings::t_upload_ms,
                       "Wall-clock sub-phase of t_init_ms: H->D transfers -- Ybus "
                       "values/indices, scatter maps, Sbus, V_init, J skeleton (ms)")
+        .def_readonly("t_context_init_ms", &AcPfTimings::t_context_init_ms,
+                      "Wall-clock sub-phase of t_init_ms: cuSPARSE/cuDSS handle + "
+                      "descriptor creation. On the first such call in a process this "
+                      "also pays CUDA-context creation and the cuSPARSE/cuDSS "
+                      "dlopen + PTX-JIT -- tens of ms independent of grid size, ~0 on "
+                      "every later solve in the same process. Call "
+                      "gpusim2grid.warmup() before timing to move it out of the "
+                      "measured region (ms)")
         .def_readonly("t_analyze_ms", &AcPfTimings::t_analyze_ms,
                       "Wall-clock: cuDSS symbolic analysis — done once, "
                       "sparsity pattern of J never changes (ms)")
@@ -139,9 +148,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Alias for t_build_J_ms: all CPU-only preprocessing (ms)")
         .def_property_readonly("t_host_to_device_ms",
                       [](const AcPfTimings& t) { return t.t_host_to_device_ms(); },
-                      "t_init_ms - t_build_J_ms: H->D data transfers + cuSPARSE/cuDSS "
-                      "handle & descriptor creation (the non-overlapping remainder of "
-                      "t_init_ms after CPU preprocessing) (ms)")
+                      "t_init_ms - t_build_J_ms - t_context_init_ms: H->D data "
+                      "transfers only (the non-overlapping remainder of t_init_ms "
+                      "after CPU preprocessing and library/context init) (ms)")
         .def_property_readonly("t_device_to_host_ms",
                       [](const AcPfTimings& t) { return t.t_device_to_host_ms(); },
                       "Alias for t_copy_v_to_host_ms: all D->H data transfers (ms)")
@@ -210,8 +219,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "upload (folded in) + block-diagonal structure upload + chunk-sized "
                       "working buffers (ms)")
         .def_readonly("t_analysis_ms",   &BatchTimings::t_analysis_ms,
-                      "Wall-clock: cuDSS init + ANALYSIS + policy init only (uniform-batch "
-                      "context) -- NOT source-specific setup, see t_source_init_ms (ms)")
+                      "Wall-clock: cuDSS ANALYSIS + policy init only (uniform-batch "
+                      "context) -- NOT the cuDSS context creation (see "
+                      "t_context_init_ms) and NOT source-specific setup (see "
+                      "t_source_init_ms) (ms)")
+        .def_readonly("t_context_init_ms", &BatchTimings::t_context_init_ms,
+                      "Wall-clock: one-time CUDA/cuSPARSE/cuDSS library + context init "
+                      "-- the base case's handle/descriptor creation plus the batch "
+                      "solver's cuDSS context creation. On the FIRST session in a "
+                      "process this is where CUDA-context creation and the "
+                      "cuSPARSE/cuDSS dlopen + PTX-JIT land: tens of ms that scale with "
+                      "nothing and drop to ~0 for every later session in the same "
+                      "process. Its own grand-total bucket, deliberately NOT part of "
+                      "t_gpu_compute_ms -- it is process warm-up, not work done for "
+                      "this batch. Call gpusim2grid.warmup() before timing to move it "
+                      "out of the measured region entirely (ms)")
         .def_readonly("t_source_init_ms", &BatchTimings::t_source_init_ms,
                       "Wall-clock: source-specific one-time GPU setup -- flat-patch/mask H->D "
                       "upload (contingency) or Sbus_all H->D upload + one-time Ybus D->D tiling "
@@ -226,7 +248,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_base_case_solve_only_ms", &BatchTimings::t_base_case_solve_only_ms,
                       "Wall-clock: non-overlapping remainder of t_base_case_ms -- cuDSS analyze "
                       "+ NR iterations (or the presolved_v validation step) only, excluding the "
-                      "build_J/upload share already folded into t_preprocess_ms/t_alloc_ms (ms)")
+                      "build_J/upload share already folded into t_preprocess_ms/t_alloc_ms and "
+                      "the context-init share split into t_context_init_ms. Under "
+                      "init_from_n_powerflow=True with lightsim2grid ground truth there is no "
+                      "solve and no cuDSS context at all, so this is ~0.2 ms (ms)")
         .def_readonly("t_ground_truth_check_ms", &BatchTimings::t_ground_truth_check_ms,
                       "Wall-clock: LSGrid::check_solution() precondition, measured BEFORE "
                       "this session existed (inside extract_ledger_data(), ls2g_bridge.cpp), "
@@ -318,11 +343,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "pure D->H (ms)")
         .def_property_readonly("t_gpu_compute_ms",
                       [](const BatchTimings& t) { return t.t_gpu_compute_ms(); },
-                      "t_base_case_solve_only_ms + t_analysis_ms + t_chunks_total_wall_ms (ms)")
+                      "t_base_case_solve_only_ms + t_analysis_ms + t_chunks_total_wall_ms. "
+                      "Excludes t_context_init_ms (one-time process warm-up) (ms)")
         .def_property_readonly("t_grand_total_ms",
                       [](const BatchTimings& t) { return t.t_grand_total_ms(); },
-                      "Sum of t_cpu_preprocess_ms + t_host_to_device_ms + t_gpu_compute_ms + "
-                      "t_device_to_host_ms. Should match an external stopwatch wrapped around "
+                      "Sum of t_cpu_preprocess_ms + t_host_to_device_ms + t_context_init_ms + "
+                      "t_gpu_compute_ms + t_device_to_host_ms. Should match an external "
+                      "stopwatch wrapped around "
                       "construction -> first run() -> compute_flows() -> .to_numpy() calls. "
                       "Caveat: t_base_case_solve_only_ms (like t_base_case_ms) is captured once "
                       "at construction -- a second run() reusing the same base case will still "
@@ -350,6 +377,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
             h2d["source_init_ms"]         = t.t_source_init_ms;
             h2d["branch_data_upload_ms"]  = t.t_branch_data_upload_ms;
             h2d["violation_setup_ms"]     = t.t_violation_setup_ms;
+
+            // One-time CUDA/cuSPARSE/cuDSS warm-up, kept out of gpu_compute on
+            // purpose -- see BatchTimings::t_context_init_ms.
+            py::dict context_init;
+            context_init["total"] = t.t_context_init_ms;
 
             py::dict gpu_compute;
             gpu_compute["total"]                    = t.t_gpu_compute_ms();
@@ -379,15 +411,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
             d2h["copy_violations_to_host_ms"] = t.t_copy_violations_to_host_ms;
 
             py::dict result;
-            result["total"]       = t.t_grand_total_ms();
-            result["cpu_preproc"] = cpu_preproc;
-            result["h2d"]         = h2d;
-            result["gpu_compute"] = gpu_compute;
-            result["d2h"]         = d2h;
+            result["total"]        = t.t_grand_total_ms();
+            result["cpu_preproc"]  = cpu_preproc;
+            result["h2d"]          = h2d;
+            result["context_init"] = context_init;
+            result["gpu_compute"]  = gpu_compute;
+            result["d2h"]          = d2h;
             return result;
         }, "Nested dict view of the coarse timing buckets: "
            "{'total': ms, 'cpu_preproc': {'total': ms, ...}, 'h2d': {'total': ms, ...}, "
-           "'gpu_compute': {'total': ms, ...}, 'd2h': {'total': ms, ...}}. Each bucket's "
+           "'context_init': {'total': ms}, 'gpu_compute': {'total': ms, ...}, "
+           "'d2h': {'total': ms, ...}}. Each bucket's "
            "'total' matches its t_*_ms coarse property; the remaining keys are the "
            "fine-grained fields it's composed of. Fine fields that are TimingEntry in C++ "
            "(the per-chunk fields under 'gpu_compute') become nested "
@@ -1406,6 +1440,23 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "choice for the ANALYSIS phase. "
         "For validating cuDSS on an arbitrary dumped (J, F) pair (e.g. from "
         "AcPfNrSession::get_J()/get_F()), see repro_cudss_bug_standalone.py.");
+
+    m.def("warmup", &warmup,
+        pybind11::arg("device") = -1,
+        "Pay CUDA/cuSPARSE/cuDSS one-time initialization up front and return "
+        "the wall-clock milliseconds it took.\n\n"
+        "The first AcPfGPU / ContingencyAnalysisGPU / InjectionSweepGPU built "
+        "in a process absorbs CUDA-context creation plus the cuSPARSE/cuDSS "
+        "dlopen + PTX-JIT -- tens of ms that scale with nothing and never "
+        "recur. That cost is reported separately as t_context_init_ms, but it "
+        "still sits inside whatever stopwatch wraps construction, and in a "
+        "benchmark loop over several grids it is charged entirely to whichever "
+        "grid runs first. Call this once before the loop and every session "
+        "afterwards reports (and takes) only its own work.\n\n"
+        "Runs a trivial 2x2 cuSPARSE SpMV and cuDSS analyze/factorize/solve, "
+        "single-system and uniform-batch, then throws the results away. "
+        "device: CUDA device ordinal, or -1 for the current device. "
+        "Idempotent.");
 
     // -----------------------------------------------------------------
     // Compilation options — queryable at runtime

@@ -280,6 +280,13 @@ AcPfNrState::AcPfNrState(
     // that would otherwise land entirely outside any timed region.
     auto t_wall_start = std::chrono::steady_clock::now();
 
+    // Everything that ran before this body: member construction, dominated by
+    // cs's cudaStreamCreate() lazily creating the CUDA context on a process'
+    // first CUDA call (tens of ms, one-time, size-independent). Charged to
+    // t_context_init_ms below alongside the cuSPARSE/cuDSS setup so it can't
+    // masquerade as solve time -- see AcPfNrState::ctor_clock_.
+    const double t_pre_body_ms = ms_since(ctor_clock_.t0);
+
     // =========================================================================
     // Device selection — must happen before any stream/allocation.
     // =========================================================================
@@ -710,7 +717,16 @@ AcPfNrState::AcPfNrState(
     //   This avoids the CudaDeviceScalar used in the original code and
     //   sidesteps the device-pointer aliasing bug that caused silent
     //   context corruption.
+    //
+    //   Timed (through the end of 4.5 below) into timings.t_context_init_ms:
+    //   on a process' first CUDA call these dlopen + PTX-JIT the cuSPARSE/
+    //   cuDSS backends and create the CUDA context itself, which can dwarf
+    //   every other phase regardless of grid size. Keeping it in its own
+    //   sub-phase stops that one-time warm-up from being reported as base-case
+    //   solve time (see AcPfTimings::t_context_init_ms and warmup()).
     // =========================================================================
+    auto t_ctx_start = std::chrono::steady_clock::now();
+
     CHK_CSP_AC(cusparseCreate(&spmv.handle));
     CHK_CSP_AC(cusparseSetPointerMode(spmv.handle, CUSPARSE_POINTER_MODE_HOST));
     CHK_CSP_AC(cusparseSetStream(spmv.handle, cs));  // bind to our stream
@@ -804,13 +820,19 @@ AcPfNrState::AcPfNrState(
         dss_b.create_dn(dim_J, thrust::raw_pointer_cast(d_F.data()));
     }
 
+    timings.t_context_init_ms = t_pre_body_ms + ms_since(t_ctx_start);
+
     // t_init_ms captured HERE (not right after the H→D uploads above): it must
     // also cover the cuSPARSE SpMV descriptor and, when created, the cuDSS
     // handle/config/data/matrix-descriptor creation just above -- on a
     // process' first CUDA call these dlopen + PTX-JIT the cuSPARSE/cuDSS
     // backends, which can dominate total wall time and would otherwise land
-    // in a completely untimed gap.
-    timings.t_init_ms = ms_since(t_wall_start);
+    // in a completely untimed gap.  Measured from ctor_clock_ (not
+    // t_wall_start) so it also covers member construction / CUDA-context
+    // creation, keeping t_context_init_ms a strict subset of it -- consumers
+    // subtract both it and t_build_J_ms (see
+    // AcPfTimings::t_host_to_device_ms()).
+    timings.t_init_ms = ms_since(ctor_clock_.t0);
 
     // ANALYSIS: reordering + symbolic factorisation. Skipped along with the
     // rest of the cuDSS context above when !need_cudss.
