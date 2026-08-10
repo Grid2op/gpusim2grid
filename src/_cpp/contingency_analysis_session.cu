@@ -148,8 +148,7 @@ void ContingencyAnalysisSession::build_contingencies(
         throw std::runtime_error(
             "ContingencyAnalysisSession: call set_branch_data() before build_contingencies()");
 
-    const int n_branches = static_cast<int>(h_branch_from_.size());
-    const int n_ctg      = static_cast<int>(branch_ids_per_ctg.size());
+    const int n_ctg = static_cast<int>(branch_ids_per_ctg.size());
 
     contingencies_.clear();
     contingencies_.reserve(n_ctg);
@@ -157,27 +156,10 @@ void ContingencyAnalysisSession::build_contingencies(
     disconnected_per_ctg_.reserve(n_ctg);
 
     for (int c = 0; c < n_ctg; ++c) {
-        Contingency ctg;
-        ctg.tripped_branches = branch_ids_per_ctg[c];   // compute_limit_violations skip list
-        for (int l : branch_ids_per_ctg[c]) {
-            if (l < 0 || l >= n_branches)
-                throw std::runtime_error(
-                    "build_contingencies: branch index out of range");
-
-            const int i = h_branch_from_(l);
-            const int j = h_branch_to_(l);
-
-            // π-model Ybus modifications to SUBTRACT for this branch trip:
-            //   (i,i) → yff   (ii self-admittance at from-bus)
-            //   (j,j) → ytt   (jj self-admittance at to-bus)
-            //   (i,j) → yft   (ij mutual admittance)
-            //   (j,i) → ytf   (ji mutual admittance)
-            ctg.triplets.push_back({i, i,  h_yff_(l).real(),  h_yff_(l).imag()});
-            ctg.triplets.push_back({j, j,  h_ytt_(l).real(),  h_ytt_(l).imag()});
-            ctg.triplets.push_back({i, j,  h_yft_(l).real(),  h_yft_(l).imag()});
-            ctg.triplets.push_back({j, i,  h_ytf_(l).real(),  h_ytf_(l).imag()});
-        }
-        contingencies_.push_back(std::move(ctg));
+        contingencies_.push_back(build_contingency_from_branch_ids(
+            branch_ids_per_ctg[c],
+            h_branch_from_, h_branch_to_,
+            h_yff_, h_yft_, h_ytf_, h_ytt_));
         disconnected_per_ctg_.push_back(branch_ids_per_ctg[c]);
     }
     has_contingencies_ = true;

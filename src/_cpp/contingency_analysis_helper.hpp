@@ -31,8 +31,9 @@
 // The raw Python / Eigen input (always double) is cast during build_flat_patches.
 // =============================================================================
 
-#include "dtypes.hpp"   // cuda_real_type, eigen_real_type, eigen_cplx_type
+#include "dtypes.hpp"   // cuda_real_type, eigen_real_type, eigen_cplx_type, CplxVect
 
+#include "Eigen/Core"
 #include "Eigen/SparseCore"
 
 #include <vector>
@@ -119,6 +120,32 @@ struct ChunkPatchRange {
     int start;   // first index in the flat arrays for this chunk
     int count;   // number of patch entries in this chunk (sum over actual_batch)
 };
+
+// ---------------------------------------------------------------------------
+// build_contingency_from_branch_ids
+//   Builds ONE Contingency's triplets from a list of tripped branch ids, given
+//   the grid's π-model admittances (branch_from/to, yff/yft/ytf/ytt — the same
+//   host arrays set_branch_data() stores). Shared by
+//   ContingencyAnalysisSession::build_contingencies() (one call per contingency
+//   in a set of distinct scenarios) and ScenarioSweepSession::set_topology()
+//   (one call per row of the row-aligned sweep) so the π-model subtraction
+//   math (see the triplet layout below) lives in exactly one place.
+//
+//   ctg.tripped_branches is set verbatim to branch_ids (compute_limit_violations'
+//   skip list / compute_flows' zero-flow list). ctg.triplets' `k` field is left
+//   unresolved (-1); callers must still run resolve_indices() over the full
+//   contingency/scenario list before build_flat_patches().
+//
+//   Throws std::runtime_error if a branch id is out of [0, n_branches).
+// ---------------------------------------------------------------------------
+Contingency build_contingency_from_branch_ids(
+    const std::vector<int>&   branch_ids,
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect> yff,
+    Eigen::Ref<const CplxVect> yft,
+    Eigen::Ref<const CplxVect> ytf,
+    Eigen::Ref<const CplxVect> ytt);
 
 // ---------------------------------------------------------------------------
 // csr_find_k

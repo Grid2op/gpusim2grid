@@ -12,6 +12,7 @@
 #include "batch_pf_driver.cuh"
 #include "batch_sources/contingency_batch.cuh"
 #include "batch_sources/injection_batch.cuh"
+#include "batch_sources/scenario_sweep_batch.cuh"
 #include "driver.cuh"                       // run_nr_loop<Policy>
 #include "../acpf_nr_kernels.cuh"
 #include "../nr_iter_step.cuh"              // NrIterBuffers, BS
@@ -827,3 +828,4 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 // =============================================================================
 template struct BatchPfDriver<ContingencyBatch>;
 template struct BatchPfDriver<InjectionBatch>;
+template struct BatchPfDriver<ScenarioSweepBatch>;

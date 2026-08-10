@@ -718,3 +718,56 @@ make_is_session_from_lsgrid(
     }
     return session;
 }
+
+std::shared_ptr<ScenarioSweepSession>
+make_ss_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    bool   init_from_n_powerflow,
+    int    batch_size,
+    int    nb_iter,
+    int    max_iter_base,
+    double tol_base,
+    int    device,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   debug_base_case,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override,
+    bool   use_distributed_slack)
+{
+    auto& g = const_cast<ls2g::LSGrid&>(grid);
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
+    if (Ybus.rows() == 0)
+        throw std::runtime_error(
+            "make_ss_session_from_lsgrid: empty Ybus — has the grid been solved "
+            "(ac_pf) before being handed to gpusim2grid?");
+
+    CplxVect        V0    = grid.get_V_solver();
+    CplxVect        Sbus  = grid.get_Sbus_solver();
+    Eigen::VectorXi slack = grid.get_slack_ids_solver_numpy();
+    RealVect        sw    = grid.get_slack_weights_solver();
+    Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
+    Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
+
+    LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
+    if (!use_distributed_slack)
+        ledger = drop_multislack_augmentation(ledger, pv, pq);
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+    auto session = std::make_shared<ScenarioSweepSession>(
+        Ybus, V0, Sbus, slack, sw, pv, pq,
+        batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
+        /*presolved_v=*/init_from_n_powerflow,
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        scaling, max_dVa, max_dVm);
+
+    // Always set — set_topology() needs branch admittances to build each
+    // scenario's Ybus triplets, not just compute_flows().
+    BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
+    session->set_branch_data(bd.branch_from, bd.branch_to,
+                             bd.yff, bd.yft, bd.ytf, bd.ytt,
+                             bd.bus_vn_kv, bd.sn_mva);
+    return session;
+}

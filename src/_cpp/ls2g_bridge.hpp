@@ -33,6 +33,7 @@
 
 #include "contingency_analysis_session.hpp"
 #include "injection_sweep_session.hpp"
+#include "scenario_sweep_session.hpp"
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
 
@@ -224,6 +225,35 @@ make_is_session_from_lsgrid(
     bool   with_branch_data,
     // Single source of truth for base_state_'s AND the batch solver's cuDSS
     // config (see InjectionSweepSession's own doc).
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
+    // own doc.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0,
+    // See the use_distributed_slack note above make_ca_session_from_lsgrid.
+    bool   use_distributed_slack = true);
+
+// Build a ScenarioSweepSession from a solved LSGrid — the row-aligned
+// combined topology + injection sweep (ScenarioSweepGPU). Branch data is
+// always set (unlike make_is_session_from_lsgrid's with_branch_data flag):
+// ScenarioSweepSession::set_topology() needs it to build the Ybus triplets
+// for each scenario's tripped branches, not just for compute_flows().
+std::shared_ptr<ScenarioSweepSession>
+make_ss_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    bool   init_from_n_powerflow,
+    int    batch_size,
+    int    nb_iter,
+    int    max_iter_base,
+    double tol_base,
+    int    device,
+    // Single source of truth for base_state_'s AND the batch solver's cuDSS
+    // config (see ScenarioSweepSession's own doc).
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,

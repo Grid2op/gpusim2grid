@@ -17,6 +17,7 @@
 struct AcPfNrSession;
 struct ContingencyAnalysisSession;
 struct InjectionSweepSession;
+struct ScenarioSweepSession;
 
 // AcPfNrSession voltage (shape [n_bus]) — syncs state_->cs.
 pybind11::capsule export_v_acpfnr_dlpack(
@@ -46,3 +47,10 @@ pybind11::capsule export_v_results_dlpack(
 
 pybind11::capsule export_v_results_dlpack_inj(
     std::shared_ptr<InjectionSweepSession> self);
+
+// ScenarioSweepSession:       shape [n_scenarios,     n_bus]
+pybind11::capsule export_v_base_dlpack_ss(
+    std::shared_ptr<ScenarioSweepSession> self);
+
+pybind11::capsule export_v_results_dlpack_ss(
+    std::shared_ptr<ScenarioSweepSession> self);

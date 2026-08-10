@@ -27,9 +27,11 @@
 #include "acpf_nr.hpp"
 #include "contingency_analysis_session.hpp"
 #include "injection_sweep_session.hpp"
+#include "scenario_sweep_session.hpp"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/contingency_batch.cuh"
 #include "contingency/batch_sources/injection_batch.cuh"
+#include "contingency/batch_sources/scenario_sweep_batch.cuh"
 
 #include <pybind11/pybind11.h>
 #include <stdexcept>
@@ -162,6 +164,41 @@ export_v_results_dlpack_inj(std::shared_ptr<InjectionSweepSession> self)
     if (!self->solver_)
         throw std::runtime_error(
             "InjectionSweepSession: run() must be called before "
+            "v_results_dlpack()");
+    self->solver_->synchronize();
+    void*   ptr = const_cast<void*>(
+        static_cast<const void*>(self->solver_->d_V_results_ptr()));
+    int64_t ns  = static_cast<int64_t>(self->solver_->n_contingencies_());
+    int64_t nb  = static_cast<int64_t>(self->solver_->n_bus());
+    int     dev = self->solver_->device_id();
+    auto    owner = std::static_pointer_cast<void>(self);
+    auto*   mt  = make_dl_tensor(ptr, dev, ns, nb, std::move(owner));
+    return pybind11::capsule(mt, "dltensor", capsule_destructor);
+}
+
+// =============================================================================
+// ScenarioSweepSession exporters
+// =============================================================================
+
+pybind11::capsule
+export_v_base_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
+{
+    self->base_state_->cs.synchronize();
+    void*   ptr = const_cast<void*>(
+        static_cast<const void*>(self->base_state_->d_V_ptr()));
+    int64_t n   = static_cast<int64_t>(self->base_state_->n_bus);
+    int     dev = self->base_state_->device_id_;
+    auto    owner = std::static_pointer_cast<void>(self);
+    auto*   mt  = make_dl_tensor(ptr, dev, n, 0, std::move(owner));
+    return pybind11::capsule(mt, "dltensor", capsule_destructor);
+}
+
+pybind11::capsule
+export_v_results_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
+{
+    if (!self->solver_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: run() must be called before "
             "v_results_dlpack()");
     self->solver_->synchronize();
     void*   ptr = const_cast<void*>(
