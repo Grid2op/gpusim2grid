@@ -1221,13 +1221,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
-           double max_dVa_override, double max_dVm_override) {
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ca_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, compute_limit_violations,
                 reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
-                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
         },
         pybind11::arg("grid"),
         pybind11::arg("init_from_n_powerflow")   = true,
@@ -1244,6 +1246,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
         "Build a ContingencyAnalysisSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy: Ybus/Sbus/V/pv/pq/slack + branch admittances are "
         "read off the C++ object). Branch data is set automatically. Solves the "
@@ -1266,7 +1269,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "scenario batch loop that run() drives always iterates regardless, so "
         "this is meaningful there either way. Each batch slot gets its own "
         "alpha from its own max|dtheta|/max|dvm|, not one alpha shared across "
-        "the whole chunk.");
+        "the whole chunk.\n"
+        "use_distributed_slack (default True): see _make_is_session_from_lsgrid.");
 
     m.def("_extract_limits_from_lsgrid",
         [](pybind11::object grid_py, int n_bus_solver) {
@@ -1287,13 +1291,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
-           double max_dVa_override, double max_dVm_override) {
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_is_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, with_branch_data,
                 reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
-                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
         },
         pybind11::arg("grid"),
         pybind11::arg("init_from_n_powerflow") = true,
@@ -1310,6 +1316,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
         "Build an InjectionSweepSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy). Branch data is set automatically when requested. "
         "Solves the same augmented system lightsim2grid poses (distributed slack / "
@@ -1328,7 +1335,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "get_ac_algo_config()). Applied to BOTH the base-case solve and the "
         "batch solver used by run() -- each scenario gets its own alpha from "
         "its own max|dtheta|/max|dvm|, not one alpha shared across the whole "
-        "chunk.");
+        "chunk.\n"
+        "use_distributed_slack (default True): with False, the MultiSlack "
+        "row/column of the augmented Jacobian is dropped and the classic bare "
+        "[pvpq | pq] system is solved instead (dim_J shrinks by the participant "
+        "count). Every OTHER in-Jacobian control -- HVDC angle-droop, SVC / "
+        "remote generator voltage control -- is preserved either way. With a "
+        "single (non-distributed) slack this is an exact reformulation; with "
+        "several participants the mismatch stops being shared per slack_weights, "
+        "which is a genuine model change, and combining it with "
+        "init_from_n_powerflow=True then legitimately fails the residual check "
+        "since the grid's own V solves the other system.");
 
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device,
@@ -1336,13 +1353,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
-           double max_dVa_override, double max_dVm_override) {
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid(
                 grid, max_iter, tol, device, init_from_n_powerflow,
                 diag_stop_before_state_correction, reordering_alg, matching_alg,
                 pivot_epsilon_alg, debug_base_case,
-                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
         },
         pybind11::arg("grid"),
         pybind11::arg("max_iter") = 10,
@@ -1357,6 +1376,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
         "Build a single-system AcPfNrSession from a solved lightsim2grid LSGrid, "
         "solving the same augmented system (distributed slack / extensions) via "
         "the NRLedger read off the C++ object. With init_from_n_powerflow=True "
@@ -1389,7 +1409,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "init_from_n_powerflow=False (the GPU actually iterates); without it, an "
         "undamped GPU Newton step can converge onto a different (sometimes "
         "spurious) root than lightsim2grid's own damped trajectory when seeded "
-        "far from the solution (e.g. a flat/DC start).");
+        "far from the solution (e.g. a flat/DC start).\n"
+        "use_distributed_slack (default True): see _make_is_session_from_lsgrid.");
 
     m.def("_make_acpf_session_from_lsgrid_with_sbus",
         [](pybind11::object grid_py, Eigen::Ref<const CplxVect> Sbus,

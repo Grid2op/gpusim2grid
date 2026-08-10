@@ -116,6 +116,31 @@ class AcPfGPU:
         inherits the grid's own configured values (or lightsim2grid's own
         defaults, 0.5 / 0.1, if forcing ``scaling_max_voltage_change=True``
         with no grid to inherit from). Ignored unless step-scaling is active.
+    use_distributed_slack : bool, default True
+        Selects which of the two slack formulations the GPU solves.
+
+        ``True`` keeps the ``MultiSlack`` augmentation lightsim2grid poses:
+        the mismatch is shared across participants per ``slack_weights``,
+        carried by one extra ``slack_absorbed`` column plus the P equation of
+        every participant.
+
+        ``False`` drops exactly those rows/columns and solves the classic
+        single-slack ``[pvpq | pq]`` system instead, shrinking ``dim_J`` by the
+        participant count. **Every other in-Jacobian control is preserved
+        either way** -- HVDC angle-droop and SVC / remote generator voltage
+        control are untouched by this switch.
+
+        With a single (non-distributed) slack, ``False`` is an exact
+        reformulation: that row/column pair is block-triangular, so no other
+        row's solution moves and only ``slack_absorbed`` stops being reported.
+        With several participants it is a genuine model change, and combining
+        it with ``init_from_n_powerflow=True`` then legitimately raises on the
+        residual check -- the grid's own converged ``V`` solves the other
+        system.
+
+        Only meaningful on the lightsim2grid-bridge path; the explicit-array
+        and Python-fallback paths have no ledger and always solve the bare
+        system.
 
     Examples
     --------
@@ -133,7 +158,8 @@ class AcPfGPU:
                  device=None, init_from_n_powerflow=True, use_bridge=None,
                  reordering_alg="default", matching_alg="none",
                  pivot_epsilon_alg="default", debug_base_case=False,
-                 scaling_max_voltage_change=None, max_dVa=None, max_dVm=None):
+                 scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
+                 use_distributed_slack=True):
         _validate_precision(precision)
         reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
         matching_alg_enum = _resolve_matching_alg(matching_alg)
@@ -196,7 +222,8 @@ class AcPfGPU:
                     -1 if scaling_max_voltage_change is None
                     else int(bool(scaling_max_voltage_change))),
                 max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
-                max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
+                max_dVm_override=-1.0 if max_dVm is None else float(max_dVm),
+                use_distributed_slack=bool(use_distributed_slack))
         else:
             # Python extraction fallback: bare [pvpq|pq] system (no distributed
             # slack in the Jacobian).
