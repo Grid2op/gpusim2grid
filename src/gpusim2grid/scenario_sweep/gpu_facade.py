@@ -298,6 +298,8 @@ class ScenarioSweepGPU:
             is trafo ``c - n_lines``). An empty inner list means "nothing
             tripped for this row".
 
+        Notes
+        -----
         Requires :meth:`set_branch_data` (automatic in grid mode) to have
         been called first. Optional: if never called, :meth:`compute`
         defaults every scenario to "no branches tripped".

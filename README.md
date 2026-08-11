@@ -28,14 +28,18 @@ In order of maturity:
    parallel, reusing one symbolic factorization across the batch.
 3. **Injection sweep on the GPU** — solve the same grid across many injection
    scenarios (varying loads/generation) in a single batched call.
+4. **Scenario sweep on the GPU** — row-aligned combination of the two: row `i`'s
+   injection profile is solved together with row `i`'s own set of tripped
+   branches, independently of every other row. Mirrors lightsim2grid's own
+   `ScenarioSweep`.
 
 Both single (FP32) and double (FP64) precision are supported and work well; the
 precision is selectable at build time (see the documentation).
 
 When seeded from a `lightsim2grid` grid — the default path for the `AcPfGPU`,
-`ContingencyAnalysisGPU` and `InjectionSweepGPU` facades — gpusim2grid solves the
-**same augmented Newton-Raphson system that lightsim2grid poses**, including the
-in-Jacobian power-system controls modelled there:
+`ContingencyAnalysisGPU`, `InjectionSweepGPU` and `ScenarioSweepGPU` facades —
+gpusim2grid solves the **same augmented Newton-Raphson system that lightsim2grid
+poses**, including the in-Jacobian power-system controls modelled there:
 
 - **distributed slack** (slack mismatch shared across weighted slack buses),
 - **HVDC angle-droop**,
@@ -43,9 +47,10 @@ in-Jacobian power-system controls modelled there:
 - **remote generator voltage control** (a generator regulating a non-local bus).
 
 These match the lightsim2grid CPU solution bit-for-bit, on both the single solve
-and the batched contingency / injection-sweep paths. The low-level array entry
-points (`acpf_nr_gpu`, the `*Session` classes constructed from raw NumPy/SciPy
-arrays) solve only the bare `[pvpq | pq]` system without these controls.
+and the batched contingency / injection-sweep / scenario-sweep paths. The
+low-level array entry points (`acpf_nr_gpu`, the `*Session` classes constructed
+from raw NumPy/SciPy arrays) solve only the bare `[pvpq | pq]` system without
+these controls.
 
 ## Alpha features
 
@@ -170,11 +175,25 @@ import torch
 V_torch = torch.from_dlpack(ca.compute(batch_size=512))
 ```
 
+Row `i`'s injection paired with row `i`'s own topology, independently of every
+other row — the GPU analogue of lightsim2grid's `ScenarioSweep`:
+
+```python
+sweep = g2g.ScenarioSweepGPU(grid, nb_iter=4)
+sweep.set_injections_from_elements(load_p, load_q, gen_p)  # (n_scen, n_load/n_gen)
+sweep.set_topology([[], [3], [], [3, 40]])                 # one branch-id list per row
+V = sweep.compute(batch_size=512)
+disconnected = sweep.get_disconnected()  # which rows a topology trip islanded
+```
+
 See [`examples/`](examples/):
 
 - `ieee14_basic.py` — end-to-end AC power flow on the IEEE 14-bus case.
 - `case6515rte_screen.py` — batched contingency screen with residuals.
+- `injection_sweep_scan.py` — batched load-scaling injection sweep.
+- `scenario_sweep_scan.py` — row-aligned combined topology + injection sweep.
 - `handle_disconnected.py` — solve the largest component of a grid-splitting contingency.
+- `limit_violations.py` — fused per-contingency bus voltage / branch current limit checking.
 - `distributed_slack.py` — augmented solve (distributed slack in the Jacobian) via the lightsim2grid bridge.
 - `differentiable_pf.py` — derivatives through a single power flow via the adjoint method.
 
@@ -184,11 +203,11 @@ The base case is solved once (on the CPU via lightsim2grid, or on the GPU) to
 get the converged voltages and the Jacobian sparsity pattern. The batch is then
 processed in GPU chunks: each scenario starts from the base-case voltages, its
 Ybus is patched in place (contingencies subtract the tripped-branch admittances;
-injection sweeps vary Sbus), and a fixed number of Newton-Raphson iterations run
-in parallel over the block-diagonal system. The cuDSS symbolic factorization is
-computed **once** and reused across the whole batch — only numeric
-refactorization/solve happen per iteration. A post-loop residual pass reports the
-final ‖F‖∞ per scenario.
+injection sweeps vary Sbus; the scenario sweep does both, row-aligned), and a
+fixed number of Newton-Raphson iterations run in parallel over the
+block-diagonal system. The cuDSS symbolic factorization is computed **once**
+and reused across the whole batch — only numeric refactorization/solve happen
+per iteration. A post-loop residual pass reports the final ‖F‖∞ per scenario.
 
 See the [API documentation](https://gpusim2grid.readthedocs.io) for the full design.
 
