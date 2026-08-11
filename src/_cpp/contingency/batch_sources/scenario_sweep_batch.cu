@@ -39,6 +39,29 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
         upload_h2d(d_active_to_orig, active_to_orig_.data(),
                    active_to_orig_.size(), cs);
 
+    // handle_disconnected_grid masking entries (only when any bus is masked).
+    if (!h_mask_slot_.empty()) {
+        upload_h2d(d_mask_slot, h_mask_slot_.data(), h_mask_slot_.size(), cs);
+        upload_h2d(d_mask_row,  h_mask_row_.data(),  h_mask_row_.size(),  cs);
+        upload_h2d(d_mask_diag, h_mask_diag_.data(), h_mask_diag_.size(), cs);
+    }
+    if (!h_maskv_slot_.empty()) {
+        upload_h2d(d_maskv_slot, h_maskv_slot_.data(), h_maskv_slot_.size(), cs);
+        upload_h2d(d_maskv_bus,  h_maskv_bus_.data(),  h_maskv_bus_.size(),  cs);
+    }
+
+    // compute_limit_violations tripped-branch table (see the ctor's
+    // build_tripped_branch_table call). h_trip_start_/h_trip_count_ are
+    // always sized n_active (possibly all-zero counts); h_trip_branch_flat_
+    // may be empty when no scenario in this batch trips any branch.
+    if (!h_trip_start_.empty()) {
+        upload_h2d(d_trip_start, h_trip_start_.data(), h_trip_start_.size(), cs);
+        upload_h2d(d_trip_count, h_trip_count_.data(), h_trip_count_.size(), cs);
+        if (!h_trip_branch_flat_.empty())
+            upload_h2d(d_trip_branch_flat, h_trip_branch_flat_.data(),
+                       h_trip_branch_flat_.size(), cs);
+    }
+
     if (static_cast<int>(h_Sbus_all_.size())
             != n_active() * ctx.n_bus) {
         throw std::runtime_error(

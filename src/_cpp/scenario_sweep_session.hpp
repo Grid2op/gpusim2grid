@@ -105,6 +105,29 @@ struct ScenarioSweepSession {
     double          sn_mva_          = 100.0;
     bool            has_branch_data_ = false;
 
+    // handle_disconnected_grid: when true, a scenario whose topology change
+    // splits the grid is solved on its largest connected component (the rest
+    // is frozen and reported as NaN) instead of being skipped — unless it
+    // strands the angle reference or a controller bus, which is still
+    // skipped. Mutable; takes effect on the next run(). mask_cfg_ is built
+    // once in the ctor from the base case + ledger.
+    bool       handle_disconnected_grid_ = false;
+    MaskConfig mask_cfg_;
+
+    // =========================================================================
+    // compute_limit_violations (opt-in; fused on-device per-chunk check --
+    // see set_compute_limit_violations()/set_limits()/run()).
+    // =========================================================================
+    bool     compute_limit_violations_ = false;
+    double   violation_tol_            = 1e-6;   // dedicated; independent of tol_base
+    int      violation_capacity_       = 16;     // K; bounds memory at n_scenarios*K
+    bool     has_limits_               = false;
+    bool     has_violations_result_    = false;
+    int      n_lines_                  = 0;      // branch ordering split (lines-then-trafos)
+
+    RealVect h_bus_vmin_kv_, h_bus_vmax_kv_;               // [n_bus], solver numbering
+    RealVect h_branch_limit_a1_ka_, h_branch_limit_a2_ka_; // [n_branches], lines-then-trafos
+
     // =========================================================================
     // Host injection data (set_injections()) — (n_scenarios × n_bus)
     // row-major physical-unit arrays, AC-solver bus numbering.
@@ -201,8 +224,10 @@ struct ScenarioSweepSession {
     // =========================================================================
     // run — constructs BatchPfDriver<ScenarioSweepBatch> + runs the chunk
     // loop. A scenario whose topology change disconnects the grid is skipped
-    // (NaN residual/voltage), same convention as ContingencyAnalysisGPU's
-    // legacy (non-handle_disconnected_grid) path.
+    // (NaN residual/voltage) — unless handle_disconnected_grid_ is set, in
+    // which case only scenarios stranding the angle reference or a
+    // controller bus are left as NaN (the rest solve on their largest
+    // connected component, masked buses reported as NaN).
     // =========================================================================
     void run();
 
@@ -212,6 +237,39 @@ struct ScenarioSweepSession {
     // device-side. Requires run() and set_branch_data().
     // =========================================================================
     void compute_flows();
+
+    // =========================================================================
+    // compute_limit_violations
+    // Opt-in fused per-chunk voltage/current/divergence check (mirrors
+    // ContingencyAnalysisSession's flag of the same name). When enabled,
+    // requires set_branch_data() and set_limits() to have been called before
+    // run(); the check then runs on-device, per chunk, writing only a
+    // bounded O(n_scenarios * violation_capacity) compact buffer.
+    // Changing the flag is a no-op if unchanged; otherwise it clears any
+    // previously computed violation results.
+    // =========================================================================
+    bool get_compute_limit_violations() const { return compute_limit_violations_; }
+    void set_compute_limit_violations(bool val) {
+        if (val == compute_limit_violations_) return;
+        compute_limit_violations_ = val;
+        has_violations_result_ = false;
+    }
+
+    // =========================================================================
+    // set_limits
+    // Configure per-bus voltage (kV, solver numbering) and per-branch current
+    // (kA, lines-then-trafos) limits for compute_limit_violations. NaN = not
+    // configured for that element. n_lines splits the lines-then-trafos
+    // branch ordering for LimitViolation.element_type/element_id
+    // de-concatenation. Required before run() when compute_limit_violations
+    // is True.
+    // =========================================================================
+    void set_limits(
+        Eigen::Ref<const RealVect> bus_vmin_kv,
+        Eigen::Ref<const RealVect> bus_vmax_kv,
+        Eigen::Ref<const RealVect> branch_limit_a1_ka,
+        Eigen::Ref<const RealVect> branch_limit_a2_ka,
+        int n_lines);
 
     // =========================================================================
     // Metadata accessors
@@ -233,6 +291,28 @@ struct ScenarioSweepSession {
     // scenario skipped/NaN; 0 == solved). Size n_scenarios(); empty before
     // run() has been called.
     Eigen::VectorXi get_disconnected() const;
+
+    // =========================================================================
+    // compute_limit_violations result accessors — synchronous D→H copy on
+    // demand, all cheap (O(n_scenarios * violation_capacity) or
+    // O(n_scenarios)). Throw if run() hasn't been called with
+    // compute_limit_violations=True.
+    // =========================================================================
+    Eigen::VectorXi get_violation_element_type() const;
+    Eigen::VectorXi get_violation_element_id()   const;
+    Eigen::VectorXi get_violation_side()         const;
+    Eigen::VectorXi get_violation_type()         const;
+    RealVect        get_violation_value()        const;
+    RealVect        get_violation_limit()        const;
+    Eigen::VectorXi get_violation_count()        const;
+    Eigen::VectorXi get_violation_truncated()    const;
+
+    // TRUE, uncapped per-type violation totals (independent of
+    // violation_capacity/K, unlike get_violation_count() above which is
+    // capped at K): -1 = not simulated, else the exact count.
+    Eigen::VectorXi get_violation_count_low_voltage()  const;
+    Eigen::VectorXi get_violation_count_high_voltage() const;
+    Eigen::VectorXi get_violation_count_current()      const;
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ScenarioSweepSession(const ScenarioSweepSession&)            = delete;

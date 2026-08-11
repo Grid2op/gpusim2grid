@@ -242,7 +242,10 @@ make_is_session_from_lsgrid(
 // combined topology + injection sweep (ScenarioSweepGPU). Branch data is
 // always set (unlike make_is_session_from_lsgrid's with_branch_data flag):
 // ScenarioSweepSession::set_topology() needs it to build the Ybus triplets
-// for each scenario's tripped branches, not just for compute_flows().
+// for each scenario's tripped branches, not just for compute_flows(). When
+// compute_limit_violations=true, also pulls bus/branch limits off the grid
+// and enables the session's fused on-device violation check (mirrors
+// make_ca_session_from_lsgrid).
 std::shared_ptr<ScenarioSweepSession>
 make_ss_session_from_lsgrid(
     const ls2g::LSGrid& grid,
@@ -252,6 +255,7 @@ make_ss_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
+    bool   compute_limit_violations = false,
     // Single source of truth for base_state_'s AND the batch solver's cuDSS
     // config (see ScenarioSweepSession's own doc).
     ReorderingAlg reordering_alg = ReorderingAlg::Default,

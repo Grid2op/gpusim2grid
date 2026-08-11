@@ -13,6 +13,7 @@
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel, zero_branch_flows_kernel
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
+#include "ledger_data.hpp"       // LedgerData (mask_cfg_ controller-bus setup)
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -79,6 +80,33 @@ ScenarioSweepSession::ScenarioSweepSession(
         debug_base_case, /*base_case_only=*/true,
         scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
+
+    // Build the handle_disconnected_grid mask configuration once from the base
+    // case (per-bus identity-row metadata + angle reference) and the ledger
+    // (controller buses → skip-if-stranded). Cheap; only consulted by run()
+    // when handle_disconnected_grid_ is enabled. Verbatim
+    // ContingencyAnalysisSession's identical ctor block.
+    {
+        const int n_bus = base_state_->n_bus;
+        mask_cfg_.row_info.p_row      = base_state_->h_p_row_of_bus;
+        mask_cfg_.row_info.q_row      = base_state_->h_q_row_of_bus;
+        mask_cfg_.row_info.p_diag_pos = base_state_->h_p_diag_pos;
+        mask_cfg_.row_info.q_diag_pos = base_state_->h_q_diag_pos;
+
+        mask_cfg_.is_reference_bus.assign(static_cast<size_t>(n_bus), 0);
+        for (int b = 0; b < n_bus; ++b)
+            if (base_state_->h_theta_col_of_bus[static_cast<size_t>(b)] < 0)
+                mask_cfg_.is_reference_bus[static_cast<size_t>(b)] = 1;
+
+        mask_cfg_.is_controller_bus.assign(static_cast<size_t>(n_bus), 0);
+        if (ledger != nullptr) {
+            auto mark = [&](int b){ if (b >= 0 && b < n_bus) mask_cfg_.is_controller_bus[static_cast<size_t>(b)] = 1; };
+            for (int b : ledger->hvdc_bus1)  mark(b);
+            for (int b : ledger->hvdc_bus2)  mark(b);
+            for (int b : ledger->vc_bus)     mark(b);
+            for (int b : ledger->vc_reg_bus) mark(b);
+        }
+    }
 }
 
 // =============================================================================
@@ -166,6 +194,38 @@ void ScenarioSweepSession::set_topology(
 }
 
 // =============================================================================
+// set_limits
+// =============================================================================
+void ScenarioSweepSession::set_limits(
+    Eigen::Ref<const RealVect> bus_vmin_kv,
+    Eigen::Ref<const RealVect> bus_vmax_kv,
+    Eigen::Ref<const RealVect> branch_limit_a1_ka,
+    Eigen::Ref<const RealVect> branch_limit_a2_ka,
+    int n_lines)
+{
+    const int n_bus = base_state_->n_bus;
+    if (bus_vmin_kv.size() != n_bus || bus_vmax_kv.size() != n_bus)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_limits: bus_vmin_kv/bus_vmax_kv "
+            "must have size n_bus");
+    if (has_branch_data_) {
+        const int n_bra = static_cast<int>(h_branch_from_.size());
+        if (branch_limit_a1_ka.size() != n_bra || branch_limit_a2_ka.size() != n_bra)
+            throw std::runtime_error(
+                "ScenarioSweepSession::set_limits: branch_limit_a1_ka/"
+                "branch_limit_a2_ka must have size n_branches");
+    }
+
+    h_bus_vmin_kv_ = bus_vmin_kv;
+    h_bus_vmax_kv_ = bus_vmax_kv;
+    h_branch_limit_a1_ka_ = branch_limit_a1_ka;
+    h_branch_limit_a2_ka_ = branch_limit_a2_ka;
+    n_lines_ = n_lines;
+    has_limits_ = true;
+    has_violations_result_ = false;
+}
+
+// =============================================================================
 // run
 // =============================================================================
 void ScenarioSweepSession::run()
@@ -180,6 +240,14 @@ void ScenarioSweepSession::run()
             "ScenarioSweepSession: set_topology()'s row count no longer "
             "matches set_injections()'s n_scenarios — call set_topology() "
             "again after changing set_injections()");
+
+    if (handle_disconnected_grid_ &&
+        strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
+        throw std::runtime_error(
+            "ScenarioSweepSession: handle_disconnected_grid is incompatible "
+            "with the 'direct_base_case_factors' strategy (it reuses the unmasked "
+            "base-case factors). Use 'direct_refactor_every' (default), "
+            "'direct_iter0_only', or 'direct_refactor_every_n'.");
 
     if (!has_topology_) {
         // Default: no branches tripped for any scenario (pure injection sweep).
@@ -213,7 +281,7 @@ void ScenarioSweepSession::run()
     }
     t_sbus_build_ms_ = ms_since(t_sbus_start);
 
-    // Host preprocessing (resolve_indices + check_connectivity +
+    // Host preprocessing (resolve_indices + connectivity/masking +
     // build_flat_patches + Sbus active-order permute), mutates contingencies_
     // in-place so disconnected flags are observable below.
     ScenarioSweepBatch source(
@@ -222,7 +290,8 @@ void ScenarioSweepSession::run()
         Ybus_rm_.innerIndexPtr(),
         Ybus_rm_,
         std::move(h_Sbus_all),
-        batch_size_);
+        batch_size_,
+        handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
     used_batch_size_ = source.used_batch_size();
 
     // (Re-)construct the solver — allows run() to be called multiple times.
@@ -243,10 +312,43 @@ void ScenarioSweepSession::run()
         max_dVa_,
         max_dVm_);
 
+    // compute_limit_violations: the fused per-chunk kernel needs branch
+    // admittances + limits on device BEFORE solve() runs its chunk loop
+    // (unlike compute_flows(), which uploads AFTER solve() and only for
+    // callers who explicitly want full flows). Mirrors
+    // ContingencyAnalysisSession::run() exactly.
+    double t_admittance_upload_ms = 0.;
+    double t_limits_setup_ms      = 0.;
+    if (compute_limit_violations_) {
+        if (!has_branch_data_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: compute_limit_violations requires "
+                "set_branch_data() to have been called first.");
+        if (!has_limits_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: compute_limit_violations requires "
+                "set_limits() to have been called first.");
+
+        solver_->upload_branch_admittances(
+            h_branch_from_, h_branch_to_, h_yff_, h_yft_, h_ytf_, h_ytt_,
+            h_bus_vn_kv_, sn_mva_);
+        t_admittance_upload_ms = solver_->branch_data_upload_ms();
+
+        solver_->set_violation_limits(
+            h_bus_vmin_kv_, h_bus_vmax_kv_,
+            h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
+            violation_tol_, violation_capacity_, n_lines_);
+        t_limits_setup_ms = solver_->violation_setup_ms();
+    }
+
     timings_ = solver_->solve();
     timings_.t_base_case_ms  = t_base_case_ms_;
     timings_.t_preprocess_ms += base_state_->timings.t_build_J_ms;
     timings_.t_alloc_ms      += base_state_->timings.t_upload_ms;
+    if (compute_limit_violations_) {
+        timings_.t_branch_data_upload_ms += t_admittance_upload_ms;
+        timings_.t_violation_setup_ms    += t_limits_setup_ms;
+    }
     timings_.t_context_init_ms += base_state_->timings.t_context_init_ms;
     timings_.t_base_case_solve_only_ms =
         t_base_case_ms_ - base_state_->timings.t_build_J_ms
@@ -261,6 +363,7 @@ void ScenarioSweepSession::run()
     for (const auto& ctg : contingencies_)
         if (ctg.disconnected) ++n_disconnected;
     timings_.n_disconnected = n_disconnected;
+    has_violations_result_ = compute_limit_violations_;
 
     solver_->cs.synchronize();
 }
@@ -416,5 +519,162 @@ Eigen::VectorXi ScenarioSweepSession::get_disconnected() const
     Eigen::VectorXi out(static_cast<Eigen::Index>(contingencies_.size()));
     for (size_t i = 0; i < contingencies_.size(); ++i)
         out(static_cast<Eigen::Index>(i)) = contingencies_[i].disconnected ? 1 : 0;
+    return out;
+}
+
+// =============================================================================
+// compute_limit_violations D→H result accessors
+// =============================================================================
+Eigen::VectorXi ScenarioSweepSession::get_violation_element_type() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_element_type;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_element_id() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_element_id;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_side() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_side;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_type() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_viol_type;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+RealVect ScenarioSweepSession::get_violation_value() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<cuda_real_type> h = solver_->d_viol_value;
+    RealVect out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(h[i]);
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+RealVect ScenarioSweepSession::get_violation_limit() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<cuda_real_type> h = solver_->d_viol_limit;
+    RealVect out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(h[i]);
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_count() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_truncated() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_truncated;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_count_low_voltage() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count_low_voltage;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_count_high_voltage() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count_high_voltage;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
+    return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_violation_count_current() const
+{
+    if (!has_violations_result_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: call run() with compute_limit_violations=True first");
+    solver_->cs.synchronize();
+    auto t_copy_start = std::chrono::steady_clock::now();
+    thrust::host_vector<int> h = solver_->d_violation_count_current;
+    Eigen::VectorXi out(static_cast<Eigen::Index>(h.size()));
+    for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
+    timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
     return out;
 }

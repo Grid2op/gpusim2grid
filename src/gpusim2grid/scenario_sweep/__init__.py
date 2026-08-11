@@ -18,10 +18,12 @@ lists, independently of every other row -- matching lightsim2grid's own
 ``ScenarioSweep`` (see CLAUDE.md's Augmented Jacobian section and the
 "ScenarioSweepGPU" workload table).
 
-Deferred scope (matches lightsim2grid's own ScenarioSweepCPP v1): no
-handle_disconnected_grid masking, no compute_limit_violations. A scenario
-whose topology change disconnects the grid is skipped (NaN), same convention
-as ContingencyAnalysisGPU's legacy (non-handle_disconnected_grid) path.
+``handle_disconnected_grid`` and ``compute_limit_violations`` are supported
+identically to ``ContingencyAnalysisGPU`` -- see that class's docs for the
+full semantics; this module reuses the same ``ViolationElementType`` /
+``LimitViolationType`` / ``LimitViolation`` types (defined once in
+``gpusim2grid.contingency_analysis._limit_violations``, not re-duplicated
+here).
 """
 
 __all__ = []
@@ -40,6 +42,11 @@ from ..contingency_analysis import (
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+)
+from ..contingency_analysis._limit_violations import (
+    ViolationElementType,
+    LimitViolationType,
+    LimitViolation,
 )
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
@@ -112,7 +119,8 @@ class _ScenarioSweepSolver:
 
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
-                 device=None, presolved_v=False, reordering_alg='default',
+                 device=None, handle_disconnected_grid=False, presolved_v=False,
+                 reordering_alg='default',
                  matching_alg='none', pivot_epsilon_alg='default',
                  debug_base_case=False,
                  scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
@@ -132,6 +140,7 @@ class _ScenarioSweepSolver:
             debug_base_case=bool(debug_base_case),
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
+        self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -254,6 +263,19 @@ class _ScenarioSweepSolver:
         self._pivot_epsilon_alg = value if isinstance(value, str) else str(value)
 
     @property
+    def handle_disconnected_grid(self):
+        """bool: solve the largest connected component of a scenario's split
+        grid (masking the rest as NaN) instead of skipping it. Scenarios that
+        strand the angle reference or a controller bus are still skipped.
+        Incompatible with the 'direct_base_case_factors' strategy. Takes
+        effect on the next run()."""
+        return self._s.handle_disconnected_grid
+
+    @handle_disconnected_grid.setter
+    def handle_disconnected_grid(self, value):
+        self._s.handle_disconnected_grid = bool(value)
+
+    @property
     def refactor_period(self):
         return self._s.refactor_period
 
@@ -306,6 +328,128 @@ class _ScenarioSweepSolver:
         Results are then available via solver.or_amps and solver.ex_amps.
         """
         self._s.compute_flows()
+
+    @property
+    def compute_limit_violations(self):
+        """bool: fused per-chunk voltage/current/divergence check (see
+        set_limits()). Mirrors ContingencyAnalysisGPU's flag of the same
+        name. Writes only a bounded compact buffer -- never the full dense
+        V_results/or_amps/ex_amps. Changing this clears any previously
+        computed violation results. Default False. Takes effect on the next
+        run()."""
+        return self._s.compute_limit_violations
+
+    @compute_limit_violations.setter
+    def compute_limit_violations(self, value):
+        self._s.compute_limit_violations = bool(value)   # C++ setter handles the clear-on-change
+
+    def set_limits(self, bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka, branch_limit_a2_ka, n_lines):
+        """Configure per-bus voltage (kV) / per-branch current (kA) limits.
+
+        NaN = not configured for that element (matches lightsim2grid's
+        convention). Required before run() when compute_limit_violations is
+        True. n_lines splits the lines-then-trafos branch ordering for
+        LimitViolation.element_type/element_id de-concatenation.
+        """
+        self._s.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
+                           branch_limit_a2_ka, int(n_lines))
+
+    @property
+    def violation_tol(self):
+        """float: residual tolerance for the DIVERGENCE check, independent of
+        tol_base. Takes effect on the next run()."""
+        return self._s.violation_tol
+
+    @violation_tol.setter
+    def violation_tol(self, value):
+        self._s.violation_tol = float(value)
+
+    @property
+    def violation_capacity(self):
+        """int: max violation records kept per scenario (K). Bounds the
+        compact output at n_scenarios * K regardless of grid size. Takes
+        effect on the next run(); default 16."""
+        return self._s.violation_capacity
+
+    @violation_capacity.setter
+    def violation_capacity(self, value):
+        self._s.violation_capacity = int(value)
+
+    def get_violations(self):
+        """list[list[LimitViolation]]: one entry per scenario (row order
+        matches set_injections()/set_topology()'s input rows). A
+        not-simulated (disconnected / masked-skip) scenario gets a single
+        GRID/NOT_SIMULATED entry (value=limit=nan -- the solver was never
+        invoked, there is no residual to report); a non-converged one gets a
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        Requires run() with compute_limit_violations=True."""
+        if not self.compute_limit_violations:
+            raise RuntimeError(
+                "get_violations() requires compute_limit_violations=True "
+                "(set solver.compute_limit_violations = True before run()).")
+        counts = self._s.get_violation_count()
+        etype  = self._s.get_violation_element_type()
+        eid    = self._s.get_violation_element_id()
+        side   = self._s.get_violation_side()
+        vtype  = self._s.get_violation_type()
+        value  = self._s.get_violation_value()
+        limit  = self._s.get_violation_limit()
+        K = self.violation_capacity
+        out = []
+        for c, cnt in enumerate(counts):
+            if cnt < 0:
+                # Pre-check (graph connectivity) dropped this scenario before
+                # it ever reached check_limit_violations_kernel -- the solver
+                # was never invoked (BatchPfDriver's d_violation_count -1
+                # sentinel). Never written by the kernel itself.
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.NOT_SIMULATED,
+                                            float('nan'), float('nan'))])
+                continue
+            base = c * K
+            out.append([
+                LimitViolation(ViolationElementType(int(etype[base + i])), int(eid[base + i]),
+                               int(side[base + i]), LimitViolationType(int(vtype[base + i])),
+                               float(value[base + i]), float(limit[base + i]))
+                for i in range(cnt)
+            ])
+        return out
+
+    def get_violations_truncated(self):
+        """(n_scenarios,) bool ndarray: True where more than
+        violation_capacity violations were found for that scenario
+        (clamped -- raise violation_capacity if this matters for your use
+        case). Requires run() with compute_limit_violations=True."""
+        return self._s.get_violation_truncated().astype(bool)
+
+    def get_violation_counts(self):
+        """dict of (n_scenarios,) int ndarrays with keys 'low_voltage',
+        'high_voltage', 'current': the TRUE, uncapped count of violations of
+        each type per scenario, -1 for a not-simulated (disconnected /
+        masked-skip) scenario.
+
+        Unlike get_violations()'s per-violation records (capped at
+        violation_capacity), these totals are always exact -- they keep
+        counting past the cap, so they remain reliable even when
+        get_violations_truncated() is True for a scenario. Requires run()
+        with compute_limit_violations=True."""
+        if not self.compute_limit_violations:
+            raise RuntimeError(
+                "get_violation_counts() requires compute_limit_violations=True "
+                "(set solver.compute_limit_violations = True before run()).")
+        return {
+            "low_voltage":  self._s.get_violation_count_low_voltage(),
+            "high_voltage": self._s.get_violation_count_high_voltage(),
+            "current":      self._s.get_violation_count_current(),
+        }
+
+    def converged(self, tol=None):
+        """(n_scenarios,) bool ndarray: residual <= tol (defaults to
+        violation_tol). Independent of compute_limit_violations -- residuals
+        are always O(n_scenarios) and always computed (see residuals);
+        this does not require compute_limit_violations to be enabled."""
+        t = self.violation_tol if tol is None else tol
+        return self.residuals.to_numpy() <= t
 
     # --- results ---
     @property

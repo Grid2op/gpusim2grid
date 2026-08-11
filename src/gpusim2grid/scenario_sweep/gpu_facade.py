@@ -18,10 +18,12 @@ policy refactor), added as a distinct class rather than folded into
 from both: one injection/topology pair per row, not a shared base case with a
 distinct scenario set.
 
-Deferred scope (matches lightsim2grid's own ScenarioSweepCPP v1): no
-handle_disconnected_grid masking, no compute_limit_violations. A scenario
-whose topology change disconnects the grid is skipped (NaN).
+``handle_disconnected_grid`` and ``compute_limit_violations`` are supported
+identically to :class:`gpusim2grid.ContingencyAnalysisGPU` -- see that
+class's docs for the full semantics.
 """
+
+import numpy as np
 
 from . import (
     _ScenarioSweepSolver,
@@ -124,7 +126,8 @@ class ScenarioSweepGPU:
 
     def __init__(self, grid, *, init_from_n_powerflow=True, precision="fp64",
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
-                 use_bridge=None, reordering_alg=None,
+                 use_bridge=None, handle_disconnected_grid=False,
+                 compute_limit_violations=False, reordering_alg=None,
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
@@ -141,6 +144,7 @@ class ScenarioSweepGPU:
                 raise ValueError(
                     "use_bridge=True requires `grid` to be a lightsim2grid "
                     "grid object, not an explicit-array tuple.")
+            self._grid = None
             Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq = grid
             self._inner = _ScenarioSweepSolver(
                 Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
@@ -153,19 +157,30 @@ class ScenarioSweepGPU:
                 scaling_max_voltage_change=bool(scaling_max_voltage_change),
                 max_dVa=0.5 if max_dVa is None else float(max_dVa),
                 max_dVm=0.1 if max_dVm is None else float(max_dVm))
-            # No grid to auto-extract branch data from: call set_branch_data()
-            # manually before set_topology()/compute_flows().
+            # No grid to auto-extract branch/limit data from: call
+            # set_branch_data() manually before set_topology()/compute_flows()
+            # (and set_limits() before run() when compute_limit_violations
+            # is wanted).
             self._n_branches = 0
+            self._inner.compute_limit_violations = bool(compute_limit_violations)
         else:
+            # Retained for set_limits_from_grid()/converged_n()/get_violations_n(),
+            # which need to read the grid's own (bus/branch limit, base-case V)
+            # state after construction.
+            self._grid = grid
+
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
             if use_bridge:
                 # Branch data is always set -- set_topology() needs it, not
                 # just compute_flows() -- see ls2g_bridge.cpp:make_ss_session_from_lsgrid.
+                # When compute_limit_violations is True, the bridge also pulls
+                # bus/branch limits off the grid and enables the fused check.
                 session = _cpp._make_ss_session_from_lsgrid(
                     grid, bool(init_from_n_powerflow), 100, int(nb_iter),
                     int(max_iter_base), float(tol_base), _normalize_device(device),
+                    bool(compute_limit_violations),
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
@@ -204,6 +219,19 @@ class ScenarioSweepGPU:
                 branch_args, _, _ = extract_branch_data(grid)
                 self._inner.set_branch_data(*branch_args)
                 self._n_branches = len(branch_args[0])
+
+                # The array-based (non-bridge) path has no C++-side grid
+                # access, so compute_limit_violations is enabled here in
+                # Python instead of inside the C++ bridge call above.
+                if compute_limit_violations:
+                    self.set_limits_from_grid()
+                    self._inner.compute_limit_violations = True
+
+        # Solve the largest connected component of a split grid (masking the
+        # rest as NaN) instead of skipping such scenarios. Works on both the
+        # bridge and the array path (mutable property on the underlying
+        # session).
+        self._inner.handle_disconnected_grid = bool(handle_disconnected_grid)
 
         # Snapshot the load/gen -> solver-bus wiring so set_injections_from_
         # elements() can assemble Sbus itself -- see InjectionSweepGPU's
@@ -305,6 +333,128 @@ class ScenarioSweepGPU:
         Each scenario's own tripped branches are reported as exactly zero.
         """
         self._inner.compute_flows()
+
+    # ------------------------------------------------- compute_limit_violations
+    def _extract_limits_arrays(self):
+        """(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines) off
+        self._grid: bulk C++ extraction (bus arrays relabeled to AC-solver
+        numbering) when the bridge is available, else the pure-Python
+        fallback iterating grid.get_lines()/get_trafos(). NaN = not
+        configured. Shared by set_limits_from_grid() and get_violations_n()."""
+        if self._grid is None:
+            raise RuntimeError(
+                "requires a lightsim2grid grid (this session was built from "
+                "an explicit-array tuple); use set_limits() instead.")
+        grid = self._grid
+        n_lines = len(grid.get_lines())
+        n_bus_solver = self._inner._s.n_bus
+        if _have_bridge():
+            bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka = \
+                _cpp._extract_limits_from_lsgrid(grid, n_bus_solver)
+        else:
+            me_to_solver = grid.id_me_to_ac_solver()
+            bus_vmin_model = grid.get_bus_vmin_kv()
+            bus_vmax_model = grid.get_bus_vmax_kv()
+            bus_vmin_kv = np.full(n_bus_solver, np.nan)
+            bus_vmax_kv = np.full(n_bus_solver, np.nan)
+            if len(bus_vmin_model) > 0:
+                for grid_id, solver_id in enumerate(me_to_solver):
+                    if solver_id >= 0:
+                        bus_vmin_kv[solver_id] = bus_vmin_model[grid_id]
+                        bus_vmax_kv[solver_id] = bus_vmax_model[grid_id]
+            limit_a1_ka = np.array([l.limit_a1_ka for l in grid.get_lines()] +
+                                    [t.limit_a1_ka for t in grid.get_trafos()])
+            limit_a2_ka = np.array([l.limit_a2_ka for l in grid.get_lines()] +
+                                    [t.limit_a2_ka for t in grid.get_trafos()])
+        return bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines
+
+    def set_limits_from_grid(self):
+        """Extract bus voltage (kV) / branch current (kA) limits straight off
+        the lightsim2grid grid and configure them via the underlying solver's
+        ``set_limits()``.
+
+        Bus arrays are relabeled from grid-model to AC-solver bus numbering
+        (same map ``set_branch_data`` uses for branch endpoints); branch
+        arrays are lines-then-trafos. NaN = not configured for that element.
+
+        Not needed when ``compute_limit_violations=True`` was passed to the
+        constructor and the bridge path is in use (the C++ bridge already
+        does this internally) -- call this when limits changed on the grid
+        after construction, or when using the array (non-bridge) path.
+        """
+        bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines = \
+            self._extract_limits_arrays()
+        self._inner.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+
+    @property
+    def compute_limit_violations(self):
+        """bool: fused per-chunk voltage/current/divergence check (see
+        set_limits_from_grid()). Default False. Takes effect on the next
+        compute()."""
+        return self._inner.compute_limit_violations
+
+    @compute_limit_violations.setter
+    def compute_limit_violations(self, value):
+        self._inner.compute_limit_violations = value
+
+    def get_violations(self):
+        """list[list[LimitViolation]]: one entry per scenario (row order
+        matches set_injections()/set_topology()'s input rows). Requires
+        compute() with compute_limit_violations=True."""
+        return self._inner.get_violations()
+
+    def get_violations_truncated(self):
+        """(n_scenarios,) bool ndarray: True where more than violation_capacity
+        violations were found for that scenario (clamped)."""
+        return self._inner.get_violations_truncated()
+
+    def get_violation_counts(self):
+        """dict of (n_scenarios,) int ndarrays with keys 'low_voltage',
+        'high_voltage', 'current': the TRUE, uncapped count of violations of
+        each type per scenario (-1 = not simulated). Unlike
+        get_violations()'s records (capped at violation_capacity), these
+        totals stay exact even when get_violations_truncated() is True."""
+        return self._inner.get_violation_counts()
+
+    def converged(self, tol=None):
+        """(n_scenarios,) bool ndarray: residual <= tol (defaults to violation_tol).
+        Independent of compute_limit_violations -- requires compute()."""
+        return self._inner.converged(tol)
+
+    def converged_n(self, tol=None):
+        """bool: whether the pre-scenario ('n') CPU base-case solve
+        converged. Construction already validates this against tol_base
+        (raising RuntimeError otherwise), so this always returns True --
+        exists for API parity with lightsim2grid's converged_n(). tol is
+        accepted for signature symmetry with converged() but unused."""
+        return True
+
+    def get_violations_n(self):
+        """list[LimitViolation] for the pre-scenario ('n') case: a single
+        voltage vector, not a batch, so this is pure Python/CPU (no GPU,
+        no memory/transfer concern -- see
+        gpusim2grid.contingency_analysis._limit_violations.compute_violations_n).
+        Requires set_limits_from_grid() (or a compute_limit_violations=True
+        construction) to have been called; with no limits configured,
+        returns []."""
+        from ..contingency_analysis._limit_violations import compute_violations_n
+
+        grid = self._grid
+        bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines = \
+            self._extract_limits_arrays()
+        if np.all(np.isnan(bus_vmin_kv)) and np.all(np.isnan(bus_vmax_kv)):
+            bus_vmin_kv = bus_vmax_kv = None
+        if np.all(np.isnan(limit_a1_ka)) and np.all(np.isnan(limit_a2_ka)):
+            limit_a1_ka = limit_a2_ka = None
+
+        branch_args, _, _ = extract_branch_data(grid)
+        branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva = branch_args
+        V_n = grid.get_V_solver()
+
+        return compute_violations_n(
+            V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
+            branch_from, branch_to, yff, yft, ytf, ytt,
+            limit_a1_ka, limit_a2_ka, sn_mva, n_lines)
 
     # ----------------------------------------------------------- pass-through
     @property

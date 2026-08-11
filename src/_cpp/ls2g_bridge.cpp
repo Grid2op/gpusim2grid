@@ -728,6 +728,7 @@ make_ss_session_from_lsgrid(
     int    max_iter_base,
     double tol_base,
     int    device,
+    bool   compute_limit_violations,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
@@ -769,5 +770,13 @@ make_ss_session_from_lsgrid(
     session->set_branch_data(bd.branch_from, bd.branch_to,
                              bd.yff, bd.yft, bd.ytf, bd.ytt,
                              bd.bus_vn_kv, bd.sn_mva);
+
+    if (compute_limit_violations) {
+        session->set_compute_limit_violations(true);
+        LimitData ld = extract_limits(grid, static_cast<int>(Ybus.rows()));
+        const int n_lines = static_cast<int>(grid.get_powerlines_as_data().nb());
+        session->set_limits(ld.bus_vmin_kv, ld.bus_vmax_kv,
+                            ld.limit_a1_ka, ld.limit_a2_ka, n_lines);
+    }
     return session;
 }

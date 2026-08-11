@@ -1225,10 +1225,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
       "independently of every other row. Solves the base case once at "
       "construction. Prefer the Python facade "
       ":class:`gpusim2grid.ScenarioSweepGPU`.\n\n"
-      "Deferred scope (matches lightsim2grid's own ScenarioSweepCPP v1): no "
-      "handle_disconnected_grid masking, no compute_limit_violations. A "
-      "scenario whose topology change disconnects the grid is skipped "
-      "(NaN), same convention as ContingencyAnalysisSession's legacy path.")
+      "A scenario whose topology change disconnects the grid is skipped "
+      "(NaN) unless handle_disconnected_grid is set, in which case it is "
+      "solved on its largest connected component instead (masked buses "
+      "reported as NaN) -- same convention as ContingencyAnalysisSession. "
+      "compute_limit_violations enables the fused per-chunk voltage/current/"
+      "divergence check, also mirroring ContingencyAnalysisSession.")
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1370,6 +1372,78 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("max_dVm", &ScenarioSweepSession::max_dVm_,
                    "MaxVoltageChangeScalingPolicy max voltage-magnitude step "
                    "(pu); only meaningful with scaling_max_voltage_change=True.")
+    .def_readwrite("handle_disconnected_grid",
+                   &ScenarioSweepSession::handle_disconnected_grid_,
+                   "When True, a scenario whose topology change splits the grid "
+                   "is solved on its largest connected component (the rest "
+                   "reported as NaN) instead of being skipped; scenarios "
+                   "stranding the angle reference or a controller bus are still "
+                   "skipped. Incompatible with the 'direct_base_case_factors' "
+                   "strategy. Takes effect on the next run().")
+    // -------------------------------------------------------------------
+    // compute_limit_violations: fused on-device per-chunk voltage/current/
+    // divergence check (mirrors ContingencyAnalysisSession's flag of the
+    // same name). Off by default -- zero extra device memory or kernels
+    // when unused.
+    // -------------------------------------------------------------------
+    .def_property("compute_limit_violations",
+                  &ScenarioSweepSession::get_compute_limit_violations,
+                  &ScenarioSweepSession::set_compute_limit_violations,
+                  "When True, an extra per-scenario voltage/current/divergence "
+                  "check runs fused into each chunk's solve (see set_limits()), "
+                  "writing only a bounded compact buffer (never the full dense "
+                  "V_results/or_amps/ex_amps). Changing this value clears any "
+                  "previously computed violation results. Default False. Takes "
+                  "effect on the next run().")
+    .def("set_limits", &ScenarioSweepSession::set_limits,
+         pybind11::arg("bus_vmin_kv"), pybind11::arg("bus_vmax_kv"),
+         pybind11::arg("branch_limit_a1_ka"), pybind11::arg("branch_limit_a2_ka"),
+         pybind11::arg("n_lines"),
+         "Configure per-bus voltage (kV, solver numbering) and per-branch "
+         "current (kA, lines-then-trafos) limits for compute_limit_violations. "
+         "NaN = not configured for that element (matches lightsim2grid's "
+         "convention). Required before run() when compute_limit_violations is "
+         "True. n_lines splits the lines-then-trafos branch ordering for "
+         "LimitViolation element_type/element_id de-concatenation.")
+    .def_readwrite("violation_tol", &ScenarioSweepSession::violation_tol_,
+                   "Residual tolerance for the fused kernel's DIVERGED check "
+                   "(independent of tol_base). Takes effect on the next run().")
+    .def_readwrite("violation_capacity", &ScenarioSweepSession::violation_capacity_,
+                   "Max violation records kept per scenario (K). Bounds the "
+                   "compact output at n_scenarios * K regardless of grid "
+                   "size. Takes effect on the next run(); default 16.")
+    .def("get_violation_element_type", &ScenarioSweepSession::get_violation_element_type,
+         "(n_scenarios * violation_capacity,) int: 0=BUS,1=LINE,2=TRAFO per slot.")
+    .def("get_violation_element_id",   &ScenarioSweepSession::get_violation_element_id,
+         "(n_scenarios * violation_capacity,) int: grid-model bus id for BUS "
+         "(solver numbering); local (own-type, 0-based) id for LINE/TRAFO; -1 for DIVERGED.")
+    .def("get_violation_side",         &ScenarioSweepSession::get_violation_side,
+         "(n_scenarios * violation_capacity,) int: 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO.")
+    .def("get_violation_type",         &ScenarioSweepSession::get_violation_type,
+         "(n_scenarios * violation_capacity,) int: "
+         "0=LOW_VOLTAGE,1=HIGH_VOLTAGE,2=CURRENT,3=DIVERGED per slot.")
+    .def("get_violation_value",        &ScenarioSweepSession::get_violation_value,
+         "(n_scenarios * violation_capacity,) float: value reached "
+         "(kV for voltage, kA for current, residual for DIVERGED).")
+    .def("get_violation_limit",        &ScenarioSweepSession::get_violation_limit,
+         "(n_scenarios * violation_capacity,) float: limit that was "
+         "violated (kV, kA, or tol for DIVERGED).")
+    .def("get_violation_count",        &ScenarioSweepSession::get_violation_count,
+         "(n_scenarios,) int: -1 = not simulated (disconnected/masked-skip), "
+         "else number of valid slots in [0, violation_capacity].")
+    .def("get_violation_truncated",    &ScenarioSweepSession::get_violation_truncated,
+         "(n_scenarios,) int (0/1): 1 if more than violation_capacity "
+         "violations were found for that scenario (clamped).")
+    .def("get_violation_count_low_voltage", &ScenarioSweepSession::get_violation_count_low_voltage,
+         "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
+         "count of LOW_VOLTAGE violations (independent of violation_capacity, "
+         "unlike get_violation_count()).")
+    .def("get_violation_count_high_voltage", &ScenarioSweepSession::get_violation_count_high_voltage,
+         "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
+         "count of HIGH_VOLTAGE violations.")
+    .def("get_violation_count_current", &ScenarioSweepSession::get_violation_count_current,
+         "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
+         "count of CURRENT violations (both sides combined).")
     // -------------------------------------------------------------------
     // Zero-copy DLPack exporters.
     // -------------------------------------------------------------------
@@ -1521,7 +1595,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.def("_make_ss_session_from_lsgrid",
         [](pybind11::object grid_py, bool init_from_n_powerflow,
            int batch_size, int nb_iter, int max_iter_base, double tol_base,
-           int device,
+           int device, bool compute_limit_violations,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
@@ -1530,7 +1604,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ss_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
-                max_iter_base, tol_base, device,
+                max_iter_base, tol_base, device, compute_limit_violations,
                 reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
                 scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
                 use_distributed_slack);
@@ -1542,6 +1616,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("max_iter_base")         = 10,
         pybind11::arg("tol_base")              = 1e-6,
         pybind11::arg("device")                = -1,
+        pybind11::arg("compute_limit_violations") = false,
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
@@ -1554,7 +1629,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "LSGrid (zero-copy). Branch data is always set (set_topology() needs "
         "it). Solves the same augmented system lightsim2grid poses "
         "(distributed slack / HVDC droop / SVC / remote voltage control) via "
-        "the NRLedger read off the grid. reordering_alg/matching_alg/"
+        "the NRLedger read off the grid. When compute_limit_violations is True, "
+        "also pulls bus/branch limits off the grid and enables the session's "
+        "fused on-device violation check. reordering_alg/matching_alg/"
         "pivot_epsilon_alg: cuDSS config, applied at construction to BOTH the "
         "base-case solve AND the batch solver used by run() (single source of "
         "truth). debug_base_case (default False): opt-in diagnostic -- see "
@@ -1567,9 +1644,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "get_ac_algo_config()). Each scenario gets its own alpha from its own "
         "max|dtheta|/max|dvm|, not one alpha shared across the whole chunk.\n"
         "use_distributed_slack (default True): see _make_is_session_from_lsgrid.\n"
-        "Deferred scope (matches lightsim2grid's own ScenarioSweepCPP v1): no "
-        "handle_disconnected_grid masking, no compute_limit_violations -- a "
-        "scenario whose topology change disconnects the grid is skipped (NaN).");
+        "handle_disconnected_grid is a mutable property on the returned "
+        "session (set it after construction), mirroring "
+        "ContingencyAnalysisSession.");
 
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device,

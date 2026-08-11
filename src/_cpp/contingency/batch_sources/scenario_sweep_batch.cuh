@@ -16,11 +16,13 @@
 //
 //   - Ybus side: identical to ContingencyBatch — per-active-slot Ybus value
 //     patches (apply_contingencies_kernel), compaction of scenarios whose
-//     topology disconnects the grid (check_connectivity → active_to_orig_).
-//     handle_disconnected_grid masking is NOT supported here (deferred scope,
-//     see CLAUDE.md) — a disconnecting scenario is skipped/NaN exactly like
-//     ContingencyBatch's legacy (mask_cfg == nullptr) path; there is no
-//     MaskConfig parameter at all.
+//     topology disconnects the grid. Two connectivity modes, selected by
+//     whether a MaskConfig is passed to the constructor (same convention as
+//     ContingencyBatch): nullptr selects the legacy check_connectivity
+//     skip-if-split path (a disconnecting scenario is skipped/NaN); non-null
+//     selects compute_component_masks' handle_disconnected_grid mode (solve
+//     the largest connected component, freezing the rest as NaN, only
+//     skipping when the angle reference or a controller bus is stranded).
 //   - Sbus side: identical to InjectionBatch's dense per-scenario (n_scenario
 //     × n_bus) complex Sbus, sbus_stride = n_bus. The one wrinkle: since
 //     compaction can drop rows, h_Sbus_all_ is built ALREADY PERMUTED into
@@ -36,9 +38,12 @@
 //                         base.d_Sbus for any unfilled tail slots (verbatim
 //                         InjectionBatch).
 //
-// Deferred scope (matches lightsim2grid's own ScenarioSweepCPP v1): no
-// fill_mask_buffers / tripped_branch_table content — compute_limit_violations
-// and handle_disconnected_grid masking are not wired up for this source.
+// fill_mask_buffers / tripped_branch_table are real implementations, verbatim
+// ContingencyBatch's — the fused masking kernels (nr_apply_bus_mask/
+// nr_mask_v_nan, driver.cuh) and the compute_limit_violations kernel
+// (check_limit_violations_kernel, batch_pf_driver.cu) are already generic
+// over any BatchSource, so no changes are needed outside this file/session to
+// support either handle_disconnected_grid or compute_limit_violations here.
 // =============================================================================
 
 #include <algorithm>
@@ -94,6 +99,30 @@ struct ScenarioSweepBatch {
     thrust::device_vector<cuda_real_type> d_flat_delta_im;
 
     // -------------------------------------------------------------------------
+    // handle_disconnected_grid masking data (empty / no-op when the mode is
+    // off). Identity-row entries and masked-voltage entries, flat over chunks
+    // with a ChunkPatchRange per chunk (same chunking as h_flat_*). Verbatim
+    // ContingencyBatch's fields — see that file's own doc.
+    // -------------------------------------------------------------------------
+    bool                         mask_mode_ = false;
+    std::vector<int>             h_mask_slot_, h_mask_row_, h_mask_diag_;
+    std::vector<ChunkPatchRange> mask_row_ranges_;
+    std::vector<int>             h_maskv_slot_, h_maskv_bus_;
+    std::vector<ChunkPatchRange> maskv_ranges_;
+    thrust::device_vector<int>   d_mask_slot, d_mask_row, d_mask_diag;
+    thrust::device_vector<int>   d_maskv_slot, d_maskv_bus;
+
+    // -------------------------------------------------------------------------
+    // compute_limit_violations: per-active-slot (global, not per-chunk)
+    // tripped-branch lookup table — see build_tripped_branch_table. Built
+    // unconditionally (cheap: O(n_active + total_trips) ints) so it costs
+    // nothing when nobody enables compute_limit_violations. Verbatim
+    // ContingencyBatch's fields.
+    // -------------------------------------------------------------------------
+    std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
+    thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
+
+    // -------------------------------------------------------------------------
     // Host-side per-scenario Sbus, ALREADY PERMUTED into active-slot order at
     // construction (see class doc). n_scenarios_ is the ORIGINAL (pre-
     // compaction) row count — kept for bookkeeping / error messages only; the
@@ -124,19 +153,30 @@ struct ScenarioSweepBatch {
     //                     caller has no further use for it; read-only here
     //                     (copied, row-permuted, into h_Sbus_all_), not moved.
     //   max_batch_size  : upper bound on systems per chunk (the user batch_size).
+    //   mask_cfg        : handle_disconnected_grid mode when non-null (see
+    //                     class doc); nullptr selects the legacy
+    //                     check_connectivity skip-if-split path.
     // -------------------------------------------------------------------------
     ScenarioSweepBatch(std::vector<Contingency>& contingencies,
                        const int*                Ybus_rm_outer,
                        const int*                Ybus_rm_inner,
                        const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                        std::vector<cudaComplexType>&& h_Sbus_all_orig,
-                       int                       max_batch_size)
+                       int                       max_batch_size,
+                       const MaskConfig*         mask_cfg = nullptr)
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
         n_scenarios_ = n_total_;
         resolve_indices(contingencies, Ybus_rm_outer, Ybus_rm_inner);
-        check_connectivity(contingencies, Ybus_rm);
+
+        mask_mode_ = (mask_cfg != nullptr);
+        if (mask_mode_)
+            compute_component_masks(contingencies, Ybus_rm,
+                                    mask_cfg->is_reference_bus,
+                                    mask_cfg->is_controller_bus);
+        else
+            check_connectivity(contingencies, Ybus_rm);
 
         int n_active = 0;
         for (const auto& ctg : contingencies)
@@ -148,6 +188,15 @@ struct ScenarioSweepBatch {
                            h_flat_ctg_id_, h_flat_k_,
                            h_flat_delta_re_, h_flat_delta_im_,
                            chunk_ranges_, active_to_orig_);
+
+        if (mask_mode_)
+            build_mask_entries(contingencies, active_to_orig_, used_batch_size_,
+                               mask_cfg->row_info,
+                               h_mask_slot_, h_mask_row_, h_mask_diag_, mask_row_ranges_,
+                               h_maskv_slot_, h_maskv_bus_, maskv_ranges_);
+
+        build_tripped_branch_table(contingencies, active_to_orig_,
+                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_);
 
         // Permute Sbus rows into active-slot order so prepare_Sbus_batch's
         // contiguous-slice copy (verbatim from InjectionBatch) stays correct
@@ -182,11 +231,34 @@ struct ScenarioSweepBatch {
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
 
     // -------------------------------------------------------------------------
-    // fill_mask_buffers — no-op (handle_disconnected_grid deferred, see class
-    // doc); leaves NrIterBuffers' mask fields at their off defaults.
+    // fill_mask_buffers — write this chunk's handle_disconnected_grid mask
+    // slice into the NrIterBuffers. Sets null / 0 when the mode is off or the
+    // chunk masks nothing, leaving the masking launches as no-ops. Verbatim
+    // ContingencyBatch::fill_mask_buffers.
     // -------------------------------------------------------------------------
-    void fill_mask_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/,
-                           const int* /*d_J_outer*/) const {}
+    void fill_mask_buffers(NrIterBuffers& buf, int chunk_idx, const int* d_J_outer) const
+    {
+        if (!mask_mode_) return;
+        buf.d_J_outer_mask = d_J_outer;
+
+        if (chunk_idx < static_cast<int>(mask_row_ranges_.size())) {
+            const ChunkPatchRange& r = mask_row_ranges_[static_cast<size_t>(chunk_idx)];
+            if (r.count > 0) {
+                buf.d_mask_slot = thrust::raw_pointer_cast(d_mask_slot.data()) + r.start;
+                buf.d_mask_row  = thrust::raw_pointer_cast(d_mask_row.data())  + r.start;
+                buf.d_mask_diag = thrust::raw_pointer_cast(d_mask_diag.data()) + r.start;
+                buf.n_mask_rows = r.count;
+            }
+        }
+        if (chunk_idx < static_cast<int>(maskv_ranges_.size())) {
+            const ChunkPatchRange& r = maskv_ranges_[static_cast<size_t>(chunk_idx)];
+            if (r.count > 0) {
+                buf.d_maskv_slot = thrust::raw_pointer_cast(d_maskv_slot.data()) + r.start;
+                buf.d_maskv_bus  = thrust::raw_pointer_cast(d_maskv_bus.data())  + r.start;
+                buf.n_mask_v     = r.count;
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Active-set interface (consumed by BatchPfDriver to compact the batch) —
@@ -201,10 +273,18 @@ struct ScenarioSweepBatch {
                : nullptr;
     }
 
-    // compute_limit_violations is out of scope for this source (see class
-    // doc) — the all-null table is never consulted since callers never
-    // enable the fused violation check on a ScenarioSweepSession.
-    TrippedBranchTable tripped_branch_table() const { return TrippedBranchTable{nullptr, nullptr, nullptr}; }
+    // -------------------------------------------------------------------------
+    // tripped_branch_table — device pointers into this batch's tripped-branch
+    // lookup table, indexed by GLOBAL active-slot id. Consumed by
+    // check_limit_violations_kernel to skip branches tripped by the scenario
+    // it is currently checking. Verbatim ContingencyBatch::tripped_branch_table.
+    // -------------------------------------------------------------------------
+    TrippedBranchTable tripped_branch_table() const {
+        return TrippedBranchTable{
+            thrust::raw_pointer_cast(d_trip_start.data()),
+            thrust::raw_pointer_cast(d_trip_count.data()),
+            thrust::raw_pointer_cast(d_trip_branch_flat.data())};
+    }
 
     // -------------------------------------------------------------------------
     // prepare_Ybus_batch — tile V + tile Ybus + apply this chunk's patches.
