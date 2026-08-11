@@ -12,6 +12,7 @@
 #include "batch_pf_driver.cuh"
 #include "batch_sources/contingency_batch.cuh"
 #include "batch_sources/injection_batch.cuh"
+#include "batch_sources/scenario_sweep_batch.cuh"
 #include "driver.cuh"                       // run_nr_loop<Policy>
 #include "../acpf_nr_kernels.cuh"
 #include "../nr_iter_step.cuh"              // NrIterBuffers, BS
@@ -238,7 +239,11 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     }, policy_);
 
     cs.synchronize();
-    t_analysis_ms_ = bpf_ms_since(t_cudss_start);
+    // Split the cuDSS context creation (first-touch dlopen/JIT on the first
+    // cuDSS use in the process) out of the ANALYSIS cost -- see
+    // CudssBatchSolver::context_init_ms() and BatchTimings::t_context_init_ms.
+    t_context_init_ms_ = linear_solver_.context_init_ms();
+    t_analysis_ms_ = bpf_ms_since(t_cudss_start) - t_context_init_ms_;
 
     // -------------------------------------------------------------------------
     // Source-specific one-time setup (flat-patch/mask H→D upload for
@@ -323,9 +328,21 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
         const double sqrt3 = std::sqrt(3.0);
         std::vector<cuda_real_type> h_base(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
-            const double vn = bus_vn_kv(h_from[l]);
-            h_base[l] = static_cast<cuda_real_type>(
-                sn_mva * 1e6 / (sqrt3 * vn * 1e3));
+            // branch_from can be -1 (Kron-reduced / half-open-line endpoint,
+            // see check_limit_violations_kernel's own bf/bt>=0 guard) --
+            // bus_vn_kv(-1) is an out-of-bounds read (UB, not caught by
+            // Eigen without assertions), and if it happens to read something
+            // near zero it makes h_base[l] = +inf, which then poisons the
+            // *live* side's reported current (ka_or/ka_ex = finite * inf)
+            // into an "infinite" CURRENT violation. Fall back to the other
+            // endpoint, which is always valid when branch_from isn't (a
+            // branch can't have both ends Kron-reduced and still appear
+            // here).
+            const int vn_bus = (h_from[l] >= 0) ? h_from[l] : h_to[l];
+            const double vn = (vn_bus >= 0) ? bus_vn_kv(vn_bus) : 0.0;
+            h_base[l] = (vn_bus >= 0)
+                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn * 1e3))
+                : cuda_real_type(0);
         }
         upload_h2d(d_base_current_A, h_base.data(), n_branches_, cs);
     }
@@ -486,6 +503,7 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.t_alloc_ms       = t_alloc_ms_;
     t.t_analysis_ms    = t_analysis_ms_;
     t.t_source_init_ms = t_source_init_ms_;
+    t.t_context_init_ms = t_context_init_ms_;
 
     // When the source has compacted disconnected contingencies out of the batch
     // (n_active_ < n_contingencies), the chunk loop only writes the connected
@@ -810,3 +828,4 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 // =============================================================================
 template struct BatchPfDriver<ContingencyBatch>;
 template struct BatchPfDriver<InjectionBatch>;
+template struct BatchPfDriver<ScenarioSweepBatch>;

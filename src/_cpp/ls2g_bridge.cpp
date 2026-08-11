@@ -89,7 +89,7 @@ struct BranchData {
     double          sn_mva;
 };
 
-BranchData extract_branch_data(const ls2g::LSGrid& grid)
+BranchData extract_branch_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
     const auto& lines  = grid.get_powerlines_as_data();
     const auto& trafos = grid.get_trafos_as_data();
@@ -108,15 +108,24 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid)
     bd.yft = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
     bd.ytf = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
     bd.ytt = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
-    // TODO(bug): bus_vn_kv is left in grid-MODEL bus numbering, unlike
-    // branch_from/branch_to just above (relabeled via me_to_solver) and unlike
-    // bus_vmin_kv/bus_vmax_kv in extract_limits() (also relabeled). Whenever
-    // id_me_to_ac_solver is not the identity -- e.g. isolated buses excluded
-    // under KLU/the augmented multi-slack system -- this mismatches V/
-    // branch_from in size (crash) or, if sizes coincide, silently pairs the
-    // wrong nominal voltage with the wrong bus in compute_branch_flows_cpu /
-    // get_violations_n. Needs the same me_to_solver remap applied here.
-    bd.bus_vn_kv = grid.get_bus_vn_kv();
+    // bus_vn_kv must be relabeled global(model)->AC-solver the same way
+    // branch_from/branch_to above and bus_vmin_kv/bus_vmax_kv in
+    // extract_limits() are, or it silently pairs the wrong nominal voltage
+    // with the wrong bus (used below to derive d_base_current_A) whenever
+    // id_me_to_ac_solver is not the identity -- e.g. isolated/Kron-reduced
+    // buses from keep_half_open_lines or a disconnected grid. A solver bus
+    // id with no model-side entry can't happen (every solver bus originates
+    // from some model bus); left at 0 defensively.
+    {
+        ls2g::RealVect vn_model = grid.get_bus_vn_kv();
+        RealVect vn_solver = RealVect::Zero(n_bus_solver);
+        for (size_t grid_id = 0; grid_id < me_to_solver.size(); ++grid_id) {
+            const int solver_id = me_to_solver[grid_id];
+            if (solver_id >= 0 && solver_id < n_bus_solver)
+                vn_solver(solver_id) = vn_model(static_cast<Eigen::Index>(grid_id));
+        }
+        bd.bus_vn_kv = vn_solver;
+    }
     bd.sn_mva    = const_cast<ls2g::LSGrid&>(grid).get_sn_mva();
     return bd;
 }
@@ -189,7 +198,154 @@ LimitData extract_limits(const ls2g::LSGrid& grid, int n_bus_solver)
     return ld;
 }
 
+// Pick the ledger a session is built on, honouring use_distributed_slack.
+//
+// use_distributed_slack=true (default) → the augmented ledger, i.e. the same
+// system lightsim2grid poses. false → nullptr, which AcPfNrState turns into
+// the trivial feature-free ledger (bare [pvpq | pq]); that is exactly what
+// "remove the slack row/column" means, since MultiSlack contributes exactly
+// one extra row (the reference bus' P equation) and one extra column
+// (slack_absorbed) on top of that bare layout, whatever the participant count.
+//
+// The other in-Jacobian controls live in the very same ledger, so dropping it
+// would drop them too. Refuse rather than silently change the physics.
+const LedgerData* select_ledger(const LedgerData& ledger,
+                                bool              use_distributed_slack,
+                                const char*       who)
+{
+    if (use_distributed_slack) return &ledger;
+    if (ledger.has_hvdc() || ledger.has_voltage_control())
+        throw std::runtime_error(
+            std::string(who) + ": use_distributed_slack=false is not supported on a "
+            "grid carrying HVDC-droop or VoltageControl (SVC / remote generator "
+            "voltage control) features -- they share the augmented Jacobian with "
+            "the MultiSlack row/column and cannot be kept while it is dropped. "
+            "Use use_distributed_slack=true, or remove those controls from the "
+            "grid first.");
+    return nullptr;
+}
+
+// Remap one bus-keyed map in place through old→new (negatives stay negative).
+void remap_map(std::vector<int>& m, const std::vector<int>& old_to_new)
+{
+    for (int& v : m) v = (v < 0) ? -1 : old_to_new[v];
+}
+
+// Remap a compact (bus, row_or_col) pair list, dropping every registration
+// whose row/col no longer exists.
+void remap_pairs(std::vector<int>& buses, std::vector<int>& idx,
+                 const std::vector<int>& old_to_new)
+{
+    std::vector<int> kb, ki;
+    kb.reserve(buses.size());
+    ki.reserve(idx.size());
+    for (size_t k = 0; k < idx.size(); ++k) {
+        const int v = idx[k];
+        const int nv = (v < 0) ? -1 : old_to_new[v];
+        if (nv < 0) continue;
+        kb.push_back(buses[k]);
+        ki.push_back(nv);
+    }
+    buses.swap(kb);
+    idx.swap(ki);
+}
+
 }  // namespace
+
+LedgerData drop_multislack_augmentation(const LedgerData& in,
+                                        const Eigen::VectorXi& pv,
+                                        const Eigen::VectorXi& pq)
+{
+    if (!in.has_multislack()) return in;
+
+    const int old_dim = in.dim_J;
+    const int n_bus   = static_cast<int>(in.p_row_of_bus.size());
+
+    // Buses of the bare layout: those that own a P equation without MultiSlack.
+    std::vector<char> in_pvpq(n_bus, 0);
+    for (Eigen::Index i = 0; i < pv.size(); ++i) in_pvpq[pv[i]] = 1;
+    for (Eigen::Index i = 0; i < pq.size(); ++i) in_pvpq[pq[i]] = 1;
+
+    // Surplus rows/cols = everything the bare layout would not have.
+    std::vector<char> row_drop(old_dim, 0), col_drop(old_dim, 0);
+    int n_row_drop = 0, n_col_drop = 0;
+    col_drop[in.slack_col] = 1;
+    ++n_col_drop;
+    for (int b = 0; b < n_bus; ++b) {
+        if (in_pvpq[b]) continue;
+        const int pr = in.p_row_of_bus[b];
+        const int tc = in.theta_col_of_bus[b];
+        if (pr >= 0 && !row_drop[pr]) { row_drop[pr] = 1; ++n_row_drop; }
+        if (tc >= 0 && !col_drop[tc]) { col_drop[tc] = 1; ++n_col_drop; }
+    }
+    if (n_row_drop != n_col_drop)
+        throw std::runtime_error(
+            "drop_multislack_augmentation: the MultiSlack augmentation is not "
+            "square (" + std::to_string(n_row_drop) + " surplus rows vs "
+            + std::to_string(n_col_drop) + " surplus columns) — the ledger does "
+            "not have the layout this transform assumes. Use "
+            "use_distributed_slack=true.");
+
+    // old → new index maps (-1 = deleted).
+    std::vector<int> row_new(old_dim, -1), col_new(old_dim, -1);
+    for (int i = 0, r = 0, c = 0; i < old_dim; ++i) {
+        if (!row_drop[i]) row_new[i] = r++;
+        if (!col_drop[i]) col_new[i] = c++;
+    }
+    const int new_dim = old_dim - n_row_drop;
+
+    LedgerData out = in;
+    out.dim_J = new_dim;
+
+    // Skeleton: drop the surplus rows, and the surplus columns of every kept
+    // row. Nothing is ever added — the augmented pattern is a superset.
+    out.J_outer.clear();
+    out.J_inner.clear();
+    out.J_outer.reserve(static_cast<size_t>(new_dim) + 1);
+    out.J_inner.reserve(in.J_inner.size());
+    out.J_outer.push_back(0);
+    for (int r = 0; r < old_dim; ++r) {
+        if (row_drop[r]) continue;
+        for (int k = in.J_outer[r]; k < in.J_outer[r + 1]; ++k) {
+            const int c = in.J_inner[k];
+            if (!col_drop[c]) out.J_inner.push_back(col_new[c]);
+        }
+        out.J_outer.push_back(static_cast<int>(out.J_inner.size()));
+    }
+
+    remap_map(out.p_row_of_bus,     row_new);
+    remap_map(out.q_row_of_bus,     row_new);
+    remap_map(out.theta_col_of_bus, col_new);
+    remap_map(out.vm_col_of_bus,    col_new);
+    remap_map(out.q_col_of_bus,     col_new);
+
+    remap_pairs(out.p_buses,     out.p_rows,     row_new);
+    remap_pairs(out.q_buses,     out.q_rows,     row_new);
+    remap_pairs(out.theta_buses, out.theta_cols, col_new);
+    remap_pairs(out.vm_buses,    out.vm_cols,    col_new);
+
+    // VoltageControl keeps its own per-controller Q columns (never surplus:
+    // they are not theta columns and not slack_col). Its custom rows are
+    // reconstructed downstream as the LAST vc_n_controllers() rows of J, which
+    // stays correct under deletion because only P rows — all of which precede
+    // them — are removed.
+    for (int& c : out.vc_q_col) {
+        if (c < 0) continue;
+        const int nc = col_new[c];
+        if (nc < 0)
+            throw std::runtime_error(
+                "drop_multislack_augmentation: a VoltageControl Q column "
+                "collided with the MultiSlack augmentation — cannot drop the "
+                "distributed slack without also dropping that controller.");
+        c = nc;
+    }
+
+    // MultiSlack itself is gone: the feature kernels are gated on slack_col>=0.
+    out.slack_col = -1;
+    out.slack_weights.clear();
+    out.slack_absorbed_gt = 0.0;
+    return out;
+}
 
 LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, double tol)
 {
@@ -365,7 +521,8 @@ make_acpf_session_from_lsgrid(
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
-    double max_dVm_override)
+    double max_dVm_override,
+    bool   use_distributed_slack)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -382,6 +539,8 @@ make_acpf_session_from_lsgrid(
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol);
+    if (!use_distributed_slack)
+        ledger = drop_multislack_augmentation(ledger, pv, pq);
 
     const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
         grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
@@ -453,7 +612,8 @@ make_ca_session_from_lsgrid(
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
-    double max_dVm_override)
+    double max_dVm_override,
+    bool   use_distributed_slack)
 {
     // get_Ybus_solver() is non-const (returns a copy) — cast away constness;
     // we only read it.
@@ -472,6 +632,8 @@ make_ca_session_from_lsgrid(
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
+    if (!use_distributed_slack)
+        ledger = drop_multislack_augmentation(ledger, pv, pq);
     const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
         grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<ContingencyAnalysisSession>(
@@ -481,7 +643,7 @@ make_ca_session_from_lsgrid(
         reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
         scaling, max_dVa, max_dVm);
 
-    BranchData bd = extract_branch_data(grid);
+    BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
     session->set_branch_data(bd.branch_from, bd.branch_to,
                              bd.yff, bd.yft, bd.ytf, bd.ytt,
                              bd.bus_vn_kv, bd.sn_mva);
@@ -519,7 +681,8 @@ make_is_session_from_lsgrid(
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
-    double max_dVm_override)
+    double max_dVm_override,
+    bool   use_distributed_slack)
 {
     auto& g = const_cast<ls2g::LSGrid&>(grid);
     Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
@@ -536,6 +699,8 @@ make_is_session_from_lsgrid(
     Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
 
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
+    if (!use_distributed_slack)
+        ledger = drop_multislack_augmentation(ledger, pv, pq);
     const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
         grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<InjectionSweepSession>(
@@ -546,10 +711,72 @@ make_is_session_from_lsgrid(
         scaling, max_dVa, max_dVm);
 
     if (with_branch_data) {
-        BranchData bd = extract_branch_data(grid);
+        BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
         session->set_branch_data(bd.branch_from, bd.branch_to,
                                  bd.yff, bd.yft, bd.ytf, bd.ytt,
                                  bd.bus_vn_kv, bd.sn_mva);
+    }
+    return session;
+}
+
+std::shared_ptr<ScenarioSweepSession>
+make_ss_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    bool   init_from_n_powerflow,
+    int    batch_size,
+    int    nb_iter,
+    int    max_iter_base,
+    double tol_base,
+    int    device,
+    bool   compute_limit_violations,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   debug_base_case,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override,
+    bool   use_distributed_slack)
+{
+    auto& g = const_cast<ls2g::LSGrid&>(grid);
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus = g.get_Ybus_solver();
+    if (Ybus.rows() == 0)
+        throw std::runtime_error(
+            "make_ss_session_from_lsgrid: empty Ybus — has the grid been solved "
+            "(ac_pf) before being handed to gpusim2grid?");
+
+    CplxVect        V0    = grid.get_V_solver();
+    CplxVect        Sbus  = grid.get_Sbus_solver();
+    Eigen::VectorXi slack = grid.get_slack_ids_solver_numpy();
+    RealVect        sw    = grid.get_slack_weights_solver();
+    Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
+    Eigen::VectorXi pq    = grid.get_pq_solver_numpy();
+
+    LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
+    if (!use_distributed_slack)
+        ledger = drop_multislack_augmentation(ledger, pv, pq);
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+    auto session = std::make_shared<ScenarioSweepSession>(
+        Ybus, V0, Sbus, slack, sw, pv, pq,
+        batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
+        /*presolved_v=*/init_from_n_powerflow,
+        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        scaling, max_dVa, max_dVm);
+
+    // Always set — set_topology() needs branch admittances to build each
+    // scenario's Ybus triplets, not just compute_flows().
+    BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
+    session->set_branch_data(bd.branch_from, bd.branch_to,
+                             bd.yff, bd.yft, bd.ytf, bd.ytt,
+                             bd.bus_vn_kv, bd.sn_mva);
+
+    if (compute_limit_violations) {
+        session->set_compute_limit_violations(true);
+        LimitData ld = extract_limits(grid, static_cast<int>(Ybus.rows()));
+        const int n_lines = static_cast<int>(grid.get_powerlines_as_data().nb());
+        session->set_limits(ld.bus_vmin_kv, ld.bus_vmax_kv,
+                            ld.limit_a1_ka, ld.limit_a2_ka, n_lines);
     }
     return session;
 }

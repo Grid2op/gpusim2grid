@@ -359,3 +359,153 @@ def test_acpf_gpu_distributed_slack_matches(solver_atol):
     assert ac.session.dim_J > n_pv + 2 * n_pq
 
     np.testing.assert_allclose(V_gpu, V_ref, atol=10 * solver_atol)
+
+
+# =============================================================================
+# use_distributed_slack=False — the single-slack counterpart of the same ledger
+#
+# Drops ONLY what MultiSlack owns (the P equation of every participant, their
+# theta unknowns, and the slack_absorbed column), leaving every other
+# in-Jacobian control in place. See drop_multislack_augmentation in
+# ls2g_bridge.cpp.
+# =============================================================================
+
+def _n_slack_participants(grid):
+    return int(np.count_nonzero(np.asarray(grid.get_slack_weights_solver())))
+
+
+@requires_gpu
+@needs_bridge
+def test_single_slack_mode_drops_exactly_the_multislack_rows(solver_atol):
+    """On a genuine N=2 distributed-slack grid, use_distributed_slack=False
+    shrinks dim_J by exactly the participant count and lands on the bare
+    [pvpq | pq] size."""
+    from gpusim2grid import AcPfGPU
+
+    grid = _solved_multislack_grid()
+    n_slack = _n_slack_participants(grid)
+    assert n_slack >= 2, "expected a genuine distributed slack"
+
+    dim_aug = AcPfGPU(grid, max_iter=40, tol=1e-10).session.dim_J
+    ac_single = AcPfGPU(grid, max_iter=40, tol=1e-10,
+                        use_distributed_slack=False)
+
+    n_pv = grid.get_pv().shape[0]
+    n_pq = grid.get_pq().shape[0]
+    assert ac_single.session.dim_J == dim_aug - n_slack
+    assert ac_single.session.dim_J == n_pv + 2 * n_pq
+
+    # The dropped rows are exactly the ones the converged V does not constrain,
+    # so lightsim2grid's solution still satisfies the reduced system.
+    np.testing.assert_allclose(ac_single.solve(), grid.get_V_solver(),
+                               atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_single_slack_mode_is_exact_for_a_non_distributed_slack(solver_atol):
+    """With ONE participant the augmentation is block-triangular, so dropping
+    it moves no other row: both modes give the same V, and dim_J differs by 1."""
+    from gpusim2grid import AcPfGPU
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        grid = init_from_pandapower(net)
+        grid.change_algorithm(AlgorithmType.NR_KLU)
+        n_model = grid.get_bus_vn_kv().shape[0]
+        grid.ac_pf(np.ones(n_model, dtype=complex), 30, 1e-10)
+
+    assert _n_slack_participants(grid) == 1
+
+    ac_aug = AcPfGPU(grid, max_iter=40, tol=1e-11)
+    ac_single = AcPfGPU(grid, max_iter=40, tol=1e-11,
+                        use_distributed_slack=False)
+    assert ac_single.session.dim_J == ac_aug.session.dim_J - 1
+    np.testing.assert_allclose(ac_single.solve(), ac_aug.solve(),
+                               atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_single_slack_mode_keeps_hvdc_droop(solver_atol):
+    """HVDC angle-droop survives use_distributed_slack=False. If the droop
+    slopes/flows had been dropped with the slack, V would not match."""
+    from gpusim2grid import AcPfGPU
+
+    model = _solved_hvdc_droop_grid()
+    ac = AcPfGPU(model, max_iter=40, tol=1e-11, use_distributed_slack=False)
+    np.testing.assert_allclose(ac.solve(), model.get_V_solver(),
+                               atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_single_slack_mode_keeps_voltage_control(solver_atol):
+    """The bordered VoltageControl rows/columns survive
+    use_distributed_slack=False (only the MultiSlack pair is removed)."""
+    from gpusim2grid import AcPfGPU
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.gridmodel import init_from_pandapower
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        model = init_from_pandapower(net)
+        if not hasattr(model, "set_gen_regulated_bus"):
+            pytest.skip("this lightsim2grid build has no set_gen_regulated_bus")
+        model.set_gen_regulated_bus(3, 9)
+        model.tell_solver_need_reset()
+        _solve_with_fallback(model, net.bus.shape[0])
+
+    n_pv = model.get_pv().shape[0]
+    n_pq = model.get_pq().shape[0]
+    ac = AcPfGPU(model, max_iter=50, tol=1e-11, use_distributed_slack=False)
+    # Still bordered: VC's own column/row pair is untouched by the transform.
+    assert ac.session.dim_J > n_pv + 2 * n_pq
+    np.testing.assert_allclose(ac.solve(), model.get_V_solver(),
+                               atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_injection_sweep_single_slack_mode_matches(solver_atol):
+    """Both slack modes agree scenario-by-scenario on a single-slack grid."""
+    from gpusim2grid import InjectionSweepGPU
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        grid = init_from_pandapower(net)
+        grid.change_algorithm(AlgorithmType.NR_KLU)
+        n_model = grid.get_bus_vn_kv().shape[0]
+        grid.ac_pf(np.ones(n_model, dtype=complex), 30, 1e-10)
+
+    load_p, load_q, *_ = grid.get_loads_res_full()
+    gen_p, *_ = grid.get_gen_res_full()
+    n_ts = 8
+    rng = np.random.default_rng(0)
+    scale = 1.0 + rng.uniform(-0.05, 0.05, size=(n_ts, 1))
+    lp = scale * load_p.reshape(1, -1)
+    lq = scale * load_q.reshape(1, -1)
+    gp = scale * gen_p.reshape(1, -1)
+
+    out = {}
+    for uds in (True, False):
+        sweep = InjectionSweepGPU(grid, nb_iter=6, tol_base=1e-10,
+                                  use_distributed_slack=uds)
+        sweep.set_injections_from_elements(lp, lq, gp)
+        sweep.compute(batch_size=n_ts)
+        out[uds] = sweep.V_results.to_numpy().reshape((n_ts, -1))
+        assert np.isfinite(out[uds]).all()
+
+    np.testing.assert_allclose(out[False], out[True], atol=10 * solver_atol)

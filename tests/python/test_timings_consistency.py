@@ -8,14 +8,17 @@ test_timings_consistency.py — solver.timings must be a complete accounting.
 Wrapping construction -> run() -> compute_flows() -> .to_numpy() calls in an
 external stopwatch should not report meaningfully more elapsed time than
 timings.t_grand_total_ms; and the coarse aggregation properties
-(t_cpu_preprocess_ms, t_host_to_device_ms, t_gpu_compute_ms,
-t_device_to_host_ms, t_grand_total_ms) must equal the sum of their documented
-components exactly (these are computed fields, no measurement noise).
+(t_cpu_preprocess_ms, t_host_to_device_ms, t_context_init_ms,
+t_gpu_compute_ms, t_device_to_host_ms, t_grand_total_ms) must equal the sum of
+their documented components exactly (these are computed fields, no measurement
+noise).
 
 A one-time throwaway solve warms up the CUDA context/stream before each
 timed measurement: CUDA context creation on a process' first GPU touch is a
 one-time, process-lifetime cost (not attributable to any single solve), and
 would otherwise make the external-vs-internal comparison spuriously loose.
+(gpusim2grid.warmup() does the same thing without a solve; the throwaway solve
+is kept here because it also warms this module's own kernels.)
 """
 import time
 
@@ -61,14 +64,19 @@ def _check_batch_aggregation(t):
     assert t.t_gpu_compute_ms == pytest.approx(
         t.t_base_case_solve_only_ms + t.t_analysis_ms + t.t_chunks_total_wall_ms,
         abs=1e-9)
+    # t_context_init_ms is its own bucket: CUDA/cuSPARSE/cuDSS one-time init is
+    # process warm-up, not this batch's compute, so it sits outside
+    # t_gpu_compute_ms while still counting toward the grand total.
     assert t.t_grand_total_ms == pytest.approx(
-        t.t_cpu_preprocess_ms + t.t_host_to_device_ms
+        t.t_cpu_preprocess_ms + t.t_host_to_device_ms + t.t_context_init_ms
         + t.t_gpu_compute_ms + t.t_device_to_host_ms, abs=1e-9)
 
 
 def _check_to_dict(t):
     d = t.to_dict()
     assert d["total"] == pytest.approx(t.t_grand_total_ms, abs=1e-9)
+
+    assert d["context_init"]["total"] == pytest.approx(t.t_context_init_ms, abs=1e-9)
 
     assert d["cpu_preproc"]["total"] == pytest.approx(t.t_cpu_preprocess_ms, abs=1e-9)
     assert d["cpu_preproc"]["preprocess_ms"] == pytest.approx(t.t_preprocess_ms, abs=1e-9)
@@ -108,8 +116,11 @@ def _check_acpf_aggregation(t):
                   + t.t_solve.wall_ms + t.t_update_V.wall_ms + t.t_mismatch.wall_ms)
     assert t.t_gpu_compute_ms == pytest.approx(
         t.t_analyze_ms + t.t_prepare_jt_ms + iters_wall, abs=1e-9)
+    # t_context_init_ms is its own bucket: CUDA/cuSPARSE/cuDSS one-time init is
+    # process warm-up, not this solve's compute, so it sits outside
+    # t_gpu_compute_ms while still counting toward the grand total.
     assert t.t_grand_total_ms == pytest.approx(
-        t.t_cpu_preprocess_ms + t.t_host_to_device_ms
+        t.t_cpu_preprocess_ms + t.t_host_to_device_ms + t.t_context_init_ms
         + t.t_gpu_compute_ms + t.t_device_to_host_ms, abs=1e-9)
 
 

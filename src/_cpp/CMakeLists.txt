@@ -20,10 +20,13 @@ pybind11_add_module(
     contingency/batch_pf_driver.cu
     contingency/violation_kernels.cu
     contingency/batch_sources/injection_batch.cu
+    contingency/batch_sources/scenario_sweep_batch.cu
     injection_sweep.cu
     injection_sweep_session.cu
+    scenario_sweep_session.cu
     dlpack_export.cu
     raw_cudss_solve.cu
+    warmup.cu
     ${_gpusim2grid_ls2g_sources})
 target_link_libraries(_gpusim2grid PRIVATE CUDA::cusparse cudss)
 

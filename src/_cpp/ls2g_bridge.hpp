@@ -33,6 +33,7 @@
 
 #include "contingency_analysis_session.hpp"
 #include "injection_sweep_session.hpp"
+#include "scenario_sweep_session.hpp"
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
 
@@ -55,6 +56,34 @@
 //      instead of deriving it via a cuDSS solve.
 LedgerData extract_ledger_data(const ls2g::LSGrid& grid,
                                bool presolved_v = false, double tol = 0.0);
+
+// Return `in` with the MultiSlack augmentation removed — the single-slack
+// counterpart of the same ledger, with every OTHER in-Jacobian control (HVDC
+// angle-droop, SVC / remote generator voltage control) preserved untouched.
+//
+// What MultiSlack owns, and therefore what is deleted here, is exactly the
+// rows/columns the bare [pvpq | pq] layout would not have:
+//   • rows: the P equation of every slack participant (lightsim2grid keeps ALL
+//     participants out of pv/pq, so none of these rows exists without it);
+//   • cols: the slack_absorbed unknown, plus the theta unknown of every
+//     NON-reference participant (the angle reference has none).
+// That is n_slack of each, so the result stays square: dim_J -= n_slack.
+// (For a single, non-distributed slack this is one row + one column, and the
+// removal is EXACT — that pair is block-triangular, the slack column's only
+// entry sitting on the reference bus' own extra P row, so every other row's
+// solution is unchanged and only slack_absorbed stops being an explicit
+// unknown. With several participants it is a genuine model change: the
+// mismatch is no longer shared per slack_weights.)
+//
+// Deleting is valid rather than rebuilding because the augmented sparsity
+// pattern is a strict SUPERSET of the bare one — every physical coupling the
+// single-slack J needs is already present, so no entry ever has to be added.
+//
+// pv/pq are the solver-numbering PV and PQ bus lists the same session is built
+// with; they define the bare layout and hence which rows/cols are surplus.
+LedgerData drop_multislack_augmentation(const LedgerData& in,
+                                        const Eigen::VectorXi& pv,
+                                        const Eigen::VectorXi& pq);
 
 // Build a single-system AcPfNrSession from a solved LSGrid, solving the same
 // augmented system lightsim2grid does (distributed slack / future extensions).
@@ -97,7 +126,9 @@ make_acpf_session_from_lsgrid(
     // max_dVm to override those specifically. See AcPfNrState's own doc.
     int    scaling_max_voltage_change_override = -1,
     double max_dVa_override = -1.0,
-    double max_dVm_override = -1.0);
+    double max_dVm_override = -1.0,
+    // See the use_distributed_slack note above make_ca_session_from_lsgrid.
+    bool   use_distributed_slack = true);
 
 // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
 // (solver numbering) instead of the grid's own Sbus. The ledger structure is
@@ -143,7 +174,30 @@ make_ca_session_from_lsgrid(
     // own doc), same single-source-of-truth pattern as reordering_alg.
     int    scaling_max_voltage_change_override = -1,
     double max_dVa_override = -1.0,
-    double max_dVm_override = -1.0);
+    double max_dVm_override = -1.0,
+    // When false, drop the augmented MultiSlack row/column and solve the
+    // classic bare [pvpq | pq] system instead (dim_J shrinks by 1, and the
+    // adjust_slack_mismatch / fill_slack_feature / update_slack_absorbed
+    // kernels are skipped entirely). The mismatch is then carried by the slack
+    // buses implicitly, exactly as in a non-distributed-slack Newton-Raphson.
+    //
+    // With a SINGLE slack participant (weight 1) this is an exact
+    // reformulation: the augmented row/column pair is block-triangular there
+    // (the slack column's only entry sits on the slack bus' own extra P row),
+    // so removing it leaves the solution for every other row untouched --
+    // only slack_absorbed stops being reported as an explicit unknown.
+    //
+    // With SEVERAL participants it is a genuine MODEL CHANGE: the mismatch is
+    // no longer shared per slack_weights. Combined with
+    // init_from_n_powerflow=true, the grid's own converged V then legitimately
+    // fails the residual check (it solves a different system) -- that throw is
+    // correct, not a bug.
+    //
+    // Throws when the grid carries HVDC-droop or VoltageControl features:
+    // those live in the same augmented ledger and cannot be preserved while
+    // the MultiSlack augmentation is dropped, and silently discarding them
+    // would change the physics behind the caller's back.
+    bool   use_distributed_slack = true);
 
 // Extract compute_limit_violations limits off a solved LSGrid: bus voltage
 // limits (kV, relabeled from grid-model to AC-solver bus numbering via
@@ -180,6 +234,41 @@ make_is_session_from_lsgrid(
     // own doc.
     int    scaling_max_voltage_change_override = -1,
     double max_dVa_override = -1.0,
-    double max_dVm_override = -1.0);
+    double max_dVm_override = -1.0,
+    // See the use_distributed_slack note above make_ca_session_from_lsgrid.
+    bool   use_distributed_slack = true);
+
+// Build a ScenarioSweepSession from a solved LSGrid — the row-aligned
+// combined topology + injection sweep (ScenarioSweepGPU). Branch data is
+// always set (unlike make_is_session_from_lsgrid's with_branch_data flag):
+// ScenarioSweepSession::set_topology() needs it to build the Ybus triplets
+// for each scenario's tripped branches, not just for compute_flows(). When
+// compute_limit_violations=true, also pulls bus/branch limits off the grid
+// and enables the session's fused on-device violation check (mirrors
+// make_ca_session_from_lsgrid).
+std::shared_ptr<ScenarioSweepSession>
+make_ss_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    bool   init_from_n_powerflow,
+    int    batch_size,
+    int    nb_iter,
+    int    max_iter_base,
+    double tol_base,
+    int    device,
+    bool   compute_limit_violations = false,
+    // Single source of truth for base_state_'s AND the batch solver's cuDSS
+    // config (see ScenarioSweepSession's own doc).
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
+    bool   debug_base_case = false,
+    // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
+    // own doc.
+    int    scaling_max_voltage_change_override = -1,
+    double max_dVa_override = -1.0,
+    double max_dVm_override = -1.0,
+    // See the use_distributed_slack note above make_ca_session_from_lsgrid.
+    bool   use_distributed_slack = true);
 
 #endif  // LS2G_BRIDGE_HPP

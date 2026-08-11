@@ -22,6 +22,9 @@ callers without a lightsim2grid grid.
 .. autoclass:: gpusim2grid.InjectionSweepGPU
    :members:
 
+.. autoclass:: gpusim2grid.ScenarioSweepGPU
+   :members:
+
 .. autoclass:: gpusim2grid.AcPfGPU
    :members:
 
@@ -93,6 +96,61 @@ Injection sweep
 ---------------
 
 .. automodule:: gpusim2grid.injection_sweep
+   :members:
+   :undoc-members:
+
+Scenario sweep
+--------------
+
+Row-aligned combination of contingency analysis and injection sweep: row
+``i``'s (P, Q) profile (:meth:`~gpusim2grid.ScenarioSweepGPU.set_injections` /
+:meth:`~gpusim2grid.ScenarioSweepGPU.set_injections_from_elements`) is solved
+together with row ``i``'s own set of tripped branches
+(:meth:`~gpusim2grid.ScenarioSweepGPU.set_topology`), independently of every
+other row. Mirrors lightsim2grid's own ``ScenarioSweep``. Deliberately a
+separate class from :class:`~gpusim2grid.InjectionSweepGPU` /
+:class:`~gpusim2grid.ContingencyAnalysisGPU` rather than an extension of
+either, since the usage pattern (one topology + injection pair per row)
+differs from both of theirs (a shared base case with a distinct scenario
+set). ``set_topology`` is optional — a row never covered defaults to "no
+branches tripped", so :class:`~gpusim2grid.ScenarioSweepGPU` also works as a
+plain injection sweep.
+
+Quick start:
+
+.. code-block:: python
+
+    import numpy as np
+    from gpusim2grid import ScenarioSweepGPU
+
+    # grid is a solved lightsim2grid grid (grid.ac_pf(...) already called).
+    sweep = ScenarioSweepGPU(grid, nb_iter=10)
+
+    # Per-element injections, mirroring lightsim2grid's own TimeSeries API:
+    # one row per scenario, one column per load / generator.
+    sweep.set_injections_from_elements(load_p, load_q, gen_p)
+
+    # One branch-id list per scenario (lines-then-trafos), row-aligned with
+    # the injections above. An empty list means "nothing tripped this row".
+    sweep.set_topology([[], [3], [], [3, 40]])
+
+    V_batch = sweep.compute(batch_size=512)   # DLPack (n_scenarios, n_bus)
+    residuals = sweep.last_residuals()
+    disconnected = sweep.get_disconnected()   # which rows were skipped (NaN)
+
+``handle_disconnected_grid`` and ``compute_limit_violations`` are supported
+identically to :class:`~gpusim2grid.ContingencyAnalysisGPU` — see the
+"Limit violations" section above for the full semantics
+(:class:`~gpusim2grid.contingency_analysis.ViolationElementType` /
+:class:`~gpusim2grid.contingency_analysis.LimitViolationType` /
+:class:`~gpusim2grid.contingency_analysis.LimitViolation` are reused as-is,
+not redefined here) and :doc:`examples`
+("Largest-component solve of a split grid" / "N-1 screen with limit
+violations") for the equivalent ``ContingencyAnalysisGPU`` walkthroughs — the
+only difference on :class:`~gpusim2grid.ScenarioSweepGPU` is that each row
+also carries its own injection.
+
+.. automodule:: gpusim2grid.scenario_sweep
    :members:
    :undoc-members:
 

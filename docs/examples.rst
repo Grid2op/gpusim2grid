@@ -34,6 +34,18 @@ solving the whole batch on the GPU reusing a single base-case factorization.
 .. literalinclude:: ../examples/injection_sweep_scan.py
    :language: python
 
+Row-aligned combined topology + injection sweep
+------------------------------------------------
+
+Sweeps a load-scaling factor across every bus, and every 10th scenario ALSO
+trips a branch: row `i`'s (P, Q) profile is solved together with row `i`'s
+own set of tripped branches, independently of every other row — via the
+``ScenarioSweepGPU`` facade, the GPU analogue of lightsim2grid's own
+``ScenarioSweep``.
+
+.. literalinclude:: ../examples/scenario_sweep_scan.py
+   :language: python
+
 Largest-component solve of a split grid
 ---------------------------------------
 

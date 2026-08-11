@@ -42,6 +42,8 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <chrono>
+
 #include "dtypes.hpp"
 #include "cuda_utils.h"       // CudaStream, CudssContext, CudssDescriptor,
                                // CuSpMV, CudaTimer
@@ -54,6 +56,22 @@ struct LedgerData;            // ledger_data.hpp (host); optional augmented-J in
 // AcPfNrState
 // =============================================================================
 struct AcPfNrState {
+
+    // -------------------------------------------------------------------------
+    // Constructor clock — MUST stay the first declared member.
+    //
+    // Members are constructed in declaration order, so this stamps the wall
+    // clock before `cs` below issues cudaStreamCreate(). In a fresh process
+    // that is typically the first CUDA driver call, and it lazily creates the
+    // CUDA context: tens of milliseconds, entirely outside the constructor
+    // body and therefore invisible to any timer started there. Charging it to
+    // t_context_init_ms (see the ctor) is what keeps it from silently
+    // inflating the base-case solve time a caller reads afterwards.
+    // -------------------------------------------------------------------------
+    struct CtorClock {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    };
+    CtorClock ctor_clock_;
 
     // -------------------------------------------------------------------------
     // CUDA stream

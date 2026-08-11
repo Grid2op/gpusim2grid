@@ -18,6 +18,45 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
+// build_contingency_from_branch_ids
+// ---------------------------------------------------------------------------
+Contingency build_contingency_from_branch_ids(
+    const std::vector<int>&   branch_ids,
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect> yff,
+    Eigen::Ref<const CplxVect> yft,
+    Eigen::Ref<const CplxVect> ytf,
+    Eigen::Ref<const CplxVect> ytt)
+{
+    const int n_branches = static_cast<int>(branch_from.size());
+
+    Contingency ctg;
+    ctg.tripped_branches = branch_ids;
+    ctg.triplets.reserve(branch_ids.size() * 4);
+
+    for (int l : branch_ids) {
+        if (l < 0 || l >= n_branches)
+            throw std::runtime_error(
+                "build_contingency_from_branch_ids: branch index out of range");
+
+        const int i = branch_from(l);
+        const int j = branch_to(l);
+
+        // π-model Ybus modifications to SUBTRACT for this branch trip:
+        //   (i,i) → yff   (ii self-admittance at from-bus)
+        //   (j,j) → ytt   (jj self-admittance at to-bus)
+        //   (i,j) → yft   (ij mutual admittance)
+        //   (j,i) → ytf   (ji mutual admittance)
+        ctg.triplets.push_back({i, i,  yff(l).real(),  yff(l).imag()});
+        ctg.triplets.push_back({j, j,  ytt(l).real(),  ytt(l).imag()});
+        ctg.triplets.push_back({i, j,  yft(l).real(),  yft(l).imag()});
+        ctg.triplets.push_back({j, i,  ytf(l).real(),  ytf(l).imag()});
+    }
+    return ctg;
+}
+
+// ---------------------------------------------------------------------------
 // csr_find_k
 // ---------------------------------------------------------------------------
 int csr_find_k(const int* row_ptr, const int* col_ind, int row, int col)

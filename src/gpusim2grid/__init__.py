@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Import lightsim2grid first so liblightsim2grid_core.so is loaded into the
 # process: the compiled _gpusim2grid extension links against it (the zero-copy
@@ -15,11 +15,15 @@ except ImportError:
 
 from .contingency_analysis import ContingencyAnalysisGPU, optimize_reference_slack
 from .injection_sweep import InjectionSweepGPU
+from .scenario_sweep import ScenarioSweepGPU
 from .acpf_nr import AcPfGPU
+from ._gpusim2grid import warmup
 
 __all__ = [
     "ContingencyAnalysisGPU",
     "optimize_reference_slack",
     "InjectionSweepGPU",
+    "ScenarioSweepGPU",
     "AcPfGPU",
+    "warmup",
 ]

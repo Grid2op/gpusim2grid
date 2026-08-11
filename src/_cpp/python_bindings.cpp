@@ -8,8 +8,10 @@
 #include "contingency_analysis_session.hpp"  // ContingencyAnalysisSession
 #include "injection_sweep.hpp"               // run_injection_sweep_gpu
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
+#include "scenario_sweep_session.hpp"        // ScenarioSweepSession
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
+#include "warmup.hpp"                        // warmup
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
@@ -81,6 +83,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_upload_ms",  &AcPfTimings::t_upload_ms,
                       "Wall-clock sub-phase of t_init_ms: H->D transfers -- Ybus "
                       "values/indices, scatter maps, Sbus, V_init, J skeleton (ms)")
+        .def_readonly("t_context_init_ms", &AcPfTimings::t_context_init_ms,
+                      "Wall-clock sub-phase of t_init_ms: cuSPARSE/cuDSS handle + "
+                      "descriptor creation. On the first such call in a process this "
+                      "also pays CUDA-context creation and the cuSPARSE/cuDSS "
+                      "dlopen + PTX-JIT -- tens of ms independent of grid size, ~0 on "
+                      "every later solve in the same process. Call "
+                      "gpusim2grid.warmup() before timing to move it out of the "
+                      "measured region (ms)")
         .def_readonly("t_analyze_ms", &AcPfTimings::t_analyze_ms,
                       "Wall-clock: cuDSS symbolic analysis — done once, "
                       "sparsity pattern of J never changes (ms)")
@@ -139,9 +149,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Alias for t_build_J_ms: all CPU-only preprocessing (ms)")
         .def_property_readonly("t_host_to_device_ms",
                       [](const AcPfTimings& t) { return t.t_host_to_device_ms(); },
-                      "t_init_ms - t_build_J_ms: H->D data transfers + cuSPARSE/cuDSS "
-                      "handle & descriptor creation (the non-overlapping remainder of "
-                      "t_init_ms after CPU preprocessing) (ms)")
+                      "t_init_ms - t_build_J_ms - t_context_init_ms: H->D data "
+                      "transfers only (the non-overlapping remainder of t_init_ms "
+                      "after CPU preprocessing and library/context init) (ms)")
         .def_property_readonly("t_device_to_host_ms",
                       [](const AcPfTimings& t) { return t.t_device_to_host_ms(); },
                       "Alias for t_copy_v_to_host_ms: all D->H data transfers (ms)")
@@ -210,8 +220,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "upload (folded in) + block-diagonal structure upload + chunk-sized "
                       "working buffers (ms)")
         .def_readonly("t_analysis_ms",   &BatchTimings::t_analysis_ms,
-                      "Wall-clock: cuDSS init + ANALYSIS + policy init only (uniform-batch "
-                      "context) -- NOT source-specific setup, see t_source_init_ms (ms)")
+                      "Wall-clock: cuDSS ANALYSIS + policy init only (uniform-batch "
+                      "context) -- NOT the cuDSS context creation (see "
+                      "t_context_init_ms) and NOT source-specific setup (see "
+                      "t_source_init_ms) (ms)")
+        .def_readonly("t_context_init_ms", &BatchTimings::t_context_init_ms,
+                      "Wall-clock: one-time CUDA/cuSPARSE/cuDSS library + context init "
+                      "-- the base case's handle/descriptor creation plus the batch "
+                      "solver's cuDSS context creation. On the FIRST session in a "
+                      "process this is where CUDA-context creation and the "
+                      "cuSPARSE/cuDSS dlopen + PTX-JIT land: tens of ms that scale with "
+                      "nothing and drop to ~0 for every later session in the same "
+                      "process. Its own grand-total bucket, deliberately NOT part of "
+                      "t_gpu_compute_ms -- it is process warm-up, not work done for "
+                      "this batch. Call gpusim2grid.warmup() before timing to move it "
+                      "out of the measured region entirely (ms)")
         .def_readonly("t_source_init_ms", &BatchTimings::t_source_init_ms,
                       "Wall-clock: source-specific one-time GPU setup -- flat-patch/mask H->D "
                       "upload (contingency) or Sbus_all H->D upload + one-time Ybus D->D tiling "
@@ -226,7 +249,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_base_case_solve_only_ms", &BatchTimings::t_base_case_solve_only_ms,
                       "Wall-clock: non-overlapping remainder of t_base_case_ms -- cuDSS analyze "
                       "+ NR iterations (or the presolved_v validation step) only, excluding the "
-                      "build_J/upload share already folded into t_preprocess_ms/t_alloc_ms (ms)")
+                      "build_J/upload share already folded into t_preprocess_ms/t_alloc_ms and "
+                      "the context-init share split into t_context_init_ms. Under "
+                      "init_from_n_powerflow=True with lightsim2grid ground truth there is no "
+                      "solve and no cuDSS context at all, so this is ~0.2 ms (ms)")
         .def_readonly("t_ground_truth_check_ms", &BatchTimings::t_ground_truth_check_ms,
                       "Wall-clock: LSGrid::check_solution() precondition, measured BEFORE "
                       "this session existed (inside extract_ledger_data(), ls2g_bridge.cpp), "
@@ -318,11 +344,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "pure D->H (ms)")
         .def_property_readonly("t_gpu_compute_ms",
                       [](const BatchTimings& t) { return t.t_gpu_compute_ms(); },
-                      "t_base_case_solve_only_ms + t_analysis_ms + t_chunks_total_wall_ms (ms)")
+                      "t_base_case_solve_only_ms + t_analysis_ms + t_chunks_total_wall_ms. "
+                      "Excludes t_context_init_ms (one-time process warm-up) (ms)")
         .def_property_readonly("t_grand_total_ms",
                       [](const BatchTimings& t) { return t.t_grand_total_ms(); },
-                      "Sum of t_cpu_preprocess_ms + t_host_to_device_ms + t_gpu_compute_ms + "
-                      "t_device_to_host_ms. Should match an external stopwatch wrapped around "
+                      "Sum of t_cpu_preprocess_ms + t_host_to_device_ms + t_context_init_ms + "
+                      "t_gpu_compute_ms + t_device_to_host_ms. Should match an external "
+                      "stopwatch wrapped around "
                       "construction -> first run() -> compute_flows() -> .to_numpy() calls. "
                       "Caveat: t_base_case_solve_only_ms (like t_base_case_ms) is captured once "
                       "at construction -- a second run() reusing the same base case will still "
@@ -350,6 +378,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
             h2d["source_init_ms"]         = t.t_source_init_ms;
             h2d["branch_data_upload_ms"]  = t.t_branch_data_upload_ms;
             h2d["violation_setup_ms"]     = t.t_violation_setup_ms;
+
+            // One-time CUDA/cuSPARSE/cuDSS warm-up, kept out of gpu_compute on
+            // purpose -- see BatchTimings::t_context_init_ms.
+            py::dict context_init;
+            context_init["total"] = t.t_context_init_ms;
 
             py::dict gpu_compute;
             gpu_compute["total"]                    = t.t_gpu_compute_ms();
@@ -379,15 +412,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
             d2h["copy_violations_to_host_ms"] = t.t_copy_violations_to_host_ms;
 
             py::dict result;
-            result["total"]       = t.t_grand_total_ms();
-            result["cpu_preproc"] = cpu_preproc;
-            result["h2d"]         = h2d;
-            result["gpu_compute"] = gpu_compute;
-            result["d2h"]         = d2h;
+            result["total"]        = t.t_grand_total_ms();
+            result["cpu_preproc"]  = cpu_preproc;
+            result["h2d"]          = h2d;
+            result["context_init"] = context_init;
+            result["gpu_compute"]  = gpu_compute;
+            result["d2h"]          = d2h;
             return result;
         }, "Nested dict view of the coarse timing buckets: "
            "{'total': ms, 'cpu_preproc': {'total': ms, ...}, 'h2d': {'total': ms, ...}, "
-           "'gpu_compute': {'total': ms, ...}, 'd2h': {'total': ms, ...}}. Each bucket's "
+           "'context_init': {'total': ms}, 'gpu_compute': {'total': ms, ...}, "
+           "'d2h': {'total': ms, ...}}. Each bucket's "
            "'total' matches its t_*_ms coarse property; the remaining keys are the "
            "fine-grained fields it's composed of. Fine fields that are TimingEntry in C++ "
            "(the per-chunk fields under 'gpu_compute') become nested "
@@ -1175,6 +1210,250 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Export batch voltages as DLPack capsule, shape [n_scenarios, n_bus].\n"
          "Requires run() to have been called.  Syncs the solver stream.");
 
+  // -----------------------------------------------------------------
+  // ScenarioSweepSession — stateful row-aligned combined topology +
+  // injection sweep. Base-case NR runs once at construction; set_branch_data()
+  // + set_injections() (+ optional set_topology()) + run() may be called
+  // repeatedly reusing that base.
+  // -----------------------------------------------------------------
+  pybind11::class_<ScenarioSweepSession,
+                   std::shared_ptr<ScenarioSweepSession>>(
+      m, "ScenarioSweepSession",
+      "Stateful GPU row-aligned combined topology + injection sweep "
+      "(low-level binding). Row i of the injection matrices is solved "
+      "together with row i of set_topology()'s branch-trip lists, "
+      "independently of every other row. Solves the base case once at "
+      "construction. Prefer the Python facade "
+      ":class:`gpusim2grid.ScenarioSweepGPU`.\n\n"
+      "A scenario whose topology change disconnects the grid is skipped "
+      "(NaN) unless handle_disconnected_grid is set, in which case it is "
+      "solved on its largest connected component instead (masked buses "
+      "reported as NaN) -- same convention as ContingencyAnalysisSession. "
+      "compute_limit_violations enables the fused per-chunk voltage/current/"
+      "divergence check, also mirroring ContingencyAnalysisSession.")
+    .def(pybind11::init(
+           [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
+              Eigen::Ref<const CplxVect>                  Vinit,
+              Eigen::Ref<const CplxVect>                  Sbus,
+              Eigen::Ref<const Eigen::VectorXi>           slack_ids,
+              Eigen::Ref<const RealVect>                  slack_weights,
+              Eigen::Ref<const Eigen::VectorXi>           pv,
+              Eigen::Ref<const Eigen::VectorXi>           pq,
+              int batch_size, int nb_iter, int max_iter_base, double tol_base,
+              int device, bool presolved_v, ReorderingAlg reordering_alg,
+              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+              bool debug_base_case, bool scaling_max_voltage_change,
+              double max_dVa, double max_dVm) {
+               return std::make_shared<ScenarioSweepSession>(
+                   Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
+                   batch_size, nb_iter, max_iter_base, tol_base, device,
+                   /*ledger=*/nullptr, presolved_v,
+                   reordering_alg, matching_alg, pivot_epsilon_alg,
+                   debug_base_case,
+                   scaling_max_voltage_change, max_dVa, max_dVm);
+           }),
+         pybind11::arg("Ybus"),
+         pybind11::arg("Vinit"),
+         pybind11::arg("Sbus"),
+         pybind11::arg("slack_ids"),
+         pybind11::arg("slack_weights"),
+         pybind11::arg("pv"),
+         pybind11::arg("pq"),
+         pybind11::arg("batch_size"),
+         pybind11::arg("nb_iter"),
+         pybind11::arg("max_iter_base") = 10,
+         pybind11::arg("tol_base")      = 1e-6,
+         pybind11::arg("device")        = -1,
+         pybind11::arg("presolved_v")   = false,
+         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+         pybind11::arg("matching_alg") = MatchingAlg::None,
+         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+         pybind11::arg("debug_base_case") = false,
+         pybind11::arg("scaling_max_voltage_change") = false,
+         pybind11::arg("max_dVa") = 0.5,
+         pybind11::arg("max_dVm") = 0.1,
+         "Construct and solve the base case. Arguments match "
+         "ContingencyAnalysisSession/InjectionSweepSession, except "
+         "batch_size counts scenarios (injection + topology pairs) per GPU "
+         "chunk.")
+    .def("set_branch_data",
+         &ScenarioSweepSession::set_branch_data,
+         pybind11::arg("branch_from"),
+         pybind11::arg("branch_to"),
+         pybind11::arg("yff"),
+         pybind11::arg("yft"),
+         pybind11::arg("ytf"),
+         pybind11::arg("ytt"),
+         pybind11::arg("bus_vn_kv"),
+         pybind11::arg("sn_mva"),
+         "Store π-model branch admittances. Must be called before "
+         "set_topology() and before compute_flows().")
+    .def("set_injections",
+         &ScenarioSweepSession::set_injections,
+         pybind11::arg("p_mw"),
+         pybind11::arg("q_mvar"),
+         pybind11::arg("sn_mva"),
+         "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
+         "(converted to per-unit on run()). Fixes n_scenarios. May be "
+         "called repeatedly.")
+    .def("set_topology",
+         &ScenarioSweepSession::set_topology,
+         pybind11::arg("branch_ids_per_scenario"),
+         "One branch-id list per scenario (lines-then-trafos, same "
+         "convention as ContingencyAnalysisSession.build_contingencies), "
+         "row-aligned with set_injections(). Requires set_branch_data() "
+         "first. Optional: if never called, run() defaults every scenario "
+         "to \"no branches tripped\" (a plain injection sweep).")
+    .def("run",            &ScenarioSweepSession::run,
+         "Solve all scenarios. Fills the device-side voltage and residual "
+         "buffers. Requires set_injections() first. A scenario whose "
+         "topology change disconnects the grid is skipped (NaN).")
+    .def("compute_flows",  &ScenarioSweepSession::compute_flows,
+         "Compute branch flows for all scenarios from d_V_results, zeroing "
+         "each scenario's own tripped branches. Requires run() and "
+         "set_branch_data() to have been called.")
+    .def("get_V_results",  &ScenarioSweepSession::get_V_results,
+         "Copy batch voltages to host: (n_scenarios * n_bus,) complex128.")
+    .def("get_residuals",  &ScenarioSweepSession::get_residuals,
+         "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
+    .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,
+         "Copy origin-terminal ampere flows to host: (n_scenarios * n_branches,). "
+         "Requires compute_flows().")
+    .def("get_ex_amps",    &ScenarioSweepSession::get_ex_amps,
+         "Copy extremity-terminal ampere flows to host: (n_scenarios * n_branches,). "
+         "Requires compute_flows().")
+    .def("get_timings",    &ScenarioSweepSession::get_timings,
+         "Return the :class:`BatchTimings` from the most recent run().")
+    .def("get_disconnected", &ScenarioSweepSession::get_disconnected,
+         "Per-scenario disconnected flag: (n_scenarios,) int, 1 == topology "
+         "change islanded the grid (scenario skipped/NaN), 0 == solved. "
+         "Empty before run() has been called.")
+    .def_property_readonly("n_scenarios", &ScenarioSweepSession::n_scenarios,
+         "Number of scenarios in the current set.")
+    .def_property_readonly("n_bus",       &ScenarioSweepSession::n_bus,
+         "Number of buses in the grid.")
+    .def_property_readonly("n_branches",  &ScenarioSweepSession::n_branches,
+         "Number of branches (lines + trafos); available after set_branch_data().")
+    .def_readwrite("batch_size", &ScenarioSweepSession::batch_size_,
+                   "Scenarios per GPU chunk (takes effect on the next run())")
+    .def_readonly("used_batch_size", &ScenarioSweepSession::used_batch_size_,
+                   "Batch size effectively used during the last run()")
+    .def_readwrite("nb_iter",    &ScenarioSweepSession::nb_iter_,
+                   "Fixed NR iterations per chunk (takes effect on the next run())")
+    .def_readwrite("refactor_period", &ScenarioSweepSession::refactor_period_,
+                   "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
+    .def_readwrite("strategy_type", &ScenarioSweepSession::strategy_type_,
+                   "Linear-solve strategy (ContingencySolverType enum; takes effect on the next run())")
+    .def_readwrite("reordering_alg", &ScenarioSweepSession::reordering_alg_,
+                   "CUDSS_CONFIG_REORDERING_ALG choice for the batch cuDSS ANALYSIS "
+                   "(ReorderingAlg enum; takes effect on the next run(), which always "
+                   "reruns ANALYSIS). Only Default/Amd/NestedDissection/NoReordering "
+                   "are supported here; BtfColamd/Colamd work only on AcPfNrSession's "
+                   "single-system solve.")
+    .def_readwrite("matching_alg", &ScenarioSweepSession::matching_alg_,
+                   "CUDSS_CONFIG_MATCHING_ALG choice for the batch cuDSS ANALYSIS "
+                   "(MatchingAlg enum; takes effect on the next run(), which always "
+                   "reruns ANALYSIS). Only NoMatching (the default) works in this "
+                   "session's batch mode.")
+    .def_readwrite("pivot_epsilon_alg", &ScenarioSweepSession::pivot_epsilon_alg_,
+                   "CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the batch cuDSS "
+                   "ANALYSIS (PivotEpsilonAlg enum; takes effect on the next "
+                   "run(), which always reruns ANALYSIS).")
+    .def_readwrite("scaling_max_voltage_change",
+                   &ScenarioSweepSession::scaling_max_voltage_change_,
+                   "NR step-scaling (mirrors lightsim2grid's own "
+                   "MaxVoltageChangeScalingPolicy); takes effect on the next "
+                   "run(). Each batch slot (scenario) gets its own alpha from "
+                   "its own max|dtheta|/max|dvm|, not one alpha shared across "
+                   "the whole chunk. Off by default.")
+    .def_readwrite("max_dVa", &ScenarioSweepSession::max_dVa_,
+                   "MaxVoltageChangeScalingPolicy max angle step (rad); only "
+                   "meaningful with scaling_max_voltage_change=True.")
+    .def_readwrite("max_dVm", &ScenarioSweepSession::max_dVm_,
+                   "MaxVoltageChangeScalingPolicy max voltage-magnitude step "
+                   "(pu); only meaningful with scaling_max_voltage_change=True.")
+    .def_readwrite("handle_disconnected_grid",
+                   &ScenarioSweepSession::handle_disconnected_grid_,
+                   "When True, a scenario whose topology change splits the grid "
+                   "is solved on its largest connected component (the rest "
+                   "reported as NaN) instead of being skipped; scenarios "
+                   "stranding the angle reference or a controller bus are still "
+                   "skipped. Incompatible with the 'direct_base_case_factors' "
+                   "strategy. Takes effect on the next run().")
+    // -------------------------------------------------------------------
+    // compute_limit_violations: fused on-device per-chunk voltage/current/
+    // divergence check (mirrors ContingencyAnalysisSession's flag of the
+    // same name). Off by default -- zero extra device memory or kernels
+    // when unused.
+    // -------------------------------------------------------------------
+    .def_property("compute_limit_violations",
+                  &ScenarioSweepSession::get_compute_limit_violations,
+                  &ScenarioSweepSession::set_compute_limit_violations,
+                  "When True, an extra per-scenario voltage/current/divergence "
+                  "check runs fused into each chunk's solve (see set_limits()), "
+                  "writing only a bounded compact buffer (never the full dense "
+                  "V_results/or_amps/ex_amps). Changing this value clears any "
+                  "previously computed violation results. Default False. Takes "
+                  "effect on the next run().")
+    .def("set_limits", &ScenarioSweepSession::set_limits,
+         pybind11::arg("bus_vmin_kv"), pybind11::arg("bus_vmax_kv"),
+         pybind11::arg("branch_limit_a1_ka"), pybind11::arg("branch_limit_a2_ka"),
+         pybind11::arg("n_lines"),
+         "Configure per-bus voltage (kV, solver numbering) and per-branch "
+         "current (kA, lines-then-trafos) limits for compute_limit_violations. "
+         "NaN = not configured for that element (matches lightsim2grid's "
+         "convention). Required before run() when compute_limit_violations is "
+         "True. n_lines splits the lines-then-trafos branch ordering for "
+         "LimitViolation element_type/element_id de-concatenation.")
+    .def_readwrite("violation_tol", &ScenarioSweepSession::violation_tol_,
+                   "Residual tolerance for the fused kernel's DIVERGED check "
+                   "(independent of tol_base). Takes effect on the next run().")
+    .def_readwrite("violation_capacity", &ScenarioSweepSession::violation_capacity_,
+                   "Max violation records kept per scenario (K). Bounds the "
+                   "compact output at n_scenarios * K regardless of grid "
+                   "size. Takes effect on the next run(); default 16.")
+    .def("get_violation_element_type", &ScenarioSweepSession::get_violation_element_type,
+         "(n_scenarios * violation_capacity,) int: 0=BUS,1=LINE,2=TRAFO per slot.")
+    .def("get_violation_element_id",   &ScenarioSweepSession::get_violation_element_id,
+         "(n_scenarios * violation_capacity,) int: grid-model bus id for BUS "
+         "(solver numbering); local (own-type, 0-based) id for LINE/TRAFO; -1 for DIVERGED.")
+    .def("get_violation_side",         &ScenarioSweepSession::get_violation_side,
+         "(n_scenarios * violation_capacity,) int: 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO.")
+    .def("get_violation_type",         &ScenarioSweepSession::get_violation_type,
+         "(n_scenarios * violation_capacity,) int: "
+         "0=LOW_VOLTAGE,1=HIGH_VOLTAGE,2=CURRENT,3=DIVERGED per slot.")
+    .def("get_violation_value",        &ScenarioSweepSession::get_violation_value,
+         "(n_scenarios * violation_capacity,) float: value reached "
+         "(kV for voltage, kA for current, residual for DIVERGED).")
+    .def("get_violation_limit",        &ScenarioSweepSession::get_violation_limit,
+         "(n_scenarios * violation_capacity,) float: limit that was "
+         "violated (kV, kA, or tol for DIVERGED).")
+    .def("get_violation_count",        &ScenarioSweepSession::get_violation_count,
+         "(n_scenarios,) int: -1 = not simulated (disconnected/masked-skip), "
+         "else number of valid slots in [0, violation_capacity].")
+    .def("get_violation_truncated",    &ScenarioSweepSession::get_violation_truncated,
+         "(n_scenarios,) int (0/1): 1 if more than violation_capacity "
+         "violations were found for that scenario (clamped).")
+    .def("get_violation_count_low_voltage", &ScenarioSweepSession::get_violation_count_low_voltage,
+         "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
+         "count of LOW_VOLTAGE violations (independent of violation_capacity, "
+         "unlike get_violation_count()).")
+    .def("get_violation_count_high_voltage", &ScenarioSweepSession::get_violation_count_high_voltage,
+         "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
+         "count of HIGH_VOLTAGE violations.")
+    .def("get_violation_count_current", &ScenarioSweepSession::get_violation_count_current,
+         "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
+         "count of CURRENT violations (both sides combined).")
+    // -------------------------------------------------------------------
+    // Zero-copy DLPack exporters.
+    // -------------------------------------------------------------------
+    .def("v_base_dlpack",    &export_v_base_dlpack_ss,
+         "Export base-case voltages as DLPack capsule, shape [n_bus].\n"
+         "Syncs the base-case stream before returning.")
+    .def("v_results_dlpack", &export_v_results_dlpack_ss,
+         "Export batch voltages as DLPack capsule, shape [n_scenarios, n_bus].\n"
+         "Requires run() to have been called.  Syncs the solver stream.");
+
     // -----------------------------------------------------------------
     // Zero-copy construction from a solved lightsim2grid LSGrid
     // (only when gpusim2grid was built against lightsim2grid_core)
@@ -1187,13 +1466,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
-           double max_dVa_override, double max_dVm_override) {
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ca_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, compute_limit_violations,
                 reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
-                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
         },
         pybind11::arg("grid"),
         pybind11::arg("init_from_n_powerflow")   = true,
@@ -1210,6 +1491,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
         "Build a ContingencyAnalysisSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy: Ybus/Sbus/V/pv/pq/slack + branch admittances are "
         "read off the C++ object). Branch data is set automatically. Solves the "
@@ -1232,7 +1514,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "scenario batch loop that run() drives always iterates regardless, so "
         "this is meaningful there either way. Each batch slot gets its own "
         "alpha from its own max|dtheta|/max|dvm|, not one alpha shared across "
-        "the whole chunk.");
+        "the whole chunk.\n"
+        "use_distributed_slack (default True): see _make_is_session_from_lsgrid.");
 
     m.def("_extract_limits_from_lsgrid",
         [](pybind11::object grid_py, int n_bus_solver) {
@@ -1253,13 +1536,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
-           double max_dVa_override, double max_dVm_override) {
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_is_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, with_branch_data,
                 reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
-                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
         },
         pybind11::arg("grid"),
         pybind11::arg("init_from_n_powerflow") = true,
@@ -1276,6 +1561,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
         "Build an InjectionSweepSession directly from a solved lightsim2grid "
         "LSGrid (zero-copy). Branch data is set automatically when requested. "
         "Solves the same augmented system lightsim2grid poses (distributed slack / "
@@ -1294,7 +1580,73 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "get_ac_algo_config()). Applied to BOTH the base-case solve and the "
         "batch solver used by run() -- each scenario gets its own alpha from "
         "its own max|dtheta|/max|dvm|, not one alpha shared across the whole "
-        "chunk.");
+        "chunk.\n"
+        "use_distributed_slack (default True): with False, the MultiSlack "
+        "row/column of the augmented Jacobian is dropped and the classic bare "
+        "[pvpq | pq] system is solved instead (dim_J shrinks by the participant "
+        "count). Every OTHER in-Jacobian control -- HVDC angle-droop, SVC / "
+        "remote generator voltage control -- is preserved either way. With a "
+        "single (non-distributed) slack this is an exact reformulation; with "
+        "several participants the mismatch stops being shared per slack_weights, "
+        "which is a genuine model change, and combining it with "
+        "init_from_n_powerflow=True then legitimately fails the residual check "
+        "since the grid's own V solves the other system.");
+
+    m.def("_make_ss_session_from_lsgrid",
+        [](pybind11::object grid_py, bool init_from_n_powerflow,
+           int batch_size, int nb_iter, int max_iter_base, double tol_base,
+           int device, bool compute_limit_violations,
+           ReorderingAlg reordering_alg, MatchingAlg matching_alg,
+           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           int scaling_max_voltage_change_override,
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_ss_session_from_lsgrid(
+                grid, init_from_n_powerflow, batch_size, nb_iter,
+                max_iter_base, tol_base, device, compute_limit_violations,
+                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("init_from_n_powerflow") = true,
+        pybind11::arg("batch_size")            = 100,
+        pybind11::arg("nb_iter")               = 4,
+        pybind11::arg("max_iter_base")         = 10,
+        pybind11::arg("tol_base")              = 1e-6,
+        pybind11::arg("device")                = -1,
+        pybind11::arg("compute_limit_violations") = false,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
+        pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("debug_base_case") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
+        "Build a ScenarioSweepSession directly from a solved lightsim2grid "
+        "LSGrid (zero-copy). Branch data is always set (set_topology() needs "
+        "it). Solves the same augmented system lightsim2grid poses "
+        "(distributed slack / HVDC droop / SVC / remote voltage control) via "
+        "the NRLedger read off the grid. When compute_limit_violations is True, "
+        "also pulls bus/branch limits off the grid and enables the session's "
+        "fused on-device violation check. reordering_alg/matching_alg/"
+        "pivot_epsilon_alg: cuDSS config, applied at construction to BOTH the "
+        "base-case solve AND the batch solver used by run() (single source of "
+        "truth). debug_base_case (default False): opt-in diagnostic -- see "
+        "AcPfNrState's own doc. When init_from_n_powerflow=True, the grid's "
+        "own solved state is verified via LSGrid::check_solution() before "
+        "being trusted (raises RuntimeError if it fails).\n"
+        "scaling_max_voltage_change_override / max_dVa_override / "
+        "max_dVm_override: NR step-scaling, same sentinel convention as "
+        "_make_acpf_session_from_lsgrid (-1/negative = inherit the grid's own "
+        "get_ac_algo_config()). Each scenario gets its own alpha from its own "
+        "max|dtheta|/max|dvm|, not one alpha shared across the whole chunk.\n"
+        "use_distributed_slack (default True): see _make_is_session_from_lsgrid.\n"
+        "handle_disconnected_grid is a mutable property on the returned "
+        "session (set it after construction), mirroring "
+        "ContingencyAnalysisSession.");
 
     m.def("_make_acpf_session_from_lsgrid",
         [](pybind11::object grid_py, int max_iter, double tol, int device,
@@ -1302,13 +1654,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
            PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
            int scaling_max_voltage_change_override,
-           double max_dVa_override, double max_dVm_override) {
+           double max_dVa_override, double max_dVm_override,
+           bool use_distributed_slack) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid(
                 grid, max_iter, tol, device, init_from_n_powerflow,
                 diag_stop_before_state_correction, reordering_alg, matching_alg,
                 pivot_epsilon_alg, debug_base_case,
-                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
+                scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
+                use_distributed_slack);
         },
         pybind11::arg("grid"),
         pybind11::arg("max_iter") = 10,
@@ -1323,6 +1677,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("use_distributed_slack") = true,
         "Build a single-system AcPfNrSession from a solved lightsim2grid LSGrid, "
         "solving the same augmented system (distributed slack / extensions) via "
         "the NRLedger read off the C++ object. With init_from_n_powerflow=True "
@@ -1355,7 +1710,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "init_from_n_powerflow=False (the GPU actually iterates); without it, an "
         "undamped GPU Newton step can converge onto a different (sometimes "
         "spurious) root than lightsim2grid's own damped trajectory when seeded "
-        "far from the solution (e.g. a flat/DC start).");
+        "far from the solution (e.g. a flat/DC start).\n"
+        "use_distributed_slack (default True): see _make_is_session_from_lsgrid.");
 
     m.def("_make_acpf_session_from_lsgrid_with_sbus",
         [](pybind11::object grid_py, Eigen::Ref<const CplxVect> Sbus,
@@ -1406,6 +1762,23 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "choice for the ANALYSIS phase. "
         "For validating cuDSS on an arbitrary dumped (J, F) pair (e.g. from "
         "AcPfNrSession::get_J()/get_F()), see repro_cudss_bug_standalone.py.");
+
+    m.def("warmup", &warmup,
+        pybind11::arg("device") = -1,
+        "Pay CUDA/cuSPARSE/cuDSS one-time initialization up front and return "
+        "the wall-clock milliseconds it took.\n\n"
+        "The first AcPfGPU / ContingencyAnalysisGPU / InjectionSweepGPU built "
+        "in a process absorbs CUDA-context creation plus the cuSPARSE/cuDSS "
+        "dlopen + PTX-JIT -- tens of ms that scale with nothing and never "
+        "recur. That cost is reported separately as t_context_init_ms, but it "
+        "still sits inside whatever stopwatch wraps construction, and in a "
+        "benchmark loop over several grids it is charged entirely to whichever "
+        "grid runs first. Call this once before the loop and every session "
+        "afterwards reports (and takes) only its own work.\n\n"
+        "Runs a trivial 2x2 cuSPARSE SpMV and cuDSS analyze/factorize/solve, "
+        "single-system and uniform-batch, then throws the results away. "
+        "device: CUDA device ordinal, or -1 for the current device. "
+        "Idempotent.");
 
     // -----------------------------------------------------------------
     // Compilation options — queryable at runtime

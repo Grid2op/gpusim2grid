@@ -30,6 +30,7 @@
 #ifndef CUDSS_BATCH_SOLVER_CUH
 #define CUDSS_BATCH_SOLVER_CUH
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 
@@ -54,6 +55,10 @@ struct CudssBatchSolver {
     CudssDescriptor dss_A_;
     CudssDescriptor dss_x_;
     CudssDescriptor dss_b_;
+
+    // Wall-clock ms of the handle/config/data creation inside initialize();
+    // see context_init_ms() below.
+    double t_context_init_ms_ = 0.;
 
     // =========================================================================
     // initialize()
@@ -97,10 +102,19 @@ struct CudssBatchSolver {
                     + ": cuDSS status=" + std::to_string(static_cast<int>(s)));
         };
 
+        // Context creation is timed separately from ANALYSIS below: on a
+        // process' first cuDSS call it dlopens + JITs the backend (tens of ms,
+        // independent of problem size), which would otherwise inflate what
+        // callers read as symbolic-analysis cost. See context_init_ms().
+        auto t_ctx_start = std::chrono::steady_clock::now();
+
         chk(cudssCreate(&dss_.handle),                "cudssCreate");
         chk(cudssSetStream(dss_.handle, cs),          "cudssSetStream");
         chk(cudssConfigCreate(&dss_.config),          "cudssConfigCreate");
         chk(cudssDataCreate(dss_.handle, &dss_.data), "cudssDataCreate");
+
+        t_context_init_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_ctx_start).count();
 
         dss_A_.create_csr(dim_J, nnz_J, d_J_outer, d_J_inner, d_J_values_batch);
         dss_x_.create_dn(dim_J, d_dx_batch);
@@ -134,6 +148,12 @@ struct CudssBatchSolver {
     //
     // All three are async on the stream bound at initialize() time.
     // =========================================================================
+    // Wall-clock ms spent creating the cuDSS handle/config/data in
+    // initialize() — pure library/context setup, no ANALYSIS. Dominated by
+    // first-touch dlopen + JIT on the first cuDSS use in the process, ~0
+    // afterwards.
+    double context_init_ms() const { return t_context_init_ms_; }
+
     void factor()   { dss_.factorize  (dss_A_, dss_x_, dss_b_); }
     void refactor() { dss_.refactorize(dss_A_, dss_x_, dss_b_); }
     void solve()    { dss_.solve      (dss_A_, dss_x_, dss_b_); }
