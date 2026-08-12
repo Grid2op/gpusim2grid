@@ -401,6 +401,15 @@ class _InjectionSweepSolver:
         q = np.ascontiguousarray(q_mvar, dtype=np.float64)
         self._s.set_injections(p, q, float(sn_mva))
 
+    def set_gen_v(self, vm_pu):
+        """Store the (n_scenarios, n_bus) generator vm_pu reseed array.
+
+        NaN = no override for that (scenario, bus). Unlike ``set_injections``,
+        does NOT feed Sbus. Optional; row count must match ``set_injections``.
+        """
+        v = np.ascontiguousarray(vm_pu, dtype=np.float64)
+        self._s.set_gen_v(v)
+
     def run(self):
         """Run all scenarios; fills V_results and residuals on device."""
         self._s.run()

@@ -21,6 +21,7 @@ from .._ls2g_utils import (
     extract_branch_data,
     extract_injection_elements,
     build_bus_injections,
+    build_gen_v,
     grid_from_pandapower,
     _validate_precision,
 )
@@ -321,6 +322,29 @@ class InjectionSweepGPU:
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+
+    def set_gen_v(self, gen_v):
+        """Per-scenario generator target voltage magnitude (vm_pu), (n_scenarios, n_gen).
+
+        Mirrors lightsim2grid's ScenarioSweep/TimeSerie ``modify_gen_v``.
+        Unlike :meth:`set_injections_from_elements`, this does NOT feed
+        Sbus — it only re-seeds ``|V|`` at each voltage-regulating
+        generator's regulated bus before that scenario's solve. A generator
+        that never regulates voltage, or is disconnected, has its column
+        ignored. Requires a lightsim2grid grid (bridge mode) — raises
+        ``RuntimeError`` in explicit-array (tuple) mode.
+
+        Parameters
+        ----------
+        gen_v : (n_steps, n_gens) — target vm_pu per generator. Row count
+            must match :meth:`set_injections`/:meth:`set_injections_from_elements`.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_gen_v() needs a lightsim2grid grid; explicit-array "
+                "(tuple) mode has no generators to read.")
+        dense = build_gen_v(self._elements, gen_v)
+        self._inner.set_gen_v(dense)
 
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.

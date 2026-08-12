@@ -248,6 +248,65 @@ class TestRowAlignedZip:
         )
         assert np.abs(res_a_permuted - res_b[finite_b]).max() < 1e-5
 
+    def test_permuting_rows_permutes_results_with_gen_v(self, ieee14_grid,
+                                                          ieee14_base_case):
+        """Same property as above, with a per-row gen_v (|V| reseed at the
+        PV buses) added on top of injections + topology."""
+        d = ieee14_base_case
+        branch_data, n_lines, n_trafos = branch_data_arrays(ieee14_grid)
+        n_bus = d["n_bus"]
+        pv = d["pv"]
+        assert pv.size > 0, "IEEE-14 should have PV buses"
+
+        scales = [1.0, 0.9, 1.0, 1.1, 0.95]
+        branch_ids_per_row = [[], [0], [], [1], [0, 1]]
+        n_scen = len(scales)
+        p_mw, q_mvar, sn_mva = _scaled_injections(ieee14_base_case, scales)
+
+        # A distinct target vm_pu per row at each PV bus, well within a
+        # normal operating range.
+        targets = np.array([1.00, 1.01, 1.02, 0.99, 0.98])
+        gen_v = np.full((n_scen, n_bus), np.nan, dtype=np.float64)
+        gen_v[:, pv] = targets[:, None]
+
+        solver_a = _make_solver(ieee14_base_case, branch_data, batch_size=n_scen)
+        solver_a.set_injections(p_mw, q_mvar, sn_mva)
+        solver_a.set_topology(branch_ids_per_row)
+        solver_a.set_gen_v(gen_v)
+        solver_a.run()
+        V_a = solver_a.V_results.to_numpy().reshape(n_scen, n_bus)
+        res_a = solver_a.residuals.to_numpy()
+
+        perm = [3, 0, 4, 1, 2]
+        p_perm = p_mw[perm]
+        q_perm = q_mvar[perm]
+        topo_perm = [branch_ids_per_row[i] for i in perm]
+        gen_v_perm = gen_v[perm]
+
+        solver_b = _make_solver(ieee14_base_case, branch_data, batch_size=n_scen)
+        solver_b.set_injections(p_perm, q_perm, sn_mva)
+        solver_b.set_topology(topo_perm)
+        solver_b.set_gen_v(gen_v_perm)
+        solver_b.run()
+        V_b = solver_b.V_results.to_numpy().reshape(n_scen, n_bus)
+        res_b = solver_b.residuals.to_numpy()
+
+        finite_a_permuted = np.isfinite(res_a)[perm]
+        finite_b = np.isfinite(res_b)
+        assert np.array_equal(finite_a_permuted, finite_b)
+        assert finite_b.any()
+
+        V_a_permuted = V_a[perm][finite_b]
+        res_a_permuted = res_a[perm][finite_b]
+        assert np.abs(V_a_permuted - V_b[finite_b]).max() < 1e-5
+        assert np.abs(res_a_permuted - res_b[finite_b]).max() < 1e-5
+
+        # Sanity: |V| at each PV bus actually landed on its row's target.
+        for s in range(n_scen):
+            if not np.isfinite(res_a[s]):
+                continue
+            assert np.abs(np.abs(V_a[s, pv]) - targets[s]).max() < 1e-4
+
 
 class TestIslandedRowHandling:
     def test_islanded_row_is_nan_others_unaffected(self, ieee14_grid, ieee14_base_case):

@@ -72,6 +72,34 @@ __global__ void apply_contingencies_kernel(
     int n_updates);
 
 // ---------------------------------------------------------------------------
+// apply_gen_v_kernel
+//
+// Re-seeds |V| in-place at every (row, bus) pair carrying a per-scenario
+// generator voltage-magnitude target — the InjectionSweep/ScenarioSweep
+// equivalent of lightsim2grid's modify_gen_v (GeneratorContainer::set_vm):
+// rescale V at that bus so |V| == target, preserving the angle. Does NOT
+// touch Sbus. Called once per chunk, right after V has been tiled from the
+// converged base case and before the NR loop starts — the reseeded value
+// then behaves exactly like an ordinary PV bus's fixed |V| for the rest of
+// the iteration (never revisited by update_Vm_kernel).
+//
+// d_gen_v uses NaN as the "no override for this (row, bus)" sentinel — most
+// entries are NaN, since only voltage-regulating generators' regulated
+// buses ever carry a target.
+//
+// Parameters
+// ----------
+// d_V         : [batch_size * n_bus] — in/out voltages (this chunk's slice)
+// d_gen_v     : [actual_batch * n_bus] — per-row target vm_pu, NaN = skip
+// n_bus, actual_batch : dimensions
+// ---------------------------------------------------------------------------
+__global__ void apply_gen_v_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_gen_v,
+    int n_bus,
+    int actual_batch);
+
+// ---------------------------------------------------------------------------
 // fill_FP_kernel
 //
 // Stores −ΔP at the ledger P-equation row of each P bus.

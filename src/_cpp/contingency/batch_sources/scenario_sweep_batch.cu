@@ -8,6 +8,7 @@
 
 #include "scenario_sweep_batch.cuh"
 #include "../batch_pf_driver.cuh"   // BatchPfDriverContext (complete type)
+#include "../../acpf_nr_kernels.cuh"   // apply_gen_v_kernel
 
 #include <stdexcept>
 #include <string>
@@ -69,14 +70,23 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     }
     upload_h2d(d_Sbus_all, h_Sbus_all_.data(), h_Sbus_all_.size(), cs);
     d_Sbus_batch.resize(static_cast<size_t>(ctx.batch_size) * ctx.n_bus);
+
+    if (has_gen_v_) {
+        if (static_cast<int>(h_gen_v_all_.size()) != n_active() * ctx.n_bus) {
+            throw std::runtime_error(
+                "[scenario_sweep_batch] h_gen_v_all_ size does not match n_active * n_bus");
+        }
+        upload_h2d(d_gen_v_all, h_gen_v_all_.data(), h_gen_v_all_.size(), cs);
+    }
 }
 
 // =============================================================================
-// prepare_Ybus_batch — verbatim ContingencyBatch::prepare_Ybus_batch.
+// prepare_Ybus_batch — tile V + gen_v reseed (InjectionBatch-style, new),
+// then verbatim ContingencyBatch::prepare_Ybus_batch (tile Ybus + patches).
 // =============================================================================
 void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
                                             int                  chunk_idx,
-                                            int                  /*actual_batch*/,
+                                            int                  actual_batch,
                                             cudaStream_t         cs,
                                             CudaTimer&           timer,
                                             BatchTimings&  t)
@@ -94,6 +104,16 @@ void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
                 src, nbytes, cudaMemcpyDeviceToDevice, cs),
                 "tile V");
         }
+    }
+    // Re-seed |V| from this chunk's gen_v row-slice (active-slot order, same
+    // c_start convention as prepare_Sbus_batch below). No-op when set_gen_v()
+    // was never called.
+    if (has_gen_v_ && actual_batch > 0) {
+        const cuda_real_type* const src =
+            thrust::raw_pointer_cast(d_gen_v_all.data())
+            + static_cast<ptrdiff_t>(chunk_idx) * ctx.batch_size * ctx.n_bus;
+        apply_gen_v_kernel<<<nr_grid_size((long long)actual_batch * ctx.n_bus, BS), BS, 0, cs>>>(
+            ctx.d_V_batch, src, ctx.n_bus, actual_batch);
     }
     t.t_tile_V += timer.stop_ms();
 

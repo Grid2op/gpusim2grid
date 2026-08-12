@@ -8,6 +8,8 @@
 
 #include "acpf_nr_kernels.cuh"
 
+#include <math.h>   // isnan
+
 static constexpr int BS = 256;   // block size for all kernels in this file
 
 // Portable real atomic add (the device default arch may predate hardware double
@@ -259,6 +261,38 @@ __global__ void apply_contingencies_kernel(
     entry = CudaFunHelper::my_cuCsub(
         entry,
         CudaFunHelper::my_make_cuComplex(delta_re[i], delta_im[i]));
+}
+
+// =============================================================================
+// apply_gen_v_kernel
+// =============================================================================
+__global__ void apply_gen_v_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_gen_v,
+    int n_bus,
+    int actual_batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_bus;
+    const int       bus = static_cast<int>(tid % n_bus);
+    if (b >= actual_batch) return;
+
+    const cuda_real_type target = d_gen_v[b * n_bus + bus];
+    if (isnan(target)) return;   // no override for this (row, bus)
+
+    const cudaComplexType V = d_V[b * n_bus + bus];
+    cuda_real_type vm = CudaFunHelper::my_cuCabs(V);
+    cuda_real_type re = CudaFunHelper::my_cuCreal(V);
+    cuda_real_type im = CudaFunHelper::my_cuCimag(V);
+    if (vm < static_cast<cuda_real_type>(1e-8)) {
+        // Degenerate |V| ~ 0: mirror GeneratorContainer::_set_vm_impl's
+        // zero-guard -- fall back to angle 0 before rescaling.
+        re = static_cast<cuda_real_type>(1.);
+        im = static_cast<cuda_real_type>(0.);
+        vm = static_cast<cuda_real_type>(1.);
+    }
+    const cuda_real_type scale = target / vm;
+    d_V[b * n_bus + bus] = CudaFunHelper::my_make_cuComplex(re * scale, im * scale);
 }
 
 // =============================================================================

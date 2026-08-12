@@ -138,6 +138,17 @@ struct ScenarioSweepSession {
     bool   has_injections_ = false;
 
     // =========================================================================
+    // Host gen_v data (set_gen_v()) — (n_scenarios × n_bus) row-major, target
+    // vm_pu, NaN = "no override for this (scenario, bus)". Unlike p_mw_/
+    // q_mvar_ this does NOT feed Sbus -- it only re-seeds |V| at the given
+    // buses before each scenario's solve, row-aligned with set_injections()/
+    // set_topology(). Optional: has_gen_v_ == false means set_gen_v() was
+    // never called.
+    // =========================================================================
+    Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> gen_v_;
+    bool   has_gen_v_      = false;
+
+    // =========================================================================
     // Host topology data (set_topology()) — one Contingency (and tripped-
     // branch list, for compute_flows' zero-flow step) per scenario, row-
     // aligned with p_mw_/q_mvar_. has_topology_ == false means "run()
@@ -211,6 +222,17 @@ struct ScenarioSweepSession {
         Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> p_mw,
         Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> q_mvar,
         double sn_mva
+    );
+
+    // =========================================================================
+    // set_gen_v — store the (n_scenarios × n_bus) target vm_pu array (NaN =
+    // no override), mirroring lightsim2grid's modify_gen_v. Does NOT feed
+    // Sbus. Optional; row-aligned with set_injections()/set_topology(). If
+    // set_injections() was already called, n_scenarios must match it
+    // (checked again at run() in case set_injections() changes afterward).
+    // =========================================================================
+    void set_gen_v(
+        Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> vm_pu
     );
 
     // =========================================================================

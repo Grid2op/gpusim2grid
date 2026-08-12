@@ -164,6 +164,29 @@ void ScenarioSweepSession::set_injections(
 }
 
 // =============================================================================
+// set_gen_v
+// =============================================================================
+void ScenarioSweepSession::set_gen_v(
+    Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> vm_pu)
+{
+    const int n_bus = base_state_->n_bus;
+
+    if (vm_pu.cols() != n_bus)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_gen_v: second dim must equal n_bus");
+    if (vm_pu.rows() <= 0)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_gen_v: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(vm_pu.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_gen_v: row count must match "
+            "set_injections()'s n_scenarios");
+
+    gen_v_     = vm_pu;
+    has_gen_v_ = true;
+}
+
+// =============================================================================
 // set_topology
 // =============================================================================
 void ScenarioSweepSession::set_topology(
@@ -241,6 +264,12 @@ void ScenarioSweepSession::run()
             "matches set_injections()'s n_scenarios — call set_topology() "
             "again after changing set_injections()");
 
+    if (has_gen_v_ && static_cast<int>(gen_v_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_gen_v()'s row count no longer matches "
+            "set_injections()'s n_scenarios -- call set_gen_v() again after "
+            "changing set_injections()");
+
     if (handle_disconnected_grid_ &&
         strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
         throw std::runtime_error(
@@ -281,6 +310,18 @@ void ScenarioSweepSession::run()
     }
     t_sbus_build_ms_ = ms_since(t_sbus_start);
 
+    // Build host-side per-unit real gen_v_all, ORIGINAL (pre-compaction) row
+    // order -- ScenarioSweepBatch permutes into active-slot order internally,
+    // same as h_Sbus_all above. Empty when set_gen_v() was never called.
+    std::vector<cuda_real_type> h_gen_v_all;
+    if (has_gen_v_) {
+        h_gen_v_all.resize(static_cast<size_t>(n_scenarios_) * static_cast<size_t>(n_bus));
+        for (int s = 0; s < n_scenarios_; ++s)
+            for (int b = 0; b < n_bus; ++b)
+                h_gen_v_all[static_cast<size_t>(s) * n_bus + b] =
+                    static_cast<cuda_real_type>(gen_v_(s, b));
+    }
+
     // Host preprocessing (resolve_indices + connectivity/masking +
     // build_flat_patches + Sbus active-order permute), mutates contingencies_
     // in-place so disconnected flags are observable below.
@@ -291,7 +332,8 @@ void ScenarioSweepSession::run()
         Ybus_rm_,
         std::move(h_Sbus_all),
         batch_size_,
-        handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
+        handle_disconnected_grid_ ? &mask_cfg_ : nullptr,
+        std::move(h_gen_v_all));
     used_batch_size_ = source.used_batch_size();
 
     // (Re-)construct the solver — allows run() to be called multiple times.

@@ -29,11 +29,19 @@
 //     active-slot order at construction (h_Sbus_all_[slot] = original row
 //     active_to_orig_[slot]) — prepare_Sbus_batch's row-slice copy is then
 //     verbatim InjectionBatch code, needing no extra indirection.
+//   - gen_v side: identical to InjectionBatch's dense per-scenario (n_scenario
+//     × n_bus) real gen_v reseed targets (NaN = no override), same active-slot
+//     permutation treatment as Sbus above (set_gen_v() is optional; empty
+//     h_gen_v_all_orig means has_gen_v_ == false and the permutation is
+//     skipped entirely).
 //
 // Per-chunk behaviour
 // -------------------
-//   prepare_Ybus_batch : tile V + tile Ybus + apply_contingencies_kernel for
-//                         this chunk's patch slice (verbatim ContingencyBatch).
+//   prepare_Ybus_batch : tile V + re-seed |V| from this chunk's gen_v
+//                         row-slice (verbatim InjectionBatch, no-op when
+//                         has_gen_v_ is false) + tile Ybus +
+//                         apply_contingencies_kernel for this chunk's patch
+//                         slice (verbatim ContingencyBatch).
 //   prepare_Sbus_batch : row-slice copy of d_Sbus_all + phantom-pad with
 //                         base.d_Sbus for any unfilled tail slots (verbatim
 //                         InjectionBatch).
@@ -134,6 +142,16 @@ struct ScenarioSweepBatch {
     thrust::device_vector<cudaComplexType> d_Sbus_all;     // n_active × n_bus
     thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus
 
+    // -------------------------------------------------------------------------
+    // Host-side per-scenario gen_v reseed targets (set_gen_v()), ALREADY
+    // PERMUTED into active-slot order at construction like h_Sbus_all_ above.
+    // Empty / has_gen_v_ == false means set_gen_v() was never called — no
+    // permutation work, no upload, no kernel launch (zero overhead).
+    // -------------------------------------------------------------------------
+    std::vector<cuda_real_type>            h_gen_v_all_;
+    bool                                    has_gen_v_ = false;
+    thrust::device_vector<cuda_real_type>  d_gen_v_all;    // n_active × n_bus
+
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
 
@@ -156,6 +174,11 @@ struct ScenarioSweepBatch {
     //   mask_cfg        : handle_disconnected_grid mode when non-null (see
     //                     class doc); nullptr selects the legacy
     //                     check_connectivity skip-if-split path.
+    //   h_gen_v_all_orig: (n_scenarios × n_bus) real gen_v reseed targets
+    //                     (NaN = no override), ORIGINAL row order, row-aligned
+    //                     with `contingencies` -- same convention as
+    //                     h_Sbus_all_orig. Empty (default) means set_gen_v()
+    //                     was never called; skips permutation/upload entirely.
     // -------------------------------------------------------------------------
     ScenarioSweepBatch(std::vector<Contingency>& contingencies,
                        const int*                Ybus_rm_outer,
@@ -163,7 +186,8 @@ struct ScenarioSweepBatch {
                        const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                        std::vector<cudaComplexType>&& h_Sbus_all_orig,
                        int                       max_batch_size,
-                       const MaskConfig*         mask_cfg = nullptr)
+                       const MaskConfig*         mask_cfg = nullptr,
+                       std::vector<cuda_real_type>&& h_gen_v_all_orig = {})
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
@@ -211,6 +235,19 @@ struct ScenarioSweepBatch {
                 h_Sbus_all_.begin() + static_cast<ptrdiff_t>(slot) * n_bus);
         }
 
+        // Same permutation for gen_v, when set_gen_v() was called.
+        has_gen_v_ = !h_gen_v_all_orig.empty();
+        if (has_gen_v_) {
+            h_gen_v_all_.resize(static_cast<size_t>(active_to_orig_.size()) * n_bus);
+            for (size_t slot = 0; slot < active_to_orig_.size(); ++slot) {
+                const int orig = active_to_orig_[slot];
+                std::copy(
+                    h_gen_v_all_orig.begin() + static_cast<ptrdiff_t>(orig) * n_bus,
+                    h_gen_v_all_orig.begin() + static_cast<ptrdiff_t>(orig + 1) * n_bus,
+                    h_gen_v_all_.begin() + static_cast<ptrdiff_t>(slot) * n_bus);
+            }
+        }
+
         t_preprocess_ms = ssb_ms_since(t_start);
     }
 
@@ -223,7 +260,8 @@ struct ScenarioSweepBatch {
 
     // -------------------------------------------------------------------------
     // initialize — upload flat Ybus-patch arrays AND the (already active-
-    // permuted) Sbus rows; allocate the per-chunk Sbus buffer. Unlike
+    // permuted) Sbus rows; allocate the per-chunk Sbus buffer. Also uploads
+    // the (already active-permuted) gen_v rows, if has_gen_v_. Unlike
     // InjectionBatch, Ybus is NOT tiled once here — it varies per scenario, so
     // it is re-tiled + patched every chunk in prepare_Ybus_batch (like
     // ContingencyBatch).
@@ -287,8 +325,10 @@ struct ScenarioSweepBatch {
     }
 
     // -------------------------------------------------------------------------
-    // prepare_Ybus_batch — tile V + tile Ybus + apply this chunk's patches.
-    // Verbatim ContingencyBatch::prepare_Ybus_batch.
+    // prepare_Ybus_batch — tile V, re-seed |V| from this chunk's gen_v
+    // row-slice (no-op when has_gen_v_ is false), tile Ybus, apply this
+    // chunk's patches. The gen_v step is new here (InjectionBatch-style);
+    // the rest is verbatim ContingencyBatch::prepare_Ybus_batch.
     // -------------------------------------------------------------------------
     void prepare_Ybus_batch(BatchPfDriverContext& ctx,
                             int                  chunk_idx,

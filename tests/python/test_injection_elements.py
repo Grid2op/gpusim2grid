@@ -24,6 +24,7 @@ from conftest import requires_gpu
 from gpusim2grid import InjectionSweepGPU
 from gpusim2grid._ls2g_utils import (
     build_bus_injections,
+    build_gen_v,
     extract_injection_elements,
 )
 
@@ -290,3 +291,109 @@ def test_tuple_grid_mode_rejects_element_injections(ieee14_base_case):
         _ = sweep.n_loads
     with pytest.raises(RuntimeError, match="no generators"):
         _ = sweep.n_gens
+
+
+# ---------------------------------------------------------------------------
+# 6. set_gen_v -- per-scenario generator voltage-magnitude reseed
+# ---------------------------------------------------------------------------
+
+def test_gen_v_matches_lightsim2grid(solver_atol):
+    """Re-seeding one regulating generator's vm_pu must match a CPU re-solve
+    with that generator's own target_vm_pu changed via change_v_gen()."""
+    grid = _fresh_grid()
+    n_bus = grid.get_Ybus_solver().shape[0]
+    load_p, load_q, gen_p = _base_injections(grid)
+
+    gens = grid.get_generators()
+    reg_ids = [i for i, g in enumerate(gens)
+              if g.voltage_regulator_on and g.connected]
+    assert reg_ids, "IEEE-14 should have a voltage-regulating generator"
+    gid = reg_ids[0]
+    new_vm = float(gens[gid].target_vm_pu) + 0.03
+
+    # Row 0 = base case (no gen_v override), row 1 = the perturbation.
+    load_p_s = np.stack([load_p, load_p])
+    load_q_s = np.stack([load_q, load_q])
+    gen_p_s = np.stack([gen_p, gen_p])
+    gen_v = np.tile(np.array([g.target_vm_pu for g in gens]), (2, 1))
+    gen_v[1, gid] = new_vm
+
+    sweep = InjectionSweepGPU(grid, nb_iter=_NB_ITER)
+    sweep.set_injections_from_elements(load_p_s, load_q_s, gen_p_s)
+    sweep.set_gen_v(gen_v)
+    sweep.compute(batch_size=2)
+    v_gpu = sweep.V_results.to_numpy().reshape(2, n_bus).copy()
+    assert (sweep.last_residuals() < 1e-6).all()
+
+    ref_grid = _fresh_grid()
+    ref_grid.change_v_gen(gid, new_vm)
+    v_ref = _to_solver_numbering(ref_grid, _solve(ref_grid))
+
+    assert np.abs(v_gpu[1] - v_ref[:n_bus]).max() <= solver_atol
+    # Row 0 (no override) must still reproduce the untouched base case.
+    assert np.abs(v_gpu[0] - np.asarray(grid.get_V_solver())).max() <= solver_atol
+
+
+def test_gen_v_disconnected_generator_column_ignored():
+    """A deactivated generator's gen_v column is ignored, whatever it holds."""
+    grid = _fresh_grid()
+    gens = grid.get_generators()
+    reg_ids = [i for i, g in enumerate(gens)
+              if g.voltage_regulator_on and g.connected and not g.is_slack]
+    assert reg_ids, "need a spare non-slack regulating generator to deactivate"
+    gid = reg_ids[-1]
+    grid.deactivate_gen(gid)
+    _solve(grid)
+
+    n_bus = grid.get_Ybus_solver().shape[0]
+    elements = extract_injection_elements(grid, n_bus)
+    assert gid not in elements.gen_regulating_sel.tolist()
+
+    base_gen_v = np.array([g.target_vm_pu for g in grid.get_generators()])
+    a = build_gen_v(elements, base_gen_v[None, :])
+
+    garbage = base_gen_v.copy()
+    garbage[gid] = 5.0   # absurd target -- must have zero effect once deactivated
+    b = build_gen_v(elements, garbage[None, :])
+
+    assert np.array_equal(np.isnan(a), np.isnan(b))
+    assert np.array_equal(a[~np.isnan(a)], b[~np.isnan(b)])
+
+
+def test_gen_v_shape_validation(ieee14_grid, ieee14_base_case):
+    grid = ieee14_grid
+    elements = extract_injection_elements(grid, ieee14_base_case["n_bus"])
+    gen_v = np.array([g.target_vm_pu for g in grid.get_generators()])
+
+    with pytest.raises(ValueError, match="must be 2-D"):
+        build_gen_v(elements, gen_v)
+
+    with pytest.raises(ValueError, match="columns while the grid counts"):
+        build_gen_v(elements, gen_v[None, :-1])
+
+    with pytest.raises(ValueError, match="at least one row"):
+        build_gen_v(elements, gen_v[None, :][:0])
+
+
+def test_gen_v_row_count_must_match_injections(ieee14_grid):
+    grid = ieee14_grid
+    sweep = InjectionSweepGPU(grid, nb_iter=_NB_ITER)
+    load_p, load_q, gen_p = _base_injections(grid)
+    sweep.set_injections_from_elements(
+        np.stack([load_p, load_p]), np.stack([load_q, load_q]),
+        np.stack([gen_p, gen_p]))
+
+    gen_v_wrong_rows = np.tile(
+        np.array([g.target_vm_pu for g in grid.get_generators()]), (3, 1))
+    with pytest.raises(RuntimeError, match="row count must match"):
+        sweep.set_gen_v(gen_v_wrong_rows)
+
+
+def test_gen_v_tuple_grid_mode_rejects(ieee14_base_case):
+    d = ieee14_base_case
+    sweep = InjectionSweepGPU(
+        (d["Ybus"], d["v_ref"], d["Sbus"], d["slack"], d["slack_weights"],
+         d["pv"], d["pq"]), nb_iter=_NB_ITER)
+
+    with pytest.raises(RuntimeError, match="needs a lightsim2grid grid"):
+        sweep.set_gen_v(np.zeros((1, 1)))

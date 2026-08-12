@@ -1121,6 +1121,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("sn_mva"),
          "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
          "(converted to per-unit on run()). May be called repeatedly.")
+    .def("set_gen_v",
+         &InjectionSweepSession::set_gen_v,
+         pybind11::arg("vm_pu"),
+         "Store the (n_scenarios × n_bus) generator voltage-magnitude reseed "
+         "targets (vm_pu, NaN = no override). Unlike set_injections, this does "
+         "NOT feed Sbus -- it only re-seeds |V| at the given buses before each "
+         "scenario's solve. Optional; row count must match set_injections() "
+         "if already called.")
     .def("set_branch_data",
          &InjectionSweepSession::set_branch_data,
          pybind11::arg("branch_from"),
@@ -1296,6 +1304,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
          "(converted to per-unit on run()). Fixes n_scenarios. May be "
          "called repeatedly.")
+    .def("set_gen_v",
+         &ScenarioSweepSession::set_gen_v,
+         pybind11::arg("vm_pu"),
+         "Store the (n_scenarios × n_bus) generator voltage-magnitude reseed "
+         "targets (vm_pu, NaN = no override). Unlike set_injections, this does "
+         "NOT feed Sbus -- it only re-seeds |V| at the given buses before each "
+         "scenario's solve. Optional; row-aligned with set_injections()/ "
+         "set_topology(); row count must match set_injections() if already "
+         "called.")
     .def("set_topology",
          &ScenarioSweepSession::set_topology,
          pybind11::arg("branch_ids_per_scenario"),

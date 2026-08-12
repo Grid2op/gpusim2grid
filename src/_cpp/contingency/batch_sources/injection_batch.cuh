@@ -19,6 +19,8 @@
 // -------------------
 //   prepare_Ybus_batch :
 //     ① tile base d_V into d_V_batch                  (batch_size D→D copies)
+//     ② re-seed |V| at any (row, bus) carrying a set_gen_v() target, via
+//        apply_gen_v_kernel (no-op when set_gen_v() was never called).
 //     (no Ybus mutation — base Ybus has already been tiled into
 //      d_Ybus_values_batch once during initialize().)
 //
@@ -72,6 +74,19 @@ struct InjectionBatch {
     thrust::device_vector<cudaComplexType> d_Sbus_all;     // n_scenario × n_bus
     thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus
 
+    // -------------------------------------------------------------------------
+    // Host/device per-scenario generator-voltage reseed target (set_gen_v()).
+    // (n_scenario × n_bus) real, NaN = "no override for this (row, bus)".
+    // Empty when set_gen_v() was never called -- has_gen_v_ then gates the
+    // reseed kernel launch off entirely (zero overhead in the common case).
+    // No per-chunk buffer needed: prepare_Ybus_batch reads a row-slice of
+    // d_gen_v_all directly (original scenario order -- this source never
+    // compacts/reorders rows).
+    // -------------------------------------------------------------------------
+    std::vector<cuda_real_type>            h_gen_v_all_;
+    bool                                    has_gen_v_ = false;
+    thrust::device_vector<cuda_real_type>  d_gen_v_all;    // n_scenario × n_bus
+
     // Preprocess time (CPU build of h_Sbus_all_).  Filled by the caller (the
     // public entry point), since the host-side complex build happens there.
     double t_preprocess_ms = 0.0;
@@ -81,12 +96,17 @@ struct InjectionBatch {
     //   h_Sbus_all  : moved in — (n_scenario × n_bus) cudaComplexType, row-major.
     //   n_scenarios : the leading dimension.
     //   preprocess_ms : optional caller-side timing for h_Sbus_all assembly.
+    //   h_gen_v_all : moved in — (n_scenario × n_bus) real, NaN = no override.
+    //                 Empty (default) means set_gen_v() was never called.
     // -------------------------------------------------------------------------
     InjectionBatch(std::vector<cudaComplexType>&& h_Sbus_all,
                    int                            n_scenarios,
-                   double                         preprocess_ms = 0.0)
+                   double                         preprocess_ms = 0.0,
+                   std::vector<cuda_real_type>&&  h_gen_v_all = {})
         : h_Sbus_all_(std::move(h_Sbus_all))
         , n_scenarios_(n_scenarios)
+        , h_gen_v_all_(std::move(h_gen_v_all))
+        , has_gen_v_(!h_gen_v_all_.empty())
         , t_preprocess_ms(preprocess_ms)
     {}
 
@@ -103,15 +123,17 @@ struct InjectionBatch {
     //   • Tile base d_Ybus_values into d_Ybus_values_batch ONCE.  Ybus is
     //     never modified per chunk in the injection sweep — fill_J reads
     //     identical base values from every batch slot.
+    //   • Upload d_gen_v_all from h_gen_v_all_ (only if has_gen_v_).
     // -------------------------------------------------------------------------
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
 
     // -------------------------------------------------------------------------
-    // prepare_Ybus_batch — tile V only.  Ybus is permanent.
+    // prepare_Ybus_batch — tile V, then re-seed |V| from this chunk's gen_v
+    // row-slice (no-op when has_gen_v_ is false).  Ybus itself is permanent.
     // -------------------------------------------------------------------------
     void prepare_Ybus_batch(BatchPfDriverContext& ctx,
-                            int                  /*chunk_idx*/,
-                            int                  /*actual_batch*/,
+                            int                  chunk_idx,
+                            int                  actual_batch,
                             cudaStream_t         cs,
                             CudaTimer&           timer,
                             BatchTimings&  t);

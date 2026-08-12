@@ -220,6 +220,15 @@ class InjectionElements:
     # HVDC converter stations, static gens, storages, REACTIVE_POWER-mode SVCs,
     # and the Q of non-voltage-regulating ("PQ") generators.
     const_mw: np.ndarray
+    # Indices (into the generator array, ascending) of the connected,
+    # voltage-regulating generators -- the only ones set_gen_v() can act on,
+    # mirroring lightsim2grid's GeneratorContainer::_set_vm_impl. Ascending
+    # order matches lightsim2grid's own "last writer wins" loop order when
+    # several generators share a regulated bus.
+    gen_regulating_sel: np.ndarray
+    # AC-solver bus id regulated by each of gen_regulating_sel's generators,
+    # same length/order.
+    gen_regulated_bus_of_sel: np.ndarray
 
 
 def extract_injection_elements(grid, n_bus):
@@ -277,6 +286,24 @@ def extract_injection_elements(grid, n_bus):
     load_sel = np.flatnonzero(load_status)
     gen_sel = np.flatnonzero(gen_status)
 
+    # Voltage-regulating generators -- the only ones set_gen_v() can act on
+    # (mirrors GeneratorContainer::_set_vm_impl's `if (!voltage_regulator_on_)
+    # continue;`). No bulk numpy accessor exists for these two GenInfo fields
+    # (unlike get_bus_id()), so a one-time Python loop over `gens` is needed;
+    # ascending order matches lightsim2grid's own gen-id iteration order, so
+    # "last writer wins" on a shared regulated bus matches exactly.
+    gen_voltage_regulator_on = np.array(
+        [g.voltage_regulator_on for g in gens], dtype=bool)
+    gen_regulated_bus = _relabel_to_solver(
+        me_to_solver,
+        np.array([g.regulated_bus_id for g in gens], dtype=np.int64))
+    gen_regulating_sel = np.flatnonzero(gen_status & gen_voltage_regulator_on)
+    # A remote-regulating generator's OWN bus can be fine while its regulated
+    # bus is the one the solver dropped -- check that subset specifically
+    # (gen_bus's own _check_alive above only covers each generator's own bus).
+    _check_alive("voltage-regulating generators",
+                gen_status & gen_voltage_regulator_on, gen_regulated_bus)
+
     # Loads are a pure-PQ container, so lightsim2grid's *results* are literally
     # the targets it stamped into Sbus (OneSideContainer_PQ::set_osc_pq_res_p /
     # _res_q), which gives us both P and Q vectorized in one call. Generators
@@ -310,7 +337,9 @@ def extract_injection_elements(grid, n_bus):
         sn_mva=float(grid.get_sn_mva()),
         load_sel=load_sel, gen_sel=gen_sel,
         scatter_load=scatter_load, scatter_gen=scatter_gen,
-        const_mw=const_mw)
+        const_mw=const_mw,
+        gen_regulating_sel=gen_regulating_sel,
+        gen_regulated_bus_of_sel=gen_regulated_bus[gen_regulating_sel])
 
 
 def build_bus_injections(elements, load_p, load_q, gen_p):
@@ -364,6 +393,42 @@ def build_bus_injections(elements, load_p, load_q, gen_p):
 
     return (np.ascontiguousarray(sbus_mw.real),
             np.ascontiguousarray(sbus_mw.imag))
+
+
+def build_gen_v(elements, gen_v):
+    """Assemble a dense per-bus vm_pu reseed array from per-generator targets.
+
+    Parameters
+    ----------
+    elements : InjectionElements — from :func:`extract_injection_elements`.
+    gen_v : (n_steps, n_gen) float array, target vm_pu per generator.
+
+    Returns
+    -------
+    ``(n_steps, n_bus)`` float64, NaN everywhere except at a voltage-
+    regulating, connected generator's regulated bus — the array
+    ``set_gen_v`` expects. A generator that never regulates voltage, or is
+    disconnected, has its column ignored. Generators sharing a regulated bus:
+    the last one (by ascending generator id, matching lightsim2grid's own
+    iteration order) wins.
+    """
+    gen_v = np.asarray(gen_v, dtype=np.float64)
+    if gen_v.ndim != 2:
+        raise ValueError(
+            f"'gen_v' must be 2-D (n_steps, n_gen), got shape {gen_v.shape}.")
+    if gen_v.shape[1] != elements.n_gen:
+        raise ValueError(
+            f"'gen_v' has {gen_v.shape[1]} columns while the grid counts "
+            f"{elements.n_gen} generators.")
+    n_steps = gen_v.shape[0]
+    if n_steps == 0:
+        raise ValueError("'gen_v' must have at least one row (step).")
+
+    dense = np.full((n_steps, elements.n_bus), np.nan, dtype=np.float64)
+    for col, bus in zip(elements.gen_regulating_sel,
+                        elements.gen_regulated_bus_of_sel):
+        dense[:, bus] = gen_v[:, col]
+    return dense
 
 
 def grid_from_pandapower(net, solver_type="NR_KLU"):
