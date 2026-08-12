@@ -12,25 +12,39 @@
 // =============================================================================
 // batch_dims_check.hpp
 //
-// gpusim2grid's batch kernels (fill_J_kernel, fill_FP_kernel/fill_FQ_kernel,
-// update_Va_kernel/update_Vm_kernel, the MultiSlack/HVDC/VoltageControl
-// feature kernels, compute_branch_flows_kernel, check_limit_violations_kernel,
-// …) and the host-side build_blockdiag_csr() all compute a batch slot's flat
-// buffer offset as a plain 32-bit `int` product -- e.g.
-//   const int J_base = b * nnz_J;                        (fill_J_kernel)
-//   h_batch_outer[b * n_bus + r] = single_outer[r] + b*nnz; (build_blockdiag_csr)
+// gpusim2grid's own batch kernels and launch-site grid-size arithmetic
+// (fill_J_kernel's J_base, the fill_FP/FQ/update_Va/Vm/MultiSlack/HVDC/
+// VoltageControl kernels, the nr_grid_size() launch helper in
+// nr_iter_step.cuh) were widened to 64-bit (ptrdiff_t/long long) offset and
+// thread-index arithmetic -- see the "tid/b widened to ptrdiff_t" comments
+// throughout acpf_nr_kernels.cu, violation_kernels.cu, driver.cuh and
+// nr_iter_step.cuh. That fix lifted the batch_size * {nnz_J, dim_J} ceiling
+// from an artificial INT32_MAX wraparound (which used to silently write
+// outside the buffer -- a CUDA illegal-memory-access crash, not a catchable
+// Python exception) up to whatever GPU memory actually allows.
 //
-// The buffers those offsets index into ARE allocated correctly (every
-// resize() in BatchPfDriver's constructor casts through size_t first), so a
-// batch too large to fit in device memory fails with a normal bad_alloc --
-// but once (batch_size or n_contingencies) * stride exceeds INT32_MAX, the
-// *offset itself* silently wraps in 32-bit int arithmetic before that OOM
-// check is ever reached. The kernel then writes outside the buffer: a CUDA
-// illegal-memory-access crash, not a catchable Python exception. On a large
-// enough grid (large nnz_J / dim_J / n_bus) this triggers at a batch size far
-// below anything that would exhaust GPU memory, so "reduce batch_size until
-// it fits" does not reliably avoid it -- the caller needs a hard error at the
-// actual 32-bit boundary instead.
+// Two things this guard still has to catch even after that fix:
+//
+//   1. cuDSS itself. cudssMatrixCreateCsr takes int64_t nrows/ncols/nnz (the
+//      single-system dims, which stay far below INT32_MAX regardless of
+//      batch_size), but cuDSS's own internal indexing into the *batched*
+//      value buffer (d_J_values_batch, read via CUDSS_CONFIG_UBATCH_SIZE
+//      during FACTORIZATION/REFACTORIZATION/SOLVE) is closed-source -- there
+//      is no public confirmation it is 64-bit-safe at batch_size * nnz_J
+//      scales beyond INT32_MAX. Until that is verified empirically on real
+//      hardware, this guard keeps rejecting the combination rather than
+//      risk relying on unverified library behavior.
+//
+//   2. The cuSPARSE block-diagonal SpMV path. build_blockdiag_csr()
+//      (contingency_analysis_helper.cpp) builds ONE literal block-diagonal
+//      Ybus matrix of size (batch_size*n_bus)^2 with batch_size*nnz_Y
+//      non-zeros, and BatchPfDriver's constructor hands its outer/inner
+//      arrays to cusparseCreateConstCsr with CUSPARSE_INDEX_32I explicitly.
+//      That is a hard, unavoidable 32-bit index requirement in the current
+//      implementation -- widening gpusim2grid's own arithmetic cannot lift
+//      it; only migrating to CUSPARSE_INDEX_64I (a separate, larger change
+//      to the SpMV descriptor setup) could. batch_size * {n_bus, nnz_Y}
+//      genuinely cannot exceed INT32_MAX today.
 //
 // check_batch_stride() is the single guard used at every call site about to
 // size or launch a batch computation over a (count, stride) pair like the
@@ -47,10 +61,11 @@ inline void check_batch_stride(const std::string& context,
         throw std::runtime_error(
             "[" + context + "] " + count_name + " (" + std::to_string(count) +
             ") * " + stride_name + " (" + std::to_string(stride) + ") exceeds "
-            "INT32_MAX (" + std::to_string(kInt32Max) + "). gpusim2grid's batch "
-            "kernels index their buffers with 32-bit ints, so this combination "
-            "would silently wrap the computed offset and corrupt GPU memory "
-            "instead of raising a clean error. Reduce " + count_name +
+            "INT32_MAX (" + std::to_string(kInt32Max) + "). This combination "
+            "hits a hard 32-bit index limit somewhere in the batch pipeline "
+            "(cuSPARSE's block-diagonal SpMV descriptor, or cuDSS's own "
+            "uniform-batch value-buffer indexing -- see batch_dims_check.hpp's "
+            "own doc for which). Reduce " + count_name +
             " (e.g. run smaller batch_size chunks) so that " + count_name +
             " * " + stride_name + " stays within INT32_MAX.");
     }
