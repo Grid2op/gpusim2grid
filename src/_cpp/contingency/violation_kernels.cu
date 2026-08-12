@@ -66,12 +66,20 @@ __global__ void check_limit_violations_kernel(
           int*             __restrict__ d_out_count_high_voltage,
           int*             __restrict__ d_out_count_current)
 {
-    const int local_c = blockIdx.x * blockDim.x + threadIdx.x;
+    // local_c widened to ptrdiff_t: local_c * n_bus below (the d_V offset) is
+    // the same at-risk product as fill_J_kernel's own J_base once
+    // actual_batch * n_bus grows large (see acpf_nr_kernels.cu's note). base
+    // (out_c * K, the per-contingency output slice offset) gets the same
+    // treatment below.
+    const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + local_c;   // GLOBAL active-slot id (tripped-branch table)
+    const int slot_global = c_start + static_cast<int>(local_c);   // GLOBAL active-slot id (tripped-branch table)
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
-    const int base  = out_c * K;
+    // base widened to ptrdiff_t: out_c * K (this contingency's output slice
+    // offset) is the same at-risk product as fill_J_kernel's own J_base once
+    // n_contingencies * K grows large.
+    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * K;
     int  cnt       = 0;      // DETAIL records written so far, capped at K
     bool truncated = false;
     // TRUE, uncapped per-type totals -- incremented on every violation found,

@@ -101,9 +101,12 @@ __global__ void compute_branch_flows_kernel(
     int actual_batch,
     const int* __restrict__ d_result_map)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_branches;   // contingency index in batch
-    const int l   = tid % n_branches;   // branch index
+    // tid/b widened to ptrdiff_t: see fill_J_kernel's own note. Here
+    // actual_batch * n_branches (this launch's thread count) and b * n_bus /
+    // out_c * n_branches (the offsets below) are the at-risk products.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_branches;   // contingency index in batch
+    const int        l  = static_cast<int>(tid % n_branches);   // branch index
     if (b >= actual_batch) return;
 
     // branch_from/branch_to are in AC-solver bus numbering (see
@@ -131,8 +134,10 @@ __global__ void compute_branch_flows_kernel(
 
     // Map the chunk-relative slot to its original result index (identity when
     // d_result_map is null, e.g. the full-batch session call or injection).
-    const int out_c   = d_result_map ? d_result_map[c_start + b] : (c_start + b);
-    const int out_idx = out_c * n_branches + l;
+    // out_c itself (a contingency index < n_contingencies) fits int32; only
+    // out_c * n_branches (the flat offset) needs the 64-bit product.
+    const int out_c   = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
+    const ptrdiff_t out_idx = static_cast<ptrdiff_t>(out_c) * n_branches + l;
     d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
     d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_A[l];
 }
@@ -153,14 +158,17 @@ __global__ void scatter_V_results_kernel(
     int n_bus,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = actual_batch * n_bus;
+    // tid/total/local_c widened to ptrdiff_t -- actual_batch * n_bus (this
+    // launch's thread count) and local_c/out_c * n_bus (the offsets below)
+    // are the at-risk products; see fill_J_kernel's own note.
+    const ptrdiff_t tid   = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t total = static_cast<ptrdiff_t>(actual_batch) * n_bus;
     if (tid >= total) return;
 
-    const int local_c = tid / n_bus;   // active-slot index in this chunk
-    const int bus     = tid % n_bus;
+    const ptrdiff_t local_c = tid / n_bus;   // active-slot index in this chunk
+    const int       bus     = static_cast<int>(tid % n_bus);
     const int out_c   = d_result_map[c_start + local_c];   // original index
-    d_V_results[out_c * n_bus + bus] = d_V_batch[local_c * n_bus + bus];
+    d_V_results[static_cast<ptrdiff_t>(out_c) * n_bus + bus] = d_V_batch[local_c * n_bus + bus];
 }
 
 // =============================================================================
@@ -240,12 +248,13 @@ __global__ void apply_contingencies_kernel(
     int nnz_Y,
     int n_updates)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const ptrdiff_t i = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n_updates) return;
 
-    // Offset to the start of this contingency's value block.
+    // Offset to the start of this contingency's value block. ctg_id[i] * nnz_Y
+    // is the same at-risk product as fill_J_kernel's J_base -- widen it too.
     // No atomicAdd needed: each (ctg_id, k) pair is unique by construction.
-    const int base = ctg_id[i] * nnz_Y;
+    const ptrdiff_t base = static_cast<ptrdiff_t>(ctg_id[i]) * nnz_Y;
     cudaComplexType& entry = value_ptr_batch[base + k_idx[i]];
     entry = CudaFunHelper::my_cuCsub(
         entry,
@@ -268,9 +277,10 @@ __global__ void fill_FP_kernel(
     int actual_batch,
     int sbus_stride)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_p;   // contingency index
-    const int k   = tid % n_p;   // P-equation slot
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_p;   // contingency index
+    const int       k   = static_cast<int>(tid % n_p);   // P-equation slot
     if (b >= actual_batch) return;
 
     const int bus = p_buses[k];
@@ -300,9 +310,10 @@ __global__ void fill_FQ_kernel(
     int actual_batch,
     int sbus_stride)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_q;
-    const int k   = tid % n_q;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_q;
+    const int       k   = static_cast<int>(tid % n_q);
     if (b >= actual_batch) return;
 
     const int bus = q_buses[k];
@@ -335,9 +346,18 @@ __global__ void fill_J_kernel(
     int nnz_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / nnz_Y;   // contingency index
-    const int k   = tid % nnz_Y;   // nnz slot within one system
+    // tid/b promoted to 64-bit: actual_batch * nnz_Y (the total thread count
+    // for this launch) can exceed INT32_MAX/UINT32_MAX on large grids well
+    // before it exceeds any CUDA hardware grid-size limit, and blockIdx.x /
+    // blockDim.x / threadIdx.x are native 32-bit CUDA types -- tid itself
+    // would silently wrap before ever reaching the b*nnz_J offset below.
+    // Every downstream `b * <stride>` (n_bus, nnz_Y, nnz_J) promotes to
+    // ptrdiff_t automatically once b is ptrdiff_t, so nothing past this line
+    // needs its own cast. k stays plain int: it indexes single-system arrays
+    // of width nnz_Y, which fits int32 by construction.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / nnz_Y;   // contingency index
+    const int       k   = static_cast<int>(tid % nnz_Y);   // nnz slot within one system
     if (b >= actual_batch) return;
 
     // Row recovery: binary search on the single-system outer array using k.
@@ -398,7 +418,9 @@ __global__ void fill_J_kernel(
     }
 
     // ---- Scatter into d_J_values (batch-offset by b * nnz_J) --------------
-    const int J_base = b * nnz_J;
+    // b is already ptrdiff_t (see tid/b above), so this product is computed
+    // in 64-bit -- no separate cast needed.
+    const ptrdiff_t J_base = b * nnz_J;
     if (d_map_j11[k] >= 0) d_J_values[J_base + d_map_j11[k]] = CudaFunHelper::my_cuCreal(dSdVa);
     if (d_map_j12[k] >= 0) d_J_values[J_base + d_map_j12[k]] = CudaFunHelper::my_cuCreal(dSdVm);
     if (d_map_j21[k] >= 0) d_J_values[J_base + d_map_j21[k]] = CudaFunHelper::my_cuCimag(dSdVa);
@@ -429,11 +451,12 @@ __global__ void reduce_step_norms_kernel(
     cuda_real_type* __restrict__ d_max_dtheta,   // [actual_batch], zeroed before launch
     cuda_real_type* __restrict__ d_max_dvm)      // [actual_batch], zeroed before launch
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = n_theta + n_vm;
-    const int b = tid / total;
+    const ptrdiff_t b = tid / total;
     if (b >= actual_batch) return;
-    const int k = tid % total;
+    const int k = static_cast<int>(tid % total);
     if (k < n_theta) {
         const cuda_real_type v = d_dx[b * dim_J + theta_cols[k]];
         atomic_max_nonneg(&d_max_dtheta[b], v < 0 ? -v : v);
@@ -450,10 +473,11 @@ __global__ void apply_step_scale_kernel(
     cuda_real_type max_dVa, cuda_real_type max_dVm,
     int dim_J, int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / dim_J;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / dim_J;
     if (b >= actual_batch) return;
-    const int j = tid % dim_J;
+    const int j = static_cast<int>(tid % dim_J);
 
     cuda_real_type alpha = static_cast<cuda_real_type>(1.);
     const cuda_real_type mdt = d_max_dtheta[b];
@@ -477,9 +501,10 @@ __global__ void update_Va_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_theta;
-    const int k   = tid % n_theta;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_theta;
+    const int       k   = static_cast<int>(tid % n_theta);
     if (b >= actual_batch) return;
 
     const int bus = theta_buses[k];
@@ -508,9 +533,10 @@ __global__ void update_Vm_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_vm;
-    const int k   = tid % n_vm;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_vm;
+    const int       k   = static_cast<int>(tid % n_vm);
     if (b >= actual_batch) return;
 
     const int bus = vm_buses[k];
@@ -539,9 +565,10 @@ __global__ void adjust_slack_mismatch_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_slack;
-    const int k   = tid % n_slack;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_slack;
+    const int       k   = static_cast<int>(tid % n_slack);
     if (b >= actual_batch) return;
     // mis += sa·weight  ⇒  residual d_F = −real(mis) gains −sa·weight
     d_F[b * dim_J + d_slack_prow[k]] -= d_slack_absorbed[b] * d_slack_w[k];
@@ -555,9 +582,13 @@ __global__ void fill_slack_feature_kernel(
     int nnz_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_slack;
-    const int k   = tid % n_slack;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note -- this kernel
+    // is also reused for VC feature stamping (fill_slack_feature_kernel is
+    // called with VC's flat pos/value pairs too), so the nnz_J-scaled offset
+    // below is exactly as much at risk as fill_J_kernel's own J_base.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_slack;
+    const int       k   = static_cast<int>(tid % n_slack);
     if (b >= actual_batch) return;
     d_J_values[b * nnz_J + d_slack_feat_pos[k]] = d_slack_w[k];
 }
@@ -584,7 +615,10 @@ __global__ void update_slack_absorbed_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    // b widened to ptrdiff_t: one thread per batch slot (no division), but
+    // b * dim_J below is still the same at-risk product as elsewhere in this
+    // file once actual_batch * dim_J grows large.
+    const ptrdiff_t b = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (b >= actual_batch) return;
     d_slack_absorbed[b] += d_dx[b * dim_J + slack_col];
 }
@@ -648,9 +682,10 @@ __global__ void hvdc_adjust_mismatch_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_hvdc;
-    const int e   = tid % n_hvdc;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_hvdc;
+    const int       e   = static_cast<int>(tid % n_hvdc);
     if (b >= actual_batch) return;
 
     const cudaComplexType V1 = d_V[b * n_bus + bus1[e]];
@@ -689,9 +724,10 @@ __global__ void hvdc_fill_feature_kernel(
     int nnz_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_hvdc;
-    const int e   = tid % n_hvdc;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_hvdc;
+    const int       e   = static_cast<int>(tid % n_hvdc);
     if (b >= actual_batch) return;
     if (status[e] != 0) return;   // saturated: constant injection, zero slopes
 
@@ -725,9 +761,10 @@ __global__ void vc_adjust_mismatch_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_ctrl;
-    const int j   = tid % n_ctrl;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_ctrl;
+    const int       j   = static_cast<int>(tid % n_ctrl);
     if (b >= actual_batch) return;
     // mis(c.bus) -= i·Q_c  ⇒  residual d_F[q_row] += Q_c
     atomic_add_real(&d_F[b * dim_J + d_vc_qrow[j]], d_vc_q[b * n_ctrl + j]);
@@ -749,9 +786,10 @@ __global__ void vc_vrow_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_grp;
-    const int g   = tid % n_grp;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_grp;
+    const int       g   = static_cast<int>(tid % n_grp);
     if (b >= actual_batch) return;
 
     const cudaComplexType Vr = d_V[b * n_bus + d_vc_reg_bus[g]];
@@ -779,9 +817,10 @@ __global__ void vc_share_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_share;
-    const int s   = tid % n_share;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_share;
+    const int       s   = static_cast<int>(tid % n_share);
     if (b >= actual_batch) return;
     const cuda_real_type q_first = d_vc_q[b * n_ctrl + d_sh_first[s]];
     const cuda_real_type q_other = d_vc_q[b * n_ctrl + d_sh_other[s]];
@@ -797,9 +836,10 @@ __global__ void vc_apply_step_kernel(
     int dim_J,
     int actual_batch)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b   = tid / n_ctrl;
-    const int j   = tid % n_ctrl;
+    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_ctrl;
+    const int       j   = static_cast<int>(tid % n_ctrl);
     if (b >= actual_batch) return;
     d_vc_q[b * n_ctrl + j] += d_dx[b * dim_J + d_vc_qcol[j]];
 }
@@ -818,8 +858,11 @@ __global__ void compute_residuals_kernel(
     int c_start,
     const int* __restrict__ d_result_map)
 {
-    // One block handles one contingency.
-    const int b = blockIdx.x;
+    // One block handles one contingency. b widened to ptrdiff_t: blockIdx.x
+    // itself is a valid small block index, but b * dim_J below is the same
+    // at-risk product as fill_J_kernel's own J_base once actual_batch *
+    // dim_J grows large.
+    const ptrdiff_t b = blockIdx.x;
     if (b >= actual_batch) return;
 
     extern __shared__ cuda_real_type sdata[];
@@ -846,7 +889,7 @@ __global__ void compute_residuals_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const int out = d_result_map ? d_result_map[c_start + b] : (c_start + b);
+        const int out = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
         d_residuals[out] = sdata[0];
     }
 }

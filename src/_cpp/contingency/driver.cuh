@@ -92,10 +92,10 @@ inline void run_nr_loop(
 
         // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
         timer.start();
-        fill_FP_kernel<<<(batch_size * buf.n_p + BS - 1) / BS, BS, 0, cs>>>(
+        fill_FP_kernel<<<nr_grid_size((long long)batch_size * buf.n_p, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
             buf.n_p, n_bus, dim_J, batch_size, buf.sbus_stride);
-        fill_FQ_kernel<<<(batch_size * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
+        fill_FQ_kernel<<<nr_grid_size((long long)batch_size * buf.n_q, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
             buf.n_q, n_bus, dim_J, batch_size, buf.sbus_stride);
         nr_feature_mismatch(buf, n_bus, dim_J, batch_size, cs);
@@ -112,7 +112,7 @@ inline void run_nr_loop(
         if constexpr (Policy::needs_fresh_jacobian) {
             timer.start();
             nr_feature_zero_J(buf, nnz_J, batch_size, cs);
-            fill_J_kernel<<<(batch_size * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
+            fill_J_kernel<<<nr_grid_size((long long)batch_size * nnz_Y, BS), BS, 0, cs>>>(
                 buf.d_J_values, buf.d_V, buf.d_Ibus,
                 buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
                 buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
@@ -125,7 +125,7 @@ inline void run_nr_loop(
             if (iter == 0) {
                 timer.start();
                 nr_feature_zero_J(buf, nnz_J, batch_size, cs);
-                fill_J_kernel<<<(batch_size * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
+                fill_J_kernel<<<nr_grid_size((long long)batch_size * nnz_Y, BS), BS, 0, cs>>>(
                     buf.d_J_values, buf.d_V, buf.d_Ibus,
                     buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
                     buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
@@ -158,10 +158,10 @@ inline void run_nr_loop(
             cudaMemsetAsync(buf.d_scale_max_dtheta, 0, batch_size * sizeof(cuda_real_type), cs);
             cudaMemsetAsync(buf.d_scale_max_dvm,    0, batch_size * sizeof(cuda_real_type), cs);
             const int total = buf.n_theta + buf.n_vm;
-            reduce_step_norms_kernel<<<(batch_size * total + BS - 1) / BS, BS, 0, cs>>>(
+            reduce_step_norms_kernel<<<nr_grid_size((long long)batch_size * total, BS), BS, 0, cs>>>(
                 buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
                 dim_J, batch_size, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
-            apply_step_scale_kernel<<<(batch_size * dim_J + BS - 1) / BS, BS, 0, cs>>>(
+            apply_step_scale_kernel<<<nr_grid_size((long long)batch_size * dim_J, BS), BS, 0, cs>>>(
                 buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
                 buf.max_dVa, buf.max_dVm, dim_J, batch_size);
         }
@@ -169,10 +169,10 @@ inline void run_nr_loop(
         // ⑤  Update V: Va (pvpq) then Vm (pq) — both on cs, CUDA stream ordering
         //     serialises them without an explicit CPU event.
         timer.start();
-        update_Va_kernel<<<(batch_size * buf.n_theta + BS - 1) / BS, BS, 0, cs>>>(
+        update_Va_kernel<<<nr_grid_size((long long)batch_size * buf.n_theta, BS), BS, 0, cs>>>(
             buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
             buf.n_theta, n_bus, dim_J, batch_size);
-        update_Vm_kernel<<<(batch_size * buf.n_vm + BS - 1) / BS, BS, 0, cs>>>(
+        update_Vm_kernel<<<nr_grid_size((long long)batch_size * buf.n_vm, BS), BS, 0, cs>>>(
             buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
             buf.n_vm, n_bus, dim_J, batch_size);
         nr_feature_update(buf, dim_J, batch_size, cs);

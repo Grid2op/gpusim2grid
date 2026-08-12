@@ -36,6 +36,27 @@
 static constexpr int BS = 256;   // block size for all NR kernels
 
 // -----------------------------------------------------------------------------
+// nr_grid_size
+//
+// ceil(total_threads / block), computed in 64-bit before narrowing to the
+// unsigned int a CUDA <<<grid, block>>> launch expects. Every launch below
+// computes total_threads as (batch or actual_batch) * <per-system stride>
+// (n_p, n_q, nnz_Y, dim_J, n_slack, n_hvdc, n_ctrl, n_grp, n_share, …); doing
+// that multiplication in plain `int` -- as every one of these call sites did
+// before -- silently wraps once the product exceeds INT32_MAX, launching too
+// few blocks and leaving the tail of the batch never computed (wrong results,
+// no crash, no error). The corresponding kernel bodies (acpf_nr_kernels.cu)
+// already widened their own tid/offset arithmetic to ptrdiff_t for the same
+// reason; this is the launch-site half of that fix. Narrowing to unsigned int
+// here is safe for any workload that actually fits in GPU memory -- CUDA's
+// own gridDim.x hardware limit (2^31-1) is far above what real batch sizes
+// reach before exhausting device memory first.
+// -----------------------------------------------------------------------------
+inline unsigned int nr_grid_size(long long total_threads, int block) {
+    return static_cast<unsigned int>((total_threads + block - 1) / block);
+}
+
+// -----------------------------------------------------------------------------
 // NrIterBuffers — non-owning raw pointer bundle
 //
 // Per-batch fields use stride actual_batch × per-system size:
@@ -206,24 +227,24 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
                                 int n_bus, int dim_J, int batch, cudaStream_t cs)
 {
     if (buf.slack_col >= 0)
-        adjust_slack_mismatch_kernel<<<(batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
+        adjust_slack_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_slack, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_slack_absorbed, buf.d_slack_prow, buf.d_slack_w,
             buf.n_slack, dim_J, batch);
     if (buf.n_hvdc > 0)
-        hvdc_adjust_mismatch_kernel<<<(batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
+        hvdc_adjust_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
             buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_pmax12, buf.d_hvdc_pmax21, buf.d_hvdc_prow1, buf.d_hvdc_prow2,
             buf.n_hvdc, n_bus, dim_J, batch);
     if (buf.n_vc_ctrl > 0) {
-        vc_adjust_mismatch_kernel<<<(batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
+        vc_adjust_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_vc_ctrl, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
-        vc_vrow_kernel<<<(batch * buf.n_vc_grp + BS - 1) / BS, BS, 0, cs>>>(
+        vc_vrow_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
             buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
             buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, batch);
         if (buf.n_vc_share > 0)
-            vc_share_kernel<<<(batch * buf.n_vc_share + BS - 1) / BS, BS, 0, cs>>>(
+            vc_share_kernel<<<nr_grid_size((long long)batch * buf.n_vc_share, BS), BS, 0, cs>>>(
                 buf.d_F, buf.d_vc_q, buf.d_vc_sh_row, buf.d_vc_sh_first, buf.d_vc_sh_other,
                 buf.d_vc_sh_wfirst, buf.d_vc_sh_wother, buf.n_vc_share, buf.n_vc_ctrl,
                 dim_J, batch);
@@ -241,16 +262,16 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
                               int n_bus, int nnz_J, int batch, cudaStream_t cs)
 {
     if (buf.slack_col >= 0)
-        fill_slack_feature_kernel<<<(batch * buf.n_slack + BS - 1) / BS, BS, 0, cs>>>(
+        fill_slack_feature_kernel<<<nr_grid_size((long long)batch * buf.n_slack, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w, buf.n_slack, nnz_J, batch);
     if (buf.n_hvdc > 0)
-        hvdc_fill_feature_kernel<<<(batch * buf.n_hvdc + BS - 1) / BS, BS, 0, cs>>>(
+        hvdc_fill_feature_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
             buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
             buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
             buf.n_hvdc, n_bus, nnz_J, batch);
     if (buf.n_vc_feat > 0)
-        fill_slack_feature_kernel<<<(batch * buf.n_vc_feat + BS - 1) / BS, BS, 0, cs>>>(
+        fill_slack_feature_kernel<<<nr_grid_size((long long)batch * buf.n_vc_feat, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val, buf.n_vc_feat, nnz_J, batch);
 }
 
@@ -260,7 +281,7 @@ inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cu
         update_slack_absorbed_kernel<<<(batch + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_slack_absorbed, buf.d_dx, buf.slack_col, dim_J, batch);
     if (buf.n_vc_ctrl > 0)
-        vc_apply_step_kernel<<<(batch * buf.n_vc_ctrl + BS - 1) / BS, BS, 0, cs>>>(
+        vc_apply_step_kernel<<<nr_grid_size((long long)batch * buf.n_vc_ctrl, BS), BS, 0, cs>>>(
             buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, batch);
 }
 
@@ -308,10 +329,10 @@ inline void nr_iter_step_fill_F(
     NrIterTimings& t)
 {
     timer.start();
-    fill_FP_kernel<<<(actual_batch * buf.n_p + BS - 1) / BS, BS, 0, cs>>>(
+    fill_FP_kernel<<<nr_grid_size((long long)actual_batch * buf.n_p, BS), BS, 0, cs>>>(
         buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
         buf.n_p, n_bus, dim_J, actual_batch, buf.sbus_stride);
-    fill_FQ_kernel<<<(actual_batch * buf.n_q + BS - 1) / BS, BS, 0, cs>>>(
+    fill_FQ_kernel<<<nr_grid_size((long long)actual_batch * buf.n_q, BS), BS, 0, cs>>>(
         buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
         buf.n_q, n_bus, dim_J, actual_batch, buf.sbus_stride);
     nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
@@ -373,7 +394,7 @@ inline void nr_iter_step_prepare(
     //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
     nr_feature_zero_J(buf, nnz_J, actual_batch, cs);
-    fill_J_kernel<<<(actual_batch * nnz_Y + BS - 1) / BS, BS, 0, cs>>>(
+    fill_J_kernel<<<nr_grid_size((long long)actual_batch * nnz_Y, BS), BS, 0, cs>>>(
         buf.d_J_values, buf.d_V, buf.d_Ibus,
         buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
@@ -430,10 +451,10 @@ inline void nr_iter_step_correct(
         cudaMemsetAsync(buf.d_scale_max_dtheta, 0, actual_batch * sizeof(cuda_real_type), cs);
         cudaMemsetAsync(buf.d_scale_max_dvm,    0, actual_batch * sizeof(cuda_real_type), cs);
         const int total = buf.n_theta + buf.n_vm;
-        reduce_step_norms_kernel<<<(actual_batch * total + BS - 1) / BS, BS, 0, cs>>>(
+        reduce_step_norms_kernel<<<nr_grid_size((long long)actual_batch * total, BS), BS, 0, cs>>>(
             buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
             dim_J, actual_batch, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
-        apply_step_scale_kernel<<<(actual_batch * dim_J + BS - 1) / BS, BS, 0, cs>>>(
+        apply_step_scale_kernel<<<nr_grid_size((long long)actual_batch * dim_J, BS), BS, 0, cs>>>(
             buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
             buf.max_dVa, buf.max_dVm, dim_J, actual_batch);
     }
@@ -442,10 +463,10 @@ inline void nr_iter_step_correct(
     //     Both kernels run on cs — CUDA stream ordering serialises them without
     //     an explicit CPU-side event.
     timer.start();
-    update_Va_kernel<<<(actual_batch * buf.n_theta + BS - 1) / BS, BS, 0, cs>>>(
+    update_Va_kernel<<<nr_grid_size((long long)actual_batch * buf.n_theta, BS), BS, 0, cs>>>(
         buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
         buf.n_theta, n_bus, dim_J, actual_batch);
-    update_Vm_kernel<<<(actual_batch * buf.n_vm + BS - 1) / BS, BS, 0, cs>>>(
+    update_Vm_kernel<<<nr_grid_size((long long)actual_batch * buf.n_vm, BS), BS, 0, cs>>>(
         buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
         buf.n_vm, n_bus, dim_J, actual_batch);
     nr_feature_update(buf, dim_J, actual_batch, cs);

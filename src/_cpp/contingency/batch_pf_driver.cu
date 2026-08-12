@@ -16,6 +16,7 @@
 #include "driver.cuh"                       // run_nr_loop<Policy>
 #include "../acpf_nr_kernels.cuh"
 #include "../nr_iter_step.cuh"              // NrIterBuffers, BS
+#include "../batch_dims_check.hpp"          // check_batch_stride
 #include "violation_kernels.cuh"            // check_limit_violations_kernel
 
 #include <thrust/device_vector.h>
@@ -113,6 +114,30 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     const int dim_J  = base.dim_J;
     const int nnz_Y  = base.nnz_Y;
     const int nnz_J  = base.nnz_J;
+
+    // -------------------------------------------------------------------------
+    // Reject batch_size * per-system-stride combinations that hit a hard
+    // 32-bit index limit still standing after the ptrdiff_t widening of
+    // gpusim2grid's own kernels/launch arithmetic (see the "tid/b widened to
+    // ptrdiff_t" comments in acpf_nr_kernels.cu, nr_iter_step.cuh, driver.cuh):
+    //   - n_bus, nnz_Y: build_blockdiag_csr() (below) builds ONE literal
+    //     block-diagonal Ybus matrix and BatchPfDriver hands its outer/inner
+    //     arrays to cusparseCreateConstCsr with CUSPARSE_INDEX_32I explicitly
+    //     -- a hard cuSPARSE requirement gpusim2grid's own arithmetic cannot
+    //     lift (see batch_dims_check.hpp's own doc).
+    //   - nnz_J, dim_J: our own fill/update/feature kernels are now 64-bit
+    //     safe at any batch_size, but cuDSS's own internal indexing into the
+    //     batched d_J_values_batch/d_F_batch/d_dx_batch buffers (via
+    //     CUDSS_CONFIG_UBATCH_SIZE) is closed-source and unverified at these
+    //     scales -- kept as a safety margin, not a known corruption vector.
+    // n_contingencies-scaled products (copy_results_to_host, branch-flow and
+    // violation output buffers) no longer need this guard: those loops and
+    // kernels were widened to 64-bit alongside the rest of this pass.
+    // -------------------------------------------------------------------------
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "nnz_J", nnz_J);
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "dim_J", dim_J);
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "n_bus", n_bus);
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "nnz_Y", nnz_Y);
 
     // Source-owned host preprocessing time was captured in the source ctor.
     t_preprocess_ms_ = source_.cpu_preprocess_ms();
@@ -286,9 +311,14 @@ void BatchPfDriver<BatchSource>::copy_results_to_host(
     cs.synchronize();
     const int n_bus = base.n_bus;
 
+    // Pure host loop (no cuSPARSE/cuDSS 32-bit index constraint involved) --
+    // widened to a 64-bit count so n_contingencies * n_bus itself, computed
+    // once here, can't silently wrap before V_out.resize()/the loop bound
+    // even sees it.
+    const long long n_v = static_cast<long long>(n_contingencies) * n_bus;
     thrust::host_vector<cudaComplexType> h_V = d_V_results;
-    V_out.resize(n_contingencies * n_bus);
-    for (int i = 0; i < n_contingencies * n_bus; ++i)
+    V_out.resize(n_v);
+    for (long long i = 0; i < n_v; ++i)
         V_out(i) = eigen_cplx_type(
             static_cast<eigen_real_type>(h_V[i].x),
             static_cast<eigen_real_type>(h_V[i].y));
@@ -314,6 +344,13 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
     double                            sn_mva)
 {
     n_branches_ = static_cast<int>(branch_from.size());
+
+    // No check_batch_stride guard needed here: compute_branch_flows_kernel's
+    // and check_limit_violations_kernel's n_branches_-scaled offsets, and
+    // copy_flow_results_to_host's host loop, were all widened to 64-bit
+    // alongside the rest of this pass -- neither cuSPARSE nor cuDSS is
+    // involved on this path (see the constructor's own check_batch_stride
+    // calls for the ones that still are).
 
     auto t_upload_start = std::chrono::steady_clock::now();
     {
@@ -426,6 +463,11 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
             "(via ContingencyAnalysisSession::set_branch_data) before enabling "
             "compute_limit_violations.");
 
+    // No check_batch_stride guard needed here: check_limit_violations_kernel's
+    // out_c * K output-slice offset was widened to 64-bit (ptrdiff_t)
+    // alongside the rest of this pass, and the n_contingencies*K output
+    // buffers below are already sized via a size_t-safe assign().
+
     auto t_setup_start = std::chrono::steady_clock::now();
 
     const int n_bus = base.n_bus;
@@ -476,13 +518,15 @@ void BatchPfDriver<BatchSource>::copy_flow_results_to_host(
     }
 
     cs.synchronize();
-    const int n = n_contingencies * n_branches_;
+    // Pure host loop -- widened to a 64-bit count for the same reason as
+    // copy_results_to_host's n_v above.
+    const long long n = static_cast<long long>(n_contingencies) * n_branches_;
     thrust::host_vector<cuda_real_type> h_or = d_or_amps_results;
     thrust::host_vector<cuda_real_type> h_ex = d_ex_amps_results;
 
     or_amps_out.resize(n);
     ex_amps_out.resize(n);
-    for (int i = 0; i < n; ++i) {
+    for (long long i = 0; i < n; ++i) {
         or_amps_out(i) = static_cast<eigen_real_type>(h_or[i]);
         ex_amps_out(i) = static_cast<eigen_real_type>(h_ex[i]);
     }
@@ -688,7 +732,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 
         if (actual_batch > 0) {
             fill_FP_kernel<<<
-                (actual_batch * base.n_p + BS - 1) / BS, BS, 0, cs>>>(
+                nr_grid_size((long long)actual_batch * base.n_p, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
@@ -697,7 +741,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
                 thrust::raw_pointer_cast(base.d_p_rows.data()),
                 base.n_p, n_bus, dim_J, actual_batch, sbus_stride);
             fill_FQ_kernel<<<
-                (actual_batch * base.n_q + BS - 1) / BS, BS, 0, cs>>>(
+                nr_grid_size((long long)actual_batch * base.n_q, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
@@ -783,8 +827,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     timer.start();
     if (actual_batch > 0) {
         if (d_result_map) {
-            const int total = actual_batch * n_bus;
-            scatter_V_results_kernel<<<(total + BS - 1) / BS, BS, 0, cs>>>(
+            scatter_V_results_kernel<<<nr_grid_size((long long)actual_batch * n_bus, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_V_results.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 d_result_map, c_start, n_bus, actual_batch);
@@ -805,8 +848,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // -------------------------------------------------------------------------
     if (_has_branch_data && actual_batch > 0) {
         timer.start();
-        const int total = actual_batch * n_branches_;
-        compute_branch_flows_kernel<<<(total + BS - 1) / BS, BS, 0, cs>>>(
+        compute_branch_flows_kernel<<<nr_grid_size((long long)actual_batch * n_branches_, BS), BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_branch_from.data()),
             thrust::raw_pointer_cast(d_branch_to.data()),
