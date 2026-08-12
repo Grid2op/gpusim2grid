@@ -16,6 +16,7 @@
 #include "driver.cuh"                       // run_nr_loop<Policy>
 #include "../acpf_nr_kernels.cuh"
 #include "../nr_iter_step.cuh"              // NrIterBuffers, BS
+#include "../batch_dims_check.hpp"          // check_batch_stride
 #include "violation_kernels.cuh"            // check_limit_violations_kernel
 
 #include <thrust/device_vector.h>
@@ -113,6 +114,25 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     const int dim_J  = base.dim_J;
     const int nnz_Y  = base.nnz_Y;
     const int nnz_J  = base.nnz_J;
+
+    // -------------------------------------------------------------------------
+    // Reject batch_size/n_contingencies * per-system-stride combinations that
+    // would overflow the 32-bit int arithmetic every batch kernel (and
+    // build_blockdiag_csr below) uses for buffer offsets -- see
+    // batch_dims_check.hpp. Checked BEFORE any allocation or host/device work
+    // so it surfaces as a clean exception instead of a CUDA illegal-memory-
+    // access crash. nnz_J is the tightest of these in practice (largest
+    // per-system stride), but all four are checked since none is dominant by
+    // construction (a sparse Ybus with dense J structure, for instance).
+    // -------------------------------------------------------------------------
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "nnz_J", nnz_J);
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "dim_J", dim_J);
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "n_bus", n_bus);
+    check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "nnz_Y", nnz_Y);
+    // copy_results_to_host() and the final V/residual result buffers are
+    // indexed over the FULL n_contingencies (not just one chunk's batch_size),
+    // e.g. `for (int i = 0; i < n_contingencies * n_bus; ++i)` below.
+    check_batch_stride("BatchPfDriver", "n_contingencies", n_contingencies, "n_bus", n_bus);
 
     // Source-owned host preprocessing time was captured in the source ctor.
     t_preprocess_ms_ = source_.cpu_preprocess_ms();
@@ -315,6 +335,15 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
 {
     n_branches_ = static_cast<int>(branch_from.size());
 
+    // compute_branch_flows_kernel/check_limit_violations_kernel index their
+    // per-chunk and full-result buffers with 32-bit ints keyed on n_branches_
+    // (e.g. `out_c * n_branches + l`, `actual_batch * n_branches`) -- guard
+    // both products before any of that data is uploaded. See batch_dims_check.hpp.
+    check_batch_stride("BatchPfDriver::upload_branch_admittances",
+                       "batch_size", batch_size_, "n_branches", n_branches_);
+    check_batch_stride("BatchPfDriver::upload_branch_admittances",
+                       "n_contingencies", n_contingencies, "n_branches", n_branches_);
+
     auto t_upload_start = std::chrono::steady_clock::now();
     {
         std::vector<int> h_from(n_branches_), h_to(n_branches_);
@@ -425,6 +454,12 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
             "BatchPfDriver::set_violation_limits: call upload_branch_admittances "
             "(via ContingencyAnalysisSession::set_branch_data) before enabling "
             "compute_limit_violations.");
+
+    // check_limit_violations_kernel writes its compact per-contingency output
+    // at 32-bit-int offsets keyed on K (violation_capacity) -- see
+    // batch_dims_check.hpp.
+    check_batch_stride("BatchPfDriver::set_violation_limits",
+                       "n_contingencies", n_contingencies, "K", K);
 
     auto t_setup_start = std::chrono::steady_clock::now();
 
