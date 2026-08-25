@@ -15,6 +15,7 @@
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
+#include "Ls2gAbiTag.hpp"                    // ls2g_current_abi_tag, core_abi_tag
 #endif
 
 #include <pybind11/pybind11.h>
@@ -33,6 +34,36 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "contingency analysis and injection sweeps, plus zero-copy DLPack "
         "export. End users should normally import the Python wrappers from the "
         "gpusim2grid package rather than calling this module directly.";
+
+#ifdef GPUSIM2GRID_HAVE_LS2G
+    // Guard against the exact bug lightsim2grid itself hit (see its
+    // CHANGELOG.rst / docs/solver_plugin.rst): _gpusim2grid and
+    // lightsim2grid_core are two separate shared libraries, and
+    // ls2g_bridge.cpp exchanges Eigen objects with lightsim2grid_core by
+    // value (get_J_solver() -> Eigen::SparseMatrix<...>, etc.). If they were
+    // compiled with different -march (or otherwise disagree on Eigen's SIMD/
+    // alignment settings), such an object allocated in one and freed in the
+    // other silently corrupts the heap. Comparing the two ABI tags here --
+    // this module's own view vs. core's compiled-in view, queried via a real
+    // cross-.so function call -- catches the mismatch at import time instead.
+    // PYBIND11_MODULE wraps this function body in a try/catch, so throwing
+    // here surfaces as a clean Python ImportError.
+    {
+        const ls2g::Ls2gAbiTag bindings_tag = ls2g::ls2g_current_abi_tag();
+        const ls2g::Ls2gAbiTag core_tag = ls2g::core_abi_tag();
+        if (bindings_tag != core_tag) {
+            throw std::runtime_error(
+                "gpusim2grid: _gpusim2grid and lightsim2grid_core were compiled with "
+                "different Eigen SIMD/alignment settings -- loading them together would "
+                "silently corrupt the heap the first time an Eigen object crosses the "
+                "module boundary. lightsim2grid_core was built with [" + core_tag.describe() +
+                "], _gpusim2grid was built with [" + bindings_tag.describe() + "]. This "
+                "should not happen with the provided build system; if you customized the "
+                "build, make sure both are compiled with identical -march flags -- see "
+                "lightsim2grid's docs/solver_plugin.rst, section \"Matching build flags\".");
+        }
+    }
+#endif
 
     // -----------------------------------------------------------------
     // TimingEntry — the building block of AcPfTimings per-phase fields.

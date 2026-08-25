@@ -34,6 +34,41 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
     target_link_libraries(_gpusim2grid PRIVATE lightsim2grid::core)
     target_compile_definitions(_gpusim2grid PRIVATE GPUSIM2GRID_HAVE_LS2G)
 
+    # Mirror lightsim2grid_core's -march=native / -O3 onto _gpusim2grid.
+    #
+    # lightsim2grid_core and _gpusim2grid.so are two *separate* shared
+    # libraries, and ls2g_bridge.cpp exchanges dynamic-size Eigen objects with
+    # it by value (grid.get_J_solver() -> Eigen::SparseMatrix<...>,
+    # grid.get_bus_vn_kv()/get_limit_a1_ka()/etc. -> RealVect/CplxVect).
+    # -march=native changes which SIMD ISA Eigen sees enabled, which changes
+    # EIGEN_MAX_ALIGN_BYTES and thus how Eigen aligns/allocates/frees its
+    # dynamic-size matrices; an object allocated under one alignment
+    # assumption and freed under another silently corrupts the heap the
+    # moment it crosses this boundary. This is a real, previously-hit bug in
+    # lightsim2grid itself (see its CHANGELOG.rst and
+    # docs/solver_plugin.rst / examples/cmake/MatchLightsim2gridBuildFlags.cmake,
+    # whose recipe this block follows) -- not a hypothetical one.
+    #
+    # lightsim2grid_core_MARCH_NATIVE / _O3_OPTIM are exported by its CMake
+    # config (lightsim2grid_coreConfig.cmake.in) with exactly this in mind.
+    if(NOT MSVC)
+        if(lightsim2grid_core_MARCH_NATIVE)
+            message(STATUS "[gpusim2grid] lightsim2grid_core was built with "
+                           "-march=native -- matching it on _gpusim2grid "
+                           "(required, see lightsim2grid's docs/solver_plugin.rst)")
+            target_compile_options(_gpusim2grid PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-march=native>
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-march=native>)
+        endif()
+        if(lightsim2grid_core_O3_OPTIM)
+            message(STATUS "[gpusim2grid] lightsim2grid_core was built with "
+                           "-O3 -- matching it on _gpusim2grid")
+            target_compile_options(_gpusim2grid PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-O3>
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>)
+        endif()
+    endif()
+
     # _gpusim2grid.so NEEDs liblightsim2grid_core.so. Both packages install
     # side by side under site-packages, so a relocatable $ORIGIN-relative rpath
     # to the lightsim2grid package dir lets the loader find it without relying
