@@ -55,10 +55,11 @@
 #include "../../cuda_utils.h"
 #include "../../cu_complex_utils.h"
 #include "../../timing_utils.hpp"
-#include "../../acpf_nr_kernels.cuh"      // apply_contingencies_kernel
+#include "../../acpf_nr_kernels.cuh"      // apply_contingencies_kernel, apply_gen_v_kernel
 #include "../../acpf_nr_state.cuh"
 #include "../../contingency_analysis_helper.hpp"
 #include "../../nr_iter_step.cuh"         // BS
+#include "../gen_v_override.hpp"          // GenVOverride
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
 
 struct BatchPfDriverContext;
@@ -134,6 +135,15 @@ struct ScenarioSweepBatch {
     thrust::device_vector<cudaComplexType> d_Sbus_all;     // n_active × n_bus
     thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus
 
+    // -------------------------------------------------------------------------
+    // set_gen_v() override (see ScenarioSweepSession::set_gen_v's doc), ALREADY
+    // PERMUTED into active-slot order at construction — same rationale as
+    // h_Sbus_all_ above. k_active() == 0 (the default) is a cheap no-op.
+    // -------------------------------------------------------------------------
+    GenVOverride gen_v_override_;
+    thrust::device_vector<int>            d_gv_active_bus;
+    thrust::device_vector<cuda_real_type> d_gv_all;
+
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
 
@@ -156,6 +166,10 @@ struct ScenarioSweepBatch {
     //   mask_cfg        : handle_disconnected_grid mode when non-null (see
     //                     class doc); nullptr selects the legacy
     //                     check_connectivity skip-if-split path.
+    //   gen_v_override_orig : optional set_gen_v() data, ORIGINAL (pre-
+    //                     compaction) row order, row-aligned with
+    //                     h_Sbus_all_orig — permuted into active-slot order
+    //                     below, same as h_Sbus_all_orig itself.
     // -------------------------------------------------------------------------
     ScenarioSweepBatch(std::vector<Contingency>& contingencies,
                        const int*                Ybus_rm_outer,
@@ -163,7 +177,8 @@ struct ScenarioSweepBatch {
                        const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                        std::vector<cudaComplexType>&& h_Sbus_all_orig,
                        int                       max_batch_size,
-                       const MaskConfig*         mask_cfg = nullptr)
+                       const MaskConfig*         mask_cfg = nullptr,
+                       GenVOverride&&            gen_v_override_orig = GenVOverride{})
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
@@ -209,6 +224,23 @@ struct ScenarioSweepBatch {
                 h_Sbus_all_orig.begin() + static_cast<ptrdiff_t>(orig) * n_bus,
                 h_Sbus_all_orig.begin() + static_cast<ptrdiff_t>(orig + 1) * n_bus,
                 h_Sbus_all_.begin() + static_cast<ptrdiff_t>(slot) * n_bus);
+        }
+
+        // Permute set_gen_v() rows into active-slot order too, mirroring
+        // h_Sbus_all_ above (same active_to_orig_ mapping) — see
+        // GenVOverride's own doc. The active-bus column list itself is
+        // row-independent, so it carries over unchanged.
+        if (gen_v_override_orig.k_active() > 0) {
+            const ptrdiff_t k = gen_v_override_orig.k_active();
+            gen_v_override_.h_active_bus = std::move(gen_v_override_orig.h_active_bus);
+            gen_v_override_.h_gen_v_all.resize(active_to_orig_.size() * static_cast<size_t>(k));
+            for (size_t slot = 0; slot < active_to_orig_.size(); ++slot) {
+                const int orig = active_to_orig_[slot];
+                std::copy(
+                    gen_v_override_orig.h_gen_v_all.begin() + static_cast<ptrdiff_t>(orig) * k,
+                    gen_v_override_orig.h_gen_v_all.begin() + static_cast<ptrdiff_t>(orig + 1) * k,
+                    gen_v_override_.h_gen_v_all.begin() + static_cast<ptrdiff_t>(slot) * k);
+            }
         }
 
         t_preprocess_ms = ssb_ms_since(t_start);

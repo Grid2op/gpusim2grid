@@ -401,6 +401,17 @@ class _InjectionSweepSolver:
         q = np.ascontiguousarray(q_mvar, dtype=np.float64)
         self._s.set_injections(p, q, float(sn_mva))
 
+    def set_gen_v(self, gen_v, gen_bus):
+        """Per-scenario generator target voltage magnitude (vm_pu, NOT kV),
+        (n_scenarios, n_gen). Does NOT feed Sbus -- see the C++
+        InjectionSweepSession.set_gen_v binding for the full semantics.
+        gen_bus: (n_gen,) AC-solver bus id per generator, -1 for a
+        disconnected one.
+        """
+        v = np.ascontiguousarray(gen_v, dtype=np.float64)
+        b = np.ascontiguousarray(gen_bus, dtype=np.int32)
+        self._s.set_gen_v(v, b)
+
     def run(self):
         """Run all scenarios; fills V_results and residuals on device."""
         self._s.run()

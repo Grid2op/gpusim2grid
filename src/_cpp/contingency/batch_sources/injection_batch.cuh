@@ -42,6 +42,9 @@
 #include "../../cu_complex_utils.h"
 #include "../../timing_utils.hpp"
 #include "../../acpf_nr_state.cuh"
+#include "../../acpf_nr_kernels.cuh"       // apply_gen_v_kernel
+#include "../../nr_iter_step.cuh"          // BS
+#include "../gen_v_override.hpp"          // GenVOverride
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
 
 struct BatchPfDriverContext;
@@ -77,17 +80,30 @@ struct InjectionBatch {
     double t_preprocess_ms = 0.0;
 
     // -------------------------------------------------------------------------
+    // set_gen_v() override (see InjectionSweepSession::set_gen_v's doc):
+    // k_active() == 0 (the default) is a cheap no-op -- prepare_Ybus_batch
+    // skips the extra kernel launch entirely. Rows are in the SAME order as
+    // h_Sbus_all_ (no compaction happens in this BatchSource).
+    // -------------------------------------------------------------------------
+    GenVOverride gen_v_override_;
+    thrust::device_vector<int>            d_gv_active_bus;
+    thrust::device_vector<cuda_real_type> d_gv_all;
+
+    // -------------------------------------------------------------------------
     // Constructor (host-only).
     //   h_Sbus_all  : moved in — (n_scenario × n_bus) cudaComplexType, row-major.
     //   n_scenarios : the leading dimension.
     //   preprocess_ms : optional caller-side timing for h_Sbus_all assembly.
+    //   gen_v_override : optional set_gen_v() data, ORIGINAL row order.
     // -------------------------------------------------------------------------
     InjectionBatch(std::vector<cudaComplexType>&& h_Sbus_all,
                    int                            n_scenarios,
-                   double                         preprocess_ms = 0.0)
+                   double                         preprocess_ms = 0.0,
+                   GenVOverride&&                 gen_v_override = GenVOverride{})
         : h_Sbus_all_(std::move(h_Sbus_all))
         , n_scenarios_(n_scenarios)
         , t_preprocess_ms(preprocess_ms)
+        , gen_v_override_(std::move(gen_v_override))
     {}
 
     InjectionBatch(InjectionBatch&&) noexcept = default;
@@ -107,11 +123,12 @@ struct InjectionBatch {
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
 
     // -------------------------------------------------------------------------
-    // prepare_Ybus_batch — tile V only.  Ybus is permanent.
+    // prepare_Ybus_batch — tile V, then apply this chunk's set_gen_v()
+    // overrides (if any).  Ybus itself is permanent.
     // -------------------------------------------------------------------------
     void prepare_Ybus_batch(BatchPfDriverContext& ctx,
-                            int                  /*chunk_idx*/,
-                            int                  /*actual_batch*/,
+                            int                  chunk_idx,
+                            int                  actual_batch,
                             cudaStream_t         cs,
                             CudaTimer&           timer,
                             BatchTimings&  t);

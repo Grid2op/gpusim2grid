@@ -322,6 +322,43 @@ class InjectionSweepGPU:
                                             load_p, load_q, gen_p)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
 
+    def set_gen_v(self, gen_v):
+        """Store per-scenario generator target voltage magnitude (vm_pu, NOT kV).
+
+        Mirrors lightsim2grid's ``modify_gen_v``: unlike
+        :meth:`set_injections_from_elements`, this does NOT feed Sbus at
+        all -- a PV/slack bus's magnitude is never part of Newton-Raphson's
+        unknown vector, so it never moves during a solve once seeded. This
+        only re-seeds ``|V|`` at each generator's own AC-solver bus,
+        immediately before that scenario's solve, keeping whatever angle is
+        already seeded there.
+
+        Parameters
+        ----------
+        gen_v : (n_scenarios, n_gens) — target vm_pu per generator,
+            row-aligned with :meth:`set_injections_from_elements` /
+            :meth:`set_injections`. NaN leaves that (scenario, generator)
+            untouched. Only applied to generators whose OWN bus is
+            voltage-fixed (PV or slack) in this session's base case -- a
+            disconnected, reactive-only ("PQ"), or remotely
+            voltage-regulating (SVC / VoltageControl) generator's column is
+            silently ignored, mirroring lightsim2grid's own
+            ``voltage_regulator_on_``-gated behavior. Left unset entirely
+            (the default), every scenario keeps the grid's own base-case
+            voltage.
+
+        Notes
+        -----
+        The generator -> bus wiring is snapshotted at construction, like
+        :meth:`set_injections_from_elements` -- mutating the grid
+        afterwards does not propagate.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_gen_v() needs a lightsim2grid grid; explicit-array "
+                "(tuple) mode has no generators to read.")
+        self._inner.set_gen_v(gen_v, self._elements.gen_bus)
+
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.
 
