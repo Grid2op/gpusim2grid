@@ -53,11 +53,19 @@ void InjectionBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
                 "tile base Ybus");
         }
     }
+
+    // set_gen_v() overrides, if any -- see GenVOverride's own doc.
+    if (gen_v_override_.k_active() > 0) {
+        upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
+                   gen_v_override_.h_active_bus.size(), cs);
+        upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
+                   gen_v_override_.h_gen_v_all.size(), cs);
+    }
 }
 
 void InjectionBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
-                                        int                  /*chunk_idx*/,
-                                        int                  /*actual_batch*/,
+                                        int                  chunk_idx,
+                                        int                  actual_batch,
                                         cudaStream_t         cs,
                                         CudaTimer&           timer,
                                         BatchTimings&  t)
@@ -78,6 +86,17 @@ void InjectionBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
     }
     t.t_tile_V += timer.stop_ms();
     // No t_tile_Ybus / t_patch_Ybus updates — Ybus is permanent.
+
+    // Re-seed generator target voltages (set_gen_v()), if configured.
+    if (gen_v_override_.k_active() > 0) {
+        const int k = gen_v_override_.k_active();
+        const int row_offset = chunk_idx * ctx.batch_size;
+        apply_gen_v_kernel<<<nr_grid_size((long long)actual_batch * k, BS), BS, 0, cs>>>(
+            ctx.d_V_batch,
+            thrust::raw_pointer_cast(d_gv_all.data()),
+            thrust::raw_pointer_cast(d_gv_active_bus.data()),
+            row_offset, k, actual_batch, ctx.n_bus);
+    }
 }
 
 void InjectionBatch::prepare_Sbus_batch(BatchPfDriverContext& ctx,

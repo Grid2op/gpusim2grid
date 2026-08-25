@@ -262,6 +262,42 @@ __global__ void apply_contingencies_kernel(
 }
 
 // =============================================================================
+// apply_gen_v_kernel
+// =============================================================================
+__global__ void apply_gen_v_kernel(
+          cudaComplexType* __restrict__ d_V_batch,
+    const cuda_real_type*  __restrict__ d_gen_v_all,
+    const int*              __restrict__ d_active_bus,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_bus)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / k_active;
+    const int       j   = static_cast<int>(tid % k_active);
+    if (r >= actual_batch) return;
+
+    const cuda_real_type target =
+        d_gen_v_all[static_cast<ptrdiff_t>(row_offset + r) * k_active + j];
+    if (isnan(target)) return;
+
+    const int bus = d_active_bus[j];
+    cudaComplexType v = d_V_batch[r * n_bus + bus];
+    cuda_real_type mag = CudaFunHelper::my_cuCabs(v);
+    if (mag < cuda_real_type(1e-10)) {
+        // matches GeneratorContainer::_set_vm_impl: a collapsed magnitude is
+        // forced to 1 first, so the scale below still lands on `target`.
+        v   = CudaFunHelper::my_make_cuComplex(cuda_real_type(1), cuda_real_type(0));
+        mag = cuda_real_type(1);
+    }
+    const cuda_real_type scale = target / mag;
+    d_V_batch[r * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
+        CudaFunHelper::my_cuCreal(v) * scale,
+        CudaFunHelper::my_cuCimag(v) * scale);
+}
+
+// =============================================================================
 // fill_FP_kernel
 // =============================================================================
 __global__ void fill_FP_kernel(

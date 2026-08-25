@@ -1152,6 +1152,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("sn_mva"),
          "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
          "(converted to per-unit on run()). May be called repeatedly.")
+    .def("set_gen_v",
+         &InjectionSweepSession::set_gen_v,
+         pybind11::arg("gen_v"),
+         pybind11::arg("gen_bus"),
+         "Per-scenario generator target voltage magnitude (vm_pu, NOT kV), "
+         "(n_scenarios x n_gen). Unlike set_injections(), this does NOT feed "
+         "Sbus -- it only re-seeds |V| at each generator's own AC-solver bus "
+         "(gen_bus[g]) right before that chunk's solve, and ONLY for "
+         "generators whose own bus is Vm-fixed (PV or slack); a "
+         "disconnected, reactive-only, or remotely voltage-regulating (SVC / "
+         "VoltageControl) generator's column is silently ignored, mirroring "
+         "lightsim2grid's own modify_gen_v / GeneratorContainer::set_vm. NaN "
+         "entries leave that (row, gen) untouched. gen_bus: (n_gen,) "
+         "AC-solver bus id per generator, -1 for a disconnected one.")
     .def("set_branch_data",
          &InjectionSweepSession::set_branch_data,
          pybind11::arg("branch_from"),
@@ -1327,6 +1341,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
          "(converted to per-unit on run()). Fixes n_scenarios. May be "
          "called repeatedly.")
+    .def("set_gen_v",
+         &ScenarioSweepSession::set_gen_v,
+         pybind11::arg("gen_v"),
+         pybind11::arg("gen_bus"),
+         "Per-scenario generator target voltage magnitude (vm_pu, NOT kV), "
+         "(n_scenarios x n_gen). Unlike set_injections(), this does NOT feed "
+         "Sbus -- it only re-seeds |V| at each generator's own AC-solver bus "
+         "(gen_bus[g]) right before that chunk's solve, and ONLY for "
+         "generators whose own bus is Vm-fixed (PV or slack); a "
+         "disconnected, reactive-only, or remotely voltage-regulating (SVC / "
+         "VoltageControl) generator's column is silently ignored, mirroring "
+         "lightsim2grid's own modify_gen_v / GeneratorContainer::set_vm. NaN "
+         "entries leave that (row, gen) untouched. gen_bus: (n_gen,) "
+         "AC-solver bus id per generator, -1 for a disconnected one.")
     .def("set_topology",
          &ScenarioSweepSession::set_topology,
          pybind11::arg("branch_ids_per_scenario"),

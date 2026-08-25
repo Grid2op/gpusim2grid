@@ -10,6 +10,7 @@
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/scenario_sweep_batch.cuh"
+#include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel, zero_branch_flows_kernel
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
@@ -66,7 +67,6 @@ ScenarioSweepSession::ScenarioSweepSession(
     , max_dVa_(max_dVa)
     , max_dVm_(max_dVm)
 {
-    (void)slack_ids;
     (void)slack_weights;
 
     auto t_base_start = std::chrono::steady_clock::now();
@@ -107,6 +107,42 @@ ScenarioSweepSession::ScenarioSweepSession(
             for (int b : ledger->vc_reg_bus) mark(b);
         }
     }
+
+    // Vm-fixed bus mask for set_gen_v(): a bus in pv or slack_ids has |V|
+    // fixed by construction (not an NR unknown) in both the bare and the
+    // augmented-ledger system -- see set_gen_v()'s own doc.
+    {
+        const int n_bus = base_state_->n_bus;
+        h_is_vm_fixed_bus_.assign(static_cast<size_t>(n_bus), 0);
+        for (Eigen::Index i = 0; i < pv.size(); ++i) {
+            const int b = pv(i);
+            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
+        }
+        for (Eigen::Index i = 0; i < slack_ids.size(); ++i) {
+            const int b = slack_ids(i);
+            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
+        }
+    }
+}
+
+// =============================================================================
+// set_gen_v
+// =============================================================================
+void ScenarioSweepSession::set_gen_v(
+    Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> gen_v,
+    Eigen::Ref<const Eigen::VectorXi> gen_bus)
+{
+    if (gen_v.cols() != gen_bus.size())
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_gen_v: gen_v's column count must "
+            "equal gen_bus's length (one entry per generator)");
+    if (gen_v.rows() <= 0)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_gen_v: n_scenarios must be > 0");
+
+    gen_v_     = gen_v;
+    gen_bus_   = gen_bus;
+    has_gen_v_ = true;
 }
 
 // =============================================================================
@@ -234,6 +270,12 @@ void ScenarioSweepSession::run()
         throw std::runtime_error(
             "ScenarioSweepSession: call set_injections() before run()");
 
+    if (has_gen_v_ && static_cast<int>(gen_v_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_gen_v()'s row count no longer "
+            "matches set_injections()'s n_scenarios -- call set_gen_v() "
+            "again after changing set_injections()");
+
     if (has_topology_
             && static_cast<int>(contingencies_.size()) != n_scenarios_)
         throw std::runtime_error(
@@ -284,6 +326,10 @@ void ScenarioSweepSession::run()
     // Host preprocessing (resolve_indices + connectivity/masking +
     // build_flat_patches + Sbus active-order permute), mutates contingencies_
     // in-place so disconnected flags are observable below.
+    GenVOverride gen_v_override;
+    if (has_gen_v_)
+        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_);
+
     ScenarioSweepBatch source(
         contingencies_,
         Ybus_rm_.outerIndexPtr(),
@@ -291,7 +337,8 @@ void ScenarioSweepSession::run()
         Ybus_rm_,
         std::move(h_Sbus_all),
         batch_size_,
-        handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
+        handle_disconnected_grid_ ? &mask_cfg_ : nullptr,
+        std::move(gen_v_override));
     used_batch_size_ = source.used_batch_size();
 
     // (Re-)construct the solver — allows run() to be called multiple times.

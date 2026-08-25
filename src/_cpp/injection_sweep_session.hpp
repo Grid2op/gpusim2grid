@@ -45,6 +45,7 @@
 #include "Eigen/SparseCore"
 
 #include <memory>
+#include <vector>
 
 // Forward-declare CUDA-dependent types.
 struct AcPfNrState;
@@ -98,6 +99,22 @@ struct InjectionSweepSession {
     double sn_mva_           = 100.0;
     int    n_scenarios_      = 0;
     bool   has_injections_   = false;
+
+    // =========================================================================
+    // Vm-fixed bus mask (pv ∪ slack_ids, built once at construction) --
+    // consulted by set_gen_v() below. See that method's own doc.
+    // =========================================================================
+    std::vector<char> h_is_vm_fixed_bus_;
+
+    // =========================================================================
+    // Host generator target-voltage override (set_gen_v()) -- optional; see
+    // that method's own doc. Empty (has_gen_v_ == false) means every row
+    // keeps using the grid's own base-case voltage, exactly as before this
+    // setter existed.
+    // =========================================================================
+    Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> gen_v_;
+    Eigen::VectorXi gen_bus_;
+    bool   has_gen_v_        = false;
 
     // =========================================================================
     // Host branch data (stored for compute_flows())
@@ -174,6 +191,34 @@ struct InjectionSweepSession {
         Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> q_mvar,
         double sn_mva
     );
+
+    // =========================================================================
+    // set_gen_v
+    //   Per-scenario generator target voltage magnitude (vm_pu, NOT kV),
+    //   (n_scenarios x n_gen). Unlike set_injections(), this does NOT feed
+    //   Sbus -- it only re-seeds |V| at each generator's own AC-solver bus
+    //   (gen_bus[g]) right before that chunk's solve, keeping whatever angle
+    //   is already there, and ONLY for generators whose own bus is Vm-fixed
+    //   (a member of h_is_vm_fixed_bus_, built from this session's pv ∪
+    //   slack_ids at construction). A PV/slack bus's magnitude is never part
+    //   of Newton-Raphson's unknown vector in either the bare or the
+    //   augmented-ledger system, so it never moves once seeded -- this
+    //   mirrors lightsim2grid's own modify_gen_v /
+    //   GeneratorContainer::set_vm exactly. A generator that is disconnected,
+    //   reactive-only ("PQ"), or remotely voltage-regulating (SVC /
+    //   VoltageControl -- PQ-classified with its own border row, so never in
+    //   pv/slack) is silently ignored, matching lightsim2grid's own
+    //   voltage_regulator_on_-gated skip. NaN entries in gen_v leave that
+    //   (row, gen) untouched. Left unset entirely (the default), every row
+    //   keeps the grid's own base-case voltage.
+    //   gen_bus must have one entry per generator (AC-solver bus id, -1 for
+    //   a disconnected generator). May be called repeatedly, and in either
+    //   order relative to set_injections() -- the row count is only checked
+    //   against set_injections()'s n_scenarios at the next run().
+    // =========================================================================
+    void set_gen_v(
+        Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> gen_v,
+        Eigen::Ref<const Eigen::VectorXi> gen_bus);
 
     // =========================================================================
     // set_branch_data

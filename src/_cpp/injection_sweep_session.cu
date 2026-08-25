@@ -10,6 +10,7 @@
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/injection_batch.cuh"
+#include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
@@ -65,7 +66,6 @@ InjectionSweepSession::InjectionSweepSession(
     , max_dVa_(max_dVa)
     , max_dVm_(max_dVm)
 {
-    (void)slack_ids;
     (void)slack_weights;
 
     auto t_base_start = std::chrono::steady_clock::now();
@@ -79,6 +79,42 @@ InjectionSweepSession::InjectionSweepSession(
         debug_base_case, /*base_case_only=*/true,
         scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
+
+    // Vm-fixed bus mask for set_gen_v(): a bus in pv or slack_ids has |V|
+    // fixed by construction (not an NR unknown) in both the bare and the
+    // augmented-ledger system -- see set_gen_v()'s own doc.
+    {
+        const int n_bus = base_state_->n_bus;
+        h_is_vm_fixed_bus_.assign(static_cast<size_t>(n_bus), 0);
+        for (Eigen::Index i = 0; i < pv.size(); ++i) {
+            const int b = pv(i);
+            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
+        }
+        for (Eigen::Index i = 0; i < slack_ids.size(); ++i) {
+            const int b = slack_ids(i);
+            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
+        }
+    }
+}
+
+// =============================================================================
+// set_gen_v
+// =============================================================================
+void InjectionSweepSession::set_gen_v(
+    Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> gen_v,
+    Eigen::Ref<const Eigen::VectorXi> gen_bus)
+{
+    if (gen_v.cols() != gen_bus.size())
+        throw std::runtime_error(
+            "InjectionSweepSession::set_gen_v: gen_v's column count must "
+            "equal gen_bus's length (one entry per generator)");
+    if (gen_v.rows() <= 0)
+        throw std::runtime_error(
+            "InjectionSweepSession::set_gen_v: n_scenarios must be > 0");
+
+    gen_v_     = gen_v;
+    gen_bus_   = gen_bus;
+    has_gen_v_ = true;
 }
 
 // =============================================================================
@@ -120,6 +156,12 @@ void InjectionSweepSession::run()
         throw std::runtime_error(
             "InjectionSweepSession: call set_injections() before run()");
 
+    if (has_gen_v_ && static_cast<int>(gen_v_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "InjectionSweepSession: set_gen_v()'s row count no longer "
+            "matches set_injections()'s n_scenarios -- call set_gen_v() "
+            "again after changing set_injections()");
+
     const int n_bus = base_state_->n_bus;
 
     // Effective per-chunk batch size: balance the last chunk (same rule as
@@ -147,7 +189,12 @@ void InjectionSweepSession::run()
     }
     t_sbus_build_ms_ = ms_since(t_sbus_start);
 
-    InjectionBatch source(std::move(h_Sbus_all), n_scenarios_, t_sbus_build_ms_);
+    GenVOverride gen_v_override;
+    if (has_gen_v_)
+        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_);
+
+    InjectionBatch source(std::move(h_Sbus_all), n_scenarios_, t_sbus_build_ms_,
+                          std::move(gen_v_override));
 
     // (Re-)construct the solver — allows run() to be called multiple times.
     solver_ = std::make_unique<InjectionSweepSolver>(

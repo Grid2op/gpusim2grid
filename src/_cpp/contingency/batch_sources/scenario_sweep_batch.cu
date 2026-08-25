@@ -69,6 +69,14 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     }
     upload_h2d(d_Sbus_all, h_Sbus_all_.data(), h_Sbus_all_.size(), cs);
     d_Sbus_batch.resize(static_cast<size_t>(ctx.batch_size) * ctx.n_bus);
+
+    // set_gen_v() overrides, if any -- see GenVOverride's own doc.
+    if (gen_v_override_.k_active() > 0) {
+        upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
+                   gen_v_override_.h_active_bus.size(), cs);
+        upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
+                   gen_v_override_.h_gen_v_all.size(), cs);
+    }
 }
 
 // =============================================================================
@@ -76,7 +84,7 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
 // =============================================================================
 void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
                                             int                  chunk_idx,
-                                            int                  /*actual_batch*/,
+                                            int                  actual_batch,
                                             cudaStream_t         cs,
                                             CudaTimer&           timer,
                                             BatchTimings&  t)
@@ -128,6 +136,19 @@ void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
         }
     }
     t.t_patch_Ybus += timer.stop_ms();
+
+    // ④  Re-seed generator target voltages (set_gen_v()), if configured.
+    //     Rows here are already in active-slot order (see the ctor), so the
+    //     row offset is a plain chunk*batch_size slice, same as ③ above.
+    if (gen_v_override_.k_active() > 0) {
+        const int k = gen_v_override_.k_active();
+        const int row_offset = chunk_idx * ctx.batch_size;
+        apply_gen_v_kernel<<<nr_grid_size((long long)actual_batch * k, BS), BS, 0, cs>>>(
+            ctx.d_V_batch,
+            thrust::raw_pointer_cast(d_gv_all.data()),
+            thrust::raw_pointer_cast(d_gv_active_bus.data()),
+            row_offset, k, actual_batch, ctx.n_bus);
+    }
 }
 
 // =============================================================================

@@ -72,6 +72,40 @@ __global__ void apply_contingencies_kernel(
     int n_updates);
 
 // ---------------------------------------------------------------------------
+// apply_gen_v_kernel
+//
+// Re-seeds |V| at each (chunk-relative row, active generator) pair to the
+// caller's target vm_pu, keeping whatever angle tile_V already wrote there --
+// mirrors lightsim2grid's GeneratorContainer::set_vm / modify_gen_v: a
+// PV/slack bus's magnitude is never part of the NR unknown vector, so this is
+// a value-only reseed of the initial guess, not a Jacobian change. One thread
+// per (row, active generator) pair; d_active_bus/d_gen_v_all only ever list
+// generators whose own bus is Vm-fixed (see GenVOverride's own doc), so no
+// bus-type check is needed here.
+//
+// Parameters
+// ----------
+// d_V_batch    : [actual_batch * n_bus] complex — already tiled from base V
+// d_gen_v_all  : [n_rows * k_active] real, row-major, row = GLOBAL scenario
+//                index (row_offset..row_offset+actual_batch); NaN = leave
+//                this (row, gen) untouched
+// d_active_bus : [k_active] — AC-solver bus id of each active generator
+//                column, same order as d_gen_v_all's columns
+// row_offset   : first global row covered by this chunk
+// k_active     : number of active generator columns
+// actual_batch : batch slots actually used in this chunk
+// n_bus        : bus count (d_V_batch's per-row stride)
+// ---------------------------------------------------------------------------
+__global__ void apply_gen_v_kernel(
+          cudaComplexType* __restrict__ d_V_batch,
+    const cuda_real_type*  __restrict__ d_gen_v_all,
+    const int*              __restrict__ d_active_bus,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_bus);
+
+// ---------------------------------------------------------------------------
 // fill_FP_kernel
 //
 // Stores −ΔP at the ledger P-equation row of each P bus.

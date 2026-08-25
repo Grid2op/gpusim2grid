@@ -138,6 +138,22 @@ struct ScenarioSweepSession {
     bool   has_injections_ = false;
 
     // =========================================================================
+    // Vm-fixed bus mask (pv ∪ slack_ids, built once at construction) --
+    // consulted by set_gen_v() below. See that method's own doc.
+    // =========================================================================
+    std::vector<char> h_is_vm_fixed_bus_;
+
+    // =========================================================================
+    // Host generator target-voltage override (set_gen_v()) -- optional; see
+    // that method's own doc. Empty (has_gen_v_ == false) means every row
+    // keeps using the grid's own base-case voltage, exactly as before this
+    // setter existed.
+    // =========================================================================
+    Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> gen_v_;
+    Eigen::VectorXi gen_bus_;
+    bool   has_gen_v_      = false;
+
+    // =========================================================================
     // Host topology data (set_topology()) — one Contingency (and tripped-
     // branch list, for compute_flows' zero-flow step) per scenario, row-
     // aligned with p_mw_/q_mvar_. has_topology_ == false means "run()
@@ -220,6 +236,18 @@ struct ScenarioSweepSession {
     // branches tripped".
     // =========================================================================
     void set_topology(const std::vector<std::vector<int>>& branch_ids_per_scenario);
+
+    // =========================================================================
+    // set_gen_v -- see InjectionSweepSession::set_gen_v's doc (identical
+    // semantics: NOT fed into Sbus, only re-seeds |V| at each generator's own
+    // Vm-fixed bus right before that scenario's solve; a disconnected,
+    // reactive-only, or remotely voltage-regulating generator's column is
+    // silently ignored). May be called repeatedly, and in either order
+    // relative to set_injections().
+    // =========================================================================
+    void set_gen_v(
+        Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> gen_v,
+        Eigen::Ref<const Eigen::VectorXi> gen_bus);
 
     // =========================================================================
     // run — constructs BatchPfDriver<ScenarioSweepBatch> + runs the chunk

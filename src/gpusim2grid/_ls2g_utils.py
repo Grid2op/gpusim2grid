@@ -220,6 +220,11 @@ class InjectionElements:
     # HVDC converter stations, static gens, storages, REACTIVE_POWER-mode SVCs,
     # and the Q of non-voltage-regulating ("PQ") generators.
     const_mw: np.ndarray
+    # (n_gen,) AC-solver bus id of every generator, -1 for a disconnected one
+    # (deliberately, not its stale model bus id -- see set_gen_v()'s doc on
+    # why a disconnected generator's column must never alias a still-connected
+    # one's bus). Used by ScenarioSweepGPU.set_gen_v() / InjectionSweepGPU.set_gen_v().
+    gen_bus: np.ndarray
 
 
 def extract_injection_elements(grid, n_bus):
@@ -305,12 +310,14 @@ def extract_injection_elements(grid, n_bus):
     const_mw += scatter_load @ (load_p_base[load_sel]
                                 + 1j * load_q_base[load_sel])
 
+    gen_bus_out = np.where(gen_status, gen_bus, -1)
+
     return InjectionElements(
         n_load=n_load, n_gen=n_gen, n_bus=int(n_bus),
         sn_mva=float(grid.get_sn_mva()),
         load_sel=load_sel, gen_sel=gen_sel,
         scatter_load=scatter_load, scatter_gen=scatter_gen,
-        const_mw=const_mw)
+        const_mw=const_mw, gen_bus=gen_bus_out)
 
 
 def build_bus_injections(elements, load_p, load_q, gen_p):
