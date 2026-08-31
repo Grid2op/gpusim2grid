@@ -284,9 +284,11 @@ NVIDIA CUDA libraries (CUDA Toolkit, cuDSS, cuSPARSE) are dependencies, not
 redistributed components, and remain under their respective NVIDIA licenses. DLPack is
 used under its own [license](https://github.com/dmlc/dlpack/blob/main/LICENSE).
 
-## Acknowledgements
+<!-- ## Acknowledgements
+
+REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
 
 Developed at RTE. Part of the [Grid2Op](https://github.com/Grid2Op) ecosystem and built
 on [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid). Uses
 [Eigen](https://eigen.tuxfamily.org), [KLU](https://github.com/DrTimothyAldenDavis/SuiteSparse),
-[cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE.
+[cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. -->
