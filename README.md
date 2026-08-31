@@ -277,8 +277,8 @@ simply have not had the time to implement them yet:
 Licensed under the **Mozilla Public License 2.0 (MPL-2.0)** — see [`LICENSE`](LICENSE)
 and [`DISCLAIMER.md`](DISCLAIMER.md).
 
-Copyright © RTE (<https://www.rte-france.com>). Released as part of the
-[Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem.
+Copyright © <!--RTE (<https://www.rte-france.com>) REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER --> . Released as part of the
+[Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem. 
 
 NVIDIA CUDA libraries (CUDA Toolkit, cuDSS, cuSPARSE) are dependencies, not
 redistributed components, and remain under their respective NVIDIA licenses. DLPack is
