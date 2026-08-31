@@ -1,8 +1,19 @@
-import subprocess
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ 
+"""One time conversion from .m file to .mat file (required for pypowsybl / OLF).
+
+This uses octave with an installed matpower version.
+
+This should be run from python.
+"""
+
 import subprocess
 from pathlib import Path
 
-MATPOWER_PATH = "/home/donnotben/Téléchargements/matpower"
+MATPOWER_PATH = "/FULL/PATH/TO/MATPOWER/INSTALL/matpower"
 
 for el in sorted(Path(".").glob("*.m")):
     case_nm = el.stem
