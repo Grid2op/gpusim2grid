@@ -234,3 +234,4 @@ docs/lightsim2grid_requirements.md
 20260831_neurips_paper/matpowerdata/*.m
 20260831_neurips_paper/matpowerdata/*.json
 20260831_neurips_paper/matpowerdata/*.mat
+20260831_neurips_paper/raw_results/*.json

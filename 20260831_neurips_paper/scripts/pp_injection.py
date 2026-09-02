@@ -454,10 +454,17 @@ def run_loop_mode_mp(net, pp_load_p, pp_load_q, pp_gen_p, n_load, bus_sgen_idx, 
     be shared across workers) and independently run run_loop_mode() over a contiguous slice
     of the scenarios, then results are merged -- the same contiguous-chunk-per-worker
     pattern exapf_injection.jl's process_chunk_group/split_into_groups use for --nthreads.
+
+    wall_time excludes the per-worker copy.deepcopy(net) and process-pool spawn -- these are
+    this backend's equivalent of the one-time "worker init" cost olf_injection.py's
+    run_multiprocess() excludes via its Barrier (there, loading the Network + warm-up
+    run_ac(); here, handing each already-warmed-up net to its worker) -- so the clock starts
+    right before pool.starmap() dispatches the actual (already-copied, already-spawned)
+    workers, timing only the scenario-solving itself.
     """
     nb_scen = pp_load_p.shape[0]
-    beg = time.perf_counter()
     if nb_threads <= 1:
+        beg = time.perf_counter()
         res, voltages = run_loop_mode(
             net, pp_load_p, pp_load_q, pp_gen_p, n_load, bus_sgen_idx, tol_pf, compute_voltages,
             pp_backend_kwargs)
@@ -472,6 +479,7 @@ def run_loop_mode_mp(net, pp_load_p, pp_load_q, pp_gen_p, n_load, bus_sgen_idx, 
         for lo, hi in chunks
     ]
     with multiprocessing.Pool(processes=len(tasks)) as pool:
+        beg = time.perf_counter()
         results = pool.starmap(run_loop_mode, tasks)
     wall_time = time.perf_counter() - beg
 
