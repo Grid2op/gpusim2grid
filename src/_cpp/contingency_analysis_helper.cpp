@@ -43,15 +43,32 @@ Contingency build_contingency_from_branch_ids(
         const int i = branch_from(l);
         const int j = branch_to(l);
 
+        // A negative endpoint means that side of the branch is isolated in
+        // the AC-solver's bus numbering (id_me_to_ac_solver relabels an
+        // unattached bus to a negative id -- e.g. the open side of a
+        // half-open line with keep_half_open_lines=True). Such a bus has no
+        // row/col in Ybus_solver at all, so there is nothing to patch there:
+        // emitting a triplet for it would make resolve_indices()'s
+        // csr_find_k() index row_ptr[negative] (UB) and produce a garbage
+        // flat CSR index downstream. Skip any triplet touching that endpoint;
+        // the branch's contribution at its still-connected endpoint (if any)
+        // is preserved.
+        const bool i_valid = i >= 0;
+        const bool j_valid = j >= 0;
+
         // π-model Ybus modifications to SUBTRACT for this branch trip:
         //   (i,i) → yff   (ii self-admittance at from-bus)
         //   (j,j) → ytt   (jj self-admittance at to-bus)
         //   (i,j) → yft   (ij mutual admittance)
         //   (j,i) → ytf   (ji mutual admittance)
-        ctg.triplets.push_back({i, i,  yff(l).real(),  yff(l).imag()});
-        ctg.triplets.push_back({j, j,  ytt(l).real(),  ytt(l).imag()});
-        ctg.triplets.push_back({i, j,  yft(l).real(),  yft(l).imag()});
-        ctg.triplets.push_back({j, i,  ytf(l).real(),  ytf(l).imag()});
+        if (i_valid)
+            ctg.triplets.push_back({i, i,  yff(l).real(),  yff(l).imag()});
+        if (j_valid)
+            ctg.triplets.push_back({j, j,  ytt(l).real(),  ytt(l).imag()});
+        if (i_valid && j_valid) {
+            ctg.triplets.push_back({i, j,  yft(l).real(),  yft(l).imag()});
+            ctg.triplets.push_back({j, i,  ytf(l).real(),  ytf(l).imag()});
+        }
     }
     return ctg;
 }
