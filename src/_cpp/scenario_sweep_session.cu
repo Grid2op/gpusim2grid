@@ -151,19 +151,19 @@ void ScenarioSweepSession::set_gen_v(
 void ScenarioSweepSession::set_branch_data(
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect>        yff,
-    Eigen::Ref<const CplxVect>        yft,
-    Eigen::Ref<const CplxVect>        ytf,
-    Eigen::Ref<const CplxVect>        ytt,
+    Eigen::Ref<const CplxVect>        yff_eff,
+    Eigen::Ref<const CplxVect>        yft_eff,
+    Eigen::Ref<const CplxVect>        ytf_eff,
+    Eigen::Ref<const CplxVect>        ytt_eff,
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double sn_mva)
 {
     h_branch_from_   = branch_from;
     h_branch_to_     = branch_to;
-    h_yff_           = yff;
-    h_yft_           = yft;
-    h_ytf_           = ytf;
-    h_ytt_           = ytt;
+    h_yff_eff_           = yff_eff;
+    h_yft_eff_           = yft_eff;
+    h_ytf_eff_           = ytf_eff;
+    h_ytt_eff_           = ytt_eff;
     h_bus_vn_kv_     = bus_vn_kv;
     sn_mva_          = sn_mva;
     has_branch_data_ = true;
@@ -223,7 +223,7 @@ void ScenarioSweepSession::set_topology(
         contingencies_.push_back(build_contingency_from_branch_ids(
             branch_ids,
             h_branch_from_, h_branch_to_,
-            h_yff_, h_yft_, h_ytf_, h_ytt_));
+            h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_));
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
     has_topology_ = true;
@@ -375,7 +375,7 @@ void ScenarioSweepSession::run()
                 "set_limits() to have been called first.");
 
         solver_->upload_branch_admittances(
-            h_branch_from_, h_branch_to_, h_yff_, h_yft_, h_ytf_, h_ytt_,
+            h_branch_from_, h_branch_to_, h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_,
             h_bus_vn_kv_, sn_mva_);
         t_admittance_upload_ms = solver_->branch_data_upload_ms();
 
@@ -427,7 +427,7 @@ void ScenarioSweepSession::compute_flows()
 
     solver_->set_branch_data(
         h_branch_from_, h_branch_to_,
-        h_yff_, h_yft_, h_ytf_, h_ytt_,
+        h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_,
         h_bus_vn_kv_, sn_mva_);
     timings_.t_branch_data_upload_ms += solver_->branch_data_upload_ms();
 
@@ -444,10 +444,10 @@ void ScenarioSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
         thrust::raw_pointer_cast(solver_->d_branch_from.data()),
         thrust::raw_pointer_cast(solver_->d_branch_to.data()),
-        thrust::raw_pointer_cast(solver_->d_yff.data()),
-        thrust::raw_pointer_cast(solver_->d_yft.data()),
-        thrust::raw_pointer_cast(solver_->d_ytf.data()),
-        thrust::raw_pointer_cast(solver_->d_ytt.data()),
+        thrust::raw_pointer_cast(solver_->d_yff_eff.data()),
+        thrust::raw_pointer_cast(solver_->d_yft_eff.data()),
+        thrust::raw_pointer_cast(solver_->d_ytf_eff.data()),
+        thrust::raw_pointer_cast(solver_->d_ytt_eff.data()),
         thrust::raw_pointer_cast(solver_->d_base_current_A.data()),
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),

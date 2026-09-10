@@ -84,7 +84,7 @@ Eigen::VectorXi concat_busids_to_solver(
 // Pull the eight set_branch_data() arguments off the grid (lines then trafos).
 struct BranchData {
     Eigen::VectorXi branch_from, branch_to;
-    CplxVect        yff, yft, ytf, ytt;
+    CplxVect        yff_eff, yft_eff, ytf_eff, ytt_eff;
     RealVect        bus_vn_kv;
     double          sn_mva;
 };
@@ -104,10 +104,10 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid, int n_bus_solver)
     bd.branch_to = concat_busids_to_solver(
         lines.get_bus_id_side_2_numpy(), trafos.get_bus_id_side_2_numpy(),
         me_to_solver);
-    bd.yff = concat_cplx(lines.yac_eff_11(), trafos.yac_eff_11());
-    bd.yft = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
-    bd.ytf = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
-    bd.ytt = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
+    bd.yff_eff = concat_cplx(lines.yac_eff_11(), trafos.yac_eff_11());
+    bd.yft_eff = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
+    bd.ytf_eff = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
+    bd.ytt_eff = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
     // bus_vn_kv must be relabeled global(model)->AC-solver the same way
     // branch_from/branch_to above and bus_vmin_kv/bus_vmax_kv in
     // extract_limits() are, or it silently pairs the wrong nominal voltage
@@ -657,7 +657,7 @@ make_ca_session_from_lsgrid(
 
     BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
     session->set_branch_data(bd.branch_from, bd.branch_to,
-                             bd.yff, bd.yft, bd.ytf, bd.ytt,
+                             bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
 
     if (compute_limit_violations) {
@@ -725,7 +725,7 @@ make_is_session_from_lsgrid(
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
         session->set_branch_data(bd.branch_from, bd.branch_to,
-                                 bd.yff, bd.yft, bd.ytf, bd.ytt,
+                                 bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                                  bd.bus_vn_kv, bd.sn_mva);
     }
     return session;
@@ -780,7 +780,7 @@ make_ss_session_from_lsgrid(
     // scenario's Ybus triplets, not just compute_flows().
     BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
     session->set_branch_data(bd.branch_from, bd.branch_to,
-                             bd.yff, bd.yft, bd.ytf, bd.ytt,
+                             bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
 
     if (compute_limit_violations) {

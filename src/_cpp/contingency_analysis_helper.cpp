@@ -23,10 +23,10 @@ Contingency build_contingency_from_branch_ids(
     const std::vector<int>&   branch_ids,
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect> yff,
-    Eigen::Ref<const CplxVect> yft,
-    Eigen::Ref<const CplxVect> ytf,
-    Eigen::Ref<const CplxVect> ytt)
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff)
 {
     const int n_branches = static_cast<int>(branch_from.size());
 
@@ -56,17 +56,17 @@ Contingency build_contingency_from_branch_ids(
         const bool j_valid = j >= 0;
 
         // π-model Ybus modifications to SUBTRACT for this branch trip:
-        //   (i,i) → yff   (ii self-admittance at from-bus)
-        //   (j,j) → ytt   (jj self-admittance at to-bus)
-        //   (i,j) → yft   (ij mutual admittance)
-        //   (j,i) → ytf   (ji mutual admittance)
+        //   (i,i) → yff_eff   (ii self-admittance at from-bus)
+        //   (j,j) → ytt_eff   (jj self-admittance at to-bus)
+        //   (i,j) → yft_eff   (ij mutual admittance)
+        //   (j,i) → ytf_eff   (ji mutual admittance)
         if (i_valid)
-            ctg.triplets.push_back({i, i,  yff(l).real(),  yff(l).imag()});
+            ctg.triplets.push_back({i, i,  yff_eff(l).real(),  yff_eff(l).imag()});
         if (j_valid)
-            ctg.triplets.push_back({j, j,  ytt(l).real(),  ytt(l).imag()});
+            ctg.triplets.push_back({j, j,  ytt_eff(l).real(),  ytt_eff(l).imag()});
         if (i_valid && j_valid) {
-            ctg.triplets.push_back({i, j,  yft(l).real(),  yft(l).imag()});
-            ctg.triplets.push_back({j, i,  ytf(l).real(),  ytf(l).imag()});
+            ctg.triplets.push_back({i, j,  yft_eff(l).real(),  yft_eff(l).imag()});
+            ctg.triplets.push_back({j, i,  ytf_eff(l).real(),  ytf_eff(l).imag()});
         }
     }
     return ctg;

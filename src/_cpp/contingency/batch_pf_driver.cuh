@@ -188,10 +188,10 @@ struct BatchPfDriver {
 
     thrust::device_vector<int>             d_branch_from;
     thrust::device_vector<int>             d_branch_to;
-    thrust::device_vector<cudaComplexType> d_yff;
-    thrust::device_vector<cudaComplexType> d_yft;
-    thrust::device_vector<cudaComplexType> d_ytf;
-    thrust::device_vector<cudaComplexType> d_ytt;
+    thrust::device_vector<cudaComplexType> d_yff_eff;
+    thrust::device_vector<cudaComplexType> d_yft_eff;
+    thrust::device_vector<cudaComplexType> d_ytf_eff;
+    thrust::device_vector<cudaComplexType> d_ytt_eff;
     thrust::device_vector<cuda_real_type>  d_base_current_A;
     thrust::device_vector<cuda_real_type>  d_bus_vn_kv;   // [n_bus], per-bus nominal kV
 
@@ -307,20 +307,20 @@ struct BatchPfDriver {
     void upload_branch_admittances(
         Eigen::Ref<const Eigen::VectorXi> branch_from,
         Eigen::Ref<const Eigen::VectorXi> branch_to,
-        Eigen::Ref<const CplxVect>        yff,
-        Eigen::Ref<const CplxVect>        yft,
-        Eigen::Ref<const CplxVect>        ytf,
-        Eigen::Ref<const CplxVect>        ytt,
+        Eigen::Ref<const CplxVect>        yff_eff,
+        Eigen::Ref<const CplxVect>        yft_eff,
+        Eigen::Ref<const CplxVect>        ytf_eff,
+        Eigen::Ref<const CplxVect>        ytt_eff,
         Eigen::Ref<const RealVect>        bus_vn_kv,
         double                            sn_mva);
 
     void set_branch_data(
         Eigen::Ref<const Eigen::VectorXi> branch_from,
         Eigen::Ref<const Eigen::VectorXi> branch_to,
-        Eigen::Ref<const CplxVect>        yff,
-        Eigen::Ref<const CplxVect>        yft,
-        Eigen::Ref<const CplxVect>        ytf,
-        Eigen::Ref<const CplxVect>        ytt,
+        Eigen::Ref<const CplxVect>        yff_eff,
+        Eigen::Ref<const CplxVect>        yft_eff,
+        Eigen::Ref<const CplxVect>        ytf_eff,
+        Eigen::Ref<const CplxVect>        ytt_eff,
         Eigen::Ref<const RealVect>        bus_vn_kv,
         double                            sn_mva);
 

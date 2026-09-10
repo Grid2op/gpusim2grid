@@ -369,10 +369,10 @@ template <typename BatchSource>
 void BatchPfDriver<BatchSource>::upload_branch_admittances(
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect>        yff,
-    Eigen::Ref<const CplxVect>        yft,
-    Eigen::Ref<const CplxVect>        ytf,
-    Eigen::Ref<const CplxVect>        ytt,
+    Eigen::Ref<const CplxVect>        yff_eff,
+    Eigen::Ref<const CplxVect>        yft_eff,
+    Eigen::Ref<const CplxVect>        ytf_eff,
+    Eigen::Ref<const CplxVect>        ytt_eff,
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double                            sn_mva)
 {
@@ -418,26 +418,26 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
     }
 
     {
-        std::vector<cudaComplexType> h_yff(n_branches_), h_yft(n_branches_),
-                                     h_ytf(n_branches_), h_ytt(n_branches_);
+        std::vector<cudaComplexType> h_yff_eff(n_branches_), h_yft_eff(n_branches_),
+                                     h_ytf_eff(n_branches_), h_ytt_eff(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
-            h_yff[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(yff(l).real()),
-                static_cast<cuda_real_type>(yff(l).imag()));
-            h_yft[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(yft(l).real()),
-                static_cast<cuda_real_type>(yft(l).imag()));
-            h_ytf[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(ytf(l).real()),
-                static_cast<cuda_real_type>(ytf(l).imag()));
-            h_ytt[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(ytt(l).real()),
-                static_cast<cuda_real_type>(ytt(l).imag()));
+            h_yff_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(yff_eff(l).real()),
+                static_cast<cuda_real_type>(yff_eff(l).imag()));
+            h_yft_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(yft_eff(l).real()),
+                static_cast<cuda_real_type>(yft_eff(l).imag()));
+            h_ytf_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(ytf_eff(l).real()),
+                static_cast<cuda_real_type>(ytf_eff(l).imag()));
+            h_ytt_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(ytt_eff(l).real()),
+                static_cast<cuda_real_type>(ytt_eff(l).imag()));
         }
-        upload_h2d(d_yff, h_yff.data(), n_branches_, cs);
-        upload_h2d(d_yft, h_yft.data(), n_branches_, cs);
-        upload_h2d(d_ytf, h_ytf.data(), n_branches_, cs);
-        upload_h2d(d_ytt, h_ytt.data(), n_branches_, cs);
+        upload_h2d(d_yff_eff, h_yff_eff.data(), n_branches_, cs);
+        upload_h2d(d_yft_eff, h_yft_eff.data(), n_branches_, cs);
+        upload_h2d(d_ytf_eff, h_ytf_eff.data(), n_branches_, cs);
+        upload_h2d(d_ytt_eff, h_ytt_eff.data(), n_branches_, cs);
     }
 
     // Full per-bus nominal kV (distinct from the per-branch-endpoint use above
@@ -460,14 +460,14 @@ template <typename BatchSource>
 void BatchPfDriver<BatchSource>::set_branch_data(
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect>        yff,
-    Eigen::Ref<const CplxVect>        yft,
-    Eigen::Ref<const CplxVect>        ytf,
-    Eigen::Ref<const CplxVect>        ytt,
+    Eigen::Ref<const CplxVect>        yff_eff,
+    Eigen::Ref<const CplxVect>        yft_eff,
+    Eigen::Ref<const CplxVect>        ytf_eff,
+    Eigen::Ref<const CplxVect>        ytt_eff,
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double                            sn_mva)
 {
-    upload_branch_admittances(branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva);
+    upload_branch_admittances(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva);
 
     d_or_amps_results.assign(
         static_cast<size_t>(n_contingencies) * n_branches_, cuda_real_type(0));
@@ -831,10 +831,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_bus_vmax_kv.data()),
             thrust::raw_pointer_cast(d_branch_from.data()),
             thrust::raw_pointer_cast(d_branch_to.data()),
-            thrust::raw_pointer_cast(d_yff.data()),
-            thrust::raw_pointer_cast(d_yft.data()),
-            thrust::raw_pointer_cast(d_ytf.data()),
-            thrust::raw_pointer_cast(d_ytt.data()),
+            thrust::raw_pointer_cast(d_yff_eff.data()),
+            thrust::raw_pointer_cast(d_yft_eff.data()),
+            thrust::raw_pointer_cast(d_ytf_eff.data()),
+            thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
             thrust::raw_pointer_cast(d_branch_limit_a1_ka.data()),
             thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
@@ -885,10 +885,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_branch_from.data()),
             thrust::raw_pointer_cast(d_branch_to.data()),
-            thrust::raw_pointer_cast(d_yff.data()),
-            thrust::raw_pointer_cast(d_yft.data()),
-            thrust::raw_pointer_cast(d_ytf.data()),
-            thrust::raw_pointer_cast(d_ytt.data()),
+            thrust::raw_pointer_cast(d_yff_eff.data()),
+            thrust::raw_pointer_cast(d_yft_eff.data()),
+            thrust::raw_pointer_cast(d_ytf_eff.data()),
+            thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
             thrust::raw_pointer_cast(d_or_amps_results.data()),
             thrust::raw_pointer_cast(d_ex_amps_results.data()),

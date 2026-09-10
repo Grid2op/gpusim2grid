@@ -151,10 +151,10 @@ def branch_triplets(gridmodel, branch_id: int, *, is_powerline: bool = True):
     branch = (gridmodel.get_lines() if is_powerline else gridmodel.get_trafos())[branch_id]
     i, j = branch.bus1_id, branch.bus2_id
     return [
-        (i, i, branch.yac_11.real, branch.yac_11.imag),
-        (j, j, branch.yac_22.real, branch.yac_22.imag),
-        (i, j, branch.yac_12.real, branch.yac_12.imag),
-        (j, i, branch.yac_21.real, branch.yac_21.imag),
+        (i, i, branch.yac_eff_11.real, branch.yac_eff_11.imag),
+        (j, j, branch.yac_eff_22.real, branch.yac_eff_22.imag),
+        (i, j, branch.yac_eff_12.real, branch.yac_eff_12.imag),
+        (j, i, branch.yac_eff_21.real, branch.yac_eff_21.imag),
     ]
 
 
@@ -170,13 +170,13 @@ def branch_data_arrays(grid):
     trafos = grid.get_trafos()
     branch_from = np.concatenate((lines.get_bus_id_side_1(),  trafos.get_bus_id_side_1()))
     branch_to   = np.concatenate((lines.get_bus_id_side_2(),  trafos.get_bus_id_side_2()))
-    yff = np.concatenate((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11().copy()))
-    yft = np.concatenate((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12().copy()))
-    ytf = np.concatenate((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
-    ytt = np.concatenate((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
+    yff_eff = np.concatenate((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11().copy()))
+    yft_eff = np.concatenate((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12().copy()))
+    ytf_eff = np.concatenate((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
+    ytt_eff = np.concatenate((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
     vn_kv  = grid.get_bus_vn_kv().copy()
     sn_mva = grid.get_sn_mva()
-    branch_data = (branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
+    branch_data = (branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, vn_kv, sn_mva)
     return branch_data, len(lines), len(trafos)
 
 
@@ -185,13 +185,13 @@ def branch_eff_triplet(branch_data, c):
     effective admittances in branch_data.  Subtracting them from Ybus removes
     branch c — matching the patch _ContingencyAnalysisSolver applies internally.
     """
-    branch_from, branch_to, yff, yft, ytf, ytt = branch_data[:6]
+    branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff = branch_data[:6]
     i, j = int(branch_from[c]), int(branch_to[c])
     return [
-        (i, i, yff[c].real, yff[c].imag),
-        (j, j, ytt[c].real, ytt[c].imag),
-        (i, j, yft[c].real, yft[c].imag),
-        (j, i, ytf[c].real, ytf[c].imag),
+        (i, i, yff_eff[c].real, yff_eff[c].imag),
+        (j, j, ytt_eff[c].real, ytt_eff[c].imag),
+        (i, j, yft_eff[c].real, yft_eff[c].imag),
+        (j, i, ytf_eff[c].real, ytf_eff[c].imag),
     ]
 
 
@@ -266,10 +266,10 @@ def ieee14_solver_with_flows(ieee14_grid, ieee14_base_case):
 
     branch_from = np.concatenate((lines.get_bus_id_side_1(),  trafos.get_bus_id_side_1()))
     branch_to   = np.concatenate((lines.get_bus_id_side_2(),  trafos.get_bus_id_side_2()))
-    yff = np.concatenate((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()))
-    yft = np.concatenate((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()))
-    ytf = np.concatenate((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()))
-    ytt = np.concatenate((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()))
+    yff_eff = np.concatenate((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()))
+    yft_eff = np.concatenate((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()))
+    ytf_eff = np.concatenate((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()))
+    ytt_eff = np.concatenate((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()))
     vn_kv = grid.get_bus_vn_kv().copy()
     sn_mva = grid.get_sn_mva()
 
@@ -280,7 +280,7 @@ def ieee14_solver_with_flows(ieee14_grid, ieee14_base_case):
         d["slack"], d["slack_weights"], d["pv"], d["pq"],
         batch_size=5, nb_iter=10, max_iter_base=10, tol_base=1e-6,
     )
-    solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
+    solver.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, vn_kv, sn_mva)
     solver.build_contingencies(cont_branch_ids)
     solver.run()
     solver.compute_flows()

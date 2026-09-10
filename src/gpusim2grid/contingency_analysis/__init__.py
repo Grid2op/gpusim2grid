@@ -251,7 +251,7 @@ class _ContingencyAnalysisSolver:
 
         solver = _ContingencyAnalysisSolver(Ybus, Vinit, Sbus,
                                            slack_ids, slack_weights, pv, pq)
-        solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt,
+        solver.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                bus_vn_kv, sn_mva)
         solver.build_contingencies([[l] for l in range(n_lines)])
         solver.run()
@@ -475,11 +475,11 @@ class _ContingencyAnalysisSolver:
     def used_batch_size(self):
         return self._s.used_batch_size
     
-    def set_branch_data(self, branch_from, branch_to, yff, yft, ytf, ytt,
+    def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
         """Store π-model branch admittances.  Required before build_contingencies
         and compute_flows."""
-        self._s.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt,
+        self._s.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                 bus_vn_kv, sn_mva)
 
     def build_contingencies(self, branch_ids_per_ctg):

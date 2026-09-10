@@ -56,13 +56,13 @@ def _run(ieee14_base_case, ieee14_grid, branch_ids_per_ctg,
 
     branch_from = np.array([b.bus1_id for b in all_branches], dtype=np.int32)
     branch_to   = np.array([b.bus2_id for b in all_branches], dtype=np.int32)
-    yff = np.array([b.yac_11 for b in all_branches], dtype=complex)
-    yft = np.array([b.yac_12 for b in all_branches], dtype=complex)
-    ytf = np.array([b.yac_21 for b in all_branches], dtype=complex)
-    ytt = np.array([b.yac_22 for b in all_branches], dtype=complex)
+    yff_eff = np.array([b.yac_eff_11 for b in all_branches], dtype=complex)
+    yft_eff = np.array([b.yac_eff_12 for b in all_branches], dtype=complex)
+    ytf_eff = np.array([b.yac_eff_21 for b in all_branches], dtype=complex)
+    ytt_eff = np.array([b.yac_eff_22 for b in all_branches], dtype=complex)
     bus_vn_kv = ieee14_grid.get_bus_vn_kv().astype(float)
 
-    solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, 100.0)
+    solver.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, 100.0)
     solver.build_contingencies(branch_ids_per_ctg)
     solver.strategy = strategy
     solver.refactor_period = refactor_period
@@ -291,17 +291,17 @@ class TestDirectRefactorEveryN:
 
         branch_from = np.array([b.bus1_id for b in all_branches], dtype=np.int32)
         branch_to   = np.array([b.bus2_id for b in all_branches], dtype=np.int32)
-        yff = np.array([b.yac_11 for b in all_branches], dtype=complex)
-        yft = np.array([b.yac_12 for b in all_branches], dtype=complex)
-        ytf = np.array([b.yac_21 for b in all_branches], dtype=complex)
-        ytt = np.array([b.yac_22 for b in all_branches], dtype=complex)
+        yff_eff = np.array([b.yac_eff_11 for b in all_branches], dtype=complex)
+        yft_eff = np.array([b.yac_eff_12 for b in all_branches], dtype=complex)
+        ytf_eff = np.array([b.yac_eff_21 for b in all_branches], dtype=complex)
+        ytt_eff = np.array([b.yac_eff_22 for b in all_branches], dtype=complex)
         bus_vn_kv = ieee14_grid.get_bus_vn_kv().astype(float)
 
         solver = _ContingencyAnalysisSolver(
             d["Ybus"], d["v_init"].copy(), d["Sbus"],
             d["slack"], d["slack_weights"], d["pv"], d["pq"],
             batch_size=_BATCH_SIZE, nb_iter=_NB_ITER)
-        solver.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, 100.0)
+        solver.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, 100.0)
         solver.build_contingencies(n1_branch_ids)
         solver.strategy = 'direct_refactor_every_n'
 

@@ -48,16 +48,16 @@ def branch_data(ieee14_grid):
         np.array(lines.get_bus_id_side_2(),  dtype=np.int32),
         np.array(trafos.get_bus_id_side_2(), dtype=np.int32),
     ])
-    yff = np.concatenate([lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()])
-    yft = np.concatenate([lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()])
-    ytf = np.concatenate([lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()])
-    ytt = np.concatenate([lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()])
+    yff_eff = np.concatenate([lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()])
+    yft_eff = np.concatenate([lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()])
+    ytf_eff = np.concatenate([lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()])
+    ytt_eff = np.concatenate([lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()])
     n_branches = len(branch_from)
 
     return {
         "branch_from": branch_from,
         "branch_to":   branch_to,
-        "yff": yff, "yft": yft, "ytf": ytf, "ytt": ytt,
+        "yff_eff": yff_eff, "yft_eff": yft_eff, "ytf_eff": ytf_eff, "ytt_eff": ytt_eff,
         "vn_kv":      grid.get_bus_vn_kv().copy(),
         "sn_mva":     grid.get_sn_mva(),
         "n_branches": n_branches,
@@ -79,7 +79,7 @@ def cas_session_ran(ieee14_base_case, branch_data):
              n_ctg, 4)
     s.set_branch_data(
         b["branch_from"], b["branch_to"],
-        b["yff"], b["yft"], b["ytf"], b["ytt"],
+        b["yff_eff"], b["yft_eff"], b["ytf_eff"], b["ytt_eff"],
         b["vn_kv"], b["sn_mva"],
     )
     s.build_contingencies(b["ctg_ids"])
@@ -165,7 +165,7 @@ class TestContingencyWrapperDLPack:
         )
         s.set_branch_data(
             b["branch_from"], b["branch_to"],
-            b["yff"], b["yft"], b["ytf"], b["ytt"],
+            b["yff_eff"], b["yft_eff"], b["ytf_eff"], b["ytt_eff"],
             b["vn_kv"], b["sn_mva"],
         )
         s.build_contingencies(b["ctg_ids"])

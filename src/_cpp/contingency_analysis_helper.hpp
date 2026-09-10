@@ -103,7 +103,7 @@ struct Contingency {
     // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.
     // Used ONLY by compute_limit_violations' fused per-contingency current
     // check (see build_tripped_branch_table below) to skip branches whose
-    // Ybus coefficients were patched but whose own yff/yft/ytf/ytt are
+    // Ybus coefficients were patched but whose own yff_eff/yft_eff/ytf_eff/ytt_eff are
     // unchanged (they would otherwise report a phantom nonzero current). This
     // is a second, independent index space from Triplet::k (CSR flat index
     // into Ybus) — no interaction with resolve_indices()/build_flat_patches().
@@ -124,7 +124,7 @@ struct ChunkPatchRange {
 // ---------------------------------------------------------------------------
 // build_contingency_from_branch_ids
 //   Builds ONE Contingency's triplets from a list of tripped branch ids, given
-//   the grid's π-model admittances (branch_from/to, yff/yft/ytf/ytt — the same
+//   the grid's π-model admittances (branch_from/to, yff_eff/yft_eff/ytf_eff/ytt_eff — the same
 //   host arrays set_branch_data() stores). Shared by
 //   ContingencyAnalysisSession::build_contingencies() (one call per contingency
 //   in a set of distinct scenarios) and ScenarioSweepSession::set_topology()
@@ -142,10 +142,10 @@ Contingency build_contingency_from_branch_ids(
     const std::vector<int>&   branch_ids,
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect> yff,
-    Eigen::Ref<const CplxVect> yft,
-    Eigen::Ref<const CplxVect> ytf,
-    Eigen::Ref<const CplxVect> ytt);
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff);
 
 // ---------------------------------------------------------------------------
 // csr_find_k
