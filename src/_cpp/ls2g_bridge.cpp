@@ -352,14 +352,26 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
     LedgerData ld;
 
     // Augmented J sparsity skeleton in RowMajor CSR (structure only). get_J_solver
-    // returns the solved augmented J in lightsim2grid's default (ColMajor) storage;
-    // convert to RowMajor so outer = row (gpusim2grid's CSR convention).
-    Eigen::SparseMatrix<eigen_real_type>                  J_cm = grid.get_J_solver();
-    Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J    = J_cm;
-    J.makeCompressed();
-    ld.dim_J = static_cast<int>(J.rows());
-    ld.J_outer.assign(J.outerIndexPtr(), J.outerIndexPtr() + ld.dim_J + 1);
-    ld.J_inner.assign(J.innerIndexPtr(), J.innerIndexPtr() + J.nonZeros());
+    // hands back lightsim2grid's compressed ColMajor J; its index arrays are
+    // transposed into gpusim2grid's CSR convention (outer = row) with one
+    // counting sort -- walking the columns in order leaves every row's column
+    // indices sorted -- rather than converting through a second Eigen matrix
+    // and makeCompressed.
+    {
+        const Eigen::Ref<const Eigen::SparseMatrix<eigen_real_type>> J_cm = grid.get_J_solver();
+        ld.dim_J = static_cast<int>(J_cm.rows());
+        const int  nnz_J    = static_cast<int>(J_cm.nonZeros());
+        const int* cm_outer = J_cm.outerIndexPtr();
+        const int* cm_inner = J_cm.innerIndexPtr();
+        ld.J_outer.assign(static_cast<size_t>(ld.dim_J) + 1, 0);
+        for (int p = 0; p < nnz_J; ++p) ++ld.J_outer[static_cast<size_t>(cm_inner[p]) + 1];
+        for (int r = 0; r < ld.dim_J; ++r) ld.J_outer[r + 1] += ld.J_outer[r];
+        ld.J_inner.resize(static_cast<size_t>(nnz_J));
+        std::vector<int> head(ld.J_outer.begin(), ld.J_outer.end() - 1);
+        for (int c = 0; c < static_cast<int>(J_cm.outerSize()); ++c)
+            for (int p = cm_outer[c]; p < cm_outer[c + 1]; ++p)
+                ld.J_inner[static_cast<size_t>(head[cm_inner[p]]++)] = c;
+    }
 
     // NRLedger bus→row/col maps (solver numbering, size n_bus, -1 absent).
     ld.p_row_of_bus     = to_int_vector(grid.get_p_to_J_row_solver());

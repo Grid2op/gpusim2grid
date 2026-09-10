@@ -41,18 +41,10 @@ void InjectionBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     d_Sbus_batch.resize(static_cast<size_t>(ctx.batch_size) * ctx.n_bus);
 
     // Tile base Ybus values into every batch slot — ONCE.
-    {
-        cudaComplexType* const       dst = ctx.d_Ybus_values_batch;
-        const cudaComplexType* const src =
-            thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data());
-        const size_t nbytes = static_cast<size_t>(ctx.nnz_Y) * sizeof(cudaComplexType);
-        for (int b = 0; b < ctx.batch_size; ++b) {
-            _chk_cuda(cudaMemcpyAsync(
-                dst + static_cast<ptrdiff_t>(b) * ctx.nnz_Y,
-                src, nbytes, cudaMemcpyDeviceToDevice, cs),
-                "tile base Ybus");
-        }
-    }
+    launch_tile(ctx.d_Ybus_values_batch,
+                thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data()),
+                ctx.nnz_Y, ctx.batch_size, cs);
+    _chk_cuda(cudaGetLastError(), "tile base Ybus");
 
     // set_gen_v() overrides, if any -- see GenVOverride's own doc.
     if (gen_v_override_.k_active() > 0) {
@@ -72,18 +64,10 @@ void InjectionBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
 {
     // Tile V from base (every chunk starts from the converged base voltage).
     timer.start();
-    {
-        cudaComplexType* const       dst = ctx.d_V_batch;
-        const cudaComplexType* const src =
-            thrust::raw_pointer_cast(ctx.base.d_V_base.data());
-        const size_t nbytes = static_cast<size_t>(ctx.n_bus) * sizeof(cudaComplexType);
-        for (int b = 0; b < ctx.batch_size; ++b) {
-            _chk_cuda(cudaMemcpyAsync(
-                dst + static_cast<ptrdiff_t>(b) * ctx.n_bus,
-                src, nbytes, cudaMemcpyDeviceToDevice, cs),
-                "tile V");
-        }
-    }
+    launch_tile(ctx.d_V_batch,
+                thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
+                ctx.n_bus, ctx.batch_size, cs);
+    _chk_cuda(cudaGetLastError(), "tile V");
     t.t_tile_V += timer.stop_ms();
     // No t_tile_Ybus / t_patch_Ybus updates — Ybus is permanent.
 

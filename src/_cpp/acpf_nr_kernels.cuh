@@ -619,4 +619,33 @@ __global__ void zero_branch_flows_kernel(
     const int*           __restrict__ d_zero_indices,
     int n_entries);
 
+// =============================================================================
+// tile_kernel / launch_tile
+//   Replicates one system's buffer into every slot of a batched buffer:
+//   dst[b * n + i] = src[i] for b in [0, batch_size). One launch replaces the
+//   loop of batch_size cudaMemcpyAsync calls the batch sources used to issue
+//   per chunk -- at a 10k batch that loop was ~25 ms of host-side launch
+//   overhead each for V and for the Ybus values, serialised on the stream.
+//   Grid: x over i, y over slots (grid-stride, so any batch_size works).
+// =============================================================================
+template <typename T>
+__global__ void tile_kernel(T* __restrict__ dst, const T* __restrict__ src, int n, int batch_size)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const T v = src[i];
+    for (int b = blockIdx.y; b < batch_size; b += gridDim.y)
+        dst[static_cast<ptrdiff_t>(b) * n + i] = v;
+}
+
+template <typename T>
+inline void launch_tile(T* dst, const T* src, int n, int batch_size, cudaStream_t cs)
+{
+    if (n <= 0 || batch_size <= 0) return;
+    constexpr int block = 256;
+    const dim3 grid(static_cast<unsigned>((n + block - 1) / block),
+                    static_cast<unsigned>(batch_size < 65535 ? batch_size : 65535));
+    tile_kernel<T><<<grid, block, 0, cs>>>(dst, src, n, batch_size);
+}
+
 #endif // ACPF_NR_KERNELS_CUH

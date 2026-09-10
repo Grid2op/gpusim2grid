@@ -19,9 +19,9 @@
 //   • build_flat_patches() — convert per-contingency triplet lists into three
 //     parallel host arrays (SoA) ready for device upload, and precompute the
 //     slice [start, count) within those arrays that belongs to each chunk.
-//   • build_blockdiag_csr() — build the outer (row pointer) and inner (column
-//     index) arrays for the block-diagonal Ybus used in batched cuSPARSE SpMV.
-//     Only the structure is built here; values are tiled per chunk at runtime.
+//   • check_connectivity() / compute_component_masks() — decide, per
+//     contingency, whether the patched Ybus graph stays connected (and which
+//     buses to mask otherwise) from one DFS tree of the base graph.
 //
 // Precision note
 // --------------
@@ -236,43 +236,6 @@ void build_flat_patches(
     std::vector<cuda_real_type>& h_flat_delta_im,
     std::vector<ChunkPatchRange>& chunk_ranges,
     std::vector<int>&            active_to_orig);
-
-// ---------------------------------------------------------------------------
-// build_blockdiag_csr
-//   Builds the structural arrays (outer/inner) for a batch_size × batch_size
-//   block-diagonal Ybus used as the cuSPARSE SpMV matrix.
-//
-//   For a single system with n_bus rows and nnz non-zeros, the block-diagonal
-//   matrix for a batch of size b has:
-//     outer : b * n_bus + 1 entries  (shifted by i * nnz for block i)
-//     inner : b * nnz entries        (shifted by i * n_bus for block i)
-//
-//   Only outer and inner are built here.  The values buffer (d_Ybus_values_batch)
-//   is tiled from base-case values and patched at the start of each chunk call.
-//
-//   Note: this function builds the structure for the MAXIMUM batch size.  For
-//   the last (potentially smaller) chunk the cuSPARSE descriptor is rebuilt to
-//   cover only actual_batch systems; outer/inner are still valid up to that
-//   prefix because the structure within each block is identical.
-//
-//   Parameters
-//   ----------
-//   n_bus         : number of buses in one system
-//   nnz           : number of non-zeros in one Ybus
-//   single_outer  : Ybus outerIndexPtr(), size n_bus + 1
-//   single_inner  : Ybus innerIndexPtr(), size nnz
-//   batch_size    : maximum batch size (number of blocks)
-//   h_batch_outer : output, size batch_size * n_bus + 1
-//   h_batch_inner : output, size batch_size * nnz
-// ---------------------------------------------------------------------------
-void build_blockdiag_csr(
-    int                  n_bus,
-    int                  nnz,
-    const int*           single_outer,
-    const int*           single_inner,
-    int                  batch_size,
-    std::vector<int>&    h_batch_outer,
-    std::vector<int>&    h_batch_inner);
 
 // ---------------------------------------------------------------------------
 // check_connectivity

@@ -201,8 +201,6 @@ void InjectionSweepSession::run()
         *base_state_,
         std::move(source),
         n_scenarios_,
-        Ybus_rm_.outerIndexPtr(),
-        Ybus_rm_.innerIndexPtr(),
         used_batch_size_,
         nb_iter_,
         strategy_type_,

@@ -18,7 +18,7 @@
 // Per-chunk behaviour
 // -------------------
 //   prepare_Ybus_batch :
-//     ① tile base d_V into d_V_batch                  (batch_size D→D copies)
+//     ① tile base d_V into d_V_batch                  (one tile_kernel launch)
 //     (no Ybus mutation — base Ybus has already been tiled into
 //      d_Ybus_values_batch once during initialize().)
 //

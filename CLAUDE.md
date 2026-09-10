@@ -13,6 +13,41 @@ GPU-accelerated AC power flow for electrical grids. The Python package is `gpusi
 
 Backed by cuDSS (sparse direct solver), cuSPARSE, cuBLAS/cuSOLVER, and Eigen (header-only, vendored at `src/eigen/`). Grid data (Ybus, Sbus, pv/pq/slack arrays, branch admittances) comes from lightsim2grid/pandapower; this package only consumes those arrays.
 
+## Commits: the DCO signoff is mandatory
+
+Every commit must end with a `Signed-off-by:` trailer naming **a human**, or the DCO check
+fails the pull request. This is the single most common reason a PR here is red.
+
+```
+Assisted-by: Claude Code (claude-opus-5)
+Claude-Session: https://claude.ai/code/session_...
+Signed-off-by: Benjamin Donnot <benjamin.donnot@rte-france.com>
+```
+
+Rules:
+
+- **A bot may not sign off.** The DCO is a legal attestation that the contributor has the
+  right to submit the work; only a person can make it. `Signed-off-by: Claude
+  <noreply@anthropic.com>` is not acceptable even though one or two such commits slipped
+  through in the past — do not copy them.
+- **The signoff must match the commit author**, so a Claude-written commit is authored by
+  the human signing it off, not by Claude.
+- The assistant is credited with **`Assisted-by:`**, naming the tool and the model — not
+  `Co-Authored-By:`, and never as an author. This follows the kernel's convention for
+  coding assistants (https://docs.kernel.org/process/coding-assistants.html).
+- Set the identity once per session, then `-s` produces a matching trailer by itself:
+
+  ```
+  git config user.name  "Benjamin Donnot"
+  git config user.email "benjamin.donnot@rte-france.com"
+  git commit -s
+  ```
+
+- Adding the trailer to a commit that already exists needs
+  `git commit --amend --no-edit -s` (and `--author="..."` if the author is wrong too),
+  followed by `git push --force-with-lease`. This is the case that actually bites: the
+  mistake is usually noticed only after CI has run.
+  
 ## Build
 
 ```bash
@@ -73,7 +108,7 @@ The central abstraction is a **templated NR loop** (`src/_cpp/contingency/driver
 
 ### Batch sources
 
-`src/_cpp/contingency/batch_sources/` adapts the workloads to the shared block-diagonal batch the NR loop consumes: `contingency_batch.cuh` patches Ybus (subtracts tripped-branch admittances), `injection_batch.{cuh,cu}` varies Sbus from per-scenario (P, Q), `scenario_sweep_batch.{cuh,cu}` composes both — per-active-slot Ybus patches (verbatim `ContingencyBatch` logic) *and* a per-scenario dense Sbus row (verbatim `InjectionBatch` logic), with the Sbus rows pre-permuted into active-slot order at construction so compaction (disconnected scenarios dropped from the batch) and the dense Sbus row-slice copy stay consistent. Contingencies/scenarios that would disconnect the Ybus graph are skipped and their residuals set to NaN. All three `BatchSource` types are explicitly instantiated as `BatchPfDriver<...>` in `contingency/batch_pf_driver.cu` — a new source needs both the header/`.cu` pair *and* a `template struct BatchPfDriver<NewBatch>;` line there.
+`src/_cpp/contingency/batch_sources/` adapts the workloads to the shared block-diagonal batch the NR loop consumes: `contingency_batch.cuh` patches Ybus (subtracts tripped-branch admittances), `injection_batch.{cuh,cu}` varies Sbus from per-scenario (P, Q), `scenario_sweep_batch.{cuh,cu}` composes both — per-active-slot Ybus patches (verbatim `ContingencyBatch` logic) *and* a per-scenario dense Sbus row (verbatim `InjectionBatch` logic), with the Sbus rows pre-permuted into active-slot order at construction so compaction (disconnected scenarios dropped from the batch) and the dense Sbus row-slice copy stay consistent. Contingencies/scenarios that would disconnect the Ybus graph are skipped and their residuals set to NaN. That connectivity decision (`check_connectivity` / `compute_component_masks`, `contingency_analysis_helper.cpp`) is answered from **one DFS tree of the base graph per batch** (tree/non-tree edges, bridges, preorder subtree ranges): an N-1 trip is O(1) — connected unless the edge is a bridge, and then the masked side is a preorder range — and an N-k trip is resolved by merging the cut-off subtrees with a union-find; only asymmetric removals or a cut-off side larger than half the grid fall back to a per-contingency BFS. Don't reintroduce per-contingency graph searches there: on a 7k-bus grid that cost ~1 s per N-1 study, more than the GPU solve. Likewise the block-diagonal Ybus CSR structure (`blockdiag_csr_kernel`, `batch_pf_driver.cu`) and the per-chunk V/Ybus tiling (`tile_kernel`, `acpf_nr_kernels.cuh`) are generated on the device — at a 10k batch the host build + pageable upload and the per-slot `cudaMemcpyAsync` loops were each hundreds of ms of pure CPU time. All three `BatchSource` types are explicitly instantiated as `BatchPfDriver<...>` in `contingency/batch_pf_driver.cu` — a new source needs both the header/`.cu` pair *and* a `template struct BatchPfDriver<NewBatch>;` line there.
 
 ### Session objects and Python facades
 

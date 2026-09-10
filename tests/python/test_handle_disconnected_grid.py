@@ -187,3 +187,86 @@ def test_flag_off_skips_the_contingency():
     V = g.V_results.to_numpy().reshape(1, n_bus)[0]
     assert np.isnan(g.last_residuals()[0])
     assert np.all(np.isnan(V))
+
+
+def _solved_double_spur_grid():
+    """case14 + a radial spur bus fed by TWO identical parallel lines (a double
+    circuit) and one load; ac-solved with NR_KLU.
+
+    Returns (grid, n_bus_model, (line_a, line_b), spur_bus_id). Tripping one
+    circuit leaves the spur fed by the other; tripping both islands it.
+    """
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        spur_bus = pp.create_bus(net, vn_kv=float(net.bus.vn_kv.iloc[0]))
+        for _ in range(2):
+            pp.create_line_from_parameters(
+                net, from_bus=0, to_bus=spur_bus, length_km=1.0,
+                r_ohm_per_km=0.05, x_ohm_per_km=0.2, c_nf_per_km=0.0, max_i_ka=1.0)
+        pp.create_load(net, bus=spur_bus, p_mw=5.0, q_mvar=2.0)
+        pp.runpp(net)
+        line_b = len(net.line) - 1
+        line_a = line_b - 1
+        grid = init_from_pandapower(net)
+        grid.change_algorithm(AlgorithmType.NR_KLU)
+        n_bus = grid.get_bus_vn_kv().shape[0]
+        v0 = grid.dc_pf(np.ones(n_bus, dtype=complex), 1, 1e-6)
+        grid.ac_pf(v0.copy(), 30, 1e-10)
+    return grid, n_bus, (line_a, line_b), spur_bus
+
+
+@requires_gpu
+@needs_bridge
+def test_double_circuit_n2_islands_the_spur(solver_atol):
+    """Tripping ONE circuit of a double line keeps the spur connected; tripping
+    BOTH in a single N-2 contingency islands it. The split is only visible on
+    the SUMMED Ybus patch (each circuit's own delta leaves the shared entry
+    non-zero), which the connectivity check must account for -- otherwise the
+    spur bus is left live on a singular system instead of being masked."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
+
+    grid, n_bus, (line_a, line_b), spur_bus = _solved_double_spur_grid()
+    ctg = [[line_a], [line_b], [line_a, line_b]]
+
+    g = ContingencyAnalysisGPU(grid, handle_disconnected_grid=True,
+                               precision=None, nb_iter=15, tol_base=1e-10)
+    g.add_contingencies_by_branch_id(ctg)
+    g.compute(batch_size=8)
+    V = g.V_results.to_numpy().reshape(len(ctg), n_bus)
+    residual = g.last_residuals()
+
+    # One circuit out: the spur stays fed, nothing is masked, all converge.
+    assert np.all(np.isfinite(V[:2]))
+    assert np.all(residual[:2] < 100 * solver_atol)
+
+    # Both circuits out: the spur is islanded (NaN) and the rest is solved.
+    assert np.isnan(V[2, spur_bus])
+    assert np.isfinite(residual[2]) and residual[2] < 100 * solver_atol
+    main = np.ones(n_bus, dtype=bool)
+    main[spur_bus] = False
+    assert np.all(np.isfinite(V[2, main]))
+
+    # ... and matches lightsim2grid's own masked N-2 solve bus-by-bus.
+    ca = ContingencyAnalysisCPP(grid)
+    ca.handle_disconnected_grid = True
+    ca.add_nk([int(line_a), int(line_b)])
+    ca.compute(np.ones(n_bus, dtype=complex), 30, 1e-10)
+    V_ref = np.asarray(ca.get_voltages())[0]
+    assert V_ref[spur_bus] == 0
+    np.testing.assert_allclose(V[2, main], V_ref[main], atol=10 * solver_atol)
+
+    # With the flag off, the same N-2 is skipped outright (legacy behaviour).
+    g_off = ContingencyAnalysisGPU(grid, handle_disconnected_grid=False,
+                                   precision=None, nb_iter=15, tol_base=1e-10)
+    g_off.add_contingencies_by_branch_id(ctg)
+    g_off.compute(batch_size=8)
+    residual_off = g_off.last_residuals()
+    assert np.all(np.isfinite(residual_off[:2]))
+    assert np.isnan(residual_off[2])

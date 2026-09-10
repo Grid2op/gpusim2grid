@@ -255,8 +255,6 @@ struct BatchPfDriver {
     //   source           — moved into source_; its initialize(ctx, cs) is invoked
     //                      once construction reaches the GPU-setup phase.
     //   n_elements       — total contingencies / scenarios in this run.
-    //   Ybus_rm_outer/inner — host RowMajor CSR of the base Ybus (used to build
-    //                      the block-diagonal outer/inner; not retained).
     //   batch_size       — systems per chunk.
     //   nb_iter          — fixed NR iterations per chunk.
     //   strategy_type    — selects which Policy alternative emplaces into policy_.
@@ -269,8 +267,6 @@ struct BatchPfDriver {
         AcPfNrState&              base_state,
         BatchSource               source,
         int                       n_contingencies_in,    // count of batch elements
-        const int*                Ybus_rm_outer,
-        const int*                Ybus_rm_inner,
         int                       batch_size,
         int                       nb_iter,
         ContingencySolverType     strategy_type   = ContingencySolverType::DirectRefactorEvery,

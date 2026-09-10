@@ -233,8 +233,8 @@ struct AcPfTimings {
 //                      decomposed pieces instead.
 //   t_preprocess_ms  — all CPU preprocessing (pure CPU, no GPU work mixed in):
 //                        • base-case: pvpq sort + build_J_structure() (scatter maps)
-//                        • contingency: resolve_indices + build_flat_patches
-//                          + build_blockdiag_csr
+//                        • contingency: resolve_indices + connectivity check
+//                          + build_flat_patches
 //                        • injection: per-scenario Sbus build (P,Q → per-unit complex)
 //   t_alloc_ms       — H→D data transfers + device buffer allocation:
 //                        • base-case: Ybus values/indices, scatter maps, Sbus,

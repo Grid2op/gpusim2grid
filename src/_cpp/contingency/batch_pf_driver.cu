@@ -62,6 +62,41 @@ inline double bpf_ms_since(const std::chrono::steady_clock::time_point& start) {
 }
 
 // =============================================================================
+// blockdiag_csr_kernel
+//   Block-diagonal CSR structure of the batched Ybus, written from the
+//   single-system arrays already on the device: row (b*n_bus + r) starts at
+//   b*nnz + outer[r], entry (b*nnz + i) sits in column b*n_bus + inner[i], and
+//   the last row pointer is batch_size*nnz. The inner array is batch_size*nnz
+//   ints -- close to a gigabyte at a 10k batch on a 7k-bus grid -- so it is
+//   generated where it lives rather than built on the host (a quarter of a
+//   second of scattered writes) and pushed through a pageable H→D copy.
+//   batch_size*nnz and batch_size*n_bus fit an int (check_batch_stride).
+// =============================================================================
+__global__ void blockdiag_csr_kernel(
+    int n_bus, int nnz, int batch_size,
+    const int* __restrict__ outer, const int* __restrict__ inner,
+    int* __restrict__ batch_outer, int* __restrict__ batch_inner)
+{
+    const long long tid     = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+    const long long n_outer = static_cast<long long>(batch_size) * n_bus + 1;
+    const long long n_inner = static_cast<long long>(batch_size) * nnz;
+    if (tid < n_inner) {
+        const int b = static_cast<int>(tid / nnz);
+        const int i = static_cast<int>(tid - static_cast<long long>(b) * nnz);
+        batch_inner[tid] = inner[i] + b * n_bus;
+    }
+    if (tid < n_outer) {
+        if (tid == n_outer - 1) {
+            batch_outer[tid] = batch_size * nnz;
+        } else {
+            const int b = static_cast<int>(tid / n_bus);
+            const int r = static_cast<int>(tid - static_cast<long long>(b) * n_bus);
+            batch_outer[tid] = outer[r] + b * nnz;
+        }
+    }
+}
+
+// =============================================================================
 // Constructor
 // =============================================================================
 template <typename BatchSource>
@@ -69,8 +104,6 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     AcPfNrState&          base_state,
     BatchSource           source,
     int                   n_contingencies_in,
-    const int*            Ybus_rm_outer,
-    const int*            Ybus_rm_inner,
     int                   batch_size,
     int                   nb_iter,
     ContingencySolverType strategy_type,
@@ -120,7 +153,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     // 32-bit index limit still standing after the ptrdiff_t widening of
     // gpusim2grid's own kernels/launch arithmetic (see the "tid/b widened to
     // ptrdiff_t" comments in acpf_nr_kernels.cu, nr_iter_step.cuh, driver.cuh):
-    //   - n_bus, nnz_Y: build_blockdiag_csr() (below) builds ONE literal
+    //   - n_bus, nnz_Y: blockdiag_csr_kernel (below) writes ONE literal
     //     block-diagonal Ybus matrix and BatchPfDriver hands its outer/inner
     //     arrays to cusparseCreateConstCsr with CUSPARSE_INDEX_32I explicitly
     //     -- a hard cuSPARSE requirement gpusim2grid's own arithmetic cannot
@@ -140,30 +173,30 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "nnz_Y", nnz_Y);
 
     // Source-owned host preprocessing time was captured in the source ctor.
+    // Nothing else on the host: the block-diagonal CSR structure below is
+    // generated on the device.
     t_preprocess_ms_ = source_.cpu_preprocess_ms();
 
     // -------------------------------------------------------------------------
-    // Build block-diagonal CSR structure (outer/inner only).  Values are
-    // tiled per chunk (ContingencyBatch) or once at construction (InjectionBatch).
-    // -------------------------------------------------------------------------
-    auto t_cpu_start = std::chrono::steady_clock::now();
-    std::vector<int> h_batch_outer, h_batch_inner;
-    build_blockdiag_csr(n_bus, nnz_Y,
-                        Ybus_rm_outer, Ybus_rm_inner,
-                        batch_size_,
-                        h_batch_outer, h_batch_inner);
-    t_preprocess_ms_ += bpf_ms_since(t_cpu_start);
-
-    // -------------------------------------------------------------------------
-    // Upload block-diagonal structure + allocate chunk-sized working buffers.
-    // Both folded under the same t_alloc_ms_ wall-clock window (the upload
-    // used to fall in a dead zone between t_preprocess_ms_ and t_alloc_ms_).
+    // Block-diagonal CSR structure (outer/inner only; values are tiled per
+    // chunk by ContingencyBatch/ScenarioSweepBatch or once at construction by
+    // InjectionBatch) + chunk-sized working buffers, all under the t_alloc_ms_
+    // wall-clock window.
     // -------------------------------------------------------------------------
     {
         auto t_alloc_start = std::chrono::steady_clock::now();
 
-        upload_h2d(d_Ybus_batch_outer, h_batch_outer.data(), h_batch_outer.size(), cs);
-        upload_h2d(d_Ybus_batch_inner, h_batch_inner.data(), h_batch_inner.size(), cs);
+        const long long n_batch_outer = static_cast<long long>(batch_size_) * n_bus + 1;
+        const long long n_batch_inner = static_cast<long long>(batch_size_) * nnz_Y;
+        d_Ybus_batch_outer.resize(static_cast<size_t>(n_batch_outer));
+        d_Ybus_batch_inner.resize(static_cast<size_t>(n_batch_inner));
+        blockdiag_csr_kernel<<<nr_grid_size(std::max(n_batch_outer, n_batch_inner), BS), BS, 0, cs>>>(
+            n_bus, nnz_Y, batch_size_,
+            thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+            thrust::raw_pointer_cast(d_Ybus_batch_outer.data()),
+            thrust::raw_pointer_cast(d_Ybus_batch_inner.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
 
         d_V_batch.resize(static_cast<size_t>(batch_size_) * n_bus);
         d_Ybus_values_batch.resize(static_cast<size_t>(batch_size_) * nnz_Y);
