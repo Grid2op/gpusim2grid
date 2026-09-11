@@ -1435,6 +1435,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "some from set_contingency_gens' mask).")
     .def_property_readonly("has_gen_contingency", &ScenarioSweepSession::has_gen_contingency,
          "True once set_contingency_gens() has been called.")
+    .def("get_row_pv_to_pq", &ScenarioSweepSession::get_row_pv_to_pq,
+         "list[list[int]]: per scenario (original row order), the AC-solver "
+         "buses the last run() turned PV->PQ because set_contingency_gens' "
+         "mask took out every generator locally regulating them. All empty "
+         "without a mask; empty before run().")
     .def("run",            &ScenarioSweepSession::run,
          "Solve all scenarios. Fills the device-side voltage and residual "
          "buffers. Requires set_injections() first. A scenario whose "

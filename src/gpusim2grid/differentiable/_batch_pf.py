@@ -8,22 +8,51 @@ by the same per-element inputs as lightsim2grid's ``ScenarioSweep``.
 
     pf = BatchPowerFlow.from_lsgrid(grid, nb_iter=6)
     V  = pf(load_p=..., load_q=..., gen_p=..., gen_v=...,
-            line_status=..., trafo_status=...)        # complex (n_scen, n_bus)
+            line_status=..., trafo_status=..., gen_status=...)   # complex (n_scen, n_bus)
 
 Every input is a ``(n_scenarios, n_elements)`` tensor (or ``None`` = the
 grid's own base-case value in every row); row ``i`` is one independent
 scenario: its own injections, its own voltage set-points and its own set of
-disconnected branches (``line_status`` / ``trafo_status`` are boolean masks
-with **True = connected**, grid2op's convention; a row trips the branches
-whose mask is False). The whole batch is solved in ONE GPU pass by a
-:class:`gpusim2grid.ScenarioSweepGPU` session that this object keeps alive,
-so consecutive calls with the same number of rows reuse everything: no
-cuDSS analysis, no first factorization, no re-upload of the grid, only the
-new rows move to the device (see ``ScenarioSweepGPU.driver_build_counter``).
+disconnected branches and generators (``line_status`` / ``trafo_status`` /
+``gen_status`` are boolean masks with **True = connected**, grid2op's
+convention; a row trips the elements whose mask is False). The whole batch
+is solved in ONE GPU pass by a :class:`gpusim2grid.ScenarioSweepGPU` session
+that this object keeps alive, so consecutive calls with the same number of
+rows reuse everything: no cuDSS analysis, no first factorization, no
+re-upload of the grid, only the new rows move to the device (see
+``ScenarioSweepGPU.driver_build_counter``).
 
 Differentiable inputs: ``load_p``, ``load_q``, ``gen_p`` (through Sbus) and
 ``gen_v`` (through the seeded voltage magnitude). ``line_status`` /
-``trafo_status`` are discrete and carry no gradient.
+``trafo_status`` / ``gen_status`` are discrete and carry no gradient.
+
+Generator contingencies (``gen_status``) are lightsim2grid's
+``ScenarioSweep.set_contingency_gens`` (see ``ScenarioSweepGPU``): a
+disconnected generator's P leaves Sbus (and the target Q of a non
+voltage-regulating one), the distributed slack is re-weighted without it,
+and when the LAST generator locally regulating a bus is off that bus turns
+PV->PQ for that row only. Structurally, every bus that can flip in some row
+gets a reserved Vm column + Q equation (the session rebuilds its base state
+whenever that set changes: one cuDSS analysis, a cold driver); rows where
+such a bus is still PV identity-pin its Q row. For the gradient this means:
+the ``gen_p`` / ``gen_v`` of a disconnected generator get 0 (its ``gen_v``
+is passed to the session as NaN, "keep the base voltage", so it can never
+clobber a still-connected co-located generator's set-point either); on a
+row where a bus is released, ``load_q`` at that bus has a gradient and the
+``gen_v`` of any generator there has none (the set-point is only an NR start
+value); on a row where a reserved bus is still PV, the batched adjoint drops
+the frozen Q equation's component of λ (``zero_identity_rows_kernel``) so it
+is neither reported as a Q gradient nor contracted into the neighbours'
+``gen_v`` gradients -- with that, λ restricted to the live equations is
+exactly the bare system's.
+
+Call-to-call state: a call without ``line_status``/``trafo_status`` (or
+without ``gen_status``) after one that had them explicitly resets the
+session's topology (an all-empty trip list per row; a warm source rebuild)
+or generator mask (an all-False mask, which also releases the reserved
+structure: a cold rebuild). So the same inputs always give the same answer
+whatever the previous call was -- verified in
+``tests/python/test_batch_power_flow.py``.
 
 Adjoint math (batched)
 ----------------------
@@ -75,7 +104,11 @@ buffers, which the *next* forward overwrites. A ``run_counter`` guard turns a
 forward→forward→backward(first) pattern into a clear error; pass
 ``snapshot_jacobian=True`` to clone those buffers in every forward instead
 (one D2D copy of ``capacity x nnz_J`` reals and ``capacity x nnz_Y``
-complex, kept until backward).
+complex, kept until backward). A snapshot still needs the session's *batch
+source* of its own forward (the active-slot map, the identity-row masks, the
+pinned rows all live there and are read at backward time): another forward
+in between may change the injections / ``gen_v`` (hot path) but not the
+topology or generator mask (``source_build_counter`` guard).
 """
 
 import numpy as np
@@ -135,6 +168,15 @@ class BatchPowerFlow:
         self._gen_bus_all = torch.as_tensor(np.asarray(el.gen_bus, dtype=np.int64), device=dev)
         self._gen_bus_np = np.ascontiguousarray(el.gen_bus, dtype=np.int32)
         self._is_vm_fixed = torch.as_tensor(self._solver.is_vm_fixed_bus, device=dev)
+        # Generator contingencies (build_bus_injections' gen_off correction):
+        # the target Q of a NON-regulating generator sits inside const_mw and
+        # leaves with it. Older snapshots (no reactive data) cannot do this.
+        if el.gen_target_q_mvar is not None and el.gen_vreg_on is not None:
+            q_off = np.where(np.asarray(el.gen_vreg_on, dtype=bool), 0.0,
+                             np.asarray(el.gen_target_q_mvar, dtype=np.float64))
+            self._gen_q_off = torch.as_tensor(q_off, dtype=rdt, device=dev)
+        else:
+            self._gen_q_off = None
 
         # Base-case per-element values: what a ``None`` input means.
         self._load_p_base = torch.tensor(np.array(el.load_p_base), dtype=rdt, device=dev)
@@ -157,6 +199,10 @@ class BatchPowerFlow:
         self._topology_in_session = False
         self._pending_topology = None   # ragged list to hand to the session on the next run
         self._gen_v_in_session = False
+        self._gen_off_mask = None       # (n_scen, n_gen) bool, True = disconnected
+        self._gen_off_in_session = False
+        self._pending_gen_off = None    # mask to hand to the session on the next run
+        self._released = None           # (n_scen, n_bus) bool of the last run, or None
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -193,7 +239,7 @@ class BatchPowerFlow:
         return self.forward(*args, **kwargs)
 
     def forward(self, load_p=None, load_q=None, gen_p=None, gen_v=None,
-                line_status=None, trafo_status=None):
+                line_status=None, trafo_status=None, gen_status=None):
         """Solve one scenario per row; returns complex ``V`` ``(n_scen, n_bus)``
         on the GPU (per-unit, AC-solver bus numbering; NaN rows = scenarios the
         connectivity pre-check dropped).
@@ -204,16 +250,22 @@ class BatchPowerFlow:
                          = keep the base-case voltage for that (row, gen))
         line_status    : (n_scen, n_line)  bool, True = connected
         trafo_status   : (n_scen, n_trafo) bool, True = connected
+        gen_status     : (n_scen, n_gen)   bool, True = connected (generator
+                         contingencies, see the module docstring; needs the
+                         lightsim2grid bridge, and only generators regulating
+                         their own bus may be disconnected)
         ``None`` = the grid's base-case value in every row. At least one
         input must be given (it fixes n_scen).
         """
-        n_scen = self._infer_n_scen(load_p, load_q, gen_p, gen_v, line_status, trafo_status)
+        n_scen = self._infer_n_scen(load_p, load_q, gen_p, gen_v,
+                                    line_status, trafo_status, gen_status)
         load_p = self._as_input(load_p, self.n_load, self._load_p_base, n_scen, "load_p")
         load_q = self._as_input(load_q, self.n_load, self._load_q_base, n_scen, "load_q")
         gen_p = self._as_input(gen_p, self.n_gen, self._gen_p_base, n_scen, "gen_p")
         gen_v = None if gen_v is None else self._as_input(gen_v, self.n_gen, None, n_scen, "gen_v")
 
         self._apply_topology(line_status, trafo_status, n_scen)
+        gen_off = self._apply_gen_status(gen_status, n_scen)
 
         if n_scen != self._last_n_scen:
             # Capacity == n_scen: one chunk, whatever rows get islanded.
@@ -224,6 +276,18 @@ class BatchPowerFlow:
         inv_sn = 1.0 / self.sn_mva
         P = self._const_re.unsqueeze(0).expand(n_scen, -1).clone()
         Q = self._const_im.unsqueeze(0).expand(n_scen, -1).clone()
+        if gen_off is not None:
+            # Same operands as build_bus_injections(gen_off=...): the P a
+            # disconnected generator would have added is not added, the target
+            # Q of a non-regulating one is taken back out of the constant term,
+            # and its gen_v set-point is dropped (NaN = keep the base voltage).
+            gen_p = torch.where(gen_off, torch.zeros_like(gen_p), gen_p)
+            if self._gen_sel.numel():
+                q_off = torch.where(gen_off, self._gen_q_off.unsqueeze(0).expand(n_scen, -1),
+                                    torch.zeros_like(gen_p))
+                Q = Q.index_add(1, self._gen_bus_sel, -q_off[:, self._gen_sel] * inv_sn)
+            if gen_v is not None:
+                gen_v = torch.where(gen_off, torch.full_like(gen_v, float("nan")), gen_v)
         if self._gen_sel.numel():
             P = P.index_add(1, self._gen_bus_sel, gen_p[:, self._gen_sel] * inv_sn)
         if self._load_sel.numel():
@@ -236,6 +300,13 @@ class BatchPowerFlow:
     def get_disconnected(self):
         """(n_scen,) int: 1 where the last call dropped the row (NaN)."""
         return self._sweep.get_disconnected()
+
+    @property
+    def reserved_switchable_buses(self):
+        """(k,) int ndarray: AC-solver buses currently owning a reserved Vm
+        column + Q equation for ``gen_status`` (empty without generator
+        contingencies) -- see ``ScenarioSweepGPU.reserved_switchable_buses``."""
+        return self._sweep.reserved_switchable_buses
 
     def last_residuals(self):
         """(n_scen,) float: ``‖F‖∞`` of each row after the last call."""
@@ -286,7 +357,7 @@ class BatchPowerFlow:
         if n is None:
             raise ValueError(
                 "BatchPowerFlow needs at least one input (load_p, load_q, gen_p, gen_v, "
-                "line_status or trafo_status) to know the number of scenarios")
+                "line_status, trafo_status or gen_status) to know the number of scenarios")
         if n <= 0:
             raise ValueError("the number of scenarios must be > 0")
         return n
@@ -349,6 +420,33 @@ class BatchPowerFlow:
         self._pending_topology = ragged
         self._topology_mask = tripped.clone()
 
+    def _apply_gen_status(self, gen_status, n_scen):
+        """Same contract as _apply_topology for the generator mask. Returns the
+        (n_scen, n_gen) bool "disconnected" mask to apply to the injections
+        (None when no generator is off), and queues the session mask when it
+        must change: a call without gen_status after one with it hands an
+        all-False mask over (bit-identical to no mask for the session, which
+        also drops the reserved structure it no longer needs)."""
+        self._pending_gen_off = None
+        if gen_status is None:
+            if self._gen_off_mask is not None or (
+                    self._gen_off_in_session and n_scen != self._last_n_scen):
+                self._pending_gen_off = np.zeros((n_scen, self.n_gen), dtype=bool)
+            self._gen_off_mask = None
+            return None
+
+        gen_off = ~self._as_status(gen_status, self.n_gen, n_scen, "gen_status")
+        if self._gen_q_off is None:
+            raise RuntimeError(
+                "gen_status needs the generators' reactive set-points; rebuild the "
+                "ScenarioSweepGPU from a lightsim2grid grid with the current "
+                "extract_injection_elements().")
+        prev = self._gen_off_mask
+        if prev is None or prev.shape != gen_off.shape or not torch.equal(prev, gen_off):
+            self._pending_gen_off = np.ascontiguousarray(gen_off.cpu().numpy(), dtype=bool)
+            self._gen_off_mask = gen_off.clone()
+        return gen_off if bool(gen_off.any()) else None
+
 
 def _device_index(sweep):
     """CUDA ordinal the session lives on (the facade normalises ``device``)."""
@@ -375,6 +473,14 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             pf._sweep.set_topology(pf._pending_topology)
             pf._topology_in_session = True
             pf._pending_topology = None
+        if pf._pending_gen_off is not None:
+            # After the injections: the session checks the row counts against
+            # them. The facade validates the mask (and would re-assemble Sbus
+            # only for set_injections_from_elements inputs, which this path
+            # never uses -- the injections above already carry the correction).
+            pf._sweep.set_contingency_gens(pf._pending_gen_off)
+            pf._gen_off_in_session = True
+            pf._pending_gen_off = None
         if gen_v is not None:
             solver.set_gen_v_dlpack(gen_v.detach().contiguous().__dlpack__(), pf._gen_bus_np, stream)
             pf._gen_v_in_session = True
@@ -389,8 +495,22 @@ class _BatchPowerFlowOp(torch.autograd.Function):
 
         V = torch.from_dlpack(solver.v_results_dlpack()).clone()
 
+        # Rows where a generator contingency released a bus (PV->PQ): its
+        # gen_v is only an NR start value there -> zero gradient.
+        pf._released = None
+        if pf._gen_off_in_session and want_gen_v:
+            rel = solver.get_row_pv_to_pq()
+            if any(rel):
+                m = torch.zeros(V.shape, dtype=torch.bool, device=dev)
+                for r, buses in enumerate(rel):
+                    if buses:
+                        m[r, torch.as_tensor(buses, device=dev)] = True
+                pf._released = m
+
         ctx.pf = pf
         ctx.run_id = solver.run_counter
+        ctx.source_id = solver.source_build_counter
+        ctx.released = pf._released
         ctx.want_gen_v = bool(want_gen_v)
         ctx.J = ctx.Y = None
         if needs_grad and pf.snapshot_jacobian:
@@ -415,6 +535,12 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                 "gradient belongs to, overwriting its Jacobians on the GPU. Call "
                 "backward() before the next forward(), or build the model with "
                 "snapshot_jacobian=True to keep a copy per forward.")
+        if ctx.J is not None and solver.source_build_counter != ctx.source_id:
+            raise RuntimeError(
+                "BatchPowerFlow.backward: another forward() with a different "
+                "topology, generator mask or number of rows ran after the one this "
+                "gradient belongs to; the Jacobian snapshot no longer matches the "
+                "session's batch structure. Call backward() before such a forward().")
 
         theta_col = torch.as_tensor(solver.theta_col_of_bus, device=dev)
         vm_col = torch.as_tensor(solver.vm_col_of_bus, device=dev)
@@ -466,6 +592,9 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             ok = (gen_bus >= 0) & pf._is_vm_fixed[safe_bus]
             g = g_bus[:, safe_bus]
             g = torch.where(ok.unsqueeze(0), g, torch.zeros_like(g))
+            if ctx.released is not None:
+                rel = ctx.released[:, safe_bus]
+                g = torch.where(rel, torch.zeros_like(g), g)
             g = torch.where(torch.isnan(gen_v), torch.zeros_like(g), g)
             grad_gen_v = g
 

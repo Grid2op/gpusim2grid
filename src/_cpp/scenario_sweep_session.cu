@@ -662,6 +662,7 @@ void ScenarioSweepSession::run()
     _prepare_gen_contingency(required, row_pv_to_pq, row_slack_off);
     if (required != reserved_buses_)
         _build_base_state(required);
+    row_pv_to_pq_ = row_pv_to_pq;
 
     if (has_gen_off_ &&
         strategy_type_ == ContingencySolverType::DirectBaseCaseFactors) {

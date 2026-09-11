@@ -262,6 +262,11 @@ struct ScenarioSweepSession {
     BoolMat            gen_off_;
     bool               has_gen_off_  = false;
     std::vector<int>   reserved_buses_;
+    // Per-row buses turned PV->PQ by the last run() (ORIGINAL row order,
+    // n_scenarios entries; all empty without a generator mask). Exposed for the
+    // differentiable wrapper: a released bus' voltage set-point is only an NR
+    // start value there, so its gen_v gradient is 0 on that row.
+    std::vector<std::vector<int>> row_pv_to_pq_;
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
     CplxVect        Vinit_, Sbus_;
@@ -415,6 +420,7 @@ struct ScenarioSweepSession {
     // caller observe when run() rebuilt the base state.
     int              dim_J() const;
     std::vector<int> get_reserved_buses() const { return reserved_buses_; }
+    std::vector<std::vector<int>> get_row_pv_to_pq() const { return row_pv_to_pq_; }
     bool             has_gen_contingency() const { return has_gen_off_; }
 
     // =========================================================================

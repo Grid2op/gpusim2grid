@@ -63,6 +63,35 @@ def _central_diff(f, x, idx, eps=1e-6):
     return (f(xp) - f(xm)) / (2 * eps)
 
 
+def _fd_check(pf, load_p, load_q, gen_p, gen_v, line_status, coords, tol=1e-4,
+              gen_status=None):
+    """Central differences of a weighted |V|^2 loss vs the analytic gradient."""
+    n_bus = pf.n_bus
+    w = torch.linspace(0.5, 1.5, n_bus, dtype=RDT, device="cuda")
+
+    def loss_of(lp, lq, gp, gv):
+        V = pf(load_p=lp, load_q=lq, gen_p=gp, gen_v=gv, line_status=line_status,
+               gen_status=gen_status)
+        valid = torch.isfinite(V.real)
+        Vs = torch.where(valid, V, torch.zeros_like(V))
+        return ((Vs.abs() ** 2) * w).sum()
+
+    ins = {"load_p": load_p, "load_q": load_q, "gen_p": gen_p, "gen_v": gen_v}
+    grads = {k: v.clone().requires_grad_(True) for k, v in ins.items() if v is not None}
+    args = {k: grads.get(k) for k in ins}
+    loss_of(args["load_p"], args["load_q"], args["gen_p"], args["gen_v"]).backward()
+    for name, idx in coords:
+        def f(x, name=name):
+            a = {k: (v.detach() if v is not None else None) for k, v in args.items()}
+            a[name] = x
+            with torch.no_grad():
+                return loss_of(a["load_p"], a["load_q"], a["gen_p"], a["gen_v"]).item()
+        fd = _central_diff(f, grads[name], idx)
+        an = grads[name].grad[idx].item()
+        assert abs(an - fd) <= tol * max(1.0, abs(fd)), (name, idx, an, fd)
+    return grads
+
+
 # ---------------------------------------------------------------------------
 # Forward
 # ---------------------------------------------------------------------------
@@ -376,31 +405,9 @@ class TestGradients:
         assert torch.all(lp.grad[1] == 0) and torch.all(gp.grad[1] == 0)
         assert torch.any(lp.grad[0] != 0) and torch.any(lp.grad[2] != 0)
 
-    def _fd_check(self, pf, load_p, load_q, gen_p, gen_v, line_status, coords, tol=1e-4):
-        """Central differences of a weighted |V|^2 loss vs the analytic gradient."""
-        n_bus = pf.n_bus
-        w = torch.linspace(0.5, 1.5, n_bus, dtype=RDT, device="cuda")
+    def _fd_check(self, *args, **kwargs):
+        return _fd_check(*args, **kwargs)
 
-        def loss_of(lp, lq, gp, gv):
-            V = pf(load_p=lp, load_q=lq, gen_p=gp, gen_v=gv, line_status=line_status)
-            valid = torch.isfinite(V.real)
-            Vs = torch.where(valid, V, torch.zeros_like(V))
-            return ((Vs.abs() ** 2) * w).sum()
-
-        ins = {"load_p": load_p, "load_q": load_q, "gen_p": gen_p, "gen_v": gen_v}
-        grads = {k: v.clone().requires_grad_(True) for k, v in ins.items() if v is not None}
-        args = {k: grads.get(k) for k in ins}
-        loss_of(args["load_p"], args["load_q"], args["gen_p"], args["gen_v"]).backward()
-        for name, idx in coords:
-            def f(x, name=name):
-                a = {k: (v.detach() if v is not None else None) for k, v in args.items()}
-                a[name] = x
-                with torch.no_grad():
-                    return loss_of(a["load_p"], a["load_q"], a["gen_p"], a["gen_v"]).item()
-            fd = _central_diff(f, grads[name], idx)
-            an = grads[name].grad[idx].item()
-            assert abs(an - fd) <= tol * max(1.0, abs(fd)), (name, idx, an, fd)
-        return grads
 
     def test_central_differences_ieee14_distributed_slack(self, ieee14_base_case):
         grid = ieee14_base_case["grid"]
@@ -505,3 +512,322 @@ class TestGradients:
         torch.testing.assert_close(lp.grad[0, el.load_sel], expected_lp, atol=1e-7, rtol=1e-5)
         torch.testing.assert_close(lq.grad[0, el.load_sel], expected_lq, atol=1e-7, rtol=1e-5)
         assert torch.all(lp.grad[1] == 0)          # row 1 got no cotangent
+
+
+# ---------------------------------------------------------------------------
+# Call-to-call state: a call without a contingency input after one with it
+# must reset the session (same inputs -> same answer, whatever ran before).
+# ---------------------------------------------------------------------------
+
+def _two_gen_case14():
+    """case14 with a 2nd generator on the bus of pp gen 2 (bus 5): the bus stays
+    PV while one of the two is off and turns PQ when both are. Returns
+    (solved grid, [gen ids on bus 5])."""
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        pp.create_gen(net, bus=5, p_mw=10.0, vm_pu=float(net.gen.vm_pu.iloc[2]),
+                      controllable=True, min_q_mvar=-50., max_q_mvar=50.)
+        grid = init_from_pandapower(net)
+    grid.change_algorithm(AlgorithmType.NR_KLU)
+    n_bus = grid.get_bus_vn_kv().shape[0]
+    v0 = grid.dc_pf(np.ones(n_bus, dtype=complex), 1, 1e-6)
+    assert grid.ac_pf(v0.copy(), 30, 1e-10).shape[0] > 0
+    gens = grid.get_generators()
+    shared = [g for g in range(len(gens)) if gens[g].bus_id == 5]
+    assert len(shared) == 2
+    return grid, shared
+
+
+class TestCallToCallState:
+
+    def _loss_grad(self, pf, load_p, load_q, gen_p, **kw):
+        lp = load_p.clone().requires_grad_(True)
+        lq = load_q.clone().requires_grad_(True)
+        gp = gen_p.clone().requires_grad_(True)
+        V = pf(load_p=lp, load_q=lq, gen_p=gp, **kw)
+        valid = torch.isfinite(V.real)
+        (torch.where(valid, V, torch.zeros_like(V)).abs() ** 2).sum().backward()
+        return V.detach(), lp.grad, lq.grad, gp.grad
+
+    def test_topology_is_reset_by_a_call_without_status(self, ieee14_base_case, solver_atol):
+        grid = ieee14_base_case["grid"]
+        pf, ref = _pf(grid), _pf(grid)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+
+        # 1. never any topology
+        V0 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        assert (pf.sweep.driver_build_counter, pf.sweep.source_build_counter) == (1, 1)
+
+        # 2. trips on two rows (warm)
+        ls, ts = _all_connected(pf, n)
+        ls[1, 3] = False
+        ls[2, 0] = False
+        V1 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, line_status=ls, trafo_status=ts).clone()
+        assert (pf.sweep.driver_build_counter, pf.sweep.source_build_counter) == (1, 2)
+        torch.testing.assert_close(V1[0], V0[0], atol=solver_atol, rtol=0)
+        assert not torch.allclose(V1[1], V0[1], atol=1e-4)
+        assert not torch.allclose(V1[2], V0[2], atol=1e-4)
+
+        # 3. no status inputs again: the trips must be gone (warm reset, no analysis)
+        V2 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        assert (pf.sweep.driver_build_counter, pf.sweep.source_build_counter) == (1, 3)
+        assert pf.timings.t_analysis_ms == 0.0
+        torch.testing.assert_close(V2, V0, atol=solver_atol, rtol=0)
+
+        # 4. and stays gone on the hot path
+        V3 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        assert pf.sweep.source_build_counter == 3
+        torch.testing.assert_close(V3, V0, atol=solver_atol, rtol=0)
+
+        # 5. all-True masks mean the same as no masks
+        ls, ts = _all_connected(pf, n)
+        V4 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, line_status=ls, trafo_status=ts).clone()
+        torch.testing.assert_close(V4, V0, atol=solver_atol, rtol=0)
+
+        # 6. gradients after the reset match a session that never saw a trip
+        out = self._loss_grad(pf, load_p, load_q, gen_p)
+        exp = self._loss_grad(ref, load_p, load_q, gen_p)
+        for a, b in zip(out, exp):
+            torch.testing.assert_close(a, b, atol=10 * solver_atol, rtol=1e-6)
+
+        # 7. a new row count without status after trips (the session would
+        #    refuse a stale trip list) -> fresh answer
+        lp5, lq5, gp5 = _base_inputs(pf, 5, [1.0, 1.02, 0.98, 1.05, 0.95])
+        ls5, ts5 = _all_connected(pf, 5)
+        ls5[4, 6] = False
+        pf(load_p=lp5, load_q=lq5, gen_p=gp5, line_status=ls5, trafo_status=ts5)
+        V6 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        torch.testing.assert_close(V6, V0, atol=solver_atol, rtol=0)
+
+    @needs_bridge
+    def test_gen_status_is_reset_by_a_call_without_it(self, ieee14_base_case, solver_atol):
+        grid = ieee14_base_case["grid"]
+        pf, ref = _pf(grid), _pf(grid)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        V0 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        assert pf.reserved_switchable_buses.size == 0
+
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[1, 1] = False
+        gs[2, 2] = False
+        V1 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_status=gs).clone()
+        assert pf.reserved_switchable_buses.size == 2      # the two buses that can flip
+        assert pf.sweep.driver_build_counter == 2           # structure changed: cold
+        torch.testing.assert_close(V1[0], V0[0], atol=solver_atol, rtol=0)
+        assert not torch.allclose(V1[1], V0[1], atol=1e-4)
+
+        # no gen_status: the mask is cleared and the reserved structure released
+        V2 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        assert pf.reserved_switchable_buses.size == 0
+        assert pf.sweep.driver_build_counter == 3
+        assert pf.sweep.solver.dim_J == ref.sweep.solver.dim_J
+        torch.testing.assert_close(V2, V0, atol=solver_atol, rtol=0)
+        V3 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()   # hot
+        assert pf.sweep.driver_build_counter == 3
+        torch.testing.assert_close(V3, V0, atol=solver_atol, rtol=0)
+
+        # all-True == no mask (no rebuild either)
+        V4 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p,
+                gen_status=torch.ones_like(gs)).clone()
+        assert pf.sweep.driver_build_counter == 3
+        torch.testing.assert_close(V4, V0, atol=solver_atol, rtol=0)
+
+        out = self._loss_grad(pf, load_p, load_q, gen_p)
+        exp = self._loss_grad(ref, load_p, load_q, gen_p)
+        for a, b in zip(out, exp):
+            torch.testing.assert_close(a, b, atol=10 * solver_atol, rtol=1e-6)
+
+        # new row count, no gen_status, after a masked call
+        lp5, lq5, gp5 = _base_inputs(pf, 5)
+        gs5 = torch.ones(5, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs5[3, 1] = False
+        pf(load_p=lp5, load_q=lq5, gen_p=gp5, gen_status=gs5)
+        V6 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
+        torch.testing.assert_close(V6, V0, atol=solver_atol, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Generator contingencies (gen_status)
+# ---------------------------------------------------------------------------
+
+@needs_bridge
+class TestGenStatus:
+
+    def test_forward_matches_scenario_sweep(self, ieee14_base_case, solver_atol):
+        from gpusim2grid import ScenarioSweepGPU
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid)
+        n = 4
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95, 1.02])
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[1, 1] = False
+        gs[2, 2] = False
+        gs[3, [1, 3]] = False
+        ls, ts = _all_connected(pf, n)
+        ls[2, 3] = False
+        gen_v = torch.full((n, pf.n_gen), float("nan"), dtype=RDT, device="cuda")
+        gen_v[:, 1] = 1.03            # off on rows 1 and 3: must be ignored there
+        gen_v[3, 2] = 1.02
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v,
+               line_status=ls, trafo_status=ts, gen_status=gs)
+        assert torch.isfinite(V).all()
+        assert pf.reserved_switchable_buses.size == 3
+
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(load_p.cpu().numpy(), load_q.cpu().numpy(),
+                                        gen_p.cpu().numpy())
+        sw.set_topology([[], [], [3], []])
+        sw.set_contingency_gens(~gs.cpu().numpy())
+        gv = gen_v.cpu().numpy().copy()
+        gv[~gs.cpu().numpy()] = np.nan
+        sw.set_gen_v(gv)
+        sw.compute(batch_size=n)
+        V_ref = sw.solver.V_results.to_numpy().reshape(n, pf.n_bus)
+        np.testing.assert_allclose(V.cpu().numpy(), V_ref, atol=solver_atol)
+
+        # the disconnected generator's P is really gone: same as gen_p = 0 there
+        gp0 = gen_p.clone()
+        gp0[~gs] = 0.0
+        V_gp0 = pf(load_p=load_p, load_q=load_q, gen_p=gp0, gen_v=gen_v,
+                   line_status=ls, trafo_status=ts, gen_status=gs)
+        torch.testing.assert_close(V_gp0, V, atol=solver_atol, rtol=0)
+
+    def test_forward_matches_one_off_powerflow(self, solver_atol):
+        """Row with both generators of a bus off (bus -> PQ) vs a fresh grid
+        with them deactivated, and one generator off (bus stays PV)."""
+        grid, (g_a, g_b) = _two_gen_case14()
+        pf = _pf(grid, nb_iter=15)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n)
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[0, g_a] = False
+        gs[1, [g_a, g_b]] = False
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_status=gs)
+        assert pf.reserved_switchable_buses.tolist() == [5]
+        assert pf.sweep.solver.get_row_pv_to_pq() == [[], [5], []]
+        buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+        for row, off in enumerate([[g_a], [g_a, g_b], []]):
+            g2, _ = _two_gen_case14()
+            for g in off:
+                g2.deactivate_gen(int(g))
+            g2.tell_solver_need_reset()
+            n_bus = g2.get_bus_vn_kv().shape[0]
+            v0 = g2.dc_pf(np.ones(n_bus, dtype=complex), 1, 1e-6)
+            ref = g2.ac_pf(v0.copy(), 30, 1e-10)
+            assert ref.shape[0] > 0
+            np.testing.assert_allclose(V[row].cpu().numpy(), ref[buses], atol=10 * solver_atol)
+
+    @fp64_only
+    def test_central_differences_released_bus(self, ieee14_base_case):
+        """Rows releasing a bus (its only generator off): the Q equation of that
+        bus is live (load_q there has a gradient), the off generator's gen_p /
+        gen_v have none, everything else matches finite differences."""
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid, nb_iter=15)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.1, 0.9])
+        line_status, _ = _all_connected(pf, n)
+        line_status[2, 3] = False
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[0, 1] = False
+        gs[2, [2, 3]] = False
+        gen_v = torch.tensor([[1.06, 1.045, 1.01, 1.07, 1.09]] * n, dtype=RDT, device="cuda")
+        bus_g1 = int(pf._gen_bus_all[1])
+        loads_at_g1 = torch.nonzero(pf._load_bus_sel == bus_g1).flatten()
+        assert loads_at_g1.numel() == 1            # case14: one load on that bus
+        l1 = int(pf._load_sel[loads_at_g1[0]])
+        coords = [("load_p", (0, 2)), ("load_q", (0, l1)), ("load_q", (1, l1)),
+                  ("load_p", (2, 5)), ("load_q", (2, 4)),
+                  ("gen_p", (0, 2)), ("gen_p", (1, 1)), ("gen_p", (2, 1)),
+                  ("gen_p", (0, 1)), ("gen_v", (0, 1)),      # off: 0
+                  ("gen_v", (0, 0)), ("gen_v", (0, 2)), ("gen_v", (1, 1)),
+                  ("gen_v", (2, 1)), ("gen_v", (2, 4))]
+        grads = _fd_check(pf, load_p, load_q, gen_p, gen_v, line_status, coords,
+                          gen_status=gs)
+        assert grads["gen_p"].grad[0, 1] == 0.0 and grads["gen_v"].grad[0, 1] == 0.0
+        assert torch.all(grads["gen_p"].grad[2, [2, 3]] == 0)
+        assert torch.all(grads["gen_v"].grad[2, [2, 3]] == 0)
+        assert grads["load_q"].grad[0, l1] != 0.0          # released: Q equation live
+        assert grads["gen_v"].grad[1, 1] != 0.0
+
+    @fp64_only
+    def test_central_differences_pinned_reserved_bus(self):
+        """A reserved bus that is still PV on a row (one of its two generators
+        off) identity-pins its Q equation: no Q gradient there, and the
+        surviving generator's gen_v gradient is the plain PV one."""
+        grid, (g_a, g_b) = _two_gen_case14()
+        pf = _pf(grid, nb_iter=15)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        line_status, _ = _all_connected(pf, n)
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[0, g_a] = False                   # bus 5 pinned (g_b keeps it PV)
+        gs[1, [g_a, g_b]] = False            # bus 5 released
+        gen_v = torch.full((n, pf.n_gen), float("nan"), dtype=RDT, device="cuda")
+        gen_v[:, [g_a, g_b]] = 1.01
+        gen_v[:, 1] = 1.045
+        bus5 = int(pf._gen_bus_all[g_a])
+        loads_at_5 = torch.nonzero(pf._load_bus_sel == bus5).flatten()
+        assert loads_at_5.numel() == 1
+        l5 = int(pf._load_sel[loads_at_5[0]])
+        coords = [("load_q", (0, l5)), ("load_q", (1, l5)), ("load_q", (2, l5)),
+                  ("load_p", (0, l5)), ("load_p", (1, 3)),
+                  ("gen_p", (0, g_b)), ("gen_p", (1, 1)),
+                  ("gen_v", (0, g_b)),        # the surviving generator of the pinned bus
+                  ("gen_v", (0, 1)), ("gen_v", (1, 1)),
+                  ("gen_v", (1, g_a)), ("gen_v", (1, g_b))]     # released: 0
+        # (no per-column FD on row 2: both generators write the same bus, the
+        #  last column wins, so a single column's FD is 0 by construction --
+        #  both report the bus gradient, checked below.)
+        grads = _fd_check(pf, load_p, load_q, gen_p, gen_v, line_status, coords,
+                          gen_status=gs)
+        assert grads["load_q"].grad[0, l5] == 0.0            # pinned: frozen Q equation
+        assert grads["load_q"].grad[2, l5] == 0.0            # plain PV bus
+        assert grads["load_q"].grad[1, l5] != 0.0            # released
+        assert torch.all(grads["gen_v"].grad[1, [g_a, g_b]] == 0)
+        assert grads["gen_v"].grad[0, g_a] == 0.0
+        assert grads["gen_v"].grad[0, g_b] != 0.0
+        torch.testing.assert_close(grads["gen_v"].grad[2, g_a], grads["gen_v"].grad[2, g_b])
+
+    @fp64_only
+    def test_gradcheck_with_gen_status(self, ieee14_base_case):
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid, nb_iter=15, snapshot_jacobian=True)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.1, 0.9])
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[0, 1] = False
+        gs[2, 3] = False
+        gen_v = torch.full((n, pf.n_gen), float("nan"), dtype=RDT, device="cuda")
+        gen_v[:, 2] = 1.01
+        gen_v[1, 1] = 1.04
+        inputs = tuple(x.clone().requires_grad_(True) for x in (load_p, load_q, gen_p, gen_v))
+
+        def f(lp, lq, gp, gv):
+            V = pf(load_p=lp, load_q=lq, gen_p=gp, gen_v=gv, gen_status=gs)
+            return torch.view_as_real(V)
+
+        assert torch.autograd.gradcheck(f, inputs, eps=1e-5, atol=1e-3, rtol=1e-2,
+                                        nondet_tol=1e-7)
+
+    def test_snapshot_backward_after_mask_change_raises(self, ieee14_base_case):
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid, snapshot_jacobian=True)
+        n = 2
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.1])
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[1, 1] = False
+        lp = load_p.clone().requires_grad_(True)
+        V1 = pf(load_p=lp, load_q=load_q, gen_p=gen_p, gen_status=gs)
+        gs2 = gs.clone()
+        gs2[0, 1] = False                    # same reserved set, other rows pinned
+        pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_status=gs2)
+        with pytest.raises(RuntimeError, match="batch structure"):
+            V1.real.sum().backward()

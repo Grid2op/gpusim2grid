@@ -341,6 +341,13 @@ class _ScenarioSweepSolver:
         some from set_contingency_gens' mask)."""
         return np.asarray(self._s.get_reserved_buses(), dtype=np.int64)
 
+    def get_row_pv_to_pq(self):
+        """list[list[int]]: per scenario (original row order), the AC-solver
+        buses the last run() turned PV->PQ because set_contingency_gens' mask
+        took out every generator locally regulating them. All empty without a
+        mask; empty before run()."""
+        return self._s.get_row_pv_to_pq()
+
     def set_topology(self, branch_ids_per_scenario):
         """Build topology from a list-of-lists of branch indices, row-aligned
         with set_injections().

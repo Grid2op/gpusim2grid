@@ -948,6 +948,27 @@ __global__ void transpose_gather_values_kernel(
     dst[b * nnz + perm[i]] = src[b * nnz + i];
 }
 
+// Zero the adjoint vector at this chunk's identity rows (handle_disconnected_
+// grid masked P/Q rows and the PV-pinned Q rows of generator contingencies).
+// An identity row r = e_c decouples: λ_r appears in the single Jᵀ equation of
+// its column c, so it absorbs x̄_c − Σ_{r'≠r} J[r',c] λ_{r'} and every other λ
+// is exactly the reduced (unpinned) system's. That λ_r is not a real
+// sensitivity -- the equation is frozen, F_r ≡ 0 whatever Sbus -- and it must
+// not reach the outputs: as λ_{q_k} it would be reported as a Q gradient at a
+// bus whose Q equation is off, and gen_v_adjoint_kernel would contract it
+// with ∂Q_k/∂Vm_j for every neighbour j (a row the bare system never has).
+// For a masked row the value is already 0 (its column carries no live entry).
+__global__ void zero_identity_rows_kernel(
+          cuda_real_type* __restrict__ d_sol,       // [batch × dim_J] (slot order)
+    const int*            __restrict__ d_mask_slot,
+    const int*            __restrict__ d_mask_row,
+    int dim_J, int n_entries)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_entries) return;
+    d_sol[static_cast<ptrdiff_t>(d_mask_slot[i]) * dim_J + d_mask_row[i]] = cuda_real_type(0);
+}
+
 // gen_v adjoint: for every (slot, Vm-fixed bus k) the contraction of the
 // adjoint vector with the dS_calc/dVm_k column (which J never stores for a
 // Vm-fixed bus):
@@ -1179,11 +1200,24 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
                        dim_J, n_active_, /*zero_nonfinite=*/true, cs);
     CHK_CUDA_BPF(cudaGetLastError());
 
-    // ③ Solve and scatter back to original order.
+    // ③ Solve, drop the identity-row components (see zero_identity_rows_kernel;
+    //    the driver is one chunk here -- keep_final_jacobian requires it -- so
+    //    the chunk-0 slice is the whole batch) and scatter back to original order.
     timer.start();
     A.solver.solve();
     A.t_solve += timer.stop_ms();
     ++A.n_solve;
+    {
+        NrIterBuffers mb{};
+        source_.fill_mask_buffers(mb, /*chunk_idx=*/0,
+                                  thrust::raw_pointer_cast(base.d_J_outer.data()));
+        if (mb.n_mask_rows > 0) {
+            zero_identity_rows_kernel<<<(mb.n_mask_rows + BS - 1) / BS, BS, 0, cs>>>(
+                thrust::raw_pointer_cast(A.d_sol.data()),
+                mb.d_mask_slot, mb.d_mask_row, dim_J, mb.n_mask_rows);
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
+    }
     zero_d(A.d_sol_full, cs);
     launch_scatter_rows(thrust::raw_pointer_cast(A.d_sol_full.data()),
                         thrust::raw_pointer_cast(A.d_sol.data()), d_map,
