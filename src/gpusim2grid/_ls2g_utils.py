@@ -344,6 +344,54 @@ def extract_injection_elements(grid, n_bus):
         load_p_base=load_p_base, load_q_base=load_q_base, gen_p_base=gen_p_base)
 
 
+GEN_V_CONFLICT_TOL = 1e-8
+
+
+def conflicting_gen_v_rows(gen_v, gen_bus, is_vm_fixed_bus, gen_off=None,
+                           tol=GEN_V_CONFLICT_TOL):
+    """Rows of a ``(n_rows, n_gen)`` ``gen_v`` matrix that ask one bus for two
+    different voltage magnitudes.
+
+    Only the entries a session would actually apply count: a generator whose
+    own AC-solver bus is Vm-fixed (``is_vm_fixed_bus[gen_bus[g]]``), connected
+    (``gen_bus[g] >= 0`` and not ``gen_off[row, g]``), with a non-NaN value.
+    Two such generators on the same bus with set-points further apart than
+    ``tol`` (per-unit) make the row infeasible -- |V| at a bus is unique --
+    so the callers report it as NOT SIMULATED instead of letting the last
+    column silently win (lightsim2grid's own ``set_vm`` behaviour).
+
+    Returns a ``(n_rows,)`` bool array, True where the row conflicts.
+    """
+    gen_v = np.asarray(gen_v, dtype=np.float64)
+    gen_bus = np.asarray(gen_bus, dtype=np.int64)
+    fixed = np.asarray(is_vm_fixed_bus, dtype=bool)
+    n_rows, n_gen = gen_v.shape
+    ok = (gen_bus >= 0)
+    ok[ok] = fixed[gen_bus[ok]]
+    cols = np.flatnonzero(ok)
+    out = np.zeros(n_rows, dtype=bool)
+    if cols.size < 2:
+        return out
+    bus = gen_bus[cols]
+    # only buses with at least two candidate columns can conflict
+    _, inv, cnt = np.unique(bus, return_inverse=True, return_counts=True)
+    multi = cnt[inv] > 1
+    if not multi.any():
+        return out
+    cols, bus = cols[multi], bus[multi]
+    vals = gen_v[:, cols]
+    active = np.isfinite(vals)
+    if gen_off is not None:
+        active &= ~np.asarray(gen_off, dtype=bool)[:, cols]
+    for b in np.unique(bus):
+        sel = bus == b
+        v = np.where(active[:, sel], vals[:, sel], np.nan)
+        with np.errstate(invalid="ignore"):
+            spread = np.nanmax(v, axis=1) - np.nanmin(v, axis=1)
+        out |= np.nan_to_num(spread, nan=0.0) > tol
+    return out
+
+
 def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None):
     """Assemble per-bus (p_mw, q_mvar) from per-element injection matrices.
 

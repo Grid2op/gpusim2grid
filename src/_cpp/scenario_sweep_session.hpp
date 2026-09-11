@@ -241,6 +241,13 @@ struct ScenarioSweepSession {
     std::vector<std::vector<int>> tripped_branches_per_scenario_;
     bool has_topology_ = false;
 
+    // Caller-declared not-simulable rows (set_skipped_rows(); ORIGINAL row
+    // order, n_scenarios entries). Copied into Contingency::skip by run(); a
+    // change is a warm source rebuild (the compaction changes).
+    std::vector<char> skip_rows_;
+    bool has_skip_   = false;
+    bool skip_dirty_ = false;
+
     // =========================================================================
     // Generator contingencies (set_contingency_gens(), lightsim2grid PR #193
     // parity). gen_data_ is the per-generator snapshot the bridge read off the
@@ -364,6 +371,18 @@ struct ScenarioSweepSession {
     // branches tripped".
     // =========================================================================
     void set_topology(const std::vector<std::vector<int>>& branch_ids_per_scenario);
+
+    // =========================================================================
+    // set_skipped_rows — (n_scenarios,) bool, row-aligned with
+    // set_injections(): True drops that row from the batch as NOT SIMULATED
+    // (NaN voltage / residual, disconnected flag = 1, GRID/NOT_SIMULATED
+    // violation) without touching the graph. Used by the Python facades for a
+    // row whose connected generators on one bus carry different voltage
+    // set-points (no V satisfies both). clear_skipped_rows() drops the mask.
+    // =========================================================================
+    void set_skipped_rows(const std::vector<char>& mask);
+    void clear_skipped_rows();
+    bool has_skipped_rows() const { return has_skip_; }
 
     // =========================================================================
     // set_gen_v -- see InjectionSweepSession::set_gen_v's doc (identical

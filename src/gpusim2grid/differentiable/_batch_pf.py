@@ -26,6 +26,15 @@ Differentiable inputs: ``load_p``, ``load_q``, ``gen_p`` (through Sbus) and
 ``gen_v`` (through the seeded voltage magnitude). ``line_status`` /
 ``trafo_status`` / ``gen_status`` are discrete and carry no gradient.
 
+A row asking one bus for two different magnitudes -- two connected
+generators on that bus, both with a non-NaN ``gen_v``, set-points further
+apart than ``gen_v_conflict_tol`` -- is infeasible (|V| at a bus is unique)
+and comes back NOT SIMULATED like an islanded row: NaN voltage, zero
+gradient, ``get_disconnected()`` = 1 (``ScenarioSweepGPU`` reports the same
+through ``set_skipped_rows``; lightsim2grid's own ``set_vm`` would silently
+let the last column win). Co-located generators with the *same* set-point
+are fine and both report the bus gradient.
+
 Generator contingencies (``gen_status``) are lightsim2grid's
 ``ScenarioSweep.set_contingency_gens`` (see ``ScenarioSweepGPU``): a
 disconnected generator's P leaves Sbus (and the target Q of a non
@@ -116,7 +125,7 @@ import torch
 from torch import Tensor
 
 from .. import _gpusim2grid as _cpp
-from .._ls2g_utils import extract_branch_data
+from .._ls2g_utils import extract_branch_data, GEN_V_CONFLICT_TOL
 from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
 from ._flows import compute_flows as _compute_flows_torch
 
@@ -131,7 +140,8 @@ class BatchPowerFlow:
     :meth:`forward`).
     """
 
-    def __init__(self, sweep, *, snapshot_jacobian=False):
+    def __init__(self, sweep, *, snapshot_jacobian=False,
+                 gen_v_conflict_tol=GEN_V_CONFLICT_TOL):
         if sweep._elements is None:
             raise ValueError(
                 "BatchPowerFlow needs a ScenarioSweepGPU built from a lightsim2grid "
@@ -140,6 +150,7 @@ class BatchPowerFlow:
         self._solver = sweep.solver                 # _ScenarioSweepSolver
         self._solver.fixed_batch_capacity = True    # always one chunk (adjoint)
         self.snapshot_jacobian = bool(snapshot_jacobian)
+        self.gen_v_conflict_tol = float(gen_v_conflict_tol)
 
         self._dev = torch.device("cuda", _device_index(sweep))
         self._rdtype = torch.float32 if bool(_cpp.is_fp32) else torch.float64
@@ -203,6 +214,19 @@ class BatchPowerFlow:
         self._gen_off_in_session = False
         self._pending_gen_off = None    # mask to hand to the session on the next run
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
+        self._skip_in_session = False
+        self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
+        # Columns that can conflict: connected generators on a Vm-fixed bus
+        # sharing that bus with another such generator.
+        gb = np.asarray(el.gen_bus, dtype=np.int64)
+        fixed = np.asarray(self._solver.is_vm_fixed_bus, dtype=bool)
+        ok = gb >= 0
+        ok[ok] = fixed[gb[ok]]
+        _, inv, cnt = np.unique(gb[ok], return_inverse=True, return_counts=True)
+        cols = np.flatnonzero(ok)[cnt[inv] > 1]
+        self._shared_cols = torch.as_tensor(cols, device=dev) if cols.size else None
+        if self._shared_cols is not None:
+            self._shared_bus = torch.as_tensor(gb[cols], device=dev)
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -212,12 +236,13 @@ class BatchPowerFlow:
                     pivot_epsilon_alg=None, use_distributed_slack=True,
                     scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                     init_from_n_powerflow=True, max_iter_base=10, tol_base=1e-8,
-                    precision=None):
+                    precision=None, gen_v_conflict_tol=GEN_V_CONFLICT_TOL):
         """Build from a *solved* lightsim2grid grid (``grid.ac_pf`` done).
 
         The keyword arguments are :class:`gpusim2grid.ScenarioSweepGPU`'s
-        (same meaning), plus ``strategy`` (linear-solve strategy string) and
-        ``snapshot_jacobian`` (see the module docstring). ``nb_iter`` is the
+        (same meaning), plus ``strategy`` (linear-solve strategy string),
+        ``snapshot_jacobian`` and ``gen_v_conflict_tol`` (see the module
+        docstring). ``nb_iter`` is the
         fixed Newton-Raphson iteration count per row: raise it (and lower
         ``tol_base``) when gradients must be accurate -- the adjoint is exact
         only at a converged solution.
@@ -232,7 +257,8 @@ class BatchPowerFlow:
             max_dVa=max_dVa, max_dVm=max_dVm,
             use_distributed_slack=use_distributed_slack)
         sweep.strategy = strategy
-        return cls(sweep, snapshot_jacobian=snapshot_jacobian)
+        return cls(sweep, snapshot_jacobian=snapshot_jacobian,
+                   gen_v_conflict_tol=gen_v_conflict_tol)
 
     # --------------------------------------------------------------- forward
     def __call__(self, *args, **kwargs):
@@ -288,6 +314,7 @@ class BatchPowerFlow:
                 Q = Q.index_add(1, self._gen_bus_sel, -q_off[:, self._gen_sel] * inv_sn)
             if gen_v is not None:
                 gen_v = torch.where(gen_off, torch.full_like(gen_v, float("nan")), gen_v)
+        self._apply_gen_v_conflicts(gen_v, n_scen)
         if self._gen_sel.numel():
             P = P.index_add(1, self._gen_bus_sel, gen_p[:, self._gen_sel] * inv_sn)
         if self._load_sel.numel():
@@ -420,6 +447,33 @@ class BatchPowerFlow:
         self._pending_topology = ragged
         self._topology_mask = tripped.clone()
 
+    def _apply_gen_v_conflicts(self, gen_v, n_scen):
+        """Rows asking one bus for two different |V| (see the module docstring)
+        are handed to the session as skipped rows; the session mask is cleared
+        again once no row conflicts. Same pending pattern as the topology."""
+        self._pending_skip = None
+        bad = None
+        if gen_v is not None and self._shared_cols is not None:
+            v = gen_v.detach()[:, self._shared_cols]
+            finite = torch.isfinite(v)
+            big, small = torch.finfo(v.dtype).max, -torch.finfo(v.dtype).max
+            hi = torch.full((n_scen, self.n_bus), small, dtype=v.dtype, device=v.device)
+            lo = torch.full((n_scen, self.n_bus), big, dtype=v.dtype, device=v.device)
+            idx = self._shared_bus.unsqueeze(0).expand(n_scen, -1)
+            hi = hi.scatter_reduce(1, idx, torch.where(finite, v, torch.full_like(v, small)),
+                                   reduce="amax")
+            lo = lo.scatter_reduce(1, idx, torch.where(finite, v, torch.full_like(v, big)),
+                                   reduce="amin")
+            both = (hi > small) & (lo < big)
+            conflict = both & ((hi - lo) > self.gen_v_conflict_tol)
+            rows = conflict.any(dim=1)
+            if bool(rows.any()):
+                bad = rows.cpu().numpy()
+        if bad is not None:
+            self._pending_skip = bad
+        elif self._skip_in_session:
+            self._pending_skip = "clear"
+
     def _apply_gen_status(self, gen_status, n_scen):
         """Same contract as _apply_topology for the generator mask. Returns the
         (n_scen, n_gen) bool "disconnected" mask to apply to the injections
@@ -473,6 +527,14 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             pf._sweep.set_topology(pf._pending_topology)
             pf._topology_in_session = True
             pf._pending_topology = None
+        if pf._pending_skip is not None:
+            if isinstance(pf._pending_skip, str):
+                solver.clear_skipped_rows()
+                pf._skip_in_session = False
+            else:
+                solver.set_skipped_rows(pf._pending_skip)
+                pf._skip_in_session = True
+            pf._pending_skip = None
         if pf._pending_gen_off is not None:
             # After the injections: the session checks the row counts against
             # them. The facade validates the mask (and would re-assemble Sbus

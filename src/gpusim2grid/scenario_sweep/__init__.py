@@ -341,6 +341,21 @@ class _ScenarioSweepSolver:
         some from set_contingency_gens' mask)."""
         return np.asarray(self._s.get_reserved_buses(), dtype=np.int64)
 
+    def set_skipped_rows(self, mask):
+        """(n_scenarios,) bool, row-aligned with set_injections(): True drops
+        that row as NOT SIMULATED (NaN voltage / residual, disconnected flag
+        = 1, GRID/NOT_SIMULATED violation) without touching the graph. Takes
+        effect on the next run() (a warm source rebuild)."""
+        self._s.set_skipped_rows(np.ascontiguousarray(mask, dtype=bool))
+
+    def clear_skipped_rows(self):
+        """Drop any set_skipped_rows() mask."""
+        self._s.clear_skipped_rows()
+
+    @property
+    def has_skipped_rows(self):
+        return self._s.has_skipped_rows
+
     def get_row_pv_to_pq(self):
         """list[list[int]]: per scenario (original row order), the AC-solver
         buses the last run() turned PV->PQ because set_contingency_gens' mask

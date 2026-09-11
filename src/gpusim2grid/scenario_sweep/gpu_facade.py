@@ -39,6 +39,7 @@ from .._ls2g_utils import (
     extract_branch_data,
     extract_injection_elements,
     build_bus_injections,
+    conflicting_gen_v_rows,
     grid_from_pandapower,
     _validate_precision,
 )
@@ -253,6 +254,9 @@ class ScenarioSweepGPU:
         # disconnected generators taken out, whatever the call order.
         self._pending_elements = None
         self._gen_off = None
+        # set_gen_v() input, kept so a later set_contingency_gens() (or vice
+        # versa) can re-derive which rows ask one bus for two different |V|.
+        self._gen_v = None
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
@@ -367,6 +371,7 @@ class ScenarioSweepGPU:
         self._gen_off = mask
         if self._pending_elements is not None:
             self._assemble_injections()
+        self._update_skipped_rows()
 
     @property
     def dim_J(self):
@@ -406,6 +411,15 @@ class ScenarioSweepGPU:
             (the default), every scenario keeps the grid's own base-case
             voltage.
 
+        A row asking one bus for two different magnitudes (two connected
+        generators on that bus, both applied, set-points further apart than
+        ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``) is infeasible -- |V|
+        at a bus is unique -- and is reported as NOT SIMULATED (NaN voltage /
+        residual, :meth:`get_disconnected` = 1, a ``GRID``/``NOT_SIMULATED``
+        violation) rather than letting the last column silently win the way
+        lightsim2grid's own ``set_vm`` does. A generator taken out by
+        :meth:`set_contingency_gens` (or a NaN entry) does not take part.
+
         Notes
         -----
         The generator -> bus wiring is snapshotted at construction, like
@@ -416,7 +430,25 @@ class ScenarioSweepGPU:
             raise RuntimeError(
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
+        gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
         self._inner.set_gen_v(gen_v, self._elements.gen_bus)
+        self._gen_v = gen_v
+        self._update_skipped_rows()
+
+    def _update_skipped_rows(self):
+        """Re-derive the not-simulable rows from set_gen_v() (and the
+        generator mask); a row-count mismatch is left to the C++ session."""
+        if self._gen_v is None:
+            return
+        gen_off = self._gen_off
+        if gen_off is not None and gen_off.shape[0] != self._gen_v.shape[0]:
+            gen_off = None
+        bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_bus,
+                                     self._inner.is_vm_fixed_bus, gen_off=gen_off)
+        if bad.any():
+            self._inner.set_skipped_rows(bad)
+        else:
+            self._inner.clear_skipped_rows()
 
     def set_topology(self, branch_ids_per_scenario):
         """Define each scenario's topology as branch removals.

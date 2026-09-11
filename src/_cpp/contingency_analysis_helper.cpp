@@ -588,6 +588,7 @@ void check_connectivity(
     std::vector<int>        masked;
 
     for (auto& ctg : contingencies) {
+        if (ctg.skip) { ctg.disconnected = true; continue; }
         sc.collect_removed(ctg, values);
         if (fast_masked_set(ix, sc, masked)) {
             if (!masked.empty()) ctg.disconnected = true;
@@ -618,6 +619,7 @@ void compute_component_masks(
     for (auto& ctg : contingencies) {
         ctg.masked_buses.clear();
         ctg.stranded_groups.clear();
+        if (ctg.skip) { ctg.disconnected = true; continue; }
         sc.collect_removed(ctg, values);
 
         if (!fast_masked_set(ix, sc, ctg.masked_buses)) {

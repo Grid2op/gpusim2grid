@@ -584,6 +584,31 @@ void ScenarioSweepSession::set_topology(
 }
 
 // =============================================================================
+// set_skipped_rows / clear_skipped_rows
+// =============================================================================
+void ScenarioSweepSession::set_skipped_rows(const std::vector<char>& mask)
+{
+    if (mask.empty())
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_skipped_rows: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(mask.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_skipped_rows: row count must match "
+            "set_injections()'s n_scenarios");
+    skip_rows_  = mask;
+    has_skip_   = true;
+    skip_dirty_ = true;
+}
+
+void ScenarioSweepSession::clear_skipped_rows()
+{
+    if (!has_skip_) return;
+    skip_rows_.clear();
+    has_skip_   = false;
+    skip_dirty_ = true;
+}
+
+// =============================================================================
 // set_limits
 // =============================================================================
 void ScenarioSweepSession::set_limits(
@@ -651,6 +676,12 @@ void ScenarioSweepSession::run()
             "matches set_injections()'s n_scenarios -- call set_contingency_gens() "
             "again after changing set_injections()");
 
+    if (has_skip_ && static_cast<int>(skip_rows_.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_skipped_rows()'s row count no longer "
+            "matches set_injections()'s n_scenarios -- call set_skipped_rows() "
+            "again after changing set_injections()");
+
     // Generator contingencies: derive what the mask needs -- the buses that
     // must own a reserved Vm column + Q equation (union over rows), the
     // per-row PV→PQ releases, the per-row slack participants taken out -- and
@@ -686,11 +717,13 @@ void ScenarioSweepSession::run()
 
     // Reset disconnected flags from any previous run() — contingencies_ is
     // mutated in place across runs.
-    for (auto& ctg : contingencies_) {
+    for (size_t r = 0; r < contingencies_.size(); ++r) {
+        Contingency& ctg = contingencies_[r];
         ctg.disconnected = false;
         ctg.masked_buses.clear();
         ctg.stranded_groups.clear();
         ctg.pinned_buses.clear();
+        ctg.skip = has_skip_ && skip_rows_[r] != 0;
     }
 
     // Per-row PV pins: every reserved bus stays PV (identity Q row) except
@@ -743,7 +776,7 @@ void ScenarioSweepSession::run()
     // -------------------------------------------------------------------------
     const ScenarioSweepDriverConfig cfg = _current_config();
     const bool cold = !solver_ || cfg != driver_cfg_;
-    const bool warm = !cold && (topology_dirty_ || gen_off_dirty_);
+    const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_);
 
     if (cold) {
         // Host preprocessing (resolve_indices + connectivity/masking +
@@ -892,6 +925,7 @@ void ScenarioSweepSession::run()
     has_violations_result_ = compute_limit_violations_;
 
     injections_dirty_ = topology_dirty_ = gen_v_dirty_ = gen_off_dirty_ = false;
+    skip_dirty_ = false;
     last_run_kept_jacobian_ = keep_final_jacobian_;
     ++run_counter_;
 

@@ -831,3 +831,51 @@ class TestGenStatus:
         pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_status=gs2)
         with pytest.raises(RuntimeError, match="batch structure"):
             V1.real.sum().backward()
+
+
+class TestConflictingSetpoints:
+    """Two connected generators on one bus with different gen_v: infeasible,
+    the row comes back NOT SIMULATED (NaN, zero gradient), and is simulated
+    again once the set-points agree, one is NaN, or one is disconnected."""
+
+    def test_row_is_dropped_and_recovers(self, solver_atol):
+        grid, (g_a, g_b) = _two_gen_case14()
+        pf = _pf(grid, nb_iter=15)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        gen_v = torch.full((n, pf.n_gen), float("nan"), dtype=RDT, device="cuda")
+        gen_v[:, [g_a, g_b]] = 1.02
+        V_ok = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v).clone()
+        assert torch.isfinite(V_ok).all()
+
+        bad = gen_v.clone()
+        bad[1, g_b] = 1.03
+        gv = bad.clone().requires_grad_(True)
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gv)
+        assert pf.get_disconnected().tolist() == [0, 1, 0]
+        assert torch.isnan(V[1]).all()
+        torch.testing.assert_close(V[[0, 2]], V_ok[[0, 2]], atol=solver_atol, rtol=0)
+        loss = torch.where(torch.isfinite(V.real), V, torch.zeros_like(V)).abs().pow(2).sum()
+        loss.backward()
+        assert torch.all(gv.grad[1] == 0)
+        assert gv.grad[0, g_a] == gv.grad[0, g_b] != 0
+
+        # NaN on one of them: applied set-point unique again
+        one = bad.clone()
+        one[1, g_a] = float("nan")
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=one)
+        assert pf.get_disconnected().tolist() == [0, 0, 0]
+        assert torch.isfinite(V).all()
+        assert abs(V[1, int(pf._gen_bus_all[g_b])]).item() == pytest.approx(1.03, abs=1e-6)
+
+        # disconnecting the conflicting generator resolves it too
+        gs = torch.ones(n, pf.n_gen, dtype=torch.bool, device="cuda")
+        gs[1, g_b] = False
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=bad, gen_status=gs)
+        assert pf.get_disconnected().tolist() == [0, 0, 0]
+        assert abs(V[1, int(pf._gen_bus_all[g_a])]).item() == pytest.approx(1.02, abs=1e-6)
+
+        # and back to the agreeing set-points: identical to the first call
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v)
+        assert pf.get_disconnected().tolist() == [0, 0, 0]
+        torch.testing.assert_close(V, V_ok, atol=solver_atol, rtol=0)

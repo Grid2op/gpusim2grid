@@ -1394,6 +1394,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "row-aligned with set_injections(). Requires set_branch_data() "
          "first. Optional: if never called, run() defaults every scenario "
          "to \"no branches tripped\" (a plain injection sweep).")
+    .def("set_skipped_rows",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 1)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_skipped_rows: mask must be 1-D (n_scenarios,)");
+             const bool* p = mask.data();
+             std::vector<char> m(static_cast<size_t>(mask.shape(0)));
+             for (size_t i = 0; i < m.size(); ++i) m[i] = p[i] ? 1 : 0;
+             self.set_skipped_rows(m);
+         },
+         pybind11::arg("mask"),
+         "(n_scenarios,) bool, row-aligned with set_injections(): True drops "
+         "that row from the batch as NOT SIMULATED (NaN voltage / residual, "
+         "disconnected flag = 1, GRID/NOT_SIMULATED violation) without "
+         "touching the graph -- e.g. two connected generators on one bus with "
+         "different voltage set-points. Takes effect on the next run() (a warm "
+         "source rebuild).")
+    .def("clear_skipped_rows", &ScenarioSweepSession::clear_skipped_rows,
+         "Drop any set_skipped_rows() mask.")
+    .def_property_readonly("has_skipped_rows", &ScenarioSweepSession::has_skipped_rows)
     .def("set_contingency_gens",
          [](ScenarioSweepSession& self,
             pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
