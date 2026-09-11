@@ -202,6 +202,45 @@ __global__ void apply_bus_mask_kernel(
 }
 
 // =============================================================================
+// apply_J_overrides_kernel
+// =============================================================================
+__global__ void apply_J_overrides_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*           __restrict__ d_jov_slot,
+    const int*           __restrict__ d_jov_pos,
+    const cuda_real_type* __restrict__ d_jov_val,
+    int nnz_J,
+    int n_entries)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_entries) return;
+    d_J_values[static_cast<ptrdiff_t>(d_jov_slot[tid]) * nnz_J + d_jov_pos[tid]] = d_jov_val[tid];
+}
+
+// =============================================================================
+// vc_stranded_vrow_kernel
+// =============================================================================
+__global__ void vc_stranded_vrow_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,
+    const int*            __restrict__ d_vc_vrow,
+    const int*            __restrict__ d_vc_grp_start,
+    const int*            __restrict__ d_str_slot,
+    const int*            __restrict__ d_str_grp,
+    int n_ctrl,
+    int dim_J,
+    int n_entries)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_entries) return;
+    const ptrdiff_t slot = d_str_slot[tid];
+    const int       g    = d_str_grp[tid];
+    // F_v = Q_c (pin the lone controller's reactive injection to 0);
+    // residual d_F = -F_v (custom row: assign), replacing vc_vrow_kernel's.
+    d_F[slot * dim_J + d_vc_vrow[g]] = -d_vc_q[slot * n_ctrl + d_vc_grp_start[g]];
+}
+
+// =============================================================================
 // mask_V_nan_kernel
 // =============================================================================
 __global__ void mask_V_nan_kernel(
@@ -597,6 +636,7 @@ __global__ void adjust_slack_mismatch_kernel(
     const cuda_real_type* __restrict__ d_slack_absorbed,
     const int*            __restrict__ d_slack_prow,
     const cuda_real_type* __restrict__ d_slack_w,
+    int w_stride,
     int n_slack,
     int dim_J,
     int actual_batch)
@@ -607,26 +647,29 @@ __global__ void adjust_slack_mismatch_kernel(
     const int       k   = static_cast<int>(tid % n_slack);
     if (b >= actual_batch) return;
     // mis += sa·weight  ⇒  residual d_F = −real(mis) gains −sa·weight
-    d_F[b * dim_J + d_slack_prow[k]] -= d_slack_absorbed[b] * d_slack_w[k];
+    // w_stride == 0: shared weights; == n_slack: this slot's own weights.
+    d_F[b * dim_J + d_slack_prow[k]] -= d_slack_absorbed[b] * d_slack_w[b * w_stride + k];
 }
 
 __global__ void fill_slack_feature_kernel(
           cuda_real_type* __restrict__ d_J_values,
     const int*            __restrict__ d_slack_feat_pos,
     const cuda_real_type* __restrict__ d_slack_w,
+    int w_stride,
     int n_slack,
     int nnz_J,
     int actual_batch)
 {
     // tid/b widened to ptrdiff_t; see fill_J_kernel's own note -- this kernel
     // is also reused for VC feature stamping (fill_slack_feature_kernel is
-    // called with VC's flat pos/value pairs too), so the nnz_J-scaled offset
-    // below is exactly as much at risk as fill_J_kernel's own J_base.
+    // called with VC's flat pos/value pairs too, w_stride 0), so the
+    // nnz_J-scaled offset below is exactly as much at risk as fill_J_kernel's
+    // own J_base.
     const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const ptrdiff_t b   = tid / n_slack;
     const int       k   = static_cast<int>(tid % n_slack);
     if (b >= actual_batch) return;
-    d_J_values[b * nnz_J + d_slack_feat_pos[k]] = d_slack_w[k];
+    d_J_values[b * nnz_J + d_slack_feat_pos[k]] = d_slack_w[b * w_stride + k];
 }
 
 __global__ void init_slack_absorbed_kernel(

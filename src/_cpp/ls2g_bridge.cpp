@@ -7,12 +7,17 @@
 // =============================================================================
 
 #include "ls2g_bridge.hpp"
-#include "timing_utils.hpp"   // ms_since
+#include "ledger_extend.hpp"   // materialize_vc_custom_rows, reserve_stranded_controller_slots
+#include "timing_utils.hpp"    // ms_since
 
 #include <chrono>
+#include <cmath>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -250,6 +255,35 @@ void remap_pairs(std::vector<int>& buses, std::vector<int>& idx,
     idx.swap(ki);
 }
 
+// The per-generator "local / remote voltage controller" predicates changed
+// name in lightsim2grid: dev_1.0.1 has GeneratorContainer::
+// gen_is_local_voltage_controller / gen_is_voltage_controller (the latter
+// meaning REMOTE), the later VoltageSourceContainer refactor renamed them
+// is_local_voltage_controller / is_remote_voltage_controller. Same gating
+// either way (status, regulator on, regulates_remote, pseudo-off rule).
+// Detect whichever the installed headers provide so the bridge builds
+// against both.
+template <class C, class = void>
+struct has_new_vc_predicates : std::false_type {};
+template <class C>
+struct has_new_vc_predicates<
+    C, std::void_t<decltype(std::declval<const C&>().is_remote_voltage_controller(0))>>
+    : std::true_type {};
+
+template <class C>
+bool gen_local_vreg(const C& gens, int g)
+{
+    if constexpr (has_new_vc_predicates<C>::value) return gens.is_local_voltage_controller(g);
+    else                                           return gens.gen_is_local_voltage_controller(g);
+}
+
+template <class C>
+bool gen_remote_vreg(const C& gens, int g)
+{
+    if constexpr (has_new_vc_predicates<C>::value) return gens.is_remote_voltage_controller(g);
+    else                                           return gens.gen_is_voltage_controller(g);
+}
+
 }  // namespace
 
 LedgerData drop_multislack_augmentation(const LedgerData& in,
@@ -340,11 +374,63 @@ LedgerData drop_multislack_augmentation(const LedgerData& in,
         c = nc;
     }
 
+    // Explicit VC custom rows (only present once ledger_extend.hpp froze them;
+    // the factories drop the slack BEFORE that, so normally empty here).
+    for (int& r : out.vc_v_rows) if (r >= 0) r = row_new[r];
+    for (auto& rows : out.vc_share_rows)
+        for (int& r : rows) if (r >= 0) r = row_new[r];
+    if (!out.switchable_vm_buses.empty())
+        throw std::runtime_error(
+            "drop_multislack_augmentation: must run before add_switchable_vm_buses");
+
     // MultiSlack itself is gone: the feature kernels are gated on slack_col>=0.
     out.slack_col = -1;
     out.slack_weights.clear();
     out.slack_absorbed_gt = 0.0;
     return out;
+}
+
+GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    const ls2g::GeneratorContainer& gens = grid.get_generators();
+    const int n_gen = gens.nb();
+    const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
+    const std::set<int> group_buses = grid.get_group_controlled_buses();  // GRID bus ids
+
+    GenContingencyData d;
+    d.n_gen = n_gen;
+    d.bus.assign(n_gen, -1);
+    d.status.assign(n_gen, 0);
+    d.local_vreg.assign(n_gen, 0);
+    d.remote_vreg.assign(n_gen, 0);
+    d.on_group_bus.assign(n_gen, 0);
+    d.slack_participant.assign(n_gen, 0);
+    d.slack_weight.assign(n_gen, 0.0);
+    d.vreg_on.assign(n_gen, 0);
+    d.target_q_mvar.assign(n_gen, 0.0);
+
+    for (int g = 0; g < n_gen; ++g) {
+        const ls2g::GenInfo gi(gens, g);
+        d.status[g]        = gi.connected ? 1 : 0;
+        d.slack_weight[g]  = static_cast<double>(gi.slack_weight);
+        d.vreg_on[g]       = gi.voltage_regulator_on ? 1 : 0;
+        d.target_q_mvar[g] = static_cast<double>(gi.target_q_mvar);
+        if (!gi.connected) continue;
+        const int bus_me = gi.bus_id;
+        int bus_solver = bus_me;
+        if (!me_to_solver.empty()) {
+            bus_solver = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size()))
+                         ? me_to_solver[bus_me] : -1;
+        }
+        if (bus_solver < 0 || bus_solver >= n_bus_solver) bus_solver = -1;
+        d.bus[g]          = bus_solver;
+        d.local_vreg[g]   = gen_local_vreg(gens, g)  ? 1 : 0;
+        d.remote_vreg[g]  = gen_remote_vreg(gens, g) ? 1 : 0;
+        d.on_group_bus[g] = (bus_me >= 0 && group_buses.count(bus_me) > 0) ? 1 : 0;
+        d.slack_participant[g] =
+            (gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12) ? 1 : 0;
+    }
+    return d;
 }
 
 LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, double tol)
@@ -634,6 +720,11 @@ make_ca_session_from_lsgrid(
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
     if (!use_distributed_slack)
         ledger = drop_multislack_augmentation(ledger, pv, pq);
+    // handle_disconnected_grid: one structural zero per lone remote-regulating
+    // generator so a contingency stranding its own bus can repurpose its
+    // voltage row by value (lightsim2grid PR #192). Negligible cost, always on
+    // for the batch sessions (handle_disconnected_grid is a mutable property).
+    reserve_stranded_controller_slots(ledger);
     const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
         grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<ContingencyAnalysisSession>(
@@ -755,6 +846,10 @@ make_ss_session_from_lsgrid(
     LedgerData ledger = extract_ledger_data(grid, init_from_n_powerflow, tol_base);
     if (!use_distributed_slack)
         ledger = drop_multislack_augmentation(ledger, pv, pq);
+    // See make_ca_session_from_lsgrid. The switchable Vm buses of generator
+    // contingencies are NOT reserved here: the session derives them from the
+    // mask it is given later and extends a copy of this ledger itself.
+    reserve_stranded_controller_slots(ledger);
     const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
         grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<ScenarioSweepSession>(
@@ -763,6 +858,10 @@ make_ss_session_from_lsgrid(
         /*presolved_v=*/init_from_n_powerflow,
         reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
         scaling, max_dVa, max_dVm);
+
+    // Per-generator snapshot for set_contingency_gens() (cheap, always).
+    session->set_gen_contingency_data(
+        extract_gen_contingency_data(grid, static_cast<int>(Ybus.rows())));
 
     // Always set — set_topology() needs branch admittances to build each
     // scenario's Ybus triplets, not just compute_flows().

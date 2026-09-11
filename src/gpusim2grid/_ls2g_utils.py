@@ -225,6 +225,13 @@ class InjectionElements:
     # why a disconnected generator's column must never alias a still-connected
     # one's bus). Used by ScenarioSweepGPU.set_gen_v() / InjectionSweepGPU.set_gen_v().
     gen_bus: np.ndarray
+    # (n_gen,) reactive setpoint (MVAr) and voltage-regulator flag of every
+    # generator. A NON-regulating ("PQ") generator's target Q sits inside
+    # const_mw; ScenarioSweepGPU.set_contingency_gens needs both to take a
+    # disconnected generator's Q back out (a regulating one never had its Q
+    # in Sbus -- it is solved for). Mirrors lightsim2grid's SbusPolicy.
+    gen_target_q_mvar: np.ndarray = None
+    gen_vreg_on: np.ndarray = None
 
 
 def extract_injection_elements(grid, n_bus):
@@ -311,16 +318,19 @@ def extract_injection_elements(grid, n_bus):
                                 + 1j * load_q_base[load_sel])
 
     gen_bus_out = np.where(gen_status, gen_bus, -1)
+    gen_target_q = np.array([float(g.target_q_mvar) for g in gens], dtype=np.float64)
+    gen_vreg_on = np.array([bool(g.voltage_regulator_on) for g in gens], dtype=bool)
 
     return InjectionElements(
         n_load=n_load, n_gen=n_gen, n_bus=int(n_bus),
         sn_mva=float(grid.get_sn_mva()),
         load_sel=load_sel, gen_sel=gen_sel,
         scatter_load=scatter_load, scatter_gen=scatter_gen,
-        const_mw=const_mw, gen_bus=gen_bus_out)
+        const_mw=const_mw, gen_bus=gen_bus_out,
+        gen_target_q_mvar=gen_target_q, gen_vreg_on=gen_vreg_on)
 
 
-def build_bus_injections(elements, load_p, load_q, gen_p):
+def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None):
     """Assemble per-bus (p_mw, q_mvar) from per-element injection matrices.
 
     Parameters
@@ -328,6 +338,15 @@ def build_bus_injections(elements, load_p, load_q, gen_p):
     elements : InjectionElements — from :func:`extract_injection_elements`.
     load_p, load_q : (n_steps, n_load) float arrays, MW / MVAr.
     gen_p : (n_steps, n_gen) float array, MW.
+    gen_off : (n_steps, n_gen) bool array, optional
+        ``True`` takes that generator out of that step's injection: its active
+        power ``gen_p[step, g]`` leaves Sbus and, for a NON voltage-regulating
+        generator, its reactive setpoint (``elements.gen_target_q_mvar``,
+        which lives inside ``const_mw``) too. A regulating generator never had
+        its Q in Sbus (it is solved for), so nothing else is subtracted for it
+        -- dropping its voltage pinning is the solver's job
+        (``ScenarioSweepGPU.set_contingency_gens``). Mirrors lightsim2grid's
+        ``SbusPolicy::Vary`` generator-contingency correction.
 
     Returns
     -------
@@ -360,10 +379,28 @@ def build_bus_injections(elements, load_p, load_q, gen_p):
                 f"has {n_steps}. All injection matrices must share the same "
                 f"number of rows.")
 
+    if gen_off is not None:
+        gen_off = np.asarray(gen_off, dtype=bool)
+        if gen_off.shape != gen_p.shape:
+            raise ValueError(
+                f"'gen_off' has shape {gen_off.shape} while 'gen_p' has "
+                f"{gen_p.shape}; both are (n_steps, n_gen).")
+        if elements.gen_target_q_mvar is None or elements.gen_vreg_on is None:
+            raise ValueError(
+                "this InjectionElements snapshot carries no generator reactive "
+                "setpoints; rebuild it with extract_injection_elements().")
+        # Same operands as lightsim2grid: take back exactly what the generator
+        # pass adds (P), plus the target Q of a non-regulating generator.
+        gen_p = np.where(gen_off, 0.0, gen_p)
+        q_off = np.where(gen_off & ~elements.gen_vreg_on[None, :],
+                         elements.gen_target_q_mvar[None, :], 0.0)
+
     sbus_mw = np.empty((n_steps, elements.n_bus), dtype=np.complex128)
     sbus_mw[:] = elements.const_mw
     if elements.gen_sel.size:
         sbus_mw += (elements.scatter_gen @ gen_p[:, elements.gen_sel].T).T
+        if gen_off is not None:
+            sbus_mw -= 1j * (elements.scatter_gen @ q_off[:, elements.gen_sel].T).T
     if elements.load_sel.size:
         load_s = (load_p[:, elements.load_sel]
                   + 1j * load_q[:, elements.load_sel])

@@ -15,12 +15,19 @@
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
 #include "ledger_data.hpp"       // LedgerData (mask_cfg_ controller-bus setup)
+#include "ledger_extend.hpp"     // add_switchable_vm_buses
+#include "mask_config_builder.cuh"   // build_mask_config
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <map>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -66,51 +73,28 @@ ScenarioSweepSession::ScenarioSweepSession(
     , scaling_max_voltage_change_(scaling_max_voltage_change)
     , max_dVa_(max_dVa)
     , max_dVm_(max_dVm)
+    , Ybus_cm_(Ybus)
+    , Vinit_(Vinit)
+    , Sbus_(Sbus)
+    , slack_ids_(slack_ids)
+    , pv_(pv)
+    , pq_(pq)
+    , max_iter_base_(max_iter_base)
+    , tol_base_(tol_base)
+    , device_(device)
+    , presolved_v_(presolved_v)
+    , debug_base_case_(debug_base_case)
 {
     (void)slack_weights;
+    if (ledger != nullptr) base_ledger_ = std::make_unique<LedgerData>(*ledger);
 
-    auto t_base_start = std::chrono::steady_clock::now();
-    base_state_ = std::make_unique<AcPfNrState>(
-        Ybus, Vinit, Sbus, pv, pq,
-        max_iter_base,
-        static_cast<eigen_real_type>(tol_base),
-        device, ledger, presolved_v,
-        /*diag_stop_before_state_correction=*/false,
-        reordering_alg, matching_alg, pivot_epsilon_alg,
-        debug_base_case, /*base_case_only=*/true,
-        scaling_max_voltage_change, max_dVa, max_dVm);
-    t_base_case_ms_ = ms_since(t_base_start);
-
-    // Build the handle_disconnected_grid mask configuration once from the base
-    // case (per-bus identity-row metadata + angle reference) and the ledger
-    // (controller buses → skip-if-stranded). Cheap; only consulted by run()
-    // when handle_disconnected_grid_ is enabled. Verbatim
-    // ContingencyAnalysisSession's identical ctor block.
-    {
-        const int n_bus = base_state_->n_bus;
-        mask_cfg_.row_info.p_row      = base_state_->h_p_row_of_bus;
-        mask_cfg_.row_info.q_row      = base_state_->h_q_row_of_bus;
-        mask_cfg_.row_info.p_diag_pos = base_state_->h_p_diag_pos;
-        mask_cfg_.row_info.q_diag_pos = base_state_->h_q_diag_pos;
-
-        mask_cfg_.is_reference_bus.assign(static_cast<size_t>(n_bus), 0);
-        for (int b = 0; b < n_bus; ++b)
-            if (base_state_->h_theta_col_of_bus[static_cast<size_t>(b)] < 0)
-                mask_cfg_.is_reference_bus[static_cast<size_t>(b)] = 1;
-
-        mask_cfg_.is_controller_bus.assign(static_cast<size_t>(n_bus), 0);
-        if (ledger != nullptr) {
-            auto mark = [&](int b){ if (b >= 0 && b < n_bus) mask_cfg_.is_controller_bus[static_cast<size_t>(b)] = 1; };
-            for (int b : ledger->hvdc_bus1)  mark(b);
-            for (int b : ledger->hvdc_bus2)  mark(b);
-            for (int b : ledger->vc_bus)     mark(b);
-            for (int b : ledger->vc_reg_bus) mark(b);
-        }
-    }
+    _build_base_state(std::vector<int>{});
 
     // Vm-fixed bus mask for set_gen_v(): a bus in pv or slack_ids has |V|
     // fixed by construction (not an NR unknown) in both the bare and the
-    // augmented-ledger system -- see set_gen_v()'s own doc.
+    // augmented-ledger system -- see set_gen_v()'s own doc. A switchable bus
+    // (generator contingencies) keeps its reseed too: it is only the NR start
+    // value on a row that releases it.
     {
         const int n_bus = base_state_->n_bus;
         h_is_vm_fixed_bus_.assign(static_cast<size_t>(n_bus), 0);
@@ -123,6 +107,234 @@ ScenarioSweepSession::ScenarioSweepSession(
             if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
         }
     }
+}
+
+// =============================================================================
+// _build_base_state — base-case NR on the (possibly extended) ledger.
+// =============================================================================
+void ScenarioSweepSession::_build_base_state(const std::vector<int>& switchable_buses)
+{
+    // solver_ references *base_state_: drop it first. Its d_V_results /
+    // DLPack views die with it (run() rebuilds it anyway).
+    solver_.reset();
+    has_violations_result_ = false;
+
+    const LedgerData* ledger_ptr = nullptr;
+    LedgerData ext;
+    if (base_ledger_) {
+        ext = *base_ledger_;
+        if (!switchable_buses.empty())
+            add_switchable_vm_buses(ext, switchable_buses, Ybus_rm_);
+        ledger_ptr = &ext;
+    }
+
+    auto t_base_start = std::chrono::steady_clock::now();
+    base_state_ = std::make_unique<AcPfNrState>(
+        Ybus_cm_, Vinit_, Sbus_, pv_, pq_,
+        max_iter_base_,
+        static_cast<eigen_real_type>(tol_base_),
+        device_, ledger_ptr, presolved_v_,
+        /*diag_stop_before_state_correction=*/false,
+        reordering_alg_, matching_alg_, pivot_epsilon_alg_,
+        debug_base_case_, /*base_case_only=*/true,
+        scaling_max_voltage_change_, max_dVa_, max_dVm_);
+    t_base_case_ms_ = ms_since(t_base_start);
+
+    // handle_disconnected_grid mask configuration (per-bus identity-row
+    // metadata + angle reference + VC group topology / row positions); its
+    // row_info also drives the per-row PV pins of generator contingencies, so
+    // it is rebuilt with the base state. Shared builder with
+    // ContingencyAnalysisSession.
+    mask_cfg_ = build_mask_config(*base_state_, ledger_ptr);
+    reserved_buses_ = base_state_->h_switchable_buses;
+}
+
+// =============================================================================
+// set_gen_contingency_data / set_contingency_gens
+// =============================================================================
+void ScenarioSweepSession::set_gen_contingency_data(const GenContingencyData& data)
+{
+    gen_data_     = data;
+    has_gen_data_ = (data.n_gen > 0);
+}
+
+void ScenarioSweepSession::set_contingency_gens(Eigen::Ref<const BoolMat> mask)
+{
+    if (!has_gen_data_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_gens: this session has no "
+            "generator data (explicit-array/tuple mode, or a build without the "
+            "lightsim2grid bridge). Generator contingencies need a session built "
+            "from a lightsim2grid grid.");
+    if (mask.cols() != gen_data_.n_gen)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_gens: the mask has " +
+            std::to_string(mask.cols()) + " columns but the grid has " +
+            std::to_string(gen_data_.n_gen) + " generators");
+    if (mask.rows() <= 0)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_gens: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(mask.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_gens: row count must match "
+            "set_injections()'s n_scenarios");
+
+    // Only a generator pinning its OWN bus is in scope. A remote controller,
+    // or a bus a control group holds (remote generator, SVC, HVDC station),
+    // lives in the VoltageControl extension, whose own Jacobian rows and
+    // columns nothing here reserves or releases (same rule as lightsim2grid).
+    for (int g = 0; g < gen_data_.n_gen; ++g) {
+        bool ever_off = false;
+        for (Eigen::Index r = 0; r < mask.rows() && !ever_off; ++r)
+            if (mask(r, g)) ever_off = true;
+        if (!ever_off) continue;
+        if (gen_data_.remote_vreg[g])
+            throw std::runtime_error(
+                "ScenarioSweepSession::set_contingency_gens: generator " +
+                std::to_string(g) + " regulates the voltage of a remote bus. Only "
+                "generators regulating their own bus can be disconnected for now: "
+                "remote voltage control is not supported by this feature yet.");
+        if (gen_data_.on_group_bus[g])
+            throw std::runtime_error(
+                "ScenarioSweepSession::set_contingency_gens: generator " +
+                std::to_string(g) + " stands on a bus whose voltage a control group "
+                "holds (a remote generator, an SVC or an HVDC converter station). "
+                "Only generators regulating their own bus can be disconnected for "
+                "now: remote voltage control is not supported by this feature yet.");
+    }
+
+    gen_off_     = mask;
+    has_gen_off_ = true;
+}
+
+int ScenarioSweepSession::dim_J() const
+{
+    return base_state_ ? base_state_->dim_J : 0;
+}
+
+// =============================================================================
+// _prepare_gen_contingency — mirrors BaseBatchSweep::_maybe_prepare_gen_contingency
+// =============================================================================
+void ScenarioSweepSession::_prepare_gen_contingency(
+    std::vector<int>&              required,
+    std::vector<std::vector<int>>& row_pv_to_pq,
+    std::vector<std::vector<int>>& row_slack_off) const
+{
+    required.clear();
+    row_pv_to_pq.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
+    row_slack_off.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
+    if (!has_gen_off_) return;
+
+    const int n_gen  = gen_data_.n_gen;
+    const int n_rows = std::min(n_scenarios_, static_cast<int>(gen_off_.rows()));
+
+    // Which bus does each LOCAL voltage controller pin? (-1: none)
+    std::map<int, std::vector<int>> gens_of_bus;
+    for (int g = 0; g < n_gen; ++g) {
+        if (!gen_data_.status[g] || !gen_data_.local_vreg[g]) continue;
+        const int b = gen_data_.bus[g];
+        if (b < 0) continue;
+        gens_of_bus[b].push_back(g);
+    }
+
+    std::set<int> req;
+    for (int r = 0; r < n_rows; ++r) {
+        for (const auto& kv : gens_of_bus) {
+            bool all_off = true;
+            for (int g : kv.second)
+                if (!gen_off_(r, g)) { all_off = false; break; }
+            if (all_off) {
+                row_pv_to_pq[static_cast<size_t>(r)].push_back(kv.first);
+                req.insert(kv.first);
+            }
+        }
+        for (int g = 0; g < n_gen; ++g)
+            if (gen_off_(r, g) && gen_data_.status[g] && gen_data_.slack_participant[g])
+                row_slack_off[static_cast<size_t>(r)].push_back(g);
+    }
+
+    // Only a bus that owns no Vm unknown / Q equation in the base ledger needs
+    // a reserved pair (add_switchable_vm_buses skips the others anyway, so
+    // this keeps `required` comparable to reserved_buses_).
+    for (int b : req) {
+        if (base_ledger_ &&
+            (base_ledger_->vm_col_of_bus[static_cast<size_t>(b)] >= 0 ||
+             base_ledger_->q_row_of_bus[static_cast<size_t>(b)] >= 0))
+            continue;
+        required.push_back(b);
+    }
+    std::sort(required.begin(), required.end());
+}
+
+// =============================================================================
+// _row_slack_weights — mirrors BaseBatchSweep::_row_slack_weights /
+// GeneratorContainer::get_slack_weights_solver_without
+// =============================================================================
+std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
+    const std::vector<std::vector<int>>& row_slack_off) const
+{
+    std::vector<cuda_real_type> out;
+    const int n_slack = base_state_->n_slack;
+    if (n_slack <= 0) return out;
+    bool any = false;
+    for (const auto& v : row_slack_off) if (!v.empty()) { any = true; break; }
+    if (!any) return out;
+
+    const int n_bus = base_state_->n_bus;
+    const std::vector<int>& slack_bus = base_state_->h_slack_bus;
+    const std::vector<cuda_real_type>& base_w = base_state_->h_slack_w;
+    int ref_bus = -1;
+    for (int b = 0; b < n_bus; ++b)
+        if (mask_cfg_.is_reference_bus[static_cast<size_t>(b)]) { ref_bus = b; break; }
+    if (ref_bus < 0 && slack_ids_.size() > 0) ref_bus = slack_ids_(0);
+
+    out.assign(static_cast<size_t>(n_scenarios_) * n_slack, static_cast<cuda_real_type>(0.));
+    std::vector<double> w(static_cast<size_t>(n_bus));
+    std::vector<char>   off(static_cast<size_t>(gen_data_.n_gen));
+    for (int r = 0; r < n_scenarios_; ++r) {
+        cuda_real_type* row = out.data() + static_cast<ptrdiff_t>(r) * n_slack;
+        if (row_slack_off[static_cast<size_t>(r)].empty()) {
+            std::copy(base_w.begin(), base_w.end(), row);
+            continue;
+        }
+        std::fill(off.begin(), off.end(), 0);
+        for (int g : row_slack_off[static_cast<size_t>(r)]) off[static_cast<size_t>(g)] = 1;
+        std::fill(w.begin(), w.end(), 0.0);
+        double sum = 0.0;
+        for (int g = 0; g < gen_data_.n_gen; ++g) {
+            if (!gen_data_.status[g] || !gen_data_.slack_participant[g] || off[static_cast<size_t>(g)]) continue;
+            const int b = gen_data_.bus[g];
+            if (b < 0) continue;
+            w[static_cast<size_t>(b)] += gen_data_.slack_weight[g];
+            sum += gen_data_.slack_weight[g];
+        }
+        if (std::abs(sum) < 1e-12) {
+            // Every participant off: the reference bus keeps the whole share
+            // (the angle reference is a property of the batch, picked once).
+            std::fill(w.begin(), w.end(), 0.0);
+            if (ref_bus >= 0 && ref_bus < n_bus) w[static_cast<size_t>(ref_bus)] = 1.0;
+        } else {
+            for (double& x : w) x /= sum;
+        }
+        for (int k = 0; k < n_slack; ++k) {
+            const int b = slack_bus[static_cast<size_t>(k)];
+            row[k] = static_cast<cuda_real_type>(w[static_cast<size_t>(b)]);
+            w[static_cast<size_t>(b)] = 0.0;   // consumed
+        }
+        // A survivor bus that is not a base participant cannot exist (the
+        // survivors are a subset of the base participants); the degenerate
+        // "reference gets 1" case can, when the reference carries no base
+        // weight (several slacks) -- refuse rather than silently drop it.
+        for (int b = 0; b < n_bus; ++b)
+            if (w[static_cast<size_t>(b)] != 0.0)
+                throw std::runtime_error(
+                    "ScenarioSweepSession: row " + std::to_string(r) + " re-weights "
+                    "the distributed slack onto bus " + std::to_string(b) + ", which "
+                    "owns no slack column entry in the base case (a reference "
+                    "bus with zero base weight). Keep at least one participating "
+                    "generator connected on that row.");
+    }
+    return out;
 }
 
 // =============================================================================
@@ -291,6 +503,37 @@ void ScenarioSweepSession::run()
             "base-case factors). Use 'direct_refactor_every' (default), "
             "'direct_iter0_only', or 'direct_refactor_every_n'.");
 
+    if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_contingency_gens()'s row count no longer "
+            "matches set_injections()'s n_scenarios -- call set_contingency_gens() "
+            "again after changing set_injections()");
+
+    // Generator contingencies: derive what the mask needs -- the buses that
+    // must own a reserved Vm column + Q equation (union over rows), the
+    // per-row PV→PQ releases, the per-row slack participants taken out -- and
+    // rebuild the base state whenever the reserved set differs from the
+    // current one (mirrors lightsim2grid's _maybe_prepare_gen_contingency,
+    // whose "n" warm-up solve rebuilds the sparsity each compute()).
+    std::vector<int>              required;
+    std::vector<std::vector<int>> row_pv_to_pq, row_slack_off;
+    _prepare_gen_contingency(required, row_pv_to_pq, row_slack_off);
+    if (required != reserved_buses_)
+        _build_base_state(required);
+
+    if (has_gen_off_ &&
+        strategy_type_ == ContingencySolverType::DirectBaseCaseFactors) {
+        bool any_effect = !reserved_buses_.empty();
+        for (const auto& v : row_slack_off) if (!v.empty()) { any_effect = true; break; }
+        if (any_effect)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_contingency_gens is incompatible with "
+                "the 'direct_base_case_factors' strategy (it reuses the base-case "
+                "factors, which cannot release a bus' voltage pinning per row). "
+                "Use 'direct_refactor_every' (default), 'direct_iter0_only', or "
+                "'direct_refactor_every_n'.");
+    }
+
     if (!has_topology_) {
         // Default: no branches tripped for any scenario (pure injection sweep).
         contingencies_.assign(static_cast<size_t>(n_scenarios_), Contingency{});
@@ -303,7 +546,21 @@ void ScenarioSweepSession::run()
     for (auto& ctg : contingencies_) {
         ctg.disconnected = false;
         ctg.masked_buses.clear();
+        ctg.stranded_groups.clear();
+        ctg.pinned_buses.clear();
     }
+
+    // Per-row PV pins: every reserved bus stays PV (identity Q row) except
+    // the ones this row turned PQ. Nothing reserved → nothing to pin.
+    if (!reserved_buses_.empty()) {
+        for (int r = 0; r < n_scenarios_; ++r) {
+            const std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
+            std::vector<int>& pinned = contingencies_[static_cast<size_t>(r)].pinned_buses;
+            for (int b : reserved_buses_)
+                if (!std::binary_search(to_pq.begin(), to_pq.end(), b)) pinned.push_back(b);
+        }
+    }
+    std::vector<cuda_real_type> h_slack_w_rows = _row_slack_weights(row_slack_off);
 
     const int n_bus = base_state_->n_bus;
 
@@ -337,8 +594,11 @@ void ScenarioSweepSession::run()
         Ybus_rm_,
         std::move(h_Sbus_all),
         batch_size_,
-        handle_disconnected_grid_ ? &mask_cfg_ : nullptr,
-        std::move(gen_v_override));
+        mask_cfg_,
+        handle_disconnected_grid_,
+        std::move(gen_v_override),
+        std::move(h_slack_w_rows),
+        base_state_->n_slack);
     used_batch_size_ = source.used_batch_size();
 
     // (Re-)construct the solver — allows run() to be called multiple times.

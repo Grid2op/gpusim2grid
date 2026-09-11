@@ -410,6 +410,26 @@ AcPfNrState::AcPfNrState(
             h_p_diag_pos[bus] = find_J_pos(h_p_row_of_bus[bus], h_theta_col_of_bus[bus]);
             h_q_diag_pos[bus] = find_J_pos(h_q_row_of_bus[bus], h_vm_col_of_bus[bus]);
         }
+
+        // Switchable Vm buses: identity-pin their (appended) Q rows for this
+        // base solve -- the base case is lightsim2grid's PV labelling, which
+        // the rows of a batch may release per slot but the "n" case never
+        // does (lightsim2grid runs its warm-up solve pinned too).
+        h_switchable_buses.clear();
+        if (ledger != nullptr) h_switchable_buses = ledger->switchable_vm_buses;
+        std::vector<int> h_pin_slot, h_pin_row, h_pin_diag;
+        for (int bus : h_switchable_buses) {
+            if (bus < 0 || bus >= n_bus || h_q_row_of_bus[bus] < 0) continue;
+            h_pin_slot.push_back(0);
+            h_pin_row.push_back(h_q_row_of_bus[bus]);
+            h_pin_diag.push_back(h_q_diag_pos[bus]);
+        }
+        n_pin = static_cast<int>(h_pin_slot.size());
+        if (n_pin > 0) {
+            upload_h2d(d_pin_slot, h_pin_slot.data(), n_pin, cs);
+            upload_h2d(d_pin_row,  h_pin_row.data(),  n_pin, cs);
+            upload_h2d(d_pin_diag, h_pin_diag.data(), n_pin, cs);
+        }
     }
 
     timings.t_build_J_ms = ms_since(t_wall_start);
@@ -475,6 +495,13 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_slack_prow,     h_prow.data(),     n_slack, cs);
         upload_h2d(d_slack_w,        h_w.data(),        n_slack, cs);
         upload_h2d(d_slack_feat_pos, h_feat_pos.data(), n_slack, cs);
+        h_slack_w = h_w;
+        h_slack_bus.clear();
+        for (int bus = 0; bus < n_bus; ++bus) {
+            const double w = ledger->slack_weights[bus];
+            if (w == 0.0 || ledger->p_row_of_bus[bus] < 0) continue;
+            h_slack_bus.push_back(bus);
+        }
 
         // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
         cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
@@ -597,15 +624,23 @@ AcPfNrState::AcPfNrState(
             slope[j] = static_cast<cuda_real_type>(ledger->vc_slope[j]);
         }
 
-        // reconstruct the custom rows: contiguous block [dim_J - n_vc_ctrl, dim_J),
-        // ordered per group (v_row, then count-1 sharing rows).
+        // the custom rows: explicit (LedgerData::vc_v_rows / vc_share_rows,
+        // frozen by ledger_extend.hpp before any row was appended at the end)
+        // or, on an un-extended ledger, reconstructed as the contiguous block
+        // [dim_J - n_vc_ctrl, dim_J), ordered per group (v_row, then count-1
+        // sharing rows) -- lightsim2grid's own layout.
         std::vector<int> vrow(n_vc_grp);
         std::vector<std::vector<int> > share(n_vc_grp);
-        int cursor = dim_J - n_vc_ctrl;
-        for (int g = 0; g < n_vc_grp; ++g) {
-            vrow[g] = cursor++;
-            const int cnt = ledger->vc_grp_count[g];
-            for (int k = 0; k < cnt - 1; ++k) share[g].push_back(cursor++);
+        if (!ledger->vc_v_rows.empty()) {
+            vrow  = ledger->vc_v_rows;
+            share = ledger->vc_share_rows;
+        } else {
+            int cursor = dim_J - n_vc_ctrl;
+            for (int g = 0; g < n_vc_grp; ++g) {
+                vrow[g] = cursor++;
+                const int cnt = ledger->vc_grp_count[g];
+                for (int k = 0; k < cnt - 1; ++k) share[g].push_back(cursor++);
+            }
         }
 
         // per-group device arrays
@@ -632,9 +667,22 @@ AcPfNrState::AcPfNrState(
             push_feat(find_J_pos(qrow[j], qcol[j]), static_cast<cuda_real_type>(-1.));  // (q_row, q_col)
             if (ledger->vc_kind[j] == 1)  // SVC slope coupling (v_row, q_col)
                 push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]), slope[j]);
+            else if (ledger->vc_grp_count[ledger->vc_group[j]] == 1)
+                // lone GEN controller: the (v_row, q_col) slot exists only when
+                // the ledger reserved it (reserve_stranded_controller_slots);
+                // stamp its normal value 0 every fill so the per-slot stranded
+                // override (value 1) always starts from a known state.
+                // push_feat skips a missing slot.
+                push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]),
+                          static_cast<cuda_real_type>(0.));
         }
+        h_vc_vrow = vrow;
+        h_vc_vrow_qcol_pos.assign(n_vc_grp, -1);
+        h_vc_vrow_vmcol_pos.assign(n_vc_grp, -1);
         for (int g = 0; g < n_vc_grp; ++g) {
             const int vmcol = ledger->vm_col_of_bus[ledger->vc_reg_bus[g]];
+            h_vc_vrow_vmcol_pos[g] = find_J_pos(vrow[g], vmcol);
+            h_vc_vrow_qcol_pos[g]  = find_J_pos(vrow[g], qcol[ledger->vc_grp_start[g]]);
             push_feat(find_J_pos(vrow[g], vmcol), static_cast<cuda_real_type>(1.));      // (v_row, vm_col)
             const int first = ledger->vc_grp_start[g];
             const cuda_real_type w_first = static_cast<cuda_real_type>(ledger->vc_weight[first]);
@@ -964,6 +1012,17 @@ AcPfNrState::AcPfNrState(
         buf.d_scale_max_dvm    = thrust::raw_pointer_cast(d_scale_max_dvm.data());
     }
 
+    // Switchable Vm buses: their Q rows stay identity-pinned in this base
+    // solve (see h_switchable_buses' own doc). Reuses the batch mask fields
+    // with slot 0; no-op (null / 0) on every un-extended ledger.
+    if (n_pin > 0) {
+        buf.d_J_outer_mask = thrust::raw_pointer_cast(d_J_outer.data());
+        buf.d_mask_slot    = thrust::raw_pointer_cast(d_pin_slot.data());
+        buf.d_mask_row     = thrust::raw_pointer_cast(d_pin_row.data());
+        buf.d_mask_diag    = thrust::raw_pointer_cast(d_pin_diag.data());
+        buf.n_mask_rows    = n_pin;
+    }
+
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
 
     if (presolved_v) {
@@ -1035,7 +1094,7 @@ AcPfNrState::AcPfNrState(
 
             // Ibus is unchanged (V didn't move): refresh F with the corrected
             // feature state without redoing SpMV/fill_J/factorize.
-            nr_iter_step_fill_F(buf, n_bus, dim_J, /*actual_batch=*/1, cs, timer, step);
+            nr_iter_step_fill_F(buf, n_bus, dim_J, nnz_J, /*actual_batch=*/1, cs, timer, step);
             timings.t_fill_F += step.t_fill_F;
         } else if (has_ext_state) {
             // Ground truth available (from a solved lightsim2grid grid, whose
@@ -1055,7 +1114,7 @@ AcPfNrState::AcPfNrState(
 
             // Ibus is unchanged (V didn't move): refresh F with the seeded
             // feature state without redoing SpMV/fill_J/factorize.
-            nr_iter_step_fill_F(buf, n_bus, dim_J, /*actual_batch=*/1, cs, timer, step);
+            nr_iter_step_fill_F(buf, n_bus, dim_J, nnz_J, /*actual_batch=*/1, cs, timer, step);
             timings.t_fill_F += step.t_fill_F;
         }
         // else: no extension active at all -- nothing to correct, d_F from

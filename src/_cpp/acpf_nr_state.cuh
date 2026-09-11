@@ -183,6 +183,30 @@ struct AcPfNrState {
     std::vector<int> h_p_row_of_bus, h_q_row_of_bus;
     std::vector<int> h_p_diag_pos,   h_q_diag_pos;
 
+    // Host copies for the batch sessions' MaskConfig / per-row slack weights:
+    //   h_slack_bus / h_slack_w       : per slack index k (same order as
+    //                                   d_slack_prow / d_slack_w), the bus and
+    //                                   its base weight
+    //   h_vc_vrow                     : per VC group, the bordered voltage row
+    //   h_vc_vrow_qcol_pos            : per group, nnz pos of (v_row, q_col of
+    //                                   its first controller), -1 if the
+    //                                   ledger reserved no such slot
+    //   h_vc_vrow_vmcol_pos           : per group, nnz pos of (v_row,
+    //                                   vm_col(reg_bus)), -1 if absent
+    std::vector<int>            h_slack_bus;
+    std::vector<cuda_real_type> h_slack_w;
+    std::vector<int>            h_vc_vrow, h_vc_vrow_qcol_pos, h_vc_vrow_vmcol_pos;
+
+    // Switchable Vm buses (LedgerData::switchable_vm_buses, sorted): their Q
+    // rows are identity-PINNED in this single-system base solve (the base
+    // case is lightsim2grid's own PV labelling; only a batch row may release
+    // one). d_pin_* are (slot 0, q_row, q_diag_pos) identity entries wired
+    // into the base NrIterBuffers' mask fields; empty on every un-extended
+    // ledger (n_pin == 0 → the mask launches are skipped, bit-identical).
+    std::vector<int>            h_switchable_buses;
+    int                         n_pin = 0;
+    thrust::device_vector<int>  d_pin_slot, d_pin_row, d_pin_diag;
+
     // -------------------------------------------------------------------------
     // MultiSlack (distributed slack in the Jacobian) — slack_col < 0 when absent.
     //   d_slack_absorbed is the per-batch-slot running state (size 1 for the

@@ -36,6 +36,7 @@
 #include "scenario_sweep_session.hpp"
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
+#include "gen_contingency_data.hpp"  // GenContingencyData
 
 // Build a LedgerData (augmented-J description) from a solved LSGrid: the J
 // sparsity skeleton (get_J_solver), the NRLedger row/col maps, and the
@@ -84,6 +85,12 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid,
 LedgerData drop_multislack_augmentation(const LedgerData& in,
                                         const Eigen::VectorXi& pv,
                                         const Eigen::VectorXi& pq);
+
+// Per-generator metadata for ScenarioSweepSession::set_contingency_gens
+// (bus in AC-solver numbering, local/remote voltage control, control-group
+// membership, slack participation + raw weight, reactive setpoint). See
+// gen_contingency_data.hpp.
+GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_bus_solver);
 
 // Build a single-system AcPfNrSession from a solved LSGrid, solving the same
 // augmented system lightsim2grid does (distributed slack / future extensions).

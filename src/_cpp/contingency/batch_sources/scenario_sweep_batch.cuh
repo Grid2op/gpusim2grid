@@ -61,6 +61,7 @@
 #include "../../nr_iter_step.cuh"         // BS
 #include "../gen_v_override.hpp"          // GenVOverride
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
+#include "../mask_streams.cuh"            // MaskStreams
 
 struct BatchPfDriverContext;
 
@@ -105,13 +106,23 @@ struct ScenarioSweepBatch {
     // with a ChunkPatchRange per chunk (same chunking as h_flat_*). Verbatim
     // ContingencyBatch's fields — see that file's own doc.
     // -------------------------------------------------------------------------
-    bool                         mask_mode_ = false;
-    std::vector<int>             h_mask_slot_, h_mask_row_, h_mask_diag_;
-    std::vector<ChunkPatchRange> mask_row_ranges_;
-    std::vector<int>             h_maskv_slot_, h_maskv_bus_;
-    std::vector<ChunkPatchRange> maskv_ranges_;
-    thrust::device_vector<int>   d_mask_slot, d_mask_row, d_mask_diag;
-    thrust::device_vector<int>   d_maskv_slot, d_maskv_bus;
+    // Also carries the per-row PV pins (Contingency::pinned_buses) of the
+    // generator-contingency feature, which are built whether or not
+    // handle_disconnected_grid is on (see the ctor).
+    bool        mask_mode_ = false;
+    MaskStreams mask_;
+
+    // -------------------------------------------------------------------------
+    // Per-row distributed-slack weights (generator contingencies, see
+    // ScenarioSweepSession::set_contingency_gens). h_slack_w_all_ is
+    // [n_active * n_slack], ALREADY PERMUTED into active-slot order like
+    // h_Sbus_all_; empty when no row re-weights the slack (every slot then
+    // keeps base's shared weights, slack_w_stride 0 -- bit-identical).
+    // -------------------------------------------------------------------------
+    std::vector<cuda_real_type>            h_slack_w_all_;
+    int                                    n_slack_ = 0;
+    thrust::device_vector<cuda_real_type>  d_slack_w_all;     // n_active × n_slack
+    thrust::device_vector<cuda_real_type>  d_slack_w_batch;   // batch_size × n_slack
 
     // -------------------------------------------------------------------------
     // compute_limit_violations: per-active-slot (global, not per-chunk)
@@ -170,6 +181,15 @@ struct ScenarioSweepBatch {
     //                     compaction) row order, row-aligned with
     //                     h_Sbus_all_orig — permuted into active-slot order
     //                     below, same as h_Sbus_all_orig itself.
+    //   mask_cfg        : the session's mask configuration (ALWAYS given: its
+    //                     row_info also drives the per-row PV pins, which do
+    //                     not depend on handle_disconnected_grid).
+    //   mask_mode       : handle_disconnected_grid mode when true (see class
+    //                     doc); false selects the legacy check_connectivity
+    //                     skip-if-split path.
+    //   h_slack_w_orig  : optional per-row slack weights, [n_scenarios *
+    //                     n_slack] in ORIGINAL row order (empty: every row
+    //                     keeps the base weights) -- permuted below too.
     // -------------------------------------------------------------------------
     ScenarioSweepBatch(std::vector<Contingency>& contingencies,
                        const int*                Ybus_rm_outer,
@@ -177,19 +197,20 @@ struct ScenarioSweepBatch {
                        const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                        std::vector<cudaComplexType>&& h_Sbus_all_orig,
                        int                       max_batch_size,
-                       const MaskConfig*         mask_cfg = nullptr,
-                       GenVOverride&&            gen_v_override_orig = GenVOverride{})
+                       const MaskConfig&         mask_cfg,
+                       bool                      mask_mode,
+                       GenVOverride&&            gen_v_override_orig = GenVOverride{},
+                       std::vector<cuda_real_type>&& h_slack_w_orig = std::vector<cuda_real_type>{},
+                       int                       n_slack = 0)
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
         n_scenarios_ = n_total_;
         resolve_indices(contingencies, Ybus_rm_outer, Ybus_rm_inner);
 
-        mask_mode_ = (mask_cfg != nullptr);
+        mask_mode_ = mask_mode;
         if (mask_mode_)
-            compute_component_masks(contingencies, Ybus_rm,
-                                    mask_cfg->is_reference_bus,
-                                    mask_cfg->is_controller_bus);
+            compute_component_masks(contingencies, Ybus_rm, mask_cfg);
         else
             check_connectivity(contingencies, Ybus_rm);
 
@@ -204,11 +225,14 @@ struct ScenarioSweepBatch {
                            h_flat_delta_re_, h_flat_delta_im_,
                            chunk_ranges_, active_to_orig_);
 
-        if (mask_mode_)
+        // Mask / pin / stranded streams: needed in mask mode AND whenever some
+        // row pins a switchable bus (generator contingencies).
+        bool any_pins = false;
+        for (const auto& ctg : contingencies)
+            if (!ctg.pinned_buses.empty()) { any_pins = true; break; }
+        if (mask_mode_ || any_pins)
             build_mask_entries(contingencies, active_to_orig_, used_batch_size_,
-                               mask_cfg->row_info,
-                               h_mask_slot_, h_mask_row_, h_mask_diag_, mask_row_ranges_,
-                               h_maskv_slot_, h_maskv_bus_, maskv_ranges_);
+                               mask_cfg, mask_.h);
 
         build_tripped_branch_table(contingencies, active_to_orig_,
                                    h_trip_branch_flat_, h_trip_start_, h_trip_count_);
@@ -243,6 +267,23 @@ struct ScenarioSweepBatch {
             }
         }
 
+        // Permute the per-row slack weights into active-slot order too.
+        n_slack_ = n_slack;
+        if (!h_slack_w_orig.empty() && n_slack > 0) {
+            if (static_cast<int>(h_slack_w_orig.size()) != n_total_ * n_slack)
+                throw std::runtime_error(
+                    "[scenario_sweep_batch] per-row slack weights must be "
+                    "(n_scenarios x n_slack)");
+            h_slack_w_all_.resize(active_to_orig_.size() * static_cast<size_t>(n_slack));
+            for (size_t slot = 0; slot < active_to_orig_.size(); ++slot) {
+                const int orig = active_to_orig_[slot];
+                std::copy(
+                    h_slack_w_orig.begin() + static_cast<ptrdiff_t>(orig) * n_slack,
+                    h_slack_w_orig.begin() + static_cast<ptrdiff_t>(orig + 1) * n_slack,
+                    h_slack_w_all_.begin() + static_cast<ptrdiff_t>(slot) * n_slack);
+            }
+        }
+
         t_preprocess_ms = ssb_ms_since(t_start);
     }
 
@@ -270,26 +311,20 @@ struct ScenarioSweepBatch {
     // -------------------------------------------------------------------------
     void fill_mask_buffers(NrIterBuffers& buf, int chunk_idx, const int* d_J_outer) const
     {
-        if (!mask_mode_) return;
-        buf.d_J_outer_mask = d_J_outer;
+        if (!mask_.any()) return;
+        mask_.fill(buf, chunk_idx, d_J_outer);
+    }
 
-        if (chunk_idx < static_cast<int>(mask_row_ranges_.size())) {
-            const ChunkPatchRange& r = mask_row_ranges_[static_cast<size_t>(chunk_idx)];
-            if (r.count > 0) {
-                buf.d_mask_slot = thrust::raw_pointer_cast(d_mask_slot.data()) + r.start;
-                buf.d_mask_row  = thrust::raw_pointer_cast(d_mask_row.data())  + r.start;
-                buf.d_mask_diag = thrust::raw_pointer_cast(d_mask_diag.data()) + r.start;
-                buf.n_mask_rows = r.count;
-            }
-        }
-        if (chunk_idx < static_cast<int>(maskv_ranges_.size())) {
-            const ChunkPatchRange& r = maskv_ranges_[static_cast<size_t>(chunk_idx)];
-            if (r.count > 0) {
-                buf.d_maskv_slot = thrust::raw_pointer_cast(d_maskv_slot.data()) + r.start;
-                buf.d_maskv_bus  = thrust::raw_pointer_cast(d_maskv_bus.data())  + r.start;
-                buf.n_mask_v     = r.count;
-            }
-        }
+    // -------------------------------------------------------------------------
+    // fill_slack_w_buffers — point buf.d_slack_w at this chunk's per-slot
+    // weights (sliced by prepare_Sbus_batch) when some row re-weighted the
+    // slack; otherwise leave base's shared array (stride 0, bit-identical).
+    // -------------------------------------------------------------------------
+    void fill_slack_w_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const
+    {
+        if (h_slack_w_all_.empty() || n_slack_ <= 0) return;
+        buf.d_slack_w      = thrust::raw_pointer_cast(d_slack_w_batch.data());
+        buf.slack_w_stride = n_slack_;
     }
 
     // -------------------------------------------------------------------------

@@ -317,6 +317,30 @@ class _ScenarioSweepSolver:
         b = np.ascontiguousarray(gen_bus, dtype=np.int32)
         self._s.set_gen_v(v, b)
 
+    def set_contingency_gens(self, mask):
+        """Per-row generator contingency mask, (n_scenarios, n_gen) bool,
+        row-aligned with set_injections(): True disconnects that generator
+        for that row. Labelling + slack side only (the injection side is the
+        caller's job) -- see the C++ ScenarioSweepSession.set_contingency_gens
+        binding for the full semantics. The buses needing a reserved Vm
+        column + Q equation are derived from the mask by the next run(), which
+        rebuilds the base state whenever that set changes.
+        """
+        m = np.ascontiguousarray(mask, dtype=bool)
+        self._s.set_contingency_gens(m)
+
+    @property
+    def dim_J(self):
+        """Augmented Jacobian dimension of the current base state (grows by
+        one per reserved switchable bus, see set_contingency_gens)."""
+        return self._s.dim_J
+
+    def get_reserved_buses(self):
+        """Sorted AC-solver bus ids currently owning a reserved Vm column + Q
+        equation for generator contingencies (empty unless run() derived
+        some from set_contingency_gens' mask)."""
+        return np.asarray(self._s.get_reserved_buses(), dtype=np.int64)
+
     def set_topology(self, branch_ids_per_scenario):
         """Build topology from a list-of-lists of branch indices, row-aligned
         with set_injections().

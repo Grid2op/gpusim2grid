@@ -702,6 +702,11 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // injection sweep / when the mode is off). d_J_outer is the shared skeleton.
     source_.fill_mask_buffers(buf, chunk, thrust::raw_pointer_cast(base.d_J_outer.data()));
 
+    // Per-slot distributed-slack weights (ScenarioSweep generator
+    // contingencies only; no-op elsewhere -- buf.d_slack_w stays base's
+    // shared array with slack_w_stride 0).
+    source_.fill_slack_w_buffers(buf, chunk);
+
     // Re-initialise the per-slot feature state for this chunk (slack_absorbed =
     // Re(Σ Sbus_slot); controller reactive injection = 0). The NR loop runs over
     // the full padded batch, so initialise batch_size_ slots.
@@ -752,9 +757,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             // Augmented-feature contributions to the final residual (slack /
             // HVDC mismatch + VC bordered custom rows), using the converged state.
             nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
-            // handle_disconnected_grid: zero the masked rows of F so the frozen
-            // component does not pollute the ‖F‖∞ residual of the solved one.
-            nr_apply_bus_mask(buf, nnz_J, dim_J, actual_batch, cs);
+            // handle_disconnected_grid / PV pins / stranded controllers: the
+            // same row rewrites the NR loop applied, so the frozen component
+            // and the pinned rows do not pollute the ‖F‖∞ residual.
+            nr_apply_F_masks(buf, nnz_J, dim_J, actual_batch, cs);
 
             compute_residuals_kernel<<<
                 actual_batch, BS,

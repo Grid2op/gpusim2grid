@@ -271,8 +271,7 @@ void check_connectivity(
 void compute_component_masks(
     std::vector<Contingency>&                                     contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
-    const std::vector<char>&                                      is_reference_bus,
-    const std::vector<char>&                                      is_controller_bus)
+    const MaskConfig&                                             cfg)
 {
     const int  n_bus = Ybus_rm.rows();
     const int* outer = Ybus_rm.outerIndexPtr();
@@ -292,8 +291,14 @@ void compute_component_masks(
     std::vector<int> comp(static_cast<size_t>(n_bus), -1);
     std::queue<int>  q;
 
+    const int n_grp  = static_cast<int>(cfg.vc_grp_count.size());
+    const int n_ctrl = static_cast<int>(cfg.vc_bus.size());
+    std::vector<int>  n_masked_ctrl(static_cast<size_t>(n_grp), 0);
+    std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
+
     for (auto& ctg : contingencies) {
         ctg.masked_buses.clear();
+        ctg.stranded_groups.clear();
 
         // Edges removed by this contingency (off-diagonal entries → ~0).
         std::unordered_set<int> removed;
@@ -333,19 +338,56 @@ void compute_component_masks(
         const int main_comp = static_cast<int>(std::distance(
             count.begin(), std::max_element(count.begin(), count.end())));
 
-        // Every bus outside the main component is masked. If the masked set
-        // strands the angle reference or a controller bus, we cannot solve it on
-        // the fixed batch structure → skip the contingency (NaN), reusing the
-        // `disconnected` compaction path.
+        // Every bus outside the main component is masked. Stranding the angle
+        // reference or a hard controller bus (HVDC end, regulated bus) has no
+        // value-only fallback on the fixed batch structure → skip the
+        // contingency (NaN), reusing the `disconnected` compaction path.
         bool skip = false;
+        std::fill(is_masked.begin(), is_masked.end(), 0);
         for (int b = 0; b < n_bus; ++b) {
             if (comp[static_cast<size_t>(b)] == main_comp) continue;
             ctg.masked_buses.push_back(b);
-            if ((!is_reference_bus.empty()  && is_reference_bus[static_cast<size_t>(b)]) ||
-                (!is_controller_bus.empty() && is_controller_bus[static_cast<size_t>(b)]))
+            is_masked[static_cast<size_t>(b)] = 1;
+            if ((!cfg.is_reference_bus.empty()       && cfg.is_reference_bus[static_cast<size_t>(b)]) ||
+                (!cfg.is_hard_controller_bus.empty() && cfg.is_hard_controller_bus[static_cast<size_t>(b)]))
                 skip = true;
         }
-        if (skip) { ctg.disconnected = true; ctg.masked_buses.clear(); }
+
+        // VoltageControl groups: count the masked controllers of each group.
+        //   count == 1, lone controller  → repurpose its voltage row (stranded)
+        //   every controller masked      → skip (nobody left to hold the row)
+        //   some of several masked       → nothing to do (sharing rows keep
+        //                                  the masked column coupled)
+        if (!skip && n_grp > 0) {
+            std::fill(n_masked_ctrl.begin(), n_masked_ctrl.end(), 0);
+            for (int j = 0; j < n_ctrl; ++j) {
+                const int b = cfg.vc_bus[static_cast<size_t>(j)];
+                if (b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)])
+                    ++n_masked_ctrl[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])];
+            }
+            for (int g = 0; g < n_grp && !skip; ++g) {
+                const int nm = n_masked_ctrl[static_cast<size_t>(g)];
+                if (nm == 0) continue;
+                const int cnt = cfg.vc_grp_count[static_cast<size_t>(g)];
+                if (cnt == 1) {
+                    // Needs the reserved (v_row, q_col) slot; without it the
+                    // column would be structurally singular → skip (defensive:
+                    // the CA/SS factories always reserve it).
+                    if (cfg.vc_vrow_qcol_pos.empty() ||
+                        cfg.vc_vrow_qcol_pos[static_cast<size_t>(g)] < 0)
+                        skip = true;
+                    else
+                        ctg.stranded_groups.push_back(g);
+                } else if (nm >= cnt) {
+                    skip = true;
+                }
+            }
+        }
+        if (skip) {
+            ctg.disconnected = true;
+            ctg.masked_buses.clear();
+            ctg.stranded_groups.clear();
+        }
     }
 }
 
@@ -356,53 +398,81 @@ void build_mask_entries(
     const std::vector<Contingency>& contingencies,
     const std::vector<int>&         active_to_orig,
     int                             batch_size,
-    const MaskRowInfo&              row_info,
-    std::vector<int>&               h_mask_slot,
-    std::vector<int>&               h_mask_row,
-    std::vector<int>&               h_mask_diag,
-    std::vector<ChunkPatchRange>&   mask_row_ranges,
-    std::vector<int>&               h_maskv_slot,
-    std::vector<int>&               h_maskv_bus,
-    std::vector<ChunkPatchRange>&   maskv_ranges)
+    const MaskConfig&               cfg,
+    MaskEntries&                    out)
 {
-    h_mask_slot.clear();  h_mask_row.clear();  h_mask_diag.clear();
-    h_maskv_slot.clear(); h_maskv_bus.clear();
+    const MaskRowInfo& row_info = cfg.row_info;
+    out = MaskEntries{};
 
     const int n_active = static_cast<int>(active_to_orig.size());
     const int n_chunks = batch_size > 0 ? (n_active + batch_size - 1) / batch_size : 0;
-    mask_row_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
-    maskv_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    out.row_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    out.v_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    out.jov_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    out.str_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
 
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
-        const int a_start      = chunk * batch_size;
-        const int a_end        = std::min(a_start + batch_size, n_active);
-        const int row_start    = static_cast<int>(h_mask_slot.size());
-        const int v_start       = static_cast<int>(h_maskv_slot.size());
+        const int a_start   = chunk * batch_size;
+        const int a_end     = std::min(a_start + batch_size, n_active);
+        const int row_start = static_cast<int>(out.slot.size());
+        const int v_start   = static_cast<int>(out.v_slot.size());
+        const int jov_start = static_cast<int>(out.jov_slot.size());
+        const int str_start = static_cast<int>(out.str_slot.size());
 
         for (int local_c = 0; local_c < a_end - a_start; ++local_c) {
             const Contingency& ctg = contingencies[active_to_orig[a_start + local_c]];
             for (int bus : ctg.masked_buses) {
                 // Identity-row entries for this bus' P and Q equations.
                 if (row_info.p_row[static_cast<size_t>(bus)] >= 0) {
-                    h_mask_slot.push_back(local_c);
-                    h_mask_row.push_back(row_info.p_row[static_cast<size_t>(bus)]);
-                    h_mask_diag.push_back(row_info.p_diag_pos[static_cast<size_t>(bus)]);
+                    out.slot.push_back(local_c);
+                    out.row.push_back(row_info.p_row[static_cast<size_t>(bus)]);
+                    out.diag.push_back(row_info.p_diag_pos[static_cast<size_t>(bus)]);
                 }
                 if (row_info.q_row[static_cast<size_t>(bus)] >= 0) {
-                    h_mask_slot.push_back(local_c);
-                    h_mask_row.push_back(row_info.q_row[static_cast<size_t>(bus)]);
-                    h_mask_diag.push_back(row_info.q_diag_pos[static_cast<size_t>(bus)]);
+                    out.slot.push_back(local_c);
+                    out.row.push_back(row_info.q_row[static_cast<size_t>(bus)]);
+                    out.diag.push_back(row_info.q_diag_pos[static_cast<size_t>(bus)]);
                 }
                 // Masked-voltage entry (reported as NaN).
-                h_maskv_slot.push_back(local_c);
-                h_maskv_bus.push_back(bus);
+                out.v_slot.push_back(local_c);
+                out.v_bus.push_back(bus);
+            }
+            // PV pins: ONLY the Q row goes to identity (dVm = 0); the P row and
+            // the voltage stay live (lightsim2grid's set_pv_pinned_buses).
+            for (int bus : ctg.pinned_buses) {
+                if (row_info.q_row[static_cast<size_t>(bus)] >= 0) {
+                    out.slot.push_back(local_c);
+                    out.row.push_back(row_info.q_row[static_cast<size_t>(bus)]);
+                    out.diag.push_back(row_info.q_diag_pos[static_cast<size_t>(bus)]);
+                }
+            }
+            // Stranded lone controllers: repurpose the voltage row by value.
+            for (int g : ctg.stranded_groups) {
+                const int pq = cfg.vc_vrow_qcol_pos[static_cast<size_t>(g)];
+                const int pv = cfg.vc_vrow_vmcol_pos[static_cast<size_t>(g)];
+                if (pq >= 0) {
+                    out.jov_slot.push_back(local_c);
+                    out.jov_pos.push_back(pq);
+                    out.jov_val.push_back(static_cast<cuda_real_type>(1.));
+                }
+                if (pv >= 0) {
+                    out.jov_slot.push_back(local_c);
+                    out.jov_pos.push_back(pv);
+                    out.jov_val.push_back(static_cast<cuda_real_type>(0.));
+                }
+                out.str_slot.push_back(local_c);
+                out.str_grp.push_back(g);
             }
         }
 
-        mask_row_ranges[static_cast<size_t>(chunk)] =
-            {row_start, static_cast<int>(h_mask_slot.size()) - row_start};
-        maskv_ranges[static_cast<size_t>(chunk)] =
-            {v_start, static_cast<int>(h_maskv_slot.size()) - v_start};
+        out.row_ranges[static_cast<size_t>(chunk)] =
+            {row_start, static_cast<int>(out.slot.size()) - row_start};
+        out.v_ranges[static_cast<size_t>(chunk)] =
+            {v_start, static_cast<int>(out.v_slot.size()) - v_start};
+        out.jov_ranges[static_cast<size_t>(chunk)] =
+            {jov_start, static_cast<int>(out.jov_slot.size()) - jov_start};
+        out.str_ranges[static_cast<size_t>(chunk)] =
+            {str_start, static_cast<int>(out.str_slot.size()) - str_start};
     }
 }
 

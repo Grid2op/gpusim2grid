@@ -108,6 +108,23 @@ struct LedgerData {
     std::vector<int>    vc_q_col;                        // per controller
     std::vector<int>    vc_reg_bus, vc_grp_start, vc_grp_count;  // per group
     std::vector<double> vc_v_set;                        // per group
+    // Explicit custom-row indices (per group: the voltage row, then its
+    // count-1 sharing rows). EMPTY means "reconstruct as the last
+    // vc_n_controllers() rows of J" (lightsim2grid's own layout, the only
+    // possibility as long as the ledger is exactly lightsim2grid's). Populated
+    // by ledger_extend.hpp's materialize_vc_custom_rows BEFORE any structural
+    // extension appends rows at the end (add_switchable_vm_buses), which would
+    // otherwise break that "last rows" rule.
+    std::vector<int>              vc_v_rows;             // per group
+    std::vector<std::vector<int>> vc_share_rows;         // per group, size count-1
+
+    // ---- Switchable Vm buses (ScenarioSweep generator contingencies) ------
+    // Sorted AC-solver bus ids that were PV in lightsim2grid's own labelling
+    // but own an APPENDED Vm column + Q equation here (ledger_extend.hpp's
+    // add_switchable_vm_buses), so a batch row may release their voltage
+    // pinning by value (identity-pinned Q row when still PV, plain PQ when
+    // their last local controller is off). Empty on every un-extended ledger.
+    std::vector<int>    switchable_vm_buses;
 
     int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
     int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }

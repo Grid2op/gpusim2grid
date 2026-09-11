@@ -39,16 +39,9 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
         upload_h2d(d_active_to_orig, active_to_orig_.data(),
                    active_to_orig_.size(), cs);
 
-    // handle_disconnected_grid masking entries (only when any bus is masked).
-    if (!h_mask_slot_.empty()) {
-        upload_h2d(d_mask_slot, h_mask_slot_.data(), h_mask_slot_.size(), cs);
-        upload_h2d(d_mask_row,  h_mask_row_.data(),  h_mask_row_.size(),  cs);
-        upload_h2d(d_mask_diag, h_mask_diag_.data(), h_mask_diag_.size(), cs);
-    }
-    if (!h_maskv_slot_.empty()) {
-        upload_h2d(d_maskv_slot, h_maskv_slot_.data(), h_maskv_slot_.size(), cs);
-        upload_h2d(d_maskv_bus,  h_maskv_bus_.data(),  h_maskv_bus_.size(),  cs);
-    }
+    // handle_disconnected_grid masking / PV-pin / stranded-controller entries
+    // (only when any exist).
+    mask_.upload(cs);
 
     // compute_limit_violations tripped-branch table (see the ctor's
     // build_tripped_branch_table call). h_trip_start_/h_trip_count_ are
@@ -76,6 +69,16 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
                    gen_v_override_.h_active_bus.size(), cs);
         upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
                    gen_v_override_.h_gen_v_all.size(), cs);
+    }
+
+    // Per-row slack weights, if any (generator contingencies).
+    if (!h_slack_w_all_.empty() && n_slack_ > 0) {
+        if (n_slack_ != ctx.base.n_slack)
+            throw std::runtime_error(
+                "[scenario_sweep_batch] per-row slack weight count does not "
+                "match the base case's participant count");
+        upload_h2d(d_slack_w_all, h_slack_w_all_.data(), h_slack_w_all_.size(), cs);
+        d_slack_w_batch.resize(static_cast<size_t>(ctx.batch_size) * n_slack_);
     }
 }
 
@@ -192,6 +195,30 @@ void ScenarioSweepBatch::prepare_Sbus_batch(BatchPfDriverContext& ctx,
             _chk_cuda(cudaMemcpyAsync(dst, src_base, row_bytes,
                                        cudaMemcpyDeviceToDevice, cs),
                       "Sbus phantom pad");
+        }
+    }
+
+    // Per-row slack weights: same row-slice + phantom-pad as Sbus above, the
+    // phantom slots taking base's shared weights.
+    if (!h_slack_w_all_.empty() && n_slack_ > 0) {
+        const int nsl = n_slack_;
+        if (actual_batch > 0) {
+            _chk_cuda(cudaMemcpyAsync(
+                thrust::raw_pointer_cast(d_slack_w_batch.data()),
+                thrust::raw_pointer_cast(d_slack_w_all.data())
+                    + static_cast<ptrdiff_t>(c_start) * nsl,
+                static_cast<size_t>(actual_batch) * nsl * sizeof(cuda_real_type),
+                cudaMemcpyDeviceToDevice, cs),
+                "slack weight row-slice copy");
+        }
+        for (int b = actual_batch; b < ctx.batch_size; ++b) {
+            _chk_cuda(cudaMemcpyAsync(
+                thrust::raw_pointer_cast(d_slack_w_batch.data())
+                    + static_cast<ptrdiff_t>(b) * nsl,
+                thrust::raw_pointer_cast(ctx.base.d_slack_w.data()),
+                static_cast<size_t>(nsl) * sizeof(cuda_real_type),
+                cudaMemcpyDeviceToDevice, cs),
+                "slack weight phantom pad");
         }
     }
 

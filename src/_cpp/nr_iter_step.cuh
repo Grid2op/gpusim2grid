@@ -179,6 +179,28 @@ struct NrIterBuffers {
     const int*             d_maskv_bus    = nullptr;   // [n_mask_v]
     int                    n_mask_v       = 0;
 
+    // ---- stranded lone VoltageControl controllers (per-chunk slice) --------
+    // Per-slot J value overrides (slot, nnz pos, value) written AFTER every
+    // feature stamp and BEFORE the bus mask, and stranded rows (slot, group)
+    // whose F[v_row] is rewritten to -Q_c after the VC mismatch kernels. Both
+    // repurpose a lone controller's bordered voltage row into "Q_c == 0" when
+    // handle_disconnected_grid masks that controller's own bus (lightsim2grid
+    // PR #192 parity). All null / 0 when unused → launches skipped.
+    const int*             d_jov_slot     = nullptr;   // [n_jov]
+    const int*             d_jov_pos      = nullptr;   // [n_jov]
+    const cuda_real_type*  d_jov_val      = nullptr;   // [n_jov]
+    int                    n_jov          = 0;
+    const int*             d_str_slot     = nullptr;   // [n_str]
+    const int*             d_str_grp      = nullptr;   // [n_str]
+    int                    n_str          = 0;
+
+    // ---- per-slot distributed-slack weights ---------------------------------
+    // 0 (default): d_slack_w is the shared single-system [n_slack] array.
+    // n_slack: d_slack_w is per slot, [actual_batch * n_slack], row b at
+    // d_slack_w[b * n_slack + k] -- a ScenarioSweep row that disconnected a
+    // slack participant re-weights the survivors (lightsim2grid PR #193).
+    int                    slack_w_stride = 0;
+
     // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
     // launched) unless enabled. Mirrors lightsim2grid's own
     // MaxVoltageChangeScalingPolicy: after solving J*dx=F, scale dx by
@@ -229,7 +251,7 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
     if (buf.slack_col >= 0)
         adjust_slack_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_slack, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_slack_absorbed, buf.d_slack_prow, buf.d_slack_w,
-            buf.n_slack, dim_J, batch);
+            buf.slack_w_stride, buf.n_slack, dim_J, batch);
     if (buf.n_hvdc > 0)
         hvdc_adjust_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
@@ -263,7 +285,8 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
 {
     if (buf.slack_col >= 0)
         fill_slack_feature_kernel<<<nr_grid_size((long long)batch * buf.n_slack, BS), BS, 0, cs>>>(
-            buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w, buf.n_slack, nnz_J, batch);
+            buf.d_J_values, buf.d_slack_feat_pos, buf.d_slack_w, buf.slack_w_stride,
+            buf.n_slack, nnz_J, batch);
     if (buf.n_hvdc > 0)
         hvdc_fill_feature_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
@@ -272,7 +295,8 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
             buf.n_hvdc, n_bus, nnz_J, batch);
     if (buf.n_vc_feat > 0)
         fill_slack_feature_kernel<<<nr_grid_size((long long)batch * buf.n_vc_feat, BS), BS, 0, cs>>>(
-            buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val, buf.n_vc_feat, nnz_J, batch);
+            buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val, /*w_stride=*/0,
+            buf.n_vc_feat, nnz_J, batch);
 }
 
 inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cudaStream_t cs)
@@ -311,6 +335,49 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 }
 
 // -----------------------------------------------------------------------------
+// Stranded lone-controller helpers (no-ops when n_jov / n_str == 0).
+//   nr_apply_J_overrides   : per-slot J value overrides. Must run AFTER every
+//                            feature stamp (they assign the normal values) and
+//                            BEFORE nr_apply_bus_mask (the masked rows win).
+//   nr_apply_stranded_vrow : F[v_row] = -Q_c for the stranded groups. Must run
+//                            AFTER nr_feature_mismatch (vc_vrow_kernel assigns
+//                            the voltage-constraint residual it replaces).
+// The two composites below bundle each with the bus mask in the right order;
+// every consumer (batched driver, post-loop residual, single-system base
+// solve) goes through them so the ordering lives in exactly one place.
+// -----------------------------------------------------------------------------
+inline void nr_apply_J_overrides(const NrIterBuffers& buf, int nnz_J, cudaStream_t cs)
+{
+    if (buf.n_jov > 0)
+        apply_J_overrides_kernel<<<(buf.n_jov + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_J_values, buf.d_jov_slot, buf.d_jov_pos, buf.d_jov_val, nnz_J, buf.n_jov);
+}
+
+inline void nr_apply_stranded_vrow(const NrIterBuffers& buf, int dim_J, cudaStream_t cs)
+{
+    if (buf.n_str > 0)
+        vc_stranded_vrow_kernel<<<(buf.n_str + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_vc_q, buf.d_vc_vrow, buf.d_vc_grp_start,
+            buf.d_str_slot, buf.d_str_grp, buf.n_vc_ctrl, dim_J, buf.n_str);
+}
+
+// After fill_F + nr_feature_mismatch: stranded rows, then the bus mask.
+inline void nr_apply_F_masks(const NrIterBuffers& buf,
+                             int nnz_J, int dim_J, int batch, cudaStream_t cs)
+{
+    nr_apply_stranded_vrow(buf, dim_J, cs);
+    nr_apply_bus_mask(buf, nnz_J, dim_J, batch, cs);
+}
+
+// After fill_J + nr_feature_fill_J: per-slot overrides, then the bus mask.
+inline void nr_apply_J_masks(const NrIterBuffers& buf,
+                             int nnz_J, int dim_J, int batch, cudaStream_t cs)
+{
+    nr_apply_J_overrides(buf, nnz_J, cs);
+    nr_apply_bus_mask(buf, nnz_J, dim_J, batch, cs);
+}
+
+// -----------------------------------------------------------------------------
 // nr_iter_step_fill_F
 //
 // Step ② alone: −[ΔP(pvpq), ΔQ(pq)] scattered into the ledger P/Q rows, at
@@ -322,7 +389,7 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 // -----------------------------------------------------------------------------
 inline void nr_iter_step_fill_F(
     const NrIterBuffers& buf,
-    int n_bus, int dim_J,
+    int n_bus, int dim_J, int nnz_J,
     int actual_batch,
     cudaStream_t cs,
     CudaTimer&   timer,
@@ -336,6 +403,10 @@ inline void nr_iter_step_fill_F(
         buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
         buf.n_q, n_bus, dim_J, actual_batch, buf.sbus_stride);
     nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
+    // Identity-pinned / masked rows: zero their F (no-op unless the buffers
+    // carry mask entries -- the single-system base solve only does when the
+    // ledger reserved switchable Vm buses, see AcPfNrState).
+    nr_apply_F_masks(buf, nnz_J, dim_J, actual_batch, cs);
     t.t_fill_F += timer.stop_ms();
 }
 
@@ -386,7 +457,7 @@ inline void nr_iter_step_prepare(
     t.t_spmv += timer.stop_ms();
 
     // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
-    nr_iter_step_fill_F(buf, n_bus, dim_J, actual_batch, cs, timer, t);
+    nr_iter_step_fill_F(buf, n_bus, dim_J, nnz_J, actual_batch, cs, timer, t);
 
     // ③  Fill J values; notify cuDSS that the values pointer changed (skipped
     //     when use_cudss=false -- no cuDSS context/descriptor exists to notify).
@@ -400,6 +471,9 @@ inline void nr_iter_step_prepare(
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
         n_bus, nnz_Y, nnz_J, actual_batch);
     nr_feature_fill_J(buf, n_bus, nnz_J, actual_batch, cs);
+    // Identity-pinned / masked rows win over every stamp above (no-op unless
+    // the buffers carry mask entries).
+    nr_apply_J_masks(buf, nnz_J, dim_J, actual_batch, cs);
     if (use_cudss) dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 

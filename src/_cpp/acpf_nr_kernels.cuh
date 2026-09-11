@@ -292,6 +292,7 @@ __global__ void adjust_slack_mismatch_kernel(
     const cuda_real_type* __restrict__ d_slack_absorbed,  // [actual_batch]
     const int*            __restrict__ d_slack_prow,       // [n_slack]
     const cuda_real_type* __restrict__ d_slack_w,          // [n_slack]
+    int w_stride,            // 0: shared [n_slack]; n_slack: per slot [actual_batch*n_slack]
     int n_slack,
     int dim_J,
     int actual_batch);
@@ -303,6 +304,7 @@ __global__ void fill_slack_feature_kernel(
           cuda_real_type* __restrict__ d_J_values,
     const int*            __restrict__ d_slack_feat_pos,   // [n_slack]
     const cuda_real_type* __restrict__ d_slack_w,          // [n_slack]
+    int w_stride,            // 0: shared [n_slack]; n_slack: per slot [actual_batch*n_slack]
     int n_slack,
     int nnz_J,
     int actual_batch);
@@ -473,6 +475,43 @@ __global__ void apply_bus_mask_kernel(
     const int*           __restrict__ d_mask_diag,
     const int*           __restrict__ d_J_outer,
     int nnz_J,
+    int dim_J,
+    int n_entries);
+
+// ---------------------------------------------------------------------------
+// apply_J_overrides_kernel  (stranded lone VoltageControl controller)
+//
+// Per-slot J value overrides: d_J_values[slot * nnz_J + pos] = val, one thread
+// per entry. Used to repurpose a stranded lone controller's bordered voltage
+// row into "Q_c == 0" -- (v_row, q_col) = 1 and (v_row, vm_col(reg)) = 0 --
+// on the slots whose contingency masks that controller's own bus. Must run
+// AFTER every feature stamp (which assign the normal values on every slot)
+// and BEFORE apply_bus_mask_kernel. No-op when n_entries == 0.
+// ---------------------------------------------------------------------------
+__global__ void apply_J_overrides_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*           __restrict__ d_jov_slot,
+    const int*           __restrict__ d_jov_pos,
+    const cuda_real_type* __restrict__ d_jov_val,
+    int nnz_J,
+    int n_entries);
+
+// ---------------------------------------------------------------------------
+// vc_stranded_vrow_kernel  (stranded lone VoltageControl controller)
+//
+// For each (slot, group) entry: d_F[slot * dim_J + v_row(g)] = -Q_c(slot,
+// first controller of g), replacing the voltage-constraint residual
+// vc_vrow_kernel just assigned. Must run AFTER the VC mismatch kernels and
+// BEFORE apply_bus_mask_kernel. No-op when n_entries == 0.
+// ---------------------------------------------------------------------------
+__global__ void vc_stranded_vrow_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,          // [actual_batch * n_ctrl]
+    const int*            __restrict__ d_vc_vrow,       // [n_grp]
+    const int*            __restrict__ d_vc_grp_start,  // [n_grp]
+    const int*            __restrict__ d_str_slot,      // [n_entries]
+    const int*            __restrict__ d_str_grp,       // [n_entries]
+    int n_ctrl,
     int dim_J,
     int n_entries);
 
