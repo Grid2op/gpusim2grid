@@ -613,12 +613,47 @@ class ScenarioSweepGPU:
         self._inner.strategy = value
 
     @property
+    def nb_iter(self):
+        """int: fixed NR iterations per scenario. Takes effect on the next
+        compute() without rebuilding the batch driver."""
+        return self._inner.nb_iter
+
+    @nb_iter.setter
+    def nb_iter(self, value):
+        self._inner.nb_iter = int(value)
+
+    @property
+    def run_counter(self):
+        """int: number of compute() calls so far."""
+        return self._inner.run_counter
+
+    @property
+    def driver_build_counter(self):
+        """int: number of cold batch-driver builds (allocation + cuDSS
+        ANALYSIS). compute() reuses the driver whenever n_scenarios and the
+        settings are unchanged: only the injections (and, when the topology
+        changed, the patch arrays) move to the GPU, and the Jacobians are
+        REFACTORIZED rather than analysed again."""
+        return self._inner.driver_build_counter
+
+    @property
+    def source_build_counter(self):
+        """int: number of batch-source builds (cold + topology changes)."""
+        return self._inner.source_build_counter
+
+    @property
+    def active_to_orig(self):
+        """(n_active,) int64: original row index of each solved batch slot."""
+        return self._inner.get_active_to_orig()
+
+    @property
     def reordering_alg(self):
         """cuDSS CUDSS_CONFIG_REORDERING_ALG choice (str). Takes effect on the
-        next compute() (which always reruns cuDSS ANALYSIS). One of 'default'
-        (default), 'amd', 'nested_dissection', 'none'. 'btf_colamd'/'colamd'
-        are rejected by cuDSS (CUDSS_STATUS_NOT_SUPPORTED) in this class's
-        uniform-batch mode -- they only work on AcPfGPU's single-system solve."""
+        next compute(), which rebuilds the batch driver (a new cuDSS ANALYSIS)
+        when it changed. One of 'default' (default), 'amd',
+        'nested_dissection', 'none'. 'btf_colamd'/'colamd' are rejected by
+        cuDSS (CUDSS_STATUS_NOT_SUPPORTED) in this class's uniform-batch mode
+        -- they only work on AcPfGPU's single-system solve."""
         return self._inner.reordering_alg
 
     @reordering_alg.setter
@@ -628,9 +663,10 @@ class ScenarioSweepGPU:
     @property
     def matching_alg(self):
         """cuDSS CUDSS_CONFIG_MATCHING_ALG choice (str). Takes effect on the
-        next compute() (which always reruns cuDSS ANALYSIS). 'none' (default)
-        is the only value cuDSS accepts in this class's uniform-batch mode --
-        every other value raises RuntimeError (CUDSS_STATUS_NOT_SUPPORTED)."""
+        next compute(), which rebuilds the batch driver when it changed.
+        'none' (default) is the only value cuDSS accepts in this class's
+        uniform-batch mode -- every other value raises RuntimeError
+        (CUDSS_STATUS_NOT_SUPPORTED)."""
         return self._inner.matching_alg
 
     @matching_alg.setter
@@ -640,8 +676,8 @@ class ScenarioSweepGPU:
     @property
     def pivot_epsilon_alg(self):
         """cuDSS CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str). Takes effect on
-        the next compute() (which always reruns cuDSS ANALYSIS). One of
-        'default' (default), 'scaled', 'static'."""
+        the next compute(), which rebuilds the batch driver when it changed.
+        One of 'default' (default), 'scaled', 'static'."""
         return self._inner.pivot_epsilon_alg
 
     @pivot_epsilon_alg.setter

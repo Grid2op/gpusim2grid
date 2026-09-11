@@ -232,6 +232,16 @@ class InjectionElements:
     # in Sbus -- it is solved for). Mirrors lightsim2grid's SbusPolicy.
     gen_target_q_mvar: np.ndarray = None
     gen_vreg_on: np.ndarray = None
+    # (n_load,) AC-solver bus id of every load (-1 for a disconnected one) and
+    # the base-case per-element values the snapshot was taken at (MW / MVAr):
+    # what gpusim2grid.differentiable.BatchPowerFlow needs to build its own
+    # device-side element->bus map and to fill a ``None`` input with the
+    # grid's own values. Feeding these bases back through
+    # :func:`build_bus_injections` reproduces the base-case Sbus.
+    load_bus: np.ndarray = None
+    load_p_base: np.ndarray = None
+    load_q_base: np.ndarray = None
+    gen_p_base: np.ndarray = None
 
 
 def extract_injection_elements(grid, n_bus):
@@ -321,13 +331,17 @@ def extract_injection_elements(grid, n_bus):
     gen_target_q = np.array([float(g.target_q_mvar) for g in gens], dtype=np.float64)
     gen_vreg_on = np.array([bool(g.voltage_regulator_on) for g in gens], dtype=bool)
 
+    load_bus_out = np.where(load_status, load_bus, -1)
+
     return InjectionElements(
         n_load=n_load, n_gen=n_gen, n_bus=int(n_bus),
         sn_mva=float(grid.get_sn_mva()),
         load_sel=load_sel, gen_sel=gen_sel,
         scatter_load=scatter_load, scatter_gen=scatter_gen,
         const_mw=const_mw, gen_bus=gen_bus_out,
-        gen_target_q_mvar=gen_target_q, gen_vreg_on=gen_vreg_on)
+        gen_target_q_mvar=gen_target_q, gen_vreg_on=gen_vreg_on,
+        load_bus=load_bus_out,
+        load_p_base=load_p_base, load_q_base=load_q_base, gen_p_base=gen_p_base)
 
 
 def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None):

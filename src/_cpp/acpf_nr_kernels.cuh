@@ -687,4 +687,105 @@ inline void launch_tile(T* dst, const T* src, int n, int batch_size, cudaStream_
     tile_kernel<T><<<grid, block, 0, cs>>>(dst, src, n, batch_size);
 }
 
+// =============================================================================
+// gather_rows_kernel / launch_gather_rows
+//   dst[r * n_cols + c] = src[map[r] * n_cols + c]   for r in [0, n_rows)
+//   (map == nullptr → identity: dst row r = src row r). Used to move the
+//   ORIGINAL-row-order per-scenario data (Sbus rows, adjoint right-hand sides)
+//   into ACTIVE-slot order on the device, replacing the host permutation the
+//   batch sources used to do. zero_nonfinite replaces NaN/inf source entries
+//   by 0 (adjoint rhs of masked/NaN buses).
+// scatter_rows_kernel / launch_scatter_rows
+//   dst[map[r] * n_cols + c] = src[r * n_cols + c]   (the inverse move).
+// Both have a plain complex / real overload path through the templates below;
+// only the real one supports zero_nonfinite.
+// =============================================================================
+template <typename T>
+__device__ __forceinline__ T gather_sanitize(T v, bool) { return v; }
+template <>
+__device__ __forceinline__ float gather_sanitize<float>(float v, bool zero_nonfinite)
+{ return (zero_nonfinite && !isfinite(v)) ? 0.f : v; }
+template <>
+__device__ __forceinline__ double gather_sanitize<double>(double v, bool zero_nonfinite)
+{ return (zero_nonfinite && !isfinite(v)) ? 0. : v; }
+
+template <typename T>
+__global__ void gather_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                   const int* __restrict__ map,
+                                   int n_cols, int n_rows, bool zero_nonfinite)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / n_cols;
+    const int       c   = static_cast<int>(tid % n_cols);
+    if (r >= n_rows) return;
+    const ptrdiff_t src_r = map ? map[r] : r;
+    dst[r * n_cols + c] = gather_sanitize<T>(src[src_r * n_cols + c], zero_nonfinite);
+}
+
+template <typename T>
+inline void launch_gather_rows(T* dst, const T* src, const int* map,
+                               int n_cols, int n_rows, bool zero_nonfinite, cudaStream_t cs)
+{
+    if (n_cols <= 0 || n_rows <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(n_cols) * n_rows;
+    gather_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, map, n_cols, n_rows, zero_nonfinite);
+}
+
+template <typename T>
+__global__ void scatter_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                    const int* __restrict__ map, int n_cols, int n_rows)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / n_cols;
+    const int       c   = static_cast<int>(tid % n_cols);
+    if (r >= n_rows) return;
+    const ptrdiff_t dst_r = map ? map[r] : r;
+    dst[dst_r * n_cols + c] = src[r * n_cols + c];
+}
+
+template <typename T>
+inline void launch_scatter_rows(T* dst, const T* src, const int* map,
+                                int n_cols, int n_rows, cudaStream_t cs)
+{
+    if (n_cols <= 0 || n_rows <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(n_cols) * n_rows;
+    scatter_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, map, n_cols, n_rows);
+}
+
+// =============================================================================
+// gather_cols_rows_kernel / launch_gather_cols_rows
+//   dst[r * k + j] = src[map[r] * n_cols_src + cols[j]]: row gather (active-
+//   slot order, map nullable = identity) combined with a column selection --
+//   the device path of set_gen_v(), which keeps only the generators whose own
+//   bus is Vm-fixed (see GenVOverride).
+// =============================================================================
+template <typename T>
+__global__ void gather_cols_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                        const int* __restrict__ map,
+                                        const int* __restrict__ cols,
+                                        int n_cols_src, int k, int n_rows)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / k;
+    const int       j   = static_cast<int>(tid % k);
+    if (r >= n_rows) return;
+    const ptrdiff_t src_r = map ? map[r] : r;
+    dst[r * k + j] = src[src_r * n_cols_src + cols[j]];
+}
+
+template <typename T>
+inline void launch_gather_cols_rows(T* dst, const T* src, const int* map, const int* cols,
+                                    int n_cols_src, int k, int n_rows, cudaStream_t cs)
+{
+    if (k <= 0 || n_rows <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(k) * n_rows;
+    gather_cols_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, map, cols, n_cols_src, k, n_rows);
+}
+
 #endif // ACPF_NR_KERNELS_CUH

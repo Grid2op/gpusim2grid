@@ -345,6 +345,24 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Fixed NR iterations per chunk (no convergence check mid-loop)")
         .def_readonly("n_refactorize",   &BatchTimings::n_refactorize,
                       "Number of REFACTORIZATION calls (n_chunks × nb_iter − 1)")
+        // --- batched adjoint (ScenarioSweepSession only; cumulative per driver life) ---
+        .def_readonly("t_adjoint_build_ms", &BatchTimings::t_adjoint_build_ms,
+                      "Wall-clock: transposed-Jacobian skeleton + position map + buffers + "
+                      "cuDSS ANALYSIS of J^T -- paid by the FIRST backward only (ms)")
+        .def_readonly("t_adjoint_first_factorize", &BatchTimings::t_adjoint_first_factorize,
+                      "cuDSS FACTORIZATION of J^T -- first backward only")
+        .def_readonly("t_adjoint_refactorize", &BatchTimings::t_adjoint_refactorize,
+                      "cuDSS REFACTORIZATION of J^T -- every later backward after a new run() -- total")
+        .def_readonly("t_adjoint_solve", &BatchTimings::t_adjoint_solve,
+                      "cuDSS SOLVE with J^T -- every backward -- total")
+        .def_readonly("adjoint_n_analysis", &BatchTimings::adjoint_n_analysis,
+                      "Number of J^T ANALYSIS calls over the driver's life (0 or 1)")
+        .def_readonly("adjoint_n_factorize", &BatchTimings::adjoint_n_factorize,
+                      "Number of J^T FACTORIZATION calls over the driver's life (0 or 1)")
+        .def_readonly("adjoint_n_refactorize", &BatchTimings::adjoint_n_refactorize,
+                      "Number of J^T REFACTORIZATION calls over the driver's life")
+        .def_readonly("adjoint_n_solve", &BatchTimings::adjoint_n_solve,
+                      "Number of J^T SOLVE calls over the driver's life")
         .def_readonly("n_disconnected",  &BatchTimings::n_disconnected,
                       "Contingencies skipped because they would disconnect the Ybus graph; "
                       "their residuals are set to NaN in the output. With "
@@ -442,6 +460,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
             d2h["copy_residuals_to_host_ms"]  = t.t_copy_residuals_to_host_ms;
             d2h["copy_violations_to_host_ms"] = t.t_copy_violations_to_host_ms;
 
+            // Batched adjoint (differentiable path): cumulative over the driver's
+            // life, separate from run() -- NOT part of 'total'.
+            py::dict adjoint;
+            adjoint["build_ms"]        = t.t_adjoint_build_ms;
+            adjoint["first_factorize"] = entry_dict(t.t_adjoint_first_factorize);
+            adjoint["refactorize"]     = entry_dict(t.t_adjoint_refactorize);
+            adjoint["solve"]           = entry_dict(t.t_adjoint_solve);
+            adjoint["n_analysis"]      = t.adjoint_n_analysis;
+            adjoint["n_factorize"]     = t.adjoint_n_factorize;
+            adjoint["n_refactorize"]   = t.adjoint_n_refactorize;
+            adjoint["n_solve"]         = t.adjoint_n_solve;
+
             py::dict result;
             result["total"]        = t.t_grand_total_ms();
             result["cpu_preproc"]  = cpu_preproc;
@@ -449,6 +479,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             result["context_init"] = context_init;
             result["gpu_compute"]  = gpu_compute;
             result["d2h"]          = d2h;
+            result["adjoint"]      = adjoint;
             return result;
         }, "Nested dict view of the coarse timing buckets: "
            "{'total': ms, 'cpu_preproc': {'total': ms, ...}, 'h2d': {'total': ms, ...}, "
@@ -1552,7 +1583,111 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Syncs the base-case stream before returning.")
     .def("v_results_dlpack", &export_v_results_dlpack_ss,
          "Export batch voltages as DLPack capsule, shape [n_scenarios, n_bus].\n"
-         "Requires run() to have been called.  Syncs the solver stream.");
+         "Requires run() to have been called.  Syncs the solver stream. The "
+         "memory is overwritten IN PLACE by the next run() that reuses the "
+         "batch driver (same n_scenarios and settings) and freed by one that "
+         "rebuilds it -- clone the tensor for a snapshot either way.")
+    // -------------------------------------------------------------------
+    // Driver persistence + differentiable path (see the Python
+    // gpusim2grid.differentiable.BatchPowerFlow wrapper).
+    // -------------------------------------------------------------------
+    .def_readwrite("fixed_batch_capacity", &ScenarioSweepSession::fixed_batch_capacity_,
+                   "When True, batch_size is used verbatim as the batch driver's "
+                   "chunk capacity (no rebalancing over the active count): with "
+                   "batch_size >= n_scenarios the whole batch is always solved as "
+                   "ONE chunk whatever rows get islanded. Needed by the adjoint "
+                   "(keep_final_jacobian). Default False. Takes effect on the "
+                   "next run() (rebuilds the driver when changed).")
+    .def_readwrite("keep_final_jacobian", &ScenarioSweepSession::keep_final_jacobian_,
+                   "When True, run() refills the batched Jacobian at the CONVERGED "
+                   "voltages after the NR loop (one extra fill_J), so that "
+                   "solve_JT_batch_dlpack() can use it. Requires the batch to be "
+                   "solved in one chunk (see fixed_batch_capacity). Default False.")
+    .def_readonly("run_counter", &ScenarioSweepSession::run_counter_,
+                  "Number of run() calls so far (an autograd backward checks it "
+                  "against the forward it belongs to).")
+    .def_readonly("driver_build_counter", &ScenarioSweepSession::driver_build_counter_,
+                  "Number of batch-driver (cold) builds so far: allocation + cuDSS "
+                  "ANALYSIS. Stays constant across run() calls that reuse the driver.")
+    .def_readonly("source_build_counter", &ScenarioSweepSession::source_build_counter_,
+                  "Number of batch-source builds so far (cold + warm runs: topology "
+                  "preprocessing + patch upload). Constant across hot runs.")
+    .def_property_readonly("adjoint_ready", &ScenarioSweepSession::adjoint_ready,
+         "True once the batched transposed system exists (first solve_JT_batch_dlpack()).")
+    .def_property_readonly("capacity", &ScenarioSweepSession::capacity,
+         "Live driver's chunk capacity (0 before run()).")
+    .def_property_readonly("n_active", &ScenarioSweepSession::n_active,
+         "Rows actually solved by the last run() (n_scenarios minus the islanded ones).")
+    .def_property_readonly("nnz_J", &ScenarioSweepSession::nnz_J,
+         "Non-zeros of one (augmented) Jacobian.")
+    .def_property_readonly("nnz_Y", &ScenarioSweepSession::nnz_Y,
+         "Non-zeros of Ybus.")
+    .def_property_readonly("p_row_of_bus", &ScenarioSweepSession::p_row_of_bus,
+         "Bus-keyed J row of each bus' P equation (length n_bus, -1 if none). "
+         "Re-read after every run(): set_contingency_gens can grow dim_J.")
+    .def_property_readonly("q_row_of_bus", &ScenarioSweepSession::q_row_of_bus,
+         "Bus-keyed J row of each bus' Q equation (length n_bus, -1 if none).")
+    .def_property_readonly("theta_col_of_bus", &ScenarioSweepSession::theta_col_of_bus,
+         "Bus-keyed J column of each bus' angle unknown (length n_bus, -1 if none).")
+    .def_property_readonly("vm_col_of_bus", &ScenarioSweepSession::vm_col_of_bus,
+         "Bus-keyed J column of each bus' |V| unknown (length n_bus, -1 for a "
+         "Vm-fixed bus).")
+    .def_property_readonly("is_vm_fixed_bus", &ScenarioSweepSession::is_vm_fixed_bus,
+         "(n_bus,) 0/1: the bus' |V| is fixed (pv or slack) -- the only buses "
+         "set_gen_v() acts on and the only ones with a gen_v gradient.")
+    .def("get_active_to_orig", &ScenarioSweepSession::get_active_to_orig,
+         "(n_active,) int: original scenario index of each active batch slot "
+         "(identity before run() or without islanded rows).")
+    .def("j_skeleton", &ScenarioSweepSession::j_skeleton,
+         "(outer, inner) int32 CSR structure of one Jacobian (host copies), "
+         "for tests / external assembly of j_values_dlpack().")
+    .def("clear_gen_v", &ScenarioSweepSession::clear_gen_v,
+         "Drop any set_gen_v() override: every row keeps the base-case voltage "
+         "again. Takes effect on the next run().")
+    .def("set_injections_dlpack", &import_injections_dlpack_ss,
+         pybind11::arg("capsule"), pybind11::arg("producer_stream") = 0,
+         "Device path of set_injections(): a DLPack capsule of a (n_scenarios, "
+         "n_bus) contiguous complex tensor (this build's precision) of PER-UNIT "
+         "Sbus rows (AC-solver bus numbering) on this session's device. One "
+         "device-to-device copy, host-synchronized before returning; the capsule "
+         "is consumed. producer_stream: the CUDA stream handle the tensor was "
+         "produced on (torch.cuda.current_stream().cuda_stream), 0 = default. "
+         "Fixes n_scenarios.")
+    .def("set_gen_v_dlpack", &import_gen_v_dlpack_ss,
+         pybind11::arg("capsule"), pybind11::arg("gen_bus"),
+         pybind11::arg("producer_stream") = 0,
+         "Device path of set_gen_v(): (n_scenarios, n_gen) contiguous real "
+         "tensor of vm_pu (this build's precision) on this device; same "
+         "semantics as set_gen_v(gen_v, gen_bus). Capsule consumed.")
+    .def("solve_JT_batch_dlpack", &export_solve_jt_batch_dlpack_ss,
+         pybind11::arg("rhs"),
+         pybind11::arg("j_values") = pybind11::none(),
+         pybind11::arg("ybus_values") = pybind11::none(),
+         pybind11::arg("v") = pybind11::none(),
+         pybind11::arg("want_gen_v_grad") = false,
+         pybind11::arg("producer_stream") = 0,
+         "Batched adjoint solve J_s^T lambda_s = rhs_s for every scenario s, "
+         "with the Jacobians at the converged voltages of the last run() "
+         "(keep_final_jacobian=True) -- or with the j_values / ybus_values / v "
+         "snapshots taken right after that run (j_values_dlpack(), "
+         "ybus_values_dlpack(), v_results_dlpack(), cloned). rhs: (n_scenarios, "
+         "dim_J) real, original row order, non-finite entries treated as 0. "
+         "Returns (lambda, gvm): lambda (n_scenarios, dim_J); gvm (n_scenarios, "
+         "n_bus) when want_gen_v_grad else None -- the adjoint contraction of "
+         "each Vm-fixed bus' dS/dVm column (the indirect part of d/d gen_v, "
+         "sign included), 0 elsewhere. Rows of islanded scenarios are 0. Both "
+         "capsules alias driver buffers overwritten by the next call: clone. "
+         "The first call builds the transposed system (J->J^T position map, "
+         "buffers, one cuDSS ANALYSIS + FACTORIZATION); later calls only "
+         "permute values, REFACTORIZE (once per new run()) and SOLVE. The "
+         "capsules given are consumed.")
+    .def("j_values_dlpack", &export_j_values_dlpack_ss,
+         "(capacity, nnz_J) real: the batched Jacobian values of the last chunk "
+         "(active-slot order; rows >= n_active are phantom base-case copies). "
+         "Aliases the chunk buffer: clone right after run() for a snapshot.")
+    .def("ybus_values_dlpack", &export_ybus_values_dlpack_ss,
+         "(capacity, nnz_Y) complex: the per-slot patched Ybus values of the last "
+         "chunk (active-slot order). Aliases the chunk buffer: clone for a snapshot.");
 
     // -----------------------------------------------------------------
     // Zero-copy construction from a solved lightsim2grid LSGrid

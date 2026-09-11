@@ -23,10 +23,11 @@ inline void _chk_cuda(cudaError_t e, const char* what) {
 }
 
 // =============================================================================
-// initialize — upload flat Ybus-patch arrays + active-permuted Sbus rows;
-// allocate the per-chunk Sbus buffer. Mirrors ContingencyBatch::initialize
-// (patch upload) + InjectionBatch::initialize (Sbus upload / buffer alloc),
-// minus InjectionBatch's one-time Ybus tiling (Ybus varies per chunk here).
+// initialize — upload flat Ybus-patch arrays, masks, tripped table, active
+// map; size the Sbus buffers. Mirrors ContingencyBatch::initialize (patch
+// upload) + InjectionBatch::initialize (buffer alloc), minus InjectionBatch's
+// one-time Ybus tiling (Ybus varies per chunk here) and minus the Sbus upload
+// (set_sbus_from_orig gathers it from the session's device buffer).
 // =============================================================================
 void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
 {
@@ -34,10 +35,12 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     upload_h2d(d_flat_k,         h_flat_k_.data(),         h_flat_k_.size(),         cs);
     upload_h2d(d_flat_delta_re,  h_flat_delta_re_.data(),  h_flat_delta_re_.size(),  cs);
     upload_h2d(d_flat_delta_im,  h_flat_delta_im_.data(),  h_flat_delta_im_.size(),  cs);
-    if (!active_to_orig_.empty()
-            && static_cast<int>(active_to_orig_.size()) < n_total_)
+    // Always uploaded (identity included): the row gathers index through it.
+    if (!active_to_orig_.empty())
         upload_h2d(d_active_to_orig, active_to_orig_.data(),
                    active_to_orig_.size(), cs);
+    else
+        d_active_to_orig.clear();
 
     // handle_disconnected_grid masking / PV-pin / stranded-controller entries
     // (only when any exist).
@@ -55,16 +58,14 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
                        h_trip_branch_flat_.size(), cs);
     }
 
-    if (static_cast<int>(h_Sbus_all_.size())
-            != n_active() * ctx.n_bus) {
+    if (n_bus_ != ctx.n_bus)
         throw std::runtime_error(
-            "[scenario_sweep_batch] h_Sbus_all_ size does not match n_active * n_bus");
-    }
-    upload_h2d(d_Sbus_all, h_Sbus_all_.data(), h_Sbus_all_.size(), cs);
+            "[scenario_sweep_batch] bus count does not match the driver's");
+    d_Sbus_all.resize(static_cast<size_t>(n_active()) * ctx.n_bus);
     d_Sbus_batch.resize(static_cast<size_t>(ctx.batch_size) * ctx.n_bus);
 
-    // set_gen_v() overrides, if any -- see GenVOverride's own doc.
-    if (gen_v_override_.k_active() > 0) {
+    // set_gen_v() overrides given to the ctor (host path), if any.
+    if (gen_v_override_.k_active() > 0 && !gen_v_override_.h_gen_v_all.empty()) {
         upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
                    gen_v_override_.h_active_bus.size(), cs);
         upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
@@ -80,6 +81,57 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
         upload_h2d(d_slack_w_all, h_slack_w_all_.data(), h_slack_w_all_.size(), cs);
         d_slack_w_batch.resize(static_cast<size_t>(ctx.batch_size) * n_slack_);
     }
+}
+
+// =============================================================================
+// set_sbus_from_orig — one gather kernel, original row order → active slots.
+// =============================================================================
+void ScenarioSweepBatch::set_sbus_from_orig(const cudaComplexType* d_Sbus_orig,
+                                            cudaStream_t cs)
+{
+    const int n_act = n_active();
+    if (n_act <= 0) return;
+    if (d_Sbus_all.size() != static_cast<size_t>(n_act) * n_bus_)
+        throw std::runtime_error(
+            "[scenario_sweep_batch] set_sbus_from_orig: call initialize() first");
+    launch_gather_rows(thrust::raw_pointer_cast(d_Sbus_all.data()), d_Sbus_orig,
+                       d_active_to_orig_ptr(), n_bus_, n_act,
+                       /*zero_nonfinite=*/false, cs);
+    _chk_cuda(cudaGetLastError(), "Sbus row gather");
+}
+
+// =============================================================================
+// set_gen_v (host path) / set_gen_v_from_orig (device path)
+// =============================================================================
+void ScenarioSweepBatch::set_gen_v(GenVOverride&& gen_v_override_orig, cudaStream_t cs)
+{
+    gen_v_override_ = GenVOverride{};
+    if (gen_v_override_orig.k_active() <= 0) return;
+    _permute_gen_v_rows(std::move(gen_v_override_orig));
+    upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
+               gen_v_override_.h_active_bus.size(), cs);
+    upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
+               gen_v_override_.h_gen_v_all.size(), cs);
+}
+
+void ScenarioSweepBatch::set_gen_v_from_orig(const cuda_real_type* d_gen_v_orig, int n_gen,
+                                             const std::vector<int>& active_cols,
+                                             const std::vector<int>& active_bus,
+                                             cudaStream_t cs)
+{
+    gen_v_override_ = GenVOverride{};
+    const int k = static_cast<int>(active_cols.size());
+    if (k <= 0 || active_bus.size() != active_cols.size()) return;
+    gen_v_override_.h_active_bus = active_bus;   // k_active() > 0 gates the reseed
+    upload_h2d(d_gv_active_bus, active_bus.data(), active_bus.size(), cs);
+    upload_h2d(d_gv_active_col, active_cols.data(), active_cols.size(), cs);
+    const int n_act = n_active();
+    d_gv_all.resize(static_cast<size_t>(n_act) * k);
+    launch_gather_cols_rows(thrust::raw_pointer_cast(d_gv_all.data()), d_gen_v_orig,
+                            d_active_to_orig_ptr(),
+                            thrust::raw_pointer_cast(d_gv_active_col.data()),
+                            n_gen, k, n_act, cs);
+    _chk_cuda(cudaGetLastError(), "gen_v gather");
 }
 
 // =============================================================================
