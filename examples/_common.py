@@ -163,18 +163,18 @@ def branch_data(grid):
     Returns
     -------
     (args, n_lines, n_trafos) where ``args`` is the tuple expected by
-    ``set_branch_data``: (branch_from, branch_to, yff, yft, ytf, ytt,
+    ``set_branch_data``: (branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
     bus_vn_kv, sn_mva).
     """
     lines = grid.get_lines()
     trafos = grid.get_trafos()
     branch_from = np.concatenate((lines.get_bus_id_side_1(), trafos.get_bus_id_side_1()))
     branch_to = np.concatenate((lines.get_bus_id_side_2(), trafos.get_bus_id_side_2()))
-    yff = np.concatenate((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11().copy()))
-    yft = np.concatenate((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12().copy()))
-    ytf = np.concatenate((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
-    ytt = np.concatenate((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
+    yff_eff = np.concatenate((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11().copy()))
+    yft_eff = np.concatenate((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12().copy()))
+    ytf_eff = np.concatenate((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21().copy()))
+    ytt_eff = np.concatenate((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22().copy()))
     vn_kv = grid.get_bus_vn_kv().copy()
     sn_mva = grid.get_sn_mva()
-    args = (branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
+    args = (branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, vn_kv, sn_mva)
     return args, len(lines), len(trafos)

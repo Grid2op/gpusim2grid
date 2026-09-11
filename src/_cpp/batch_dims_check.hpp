@@ -35,8 +35,8 @@
 //      hardware, this guard keeps rejecting the combination rather than
 //      risk relying on unverified library behavior.
 //
-//   2. The cuSPARSE block-diagonal SpMV path. build_blockdiag_csr()
-//      (contingency_analysis_helper.cpp) builds ONE literal block-diagonal
+//   2. The cuSPARSE block-diagonal SpMV path. blockdiag_csr_kernel
+//      (batch_pf_driver.cu) writes ONE literal block-diagonal
 //      Ybus matrix of size (batch_size*n_bus)^2 with batch_size*nnz_Y
 //      non-zeros, and BatchPfDriver's constructor hands its outer/inner
 //      arrays to cusparseCreateConstCsr with CUSPARSE_INDEX_32I explicitly.

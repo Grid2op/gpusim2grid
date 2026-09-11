@@ -6,8 +6,8 @@
 compute_flows — differentiable branch-flow computation in pure PyTorch.
 
 π-model branch equations:
-    I_or = yff * V[from] + yft * V[to]
-    I_ex = ytf * V[from] + ytt * V[to]
+    I_or = yff_eff * V[from] + yft_eff * V[to]
+    I_ex = ytf_eff * V[from] + ytt_eff * V[to]
 
     S_or = V[from] * conj(I_or)      (complex apparent power, per-unit)
     S_ex = V[to]   * conj(I_ex)
@@ -26,10 +26,10 @@ from torch import Tensor
 
 def compute_flows(
     V: Tensor,           # complex [n_bus] on GPU
-    yff: Tensor,         # complex [n_branches]
-    yft: Tensor,         # complex [n_branches]
-    ytf: Tensor,         # complex [n_branches]
-    ytt: Tensor,         # complex [n_branches]
+    yff_eff: Tensor,         # complex [n_branches]
+    yft_eff: Tensor,         # complex [n_branches]
+    ytf_eff: Tensor,         # complex [n_branches]
+    ytt_eff: Tensor,         # complex [n_branches]
     branch_from: Tensor, # int64  [n_branches]
     branch_to: Tensor,   # int64  [n_branches]
     bus_vn_kv: Tensor,   # float  [n_bus] — nominal voltage kV per bus
@@ -49,8 +49,8 @@ def compute_flows(
     Vi = V[branch_from]  # complex [n_branches]
     Vj = V[branch_to]    # complex [n_branches]
 
-    I_or = yff * Vi + yft * Vj  # origin terminal current
-    I_ex = ytf * Vi + ytt * Vj  # extremity terminal current
+    I_or = yff_eff * Vi + yft_eff * Vj  # origin terminal current
+    I_ex = ytf_eff * Vi + ytt_eff * Vj  # extremity terminal current
 
     S_or = Vi * I_or.conj()     # complex apparent power (pu), origin
     S_ex = Vj * I_ex.conj()     # complex apparent power (pu), extremity

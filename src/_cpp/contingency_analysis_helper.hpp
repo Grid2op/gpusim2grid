@@ -19,9 +19,9 @@
 //   • build_flat_patches() — convert per-contingency triplet lists into three
 //     parallel host arrays (SoA) ready for device upload, and precompute the
 //     slice [start, count) within those arrays that belongs to each chunk.
-//   • build_blockdiag_csr() — build the outer (row pointer) and inner (column
-//     index) arrays for the block-diagonal Ybus used in batched cuSPARSE SpMV.
-//     Only the structure is built here; values are tiled per chunk at runtime.
+//   • check_connectivity() / compute_component_masks() — decide, per
+//     contingency, whether the patched Ybus graph stays connected (and which
+//     buses to mask otherwise) from one DFS tree of the base graph.
 //
 // Precision note
 // --------------
@@ -103,7 +103,7 @@ struct Contingency {
     // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.
     // Used ONLY by compute_limit_violations' fused per-contingency current
     // check (see build_tripped_branch_table below) to skip branches whose
-    // Ybus coefficients were patched but whose own yff/yft/ytf/ytt are
+    // Ybus coefficients were patched but whose own yff_eff/yft_eff/ytf_eff/ytt_eff are
     // unchanged (they would otherwise report a phantom nonzero current). This
     // is a second, independent index space from Triplet::k (CSR flat index
     // into Ybus) — no interaction with resolve_indices()/build_flat_patches().
@@ -124,7 +124,7 @@ struct ChunkPatchRange {
 // ---------------------------------------------------------------------------
 // build_contingency_from_branch_ids
 //   Builds ONE Contingency's triplets from a list of tripped branch ids, given
-//   the grid's π-model admittances (branch_from/to, yff/yft/ytf/ytt — the same
+//   the grid's π-model admittances (branch_from/to, yff_eff/yft_eff/ytf_eff/ytt_eff — the same
 //   host arrays set_branch_data() stores). Shared by
 //   ContingencyAnalysisSession::build_contingencies() (one call per contingency
 //   in a set of distinct scenarios) and ScenarioSweepSession::set_topology()
@@ -142,10 +142,10 @@ Contingency build_contingency_from_branch_ids(
     const std::vector<int>&   branch_ids,
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect> yff,
-    Eigen::Ref<const CplxVect> yft,
-    Eigen::Ref<const CplxVect> ytf,
-    Eigen::Ref<const CplxVect> ytt);
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff);
 
 // ---------------------------------------------------------------------------
 // csr_find_k
@@ -236,43 +236,6 @@ void build_flat_patches(
     std::vector<cuda_real_type>& h_flat_delta_im,
     std::vector<ChunkPatchRange>& chunk_ranges,
     std::vector<int>&            active_to_orig);
-
-// ---------------------------------------------------------------------------
-// build_blockdiag_csr
-//   Builds the structural arrays (outer/inner) for a batch_size × batch_size
-//   block-diagonal Ybus used as the cuSPARSE SpMV matrix.
-//
-//   For a single system with n_bus rows and nnz non-zeros, the block-diagonal
-//   matrix for a batch of size b has:
-//     outer : b * n_bus + 1 entries  (shifted by i * nnz for block i)
-//     inner : b * nnz entries        (shifted by i * n_bus for block i)
-//
-//   Only outer and inner are built here.  The values buffer (d_Ybus_values_batch)
-//   is tiled from base-case values and patched at the start of each chunk call.
-//
-//   Note: this function builds the structure for the MAXIMUM batch size.  For
-//   the last (potentially smaller) chunk the cuSPARSE descriptor is rebuilt to
-//   cover only actual_batch systems; outer/inner are still valid up to that
-//   prefix because the structure within each block is identical.
-//
-//   Parameters
-//   ----------
-//   n_bus         : number of buses in one system
-//   nnz           : number of non-zeros in one Ybus
-//   single_outer  : Ybus outerIndexPtr(), size n_bus + 1
-//   single_inner  : Ybus innerIndexPtr(), size nnz
-//   batch_size    : maximum batch size (number of blocks)
-//   h_batch_outer : output, size batch_size * n_bus + 1
-//   h_batch_inner : output, size batch_size * nnz
-// ---------------------------------------------------------------------------
-void build_blockdiag_csr(
-    int                  n_bus,
-    int                  nnz,
-    const int*           single_outer,
-    const int*           single_inner,
-    int                  batch_size,
-    std::vector<int>&    h_batch_outer,
-    std::vector<int>&    h_batch_inner);
 
 // ---------------------------------------------------------------------------
 // check_connectivity

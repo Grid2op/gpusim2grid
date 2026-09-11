@@ -213,7 +213,7 @@ class ContingencyAnalysisGPU:
 
     >>> ca = ContingencyAnalysisGPU(
     ...     (Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq), nb_iter=4)
-    >>> ca.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva)
+    >>> ca.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva)
     >>> ca.add_contingencies_by_branch_id([[12], [40], [12, 40]])
     >>> V_batch = ca.compute(batch_size=512)
     """
@@ -355,7 +355,7 @@ class ContingencyAnalysisGPU:
         self._last_residuals = None
 
     # ------------------------------------------------------------------ spec
-    def set_branch_data(self, branch_from, branch_to, yff, yft, ytf, ytt,
+    def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
         """Store π-model branch admittances (explicit-array mode only).
 
@@ -363,7 +363,7 @@ class ContingencyAnalysisGPU:
         when ``grid`` was an explicit-array tuple. Required before
         :meth:`add_contingencies_by_branch_id` and :meth:`compute_flows`.
         """
-        self._inner.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt,
+        self._inner.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                     bus_vn_kv, sn_mva)
         self._n_branches = len(branch_from)
 
@@ -523,12 +523,12 @@ class ContingencyAnalysisGPU:
             limit_a1_ka = limit_a2_ka = None
 
         branch_args, _, _ = extract_branch_data(grid)
-        branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva = branch_args
+        branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva = branch_args
         V_n = grid.get_V_solver()
 
         return compute_violations_n(
             V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-            branch_from, branch_to, yff, yft, ytf, ytt,
+            branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
             limit_a1_ka, limit_a2_ka, sn_mva, n_lines)
 
     # ----------------------------------------------------------- pass-through

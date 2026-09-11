@@ -8,12 +8,11 @@
 
 #include "contingency_analysis_helper.hpp"
 
-#include <algorithm>        // std::lower_bound, std::min
+#include <algorithm>        // std::lower_bound, std::min, std::sort, std::max_element
+#include <cmath>            // std::abs
 #include <cassert>
-#include <queue>            // std::queue (BFS)
 #include <stdexcept>
 #include <string>
-#include <unordered_set>    // std::unordered_set (O(1) flat-index lookup)
 #include <utility>          // std::pair
 #include <vector>
 
@@ -24,10 +23,10 @@ Contingency build_contingency_from_branch_ids(
     const std::vector<int>&   branch_ids,
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect> yff,
-    Eigen::Ref<const CplxVect> yft,
-    Eigen::Ref<const CplxVect> ytf,
-    Eigen::Ref<const CplxVect> ytt)
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff)
 {
     const int n_branches = static_cast<int>(branch_from.size());
 
@@ -43,15 +42,32 @@ Contingency build_contingency_from_branch_ids(
         const int i = branch_from(l);
         const int j = branch_to(l);
 
+        // A negative endpoint means that side of the branch is isolated in
+        // the AC-solver's bus numbering (id_me_to_ac_solver relabels an
+        // unattached bus to a negative id -- e.g. the open side of a
+        // half-open line with keep_half_open_lines=True). Such a bus has no
+        // row/col in Ybus_solver at all, so there is nothing to patch there:
+        // emitting a triplet for it would make resolve_indices()'s
+        // csr_find_k() index row_ptr[negative] (UB) and produce a garbage
+        // flat CSR index downstream. Skip any triplet touching that endpoint;
+        // the branch's contribution at its still-connected endpoint (if any)
+        // is preserved.
+        const bool i_valid = i >= 0;
+        const bool j_valid = j >= 0;
+
         // π-model Ybus modifications to SUBTRACT for this branch trip:
-        //   (i,i) → yff   (ii self-admittance at from-bus)
-        //   (j,j) → ytt   (jj self-admittance at to-bus)
-        //   (i,j) → yft   (ij mutual admittance)
-        //   (j,i) → ytf   (ji mutual admittance)
-        ctg.triplets.push_back({i, i,  yff(l).real(),  yff(l).imag()});
-        ctg.triplets.push_back({j, j,  ytt(l).real(),  ytt(l).imag()});
-        ctg.triplets.push_back({i, j,  yft(l).real(),  yft(l).imag()});
-        ctg.triplets.push_back({j, i,  ytf(l).real(),  ytf(l).imag()});
+        //   (i,i) → yff_eff   (ii self-admittance at from-bus)
+        //   (j,j) → ytt_eff   (jj self-admittance at to-bus)
+        //   (i,j) → yft_eff   (ij mutual admittance)
+        //   (j,i) → ytf_eff   (ji mutual admittance)
+        if (i_valid)
+            ctg.triplets.push_back({i, i,  yff_eff(l).real(),  yff_eff(l).imag()});
+        if (j_valid)
+            ctg.triplets.push_back({j, j,  ytt_eff(l).real(),  ytt_eff(l).imag()});
+        if (i_valid && j_valid) {
+            ctg.triplets.push_back({i, j,  yft_eff(l).real(),  yft_eff(l).imag()});
+            ctg.triplets.push_back({j, i,  ytf_eff(l).real(),  ytf_eff(l).imag()});
+        }
     }
     return ctg;
 }
@@ -191,77 +207,393 @@ void build_flat_patches(
 }
 
 // ---------------------------------------------------------------------------
+// Connectivity queries
+//
+// Both check_connectivity and compute_component_masks answer the same
+// question for every contingency: does removing this contingency's edges split
+// the Ybus graph, and if so, which buses fall off the main component? The
+// original implementation answered it with a full BFS per contingency --
+// O(n_bus + nnz_Y) each, with an unordered_set probe on every edge -- which on
+// a 7k-bus grid costs ~100 us per contingency and adds up to more than a
+// second over an N-1 study, more than the GPU solve itself.
+//
+// The graph never changes within a batch, so the structure that decides the
+// answer is built ONCE (ConnectivityIndex) and each contingency is reduced to
+// a few array lookups:
+//
+//   * A DFS tree rooted at bus 0, with preorder numbering (tin/tout) and
+//     low-links, marks every edge as tree/non-tree and every tree edge as
+//     bridge/non-bridge (Tarjan). Removing only NON-tree edges leaves the
+//     spanning tree intact, so the graph stays connected -- no search needed.
+//   * A single removed edge that IS a bridge splits the graph in exactly two:
+//     the DFS subtree below it (a contiguous preorder range [tin, tout)) and
+//     the rest. The masked side is read straight off the preorder array.
+//   * Several removed edges (N-k) cut the tree into pieces: the root piece and
+//     one subtree per removed tree edge. Only NON-tree edges leaving those
+//     subtrees can glue pieces back together, so the subtrees -- typically a
+//     few antenna buses -- are scanned and the pieces merged with a union-find.
+//     The work is proportional to the cut-off subtrees, not to the grid.
+//   * Anything else (a cut-off side larger than half the grid, a removed set
+//     that is not symmetric in Ybus, a base graph that is not connected to
+//     begin with) falls back to a component labelling BFS, written with flat
+//     arrays and a byte mark per removed edge instead of the hash set.
+//
+// The decisions are identical to the per-contingency BFS: the fast paths only
+// fire where the DFS tree proves the answer, and the tie-break for "largest
+// component" (first component in bus order wins, i.e. bus 0's side) is
+// reproduced by never masking bus 0's side unless it is strictly the smaller.
+//
+// One deliberate difference: the removed-edge test now sums the deltas that
+// several triplets of the same contingency put on the same Ybus entry before
+// comparing with the base value (which is what build_flat_patches merges and
+// the GPU applies). Tripping both circuits of a double line in one N-2
+// contingency used to leave that edge "present" for the connectivity check
+// because each circuit's delta alone does not zero the entry.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Threshold below which a Ybus entry is considered zero after the patch.
+constexpr double kRemovedEdgeEps = 1e-10;
+
+struct ConnectivityIndex {
+    int        n_bus = 0;
+    int        nnz   = 0;
+    const int* outer = nullptr;   // Ybus_rm CSR row pointers
+    const int* inner = nullptr;   // Ybus_rm CSR column indices
+
+    std::vector<int>  row_of;      // [nnz]   row i of flat entry k
+    std::vector<int>  k_rev;       // [nnz]   flat index of (j,i) for entry (i,j); -1 if absent / diagonal
+    std::vector<char> is_tree;     // [nnz]   entry is a DFS-tree edge (both directions)
+    std::vector<char> is_bridge;   // [nnz]   entry is a bridge (both directions)
+    std::vector<int>  tree_child;  // [nnz]   deeper endpoint of a tree edge, -1 otherwise
+    std::vector<int>  tin, tout;   // [n_bus] preorder index / end of subtree (exclusive)
+    std::vector<int>  preorder;    // [n_bus] bus at each preorder position
+    bool              base_connected = false;
+
+    explicit ConnectivityIndex(const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm)
+        : n_bus(static_cast<int>(Ybus_rm.rows()))
+        , nnz(static_cast<int>(Ybus_rm.nonZeros()))
+        , outer(Ybus_rm.outerIndexPtr())
+        , inner(Ybus_rm.innerIndexPtr())
+        , row_of(static_cast<size_t>(nnz))
+        , k_rev(static_cast<size_t>(nnz), -1)
+        , is_tree(static_cast<size_t>(nnz), 0)
+        , is_bridge(static_cast<size_t>(nnz), 0)
+        , tree_child(static_cast<size_t>(nnz), -1)
+        , tin(static_cast<size_t>(n_bus), -1)
+        , tout(static_cast<size_t>(n_bus), -1)
+        , preorder(static_cast<size_t>(n_bus), -1)
+    {
+        for (int i = 0; i < n_bus; ++i)
+            for (int p = outer[i]; p < outer[i + 1]; ++p) {
+                row_of[static_cast<size_t>(p)] = i;
+                const int j = inner[p];
+                if (j == i) continue;
+                const int* b = inner + outer[j];
+                const int* e = inner + outer[j + 1];
+                const int* it = std::lower_bound(b, e, i);
+                if (it != e && *it == i) k_rev[static_cast<size_t>(p)] = static_cast<int>(it - inner);
+            }
+        if (n_bus == 0) { base_connected = true; return; }
+
+        // Iterative DFS from bus 0: preorder numbering, low-links, bridges.
+        std::vector<int> low(static_cast<size_t>(n_bus), 0);
+        std::vector<int> parent_k(static_cast<size_t>(n_bus), -1);  // flat index of (parent -> bus)
+        std::vector<int> it_pos(static_cast<size_t>(n_bus), 0);     // next CSR position to scan
+        std::vector<int> stack;
+        stack.reserve(static_cast<size_t>(n_bus));
+        int counter = 0;
+        tin[0] = low[0] = counter; preorder[counter++] = 0;
+        it_pos[0] = outer[0];
+        stack.push_back(0);
+        while (!stack.empty()) {
+            const int u = stack.back();
+            int& p = it_pos[static_cast<size_t>(u)];
+            if (p < outer[u + 1]) {
+                const int k = p++;
+                const int v = inner[k];
+                if (v == u) continue;                                 // diagonal
+                if (parent_k[static_cast<size_t>(u)] >= 0
+                        && k_rev[static_cast<size_t>(k)] == parent_k[static_cast<size_t>(u)])
+                    continue;                                         // the edge we came down
+                if (tin[static_cast<size_t>(v)] < 0) {
+                    tin[static_cast<size_t>(v)] = low[static_cast<size_t>(v)] = counter;
+                    preorder[counter++] = v;
+                    parent_k[static_cast<size_t>(v)] = k;
+                    it_pos[static_cast<size_t>(v)] = outer[v];
+                    is_tree[static_cast<size_t>(k)] = 1;
+                    tree_child[static_cast<size_t>(k)] = v;
+                    const int kr = k_rev[static_cast<size_t>(k)];
+                    if (kr >= 0) { is_tree[static_cast<size_t>(kr)] = 1; tree_child[static_cast<size_t>(kr)] = v; }
+                    stack.push_back(v);
+                } else {
+                    low[static_cast<size_t>(u)] = std::min(low[static_cast<size_t>(u)], tin[static_cast<size_t>(v)]);
+                }
+            } else {
+                stack.pop_back();
+                tout[static_cast<size_t>(u)] = counter;
+                const int pk = parent_k[static_cast<size_t>(u)];
+                if (pk >= 0) {
+                    const int par = row_of[static_cast<size_t>(pk)];
+                    low[static_cast<size_t>(par)] = std::min(low[static_cast<size_t>(par)], low[static_cast<size_t>(u)]);
+                    if (low[static_cast<size_t>(u)] > tin[static_cast<size_t>(par)]) {
+                        is_bridge[static_cast<size_t>(pk)] = 1;
+                        const int kr = k_rev[static_cast<size_t>(pk)];
+                        if (kr >= 0) is_bridge[static_cast<size_t>(kr)] = 1;
+                    }
+                }
+            }
+        }
+        base_connected = (counter == n_bus);
+    }
+
+    bool in_subtree(int bus, int child) const {
+        const int t = tin[static_cast<size_t>(bus)];
+        return t >= tin[static_cast<size_t>(child)] && t < tout[static_cast<size_t>(child)];
+    }
+};
+
+// Per-batch scratch: the removed-edge extraction, the N-k piece merging, and
+// the BFS fallback all reuse these buffers across contingencies.
+struct ConnectivityScratch {
+    std::vector<int>    removed;       // flat indices removed by the current contingency
+    std::vector<int>    acc_k;         // merged (k, delta) of the current contingency
+    std::vector<double> acc_re, acc_im;
+    std::vector<char>   removed_mark;  // [nnz] byte per flat index, set only while scanning
+    std::vector<int>    cut_child;     // children of the removed tree edges, sorted by tin
+    std::vector<int>    outer_lo, outer_hi;   // preorder ranges of the outermost cut subtrees
+    std::vector<int>    uf;            // union-find parent over the pieces (0 = root piece)
+    std::vector<int>    comp;          // [n_bus] component label (fallback)
+    std::vector<int>    queue;         // [n_bus] BFS queue (fallback)
+    std::vector<int>    count;         // component sizes (fallback)
+
+    ConnectivityScratch(int n_bus, int nnz)
+        : removed_mark(static_cast<size_t>(nnz), 0)
+        , comp(static_cast<size_t>(n_bus), -1)
+        , queue(static_cast<size_t>(n_bus), 0)
+    {}
+
+    // Off-diagonal flat indices whose post-contingency value is ~0. Deltas of
+    // several triplets on the same entry are summed first (see the note above).
+    void collect_removed(const Contingency& ctg, const eigen_cplx_type* values) {
+        removed.clear();
+        acc_k.clear(); acc_re.clear(); acc_im.clear();
+        for (const auto& t : ctg.triplets) {
+            if (t.row == t.col) continue;
+            size_t idx = 0;
+            for (; idx < acc_k.size(); ++idx) if (acc_k[idx] == t.k) break;
+            if (idx == acc_k.size()) { acc_k.push_back(t.k); acc_re.push_back(0.); acc_im.push_back(0.); }
+            acc_re[idx] += t.delta_re;
+            acc_im[idx] += t.delta_im;
+        }
+        for (size_t idx = 0; idx < acc_k.size(); ++idx) {
+            const eigen_cplx_type new_val = values[acc_k[idx]] - eigen_cplx_type(acc_re[idx], acc_im[idx]);
+            if (std::abs(new_val) < kRemovedEdgeEps) removed.push_back(acc_k[idx]);
+        }
+    }
+
+    bool is_removed(int k) const {
+        for (int r : removed) if (r == k) return true;
+        return false;
+    }
+
+    int uf_find(int a) {
+        while (uf[static_cast<size_t>(a)] != a) {
+            uf[static_cast<size_t>(a)] = uf[static_cast<size_t>(uf[static_cast<size_t>(a)])];
+            a = uf[static_cast<size_t>(a)];
+        }
+        return a;
+    }
+    void uf_unite(int a, int b) {
+        a = uf_find(a); b = uf_find(b);
+        if (a != b) uf[static_cast<size_t>(std::max(a, b))] = std::min(a, b);
+    }
+};
+
+// Decides, without a search, whether the current removed set splits the
+// graph, and if so which buses fall off bus 0's side. Returns false when the
+// DFS tree cannot settle it cheaply (the caller then labels components with a
+// BFS). On true: `masked` holds the sorted buses outside the main component,
+// empty when the graph stays connected.
+bool fast_masked_set(const ConnectivityIndex& ix, ConnectivityScratch& sc, std::vector<int>& masked)
+{
+    masked.clear();
+    if (sc.removed.empty()) return true;          // graph untouched
+    if (!ix.base_connected) return false;
+
+    // The removal must be symmetric for the undirected reasoning to hold.
+    // Collect the removed TREE edges (their child endpoints); a removal that
+    // touches no tree edge leaves the spanning tree -- and connectivity -- intact.
+    sc.cut_child.clear();
+    int n_und = 0, single_k = -1;
+    for (int k : sc.removed) {
+        const int kr = ix.k_rev[static_cast<size_t>(k)];
+        if (kr < 0 || !sc.is_removed(kr)) return false;
+        if (ix.row_of[static_cast<size_t>(k)] < ix.inner[k]) {
+            ++n_und;
+            single_k = k;
+            if (ix.is_tree[static_cast<size_t>(k)]) sc.cut_child.push_back(ix.tree_child[static_cast<size_t>(k)]);
+        }
+    }
+    if (sc.cut_child.empty()) return true;         // spanning tree survives
+    const int n_bus = ix.n_bus;
+
+    if (n_und == 1) {
+        // One edge: it disconnects the graph iff it is a bridge, and then the
+        // two components are the subtree below it and bus 0's side.
+        if (!ix.is_bridge[static_cast<size_t>(single_k)]) return true;
+        const int child = sc.cut_child[0];
+        const int t0 = ix.tin[static_cast<size_t>(child)], t1 = ix.tout[static_cast<size_t>(child)];
+        const int sub_size = t1 - t0;
+        if (n_bus - sub_size >= sub_size) {
+            masked.assign(ix.preorder.begin() + t0, ix.preorder.begin() + t1);
+            std::sort(masked.begin(), masked.end());
+        } else {
+            masked.reserve(static_cast<size_t>(n_bus - sub_size));
+            for (int b = 0; b < n_bus; ++b)
+                if (!ix.in_subtree(b, child)) masked.push_back(b);
+        }
+        return true;
+    }
+
+    // Several edges: cut the tree at every removed tree edge. Piece 0 is bus
+    // 0's side; piece i (1-based, children sorted by preorder) is the subtree
+    // below the i-th cut minus the cuts nested inside it. Only non-tree edges
+    // leaving a cut subtree can reconnect pieces, so the subtrees are scanned
+    // and the pieces merged with a union-find.
+    std::sort(sc.cut_child.begin(), sc.cut_child.end(),
+              [&](int a, int b) { return ix.tin[static_cast<size_t>(a)] < ix.tin[static_cast<size_t>(b)]; });
+    const int t = static_cast<int>(sc.cut_child.size());
+    auto piece_of = [&](int bus) -> int {
+        const int tb = ix.tin[static_cast<size_t>(bus)];
+        for (int i = t - 1; i >= 0; --i) {
+            const int c = sc.cut_child[static_cast<size_t>(i)];
+            if (ix.tin[static_cast<size_t>(c)] <= tb && tb < ix.tout[static_cast<size_t>(c)]) return i + 1;
+        }
+        return 0;
+    };
+
+    // Outermost cut subtrees (the ranges actually scanned) and their total
+    // size. If they cover more than half the grid, the plain BFS is no more
+    // expensive and keeps the largest-component bookkeeping simple.
+    sc.outer_lo.clear(); sc.outer_hi.clear();
+    int scanned = 0;
+    for (int i = 0; i < t; ++i) {
+        const int c = sc.cut_child[static_cast<size_t>(i)];
+        const int lo = ix.tin[static_cast<size_t>(c)], hi = ix.tout[static_cast<size_t>(c)];
+        if (!sc.outer_hi.empty() && lo < sc.outer_hi.back()) continue;   // nested in the previous range
+        sc.outer_lo.push_back(lo); sc.outer_hi.push_back(hi);
+        scanned += hi - lo;
+    }
+    if (2 * scanned > n_bus) return false;
+
+    sc.uf.resize(static_cast<size_t>(t) + 1);
+    for (int i = 0; i <= t; ++i) sc.uf[static_cast<size_t>(i)] = i;
+    for (int k : sc.removed) sc.removed_mark[static_cast<size_t>(k)] = 1;
+    for (size_t r = 0; r < sc.outer_lo.size(); ++r) {
+        for (int pos = sc.outer_lo[r]; pos < sc.outer_hi[r]; ++pos) {
+            const int u  = ix.preorder[static_cast<size_t>(pos)];
+            const int pu = piece_of(u);
+            for (int p = ix.outer[u]; p < ix.outer[u + 1]; ++p) {
+                const int v = ix.inner[p];
+                if (v == u || ix.is_tree[static_cast<size_t>(p)] || sc.removed_mark[static_cast<size_t>(p)]) continue;
+                sc.uf_unite(pu, piece_of(v));
+            }
+        }
+    }
+    for (int k : sc.removed) sc.removed_mark[static_cast<size_t>(k)] = 0;
+
+    bool all_joined = true;
+    for (int i = 1; i <= t; ++i) if (sc.uf_find(i) != 0) { all_joined = false; break; }
+    if (all_joined) return true;
+
+    // Bus 0's side keeps at least n_bus - scanned >= n_bus / 2 buses, so it is
+    // the main component (on an exact tie it is the first in bus order, which
+    // is what the labelling path picks). Everything not joined to it is masked.
+    for (size_t r = 0; r < sc.outer_lo.size(); ++r)
+        for (int pos = sc.outer_lo[r]; pos < sc.outer_hi[r]; ++pos) {
+            const int u = ix.preorder[static_cast<size_t>(pos)];
+            if (sc.uf_find(piece_of(u)) != 0) masked.push_back(u);
+        }
+    std::sort(masked.begin(), masked.end());
+    return true;
+}
+
+// Fallback: label the connected components of the graph minus the removed
+// (directed) entries, BFS from every unvisited bus in increasing order.
+// Returns the number of components; sc.comp holds the labels.
+int label_components(const ConnectivityIndex& ix, ConnectivityScratch& sc)
+{
+    for (int k : sc.removed) sc.removed_mark[static_cast<size_t>(k)] = 1;
+    std::fill(sc.comp.begin(), sc.comp.end(), -1);
+    int nb_comp = 0;
+    for (int start = 0; start < ix.n_bus; ++start) {
+        if (sc.comp[static_cast<size_t>(start)] != -1) continue;
+        sc.comp[static_cast<size_t>(start)] = nb_comp;
+        int head = 0, tail = 0;
+        sc.queue[tail++] = start;
+        while (head < tail) {
+            const int u = sc.queue[head++];
+            for (int p = ix.outer[u]; p < ix.outer[u + 1]; ++p) {
+                const int v = ix.inner[p];
+                if (v == u || sc.removed_mark[static_cast<size_t>(p)]) continue;
+                if (sc.comp[static_cast<size_t>(v)] == -1) {
+                    sc.comp[static_cast<size_t>(v)] = nb_comp;
+                    sc.queue[tail++] = v;
+                }
+            }
+        }
+        ++nb_comp;
+    }
+    for (int k : sc.removed) sc.removed_mark[static_cast<size_t>(k)] = 0;
+    return nb_comp;
+}
+
+// Fallback for check_connectivity: number of buses reachable from bus 0.
+int count_reachable_from_0(const ConnectivityIndex& ix, ConnectivityScratch& sc)
+{
+    if (ix.n_bus == 0) return 0;
+    for (int k : sc.removed) sc.removed_mark[static_cast<size_t>(k)] = 1;
+    std::fill(sc.comp.begin(), sc.comp.end(), -1);
+    sc.comp[0] = 0;
+    int head = 0, tail = 0;
+    sc.queue[tail++] = 0;
+    while (head < tail) {
+        const int u = sc.queue[head++];
+        for (int p = ix.outer[u]; p < ix.outer[u + 1]; ++p) {
+            const int v = ix.inner[p];
+            if (v == u || sc.removed_mark[static_cast<size_t>(p)]) continue;
+            if (sc.comp[static_cast<size_t>(v)] == -1) {
+                sc.comp[static_cast<size_t>(v)] = 0;
+                sc.queue[tail++] = v;
+            }
+        }
+    }
+    for (int k : sc.removed) sc.removed_mark[static_cast<size_t>(k)] = 0;
+    return tail;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // check_connectivity
 // ---------------------------------------------------------------------------
 void check_connectivity(
     std::vector<Contingency>&                                     contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm)
 {
-    const int  n_bus  = Ybus_rm.rows();
-    const int* outer  = Ybus_rm.outerIndexPtr();
-    const int* inner  = Ybus_rm.innerIndexPtr();
-
-    // Build adjacency once from off-diagonal Ybus non-zeros.
-    // adj[u] = list of (neighbor_bus, flat_CSR_index) pairs.
-    // The flat CSR index is used to identify edges removed by a contingency.
-    std::vector<std::vector<std::pair<int, int> > > adj(
-        static_cast<size_t>(n_bus));
-    for (int u = 0; u < n_bus; ++u) {
-        for (int idx = outer[u]; idx < outer[u + 1]; ++idx) {
-            int v = inner[idx];
-            if (v != u)  // off-diagonal only — these are the graph edges
-                adj[static_cast<size_t>(u)].push_back(std::make_pair(v, idx));
-        }
-    }
-
-    // Threshold below which a Ybus entry is considered zero after the patch.
-    const double eps = 1e-10;
-
-    const eigen_cplx_type* values = Ybus_rm.valuePtr();
-
-    std::vector<bool> visited(static_cast<size_t>(n_bus));
-    std::queue<int>   q;
+    const ConnectivityIndex ix(Ybus_rm);
+    ConnectivityScratch     sc(ix.n_bus, ix.nnz);
+    const eigen_cplx_type*  values = Ybus_rm.valuePtr();
+    std::vector<int>        masked;
 
     for (auto& ctg : contingencies) {
-        // Collect flat CSR indices of off-diagonal entries whose post-contingency
-        // value would be (near) zero.  Only those edges are removed from the graph.
-        std::unordered_set<int> removed;
-        for (const auto& t : ctg.triplets) {
-            if (t.row == t.col) continue;   // diagonal — not a graph edge
-            const eigen_cplx_type new_val =
-                values[t.k] - eigen_cplx_type(t.delta_re, t.delta_im);
-            if (std::abs(new_val) < eps)
-                removed.insert(t.k);
-        }
-
-        if (removed.empty()) continue;  // no edges removed → still connected
-
-        // BFS from node 0 over the base graph, skipping removed edges.
-        std::fill(visited.begin(), visited.end(), false);
-        while (!q.empty()) q.pop();  // clear queue (reuse to avoid realloc)
-
-        visited[0] = true;
-        q.push(0);
-        int count = 1;
-
-        while (!q.empty()) {
-            int u = q.front(); q.pop();
-            const std::vector<std::pair<int, int> >& nbrs =
-                adj[static_cast<size_t>(u)];
-            for (size_t i = 0; i < nbrs.size(); ++i) {
-                int v      = nbrs[i].first;
-                int flat_k = nbrs[i].second;
-                if (!visited[static_cast<size_t>(v)]
-                        && removed.count(flat_k) == 0) {
-                    visited[static_cast<size_t>(v)] = true;
-                    ++count;
-                    q.push(v);
-                }
-            }
-        }
-
-        if (count < n_bus)
+        sc.collect_removed(ctg, values);
+        if (fast_masked_set(ix, sc, masked)) {
+            if (!masked.empty()) ctg.disconnected = true;
+        } else if (count_reachable_from_0(ix, sc) < ix.n_bus) {
             ctg.disconnected = true;
+        }
     }
 }
 
@@ -274,76 +606,40 @@ void compute_component_masks(
     const std::vector<char>&                                      is_reference_bus,
     const std::vector<char>&                                      is_controller_bus)
 {
-    const int  n_bus = Ybus_rm.rows();
-    const int* outer = Ybus_rm.outerIndexPtr();
-    const int* inner = Ybus_rm.innerIndexPtr();
-
-    // Adjacency over off-diagonal Ybus non-zeros (bus, flat CSR index), reused
-    // across contingencies — identical construction to check_connectivity.
-    std::vector<std::vector<std::pair<int, int> > > adj(static_cast<size_t>(n_bus));
-    for (int u = 0; u < n_bus; ++u)
-        for (int idx = outer[u]; idx < outer[u + 1]; ++idx)
-            if (inner[idx] != u)
-                adj[static_cast<size_t>(u)].push_back(std::make_pair(inner[idx], idx));
-
-    const double eps = 1e-10;
-    const eigen_cplx_type* values = Ybus_rm.valuePtr();
-
-    std::vector<int> comp(static_cast<size_t>(n_bus), -1);
-    std::queue<int>  q;
+    const ConnectivityIndex ix(Ybus_rm);
+    ConnectivityScratch     sc(ix.n_bus, ix.nnz);
+    const eigen_cplx_type*  values = Ybus_rm.valuePtr();
+    const int               n_bus  = ix.n_bus;
 
     for (auto& ctg : contingencies) {
         ctg.masked_buses.clear();
+        sc.collect_removed(ctg, values);
 
-        // Edges removed by this contingency (off-diagonal entries → ~0).
-        std::unordered_set<int> removed;
-        for (const auto& t : ctg.triplets) {
-            if (t.row == t.col) continue;
-            const eigen_cplx_type new_val =
-                values[t.k] - eigen_cplx_type(t.delta_re, t.delta_im);
-            if (std::abs(new_val) < eps) removed.insert(t.k);
+        if (!fast_masked_set(ix, sc, ctg.masked_buses)) {
+            const int nb_comp = label_components(ix, sc);
+            if (nb_comp <= 1) continue;   // still connected → nothing masked
+
+            // Largest component by bus count (first one wins a tie).
+            sc.count.assign(static_cast<size_t>(nb_comp), 0);
+            for (int b = 0; b < n_bus; ++b) ++sc.count[static_cast<size_t>(sc.comp[static_cast<size_t>(b)])];
+            const int main_comp = static_cast<int>(std::distance(
+                sc.count.begin(), std::max_element(sc.count.begin(), sc.count.end())));
+            for (int b = 0; b < n_bus; ++b)
+                if (sc.comp[static_cast<size_t>(b)] != main_comp) ctg.masked_buses.push_back(b);
         }
-        if (removed.empty()) continue;   // graph untouched → nothing masked
-
-        // Label connected components (BFS, skipping removed edges).
-        std::fill(comp.begin(), comp.end(), -1);
-        int nb_comp = 0;
-        for (int start = 0; start < n_bus; ++start) {
-            if (comp[static_cast<size_t>(start)] != -1) continue;
-            comp[static_cast<size_t>(start)] = nb_comp;
-            q.push(start);
-            while (!q.empty()) {
-                const int u = q.front(); q.pop();
-                const auto& nbrs = adj[static_cast<size_t>(u)];
-                for (size_t i = 0; i < nbrs.size(); ++i) {
-                    const int v = nbrs[i].first, flat_k = nbrs[i].second;
-                    if (comp[static_cast<size_t>(v)] == -1 && removed.count(flat_k) == 0) {
-                        comp[static_cast<size_t>(v)] = nb_comp;
-                        q.push(v);
-                    }
-                }
-            }
-            ++nb_comp;
-        }
-        if (nb_comp <= 1) continue;   // still connected → nothing masked
-
-        // Largest component by bus count.
-        std::vector<int> count(static_cast<size_t>(nb_comp), 0);
-        for (int b = 0; b < n_bus; ++b) ++count[static_cast<size_t>(comp[static_cast<size_t>(b)])];
-        const int main_comp = static_cast<int>(std::distance(
-            count.begin(), std::max_element(count.begin(), count.end())));
+        if (ctg.masked_buses.empty()) continue;   // graph untouched / still connected
 
         // Every bus outside the main component is masked. If the masked set
         // strands the angle reference or a controller bus, we cannot solve it on
         // the fixed batch structure → skip the contingency (NaN), reusing the
         // `disconnected` compaction path.
         bool skip = false;
-        for (int b = 0; b < n_bus; ++b) {
-            if (comp[static_cast<size_t>(b)] == main_comp) continue;
-            ctg.masked_buses.push_back(b);
+        for (int b : ctg.masked_buses) {
             if ((!is_reference_bus.empty()  && is_reference_bus[static_cast<size_t>(b)]) ||
-                (!is_controller_bus.empty() && is_controller_bus[static_cast<size_t>(b)]))
+                (!is_controller_bus.empty() && is_controller_bus[static_cast<size_t>(b)])) {
                 skip = true;
+                break;
+            }
         }
         if (skip) { ctg.disconnected = true; ctg.masked_buses.clear(); }
     }
@@ -427,36 +723,4 @@ void build_tripped_branch_table(
         h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size());
         h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
     }
-}
-
-// ---------------------------------------------------------------------------
-// build_blockdiag_csr
-// ---------------------------------------------------------------------------
-void build_blockdiag_csr(
-    int                  n_bus,
-    int                  nnz,
-    const int*           single_outer,
-    const int*           single_inner,
-    int                  batch_size,
-    std::vector<int>&    h_batch_outer,
-    std::vector<int>&    h_batch_inner)
-{
-    h_batch_outer.resize(static_cast<size_t>(batch_size) * n_bus + 1);
-    h_batch_inner.resize(static_cast<size_t>(batch_size) * nnz);
-
-    for (int b = 0; b < batch_size; ++b)
-    {
-        // Row pointers for block b: single_outer[r] shifted by b * nnz so that
-        // row (b * n_bus + r) starts at flat position b * nnz + single_outer[r].
-        for (int r = 0; r < n_bus; ++r)
-            h_batch_outer[b * n_bus + r] = single_outer[r] + b * nnz;
-
-        // Column indices for block b: each column j within the block maps to
-        // global column b * n_bus + j in the block-diagonal matrix.
-        for (int i = 0; i < nnz; ++i)
-            h_batch_inner[b * nnz + i] = single_inner[i] + b * n_bus;
-    }
-
-    // Sentinel: last row pointer is the total number of non-zeros.
-    h_batch_outer[batch_size * n_bus] = batch_size * nnz;
 }

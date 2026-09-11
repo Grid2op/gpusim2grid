@@ -259,7 +259,7 @@ class InjectionSweepGPU:
         self._last_residuals = None
 
     # ------------------------------------------------------------------ spec
-    def set_branch_data(self, branch_from, branch_to, yff, yft, ytf, ytt,
+    def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
         """Store π-model branch admittances (explicit-array mode only).
 
@@ -267,7 +267,7 @@ class InjectionSweepGPU:
         was set to False at construction); only needed when ``grid`` was an
         explicit-array tuple. Required before :meth:`compute_flows`.
         """
-        self._inner.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt,
+        self._inner.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                     bus_vn_kv, sn_mva)
 
     def set_injections(self, p_mw, q_mvar, sn_mva):

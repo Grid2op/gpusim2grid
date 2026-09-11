@@ -48,20 +48,20 @@ def test_compute_violations_n_classification():
 
     branch_from = np.array([0])
     branch_to   = np.array([1])
-    # yff/yft/ytf/ytt chosen so I_or is large enough to exceed limit_a1_ka;
+    # yff_eff/yft_eff/ytf_eff/ytt_eff chosen so I_or is large enough to exceed limit_a1_ka;
     # keep it simple: a pure shunt-like self-admittance at "from", nothing
-    # at "to" (I_or = yff*V_from, I_ex = 0).
-    yff = np.array([1.0 + 0j])
-    yft = np.array([0.0 + 0j])
-    ytf = np.array([0.0 + 0j])
-    ytt = np.array([0.0 + 0j])
+    # at "to" (I_or = yff_eff*V_from, I_ex = 0).
+    yff_eff = np.array([1.0 + 0j])
+    yft_eff = np.array([0.0 + 0j])
+    ytf_eff = np.array([0.0 + 0j])
+    ytt_eff = np.array([0.0 + 0j])
     sn_mva = 100.0
     limit_a1_ka = np.array([1e-6])   # guaranteed to be exceeded
     limit_a2_ka = np.array([np.nan]) # not configured -> no ex-side check
 
     violations = compute_violations_n(
         V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-        branch_from, branch_to, yff, yft, ytf, ytt,
+        branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
         limit_a1_ka, limit_a2_ka, sn_mva, n_lines=1)
 
     types_seen = {(v.element_type, v.violation_type) for v in violations}
@@ -77,7 +77,7 @@ def test_compute_violations_n_classification():
     # DIVERGENCE (finite residual > tol) short-circuits everything else.
     diverged = compute_violations_n(
         V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-        branch_from, branch_to, yff, yft, ytf, ytt,
+        branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
         limit_a1_ka, limit_a2_ka, sn_mva, n_lines=1,
         residual=1.0, tol=1e-6)
     assert len(diverged) == 1
@@ -91,7 +91,7 @@ def test_compute_violations_n_classification():
     # compute_violations_n (see its own docstring).
     nan_residual = compute_violations_n(
         V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-        branch_from, branch_to, yff, yft, ytf, ytt,
+        branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
         limit_a1_ka, limit_a2_ka, sn_mva, n_lines=1,
         residual=np.nan, tol=1e-6)
     assert len(nan_residual) == 1
@@ -103,7 +103,7 @@ def test_compute_violations_n_classification():
     # None limits (nothing configured at all) -> no violations, no crash.
     empty = compute_violations_n(
         V, bus_vn_kv, None, None,
-        branch_from, branch_to, yff, yft, ytf, ytt,
+        branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
         None, None, sn_mva, n_lines=1)
     assert empty == []
 

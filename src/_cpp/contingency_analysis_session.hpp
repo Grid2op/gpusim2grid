@@ -108,7 +108,7 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     Eigen::VectorXi h_branch_from_;
     Eigen::VectorXi h_branch_to_;
-    CplxVect        h_yff_, h_yft_, h_ytf_, h_ytt_;
+    CplxVect        h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_;
     RealVect        h_bus_vn_kv_;
     double          sn_mva_          = 100.0;
     bool            has_branch_data_ = false;
@@ -196,10 +196,10 @@ struct ContingencyAnalysisSession {
     void set_branch_data(
         Eigen::Ref<const Eigen::VectorXi> branch_from,
         Eigen::Ref<const Eigen::VectorXi> branch_to,
-        Eigen::Ref<const CplxVect>        yff,
-        Eigen::Ref<const CplxVect>        yft,
-        Eigen::Ref<const CplxVect>        ytf,
-        Eigen::Ref<const CplxVect>        ytt,
+        Eigen::Ref<const CplxVect>        yff_eff,
+        Eigen::Ref<const CplxVect>        yft_eff,
+        Eigen::Ref<const CplxVect>        ytf_eff,
+        Eigen::Ref<const CplxVect>        ytt_eff,
         Eigen::Ref<const RealVect>        bus_vn_kv,
         double sn_mva
     );

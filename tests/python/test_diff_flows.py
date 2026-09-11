@@ -54,15 +54,15 @@ def branch_data(ieee14_grid):
         np.array(lines.get_bus_id_side_2(),  dtype=np.int32),
         np.array(trafos.get_bus_id_side_2(), dtype=np.int32),
     ])
-    yff = np.concatenate([lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()])
-    yft = np.concatenate([lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()])
-    ytf = np.concatenate([lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()])
-    ytt = np.concatenate([lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()])
+    yff_eff = np.concatenate([lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()])
+    yft_eff = np.concatenate([lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()])
+    ytf_eff = np.concatenate([lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()])
+    ytt_eff = np.concatenate([lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()])
 
     return {
         "branch_from": branch_from,
         "branch_to":   branch_to,
-        "yff": yff, "yft": yft, "ytf": ytf, "ytt": ytt,
+        "yff_eff": yff_eff, "yft_eff": yft_eff, "ytf_eff": ytf_eff, "ytt_eff": ytt_eff,
         "vn_kv":  grid.get_bus_vn_kv().copy(),
         "sn_mva": grid.get_sn_mva(),
     }
@@ -99,21 +99,21 @@ class TestComputeFlows:
             atol   = 1e-4   # FP64: ~1e-4 A tolerance
 
         V_t   = torch.from_numpy(V_ref.astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
-        yff_t = torch.from_numpy(b["yff"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
-        yft_t = torch.from_numpy(b["yft"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
-        ytf_t = torch.from_numpy(b["ytf"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
-        ytt_t = torch.from_numpy(b["ytt"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
+        yff_eff_t = torch.from_numpy(b["yff_eff"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
+        yft_eff_t = torch.from_numpy(b["yft_eff"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
+        ytf_eff_t = torch.from_numpy(b["ytf_eff"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
+        ytt_eff_t = torch.from_numpy(b["ytt_eff"].astype(np.complex128 if not _is_fp32() else np.complex64)).cuda()
         frm   = torch.from_numpy(b["branch_from"].astype(np.int64)).cuda()
         to_   = torch.from_numpy(b["branch_to"].astype(np.int64)).cuda()
         vn_t  = torch.from_numpy(b["vn_kv"].astype(np.float64 if not _is_fp32() else np.float32)).cuda()
 
-        flows = compute_flows(V_t, yff_t, yft_t, ytf_t, ytt_t,
+        flows = compute_flows(V_t, yff_eff_t, yft_eff_t, ytf_eff_t, ytt_eff_t,
                               frm, to_, vn_t, b["sn_mva"])
 
         # Oracle (always FP64)
         or_a_ref, ex_a_ref = compute_branch_flows_cpu(
             V_ref, b["branch_from"], b["branch_to"],
-            b["yff"], b["yft"], b["ytf"], b["ytt"],
+            b["yff_eff"], b["yft_eff"], b["ytf_eff"], b["ytt_eff"],
             b["vn_kv"], b["sn_mva"])
 
         i_or_gpu = flows["i_or_a"].cpu().to(torch.float64).numpy()
@@ -144,10 +144,10 @@ class TestComputeFlows:
 
         flows = compute_flows(
             V_t,
-            torch.from_numpy(b["yff"]).to(cdtype).cuda(),
-            torch.from_numpy(b["yft"]).to(cdtype).cuda(),
-            torch.from_numpy(b["ytf"]).to(cdtype).cuda(),
-            torch.from_numpy(b["ytt"]).to(cdtype).cuda(),
+            torch.from_numpy(b["yff_eff"]).to(cdtype).cuda(),
+            torch.from_numpy(b["yft_eff"]).to(cdtype).cuda(),
+            torch.from_numpy(b["ytf_eff"]).to(cdtype).cuda(),
+            torch.from_numpy(b["ytt_eff"]).to(cdtype).cuda(),
             torch.from_numpy(b["branch_from"].astype(np.int64)).cuda(),
             torch.from_numpy(b["branch_to"].astype(np.int64)).cuda(),
             torch.from_numpy(b["vn_kv"]).to(fdtype).cuda(),
@@ -174,10 +174,10 @@ class TestComputeFlows:
         Sr = torch.tensor(Sbus_np.real, dtype=torch.float64, device='cuda', requires_grad=True)
         Si = torch.tensor(Sbus_np.imag, dtype=torch.float64, device='cuda', requires_grad=True)
 
-        yff_t = torch.from_numpy(b["yff"].astype(np.complex128)).cuda()
-        yft_t = torch.from_numpy(b["yft"].astype(np.complex128)).cuda()
-        ytf_t = torch.from_numpy(b["ytf"].astype(np.complex128)).cuda()
-        ytt_t = torch.from_numpy(b["ytt"].astype(np.complex128)).cuda()
+        yff_eff_t = torch.from_numpy(b["yff_eff"].astype(np.complex128)).cuda()
+        yft_eff_t = torch.from_numpy(b["yft_eff"].astype(np.complex128)).cuda()
+        ytf_eff_t = torch.from_numpy(b["ytf_eff"].astype(np.complex128)).cuda()
+        ytt_eff_t = torch.from_numpy(b["ytt_eff"].astype(np.complex128)).cuda()
         frm   = torch.from_numpy(b["branch_from"].astype(np.int64)).cuda()
         to_   = torch.from_numpy(b["branch_to"].astype(np.int64)).cuda()
         vn_t  = torch.from_numpy(b["vn_kv"].astype(np.float64)).cuda()
@@ -193,7 +193,7 @@ class TestComputeFlows:
         def loss_fn(Sr, Si):
             V = solve_power_flow(
                 Sr, Si, Ybus, Vinit, pv, pq_arr, slack, slack_weights, 10, 1e-8)
-            flows = compute_flows(V, yff_t, yft_t, ytf_t, ytt_t,
+            flows = compute_flows(V, yff_eff_t, yft_eff_t, ytf_eff_t, ytt_eff_t,
                                   frm, to_, vn_t, sn_mva)
             return flows["i_or_a"].sum()
 
