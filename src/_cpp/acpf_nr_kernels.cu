@@ -949,21 +949,27 @@ __global__ void compute_residuals_kernel(
     const cuda_real_type* F_b = d_F + b * dim_J;
     cuda_real_type local_max = cuda_real_type(0);
 
-    // Each thread scans its portion of F_b.
+    // Each thread scans its portion of F_b. NaN must PROPAGATE: a plain
+    // `v > local_max` is false for NaN, so a slot whose F is entirely NaN
+    // (e.g. a NaN cuDSS solve poisoning V) would otherwise report residual 0
+    // and look converged. `nan_max` is a sticky-NaN max: once any element of
+    // F_b is NaN the slot's residual is NaN. (The lambda is a plain __device__
+    // helper; keeping it local avoids adding a header symbol for one use.)
+    auto nan_max = [](cuda_real_type a, cuda_real_type b) -> cuda_real_type {
+        return (isnan(a) || isnan(b)) ? cuda_real_type(NAN) : (b > a ? b : a);
+    };
     for (int i = threadIdx.x; i < dim_J; i += blockDim.x) {
         cuda_real_type v = F_b[i];
         if (v < cuda_real_type(0)) v = -v;
-        if (v > local_max) local_max = v;
+        local_max = nan_max(local_max, v);
     }
     sdata[threadIdx.x] = local_max;
     __syncthreads();
 
-    // Tree reduction within the block.
+    // Tree reduction within the block (NaN-propagating, see above).
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            if (sdata[threadIdx.x + stride] > sdata[threadIdx.x])
-                sdata[threadIdx.x] = sdata[threadIdx.x + stride];
-        }
+        if (threadIdx.x < stride)
+            sdata[threadIdx.x] = nan_max(sdata[threadIdx.x], sdata[threadIdx.x + stride]);
         __syncthreads();
     }
 
