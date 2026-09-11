@@ -62,6 +62,41 @@ inline double bpf_ms_since(const std::chrono::steady_clock::time_point& start) {
 }
 
 // =============================================================================
+// blockdiag_csr_kernel
+//   Block-diagonal CSR structure of the batched Ybus, written from the
+//   single-system arrays already on the device: row (b*n_bus + r) starts at
+//   b*nnz + outer[r], entry (b*nnz + i) sits in column b*n_bus + inner[i], and
+//   the last row pointer is batch_size*nnz. The inner array is batch_size*nnz
+//   ints -- close to a gigabyte at a 10k batch on a 7k-bus grid -- so it is
+//   generated where it lives rather than built on the host (a quarter of a
+//   second of scattered writes) and pushed through a pageable H→D copy.
+//   batch_size*nnz and batch_size*n_bus fit an int (check_batch_stride).
+// =============================================================================
+__global__ void blockdiag_csr_kernel(
+    int n_bus, int nnz, int batch_size,
+    const int* __restrict__ outer, const int* __restrict__ inner,
+    int* __restrict__ batch_outer, int* __restrict__ batch_inner)
+{
+    const long long tid     = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+    const long long n_outer = static_cast<long long>(batch_size) * n_bus + 1;
+    const long long n_inner = static_cast<long long>(batch_size) * nnz;
+    if (tid < n_inner) {
+        const int b = static_cast<int>(tid / nnz);
+        const int i = static_cast<int>(tid - static_cast<long long>(b) * nnz);
+        batch_inner[tid] = inner[i] + b * n_bus;
+    }
+    if (tid < n_outer) {
+        if (tid == n_outer - 1) {
+            batch_outer[tid] = batch_size * nnz;
+        } else {
+            const int b = static_cast<int>(tid / n_bus);
+            const int r = static_cast<int>(tid - static_cast<long long>(b) * n_bus);
+            batch_outer[tid] = outer[r] + b * nnz;
+        }
+    }
+}
+
+// =============================================================================
 // Constructor
 // =============================================================================
 template <typename BatchSource>
@@ -69,8 +104,6 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     AcPfNrState&          base_state,
     BatchSource           source,
     int                   n_contingencies_in,
-    const int*            Ybus_rm_outer,
-    const int*            Ybus_rm_inner,
     int                   batch_size,
     int                   nb_iter,
     ContingencySolverType strategy_type,
@@ -120,7 +153,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     // 32-bit index limit still standing after the ptrdiff_t widening of
     // gpusim2grid's own kernels/launch arithmetic (see the "tid/b widened to
     // ptrdiff_t" comments in acpf_nr_kernels.cu, nr_iter_step.cuh, driver.cuh):
-    //   - n_bus, nnz_Y: build_blockdiag_csr() (below) builds ONE literal
+    //   - n_bus, nnz_Y: blockdiag_csr_kernel (below) writes ONE literal
     //     block-diagonal Ybus matrix and BatchPfDriver hands its outer/inner
     //     arrays to cusparseCreateConstCsr with CUSPARSE_INDEX_32I explicitly
     //     -- a hard cuSPARSE requirement gpusim2grid's own arithmetic cannot
@@ -140,30 +173,30 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     check_batch_stride("BatchPfDriver", "batch_size", batch_size_, "nnz_Y", nnz_Y);
 
     // Source-owned host preprocessing time was captured in the source ctor.
+    // Nothing else on the host: the block-diagonal CSR structure below is
+    // generated on the device.
     t_preprocess_ms_ = source_.cpu_preprocess_ms();
 
     // -------------------------------------------------------------------------
-    // Build block-diagonal CSR structure (outer/inner only).  Values are
-    // tiled per chunk (ContingencyBatch) or once at construction (InjectionBatch).
-    // -------------------------------------------------------------------------
-    auto t_cpu_start = std::chrono::steady_clock::now();
-    std::vector<int> h_batch_outer, h_batch_inner;
-    build_blockdiag_csr(n_bus, nnz_Y,
-                        Ybus_rm_outer, Ybus_rm_inner,
-                        batch_size_,
-                        h_batch_outer, h_batch_inner);
-    t_preprocess_ms_ += bpf_ms_since(t_cpu_start);
-
-    // -------------------------------------------------------------------------
-    // Upload block-diagonal structure + allocate chunk-sized working buffers.
-    // Both folded under the same t_alloc_ms_ wall-clock window (the upload
-    // used to fall in a dead zone between t_preprocess_ms_ and t_alloc_ms_).
+    // Block-diagonal CSR structure (outer/inner only; values are tiled per
+    // chunk by ContingencyBatch/ScenarioSweepBatch or once at construction by
+    // InjectionBatch) + chunk-sized working buffers, all under the t_alloc_ms_
+    // wall-clock window.
     // -------------------------------------------------------------------------
     {
         auto t_alloc_start = std::chrono::steady_clock::now();
 
-        upload_h2d(d_Ybus_batch_outer, h_batch_outer.data(), h_batch_outer.size(), cs);
-        upload_h2d(d_Ybus_batch_inner, h_batch_inner.data(), h_batch_inner.size(), cs);
+        const long long n_batch_outer = static_cast<long long>(batch_size_) * n_bus + 1;
+        const long long n_batch_inner = static_cast<long long>(batch_size_) * nnz_Y;
+        d_Ybus_batch_outer.resize(static_cast<size_t>(n_batch_outer));
+        d_Ybus_batch_inner.resize(static_cast<size_t>(n_batch_inner));
+        blockdiag_csr_kernel<<<nr_grid_size(std::max(n_batch_outer, n_batch_inner), BS), BS, 0, cs>>>(
+            n_bus, nnz_Y, batch_size_,
+            thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+            thrust::raw_pointer_cast(d_Ybus_batch_outer.data()),
+            thrust::raw_pointer_cast(d_Ybus_batch_inner.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
 
         d_V_batch.resize(static_cast<size_t>(batch_size_) * n_bus);
         d_Ybus_values_batch.resize(static_cast<size_t>(batch_size_) * nnz_Y);
@@ -336,10 +369,10 @@ template <typename BatchSource>
 void BatchPfDriver<BatchSource>::upload_branch_admittances(
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect>        yff,
-    Eigen::Ref<const CplxVect>        yft,
-    Eigen::Ref<const CplxVect>        ytf,
-    Eigen::Ref<const CplxVect>        ytt,
+    Eigen::Ref<const CplxVect>        yff_eff,
+    Eigen::Ref<const CplxVect>        yft_eff,
+    Eigen::Ref<const CplxVect>        ytf_eff,
+    Eigen::Ref<const CplxVect>        ytt_eff,
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double                            sn_mva)
 {
@@ -385,26 +418,26 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
     }
 
     {
-        std::vector<cudaComplexType> h_yff(n_branches_), h_yft(n_branches_),
-                                     h_ytf(n_branches_), h_ytt(n_branches_);
+        std::vector<cudaComplexType> h_yff_eff(n_branches_), h_yft_eff(n_branches_),
+                                     h_ytf_eff(n_branches_), h_ytt_eff(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
-            h_yff[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(yff(l).real()),
-                static_cast<cuda_real_type>(yff(l).imag()));
-            h_yft[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(yft(l).real()),
-                static_cast<cuda_real_type>(yft(l).imag()));
-            h_ytf[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(ytf(l).real()),
-                static_cast<cuda_real_type>(ytf(l).imag()));
-            h_ytt[l] = CudaFunHelper::my_make_cuComplex(
-                static_cast<cuda_real_type>(ytt(l).real()),
-                static_cast<cuda_real_type>(ytt(l).imag()));
+            h_yff_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(yff_eff(l).real()),
+                static_cast<cuda_real_type>(yff_eff(l).imag()));
+            h_yft_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(yft_eff(l).real()),
+                static_cast<cuda_real_type>(yft_eff(l).imag()));
+            h_ytf_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(ytf_eff(l).real()),
+                static_cast<cuda_real_type>(ytf_eff(l).imag()));
+            h_ytt_eff[l] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(ytt_eff(l).real()),
+                static_cast<cuda_real_type>(ytt_eff(l).imag()));
         }
-        upload_h2d(d_yff, h_yff.data(), n_branches_, cs);
-        upload_h2d(d_yft, h_yft.data(), n_branches_, cs);
-        upload_h2d(d_ytf, h_ytf.data(), n_branches_, cs);
-        upload_h2d(d_ytt, h_ytt.data(), n_branches_, cs);
+        upload_h2d(d_yff_eff, h_yff_eff.data(), n_branches_, cs);
+        upload_h2d(d_yft_eff, h_yft_eff.data(), n_branches_, cs);
+        upload_h2d(d_ytf_eff, h_ytf_eff.data(), n_branches_, cs);
+        upload_h2d(d_ytt_eff, h_ytt_eff.data(), n_branches_, cs);
     }
 
     // Full per-bus nominal kV (distinct from the per-branch-endpoint use above
@@ -427,14 +460,14 @@ template <typename BatchSource>
 void BatchPfDriver<BatchSource>::set_branch_data(
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
-    Eigen::Ref<const CplxVect>        yff,
-    Eigen::Ref<const CplxVect>        yft,
-    Eigen::Ref<const CplxVect>        ytf,
-    Eigen::Ref<const CplxVect>        ytt,
+    Eigen::Ref<const CplxVect>        yff_eff,
+    Eigen::Ref<const CplxVect>        yft_eff,
+    Eigen::Ref<const CplxVect>        ytf_eff,
+    Eigen::Ref<const CplxVect>        ytt_eff,
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double                            sn_mva)
 {
-    upload_branch_admittances(branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva);
+    upload_branch_admittances(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva);
 
     d_or_amps_results.assign(
         static_cast<size_t>(n_contingencies) * n_branches_, cuda_real_type(0));
@@ -804,10 +837,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_bus_vmax_kv.data()),
             thrust::raw_pointer_cast(d_branch_from.data()),
             thrust::raw_pointer_cast(d_branch_to.data()),
-            thrust::raw_pointer_cast(d_yff.data()),
-            thrust::raw_pointer_cast(d_yft.data()),
-            thrust::raw_pointer_cast(d_ytf.data()),
-            thrust::raw_pointer_cast(d_ytt.data()),
+            thrust::raw_pointer_cast(d_yff_eff.data()),
+            thrust::raw_pointer_cast(d_yft_eff.data()),
+            thrust::raw_pointer_cast(d_ytf_eff.data()),
+            thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
             thrust::raw_pointer_cast(d_branch_limit_a1_ka.data()),
             thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
@@ -858,10 +891,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_branch_from.data()),
             thrust::raw_pointer_cast(d_branch_to.data()),
-            thrust::raw_pointer_cast(d_yff.data()),
-            thrust::raw_pointer_cast(d_yft.data()),
-            thrust::raw_pointer_cast(d_ytf.data()),
-            thrust::raw_pointer_cast(d_ytt.data()),
+            thrust::raw_pointer_cast(d_yff_eff.data()),
+            thrust::raw_pointer_cast(d_yft_eff.data()),
+            thrust::raw_pointer_cast(d_ytf_eff.data()),
+            thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
             thrust::raw_pointer_cast(d_or_amps_results.data()),
             thrust::raw_pointer_cast(d_ex_amps_results.data()),

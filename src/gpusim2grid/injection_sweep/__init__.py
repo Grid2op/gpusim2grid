@@ -377,17 +377,17 @@ class _InjectionSweepSolver:
         return self._s.used_batch_size
 
     # --- branch data (optional, needed for compute_flows) ---
-    def set_branch_data(self, branch_from, branch_to, yff, yft, ytf, ytt,
+    def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
         """Store π-model branch admittances.  Required before compute_flows().
 
         Parameters match _ContingencyAnalysisSolver.set_branch_data() exactly:
         branch_from, branch_to : (n_branches,) int
-        yff, yft, ytf, ytt     : (n_branches,) complex — π-model admittances
+        yff_eff, yft_eff, ytf_eff, ytt_eff     : (n_branches,) complex — π-model admittances
         bus_vn_kv              : (n_bus,) float — nominal voltage in kV per bus
         sn_mva                 : float — system base apparent power (MVA)
         """
-        self._s.set_branch_data(branch_from, branch_to, yff, yft, ytf, ytt,
+        self._s.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                 bus_vn_kv, sn_mva)
 
     # --- inputs ---

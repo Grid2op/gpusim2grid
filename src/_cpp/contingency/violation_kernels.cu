@@ -41,10 +41,10 @@ __global__ void check_limit_violations_kernel(
     const cuda_real_type*  __restrict__ d_bus_vmax_kv,
     const int*             __restrict__ d_branch_from,
     const int*             __restrict__ d_branch_to,
-    const cudaComplexType* __restrict__ d_yff,
-    const cudaComplexType* __restrict__ d_yft,
-    const cudaComplexType* __restrict__ d_ytf,
-    const cudaComplexType* __restrict__ d_ytt,
+    const cudaComplexType* __restrict__ d_yff_eff,
+    const cudaComplexType* __restrict__ d_yft_eff,
+    const cudaComplexType* __restrict__ d_ytf_eff,
+    const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
     const cuda_real_type*  __restrict__ d_branch_limit_a1_ka,
     const cuda_real_type*  __restrict__ d_branch_limit_a2_ka,
@@ -132,7 +132,7 @@ __global__ void check_limit_violations_kernel(
         bool tripped = false;
         for (int ti = 0; ti < t_count; ++ti)
             if (d_trip_branch_flat[t_start + ti] == l) { tripped = true; break; }
-        if (tripped) continue;   // Ybus was patched but yff/yft/ytf/ytt weren't -- would report a phantom current
+        if (tripped) continue;   // Ybus was patched but yff_eff/yft_eff/ytf_eff/ytt_eff weren't -- would report a phantom current
 
         const cuda_real_type lim1 = d_branch_limit_a1_ka[l];
         const cuda_real_type lim2 = d_branch_limit_a2_ka[l];
@@ -152,10 +152,10 @@ __global__ void check_limit_violations_kernel(
         const cudaComplexType Vi = (bf >= 0) ? d_V[local_c * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
         const cudaComplexType Vj = (bt >= 0) ? d_V[local_c * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
         const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_yff[l], Vi), CudaFunHelper::my_cuCmul(d_yft[l], Vj))
+            CudaFunHelper::my_cuCmul(d_yff_eff[l], Vi), CudaFunHelper::my_cuCmul(d_yft_eff[l], Vj))
             : CudaFunHelper::my_make_cuComplex(0., 0.);
         const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_ytf[l], Vi), CudaFunHelper::my_cuCmul(d_ytt[l], Vj))
+            CudaFunHelper::my_cuCmul(d_ytf_eff[l], Vi), CudaFunHelper::my_cuCmul(d_ytt_eff[l], Vj))
             : CudaFunHelper::my_make_cuComplex(0., 0.);
         // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
         const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l] * cuda_real_type(0.001);

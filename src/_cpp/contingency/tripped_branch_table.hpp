@@ -12,7 +12,7 @@
 // BatchSource's own per-active-slot tripped-branch lookup table (see
 // build_tripped_branch_table in contingency_analysis_helper.hpp). Consumed by
 // check_limit_violations_kernel to skip branches tripped by the contingency
-// it is currently checking (their yff/yft/ytf/ytt are unchanged by a
+// it is currently checking (their yff_eff/yft_eff/ytf_eff/ytt_eff are unchanged by a
 // contingency — only the shared Ybus is patched — so the naive current
 // formula would otherwise report a phantom nonzero current for them).
 //

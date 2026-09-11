@@ -89,7 +89,7 @@ Eigen::VectorXi concat_busids_to_solver(
 // Pull the eight set_branch_data() arguments off the grid (lines then trafos).
 struct BranchData {
     Eigen::VectorXi branch_from, branch_to;
-    CplxVect        yff, yft, ytf, ytt;
+    CplxVect        yff_eff, yft_eff, ytf_eff, ytt_eff;
     RealVect        bus_vn_kv;
     double          sn_mva;
 };
@@ -109,10 +109,10 @@ BranchData extract_branch_data(const ls2g::LSGrid& grid, int n_bus_solver)
     bd.branch_to = concat_busids_to_solver(
         lines.get_bus_id_side_2_numpy(), trafos.get_bus_id_side_2_numpy(),
         me_to_solver);
-    bd.yff = concat_cplx(lines.yac_eff_11(), trafos.yac_eff_11());
-    bd.yft = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
-    bd.ytf = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
-    bd.ytt = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
+    bd.yff_eff = concat_cplx(lines.yac_eff_11(), trafos.yac_eff_11());
+    bd.yft_eff = concat_cplx(lines.yac_eff_12(), trafos.yac_eff_12());
+    bd.ytf_eff = concat_cplx(lines.yac_eff_21(), trafos.yac_eff_21());
+    bd.ytt_eff = concat_cplx(lines.yac_eff_22(), trafos.yac_eff_22());
     // bus_vn_kv must be relabeled global(model)->AC-solver the same way
     // branch_from/branch_to above and bus_vmin_kv/bus_vmax_kv in
     // extract_limits() are, or it silently pairs the wrong nominal voltage
@@ -438,14 +438,26 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
     LedgerData ld;
 
     // Augmented J sparsity skeleton in RowMajor CSR (structure only). get_J_solver
-    // returns the solved augmented J in lightsim2grid's default (ColMajor) storage;
-    // convert to RowMajor so outer = row (gpusim2grid's CSR convention).
-    Eigen::SparseMatrix<eigen_real_type>                  J_cm = grid.get_J_solver();
-    Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J    = J_cm;
-    J.makeCompressed();
-    ld.dim_J = static_cast<int>(J.rows());
-    ld.J_outer.assign(J.outerIndexPtr(), J.outerIndexPtr() + ld.dim_J + 1);
-    ld.J_inner.assign(J.innerIndexPtr(), J.innerIndexPtr() + J.nonZeros());
+    // hands back lightsim2grid's compressed ColMajor J; its index arrays are
+    // transposed into gpusim2grid's CSR convention (outer = row) with one
+    // counting sort -- walking the columns in order leaves every row's column
+    // indices sorted -- rather than converting through a second Eigen matrix
+    // and makeCompressed.
+    {
+        const Eigen::Ref<const Eigen::SparseMatrix<eigen_real_type>> J_cm = grid.get_J_solver();
+        ld.dim_J = static_cast<int>(J_cm.rows());
+        const int  nnz_J    = static_cast<int>(J_cm.nonZeros());
+        const int* cm_outer = J_cm.outerIndexPtr();
+        const int* cm_inner = J_cm.innerIndexPtr();
+        ld.J_outer.assign(static_cast<size_t>(ld.dim_J) + 1, 0);
+        for (int p = 0; p < nnz_J; ++p) ++ld.J_outer[static_cast<size_t>(cm_inner[p]) + 1];
+        for (int r = 0; r < ld.dim_J; ++r) ld.J_outer[r + 1] += ld.J_outer[r];
+        ld.J_inner.resize(static_cast<size_t>(nnz_J));
+        std::vector<int> head(ld.J_outer.begin(), ld.J_outer.end() - 1);
+        for (int c = 0; c < static_cast<int>(J_cm.outerSize()); ++c)
+            for (int p = cm_outer[c]; p < cm_outer[c + 1]; ++p)
+                ld.J_inner[static_cast<size_t>(head[cm_inner[p]]++)] = c;
+    }
 
     // NRLedger bus→row/col maps (solver numbering, size n_bus, -1 absent).
     ld.p_row_of_bus     = to_int_vector(grid.get_p_to_J_row_solver());
@@ -736,7 +748,7 @@ make_ca_session_from_lsgrid(
 
     BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
     session->set_branch_data(bd.branch_from, bd.branch_to,
-                             bd.yff, bd.yft, bd.ytf, bd.ytt,
+                             bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
 
     if (compute_limit_violations) {
@@ -804,7 +816,7 @@ make_is_session_from_lsgrid(
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
         session->set_branch_data(bd.branch_from, bd.branch_to,
-                                 bd.yff, bd.yft, bd.ytf, bd.ytt,
+                                 bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                                  bd.bus_vn_kv, bd.sn_mva);
     }
     return session;
@@ -867,7 +879,7 @@ make_ss_session_from_lsgrid(
     // scenario's Ybus triplets, not just compute_flows().
     BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
     session->set_branch_data(bd.branch_from, bd.branch_to,
-                             bd.yff, bd.yft, bd.ytf, bd.ytt,
+                             bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
 
     if (compute_limit_violations) {

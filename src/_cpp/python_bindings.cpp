@@ -917,13 +917,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
          &ContingencyAnalysisSession::set_branch_data,
          pybind11::arg("branch_from"),
          pybind11::arg("branch_to"),
-         pybind11::arg("yff"),
-         pybind11::arg("yft"),
-         pybind11::arg("ytf"),
-         pybind11::arg("ytt"),
+         pybind11::arg("yff_eff"),
+         pybind11::arg("yft_eff"),
+         pybind11::arg("ytf_eff"),
+         pybind11::arg("ytt_eff"),
          pybind11::arg("bus_vn_kv"),
          pybind11::arg("sn_mva"),
-         "Store per-branch pi-model effective admittances (yff, yft, ytf, ytt), "
+         "Store per-branch pi-model effective admittances (yff_eff, yft_eff, ytf_eff, ytt_eff), "
          "the from/to bus indices, per-bus nominal voltage (kV) and system base "
          "(MVA). Branches are ordered lines-then-trafos. Required before "
          "build_contingencies() and compute_flows().")
@@ -1170,10 +1170,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          &InjectionSweepSession::set_branch_data,
          pybind11::arg("branch_from"),
          pybind11::arg("branch_to"),
-         pybind11::arg("yff"),
-         pybind11::arg("yft"),
-         pybind11::arg("ytf"),
-         pybind11::arg("ytt"),
+         pybind11::arg("yff_eff"),
+         pybind11::arg("yft_eff"),
+         pybind11::arg("ytf_eff"),
+         pybind11::arg("ytt_eff"),
          pybind11::arg("bus_vn_kv"),
          pybind11::arg("sn_mva"),
          "Store π-model branch admittances. Must be called before compute_flows().")
@@ -1325,10 +1325,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          &ScenarioSweepSession::set_branch_data,
          pybind11::arg("branch_from"),
          pybind11::arg("branch_to"),
-         pybind11::arg("yff"),
-         pybind11::arg("yft"),
-         pybind11::arg("ytf"),
-         pybind11::arg("ytt"),
+         pybind11::arg("yff_eff"),
+         pybind11::arg("yft_eff"),
+         pybind11::arg("ytf_eff"),
+         pybind11::arg("ytt_eff"),
          pybind11::arg("bus_vn_kv"),
          pybind11::arg("sn_mva"),
          "Store π-model branch admittances. Must be called before "

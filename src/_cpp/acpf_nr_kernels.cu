@@ -88,10 +88,10 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_V,
     const int*             __restrict__ d_branch_from,
     const int*             __restrict__ d_branch_to,
-    const cudaComplexType* __restrict__ d_yff,
-    const cudaComplexType* __restrict__ d_yft,
-    const cudaComplexType* __restrict__ d_ytf,
-    const cudaComplexType* __restrict__ d_ytt,
+    const cudaComplexType* __restrict__ d_yff_eff,
+    const cudaComplexType* __restrict__ d_yft_eff,
+    const cudaComplexType* __restrict__ d_ytf_eff,
+    const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
@@ -122,15 +122,15 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType Vi = (bf >= 0) ? d_V[b * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
     const cudaComplexType Vj = (bt >= 0) ? d_V[b * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
 
-    // I_or = yff * Vi + yft * Vj  (origin / from-bus terminal current)
+    // I_or = yff_eff * Vi + yft_eff * Vj  (origin / from-bus terminal current)
     const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
-        CudaFunHelper::my_cuCmul(d_yff[l], Vi),
-        CudaFunHelper::my_cuCmul(d_yft[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
+        CudaFunHelper::my_cuCmul(d_yff_eff[l], Vi),
+        CudaFunHelper::my_cuCmul(d_yft_eff[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
 
-    // I_ex = ytf * Vi + ytt * Vj  (extremity / to-bus terminal current)
+    // I_ex = ytf_eff * Vi + ytt_eff * Vj  (extremity / to-bus terminal current)
     const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
-        CudaFunHelper::my_cuCmul(d_ytf[l], Vi),
-        CudaFunHelper::my_cuCmul(d_ytt[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
+        CudaFunHelper::my_cuCmul(d_ytf_eff[l], Vi),
+        CudaFunHelper::my_cuCmul(d_ytt_eff[l], Vj)) : CudaFunHelper::my_make_cuComplex(0., 0.);
 
     // Map the chunk-relative slot to its original result index (identity when
     // d_result_map is null, e.g. the full-batch session call or injection).

@@ -94,34 +94,18 @@ void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
 {
     // ①  Tile V
     timer.start();
-    {
-        cudaComplexType* const       dst = ctx.d_V_batch;
-        const cudaComplexType* const src =
-            thrust::raw_pointer_cast(ctx.base.d_V_base.data());
-        const size_t nbytes = static_cast<size_t>(ctx.n_bus) * sizeof(cudaComplexType);
-        for (int b = 0; b < ctx.batch_size; ++b) {
-            _chk_cuda(cudaMemcpyAsync(
-                dst + static_cast<ptrdiff_t>(b) * ctx.n_bus,
-                src, nbytes, cudaMemcpyDeviceToDevice, cs),
-                "tile V");
-        }
-    }
+    launch_tile(ctx.d_V_batch,
+                thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
+                ctx.n_bus, ctx.batch_size, cs);
+    _chk_cuda(cudaGetLastError(), "tile V");
     t.t_tile_V += timer.stop_ms();
 
     // ②  Tile Ybus values
     timer.start();
-    {
-        cudaComplexType* const       dst = ctx.d_Ybus_values_batch;
-        const cudaComplexType* const src =
-            thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data());
-        const size_t nbytes = static_cast<size_t>(ctx.nnz_Y) * sizeof(cudaComplexType);
-        for (int b = 0; b < ctx.batch_size; ++b) {
-            _chk_cuda(cudaMemcpyAsync(
-                dst + static_cast<ptrdiff_t>(b) * ctx.nnz_Y,
-                src, nbytes, cudaMemcpyDeviceToDevice, cs),
-                "tile Ybus");
-        }
-    }
+    launch_tile(ctx.d_Ybus_values_batch,
+                thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data()),
+                ctx.nnz_Y, ctx.batch_size, cs);
+    _chk_cuda(cudaGetLastError(), "tile Ybus");
     t.t_tile_Ybus += timer.stop_ms();
 
     // ③  Apply this chunk's contingency (branch-trip) patches

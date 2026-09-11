@@ -65,6 +65,7 @@
 #include <chrono>
 #include <iostream>
 #include <vector>
+#include <cassert>
 
 // ---------------------------------------------------------------------------
 // Error-checking macros — throw on failure so the AcPfNrState constructor
@@ -110,13 +111,25 @@ struct AbsFunctor {
 
 // =============================================================================
 // §2  CPU helper: build_J_structure
-//   Derives the J CSR sparsity skeleton and four scatter maps from the
-//   RowMajor Ybus restricted to the pvpq/pq subsets.
-//   Identical logic to the original acpf_nr.cu; reproduced here so this
-//   translation unit is self-contained.
+//   Derives the J CSR sparsity skeleton and the four dS scatter maps from the
+//   RowMajor Ybus restricted to the pvpq/pq subsets (the feature-free layout:
+//   P/theta on sorted(pvpq) at rows/cols [0, n_pvpq), Q/vm on pq in input
+//   order at [n_pvpq, dim_J)).
+//
+//   The CSR arrays are written directly with two counting sorts -- bucket the
+//   contributions by J column, then scatter them into their rows, which hands
+//   every row its column indices already sorted -- and each contribution's
+//   value position is recorded at the moment its row entry is written. This
+//   replaces Eigen's setFromTriplets + makeCompressed (a temporary matrix, a
+//   duplicate-collapse pass, a transpose) followed by 4 * nnz(Ybus) binary
+//   searches to find where each contribution landed -- the same technique as
+//   lightsim2grid's NRSystem::build_J_sparsity. No two contributions share a
+//   coefficient in this layout (distinct Ybus entries map to distinct
+//   (row, col) pairs), which the debug build asserts.
 // =============================================================================
 static void build_J_structure(
-    Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor>& J_csr,
+    std::vector<int>& J_outer,
+    std::vector<int>& J_inner,
     std::vector<int>& map_j11,
     std::vector<int>& map_j12,
     std::vector<int>& map_j21,
@@ -135,53 +148,76 @@ static void build_J_structure(
     for (int i = 0; i < n_pvpq; ++i) pvpq_inv[pvpq(i)] = i;
     for (int i = 0; i < n_pq;   ++i) pq_inv[pq(i)]     = i;
 
-    struct Contrib { int jrow, jcol, ybus_k; };
-    std::vector<Contrib> c11, c12, c21, c22;
+    // One contribution per (Ybus entry, J block): the J coefficient it lands
+    // on and which scatter map (0: j11, 1: j12, 2: j21, 3: j22) records it.
+    // The per-column histogram is counted along the way.
+    struct Contrib { int jrow, jcol, ybus_k; int which; };
+    std::vector<Contrib> cntrb;
+    cntrb.reserve(static_cast<size_t>(4) * nnz_Y);
+    std::vector<int> col_ptr(static_cast<size_t>(dim_J) + 1, 0);
 
     int k = 0;
     for (int outer = 0; outer < Ybus.outerSize(); ++outer) {
         for (Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>::InnerIterator
              it(Ybus, outer); it; ++it, ++k)
         {
-            int i = (int)it.row(), j = (int)it.col();
-            int ri = pvpq_inv[i], rq = pq_inv[i];
-            int ci = pvpq_inv[j], cq = pq_inv[j];
-            if (ri >= 0 && ci >= 0) c11.push_back({ri,          ci,          k});
-            if (ri >= 0 && cq >= 0) c12.push_back({ri,          n_pvpq + cq, k});
-            if (rq >= 0 && ci >= 0) c21.push_back({n_pvpq + rq, ci,          k});
-            if (rq >= 0 && cq >= 0) c22.push_back({n_pvpq + rq, n_pvpq + cq, k});
+            const int i = (int)it.row(), j = (int)it.col();
+            const int ri = pvpq_inv[i], rq = pq_inv[i];
+            const int ci = pvpq_inv[j], cq = pq_inv[j];
+            if (ri >= 0 && ci >= 0) { cntrb.push_back({ri,          ci,          k, 0}); ++col_ptr[ci + 1]; }
+            if (ri >= 0 && cq >= 0) { cntrb.push_back({ri,          n_pvpq + cq, k, 1}); ++col_ptr[n_pvpq + cq + 1]; }
+            if (rq >= 0 && ci >= 0) { cntrb.push_back({n_pvpq + rq, ci,          k, 2}); ++col_ptr[ci + 1]; }
+            if (rq >= 0 && cq >= 0) { cntrb.push_back({n_pvpq + rq, n_pvpq + cq, k, 3}); ++col_ptr[n_pvpq + cq + 1]; }
         }
     }
+    const int n_ent = static_cast<int>(cntrb.size());
 
-    std::vector<Eigen::Triplet<eigen_real_type>> triplets;
-    triplets.reserve(c11.size() + c12.size() + c21.size() + c22.size());
-    for (auto& c : c11) triplets.push_back({c.jrow, c.jcol, 0.});
-    for (auto& c : c12) triplets.push_back({c.jrow, c.jcol, 0.});
-    for (auto& c : c21) triplets.push_back({c.jrow, c.jcol, 0.});
-    for (auto& c : c22) triplets.push_back({c.jrow, c.jcol, 0.});
+    // ---- 1. bucket the contributions by J column ---------------------------
+    for (int c = 0; c < dim_J; ++c) col_ptr[c + 1] += col_ptr[c];
+    std::vector<int> by_col(static_cast<size_t>(n_ent));
+    {
+        std::vector<int> head(col_ptr.begin(), col_ptr.end() - 1);
+        for (int e = 0; e < n_ent; ++e) by_col[head[cntrb[e].jcol]++] = e;
+    }
 
-    J_csr.resize(dim_J, dim_J);
-    J_csr.setFromTriplets(triplets.begin(), triplets.end());
-    J_csr.makeCompressed();
+    // ---- 2. row starts, then scatter in increasing column order -----------
+    // Walking the column buckets in order hands every row its entries sorted
+    // by column, and the position each entry gets is the one its scatter map
+    // needs.
+    J_outer.assign(static_cast<size_t>(dim_J) + 1, 0);
+    for (int e = 0; e < n_ent; ++e) ++J_outer[cntrb[e].jrow + 1];
+    for (int r = 0; r < dim_J; ++r) J_outer[r + 1] += J_outer[r];
+    const int nnz_J = J_outer[dim_J];
+    J_inner.resize(static_cast<size_t>(nnz_J));
 
     map_j11.assign(nnz_Y, -1);
     map_j12.assign(nnz_Y, -1);
     map_j21.assign(nnz_Y, -1);
     map_j22.assign(nnz_Y, -1);
 
-    auto find_J_pos = [&](int row, int col) -> int {
-        int start = J_csr.outerIndexPtr()[row];
-        int end   = J_csr.outerIndexPtr()[row + 1];
-        const int* inner = J_csr.innerIndexPtr();
-        auto it = std::lower_bound(inner + start, inner + end, col);
-        if (it == inner + end || *it != col) return -1;
-        return (int)(it - inner);
-    };
+    std::vector<int> head(J_outer.begin(), J_outer.end() - 1);
+    for (int p = 0; p < n_ent; ++p) {
+        const Contrib& c   = cntrb[by_col[p]];
+        const int      pos = head[c.jrow]++;
+        J_inner[pos] = c.jcol;
+        switch (c.which) {
+            case 0: map_j11[c.ybus_k] = pos; break;
+            case 1: map_j12[c.ybus_k] = pos; break;
+            case 2: map_j21[c.ybus_k] = pos; break;
+            default: map_j22[c.ybus_k] = pos; break;
+        }
+    }
 
-    for (auto& c : c11) map_j11[c.ybus_k] = find_J_pos(c.jrow, c.jcol);
-    for (auto& c : c12) map_j12[c.ybus_k] = find_J_pos(c.jrow, c.jcol);
-    for (auto& c : c21) map_j21[c.ybus_k] = find_J_pos(c.jrow, c.jcol);
-    for (auto& c : c22) map_j22[c.ybus_k] = find_J_pos(c.jrow, c.jcol);
+#ifndef NDEBUG
+    // What the device-side fill and cuDSS are entitled to assume: every row
+    // filled exactly to its end, column indices strictly increasing (a repeat
+    // would be a coefficient claimed by two contributions).
+    for (int r = 0; r < dim_J; ++r) {
+        assert(head[r] == J_outer[r + 1] && "a J row was not filled to its end");
+        for (int p = J_outer[r] + 1; p < J_outer[r + 1]; ++p)
+            assert(J_inner[p - 1] < J_inner[p] && "J column indices must be strictly increasing");
+    }
+#endif
 }
 
 // =============================================================================
@@ -196,6 +232,12 @@ static void build_J_structure(
 //     J(q_row(i), vm_col(j))    ← Im(dS/dVm)   [map_j22]
 //   A -1 in any ledger map drops that contribution (e.g. the reference slack has
 //   no theta column). Mirrors NRSystem::build_J_sparsity's generic dS pass.
+//
+//   Positions are looked up through a dense column → value-position table of
+//   one J row at a time: the row a bus' P (then Q) equation lives in is
+//   unpacked once, every Ybus entry of that bus reads its two positions off
+//   the table, and the row is cleared again. O(nnz_J + 4 nnz_Y) in total,
+//   instead of a binary search per contribution.
 // =============================================================================
 static void build_scatter_maps_aug(
     std::vector<int>& map_j11,
@@ -211,32 +253,47 @@ static void build_scatter_maps_aug(
     const std::vector<int>& vm_col_of_bus)
 {
     const int nnz_Y = Ybus.nonZeros();
+    const int dim_J = static_cast<int>(J_outer.size()) - 1;
     map_j11.assign(nnz_Y, -1);
     map_j12.assign(nnz_Y, -1);
     map_j21.assign(nnz_Y, -1);
     map_j22.assign(nnz_Y, -1);
 
-    auto find_J_pos = [&](int row, int col) -> int {
-        const int start = J_outer[row];
-        const int end   = J_outer[row + 1];
-        const int* inner = J_inner.data();
-        auto it = std::lower_bound(inner + start, inner + end, col);
-        if (it == inner + end || *it != col) return -1;
-        return static_cast<int>(it - inner);
+    std::vector<int> pos_of_col(static_cast<size_t>(dim_J), -1);
+    auto unpack = [&](int row) {
+        for (int p = J_outer[row]; p < J_outer[row + 1]; ++p) pos_of_col[J_inner[p]] = p;
+    };
+    auto clear = [&](int row) {
+        for (int p = J_outer[row]; p < J_outer[row + 1]; ++p) pos_of_col[J_inner[p]] = -1;
     };
 
-    int k = 0;
-    for (int outer = 0; outer < Ybus.outerSize(); ++outer) {
-        for (Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>::InnerIterator
-             it(Ybus, outer); it; ++it, ++k)
-        {
-            const int i = (int)it.row(), j = (int)it.col();
-            const int ri = p_row_of_bus[i], rq = q_row_of_bus[i];
-            const int ci = theta_col_of_bus[j], cq = vm_col_of_bus[j];
-            if (ri >= 0 && ci >= 0) map_j11[k] = find_J_pos(ri, ci);
-            if (ri >= 0 && cq >= 0) map_j12[k] = find_J_pos(ri, cq);
-            if (rq >= 0 && ci >= 0) map_j21[k] = find_J_pos(rq, ci);
-            if (rq >= 0 && cq >= 0) map_j22[k] = find_J_pos(rq, cq);
+    // Ybus is compressed (it was converted to RowMajor by assignment), so
+    // its CSR arrays index the nnz positions directly: bus i's entries are
+    // [Y_outer[i], Y_outer[i+1]), visited twice below (P row, then Q row).
+    assert(Ybus.isCompressed() && "build_scatter_maps_aug expects a compressed RowMajor Ybus");
+    const int* Y_outer = Ybus.outerIndexPtr();
+    const int* Y_inner = Ybus.innerIndexPtr();
+    for (int i = 0; i < Ybus.outerSize(); ++i) {
+        const int ri = p_row_of_bus[i], rq = q_row_of_bus[i];
+        if (ri >= 0) {
+            unpack(ri);
+            for (int k = Y_outer[i]; k < Y_outer[i + 1]; ++k) {
+                const int j  = Y_inner[k];
+                const int ci = theta_col_of_bus[j], cq = vm_col_of_bus[j];
+                if (ci >= 0) map_j11[k] = pos_of_col[ci];
+                if (cq >= 0) map_j12[k] = pos_of_col[cq];
+            }
+            clear(ri);
+        }
+        if (rq >= 0) {
+            unpack(rq);
+            for (int k = Y_outer[i]; k < Y_outer[i + 1]; ++k) {
+                const int j  = Y_inner[k];
+                const int ci = theta_col_of_bus[j], cq = vm_col_of_bus[j];
+                if (ci >= 0) map_j21[k] = pos_of_col[ci];
+                if (cq >= 0) map_j22[k] = pos_of_col[cq];
+            }
+            clear(rq);
         }
     }
 }
@@ -338,13 +395,11 @@ AcPfNrState::AcPfNrState(
     std::vector<int> theta_buses, theta_cols, vm_buses, vm_cols;
 
     if (ledger == nullptr) {
-        Eigen::SparseMatrix<eigen_real_type, Eigen::RowMajor> J_csr;
-        build_J_structure(J_csr, h_map_j11, h_map_j12, h_map_j21, h_map_j22,
+        build_J_structure(J_outer_h, J_inner_h,
+                          h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                           Ybus_rm, pvpq_host, pq_in);
         dim_J = n_pvpq + n_pq;
-        nnz_J = J_csr.nonZeros();
-        J_outer_h.assign(J_csr.outerIndexPtr(), J_csr.outerIndexPtr() + dim_J + 1);
-        J_inner_h.assign(J_csr.innerIndexPtr(), J_csr.innerIndexPtr() + nnz_J);
+        nnz_J = static_cast<int>(J_inner_h.size());
 
         // Trivial ledger pair lists: P/theta on sorted(pvpq) at rows/cols
         // [0,n_pvpq); Q/vm on pq (input order) at [n_pvpq, dim_J).

@@ -13,7 +13,7 @@
 // Per-chunk behaviour
 // -------------------
 //   prepare_Ybus_batch :
-//     ① tile base d_V into d_V_batch                  (batch_size D→D copies)
+//     ① tile base d_V into d_V_batch                  (one tile_kernel launch)
 //     ② tile base d_Ybus_values into d_Ybus_values_batch
 //     ③ apply_contingencies_kernel: subtract Ybus deltas for this chunk's
 //        contingencies (chunk-relative ctg_id, no atomicAdd by construction)
@@ -255,7 +255,7 @@ struct ContingencyBatch {
     // -------------------------------------------------------------------------
     // prepare_Ybus_batch  — called once per chunk, BEFORE the NR loop.
     //
-    //   ① tile d_V_base → d_V_batch    (batch_size D→D copies, on cs)
+    //   ① tile d_V_base → d_V_batch    (one tile_kernel launch, on cs)
     //   ② tile d_Ybus_values → d_Ybus_values_batch
     //   ③ apply_contingencies_kernel for this chunk's patch slice
     //
@@ -269,36 +269,18 @@ struct ContingencyBatch {
                             CudaTimer&           timer,
                             BatchTimings&  t)
     {
-        // ①  Tile V
+        // ①  Tile V (errors surface through the next CUDA call)
         timer.start();
-        {
-            cudaComplexType* const       dst = ctx.d_V_batch;
-            const cudaComplexType* const src =
-                thrust::raw_pointer_cast(ctx.base.d_V_base.data());
-            const size_t nbytes = static_cast<size_t>(ctx.n_bus) * sizeof(cudaComplexType);
-            for (int b = 0; b < ctx.batch_size; ++b) {
-                cudaError_t e = cudaMemcpyAsync(
-                    dst + static_cast<ptrdiff_t>(b) * ctx.n_bus,
-                    src, nbytes, cudaMemcpyDeviceToDevice, cs);
-                (void)e;   // errors surface through the next CUDA call
-            }
-        }
+        launch_tile(ctx.d_V_batch,
+                    thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
+                    ctx.n_bus, ctx.batch_size, cs);
         t.t_tile_V += timer.stop_ms();
 
         // ②  Tile Ybus values
         timer.start();
-        {
-            cudaComplexType* const       dst = ctx.d_Ybus_values_batch;
-            const cudaComplexType* const src =
-                thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data());
-            const size_t nbytes = static_cast<size_t>(ctx.nnz_Y) * sizeof(cudaComplexType);
-            for (int b = 0; b < ctx.batch_size; ++b) {
-                cudaError_t e = cudaMemcpyAsync(
-                    dst + static_cast<ptrdiff_t>(b) * ctx.nnz_Y,
-                    src, nbytes, cudaMemcpyDeviceToDevice, cs);
-                (void)e;
-            }
-        }
+        launch_tile(ctx.d_Ybus_values_batch,
+                    thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data()),
+                    ctx.nnz_Y, ctx.batch_size, cs);
         t.t_tile_Ybus += timer.stop_ms();
 
         // ③  Apply contingency patches

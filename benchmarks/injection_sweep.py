@@ -144,10 +144,10 @@ def main(args):
 
     branch_from = np.concat((lines.get_bus_id_side_1(),  trafos.get_bus_id_side_1()))
     branch_to   = np.concat((lines.get_bus_id_side_2(),  trafos.get_bus_id_side_2()))
-    yff = np.concat((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()))
-    yft = np.concat((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()))
-    ytf = np.concat((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()))
-    ytt = np.concat((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()))
+    yff_eff = np.concat((lines.get_yac_eff_11().copy(), trafos.get_yac_eff_11()))
+    yft_eff = np.concat((lines.get_yac_eff_12().copy(), trafos.get_yac_eff_12()))
+    ytf_eff = np.concat((lines.get_yac_eff_21().copy(), trafos.get_yac_eff_21()))
+    ytt_eff = np.concat((lines.get_yac_eff_22().copy(), trafos.get_yac_eff_22()))
 
     load_p_base, load_q_base, gen_p_base, gen_is_slack = read_base_injections(grid)
 
@@ -156,7 +156,7 @@ def main(args):
 
     # Reference branch flows from the lightsim2grid base-case solution.
     ref_or_amps, _ = compute_branch_flows_cpu(
-        v_res[:n_bus], branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
+        v_res[:n_bus], branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, vn_kv, sn_mva)
 
     # --- Scenario generation ---
     n_random = args.n_scenarios

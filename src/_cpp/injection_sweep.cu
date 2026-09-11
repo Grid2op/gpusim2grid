@@ -134,8 +134,6 @@ BatchTimings run_injection_sweep_gpu(
         base_state,
         std::move(source),
         n_scen,
-        Ybus_rm.outerIndexPtr(),
-        Ybus_rm.innerIndexPtr(),
         used_bs,
         nb_iter,
         strategy_type,

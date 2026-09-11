@@ -87,7 +87,7 @@ class LimitViolation:
 
 
 def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-                          branch_from, branch_to, yff, yft, ytf, ytt,
+                          branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                           branch_limit_a1_ka, branch_limit_a2_ka, sn_mva,
                           n_lines, residual=None, tol=None):
     """Pre-contingency ("n") limit-violation check: a single voltage vector,
@@ -104,7 +104,7 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
     bus_vn_kv, bus_vmin_kv, bus_vmax_kv : (n_bus,) float or None
         Nominal / limit voltages in kV. None (or all-NaN limits) disables the
         bus-voltage check.
-    branch_from, branch_to, yff, yft, ytf, ytt, sn_mva
+    branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, sn_mva
         Same arguments as compute_branch_flows_cpu (lines-then-trafos order).
     branch_limit_a1_ka, branch_limit_a2_ka : (n_branches,) float or None
         Per-side current limits in kA. None (or all-NaN) disables the
@@ -150,7 +150,7 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
 
     if branch_limit_a1_ka is not None and branch_limit_a2_ka is not None:
         or_amps, ex_amps = compute_branch_flows_cpu(
-            V, branch_from, branch_to, yff, yft, ytf, ytt, bus_vn_kv, sn_mva)
+            V, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva)
         or_ka, ex_ka = or_amps * 1e-3, ex_amps * 1e-3
         for l in range(len(branch_from)):
             etype = ViolationElementType.LINE if l < n_lines else ViolationElementType.TRAFO
