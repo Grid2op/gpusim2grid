@@ -20,7 +20,9 @@ distinct scenario set.
 
 ``handle_disconnected_grid`` and ``compute_limit_violations`` are supported
 identically to :class:`gpusim2grid.ContingencyAnalysisGPU` -- see that
-class's docs for the full semantics.
+class's docs for the full semantics. :meth:`ScenarioSweepGPU.set_contingency_gens`
+adds lightsim2grid's third contingency axis (per-row generator disconnection,
+PV→PQ relabelling without changing the Jacobian pattern).
 """
 
 import numpy as np
@@ -103,6 +105,7 @@ class ScenarioSweepGPU:
     ...                                 # (n_scen, n_load) / (n_scen, n_gen)
     >>> sweep.set_topology([[3], [], [3, 40]])  # one branch-id list per row
     >>> sweep.set_gen_v(gen_v)                  # optional: (n_scen, n_gen) vm_pu
+    >>> sweep.set_contingency_gens(gen_off)     # optional: (n_scen, n_gen) bool
     >>> V_batch = sweep.compute(batch_size=512)      # DLPack (n_scen, n_bus)
     >>> residuals = sweep.last_residuals()
     >>> disconnected = sweep.get_disconnected()      # which rows were skipped
@@ -245,6 +248,12 @@ class ScenarioSweepGPU:
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
 
+        # set_injections_from_elements() inputs, kept so a later
+        # set_contingency_gens() (or vice versa) can re-assemble Sbus with the
+        # disconnected generators taken out, whatever the call order.
+        self._pending_elements = None
+        self._gen_off = None
+
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
@@ -265,7 +274,15 @@ class ScenarioSweepGPU:
         numbering.  Prefer :meth:`set_injections_from_elements` when ``grid``
         is a lightsim2grid grid — it takes per-element data and does this
         assembly for you.
+
+        With :meth:`set_contingency_gens`, a caller assembling Sbus itself
+        must ALSO have removed each disconnected generator's own injection
+        from these arrays (its P, and its target Q when it does not regulate
+        voltage): the generator mask then only flips the bus PV→PQ and
+        re-weights the slack. :meth:`set_injections_from_elements` does the
+        removal for you.
         """
+        self._pending_elements = None
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
@@ -275,16 +292,94 @@ class ScenarioSweepGPU:
         :meth:`InjectionSweepGPU.set_injections_from_elements`: one row per
         step (scenario), one column per element. See that method's docstring
         for the full semantics (constant term, disconnected-element handling,
-        the "snapshotted at construction" caveat).
+        the "snapshotted at construction" caveat). A generator disconnected by
+        :meth:`set_contingency_gens` has its injection taken out of that row
+        automatically, whichever of the two is called first.
         """
         if self._elements is None:
             raise RuntimeError(
                 "set_injections_from_elements() needs a lightsim2grid grid; "
                 "explicit-array (tuple) mode has no loads/generators to read. "
                 "Use set_injections(p_mw, q_mvar, sn_mva) instead.")
+        self._pending_elements = (
+            np.asarray(load_p, dtype=np.float64),
+            np.asarray(load_q, dtype=np.float64),
+            np.asarray(gen_p, dtype=np.float64))
+        self._assemble_injections()
+
+    def _assemble_injections(self):
+        load_p, load_q, gen_p = self._pending_elements
+        gen_off = self._gen_off
+        if gen_off is not None and gen_off.shape[0] != gen_p.shape[0]:
+            # Row counts disagree: leave the check to the C++ session at
+            # compute() (same rule as set_topology), assemble without the mask.
+            gen_off = None
         p_mw, q_mvar = build_bus_injections(self._elements,
-                                            load_p, load_q, gen_p)
+                                            load_p, load_q, gen_p,
+                                            gen_off=gen_off)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+
+    def set_contingency_gens(self, mask):
+        """Per-row generator contingency mask, shape ``(n_scenarios, n_gen)``,
+        dtype bool. ``True`` means "disconnect this generator for this row".
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_contingency_gens``. Unlike
+        :meth:`set_topology` this does not edit the admittance matrix -- a
+        generator carries no admittance. It removes the generator's active
+        power (and, if it does not regulate voltage, its reactive setpoint)
+        from that row's injection, re-weights the distributed slack without
+        it, and -- when the **last** generator regulating its own bus is taken
+        out -- turns that bus from PV to PQ for the row, so its voltage
+        magnitude is solved for instead of held at the setpoint. The lost MW
+        is picked up by the slack; express a redispatch through
+        :meth:`set_injections_from_elements` instead.
+
+        The PV/PQ relabelling costs no per-row symbolic factorization: every
+        bus that can flip is given a voltage-magnitude unknown and a reactive
+        equation once, so the Jacobian's sparsity is the union over all rows,
+        and each row merely identity-pins the equation of the buses that are
+        still PV. That set is derived from the mask automatically: the next
+        :meth:`compute` rebuilds the session's base state (one base-case setup
+        + cuDSS analysis, tens of ms) whenever it changes -- growing or
+        shrinking, so an all-False mask is bit-identical to no mask -- and
+        reuses it otherwise. :attr:`dim_J` / :attr:`reserved_switchable_buses`
+        show the current structure.
+
+        Only generators regulating their **own** bus are supported: raises
+        for a generator regulating a remote bus, or one whose bus a control
+        group holds (a remote generator, an SVC or an HVDC converter station),
+        and in explicit-array (tuple) mode (no generator data).
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_contingency_gens() needs a lightsim2grid grid; "
+                "explicit-array (tuple) mode has no generators to read.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(
+                f"'mask' must be 2-D (n_scenarios, n_gen), got shape {mask.shape}.")
+        if mask.shape[1] != self._elements.n_gen:
+            raise ValueError(
+                f"The number of generators on the grid ({self._elements.n_gen}) "
+                f"differs from the number of columns of the mask ({mask.shape[1]}).")
+        mask = np.ascontiguousarray(mask, dtype=bool)
+        self._inner.set_contingency_gens(mask)
+        self._gen_off = mask
+        if self._pending_elements is not None:
+            self._assemble_injections()
+
+    @property
+    def dim_J(self):
+        """Augmented Jacobian dimension of the current base state. Grows by
+        one per bus reserved for :meth:`set_contingency_gens` (see there)."""
+        return self._inner.dim_J
+
+    @property
+    def reserved_switchable_buses(self):
+        """(k,) int ndarray: sorted AC-solver bus ids currently owning a
+        reserved Vm column + Q equation for generator contingencies (empty
+        unless :meth:`compute` derived some from the mask)."""
+        return self._inner.get_reserved_buses()
 
     def set_gen_v(self, gen_v):
         """Store per-scenario generator target voltage magnitude (vm_pu, NOT kV).

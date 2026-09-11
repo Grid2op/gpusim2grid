@@ -1363,6 +1363,47 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "row-aligned with set_injections(). Requires set_branch_data() "
          "first. Optional: if never called, run() defaults every scenario "
          "to \"no branches tripped\" (a plain injection sweep).")
+    .def("set_contingency_gens",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_contingency_gens: mask must be 2-D "
+                     "(n_scenarios, n_gen)");
+             const auto n_rows = static_cast<Eigen::Index>(mask.shape(0));
+             const auto n_cols = static_cast<Eigen::Index>(mask.shape(1));
+             ScenarioSweepSession::BoolMat m(n_rows, n_cols);
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < n_rows; ++i)
+                 for (Eigen::Index j = 0; j < n_cols; ++j)
+                     m(i, j) = r(i, j);
+             self.set_contingency_gens(m);
+         },
+         pybind11::arg("mask"),
+         "Per-row generator contingency mask, shape (n_scenarios, n_gen), dtype "
+         "bool: True disconnects that generator for that row (mirrors "
+         "lightsim2grid's ScenarioSweep.set_contingency_gens). Labelling side "
+         "only -- when the LAST generator locally regulating a bus is off, that "
+         "bus turns PQ for the row (its reserved Q row is released; still-PV "
+         "rows identity-pin it), and the distributed slack is re-weighted "
+         "without the disconnected participants. The INJECTION side (the "
+         "generator's P, and its target Q when it does not regulate voltage, "
+         "leaving Sbus) is the caller's job: ScenarioSweepGPU."
+         "set_injections_from_elements does it. The buses that need a reserved "
+         "Vm column + Q equation are derived from the mask by the next run(), "
+         "which rebuilds the base state (one base-case setup + cuDSS analysis) "
+         "whenever that set changes. Raises for a generator regulating a "
+         "remote bus or standing on a bus a control group holds, and in "
+         "explicit-array (tuple) mode (no generator data).")
+    .def_property_readonly("dim_J", &ScenarioSweepSession::dim_J,
+         "Augmented Jacobian dimension of the current base state (grows by "
+         "one per reserved switchable Vm bus -- see set_contingency_gens).")
+    .def("get_reserved_buses", &ScenarioSweepSession::get_reserved_buses,
+         "Sorted AC-solver bus ids currently owning a reserved Vm column + Q "
+         "equation for generator contingencies (empty unless run() derived "
+         "some from set_contingency_gens' mask).")
+    .def_property_readonly("has_gen_contingency", &ScenarioSweepSession::has_gen_contingency,
+         "True once set_contingency_gens() has been called.")
     .def("run",            &ScenarioSweepSession::run,
          "Solve all scenarios. Fills the device-side voltage and residual "
          "buffers. Requires set_injections() first. A scenario whose "

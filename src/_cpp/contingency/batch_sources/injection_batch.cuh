@@ -164,6 +164,10 @@ struct InjectionBatch {
     void fill_mask_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/,
                            const int* /*d_J_outer*/) const {}
 
+    // BatchSource concept: the injection sweep has no generator contingencies,
+    // so every slot keeps the shared base-case slack weights.
+    void fill_slack_w_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
+
     // BatchSource concept: the injection sweep never trips branches (topology
     // is fixed) — compute_limit_violations is scoped to contingency analysis
     // only, so this trivial all-nullptr table is never actually consulted.

@@ -13,6 +13,7 @@
 #include "acpf_nr_kernels.cuh"
 #include "contingency_analysis_helper.hpp"
 #include "ledger_data.hpp"
+#include "mask_config_builder.cuh"   // build_mask_config
 #include "cuda_utils.h"
 
 #include <thrust/device_vector.h>
@@ -83,35 +84,11 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
     t_base_case_ms_ = ms_since(t_base_start);
 
     // Build the handle_disconnected_grid mask configuration once from the base
-    // case (per-bus identity-row metadata + angle reference) and the ledger
-    // (controller buses → skip-if-stranded). Cheap; only consulted by run() when
-    // handle_disconnected_grid_ is enabled.
-    {
-        const int n_bus = base_state_->n_bus;
-        mask_cfg_.row_info.p_row      = base_state_->h_p_row_of_bus;
-        mask_cfg_.row_info.q_row      = base_state_->h_q_row_of_bus;
-        mask_cfg_.row_info.p_diag_pos = base_state_->h_p_diag_pos;
-        mask_cfg_.row_info.q_diag_pos = base_state_->h_q_diag_pos;
-
-        // Angle reference(s): the bus(es) with no theta column anchor the angle
-        // and cannot be frozen; stranding one means the island is unsolvable.
-        mask_cfg_.is_reference_bus.assign(static_cast<size_t>(n_bus), 0);
-        for (int b = 0; b < n_bus; ++b)
-            if (base_state_->h_theta_col_of_bus[static_cast<size_t>(b)] < 0)
-                mask_cfg_.is_reference_bus[static_cast<size_t>(b)] = 1;
-
-        // Controller buses (HVDC ends / voltage-control gen & regulated buses):
-        // their feature equations reference the live block, so a contingency that
-        // strands one is conservatively skipped (no GPU per-scenario disabling).
-        mask_cfg_.is_controller_bus.assign(static_cast<size_t>(n_bus), 0);
-        if (ledger != nullptr) {
-            auto mark = [&](int b){ if (b >= 0 && b < n_bus) mask_cfg_.is_controller_bus[static_cast<size_t>(b)] = 1; };
-            for (int b : ledger->hvdc_bus1)  mark(b);
-            for (int b : ledger->hvdc_bus2)  mark(b);
-            for (int b : ledger->vc_bus)     mark(b);
-            for (int b : ledger->vc_reg_bus) mark(b);
-        }
-    }
+    // case (per-bus identity-row metadata + angle reference + VC row positions)
+    // and the ledger (HVDC ends / regulated buses → skip-if-stranded, VC group
+    // topology → a stranded LONE controller is recovered instead). Cheap; only
+    // consulted by run() when handle_disconnected_grid_ is enabled.
+    mask_cfg_ = build_mask_config(*base_state_, ledger);
 }
 
 // =============================================================================
@@ -188,6 +165,8 @@ void ContingencyAnalysisSession::run()
     for (auto& ctg : contingencies_) {
         ctg.disconnected = false;
         ctg.masked_buses.clear();
+        ctg.stranded_groups.clear();
+        ctg.pinned_buses.clear();
     }
 
     // Host preprocessing (resolve_indices + connectivity/masking + build_flat_patches)

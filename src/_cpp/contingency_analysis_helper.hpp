@@ -94,10 +94,27 @@ struct Contingency {
     //                  of the patched graph (empty when the grid stays connected).
     //                  Those buses are frozen; the largest component is solved.
     //   In this mode `disconnected` is reused to mean "still skipped": it is set
-    //   only when the contingency strands the angle reference or a controller
-    //   bus (an island we cannot solve), so it is compacted out → NaN, exactly
-    //   like a fully-disconnecting contingency in the legacy path.
+    //   only when the contingency strands the angle reference, an HVDC end, a
+    //   regulated bus, or EVERY controller of a VoltageControl group (an island
+    //   we cannot solve), so it is compacted out → NaN, exactly like a
+    //   fully-disconnecting contingency in the legacy path.
     std::vector<int> masked_buses;
+
+    // handle_disconnected_grid mode: VoltageControl groups with exactly ONE
+    // controller whose own bus is in masked_buses while the regulated bus is
+    // still live. Their bordered voltage row is repurposed by value into
+    // "Q_c == 0" (J[v_row, q_col] = 1, J[v_row, vm_col(reg)] = 0, F[v_row] =
+    // -Q_c), letting the regulated bus float as an ordinary PQ bus -- the GPU
+    // counterpart of lightsim2grid's VoltageControl::set_masked_buses.
+    std::vector<int> stranded_groups;
+
+    // ScenarioSweep generator contingencies: buses whose Q equation is
+    // identity-pinned for this row (dVm = 0 -- the bus stays PV) even though
+    // the shared ledger reserved a Vm column + Q row for them. The complement
+    // (reserved buses NOT listed here) solve as PQ for this row. Empty when no
+    // generator contingency is configured. Independent of masked_buses (a bus
+    // in both gets the same identity Q row twice -- harmless).
+    std::vector<int> pinned_buses;
 
     // Branch ids (lines-then-trafos) tripped by this contingency, populated
     // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.
@@ -283,9 +300,52 @@ struct MaskRowInfo {
 //   the legacy check_connectivity (skip-if-split) path.
 // ---------------------------------------------------------------------------
 struct MaskConfig {
-    std::vector<char> is_reference_bus;   // size n_bus
-    std::vector<char> is_controller_bus;  // size n_bus
+    std::vector<char> is_reference_bus;        // size n_bus: angle reference
+    // HVDC converter ends + every VoltageControl REGULATED bus: stranding one
+    // has no value-only fallback on the fixed structure → skip.
+    std::vector<char> is_hard_controller_bus;  // size n_bus
+
+    // VoltageControl group topology (all empty when the ledger has no VC):
+    // which bus each controller sits on and which group it belongs to, so a
+    // masked set can be classified per group (lone controller stranded →
+    // repurpose; every controller of a group stranded → skip; some of several
+    // stranded → left alone, the sharing rows keep the column coupled).
+    std::vector<int> vc_bus;             // per controller
+    std::vector<int> vc_group;           // per controller
+    std::vector<int> vc_grp_count;       // per group
+    std::vector<int> vc_vrow;            // per group: the bordered voltage row
+    std::vector<int> vc_vrow_qcol_pos;   // per group: nnz pos of (v_row, q_col_first), -1 if none
+    std::vector<int> vc_vrow_vmcol_pos;  // per group: nnz pos of (v_row, vm_col(reg_bus)), -1 if none
+
     MaskRowInfo       row_info;
+};
+
+// ---------------------------------------------------------------------------
+// MaskEntries
+//   All the flat, chunk-sliced host streams build_mask_entries produces (one
+//   ChunkPatchRange per chunk each, chunk-relative slot ids, same chunking as
+//   build_flat_patches). Uploaded/sliced by MaskStreams (mask_streams.cuh).
+//     • rows   : identity-row entries (slot, J row, diag nnz pos) — one per
+//                masked P/Q row AND one per pinned Q row (PV pin);
+//     • v      : masked-voltage entries (slot, bus) — NaN out;
+//     • jov    : per-slot J value overrides (slot, nnz pos, value) — the
+//                repurposed stranded-controller row;
+//     • str    : stranded rows (slot, group) — F[v_row] = -Q_c per slot.
+// ---------------------------------------------------------------------------
+struct MaskEntries {
+    std::vector<int>            slot, row, diag;
+    std::vector<ChunkPatchRange> row_ranges;
+    std::vector<int>            v_slot, v_bus;
+    std::vector<ChunkPatchRange> v_ranges;
+    std::vector<int>            jov_slot, jov_pos;
+    std::vector<cuda_real_type> jov_val;
+    std::vector<ChunkPatchRange> jov_ranges;
+    std::vector<int>            str_slot, str_grp;
+    std::vector<ChunkPatchRange> str_ranges;
+
+    bool any() const {
+        return !slot.empty() || !v_slot.empty() || !jov_slot.empty() || !str_slot.empty();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -295,41 +355,35 @@ struct MaskConfig {
 // graph (same removed-edge logic as check_connectivity), keeps the largest by
 // bus count, and records every other bus in Contingency::masked_buses. A
 // contingency is marked `disconnected` (→ skipped/NaN) when its masked set
-// contains the angle reference (is_reference_bus) or any controller bus
-// (is_controller_bus: HVDC/SVC/remote-gen) — those islands cannot be solved on
-// the GPU's fixed structure. Connected contingencies get masked_buses == empty.
-//
-// is_reference_bus / is_controller_bus : size n_bus, 1 ⇒ bus is of that kind.
+// contains the angle reference, a hard controller bus (HVDC end / regulated
+// bus), or EVERY controller of a VoltageControl group — those islands cannot
+// be solved on the GPU's fixed structure. A masked LONE controller (a group
+// of exactly one) whose regulated bus stays live is recorded in
+// Contingency::stranded_groups instead (its voltage row is repurposed by
+// value into Q_c == 0, lightsim2grid PR #192 parity); a masked member of a
+// multi-controller group is left as is. Connected contingencies get
+// masked_buses == empty.
 // ---------------------------------------------------------------------------
 void compute_component_masks(
     std::vector<Contingency>&                                     contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
-    const std::vector<char>&                                      is_reference_bus,
-    const std::vector<char>&                                      is_controller_bus);
+    const MaskConfig&                                             cfg);
 
 // ---------------------------------------------------------------------------
-// build_mask_entries  (handle_disconnected_grid mode)
+// build_mask_entries  (handle_disconnected_grid mode + PV pins)
 //
-// Converts the per-contingency masked bus sets into flat, chunk-sliced device
-// upload arrays, mirroring build_flat_patches' layout (chunk-relative slot ids,
-// one ChunkPatchRange per chunk). Two parallel streams are produced:
-//   • identity-row entries (slot, row, diag_pos) — one per masked P/Q row;
-//   • masked-voltage entries (slot, bus)         — one per masked bus (NaN out).
-// active_to_orig / batch_size must match the values used by build_flat_patches
-// so the per-chunk ranges line up with the contingency batch chunks.
+// Converts the per-contingency masked_buses / stranded_groups / pinned_buses
+// into the flat, chunk-sliced device upload streams of MaskEntries, mirroring
+// build_flat_patches' layout (chunk-relative slot ids, one ChunkPatchRange per
+// chunk). active_to_orig / batch_size must match the values used by
+// build_flat_patches so the per-chunk ranges line up with the batch chunks.
 // ---------------------------------------------------------------------------
 void build_mask_entries(
     const std::vector<Contingency>& contingencies,
     const std::vector<int>&         active_to_orig,
     int                             batch_size,
-    const MaskRowInfo&              row_info,
-    std::vector<int>&               h_mask_slot,
-    std::vector<int>&               h_mask_row,
-    std::vector<int>&               h_mask_diag,
-    std::vector<ChunkPatchRange>&   mask_row_ranges,
-    std::vector<int>&               h_maskv_slot,
-    std::vector<int>&               h_maskv_bus,
-    std::vector<ChunkPatchRange>&   maskv_ranges);
+    const MaskConfig&               cfg,
+    MaskEntries&                    out);
 
 // ---------------------------------------------------------------------------
 // build_tripped_branch_table  (compute_limit_violations)

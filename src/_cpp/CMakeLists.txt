@@ -15,6 +15,7 @@ pybind11_add_module(
     cuda_utils.cu
     acpf_nr.cu
     contingency_analysis_helper.cpp
+    ledger_extend.cpp
     acpf_nr_kernels.cu
     contingency_analysis_session.cu
     contingency/batch_pf_driver.cu

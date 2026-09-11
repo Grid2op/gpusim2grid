@@ -38,6 +38,7 @@
 #include "../../contingency_analysis_helper.hpp"
 #include "../../nr_iter_step.cuh"         // BS
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
+#include "../mask_streams.cuh"            // MaskStreams
 
 // Forward declaration to avoid circular include.
 struct BatchPfDriverContext;
@@ -94,13 +95,8 @@ struct ContingencyBatch {
     // Identity-row entries and masked-voltage entries, flat over chunks with a
     // ChunkPatchRange per chunk (same chunking as h_flat_*).
     // -------------------------------------------------------------------------
-    bool                         mask_mode_ = false;
-    std::vector<int>             h_mask_slot_, h_mask_row_, h_mask_diag_;
-    std::vector<ChunkPatchRange> mask_row_ranges_;
-    std::vector<int>             h_maskv_slot_, h_maskv_bus_;
-    std::vector<ChunkPatchRange> maskv_ranges_;
-    thrust::device_vector<int>   d_mask_slot, d_mask_row, d_mask_diag;
-    thrust::device_vector<int>   d_maskv_slot, d_maskv_bus;
+    bool        mask_mode_ = false;
+    MaskStreams mask_;
 
     // -------------------------------------------------------------------------
     // compute_limit_violations: per-active-slot (global, not per-chunk)
@@ -141,9 +137,7 @@ struct ContingencyBatch {
         // path: skip any contingency that disconnects the graph.
         mask_mode_ = (mask_cfg != nullptr);
         if (mask_mode_)
-            compute_component_masks(contingencies, Ybus_rm,
-                                    mask_cfg->is_reference_bus,
-                                    mask_cfg->is_controller_bus);
+            compute_component_masks(contingencies, Ybus_rm, *mask_cfg);
         else
             check_connectivity(contingencies, Ybus_rm);
 
@@ -165,9 +159,7 @@ struct ContingencyBatch {
 
         if (mask_mode_)
             build_mask_entries(contingencies, active_to_orig_, used_batch_size_,
-                               mask_cfg->row_info,
-                               h_mask_slot_, h_mask_row_, h_mask_diag_, mask_row_ranges_,
-                               h_maskv_slot_, h_maskv_bus_, maskv_ranges_);
+                               *mask_cfg, mask_.h);
 
         build_tripped_branch_table(contingencies, active_to_orig_,
                                    h_trip_branch_flat_, h_trip_start_, h_trip_count_);
@@ -200,15 +192,7 @@ struct ContingencyBatch {
                        active_to_orig_.size(), cs);
 
         // handle_disconnected_grid masking entries (only when any bus is masked).
-        if (!h_mask_slot_.empty()) {
-            upload_h2d(d_mask_slot, h_mask_slot_.data(), h_mask_slot_.size(), cs);
-            upload_h2d(d_mask_row,  h_mask_row_.data(),  h_mask_row_.size(),  cs);
-            upload_h2d(d_mask_diag, h_mask_diag_.data(), h_mask_diag_.size(), cs);
-        }
-        if (!h_maskv_slot_.empty()) {
-            upload_h2d(d_maskv_slot, h_maskv_slot_.data(), h_maskv_slot_.size(), cs);
-            upload_h2d(d_maskv_bus,  h_maskv_bus_.data(),  h_maskv_bus_.size(),  cs);
-        }
+        mask_.upload(cs);
 
         // compute_limit_violations tripped-branch table (see the ctor's
         // build_tripped_branch_table call). h_trip_start_/h_trip_count_ are
@@ -232,26 +216,12 @@ struct ContingencyBatch {
     void fill_mask_buffers(NrIterBuffers& buf, int chunk_idx, const int* d_J_outer) const
     {
         if (!mask_mode_) return;
-        buf.d_J_outer_mask = d_J_outer;
-
-        if (chunk_idx < static_cast<int>(mask_row_ranges_.size())) {
-            const ChunkPatchRange& r = mask_row_ranges_[static_cast<size_t>(chunk_idx)];
-            if (r.count > 0) {
-                buf.d_mask_slot = thrust::raw_pointer_cast(d_mask_slot.data()) + r.start;
-                buf.d_mask_row  = thrust::raw_pointer_cast(d_mask_row.data())  + r.start;
-                buf.d_mask_diag = thrust::raw_pointer_cast(d_mask_diag.data()) + r.start;
-                buf.n_mask_rows = r.count;
-            }
-        }
-        if (chunk_idx < static_cast<int>(maskv_ranges_.size())) {
-            const ChunkPatchRange& r = maskv_ranges_[static_cast<size_t>(chunk_idx)];
-            if (r.count > 0) {
-                buf.d_maskv_slot = thrust::raw_pointer_cast(d_maskv_slot.data()) + r.start;
-                buf.d_maskv_bus  = thrust::raw_pointer_cast(d_maskv_bus.data())  + r.start;
-                buf.n_mask_v     = r.count;
-            }
-        }
+        mask_.fill(buf, chunk_idx, d_J_outer);
     }
+
+    // BatchSource concept: contingency analysis keeps the shared base-case
+    // slack weights on every slot (no per-row generator contingencies).
+    void fill_slack_w_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
 
     // -------------------------------------------------------------------------
     // Active-set interface (consumed by BatchPfDriver to compact the batch).

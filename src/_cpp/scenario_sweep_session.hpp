@@ -43,6 +43,7 @@
 #include "dtypes.hpp"
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType, Contingency
+#include "gen_contingency_data.hpp"          // GenContingencyData
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -163,6 +164,38 @@ struct ScenarioSweepSession {
     std::vector<std::vector<int>> tripped_branches_per_scenario_;
     bool has_topology_ = false;
 
+    // =========================================================================
+    // Generator contingencies (set_contingency_gens(), lightsim2grid PR #193
+    // parity). gen_data_ is the per-generator snapshot the bridge read off the
+    // grid (array/tuple mode has none → set_contingency_gens raises).
+    // gen_off_ is the (n_scenarios × n_gen) mask, ORIGINAL row order.
+    //
+    // The buses that lose their LAST local voltage controller in SOME row need
+    // a reserved Vm column + Q equation in the shared Jacobian (ledger_extend
+    // .hpp's add_switchable_vm_buses); reserved_buses_ is the sorted set the
+    // CURRENT base_state_ was built with. run() derives the set the mask needs
+    // and rebuilds base_state_ (one base-case setup + cuDSS analysis) whenever
+    // the two differ -- growing or shrinking, so an all-False mask is
+    // bit-identical to no mask at all. The stored ctor inputs below exist for
+    // exactly that rebuild; base_ledger_ is the UNEXTENDED ledger copy.
+    // =========================================================================
+    using BoolMat = Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    GenContingencyData gen_data_;
+    bool               has_gen_data_ = false;
+    BoolMat            gen_off_;
+    bool               has_gen_off_  = false;
+    std::vector<int>   reserved_buses_;
+
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
+    CplxVect        Vinit_, Sbus_;
+    Eigen::VectorXi slack_ids_, pv_, pq_;
+    int    max_iter_base_   = 10;
+    double tol_base_        = 1e-6;
+    int    device_          = -1;
+    bool   presolved_v_     = false;
+    bool   debug_base_case_ = false;
+    std::unique_ptr<LedgerData> base_ledger_;   // null in array/tuple mode
+
     // Host-side flow result storage (filled by compute_flows()).
     RealVect h_or_amps_;
     RealVect h_ex_amps_;
@@ -248,6 +281,38 @@ struct ScenarioSweepSession {
     void set_gen_v(
         Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> gen_v,
         Eigen::Ref<const Eigen::VectorXi> gen_bus);
+
+    // =========================================================================
+    // set_gen_contingency_data — per-generator snapshot (bridge factory only;
+    // see gen_contingency_data.hpp). Enables set_contingency_gens().
+    // =========================================================================
+    void set_gen_contingency_data(const GenContingencyData& data);
+
+    // =========================================================================
+    // set_contingency_gens — (n_scenarios × n_gen) bool mask, row-aligned with
+    // set_injections()/set_topology(): True disconnects that generator for
+    // that row. Mirrors lightsim2grid's ScenarioSweep::set_contingency_gens:
+    //   • the injection side (its P, and its target Q when it does not
+    //     regulate voltage, leaving Sbus) is the CALLER's job (the Python
+    //     facade does it in set_injections_from_elements);
+    //   • the labelling side is done here: when the LAST generator locally
+    //     regulating a bus is off, that bus turns PQ for the row (its
+    //     reserved Q row is released; still-PV rows identity-pin it);
+    //   • the distributed slack is re-weighted per row without the
+    //     disconnected participants (the slack BUS SET never changes).
+    // Refuses a generator regulating a remote bus or standing on a bus a
+    // control group holds (VoltageControl owns those rows/columns). Only
+    // stores the mask; the structure is derived (and the base state rebuilt
+    // if needed) by the next run().
+    // =========================================================================
+    void set_contingency_gens(Eigen::Ref<const BoolMat> mask);
+
+    // Current augmented Jacobian dimension of the base state (grows by one per
+    // reserved switchable bus) and the reserved buses themselves -- lets a
+    // caller observe when run() rebuilt the base state.
+    int              dim_J() const;
+    std::vector<int> get_reserved_buses() const { return reserved_buses_; }
+    bool             has_gen_contingency() const { return has_gen_off_; }
 
     // =========================================================================
     // run — constructs BatchPfDriver<ScenarioSweepBatch> + runs the chunk
@@ -347,6 +412,25 @@ struct ScenarioSweepSession {
     ScenarioSweepSession& operator=(const ScenarioSweepSession&) = delete;
     ScenarioSweepSession(ScenarioSweepSession&&)                 = delete;
     ScenarioSweepSession& operator=(ScenarioSweepSession&&)      = delete;
+
+private:
+    // (Re)build base_state_ + mask_cfg_ on the base ledger extended with the
+    // given switchable buses (empty: the un-extended ledger). Drops solver_
+    // first (it references *base_state_).
+    void _build_base_state(const std::vector<int>& switchable_buses);
+
+    // Derive, from gen_off_, the buses that lose every local controller per
+    // row (row_pv_to_pq), the union of those (required, sorted, restricted to
+    // buses that need a reserved Vm/Q pair), and the slack participants each
+    // row disconnects (row_slack_off). All empty when no mask is set.
+    void _prepare_gen_contingency(std::vector<int>&              required,
+                                  std::vector<std::vector<int>>& row_pv_to_pq,
+                                  std::vector<std::vector<int>>& row_slack_off) const;
+
+    // Per-row distributed-slack weights, [n_scenarios * n_slack] in the base
+    // state's participant order; empty when no row re-weights the slack.
+    std::vector<cuda_real_type> _row_slack_weights(
+        const std::vector<std::vector<int>>& row_slack_off) const;
 };
 
 #endif // SCENARIO_SWEEP_SESSION_HPP
