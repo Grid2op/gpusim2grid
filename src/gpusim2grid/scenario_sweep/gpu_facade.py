@@ -39,6 +39,7 @@ from .._ls2g_utils import (
     extract_branch_data,
     extract_injection_elements,
     build_bus_injections,
+    conflicting_gen_v_rows,
     grid_from_pandapower,
     _validate_precision,
 )
@@ -253,6 +254,9 @@ class ScenarioSweepGPU:
         # disconnected generators taken out, whatever the call order.
         self._pending_elements = None
         self._gen_off = None
+        # set_gen_v() input, kept so a later set_contingency_gens() (or vice
+        # versa) can re-derive which rows ask one bus for two different |V|.
+        self._gen_v = None
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
@@ -367,6 +371,7 @@ class ScenarioSweepGPU:
         self._gen_off = mask
         if self._pending_elements is not None:
             self._assemble_injections()
+        self._update_skipped_rows()
 
     @property
     def dim_J(self):
@@ -406,6 +411,15 @@ class ScenarioSweepGPU:
             (the default), every scenario keeps the grid's own base-case
             voltage.
 
+        A row asking one bus for two different magnitudes (two connected
+        generators on that bus, both applied, set-points further apart than
+        ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``) is infeasible -- |V|
+        at a bus is unique -- and is reported as NOT SIMULATED (NaN voltage /
+        residual, :meth:`get_disconnected` = 1, a ``GRID``/``NOT_SIMULATED``
+        violation) rather than letting the last column silently win the way
+        lightsim2grid's own ``set_vm`` does. A generator taken out by
+        :meth:`set_contingency_gens` (or a NaN entry) does not take part.
+
         Notes
         -----
         The generator -> bus wiring is snapshotted at construction, like
@@ -416,7 +430,25 @@ class ScenarioSweepGPU:
             raise RuntimeError(
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
+        gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
         self._inner.set_gen_v(gen_v, self._elements.gen_bus)
+        self._gen_v = gen_v
+        self._update_skipped_rows()
+
+    def _update_skipped_rows(self):
+        """Re-derive the not-simulable rows from set_gen_v() (and the
+        generator mask); a row-count mismatch is left to the C++ session."""
+        if self._gen_v is None:
+            return
+        gen_off = self._gen_off
+        if gen_off is not None and gen_off.shape[0] != self._gen_v.shape[0]:
+            gen_off = None
+        bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_bus,
+                                     self._inner.is_vm_fixed_bus, gen_off=gen_off)
+        if bad.any():
+            self._inner.set_skipped_rows(bad)
+        else:
+            self._inner.clear_skipped_rows()
 
     def set_topology(self, branch_ids_per_scenario):
         """Define each scenario's topology as branch removals.
@@ -613,12 +645,47 @@ class ScenarioSweepGPU:
         self._inner.strategy = value
 
     @property
+    def nb_iter(self):
+        """int: fixed NR iterations per scenario. Takes effect on the next
+        compute() without rebuilding the batch driver."""
+        return self._inner.nb_iter
+
+    @nb_iter.setter
+    def nb_iter(self, value):
+        self._inner.nb_iter = int(value)
+
+    @property
+    def run_counter(self):
+        """int: number of compute() calls so far."""
+        return self._inner.run_counter
+
+    @property
+    def driver_build_counter(self):
+        """int: number of cold batch-driver builds (allocation + cuDSS
+        ANALYSIS). compute() reuses the driver whenever n_scenarios and the
+        settings are unchanged: only the injections (and, when the topology
+        changed, the patch arrays) move to the GPU, and the Jacobians are
+        REFACTORIZED rather than analysed again."""
+        return self._inner.driver_build_counter
+
+    @property
+    def source_build_counter(self):
+        """int: number of batch-source builds (cold + topology changes)."""
+        return self._inner.source_build_counter
+
+    @property
+    def active_to_orig(self):
+        """(n_active,) int64: original row index of each solved batch slot."""
+        return self._inner.get_active_to_orig()
+
+    @property
     def reordering_alg(self):
         """cuDSS CUDSS_CONFIG_REORDERING_ALG choice (str). Takes effect on the
-        next compute() (which always reruns cuDSS ANALYSIS). One of 'default'
-        (default), 'amd', 'nested_dissection', 'none'. 'btf_colamd'/'colamd'
-        are rejected by cuDSS (CUDSS_STATUS_NOT_SUPPORTED) in this class's
-        uniform-batch mode -- they only work on AcPfGPU's single-system solve."""
+        next compute(), which rebuilds the batch driver (a new cuDSS ANALYSIS)
+        when it changed. One of 'default' (default), 'amd',
+        'nested_dissection', 'none'. 'btf_colamd'/'colamd' are rejected by
+        cuDSS (CUDSS_STATUS_NOT_SUPPORTED) in this class's uniform-batch mode
+        -- they only work on AcPfGPU's single-system solve."""
         return self._inner.reordering_alg
 
     @reordering_alg.setter
@@ -628,9 +695,10 @@ class ScenarioSweepGPU:
     @property
     def matching_alg(self):
         """cuDSS CUDSS_CONFIG_MATCHING_ALG choice (str). Takes effect on the
-        next compute() (which always reruns cuDSS ANALYSIS). 'none' (default)
-        is the only value cuDSS accepts in this class's uniform-batch mode --
-        every other value raises RuntimeError (CUDSS_STATUS_NOT_SUPPORTED)."""
+        next compute(), which rebuilds the batch driver when it changed.
+        'none' (default) is the only value cuDSS accepts in this class's
+        uniform-batch mode -- every other value raises RuntimeError
+        (CUDSS_STATUS_NOT_SUPPORTED)."""
         return self._inner.matching_alg
 
     @matching_alg.setter
@@ -640,8 +708,8 @@ class ScenarioSweepGPU:
     @property
     def pivot_epsilon_alg(self):
         """cuDSS CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (str). Takes effect on
-        the next compute() (which always reruns cuDSS ANALYSIS). One of
-        'default' (default), 'scaled', 'static'."""
+        the next compute(), which rebuilds the batch driver when it changed.
+        One of 'default' (default), 'scaled', 'static'."""
         return self._inner.pivot_epsilon_alg
 
     @pivot_epsilon_alg.setter

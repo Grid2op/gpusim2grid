@@ -9,6 +9,8 @@ re-solves the network on the GPU for many (P, Q) injection profiles in parallel.
 It is a thin facade over :class:`_InjectionSweepSolver`.
 """
 
+import numpy as np
+
 from . import (
     _InjectionSweepSolver,
     _normalize_device,
@@ -21,6 +23,7 @@ from .._ls2g_utils import (
     extract_branch_data,
     extract_injection_elements,
     build_bus_injections,
+    conflicting_gen_v_rows,
     grid_from_pandapower,
     _validate_precision,
 )
@@ -254,6 +257,13 @@ class InjectionSweepGPU:
             self._elements = None   # no loads/generators to read
         else:
             self._elements = extract_injection_elements(grid, self._inner.n_bus)
+            # |V|-fixed buses (pv ∪ slack, AC-solver numbering) -- the only
+            # buses set_gen_v() acts on; used to spot two connected generators
+            # asking one bus for two different magnitudes.
+            fixed = np.zeros(self._inner.n_bus, dtype=bool)
+            fixed[np.asarray(grid.get_pv(), dtype=np.int64)] = True
+            fixed[np.asarray(grid.get_slack_ids(), dtype=np.int64)] = True
+            self._is_vm_fixed_bus = fixed
 
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
@@ -345,7 +355,12 @@ class InjectionSweepGPU:
             silently ignored, mirroring lightsim2grid's own
             ``voltage_regulator_on_``-gated behavior. Left unset entirely
             (the default), every scenario keeps the grid's own base-case
-            voltage.
+            voltage. Raises ``ValueError`` when a row asks one bus for two
+            different magnitudes (two connected generators on that bus with
+            set-points further apart than
+            ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``): no V satisfies
+            both, and lightsim2grid's own ``set_vm`` would silently let the
+            last one win.
 
         Notes
         -----
@@ -357,6 +372,16 @@ class InjectionSweepGPU:
             raise RuntimeError(
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
+        gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
+        bad = conflicting_gen_v_rows(gen_v, self._elements.gen_bus, self._is_vm_fixed_bus)
+        if bad.any():
+            rows = np.flatnonzero(bad)
+            raise ValueError(
+                f"set_gen_v: rows {rows[:10].tolist()}{'...' if rows.size > 10 else ''} "
+                "ask one bus for two different voltage magnitudes (two connected "
+                "generators on the same bus with different set-points): no V "
+                "satisfies both. Give co-located generators the same vm_pu, or "
+                "NaN for all but one of them.")
         self._inner.set_gen_v(gen_v, self._elements.gen_bus)
 
     def compute(self, batch_size=512):

@@ -341,6 +341,28 @@ class _ScenarioSweepSolver:
         some from set_contingency_gens' mask)."""
         return np.asarray(self._s.get_reserved_buses(), dtype=np.int64)
 
+    def set_skipped_rows(self, mask):
+        """(n_scenarios,) bool, row-aligned with set_injections(): True drops
+        that row as NOT SIMULATED (NaN voltage / residual, disconnected flag
+        = 1, GRID/NOT_SIMULATED violation) without touching the graph. Takes
+        effect on the next run() (a warm source rebuild)."""
+        self._s.set_skipped_rows(np.ascontiguousarray(mask, dtype=bool))
+
+    def clear_skipped_rows(self):
+        """Drop any set_skipped_rows() mask."""
+        self._s.clear_skipped_rows()
+
+    @property
+    def has_skipped_rows(self):
+        return self._s.has_skipped_rows
+
+    def get_row_pv_to_pq(self):
+        """list[list[int]]: per scenario (original row order), the AC-solver
+        buses the last run() turned PV->PQ because set_contingency_gens' mask
+        took out every generator locally regulating them. All empty without a
+        mask; empty before run()."""
+        return self._s.get_row_pv_to_pq()
+
     def set_topology(self, branch_ids_per_scenario):
         """Build topology from a list-of-lists of branch indices, row-aligned
         with set_injections().
@@ -548,10 +570,138 @@ class _ScenarioSweepSolver:
         """Zero-copy DLPack capsule of batch voltages, shape [n_scenarios, n_bus].
 
         Requires ``run()`` to have been called.  The capsule aliases live GPU
-        memory — calling ``run()`` again overwrites it in place.  Clone before
-        a subsequent ``run()`` if a snapshot is needed.
+        memory — a later ``run()`` that reuses the batch driver (same
+        n_scenarios and settings) overwrites it in place, one that rebuilds
+        the driver frees it.  Clone before a subsequent ``run()`` if a
+        snapshot is needed.
         """
         return self._s.v_results_dlpack()
+
+    # --- driver persistence + differentiable path (see
+    #     gpusim2grid.differentiable.BatchPowerFlow) ---
+    @property
+    def fixed_batch_capacity(self):
+        """bool: use ``batch_size`` verbatim as the driver's chunk capacity (no
+        rebalancing over the active count), so with ``batch_size >=
+        n_scenarios`` the batch is always one chunk. Default False."""
+        return self._s.fixed_batch_capacity
+
+    @fixed_batch_capacity.setter
+    def fixed_batch_capacity(self, value):
+        self._s.fixed_batch_capacity = bool(value)
+
+    @property
+    def keep_final_jacobian(self):
+        """bool: refill the batched Jacobian at the converged voltages after
+        each run() so solve_JT_batch_dlpack() can use it. Default False."""
+        return self._s.keep_final_jacobian
+
+    @keep_final_jacobian.setter
+    def keep_final_jacobian(self, value):
+        self._s.keep_final_jacobian = bool(value)
+
+    @property
+    def run_counter(self):
+        """int: number of run() calls so far."""
+        return self._s.run_counter
+
+    @property
+    def driver_build_counter(self):
+        """int: number of (cold) batch-driver builds -- allocation + cuDSS
+        ANALYSIS. Constant across run() calls that reuse the driver."""
+        return self._s.driver_build_counter
+
+    @property
+    def source_build_counter(self):
+        """int: number of batch-source builds (cold + warm runs). Constant
+        across hot runs (injections / gen_v only)."""
+        return self._s.source_build_counter
+
+    @property
+    def capacity(self):
+        """int: the live driver's chunk capacity (0 before run())."""
+        return self._s.capacity
+
+    @property
+    def n_active(self):
+        """int: rows actually solved by the last run()."""
+        return self._s.n_active
+
+    @property
+    def adjoint_ready(self):
+        """bool: the batched transposed system has been built (first backward)."""
+        return self._s.adjoint_ready
+
+    @property
+    def nnz_J(self):
+        return self._s.nnz_J
+
+    @property
+    def nnz_Y(self):
+        return self._s.nnz_Y
+
+    @property
+    def p_row_of_bus(self):
+        return np.asarray(self._s.p_row_of_bus, dtype=np.int64)
+
+    @property
+    def q_row_of_bus(self):
+        return np.asarray(self._s.q_row_of_bus, dtype=np.int64)
+
+    @property
+    def theta_col_of_bus(self):
+        return np.asarray(self._s.theta_col_of_bus, dtype=np.int64)
+
+    @property
+    def vm_col_of_bus(self):
+        return np.asarray(self._s.vm_col_of_bus, dtype=np.int64)
+
+    @property
+    def is_vm_fixed_bus(self):
+        """(n_bus,) bool: |V| fixed at that bus (pv or slack)."""
+        return np.asarray(self._s.is_vm_fixed_bus, dtype=bool)
+
+    def get_active_to_orig(self):
+        """(n_active,) int64: original scenario index of each active slot."""
+        return np.asarray(self._s.get_active_to_orig(), dtype=np.int64)
+
+    def j_skeleton(self):
+        """(outer, inner) int32 CSR structure of one Jacobian."""
+        outer, inner = self._s.j_skeleton()
+        return np.asarray(outer, dtype=np.int32), np.asarray(inner, dtype=np.int32)
+
+    def clear_gen_v(self):
+        """Drop any set_gen_v() override (rows keep the base-case voltage)."""
+        self._s.clear_gen_v()
+
+    def set_injections_dlpack(self, capsule, producer_stream=0):
+        """Device path of set_injections(): a DLPack capsule of a
+        (n_scenarios, n_bus) contiguous complex PER-UNIT Sbus tensor on this
+        session's device (this build's precision). Consumes the capsule."""
+        self._s.set_injections_dlpack(capsule, int(producer_stream))
+
+    def set_gen_v_dlpack(self, capsule, gen_bus, producer_stream=0):
+        """Device path of set_gen_v(gen_v, gen_bus): (n_scenarios, n_gen)
+        contiguous real tensor of vm_pu on this device. Consumes the capsule."""
+        b = np.ascontiguousarray(gen_bus, dtype=np.int32)
+        self._s.set_gen_v_dlpack(capsule, b, int(producer_stream))
+
+    def solve_JT_batch_dlpack(self, rhs, j_values=None, ybus_values=None, v=None,
+                              want_gen_v_grad=False, producer_stream=0):
+        """Batched adjoint solve; see ScenarioSweepSession.solve_JT_batch_dlpack.
+        Returns (lambda capsule, gvm capsule or None); clone both."""
+        return self._s.solve_JT_batch_dlpack(rhs, j_values, ybus_values, v,
+                                             bool(want_gen_v_grad), int(producer_stream))
+
+    def j_values_dlpack(self):
+        """(capacity, nnz_J) real DLPack capsule aliasing the last chunk's
+        Jacobian values (active-slot order)."""
+        return self._s.j_values_dlpack()
+
+    def ybus_values_dlpack(self):
+        """(capacity, nnz_Y) complex DLPack capsule aliasing the last chunk's
+        patched Ybus values (active-slot order)."""
+        return self._s.ybus_values_dlpack()
 
     @property
     def n_scenarios(self):

@@ -56,7 +56,12 @@
 #include "strategies/policy_iter0_only.cuh"
 #include "strategies/policy_refactor_every_n.cuh"
 
+#include <chrono>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <variant>
+#include <vector>
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -73,6 +78,52 @@ struct BatchPfDriverContext {
     int              batch_size;
     int              n_bus;
     int              nnz_Y;
+};
+
+// -----------------------------------------------------------------------------
+// BatchAdjoint — the batched transposed system Jᵀ λ = x̄ (one per batch slot),
+// built LAZILY by BatchPfDriver::solve_JT_batch on its first call and reused
+// by every later call (requirements: nothing exists until the first backward;
+// later backward calls only permute values, REFACTORIZE and SOLVE).
+//
+// cuDSS (0.8) has no transposed-solve mode, so Jᵀ is an explicit second
+// uniform-batch system over the SAME capacity: its CSR skeleton is the
+// transpose of the shared J skeleton (host counting sort, once), and its
+// values are J's values permuted through d_J_to_JT (JT_values[map[i]] =
+// J_values[i]) by one kernel per call. Everything is sized by the driver's
+// fixed capacity (batch_size_), so it survives replace_source() and dies with
+// the driver.
+// -----------------------------------------------------------------------------
+struct BatchAdjoint {
+    CudssBatchSolver solver;                       // own cuDSS context + ANALYSIS
+
+    thrust::device_vector<int>            d_JT_outer;    // [dim_J + 1]
+    thrust::device_vector<int>            d_JT_inner;    // [nnz_J]
+    thrust::device_vector<int>            d_J_to_JT;     // [nnz_J] position map
+    thrust::device_vector<cuda_real_type> d_JT_values;   // [capacity × nnz_J]
+    thrust::device_vector<cuda_real_type> d_rhs;         // [capacity × dim_J], slot order
+    thrust::device_vector<cuda_real_type> d_sol;         // [capacity × dim_J], slot order
+    thrust::device_vector<cuda_real_type> d_sol_full;    // [n_contingencies × dim_J], original order
+
+    // gen_v adjoint (dS/dVm column contraction at Vm-fixed buses), built on
+    // the first call that asks for it.
+    bool                                   gen_v_ready = false;
+    thrust::device_vector<int>             d_Ybus_T_pos;      // [nnz_Y] position of (j,i) for entry (i,j)
+    thrust::device_vector<int>             d_p_row_of_bus;    // [n_bus]
+    thrust::device_vector<int>             d_q_row_of_bus;    // [n_bus]
+    thrust::device_vector<char>            d_is_vm_fixed_bus; // [n_bus]
+    thrust::device_vector<cudaComplexType> d_V_ext_slots;     // [capacity × n_bus] snapshot-mode scratch
+    thrust::device_vector<cuda_real_type>  d_gvm;             // [capacity × n_bus], slot order
+    thrust::device_vector<cuda_real_type>  d_gvm_full;        // [n_contingencies × n_bus], original order
+
+    bool factorized           = false;
+    int  factorized_for_solve = -1;   // driver n_solves_ whose own J was last permuted+refactored
+
+    // Counters / timings (cumulative over the driver's life; surfaced through
+    // BatchTimings by the sessions).
+    int    n_analysis = 0, n_factorize = 0, n_refactorize = 0, n_solve = 0;
+    double t_build_ms = 0.;
+    TimingEntry t_first_factorize, t_refactorize, t_solve;
 };
 
 // =============================================================================
@@ -248,6 +299,29 @@ struct BatchPfDriver {
                  PolicyIter0Only,
                  PolicyRefactorEveryN> policy_;
 
+    // cuDSS analysis config, retained so the lazily built adjoint context
+    // (BatchAdjoint) analyses Jᵀ with the same choices as the forward.
+    ReorderingAlg   reordering_alg_    = ReorderingAlg::Default;
+    MatchingAlg     matching_alg_      = MatchingAlg::None;
+    PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+
+    // -------------------------------------------------------------------------
+    // Persistence / adjoint state
+    //
+    //   keep_final_jacobian_ : after the NR loop of a chunk, refill
+    //                          d_J_values_batch at the CONVERGED V (the loop
+    //                          leaves J(V_{nb_iter-1}) behind). Only one chunk
+    //                          may be solved then (only the last chunk's J
+    //                          survives in the chunk buffer) -- solve() throws
+    //                          otherwise. Set by the differentiable wrapper.
+    //   n_solves_            : solve() calls on this driver; the adjoint keys
+    //                          its "J already permuted + refactored" cache on it.
+    //   adjoint_             : null until the first solve_JT_batch().
+    // -------------------------------------------------------------------------
+    bool keep_final_jacobian_ = false;
+    int  n_solves_            = 0;
+    std::unique_ptr<BatchAdjoint> adjoint_;
+
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -286,6 +360,107 @@ struct BatchPfDriver {
     // solve()  — iterate chunks; fills d_V_results + d_residuals.
     // -------------------------------------------------------------------------
     BatchTimings solve();
+
+    // -------------------------------------------------------------------------
+    // replace_source — swap in a NEW BatchSource on a LIVE driver (the "warm"
+    // path of ScenarioSweepSession::run(): new topology, same shape). Keeps
+    // the cuDSS context + ANALYSIS, the chunk buffers, the SpMV descriptor and
+    // the policy state (a policy that already factorized refactorizes next),
+    // re-running only the source's own H→D setup. The new source must have
+    // been built for this driver's capacity (used_batch_size() == batch_size_)
+    // so its chunk ranges line up with the chunk loop; its active count may
+    // shrink or grow within n_contingencies (phantom padding handles a short
+    // last chunk). A member template so the explicit class instantiations of
+    // sources that are not move-assignable do not instantiate it.
+    // -------------------------------------------------------------------------
+    template <typename S = BatchSource>
+    void replace_source(S&& src)
+    {
+        cs.synchronize();
+        if (src.used_batch_size() != batch_size_)
+            throw std::runtime_error(
+                "[batch_pf] replace_source: the new source was built for a chunk "
+                "size of " + std::to_string(src.used_batch_size()) + " but this "
+                "driver's capacity is " + std::to_string(batch_size_));
+        if (src.n_active() > n_contingencies)
+            throw std::runtime_error(
+                "[batch_pf] replace_source: more active elements than result slots");
+        source_   = std::move(src);
+        n_active_ = source_.n_active();
+        n_chunks_ = (n_active_ + batch_size_ - 1) / batch_size_;
+        t_preprocess_ms_ = source_.cpu_preprocess_ms();
+
+        auto t_source_start = std::chrono::steady_clock::now();
+        {
+            BatchPfDriverContext ctx = make_context();
+            source_.initialize(ctx, cs);
+        }
+        cs.synchronize();
+        t_source_init_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_source_start).count();
+        if (adjoint_) adjoint_->factorized_for_solve = -1;
+    }
+
+    // -------------------------------------------------------------------------
+    // mark_reused — a session reusing this driver for another run() calls
+    // this first so the one-time construction costs (allocation, cuDSS
+    // ANALYSIS, context creation) are reported once, not on every run; on the
+    // "hot" path (no new source at all) the source's own preprocess/upload
+    // costs are zeroed too. The absolute numbers are what let a caller (or a
+    // test) tell "reused" from "rebuilt".
+    // -------------------------------------------------------------------------
+    void mark_reused(bool hot)
+    {
+        t_alloc_ms_        = 0.;
+        t_analysis_ms_     = 0.;
+        t_context_init_ms_ = 0.;
+        if (hot) {
+            t_preprocess_ms_  = 0.;
+            t_source_init_ms_ = 0.;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // solve_JT_batch — batched adjoint solve Jᵀ λ = x̄ per active slot, in
+    // ORIGINAL row order both ways (see BatchAdjoint above; first call builds
+    // everything). Requires solve() to have run with keep_final_jacobian_ so
+    // d_J_values_batch holds the converged J (alias mode), or a caller-owned
+    // [capacity × nnz_J] snapshot of those values (d_J_ext, snapshot mode).
+    //
+    //   d_rhs_orig      : [n_contingencies × dim_J]; non-finite entries → 0.
+    //   d_J_ext         : nullptr → use d_J_values_batch.
+    //   want_gen_v_grad : also compute the gen_v (Vm-fixed bus) gradient
+    //                     contraction into d_gvm_full (see gen_v_adjoint_kernel).
+    //   d_Ybus_ext      : snapshot of [capacity × nnz_Y] patched Ybus values
+    //                     (nullptr → d_Ybus_values_batch). gen_v only.
+    //   d_V_ext_orig    : [n_contingencies × n_bus] converged V in original
+    //                     order (nullptr → the chunk's own d_V_batch). gen_v only.
+    //   is_vm_fixed_bus : [n_bus] (pv ∪ slack) mask, gen_v only.
+    // Results: d_JT_sol_full_ptr() [n_contingencies × dim_J] and, when asked,
+    // d_gvm_full_ptr() [n_contingencies × n_bus]; rows of compacted-out
+    // (islanded) elements are 0. Synchronizes cs before returning.
+    // -------------------------------------------------------------------------
+    void solve_JT_batch(const cuda_real_type*    d_rhs_orig,
+                        const cuda_real_type*    d_J_ext,
+                        bool                     want_gen_v_grad,
+                        const cudaComplexType*   d_Ybus_ext,
+                        const cudaComplexType*   d_V_ext_orig,
+                        const std::vector<char>& is_vm_fixed_bus);
+
+    bool adjoint_ready() const { return static_cast<bool>(adjoint_); }
+    const cuda_real_type* d_JT_sol_full_ptr() const {
+        return adjoint_ ? thrust::raw_pointer_cast(adjoint_->d_sol_full.data()) : nullptr;
+    }
+    const cuda_real_type* d_gvm_full_ptr() const {
+        return (adjoint_ && !adjoint_->d_gvm_full.empty())
+            ? thrust::raw_pointer_cast(adjoint_->d_gvm_full.data()) : nullptr;
+    }
+    const cuda_real_type* j_values_ptr() const {
+        return thrust::raw_pointer_cast(d_J_values_batch.data());
+    }
+    const cudaComplexType* ybus_values_ptr() const {
+        return thrust::raw_pointer_cast(d_Ybus_values_batch.data());
+    }
 
     // -------------------------------------------------------------------------
     // copy_results_to_host  — syncs cs and copies V_results + residuals.
@@ -375,6 +550,12 @@ struct BatchPfDriver {
 
 private:
     void _solve_chunk(int c_start, int actual_batch, BatchTimings& t);
+    // First-call setup of the adjoint: skeleton transpose + position map,
+    // buffers, cuDSS ANALYSIS of Jᵀ (with the forward's config).
+    void _prepare_adjoint();
+    // First-call setup of the gen_v contraction data (Ybus transpose-position
+    // map, bus→row maps, Vm-fixed mask).
+    void _prepare_gen_v_adjoint(const std::vector<char>& is_vm_fixed_bus);
 };
 
 #endif // BATCH_PF_DRIVER_CUH
