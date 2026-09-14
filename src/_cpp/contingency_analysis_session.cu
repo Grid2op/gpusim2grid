@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "contingency_analysis_session.hpp"
+#include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/contingency_batch.cuh"
@@ -230,6 +231,13 @@ void ContingencyAnalysisSession::run()
         t_limits_setup_ms = solver_->violation_setup_ms();
     }
 
+    // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+    // violations): plan / outputs on device before the chunk loop, base-case
+    // report now. No generator contingencies here (nullptr mask).
+    const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
+        phys_, *solver_, "ContingencyAnalysisSession", violation_tol_, sn_mva_,
+        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0);
+
     // Run all chunks; fills d_V_results and d_residuals on device (and, when
     // compute_limit_violations_ is set, the compact violation buffers too —
     // see check_limit_violations_kernel in _solve_chunk).
@@ -282,6 +290,7 @@ void ContingencyAnalysisSession::run()
 
     timings_.n_disconnected = n_disconnected;
     has_violations_result_ = compute_limit_violations_;
+    physical_checks::after_solve(phys_, timings_, t_phys);
 }
 
 // =============================================================================
@@ -624,4 +633,41 @@ RealVect ContingencyAnalysisSession::get_ex_amps() const
         throw std::runtime_error(
             "ContingencyAnalysisSession: call run() and compute_flows() first");
     return h_ex_amps_;
+}
+
+// =============================================================================
+// Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+// violations) -- shared glue in contingency/physical_checks_impl.cuh
+// =============================================================================
+void ContingencyAnalysisSession::set_bus_q_capability(const BusQPlanData& plan)
+{
+    phys_.set_bus_q_plan(plan, base_state_->n_bus);
+}
+
+BusQViolationsResult ContingencyAnalysisSession::get_bus_q_violations() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/false, "ContingencyAnalysisSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+BusQViolationsResult ContingencyAnalysisSession::get_bus_q_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/true, "ContingencyAnalysisSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult ContingencyAnalysisSession::get_hvdc_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/false, "ContingencyAnalysisSession",
+                                         timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult ContingencyAnalysisSession::get_hvdc_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "ContingencyAnalysisSession",
+                                         timings_.t_copy_violations_to_host_ms);
 }

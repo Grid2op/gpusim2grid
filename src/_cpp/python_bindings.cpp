@@ -9,6 +9,7 @@
 #include "injection_sweep.hpp"               // run_injection_sweep_gpu
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "scenario_sweep_session.hpp"        // ScenarioSweepSession
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
 #include "warmup.hpp"                        // warmup
@@ -27,6 +28,165 @@
 #include <vector>
 
 
+// -----------------------------------------------------------------------------
+// Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+// violations): the same five entries on the three batch sessions. The config
+// and result types are bound once (bind_physical_checks_types); this wraps a
+// session class_ at the head of its definition chain.
+// -----------------------------------------------------------------------------
+template <class Cls>
+Cls bind_physical_checks(Cls cls)
+{
+    using Session = typename Cls::type;
+    cls.def_property_readonly("physical_checks",
+            [](Session& self) -> PhysicalChecksConfig& { return self.physical_checks(); },
+            pybind11::return_value_policy::reference_internal,
+            "Configuration of the opt-in post-solve PHYSICAL checks (a "
+            "PhysicalChecksConfig, live: set its attributes before run()): one flag, "
+            "compute_physical_violations, for the per-bus reactive capability "
+            "(lightsim2grid PR #206) and the droop hvdc P-saturation together.")
+       .def("set_bus_q_capability", &Session::set_bus_q_capability, pybind11::arg("plan"),
+            "Hand in the BusQPlanData the reactive-capability check needs (which "
+            "buses are held by a machine, and what each can produce). Built from a "
+            "solved lightsim2grid grid by _extract_bus_q_plan_from_lsgrid, or by "
+            "hand in array mode. Validated against n_bus; drops any previous report.")
+       .def("get_bus_q_violations", &Session::get_bus_q_violations,
+            "BusQViolationsResult of the last run(): per row, the buses whose "
+            "machines had to produce more (or less) reactive power than the SUM of "
+            "what they own (the BUS part of the physical report). Requires "
+            "compute_physical_violations to have been on.")
+       .def("get_bus_q_violations_n", &Session::get_bus_q_violations_n,
+            "The same for the base (\"n\") case every row is solved from (one row; "
+            "count 0 when the base solve did not converge).")
+       .def("get_hvdc_p_violations", &Session::get_hvdc_p_violations,
+            "HvdcPViolationsResult of the last run(): per row, the linear-regime "
+            "droop hvdc lines whose flow exceeds pmax in the direction it flows. "
+            "(the HVDC part of the physical report). Requires "
+            "compute_physical_violations to have been on.")
+       .def("get_hvdc_p_violations_n", &Session::get_hvdc_p_violations_n,
+            "The same for the base (\"n\") case.");
+    return cls;
+}
+
+static void bind_physical_checks_types(pybind11::module_& m)
+{
+    pybind11::class_<BusQPlanData>(m, "BusQPlanData",
+        "Flattened plan of the per-bus reactive-capability check "
+        "(compute_physical_violations): per checked bus (SOLVER numbering) the summed "
+        "fixed capability of its hvdc converter stations (MVAr), how many always-live "
+        "machines (stations + voltage-mode SVCs) hold it, the summed SVC susceptance "
+        "range (pu, worth b*|V|^2*sn_mva MVAr at the row's voltage) and a CSR of its "
+        "voltage-regulating generators (container id, min_q/max_q MVAr). Built from a "
+        "solved lightsim2grid grid by _extract_bus_q_plan_from_lsgrid (lightsim2grid's "
+        "own build_bus_q_plan), or from arrays here.")
+        .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> bus_solver,
+                               Eigen::Ref<const RealVect> qmin_fixed_mvar,
+                               Eigen::Ref<const RealVect> qmax_fixed_mvar,
+                               Eigen::Ref<const Eigen::VectorXi> n_fixed,
+                               Eigen::Ref<const RealVect> bmin_sum_pu,
+                               Eigen::Ref<const RealVect> bmax_sum_pu,
+                               Eigen::Ref<const Eigen::VectorXi> gen_start,
+                               Eigen::Ref<const Eigen::VectorXi> gen_id,
+                               Eigen::Ref<const RealVect> gen_qmin_mvar,
+                               Eigen::Ref<const RealVect> gen_qmax_mvar,
+                               double sn_mva) {
+                 BusQPlanData p;
+                 p.n_check = static_cast<int>(bus_solver.size());
+                 p.bus_solver = bus_solver; p.qmin_fixed_mvar = qmin_fixed_mvar;
+                 p.qmax_fixed_mvar = qmax_fixed_mvar; p.n_fixed = n_fixed;
+                 p.bmin_sum_pu = bmin_sum_pu; p.bmax_sum_pu = bmax_sum_pu;
+                 p.gen_start = gen_start; p.gen_id = gen_id;
+                 p.gen_qmin_mvar = gen_qmin_mvar; p.gen_qmax_mvar = gen_qmax_mvar;
+                 p.sn_mva = sn_mva;
+                 return p;
+             }),
+             pybind11::arg("bus_solver"), pybind11::arg("qmin_fixed_mvar"),
+             pybind11::arg("qmax_fixed_mvar"), pybind11::arg("n_fixed"),
+             pybind11::arg("bmin_sum_pu"), pybind11::arg("bmax_sum_pu"),
+             pybind11::arg("gen_start"), pybind11::arg("gen_id"),
+             pybind11::arg("gen_qmin_mvar"), pybind11::arg("gen_qmax_mvar"),
+             pybind11::arg("sn_mva"))
+        .def_readonly("n_check",         &BusQPlanData::n_check)
+        .def_readonly("bus_solver",      &BusQPlanData::bus_solver)
+        .def_readonly("qmin_fixed_mvar", &BusQPlanData::qmin_fixed_mvar)
+        .def_readonly("qmax_fixed_mvar", &BusQPlanData::qmax_fixed_mvar)
+        .def_readonly("n_fixed",         &BusQPlanData::n_fixed)
+        .def_readonly("bmin_sum_pu",     &BusQPlanData::bmin_sum_pu)
+        .def_readonly("bmax_sum_pu",     &BusQPlanData::bmax_sum_pu)
+        .def_readonly("gen_start",       &BusQPlanData::gen_start)
+        .def_readonly("gen_id",          &BusQPlanData::gen_id)
+        .def_readonly("gen_qmin_mvar",   &BusQPlanData::gen_qmin_mvar)
+        .def_readonly("gen_qmax_mvar",   &BusQPlanData::gen_qmax_mvar)
+        .def_readonly("sn_mva",          &BusQPlanData::sn_mva);
+
+    pybind11::class_<PhysicalChecksConfig>(m, "PhysicalChecksConfig",
+        "Settings of the opt-in post-solve PHYSICAL checks of a batch session "
+        "(mutable, taken into account at the next run()). One flag for the whole "
+        "category (lightsim2grid's compute_physical_violations): every record has "
+        "category PHYSICAL -- a state the grid cannot reach -- whatever the element. "
+        "They only REPORT: nothing is enforced, no row is re-solved.\n\n"
+        "Today two checks: every converged row reports (a) the buses whose "
+        "voltage-holding machines (regulating generators, hvdc converter stations, "
+        "voltage-mode SVCs) had to produce more (or less) reactive power than the SUM "
+        "of what they own (LOW_Q / HIGH_Q on a BUS; OpenLoadFlow's ReactiveLimits "
+        "outer loop; per bus, not per machine; needs set_bus_q_capability()), and (b) "
+        "the linear-regime droop hvdc lines whose theta-driven flow exceeds pmax in "
+        "the direction it flows (HVDC_P_SATURATION on an HVDC, side 1 = would "
+        "saturate 1->2, 2 = 2->1; OpenLoadFlow's HvdcAcEmulationLimits).")
+        .def_property("compute_physical_violations",
+                      [](const PhysicalChecksConfig& c) { return c.compute_physical_violations; },
+                      &PhysicalChecksConfig::set_compute_physical_violations,
+                      "Opt-in flag of the physical checks (default False). Changing it "
+                      "drops the previous report.")
+        .def_property("physical_violation_tol_mva",
+                      [](const PhysicalChecksConfig& c) { return c.physical_violation_tol_mva; },
+                      &PhysicalChecksConfig::set_physical_violation_tol_mva,
+                      "Slack (MVA) on every comparison -- MVAr for the reactive check "
+                      "(q_bus < sum(min_q) - tol or q_bus > sum(max_q) + tol), MW for the "
+                      "hvdc one (p_flow > pmax + tol). Default 1e-4; must be finite and >= 0.")
+        .def_property("physical_violation_capacity",
+                      [](const PhysicalChecksConfig& c) { return c.physical_violation_capacity; },
+                      &PhysicalChecksConfig::set_physical_violation_capacity,
+                      "Records kept per row and per check (bounds each output at n_rows * "
+                      "capacity); a row with more is flagged truncated. Default 16.")
+        .def_property_readonly("has_bus_q_capability",
+                      [](const PhysicalChecksConfig& c) { return c.has_bus_q_plan; },
+                      "Whether set_bus_q_capability() was called on the session.")
+        .def_property_readonly("bus_q_plan",
+                      [](const PhysicalChecksConfig& c) { return c.bus_q_plan; },
+                      "A copy of the BusQPlanData in use (empty if none was set).");
+
+    pybind11::class_<BusQViolationsResult>(m, "BusQViolationsResult",
+        "Flat per-row records of the reactive-capability check: row r owns "
+        "bus_id/type/value/limit[r*capacity : r*capacity + count[r]]; count -1 = the "
+        "row was never simulated (compacted out), 0 = simulated, no violation (or not "
+        "converged); type 5 = LOW_Q, 6 = HIGH_Q; bus_id the SOLVER bus id; value the "
+        "reactive power the machines holding that bus had to produce (MVAr), limit "
+        "their SUMMED capability (MVAr); truncated 1 when more than `capacity` buses "
+        "violated on that row.")
+        .def_readonly("bus_id",    &BusQViolationsResult::bus_id)
+        .def_readonly("type",      &BusQViolationsResult::type)
+        .def_readonly("value",     &BusQViolationsResult::value)
+        .def_readonly("limit",     &BusQViolationsResult::limit)
+        .def_readonly("count",     &BusQViolationsResult::count)
+        .def_readonly("truncated", &BusQViolationsResult::truncated)
+        .def_readonly("capacity",  &BusQViolationsResult::capacity);
+
+    pybind11::class_<HvdcPViolationsResult>(m, "HvdcPViolationsResult",
+        "Flat per-row records of the droop hvdc P-saturation check, same layout as "
+        "BusQViolationsResult: hvdc_id the GRID hvdc id, side 1 (would saturate 1->2: "
+        "p1 > pmax_1to2) or 2 (2->1), value the flow leaving the AC bus into the hvdc "
+        "(MW), limit pmax (MW). Every record is element type HVDC (4), violation type "
+        "HVDC_P_SATURATION (7).")
+        .def_readonly("hvdc_id",   &HvdcPViolationsResult::hvdc_id)
+        .def_readonly("side",      &HvdcPViolationsResult::side)
+        .def_readonly("value",     &HvdcPViolationsResult::value)
+        .def_readonly("limit",     &HvdcPViolationsResult::limit)
+        .def_readonly("count",     &HvdcPViolationsResult::count)
+        .def_readonly("truncated", &HvdcPViolationsResult::truncated)
+        .def_readonly("capacity",  &HvdcPViolationsResult::capacity);
+}
+
 PYBIND11_MODULE(_gpusim2grid, m)
 {
     m.doc() =
@@ -34,6 +194,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "contingency analysis and injection sweeps, plus zero-copy DLPack "
         "export. End users should normally import the Python wrappers from the "
         "gpusim2grid package rather than calling this module directly.";
+
+    bind_physical_checks_types(m);
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
     // Guard against the exact bug lightsim2grid itself hit (see its
@@ -277,6 +439,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall-clock: H->D upload of bus/branch limit arrays + device buffer "
                       "allocation (set_violation_limits()); zero unless "
                       "compute_limit_violations is enabled (ms)")
+        .def_readonly("t_physical_setup_ms", &BatchTimings::t_physical_setup_ms,
+                      "Wall-clock: H->D upload of the reactive-capability plan + device buffer "
+                      "allocation + the base-case (\"n\") physical checks; zero unless "
+                      "compute_physical_violations is enabled (ms)")
         .def_readonly("t_base_case_solve_only_ms", &BatchTimings::t_base_case_solve_only_ms,
                       "Wall-clock: non-overlapping remainder of t_base_case_ms -- cuDSS analyze "
                       "+ NR iterations (or the presolved_v validation step) only, excluding the "
@@ -332,6 +498,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_violation_check", &BatchTimings::t_violation_check,
                       "check_limit_violations_kernel — total across all chunks; zero "
                       "unless compute_limit_violations is enabled")
+        .def_readonly("t_bus_q_check", &BatchTimings::t_bus_q_check,
+                      "check_bus_q_violations_kernel (the reactive part of compute_physical_"
+                      "violations) — total across all chunks; zero unless enabled")
+        .def_readonly("t_hvdc_p_check", &BatchTimings::t_hvdc_p_check,
+                      "check_hvdc_p_violations_kernel (the hvdc part of compute_physical_"
+                      "violations) — total across all chunks; zero unless enabled")
         .def_readonly("t_flow_computation", &BatchTimings::t_flow_computation,
                       "compute_branch_flows_kernel — total across all chunks (0 if no branch data)")
         // --- metadata ---
@@ -427,6 +599,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             h2d["source_init_ms"]         = t.t_source_init_ms;
             h2d["branch_data_upload_ms"]  = t.t_branch_data_upload_ms;
             h2d["violation_setup_ms"]     = t.t_violation_setup_ms;
+            h2d["physical_setup_ms"]      = t.t_physical_setup_ms;
 
             // One-time CUDA/cuSPARSE/cuDSS warm-up, kept out of gpu_compute on
             // purpose -- see BatchTimings::t_context_init_ms.
@@ -451,6 +624,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["residual"]          = entry_dict(t.t_residual);
             gpu_compute["store_V"]           = entry_dict(t.t_store_V);
             gpu_compute["violation_check"]   = entry_dict(t.t_violation_check);
+            gpu_compute["bus_q_check"]       = entry_dict(t.t_bus_q_check);
+            gpu_compute["hvdc_p_check"]      = entry_dict(t.t_hvdc_p_check);
             gpu_compute["flow_computation"]  = entry_dict(t.t_flow_computation);
 
             py::dict d2h;
@@ -872,7 +1047,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // ContingencyAnalysisSession (exposed as ContingencyAnalysisSession;
   // the recommended Python entry point is gpusim2grid.ContingencyAnalysisGPU)
   // -----------------------------------------------------------------
-  pybind11::class_<ContingencyAnalysisSession,
+  bind_physical_checks(pybind11::class_<ContingencyAnalysisSession,
                    std::shared_ptr<ContingencyAnalysisSession>>(
       m, "ContingencyAnalysisSession",
       "Stateful GPU N-k contingency analysis solver (low-level binding).\n\n"
@@ -883,7 +1058,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       "which adds string strategy selection, device parsing, and lazy "
       "host-transfer result buffers.\n\n"
       "Lifecycle: set_branch_data() -> build_contingencies() -> run() -> "
-      "compute_flows().")
+      "compute_flows()."))
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1124,14 +1299,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // Base-case NR runs once at construction; set_injections() + run() may be
   // called repeatedly to sweep different injection sets reusing that base.
   // -----------------------------------------------------------------
-  pybind11::class_<InjectionSweepSession,
+  bind_physical_checks(pybind11::class_<InjectionSweepSession,
                    std::shared_ptr<InjectionSweepSession>>(
       m, "InjectionSweepSession",
       "Stateful GPU batched-injection power flow solver (low-level binding).\n\n"
       "Solves the base case once at construction; set_injections() + run() may "
       "be called repeatedly to sweep different (P, Q) injection sets reusing "
       "that base case. Prefer the Python facade "
-      ":class:`gpusim2grid.InjectionSweepGPU`.")
+      ":class:`gpusim2grid.InjectionSweepGPU`."))
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1292,7 +1467,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // + set_injections() (+ optional set_topology()) + run() may be called
   // repeatedly reusing that base.
   // -----------------------------------------------------------------
-  pybind11::class_<ScenarioSweepSession,
+  bind_physical_checks(pybind11::class_<ScenarioSweepSession,
                    std::shared_ptr<ScenarioSweepSession>>(
       m, "ScenarioSweepSession",
       "Stateful GPU row-aligned combined topology + injection sweep "
@@ -1306,7 +1481,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       "solved on its largest connected component instead (masked buses "
       "reported as NaN) -- same convention as ContingencyAnalysisSession. "
       "compute_limit_violations enables the fused per-chunk voltage/current/"
-      "divergence check, also mirroring ContingencyAnalysisSession.")
+      "divergence check, also mirroring ContingencyAnalysisSession."))
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1789,6 +1964,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "LSGrid: (bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka). Bus "
         "arrays are relabeled to AC-solver bus numbering (size n_bus_solver); "
         "branch arrays are lines-then-trafos. NaN = not configured.");
+
+    m.def("_extract_bus_q_plan_from_lsgrid",
+        [](pybind11::object grid_py, int n_bus_solver) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return extract_bus_q_plan_from_lsgrid(grid, n_bus_solver);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("n_bus_solver"),
+        "BusQPlanData of compute_physical_violations off a solved lightsim2grid LSGrid, "
+        "built by lightsim2grid's own bus_q_check::build_bus_q_plan (so the routing "
+        "-- which machines hold which bus -- is identical to its batch classes'): "
+        "voltage-regulating generators (min_q/max_q MVAr), hvdc converter stations "
+        "and voltage-mode SVCs (b_min/b_max, pu). Solver bus numbering; n_bus_solver "
+        "is the session's n_bus.");
 
     m.def("_make_is_session_from_lsgrid",
         [](pybind11::object grid_py, bool init_from_n_powerflow,

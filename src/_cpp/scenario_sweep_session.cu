@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "scenario_sweep_session.hpp"
+#include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/scenario_sweep_batch.cuh"
@@ -46,6 +47,11 @@ struct ScenarioSweepDeviceData {
     thrust::device_vector<cudaComplexType> d_Sbus_orig;    // n_scenarios × n_bus, per-unit
     thrust::device_vector<cuda_real_type>  d_gen_v_orig;   // n_scenarios × n_gen (device path only)
     int              gen_v_n_gen = 0;
+    // (n_scenarios × n_gen) uint8 copy of gen_off_ (ORIGINAL row order), read
+    // by check_bus_q_violations_kernel (compute_physical_violations with generator
+    // contingencies). Session-owned: the driver only keeps the pointer.
+    thrust::device_vector<unsigned char>   d_gen_off;
+    int              gen_off_n_gen = 0;
     std::vector<int> gv_active_cols;   // Vm-fixed generator columns (device path)
     std::vector<int> gv_active_bus;    // ... and their AC-solver buses
 };
@@ -895,6 +901,31 @@ void ScenarioSweepSession::run()
         t_limits_setup_ms = solver_->violation_setup_ms();
     }
 
+    // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+    // violations). Called on EVERY run, like the limits above: it is what
+    // resets the per-row sentinels on a reused driver. The generator mask
+    // (a generator this row disconnects leaves its bus' summed capability)
+    // travels as a device uint8 copy of gen_off_, refreshed whenever it changed.
+    const unsigned char* d_gen_off_ptr = nullptr;
+    int n_gen_off = 0;
+    if (phys_.compute_physical_violations && has_gen_off_) {
+        n_gen_off = static_cast<int>(gen_off_.cols());
+        const size_t want = static_cast<size_t>(n_scenarios_) * static_cast<size_t>(n_gen_off);
+        if (cold || warm || gen_off_dirty_ || dev_->d_gen_off.size() != want
+                || dev_->gen_off_n_gen != n_gen_off) {
+            std::vector<unsigned char> h(want, 0);
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (int g = 0; g < n_gen_off; ++g)
+                    h[static_cast<size_t>(r) * n_gen_off + g] = gen_off_(r, g) ? 1 : 0;
+            dev_->d_gen_off.assign(h.begin(), h.end());
+            dev_->gen_off_n_gen = n_gen_off;
+        }
+        d_gen_off_ptr = thrust::raw_pointer_cast(dev_->d_gen_off.data());
+    }
+    const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
+        phys_, *solver_, "ScenarioSweepSession", violation_tol_, sn_mva_,
+        base_state_->timings.converged, d_gen_off_ptr, n_gen_off);
+
     timings_ = solver_->solve();
     timings_.t_base_case_ms = t_base_case_ms_;
     timings_.t_preprocess_ms += t_sbus_build_ms_;
@@ -923,6 +954,7 @@ void ScenarioSweepSession::run()
         if (ctg.disconnected) ++n_disconnected;
     timings_.n_disconnected = n_disconnected;
     has_violations_result_ = compute_limit_violations_;
+    physical_checks::after_solve(phys_, timings_, t_phys);
 
     injections_dirty_ = topology_dirty_ = gen_v_dirty_ = gen_off_dirty_ = false;
     skip_dirty_ = false;
@@ -1327,4 +1359,42 @@ Eigen::VectorXi ScenarioSweepSession::get_violation_count_current() const
     for (size_t i = 0; i < h.size(); ++i) out(static_cast<Eigen::Index>(i)) = h[i];
     timings_.t_copy_violations_to_host_ms += ms_since(t_copy_start);
     return out;
+}
+
+
+// =============================================================================
+// Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+// violations) -- shared glue in contingency/physical_checks_impl.cuh
+// =============================================================================
+void ScenarioSweepSession::set_bus_q_capability(const BusQPlanData& plan)
+{
+    phys_.set_bus_q_plan(plan, base_state_->n_bus);
+}
+
+BusQViolationsResult ScenarioSweepSession::get_bus_q_violations() const
+{
+    if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/false, "ScenarioSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+BusQViolationsResult ScenarioSweepSession::get_bus_q_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/true, "ScenarioSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult ScenarioSweepSession::get_hvdc_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/false, "ScenarioSweepSession",
+                                         timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult ScenarioSweepSession::get_hvdc_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "ScenarioSweepSession",
+                                         timings_.t_copy_violations_to_host_ms);
 }

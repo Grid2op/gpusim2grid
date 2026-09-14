@@ -706,40 +706,8 @@ __global__ void update_slack_absorbed_kernel(
 // HVDC angle-droop kernels (Phase 3)
 // =============================================================================
 
-// Active power received by the non-controller side (HvdcDroopSolverData::recv_pu)
-__device__ __forceinline__ cuda_real_type hvdc_recv_pu(
-    cuda_real_type p_ctrl_abs, bool side1_ctrl,
-    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r)
-{
-    const cuda_real_type lf_ctrl = side1_ctrl ? lf1 : lf2;
-    const cuda_real_type lf_recv = side1_ctrl ? lf2 : lf1;
-    const cuda_real_type line_in = (static_cast<cuda_real_type>(1.) - lf_ctrl) * p_ctrl_abs;
-    return (static_cast<cuda_real_type>(1.) - lf_recv) * (line_in - r * line_in * line_in);
-}
-
-// The two active flows leaving the AC buses into the HVDC (HvdcDroopSolverData::flows_pu)
-__device__ __forceinline__ void hvdc_flows_pu(
-    int st, cuda_real_type raw,
-    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r,
-    cuda_real_type pmax12, cuda_real_type pmax21,
-    cuda_real_type& p1_flow, cuda_real_type& p2_flow)
-{
-    if (st == 0) {
-        if (raw >= static_cast<cuda_real_type>(0.)) {
-            p1_flow =  raw;
-            p2_flow = -hvdc_recv_pu(raw, true, lf1, lf2, r);
-        } else {
-            p1_flow = -hvdc_recv_pu(-raw, false, lf1, lf2, r);
-            p2_flow = -raw;
-        }
-    } else if (st > 0) {
-        p1_flow =  pmax12;
-        p2_flow = -hvdc_recv_pu(pmax12, true, lf1, lf2, r);
-    } else {
-        p1_flow = -hvdc_recv_pu(pmax21, false, lf1, lf2, r);
-        p2_flow =  pmax21;
-    }
-}
+// hvdc_recv_pu / hvdc_flows_pu live in acpf_nr_kernels.cuh (shared with the
+// droop P-saturation check, violation_kernels.cu).
 
 __global__ void hvdc_adjust_mismatch_kernel(
           cuda_real_type*  __restrict__ d_F,

@@ -37,6 +37,7 @@
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
 #include "gen_contingency_data.hpp"  // GenContingencyData
+#include "contingency/bus_q_check_data.hpp"  // BusQPlanData
 
 // Build a LedgerData (augmented-J description) from a solved LSGrid: the J
 // sparsity skeleton (get_J_solver), the NRLedger row/col maps, and the
@@ -217,6 +218,17 @@ make_ca_session_from_lsgrid(
 // Returns (bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka).
 std::tuple<RealVect, RealVect, RealVect, RealVect>
 extract_limits_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// The plan of the per-bus reactive-capability check (compute_physical_violations,
+// lightsim2grid PR #206) off a solved LSGrid, built by lightsim2grid's OWN
+// bus_q_check::build_bus_q_plan -- the same routing its batch classes use:
+// which buses a voltage-regulating machine holds (a local PV generator or a
+// VoltageControl controller, an hvdc converter station, a voltage-mode SVC),
+// and what each can produce -- and flattened into BusQPlanData (solver bus
+// numbering, MVAr for generators / stations, pu susceptance for SVCs, plus
+// sn_mva). n_bus_solver is the session's n_bus. Empty when no machine
+// regulates any voltage.
+BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
 
 // Build an InjectionSweepSession from a solved LSGrid (branch data set when
 // with_branch_data=true so compute_flows() works without extra setup).

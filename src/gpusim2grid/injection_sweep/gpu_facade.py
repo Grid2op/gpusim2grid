@@ -12,6 +12,7 @@ It is a thin facade over :class:`_InjectionSweepSolver`.
 import numpy as np
 
 from . import (
+    PhysicalChecksFacadeMixin,
     _InjectionSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -36,7 +37,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class InjectionSweepGPU:
+class InjectionSweepGPU(PhysicalChecksFacadeMixin):
     """Batch injection sweep on the GPU, seeded from a CPU base-case solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -168,7 +169,8 @@ class InjectionSweepGPU:
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
-                 use_distributed_slack=True):
+                 use_distributed_slack=True,
+                 compute_physical_violations=False):
         _validate_precision(precision)
 
         # Single source of truth, resolved once here and applied at
@@ -255,7 +257,12 @@ class InjectionSweepGPU:
         # `self._grid`) so the session stays independent of the grid object.
         if isinstance(grid, (tuple, list)):
             self._elements = None   # no loads/generators to read
+            self._grid = None
         else:
+            # The grid itself is kept ONLY for set_bus_q_capability_from_grid()
+            # (the plan of compute_physical_violations is built by lightsim2grid's
+            # own build_bus_q_plan); everything else reads the snapshot below.
+            self._grid = grid
             self._elements = extract_injection_elements(grid, self._inner.n_bus)
             # |V|-fixed buses (pv ∪ slack, AC-solver numbering) -- the only
             # buses set_gen_v() acts on; used to spot two connected generators
@@ -267,6 +274,9 @@ class InjectionSweepGPU:
 
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
+
+        # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        self._apply_physical_checks_kwargs(compute_physical_violations)
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,

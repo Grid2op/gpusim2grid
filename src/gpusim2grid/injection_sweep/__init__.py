@@ -52,6 +52,10 @@ from ..contingency_analysis import (
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
 )
+from ..contingency_analysis._physical_checks import (
+    PhysicalChecksEngineMixin,
+    PhysicalChecksFacadeMixin,
+)
 
 
 _STRATEGY_MAP = {
@@ -168,7 +172,7 @@ class _DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _InjectionSweepSolver:
+class _InjectionSweepSolver(PhysicalChecksEngineMixin):
     """Stateful GPU batched-injection power flow solver.
 
     The base-case Newton-Raphson is solved once at construction; subsequent

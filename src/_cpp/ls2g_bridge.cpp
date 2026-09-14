@@ -10,6 +10,8 @@
 #include "ledger_extend.hpp"   // materialize_vc_custom_rows, reserve_stranded_controller_slots
 #include "timing_utils.hpp"    // ms_since
 
+#include <batch_algorithm/BusQCheck.hpp>   // ls2g::bus_q_check::build_bus_q_plan (lightsim2grid >= PR #206)
+
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -529,6 +531,19 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             ld.hvdc_pmax21 = to_dv(h.pmax21);
             ld.hvdc_connected1.assign(h.connected1.begin(), h.connected1.end());
             ld.hvdc_connected2.assign(h.connected2.begin(), h.connected2.end());
+            // Grid hvdc id of each entry, replaying LSGrid::fill_hvdc_droop_solver_data's
+            // own selection (droop enabled AND globally connected, ascending id) --
+            // what compute_physical_violations reports. Only trusted when the replay
+            // lands on the same count; otherwise left empty (entry index).
+            {
+                const ls2g::HvdcLineContainer& hv = grid.get_dclines();
+                const std::vector<bool>& droop_on = hv.get_droop_enabled();
+                const std::vector<bool>& glob_on  = hv.get_status_global();
+                std::vector<int> ids;
+                for (int hid = 0; hid < hv.nb(); ++hid)
+                    if (droop_on[hid] && glob_on[hid]) ids.push_back(hid);
+                if (static_cast<int>(ids.size()) == nh) ld.hvdc_id = ids;
+            }
         }
     }
 
@@ -783,6 +798,67 @@ extract_limits_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver)
 {
     LimitData ld = extract_limits(grid, n_bus_solver);
     return std::make_tuple(ld.bus_vmin_kv, ld.bus_vmax_kv, ld.limit_a1_ka, ld.limit_a2_ka);
+}
+
+BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    // lightsim2grid's own routing, on the labelling the session solves in (the
+    // AC cache of a solved grid) and the same controller list the ledger was
+    // read from (extract_ledger_data).
+    ls2g::VoltageControlSolverData ctrl;
+    grid.fill_voltage_control_solver_data(ctrl, /*ac=*/true);
+    ls2g::bus_q_check::BusQPlan plan;
+    ls2g::bus_q_check::build_bus_q_plan(grid, grid.id_me_to_ac_solver(), ctrl, plan);
+
+    const ls2g::GeneratorContainer& gens  = grid.get_generators();
+    const ls2g::SvcContainer&       svcs  = grid.get_svcs();
+    const ls2g::HvdcLineContainer&  hvdcs = grid.get_dclines();
+
+    BusQPlanData out;
+    out.sn_mva = static_cast<double>(grid.get_sn_mva());
+    std::vector<int>    bus_solver, n_fixed, gen_start{0}, gen_id;
+    std::vector<double> qmin_fixed, qmax_fixed, bmin_sum, bmax_sum, gen_qmin, gen_qmax;
+    for (const ls2g::bus_q_check::BusQEntry& e : plan.buses) {
+        if (e.bus_solver < 0 || e.bus_solver >= n_bus_solver) continue;   // not in the solved system
+        double qmin = 0., qmax = 0., bmin = 0., bmax = 0.;
+        for (const auto& st : e.station_ids) {
+            qmin += static_cast<double>(hvdcs.get_station_min_q_mvar(st.first, st.second));
+            qmax += static_cast<double>(hvdcs.get_station_max_q_mvar(st.first, st.second));
+        }
+        for (int svc : e.svc_ids) {
+            bmin += static_cast<double>(svcs.get_b_min(svc));
+            bmax += static_cast<double>(svcs.get_b_max(svc));
+        }
+        for (int g : e.gen_ids) {
+            gen_id.push_back(g);
+            gen_qmin.push_back(static_cast<double>(gens.get_min_q(g)));
+            gen_qmax.push_back(static_cast<double>(gens.get_max_q(g)));
+        }
+        bus_solver.push_back(e.bus_solver);
+        n_fixed.push_back(static_cast<int>(e.station_ids.size() + e.svc_ids.size()));
+        qmin_fixed.push_back(qmin); qmax_fixed.push_back(qmax);
+        bmin_sum.push_back(bmin);   bmax_sum.push_back(bmax);
+        gen_start.push_back(static_cast<int>(gen_id.size()));
+    }
+    auto iv = [](const std::vector<int>& v) { return Eigen::VectorXi::Map(v.data(), static_cast<Eigen::Index>(v.size())).eval(); };
+    auto rv = [](const std::vector<double>& v) {
+        RealVect r(static_cast<Eigen::Index>(v.size()));
+        for (size_t i = 0; i < v.size(); ++i) r(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(v[i]);
+        return r;
+    };
+    out.n_check         = static_cast<int>(bus_solver.size());
+    out.bus_solver      = iv(bus_solver);
+    out.n_fixed         = iv(n_fixed);
+    out.gen_start       = iv(gen_start);
+    out.gen_id          = iv(gen_id);
+    out.qmin_fixed_mvar = rv(qmin_fixed);
+    out.qmax_fixed_mvar = rv(qmax_fixed);
+    out.bmin_sum_pu     = rv(bmin_sum);
+    out.bmax_sum_pu     = rv(bmax_sum);
+    out.gen_qmin_mvar   = rv(gen_qmin);
+    out.gen_qmax_mvar   = rv(gen_qmax);
+    out.validate(n_bus_solver);
+    return out;
 }
 
 std::shared_ptr<InjectionSweepSession>

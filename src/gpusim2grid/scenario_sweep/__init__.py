@@ -46,7 +46,13 @@ from ..contingency_analysis import (
 from ..contingency_analysis._limit_violations import (
     ViolationElementType,
     LimitViolationType,
+    ViolationCategory,
+    violation_category,
     LimitViolation,
+)
+from ..contingency_analysis._physical_checks import (
+    PhysicalChecksEngineMixin,
+    PhysicalChecksFacadeMixin,
 )
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
@@ -76,7 +82,7 @@ def _resolve_strategy(strategy):
     )
 
 
-class _ScenarioSweepSolver:
+class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
     """Stateful GPU row-aligned combined topology + injection sweep.
 
     The base-case Newton-Raphson is solved once at construction; subsequent

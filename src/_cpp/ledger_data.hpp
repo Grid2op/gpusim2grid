@@ -83,6 +83,10 @@ struct LedgerData {
     // cross-check, not something normally expected to be false -- see
     // HvdcDroopSolverData::connected1/connected2 in lightsim2grid.
     std::vector<int>    hvdc_connected1, hvdc_connected2;
+    // Grid-model hvdc id of each entry (what a violation record reports; see
+    // compute_physical_violations). Optional: empty means "the entry index"
+    // (array/tuple mode, where there is no other numbering).
+    std::vector<int>    hvdc_id;
 
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }

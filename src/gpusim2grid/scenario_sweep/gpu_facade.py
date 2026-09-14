@@ -28,6 +28,7 @@ PV→PQ relabelling without changing the Jacobian pattern).
 import numpy as np
 
 from . import (
+    PhysicalChecksFacadeMixin,
     _ScenarioSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -52,7 +53,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class ScenarioSweepGPU:
+class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -136,7 +137,8 @@ class ScenarioSweepGPU:
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
-                 use_distributed_slack=True):
+                 use_distributed_slack=True,
+                 compute_physical_violations=False):
         _validate_precision(precision)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
@@ -248,6 +250,9 @@ class ScenarioSweepGPU:
 
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
+
+        # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        self._apply_physical_checks_kwargs(compute_physical_violations)
 
         # set_injections_from_elements() inputs, kept so a later
         # set_contingency_gens() (or vice versa) can re-assemble Sbus with the

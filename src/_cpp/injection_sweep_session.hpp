@@ -43,6 +43,7 @@
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 
 #include <memory>
 #include <vector>
@@ -140,6 +141,13 @@ struct InjectionSweepSession {
     // transfer time (t_copy_V_to_host_ms / t_copy_residuals_to_host_ms)
     // without relaxing their constness.
     mutable BatchTimings timings_;
+
+    // post-solve physical checks (see physical_checks() above)
+    PhysicalChecksConfig phys_;
+    // Residual gate of the physical checks (a row whose ||F||inf is NaN or above
+    // it reports nothing), the same role violation_tol_ plays on the other two
+    // sessions. Independent of tol_base.
+    double violation_tol_ = 1e-6;
 
     // =========================================================================
     // Constructor — runs base-case NR to convergence (AcPfNrState construction).
@@ -267,6 +275,25 @@ struct InjectionSweepSession {
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
+
+    // =========================================================================
+    // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
+    // .hpp): the per-bus reactive capability (compute_physical_violations,
+    // lightsim2grid PR #206 parity) and the droop hvdc P-saturation
+    // (compute_physical_violations). Flags / tolerances / capacities live on
+    // physical_checks(); mutable, taken into account at the next run().
+    // set_bus_q_capability() hands in the plan the reactive check needs (built
+    // by lightsim2grid's own build_bus_q_plan through the bridge, or by the
+    // caller in array mode). The get_* accessors are synchronous D->H copies
+    // and throw unless the last run() had the corresponding flag on.
+    // =========================================================================
+    PhysicalChecksConfig&       physical_checks()       { return phys_; }
+    const PhysicalChecksConfig& physical_checks() const { return phys_; }
+    void set_bus_q_capability(const BusQPlanData& plan);
+    BusQViolationsResult  get_bus_q_violations()    const;
+    BusQViolationsResult  get_bus_q_violations_n()  const;
+    HvdcPViolationsResult get_hvdc_p_violations()   const;
+    HvdcPViolationsResult get_hvdc_p_violations_n() const;
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     InjectionSweepSession(const InjectionSweepSession&)            = delete;

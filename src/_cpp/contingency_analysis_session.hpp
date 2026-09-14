@@ -35,6 +35,7 @@
 #include "dtypes.hpp"
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -131,6 +132,9 @@ struct ContingencyAnalysisSession {
 
     RealVect h_bus_vmin_kv_, h_bus_vmax_kv_;               // [n_bus], solver numbering
     RealVect h_branch_limit_a1_ka_, h_branch_limit_a2_ka_; // [n_branches], lines-then-trafos
+
+    // post-solve physical checks (see physical_checks() above)
+    PhysicalChecksConfig phys_;
 
     // =========================================================================
     // Contingency data (populated by build_contingencies())
@@ -302,6 +306,25 @@ struct ContingencyAnalysisSession {
     Eigen::VectorXi get_violation_count_low_voltage()  const;
     Eigen::VectorXi get_violation_count_high_voltage() const;
     Eigen::VectorXi get_violation_count_current()      const;
+
+    // =========================================================================
+    // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
+    // .hpp): the per-bus reactive capability (compute_physical_violations,
+    // lightsim2grid PR #206 parity) and the droop hvdc P-saturation
+    // (compute_physical_violations). Flags / tolerances / capacities live on
+    // physical_checks(); mutable, taken into account at the next run().
+    // set_bus_q_capability() hands in the plan the reactive check needs (built
+    // by lightsim2grid's own build_bus_q_plan through the bridge, or by the
+    // caller in array mode). The get_* accessors are synchronous D->H copies
+    // and throw unless the last run() had the corresponding flag on.
+    // =========================================================================
+    PhysicalChecksConfig&       physical_checks()       { return phys_; }
+    const PhysicalChecksConfig& physical_checks() const { return phys_; }
+    void set_bus_q_capability(const BusQPlanData& plan);
+    BusQViolationsResult  get_bus_q_violations()    const;
+    BusQViolationsResult  get_bus_q_violations_n()  const;
+    HvdcPViolationsResult get_hvdc_p_violations()   const;
+    HvdcPViolationsResult get_hvdc_p_violations_n() const;
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ContingencyAnalysisSession(const ContingencyAnalysisSession&)            = delete;

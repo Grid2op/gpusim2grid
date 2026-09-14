@@ -352,6 +352,10 @@ struct BatchTimings {
     // compute_limit_violations only; zero unless enabled.
     double t_violation_setup_ms         = 0.;   // H->D limits upload + buffer alloc (set_violation_limits())
     double t_copy_violations_to_host_ms = 0.;   // D->H across the 10 get_violation_*() accessors
+    // compute_physical_violations only; zero unless enabled: H->D plan upload +
+    // buffer alloc + the base ("n") checks (set_bus_q_check / run_bus_q_check_n,
+    // set_hvdc_p_check / run_hvdc_p_check_n)
+    double t_physical_setup_ms = 0.;
 
     // --- per-chunk accumulated (TimingEntry: gpu + wall) ---
     TimingEntry t_tile_V;
@@ -371,6 +375,10 @@ struct BatchTimings {
     // is enabled -- see t_store_V for the rest of that phase (nr_mask_v_nan +
     // the V-results store, both unconditional).
     TimingEntry t_violation_check;
+    // check_bus_q_violations_kernel / check_hvdc_p_violations_kernel only; zero
+    // unless compute_physical_violations is on.
+    TimingEntry t_bus_q_check;
+    TimingEntry t_hvdc_p_check;
     TimingEntry t_flow_computation;
 
     // --- metadata ---
@@ -404,7 +412,8 @@ struct BatchTimings {
               + t_tile_Sbus      + t_spmv           + t_fill_F
               + t_fill_J         + t_first_factorize + t_refactorize
               + t_solve          + t_update_V       + t_residual
-              + t_store_V        + t_violation_check + t_flow_computation).wall_ms;
+              + t_store_V        + t_violation_check + t_bus_q_check
+              + t_hvdc_p_check   + t_flow_computation).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).
@@ -419,7 +428,7 @@ struct BatchTimings {
 
     double t_host_to_device_ms() const {
         return t_alloc_ms + t_source_init_ms + t_branch_data_upload_ms
-             + t_violation_setup_ms;
+             + t_violation_setup_ms + t_physical_setup_ms;
     }
 
     double t_device_to_host_ms() const {

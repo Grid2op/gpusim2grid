@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "injection_sweep_session.hpp"
+#include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/injection_batch.cuh"
@@ -212,6 +213,12 @@ void InjectionSweepSession::run()
         max_dVa_,
         max_dVm_);
 
+    // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+    // violations); an injection sweep never disconnects a generator (nullptr mask).
+    const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
+        phys_, *solver_, "InjectionSweepSession", violation_tol_, sn_mva_,
+        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0);
+
     timings_ = solver_->solve();
     timings_.t_base_case_ms  = t_base_case_ms_;
     timings_.t_preprocess_ms += base_state_->timings.t_build_J_ms;
@@ -235,6 +242,7 @@ void InjectionSweepSession::run()
     // AcPfTimings::t_ground_truth_check_ms.
     timings_.t_ground_truth_check_ms = base_state_->timings.t_ground_truth_check_ms;
     timings_.n_disconnected   = 0;
+    physical_checks::after_solve(phys_, timings_, t_phys);
 
     solver_->cs.synchronize();
 }
@@ -394,4 +402,41 @@ RealVect InjectionSweepSession::get_ex_amps() const
         throw std::runtime_error(
             "InjectionSweepSession: call run() and compute_flows() first");
     return h_ex_amps_;
+}
+
+// =============================================================================
+// Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+// violations) -- shared glue in contingency/physical_checks_impl.cuh
+// =============================================================================
+void InjectionSweepSession::set_bus_q_capability(const BusQPlanData& plan)
+{
+    phys_.set_bus_q_plan(plan, base_state_->n_bus);
+}
+
+BusQViolationsResult InjectionSweepSession::get_bus_q_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+BusQViolationsResult InjectionSweepSession::get_bus_q_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult InjectionSweepSession::get_hvdc_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                         timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult InjectionSweepSession::get_hvdc_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                         timings_.t_copy_violations_to_host_ms);
 }
