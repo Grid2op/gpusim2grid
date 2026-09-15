@@ -879,3 +879,34 @@ class TestConflictingSetpoints:
         V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v)
         assert pf.get_disconnected().tolist() == [0, 0, 0]
         torch.testing.assert_close(V, V_ok, atol=solver_atol, rtol=0)
+
+    @fp64_only
+    def test_non_regulating_colocated_generator_is_ignored(self, solver_atol):
+        """A non voltage-regulating generator sharing a PV bus with a regulating
+        one writes no voltage: its gen_v (0.0, as in real snapshots) neither
+        conflicts nor applies and gets a zero gradient -- checked against finite
+        differences, like the regulating generator's own gen_v."""
+        pytest.importorskip("pypowsybl")
+        from test_gen_v import _ieee14_with_colocated_pq_gen
+        grid, g_reg, g_pq = _ieee14_with_colocated_pq_gen()
+        pf = _pf(grid, nb_iter=15)
+        assert int(pf._gen_v_bus_all[g_pq]) == -1
+        assert int(pf._gen_v_bus_all[g_reg]) == int(pf._gen_bus_all[g_pq]) >= 0
+        n = 2
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05])
+        line_status, _ = _all_connected(pf, n)
+        gen_v = torch.full((n, pf.n_gen), float("nan"), dtype=RDT, device="cuda")
+        gen_v[:, g_reg] = 1.04
+        V_ref = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v,
+                   line_status=line_status).clone()
+        gen_v[:, g_pq] = 0.0
+        grads = _fd_check(pf, load_p, load_q, gen_p, gen_v, line_status,
+                          [("gen_v", (0, g_reg)), ("gen_v", (1, g_reg)),
+                           ("gen_v", (1, g_pq)), ("load_q", (1, 1))])
+        assert torch.all(grads["gen_v"].grad[:, g_pq] == 0)
+        assert torch.all(grads["gen_v"].grad[:, g_reg] != 0)
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v,
+               line_status=line_status)
+        assert pf.get_disconnected().tolist() == [0, 0]
+        torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
+        assert abs(V[0, int(pf._gen_bus_all[g_reg])]).item() == pytest.approx(1.04, abs=1e-8)

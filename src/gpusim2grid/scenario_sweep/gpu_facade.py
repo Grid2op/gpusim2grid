@@ -408,11 +408,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
             row-aligned with :meth:`set_injections_from_elements` /
             :meth:`set_injections` / :meth:`set_topology`. NaN leaves that
             (scenario, generator) untouched. Only applied to generators
-            whose OWN bus is voltage-fixed (PV or slack) in this session's
-            base case -- a disconnected, reactive-only ("PQ"), or remotely
-            voltage-regulating (SVC / VoltageControl) generator's column is
-            silently ignored, mirroring lightsim2grid's own
-            ``voltage_regulator_on_``-gated behavior. Left unset entirely
+            that regulate the voltage of their OWN bus, that bus being
+            voltage-fixed (PV or slack) in this session's base case -- a
+            disconnected, non-regulating (``voltage_regulator_on`` False,
+            even when co-located with a regulating one), treated-as-off, or
+            remotely voltage-regulating (SVC / VoltageControl) generator's
+            column is silently ignored, mirroring lightsim2grid's own
+            ``set_vm`` skips (``InjectionElements.gen_v_bus``). Left unset entirely
             (the default), every scenario keeps the grid's own base-case
             voltage.
 
@@ -436,7 +438,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
         gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
-        self._inner.set_gen_v(gen_v, self._elements.gen_bus)
+        self._inner.set_gen_v(gen_v, self._elements.gen_v_bus)
         self._gen_v = gen_v
         self._update_skipped_rows()
 
@@ -448,7 +450,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         gen_off = self._gen_off
         if gen_off is not None and gen_off.shape[0] != self._gen_v.shape[0]:
             gen_off = None
-        bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_bus,
+        bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_v_bus,
                                      self._inner.is_vm_fixed_bus, gen_off=gen_off)
         if bad.any():
             self._inner.set_skipped_rows(bad)

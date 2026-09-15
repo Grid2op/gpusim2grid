@@ -92,8 +92,11 @@ depending on ``gen_v`` through ``G``. Hence
 where ``∂S_calc/∂Vm_k`` is the dS/dVm column ``fill_J`` never stores for a
 Vm-fixed bus, evaluated on the row's own patched Ybus. The minus sign is the
 implicit-function sign: ``dx/dVm_k = -J⁻¹ ∂S_calc/∂Vm_k``. Only generators
-whose own bus is Vm-fixed (pv or slack) get a non-zero gradient -- exactly
-the ones ``set_gen_v`` acts on; a NaN entry (= "keep the base-case voltage")
+that write the voltage of their own Vm-fixed (pv or slack) bus
+(``InjectionElements.gen_v_bus``: connected, voltage regulation on, not
+treated as off) get a non-zero gradient -- exactly the ones ``set_gen_v``
+acts on; a non-regulating generator co-located with a regulating one gets 0
+and its ``gen_v`` never conflicts; a NaN entry (= "keep the base-case voltage")
 gets 0.
 
 Row bookkeeping: the session works in *active-slot* order (rows the
@@ -177,7 +180,9 @@ class BatchPowerFlow:
         self._load_sel = torch.as_tensor(np.asarray(el.load_sel, dtype=np.int64), device=dev)
         self._load_bus_sel = torch.as_tensor(np.asarray(el.load_bus[el.load_sel], dtype=np.int64), device=dev)
         self._gen_bus_all = torch.as_tensor(np.asarray(el.gen_bus, dtype=np.int64), device=dev)
-        self._gen_bus_np = np.ascontiguousarray(el.gen_bus, dtype=np.int32)
+        # bus each gen_v set-point writes (-1: none; see InjectionElements.gen_v_bus)
+        self._gen_v_bus_all = torch.as_tensor(np.asarray(el.gen_v_bus, dtype=np.int64), device=dev)
+        self._gen_v_bus_np = np.ascontiguousarray(el.gen_v_bus, dtype=np.int32)
         self._is_vm_fixed = torch.as_tensor(self._solver.is_vm_fixed_bus, device=dev)
         # Generator contingencies (build_bus_injections' gen_off correction):
         # the target Q of a NON-regulating generator sits inside const_mw and
@@ -216,9 +221,9 @@ class BatchPowerFlow:
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
         self._skip_in_session = False
         self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
-        # Columns that can conflict: connected generators on a Vm-fixed bus
-        # sharing that bus with another such generator.
-        gb = np.asarray(el.gen_bus, dtype=np.int64)
+        # Columns that can conflict: voltage-writing generators on a Vm-fixed
+        # bus sharing that bus with another such generator.
+        gb = np.asarray(el.gen_v_bus, dtype=np.int64)
         fixed = np.asarray(self._solver.is_vm_fixed_bus, dtype=bool)
         ok = gb >= 0
         ok[ok] = fixed[gb[ok]]
@@ -544,7 +549,7 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             pf._gen_off_in_session = True
             pf._pending_gen_off = None
         if gen_v is not None:
-            solver.set_gen_v_dlpack(gen_v.detach().contiguous().__dlpack__(), pf._gen_bus_np, stream)
+            solver.set_gen_v_dlpack(gen_v.detach().contiguous().__dlpack__(), pf._gen_v_bus_np, stream)
             pf._gen_v_in_session = True
         elif pf._gen_v_in_session:
             solver.clear_gen_v()
@@ -649,7 +654,7 @@ class _BatchPowerFlowOp(torch.autograd.Function):
         if ctx.want_gen_v:
             gvm = torch.from_dlpack(gvm_cap).clone()          # indirect term (sign included)
             g_bus = proj_vm + gvm                              # + direct term
-            gen_bus = pf._gen_bus_all
+            gen_bus = pf._gen_v_bus_all
             safe_bus = gen_bus.clamp(min=0)
             ok = (gen_bus >= 0) & pf._is_vm_fixed[safe_bus]
             g = g_bus[:, safe_bus]

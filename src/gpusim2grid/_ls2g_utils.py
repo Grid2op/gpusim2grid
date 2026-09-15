@@ -232,6 +232,15 @@ class InjectionElements:
     # in Sbus -- it is solved for). Mirrors lightsim2grid's SbusPolicy.
     gen_target_q_mvar: np.ndarray = None
     gen_vreg_on: np.ndarray = None
+    # (n_gen,) AC-solver bus whose magnitude each generator's gen_v set-point
+    # writes, -1 where it writes none: lightsim2grid's _for_each_vm_writer skips
+    # (disconnected, voltage regulation off, treated as off = pseudo-off while
+    # turnedoff_gen_pv is False), taken at the base case. The only mapping
+    # set_gen_v() / conflicting_gen_v_rows() / BatchPowerFlow's gen_v may use:
+    # gen_bus would let a non-regulating generator's stale target_vm (often
+    # 0.0 in real snapshots) clobber, or conflict with, a co-located regulating
+    # generator's set-point.
+    gen_v_bus: np.ndarray = None
     # (n_load,) AC-solver bus id of every load (-1 for a disconnected one) and
     # the base-case per-element values the snapshot was taken at (MW / MVAr):
     # what gpusim2grid.differentiable.BatchPowerFlow needs to build its own
@@ -330,6 +339,11 @@ def extract_injection_elements(grid, n_bus):
     gen_bus_out = np.where(gen_status, gen_bus, -1)
     gen_target_q = np.array([float(g.target_q_mvar) for g in gens], dtype=np.float64)
     gen_vreg_on = np.array([bool(g.voltage_regulator_on) for g in gens], dtype=bool)
+    # GeneratorContainer::_treated_as_off: (!turnedoff_gen_pv) && is_pseudo_off
+    pseudo_off = np.array([(not g.is_slack) and abs(g.slack_weight) < _TOL_EQUAL_FLOAT
+                           and abs(g.target_p_mw) < _TOL_EQUAL_FLOAT for g in gens], dtype=bool)
+    treated_off = pseudo_off & (not bool(grid.get_turnedoff_gen_pv()))
+    gen_v_bus = np.where(gen_status & gen_vreg_on & ~treated_off, gen_bus, -1)
 
     load_bus_out = np.where(load_status, load_bus, -1)
 
@@ -340,11 +354,14 @@ def extract_injection_elements(grid, n_bus):
         scatter_load=scatter_load, scatter_gen=scatter_gen,
         const_mw=const_mw, gen_bus=gen_bus_out,
         gen_target_q_mvar=gen_target_q, gen_vreg_on=gen_vreg_on,
+        gen_v_bus=gen_v_bus,
         load_bus=load_bus_out,
         load_p_base=load_p_base, load_q_base=load_q_base, gen_p_base=gen_p_base)
 
 
 GEN_V_CONFLICT_TOL = 1e-8
+# lightsim2grid's BaseConstants::_tol_equal_float (pseudo-off test)
+_TOL_EQUAL_FLOAT = 1e-7
 
 
 def conflicting_gen_v_rows(gen_v, gen_bus, is_vm_fixed_bus, gen_off=None,
@@ -352,9 +369,11 @@ def conflicting_gen_v_rows(gen_v, gen_bus, is_vm_fixed_bus, gen_off=None,
     """Rows of a ``(n_rows, n_gen)`` ``gen_v`` matrix that ask one bus for two
     different voltage magnitudes.
 
-    Only the entries a session would actually apply count: a generator whose
-    own AC-solver bus is Vm-fixed (``is_vm_fixed_bus[gen_bus[g]]``), connected
-    (``gen_bus[g] >= 0`` and not ``gen_off[row, g]``), with a non-NaN value.
+    ``gen_bus`` must be ``InjectionElements.gen_v_bus`` (-1 for a generator
+    that writes no voltage), not ``gen_bus``. Only the entries a session would
+    actually apply count: a generator whose AC-solver bus is Vm-fixed
+    (``is_vm_fixed_bus[gen_bus[g]]``), writing a voltage (``gen_bus[g] >= 0``)
+    and not taken out by ``gen_off[row, g]``, with a non-NaN value.
     Two such generators on the same bus with set-points further apart than
     ``tol`` (per-unit) make the row infeasible -- |V| at a bus is unique --
     so the callers report it as NOT SIMULATED instead of letting the last
