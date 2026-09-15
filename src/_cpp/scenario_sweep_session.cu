@@ -329,7 +329,7 @@ void ScenarioSweepSession::_prepare_gen_contingency(
 
 // =============================================================================
 // _row_slack_weights — mirrors BaseBatchSweep::_row_slack_weights /
-// GeneratorContainer::get_slack_weights_solver_without
+// LSGrid::get_slack_weights_solver_without
 // =============================================================================
 std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     const std::vector<std::vector<int>>& row_slack_off) const
@@ -360,8 +360,15 @@ std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
         }
         std::fill(off.begin(), off.end(), 0);
         for (int g : row_slack_off[static_cast<size_t>(r)]) off[static_cast<size_t>(g)] = 1;
+        // the storage units taking part in the slack keep their share on every
+        // row: no row disconnects one
         std::fill(w.begin(), w.end(), 0.0);
         double sum = 0.0;
+        const std::vector<double>& sto_w = gen_data_.storage_slack_weight_bus;
+        for (int b = 0; b < n_bus && b < static_cast<int>(sto_w.size()); ++b) {
+            w[static_cast<size_t>(b)] = sto_w[static_cast<size_t>(b)];
+            sum += sto_w[static_cast<size_t>(b)];
+        }
         for (int g = 0; g < gen_data_.n_gen; ++g) {
             if (!gen_data_.status[g] || !gen_data_.slack_participant[g] || off[static_cast<size_t>(g)]) continue;
             const int b = gen_data_.bus[g];

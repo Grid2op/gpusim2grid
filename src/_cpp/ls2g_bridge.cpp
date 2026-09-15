@@ -449,6 +449,23 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
         d.slack_participant[g] =
             (gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12) ? 1 : 0;
     }
+
+    // the storage units taking part in the distributed slack: a constant term of
+    // every row's re-weighting, since no row disconnects one
+    d.storage_slack_weight_bus.assign(static_cast<size_t>(std::max(n_bus_solver, 0)), 0.0);
+    const ls2g::StorageContainer& storages = grid.get_storages();
+    for (int s = 0; s < storages.nb(); ++s) {
+        const ls2g::StorageInfo si(storages, s);
+        if (!si.connected || !si.is_slack || std::abs(static_cast<double>(si.slack_weight)) <= 1e-12) continue;
+        const int bus_me = si.bus_id;
+        int bus_solver = bus_me;
+        if (!me_to_solver.empty()) {
+            bus_solver = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size()))
+                         ? me_to_solver[bus_me] : -1;
+        }
+        if (bus_solver < 0 || bus_solver >= n_bus_solver) continue;
+        d.storage_slack_weight_bus[static_cast<size_t>(bus_solver)] += static_cast<double>(si.slack_weight);
+    }
     return d;
 }
 
