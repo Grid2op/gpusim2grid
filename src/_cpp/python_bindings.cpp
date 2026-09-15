@@ -73,8 +73,9 @@ static void bind_physical_checks_types(pybind11::module_& m)
     pybind11::class_<BusQPlanData>(m, "BusQPlanData",
         "Flattened plan of the per-bus reactive-capability check "
         "(compute_physical_violations): per checked bus (SOLVER numbering) the summed "
-        "fixed capability of its hvdc converter stations (MVAr), how many always-live "
-        "machines (stations + voltage-mode SVCs) hold it, the summed SVC susceptance "
+        "fixed capability of its hvdc converter stations and voltage-regulating storage "
+        "units (MVAr), how many always-live machines (stations + storage units + "
+        "voltage-mode SVCs) hold it, the summed SVC susceptance "
         "range (pu, worth b*|V|^2*sn_mva MVAr at the row's voltage) and a CSR of its "
         "voltage-regulating generators (container id, min_q/max_q MVAr). Built from a "
         "solved lightsim2grid grid by _extract_bus_q_plan_from_lsgrid (lightsim2grid's "
@@ -1975,8 +1976,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "BusQPlanData of compute_physical_violations off a solved lightsim2grid LSGrid, "
         "built by lightsim2grid's own bus_q_check::build_bus_q_plan (so the routing "
         "-- which machines hold which bus -- is identical to its batch classes'): "
-        "voltage-regulating generators (min_q/max_q MVAr), hvdc converter stations "
-        "and voltage-mode SVCs (b_min/b_max, pu). Solver bus numbering; n_bus_solver "
+        "voltage-regulating generators (min_q/max_q MVAr), storage units and hvdc "
+        "converter stations (MVAr) and voltage-mode SVCs (b_min/b_max, pu). Solver bus "
+        "numbering; n_bus_solver "
         "is the session's n_bus.");
 
     m.def("_make_is_session_from_lsgrid",

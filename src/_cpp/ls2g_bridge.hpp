@@ -223,9 +223,10 @@ extract_limits_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
 // lightsim2grid PR #206) off a solved LSGrid, built by lightsim2grid's OWN
 // bus_q_check::build_bus_q_plan -- the same routing its batch classes use:
 // which buses a voltage-regulating machine holds (a local PV generator or a
-// VoltageControl controller, an hvdc converter station, a voltage-mode SVC),
-// and what each can produce -- and flattened into BusQPlanData (solver bus
-// numbering, MVAr for generators / stations, pu susceptance for SVCs, plus
+// VoltageControl controller, a voltage-regulating storage unit, an hvdc
+// converter station, a voltage-mode SVC), and what each can produce -- and
+// flattened into BusQPlanData (solver bus numbering, MVAr for generators /
+// storage units / stations, pu susceptance for SVCs, plus
 // sn_mva). n_bus_solver is the session's n_bus. Empty when no machine
 // regulates any voltage.
 BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);

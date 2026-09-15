@@ -408,6 +408,51 @@ def test_voltage_control_grids_match(solver_atol, make):
                  _got_rows([gpu.get_physical_violations_n()]), _mvar_atol(grid, solver_atol))
 
 
+STORAGE_BUS, STORAGE_MAX_Q = 9, 0.5
+
+
+def _tight_storage_grid(max_q_mvar=5.):
+    """Tight case14 with a storage unit regulating its own bus 9 (a load bus,
+    no generator): a PV bus like a local generator's, whose [min_q, max_q]
+    joins that bus' capability as a fixed term (no row disconnects it)."""
+    from lightsim2grid.network import init_from_pandapower
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(_tight_net(max_q_mvar))
+        if not hasattr(grid, "init_storages_full"):
+            pytest.skip("this lightsim2grid build has no init_storages_full")
+        grid.init_storages_full(np.array([0.0]), np.array([0.0]), [True], np.array([1.035]),
+                                np.array([-STORAGE_MAX_Q]), np.array([STORAGE_MAX_Q]),
+                                np.array([STORAGE_BUS], dtype=np.int32))
+        grid.tell_solver_need_reset()
+    v0 = _solve(grid)
+    return grid, v0
+
+
+@needs_bridge
+def test_storage_unit_capability_matches(solver_atol):
+    """A voltage-regulating storage unit holds its bus like a local generator:
+    the bridge must carry its reactive range into the plan, or the GPU
+    compares that bus against nothing and disagrees with lightsim2grid."""
+    grid, v0 = _tight_storage_grid()
+    ctgs = _all_n1(grid)[:8]
+    ref = _ref_ca(grid, v0, ctgs)
+    gpu = _gpu_ca(grid, ctgs)
+    atol = _mvar_atol(grid, solver_atol)
+    conv = np.asarray(ref.converged_mask(), dtype=bool)
+    assert conv.sum() >= 4
+    ref_rows = [r for r, c in zip(_ref_rows(ref.get_physical_violations(), _me2s(grid)), conv) if c]
+    got_rows = [r for r, c in zip(_got_rows(gpu.get_physical_violations()), conv) if c]
+    _assert_same(ref_rows, got_rows, atol)
+    ref_n = _ref_rows([ref.get_physical_violations_n()], _me2s(grid))
+    _assert_same(ref_n, _got_rows([gpu.get_physical_violations_n()]), atol)
+    # the storage unit's bus is actually reported, against its own range alone
+    sto_solver = int(_me2s(grid)[STORAGE_BUS])
+    at_sto = [x for x in ref_n[0] if x[0] == sto_solver]
+    assert len(at_sto) == 1, "the fixture needs the storage unit's bus to be reported"
+    np.testing.assert_allclose(abs(at_sto[0][3]), STORAGE_MAX_Q, atol=1e-9)
+
+
 @needs_bridge
 def test_tuple_mode_matches_bridge(solver_atol):
     """Explicit-array mode: the plan is handed in as arrays (or the

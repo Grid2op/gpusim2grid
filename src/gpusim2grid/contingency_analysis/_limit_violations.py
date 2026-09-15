@@ -77,7 +77,8 @@ class LimitViolationType(IntEnum):
     #: pmax in the direction it flows -- OpenLoadFlow's HvdcAcEmulationLimits
     #: outer loop would saturate it (``compute_physical_violations``). Category
     #: PHYSICAL; gpusim2grid's own code, not in lightsim2grid yet.
-    HVDC_P_SATURATION = 7
+    HIGH_P = 7               # lightsim2grid's name for it (LimitViolation.hpp)
+    HVDC_P_SATURATION = 7    # alias: the name it was introduced under here
 
 
 class ViolationCategory(IntEnum):

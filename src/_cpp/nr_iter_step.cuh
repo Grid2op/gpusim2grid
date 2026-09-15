@@ -290,7 +290,7 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
     if (buf.n_hvdc > 0)
         hvdc_fill_feature_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
             buf.n_hvdc, n_bus, nnz_J, batch);
     if (buf.n_vc_feat > 0)

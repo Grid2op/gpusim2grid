@@ -762,6 +762,7 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
     const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
     const int*             __restrict__ h11,
     const int*             __restrict__ h12,
     const int*             __restrict__ h21,
@@ -785,11 +786,20 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type th2 = CudaFunHelper::my_atan2(
         CudaFunHelper::my_cuCimag(V2), CudaFunHelper::my_cuCreal(V2));
     const cuda_real_type raw = p0[e] + k[e] * (th1 - th2);
-    const cuda_real_type loss_mult =
-        (static_cast<cuda_real_type>(1.) - lf1[e]) * (static_cast<cuda_real_type>(1.) - lf2[e]);
-    // dp1 = dp_side1/dtheta1, dp2 = dp_side2/dtheta1; d/dtheta2 = -d/dtheta1
-    const cuda_real_type dp1 = (raw >= static_cast<cuda_real_type>(0.)) ? k[e] : k[e] * loss_mult;
-    const cuda_real_type dp2 = (raw <  static_cast<cuda_real_type>(0.)) ? -k[e] : -k[e] * loss_mult;
+    const cuda_real_type one = static_cast<cuda_real_type>(1.);
+    const bool side1_ctrl = raw >= static_cast<cuda_real_type>(0.);
+    // Exact derivative of hvdc_recv_pu w.r.t. the controller flow |raw|:
+    //   recv = (1-lf_recv)·(line_in - r·line_in²),  line_in = (1-lf_ctrl)·|raw|
+    //   recv' = (1-lf_recv)(1-lf_ctrl)·(1 - 2·r·line_in)
+    const cuda_real_type lf_ctrl = side1_ctrl ? lf1[e] : lf2[e];
+    const cuda_real_type line_in = (one - lf_ctrl) * (side1_ctrl ? raw : -raw);
+    const cuda_real_type recv_slope =
+        (one - lf1[e]) * (one - lf2[e]) * (one - static_cast<cuda_real_type>(2.) * r[e] * line_in);
+    // dp1 = dp_side1/dtheta1, dp2 = dp_side2/dtheta1; d/dtheta2 = -d/dtheta1.
+    // Controller side: p = ±raw, slope ±k. Receiving side: p = -recv(|raw|),
+    // and d|raw|/dtheta1 = ±k, so its slope is ∓k·recv'.
+    const cuda_real_type dp1 = side1_ctrl ?  k[e] :  k[e] * recv_slope;
+    const cuda_real_type dp2 = side1_ctrl ? -k[e] * recv_slope : -k[e];
 
     if (h11[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h11[e]],  dp1);
     if (h12[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h12[e]], -dp1);

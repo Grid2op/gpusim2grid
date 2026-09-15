@@ -334,8 +334,14 @@ __global__ void update_slack_absorbed_kernel(
 // GPU (mirroring lightsim2grid's Hvdc extension):
 //   • hvdc_adjust_mismatch_kernel : the theta-dependent droop flows leaving each
 //       end bus into the HVDC  ⇒  d_F[p_row(end)] -= p_flow
-//   • hvdc_fill_feature_kernel    : the (piecewise-constant) dP/dtheta slopes
-//       ADDED onto the four (p_row(end), theta_col(end)) J positions.
+//   • hvdc_fill_feature_kernel    : the dP/dtheta slopes ADDED onto the four
+//       (p_row(end), theta_col(end)) J positions -- the exact derivative of the
+//       flows above: k on the controller side, k·(1-lf1)(1-lf2)·(1 - 2·r·line_in)
+//       on the receiving side (the resistive loss is quadratic in the line
+//       current, so its slope is not constant). lightsim2grid's own stamp
+//       (NRSystem.hpp, Hvdc::fill_feature_values) drops that last factor; NR
+//       converges either way, but an adjoint solved on the inexact Jacobian
+//       inherits the error (~1e-4 relative on the P gradients of a real grid).
 //
 // Two lines may share an end bus / J position, so both kernels use atomicAdd.
 // Because the feature slopes ACCUMULATE onto (and some HVDC-only positions are
@@ -411,6 +417,7 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
     const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
     const int*             __restrict__ h11,
     const int*             __restrict__ h12,
     const int*             __restrict__ h21,

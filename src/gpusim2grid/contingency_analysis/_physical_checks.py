@@ -50,8 +50,8 @@ class PhysicalChecksEngineMixin:
     @property
     def compute_physical_violations(self):
         """bool: report, per converged row, the PHYSICAL violations -- the buses
-        whose voltage-holding machines (regulating generators, hvdc converter
-        stations, voltage-mode SVCs) had to produce more (or less) reactive
+        whose voltage-holding machines (regulating generators and storage
+        units, hvdc converter stations, voltage-mode SVCs) had to produce more (or less) reactive
         power than the SUM of what they own (``LOW_Q`` / ``HIGH_Q``; per bus,
         not per machine), and the linear-regime droop hvdc lines whose flow
         exceeds pmax in the direction it flows (``HVDC_P_SATURATION``). Same
@@ -104,7 +104,9 @@ class PhysicalChecksEngineMixin:
         of its constructor arguments ``(bus_solver, qmin_fixed_mvar,
         qmax_fixed_mvar, n_fixed, bmin_sum_pu, bmax_sum_pu, gen_start, gen_id,
         gen_qmin_mvar, gen_qmax_mvar, sn_mva)`` -- solver bus numbering, MVAr
-        for generators / hvdc stations, pu susceptance for SVCs, generators as
+        for generators / storage units / hvdc stations (a storage unit counts in
+        ``qmin_fixed_mvar`` / ``qmax_fixed_mvar`` and ``n_fixed``, like a station),
+        pu susceptance for SVCs, generators as
         a per-bus CSR of container ids (the columns of a generator-contingency
         mask). An empty plan (no bus) is accepted. Validated against n_bus;
         drops any previous report."""
@@ -165,8 +167,8 @@ class PhysicalChecksFacadeMixin:
         """Build the routing of the reactive-capability check off the
         lightsim2grid grid (the one this object was built from, unless ``grid``
         is given) with lightsim2grid's OWN ``build_bus_q_plan`` -- which buses a
-        voltage-regulating generator, hvdc converter station or voltage-mode SVC
-        holds, and what each can produce -- and hand it to the session. Needs
+        voltage-regulating generator, storage unit, hvdc converter station or
+        voltage-mode SVC holds, and what each can produce -- and hand it to the session. Needs
         the compiled bridge (any solved LSGrid will do, independently of
         ``use_bridge``). Done automatically when ``compute_physical_violations``
         is turned on and no plan was set yet; call it again if the generators'

@@ -811,6 +811,7 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
     ls2g::bus_q_check::build_bus_q_plan(grid, grid.id_me_to_ac_solver(), ctrl, plan);
 
     const ls2g::GeneratorContainer& gens  = grid.get_generators();
+    const ls2g::StorageContainer&   stos  = grid.get_storages();
     const ls2g::SvcContainer&       svcs  = grid.get_svcs();
     const ls2g::HvdcLineContainer&  hvdcs = grid.get_dclines();
 
@@ -825,6 +826,12 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
             qmin += static_cast<double>(hvdcs.get_station_min_q_mvar(st.first, st.second));
             qmax += static_cast<double>(hvdcs.get_station_max_q_mvar(st.first, st.second));
         }
+        // a voltage-regulating storage unit: a fixed [min_q, max_q] MVAr (generator
+        // convention), and no row disconnects one -- a fixed term like a station
+        for (int s : e.storage_ids) {
+            qmin += static_cast<double>(stos.get_min_q(s));
+            qmax += static_cast<double>(stos.get_max_q(s));
+        }
         for (int svc : e.svc_ids) {
             bmin += static_cast<double>(svcs.get_b_min(svc));
             bmax += static_cast<double>(svcs.get_b_max(svc));
@@ -835,7 +842,7 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
             gen_qmax.push_back(static_cast<double>(gens.get_max_q(g)));
         }
         bus_solver.push_back(e.bus_solver);
-        n_fixed.push_back(static_cast<int>(e.station_ids.size() + e.svc_ids.size()));
+        n_fixed.push_back(static_cast<int>(e.station_ids.size() + e.storage_ids.size() + e.svc_ids.size()));
         qmin_fixed.push_back(qmin); qmax_fixed.push_back(qmax);
         bmin_sum.push_back(bmin);   bmax_sum.push_back(bmax);
         gen_start.push_back(static_cast<int>(gen_id.size()));

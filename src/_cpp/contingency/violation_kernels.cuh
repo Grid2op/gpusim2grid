@@ -197,7 +197,7 @@ __global__ void check_limit_violations_kernel(
 //             + bmin_sum . |V_b|^2 . sn_mva          (idem q_max)
 //   a generator is live unless d_gen_off[out_c * n_gen + gen_id] (a
 //   ScenarioSweep generator contingency; nullptr = none). nb_live == 0 (every
-//   generator off, no station / SVC) => the bus is an ordinary PQ bus in this
+//   generator off, no station / storage unit / SVC) => the bus is an ordinary PQ bus in this
 //   row and is not checked (the residual there is nobody's output).
 //
 //   violation:  q_bus < q_min - tol_mvar  -> LOW_Q  (value q_bus, limit q_min)

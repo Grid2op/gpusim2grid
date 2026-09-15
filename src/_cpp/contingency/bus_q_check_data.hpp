@@ -20,10 +20,10 @@
 //
 // Per checked bus k (solver numbering):
 //   - qmin_fixed_mvar / qmax_fixed_mvar : the capability that never changes
-//     from row to row -- the voltage-regulating HVDC converter stations
-//     standing on the bus ([min_q, max_q] MVAr each, summed);
+//     from row to row -- the voltage-regulating HVDC converter stations and
+//     storage units standing on the bus ([min_q, max_q] MVAr each, summed);
 //   - n_fixed : how many such always-live machines hold the bus (stations +
-//     voltage-mode SVCs), so that a row can tell "nothing holds this bus any
+//     storage units + voltage-mode SVCs), so that a row can tell "nothing holds this bus any
 //     more" (nb_live == 0 -> not checked) once its generators are off;
 //   - bmin_sum_pu / bmax_sum_pu : the voltage-mode SVCs' susceptance range,
 //     summed (pu, base sn_mva). An SVC's capability is a susceptance, so what
@@ -54,8 +54,8 @@
 struct BusQPlanData {
     int             n_check = 0;
     Eigen::VectorXi bus_solver;                        // [n_check]
-    RealVect        qmin_fixed_mvar, qmax_fixed_mvar;  // [n_check] HVDC station sums (MVAr)
-    Eigen::VectorXi n_fixed;                           // [n_check] stations + svcs (always live)
+    RealVect        qmin_fixed_mvar, qmax_fixed_mvar;  // [n_check] HVDC station + storage unit sums (MVAr)
+    Eigen::VectorXi n_fixed;                           // [n_check] stations + storage units + svcs (always live)
     RealVect        bmin_sum_pu, bmax_sum_pu;          // [n_check] SVC susceptance sums (pu)
     Eigen::VectorXi gen_start;                         // [n_check + 1] CSR
     Eigen::VectorXi gen_id;                            // [nnz] generator container id
