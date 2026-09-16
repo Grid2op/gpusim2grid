@@ -60,6 +60,7 @@ struct PolicyRefactorEvery {
                     NrIterTimings&    t)
     {
         solver.set_values(d_J_values_batch);
+        solver.prepare_factorization();  // pending per-chunk ANALYSIS (non-uniform cuDSS modes)
 
         timer.start();
         const bool is_refactor = factorized_;

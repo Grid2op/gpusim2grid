@@ -81,6 +81,7 @@ inline void run_nr_loop(
     BatchTimings&  t)
 {
     policy.begin_chunk();
+    linear_solver.begin_chunk();
 
     for (int iter = 0; iter < nb_iter; ++iter) {
         NrIterTimings step;

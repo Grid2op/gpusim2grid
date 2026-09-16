@@ -96,6 +96,20 @@ __global__ void blockdiag_csr_kernel(
     }
 }
 
+// Declared in strategies/cudss_batch_solver.cuh: the same skeleton, for the
+// Jacobian of the experimental block-diagonal cuDSS mode.
+void cudss_blockdiag_csr(int n, int nnz, int batch,
+                         const int* outer, const int* inner,
+                         int* batch_outer, int* batch_inner,
+                         cudaStream_t cs)
+{
+    const long long n_outer = static_cast<long long>(batch) * n + 1;
+    const long long n_inner = static_cast<long long>(batch) * nnz;
+    blockdiag_csr_kernel<<<nr_grid_size(std::max(n_outer, n_inner), BS), BS, 0, cs>>>(
+        n, nnz, batch, outer, inner, batch_outer, batch_inner);
+    CHK_CUDA_BPF(cudaGetLastError());
+}
+
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -793,11 +807,14 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
 
     // Chunk loop runs over the ACTIVE set (c_start / actual_batch in active-slot
     // space); _solve_chunk scatters each result to its original index.
+    // Per-chunk ANALYSIS of the non-uniform cuDSS modes (0 in uniform mode).
+    const double t_chunk_analysis_start = linear_solver_.analysis_ms();
     for (int chunk = 0; chunk < n_chunks_; ++chunk) {
         const int c_start      = chunk * batch_size_;
         const int actual_batch = std::min(batch_size_, n_active_ - c_start);
         _solve_chunk(c_start, actual_batch, t);
     }
+    t.t_analysis_ms += linear_solver_.analysis_ms() - t_chunk_analysis_start;
 
     cs.synchronize();
     return t;
@@ -1437,6 +1454,7 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
             thrust::raw_pointer_cast(A.d_J_to_JT.data()), nnz_J, batch_size_);
         CHK_CUDA_BPF(cudaGetLastError());
         A.solver.set_values(thrust::raw_pointer_cast(A.d_JT_values.data()));
+        A.solver.prepare_factorization();
         timer.start();
         if (!A.factorized) {
             A.solver.factor();
