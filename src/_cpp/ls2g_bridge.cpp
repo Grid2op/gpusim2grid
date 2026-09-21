@@ -11,6 +11,7 @@
 #include "timing_utils.hpp"    // ms_since
 
 #include <batch_algorithm/BusQCheck.hpp>   // ls2g::bus_q_check::build_bus_q_plan (lightsim2grid >= PR #206)
+#include <batch_algorithm/GenPCheck.hpp>   // ls2g::gen_p_check::build_gen_p_plan (lightsim2grid >= 1.1.0)
 
 #include <chrono>
 #include <cmath>
@@ -881,6 +882,61 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
     out.bmax_sum_pu     = rv(bmax_sum);
     out.gen_qmin_mvar   = rv(gen_qmin);
     out.gen_qmax_mvar   = rv(gen_qmax);
+    out.validate(n_bus_solver);
+    return out;
+}
+
+GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    // lightsim2grid's own selection, on the labelling the session solves in
+    ls2g::gen_p_check::GenPPlan plan;
+    ls2g::gen_p_check::build_gen_p_plan(grid, grid.id_me_to_ac_solver(), plan);
+
+    GenPPlanData out;
+    out.sn_mva = static_cast<double>(grid.get_sn_mva());
+    std::vector<int>    el_type, el_id, bus_solver, part_el_type, part_el_id, part_bus_solver;
+    std::vector<double> weight, min_p, max_p, target_p, part_weight;
+    for (const ls2g::gen_p_check::GenPEntry& e : plan.gens) {
+        if (e.bus_solver < 0 || e.bus_solver >= n_bus_solver) continue;   // not in the solved system
+        el_type.push_back(static_cast<int>(e.el_type));   // 5 GENERATOR / 6 STORAGE, same codes
+        el_id.push_back(e.el_id);
+        bus_solver.push_back(e.bus_solver);
+        weight.push_back(static_cast<double>(e.slack_weight));
+        min_p.push_back(static_cast<double>(e.min_p_mw));
+        max_p.push_back(static_cast<double>(e.max_p_mw));
+        // a generator's target is the ROW's upstream (target_p_of); here the
+        // grid's own is the base every row falls back to, see set_gen_p_targets
+        const double target = (e.el_type == ls2g::ViolationElementType::GENERATOR)
+            ? static_cast<double>(grid.get_gen_target_p()(e.el_id))
+            : static_cast<double>(e.target_p_mw);
+        target_p.push_back(target);
+    }
+    for (const ls2g::gen_p_check::GenPParticipant& q : plan.participants) {
+        if (q.bus_solver < 0 || q.bus_solver >= n_bus_solver) continue;
+        part_el_type.push_back(static_cast<int>(q.el_type));
+        part_el_id.push_back(q.el_id);
+        part_bus_solver.push_back(q.bus_solver);
+        part_weight.push_back(static_cast<double>(q.slack_weight));
+    }
+    auto iv = [](const std::vector<int>& v) { return Eigen::VectorXi::Map(v.data(), static_cast<Eigen::Index>(v.size())).eval(); };
+    auto rv = [](const std::vector<double>& v) {
+        RealVect r(static_cast<Eigen::Index>(v.size()));
+        for (size_t i = 0; i < v.size(); ++i) r(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(v[i]);
+        return r;
+    };
+    out.n_entries       = static_cast<int>(el_type.size());
+    out.el_type         = iv(el_type);
+    out.el_id           = iv(el_id);
+    out.bus_solver      = iv(bus_solver);
+    out.slack_weight    = rv(weight);
+    out.min_p_mw        = rv(min_p);
+    out.max_p_mw        = rv(max_p);
+    out.target_p_mw     = rv(target_p);
+    out.n_part          = static_cast<int>(part_el_type.size());
+    out.part_el_type    = iv(part_el_type);
+    out.part_el_id      = iv(part_el_id);
+    out.part_bus_solver = iv(part_bus_solver);
+    out.part_weight     = rv(part_weight);
     out.validate(n_bus_solver);
     return out;
 }

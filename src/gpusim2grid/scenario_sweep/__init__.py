@@ -312,6 +312,21 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
         q = np.ascontiguousarray(q_mvar, dtype=np.float64)
         self._s.set_injections(p, q, float(sn_mva))
 
+    def set_gen_p_targets(self, targets):
+        """Per-row active set-points of the machines of the slack active-power
+        plan (``set_gen_p_capability``): ``(n_scenarios, n_entries)`` MW in the
+        GENERATOR convention, one column per entry of the plan in its order,
+        NaN = keep the grid's own set-point; row-aligned with
+        :meth:`set_injections`. A row's generator produces ITS target plus its
+        share of the slack, and only the caller knows that target -- the
+        facade fills this from ``set_injections_from_elements``' ``gen_p``.
+        Left unset (or given an empty array), every row is checked against the
+        base set-points. Takes effect on the next run()."""
+        t = np.ascontiguousarray(targets, dtype=np.float64)
+        if t.size == 0:
+            t = np.zeros((0, 0), dtype=np.float64)
+        self._s.set_gen_p_targets(t)
+
     def set_gen_v(self, gen_v, gen_bus):
         """Per-scenario generator target voltage magnitude (vm_pu, NOT kV),
         (n_scenarios, n_gen). Does NOT feed Sbus -- see the C++
@@ -667,21 +682,6 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
         """(n_bus,) bool: |V| fixed at that bus (pv or slack without a |V| unknown)."""
         return np.asarray(self._s.is_vm_fixed_bus, dtype=bool)
 
-    def get_active_to_orig(self):
-        """(n_active,) int64: original scenario index of each active slot."""
-        return np.asarray(self._s.get_active_to_orig(), dtype=np.int64)
-
-    def j_skeleton(self):
-        """(outer, inner) int32 CSR structure of one Jacobian."""
-        outer, inner = self._s.j_skeleton()
-        return np.asarray(outer, dtype=np.int32), np.asarray(inner, dtype=np.int32)
-
-    def clear_gen_v(self):
-        """Drop any set_gen_v() override (rows keep the base-case voltage)."""
-        self._s.clear_gen_v()
-
-    def set_injections_dlpack(self, capsule, producer_stream=0):
-        """Device path of set_injections(): a DLPack capsule of a
     @property
     def vc_group_of_bus(self):
         """(n_bus,) int64: VoltageControl group regulating the bus, -1 for none."""
@@ -704,6 +704,21 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
         """list[list[int]]: per row of the last run(), the stranded VoltageControl groups."""
         return self._s.get_row_stranded_vc_groups()
 
+    def get_active_to_orig(self):
+        """(n_active,) int64: original scenario index of each active slot."""
+        return np.asarray(self._s.get_active_to_orig(), dtype=np.int64)
+
+    def j_skeleton(self):
+        """(outer, inner) int32 CSR structure of one Jacobian."""
+        outer, inner = self._s.j_skeleton()
+        return np.asarray(outer, dtype=np.int32), np.asarray(inner, dtype=np.int32)
+
+    def clear_gen_v(self):
+        """Drop any set_gen_v() override (rows keep the base-case voltage)."""
+        self._s.clear_gen_v()
+
+    def set_injections_dlpack(self, capsule, producer_stream=0):
+        """Device path of set_injections(): a DLPack capsule of a
         (n_scenarios, n_bus) contiguous complex PER-UNIT Sbus tensor on this
         session's device (this build's precision). Consumes the capsule."""
         self._s.set_injections_dlpack(capsule, int(producer_stream))

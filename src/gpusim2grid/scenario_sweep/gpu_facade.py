@@ -293,6 +293,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         """
         self._pending_elements = None
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
+        # per-bus injections carry no per-generator set-point: the slack
+        # active-power check falls back to the grid's own targets
+        self._gen_p_rows = None
+        self._push_gen_p_targets()
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
         """Store per-element injections, mirroring lightsim2grid's own batch API.
@@ -327,6 +331,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
                                             load_p, load_q, gen_p,
                                             gen_off=gen_off)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+        # the slack active-power check needs each row's own generator
+        # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
+        self._gen_p_rows = gen_p
+        self._push_gen_p_targets()
 
     def set_contingency_gens(self, mask):
         """Per-row generator contingency mask, shape ``(n_scenarios, n_gen)``,

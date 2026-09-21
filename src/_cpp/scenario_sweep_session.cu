@@ -918,7 +918,9 @@ void ScenarioSweepSession::run()
     }
     const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
         phys_, *solver_, "ScenarioSweepSession", violation_tol_, sn_mva_,
-        base_state_->timings.converged, d_gen_off_ptr, n_gen_off);
+        base_state_->timings.converged, d_gen_off_ptr, n_gen_off,
+        &gen_p_targets_, gen_p_targets_dirty_);
+    gen_p_targets_dirty_ = false;
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms = t_base_case_ms_;
@@ -1001,8 +1003,6 @@ std::vector<int> ScenarioSweepSession::is_vm_fixed_bus()  const
 {
     return std::vector<int>(h_is_vm_fixed_bus_.begin(), h_is_vm_fixed_bus_.end());
 }
-
-Eigen::VectorXi ScenarioSweepSession::get_active_to_orig() const
 std::vector<int> ScenarioSweepSession::vc_group_of_bus() const { return h_vc_group_of_bus_; }
 std::vector<int> ScenarioSweepSession::vc_v_row_of_group() const { return base_state_->h_vc_vrow; }
 std::vector<double> ScenarioSweepSession::vc_v_set() const
@@ -1027,6 +1027,8 @@ std::vector<std::vector<int>> ScenarioSweepSession::get_row_stranded_vc_groups()
     for (size_t r = 0; r < contingencies_.size(); ++r) out[r] = contingencies_[r].stranded_groups;
     return out;
 }
+
+Eigen::VectorXi ScenarioSweepSession::get_active_to_orig() const
 {
     if (!solver_) {
         Eigen::VectorXi out(n_scenarios_);
@@ -1415,4 +1417,29 @@ HvdcPViolationsResult ScenarioSweepSession::get_hvdc_p_violations_n() const
     if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
     return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "ScenarioSweepSession",
                                          timings_.t_copy_violations_to_host_ms);
+}
+
+void ScenarioSweepSession::set_gen_p_capability(const GenPPlanData& plan)
+{
+    phys_.set_gen_p_plan(plan, base_state_->n_bus);
+}
+
+GenPViolationsResult ScenarioSweepSession::get_gen_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/false, "ScenarioSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+GenPViolationsResult ScenarioSweepSession::get_gen_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ScenarioSweepSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/true, "ScenarioSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+void ScenarioSweepSession::set_gen_p_targets(Eigen::Ref<const RealMatRM> targets)
+{
+    gen_p_targets_       = targets;
+    gen_p_targets_dirty_ = true;
 }

@@ -21,6 +21,7 @@ __all__ = [
     "compute_violations_n",
     "bus_q_violations_from_result",
     "hvdc_p_violations_from_result",
+    "gen_p_violations_from_result",
 ]
 
 from dataclasses import dataclass
@@ -31,15 +32,23 @@ import numpy as np
 
 class ViolationElementType(IntEnum):
     """Mirrors lightsim2grid's ls2g::ViolationElementType exactly (including
-    GRID, added on lightsim2grid's improve_const_ref branch). HVDC is
-    gpusim2grid's own addition (the element the droop P-saturation check,
-    ``compute_physical_violations``, reports on) -- lightsim2grid has no such
-    element type yet; keep the value in sync with it the day it does."""
+    GRID, NOT_SIMULATED's element, and HVDC / GENERATOR / STORAGE, the elements
+    the PHYSICAL checks of ``compute_physical_violations`` report on)."""
     BUS = 0
     LINE = 1
     TRAFO = 2
     GRID = 3  # the whole grid/contingency, not a specific element
     HVDC = 4  # an hvdc line (compute_physical_violations)
+    #: A generator / a storage unit, by its own container id: its ACTIVE power
+    #: only (LOW_P / HIGH_P, the distributed slack asked it for more than it
+    #: has). A reactive violation is reported on the BUS instead, because how a
+    #: bus' reactive power is divided between its machines is a convention,
+    #: while the active one is divided by the participation factors the caller
+    #: chose. A STORAGE record's value/limit are in the GENERATOR convention
+    #: (positive = injected), like its min_q/max_q and unlike the LOAD-convention
+    #: target_p_mw lightsim2grid stores for it.
+    GENERATOR = 5
+    STORAGE = 6
 
 
 class LimitViolationType(IntEnum):
@@ -76,9 +85,15 @@ class LimitViolationType(IntEnum):
     #: A droop ("AC emulation") hvdc line in linear regime whose flow exceeds
     #: pmax in the direction it flows -- OpenLoadFlow's HvdcAcEmulationLimits
     #: outer loop would saturate it (``compute_physical_violations``). Category
-    #: PHYSICAL; gpusim2grid's own code, not in lightsim2grid yet.
+    #: PHYSICAL. On a GENERATOR / STORAGE: the distributed slack -- solved
+    #: inside the Jacobian by participation factors that know nothing about
+    #: limits -- asked the machine for more than its max_p_mw (lightsim2grid's
+    #: GenPCheck.hpp; OpenLoadFlow's DistributedSlack outer loop).
     HIGH_P = 7               # lightsim2grid's name for it (LimitViolation.hpp)
     HVDC_P_SATURATION = 7    # alias: the name it was introduced under here
+    #: ... and the other way: a slack GENERATOR / STORAGE below its min_p_mw
+    #: (an hvdc line's two directions are two HIGH_P with a different side).
+    LOW_P = 8
 
 
 class ViolationCategory(IntEnum):
@@ -91,7 +106,7 @@ class ViolationCategory(IntEnum):
         state nobody wants to sit in. LOW_VOLTAGE, HIGH_VOLTAGE, CURRENT.
     PHYSICAL : a limit of the equipment itself, which nothing can leave: the
         converged solution is NOT physically realizable, the control it assumes
-        cannot happen. LOW_Q, HIGH_Q, HVDC_P_SATURATION.
+        cannot happen. LOW_Q, HIGH_Q, HIGH_P (= HVDC_P_SATURATION), LOW_P.
     SOLVER : not a limit at all, what the solver did. NOT_SIMULATED, DIVERGENCE.
     """
     OPERATIONAL = 0
@@ -106,7 +121,7 @@ def violation_category(violation_type):
              LimitViolationType.CURRENT):
         return ViolationCategory.OPERATIONAL
     if t in (LimitViolationType.LOW_Q, LimitViolationType.HIGH_Q,
-             LimitViolationType.HVDC_P_SATURATION):
+             LimitViolationType.HVDC_P_SATURATION, LimitViolationType.LOW_P):
         return ViolationCategory.PHYSICAL
     return ViolationCategory.SOLVER
 
@@ -141,6 +156,11 @@ class LimitViolation:
         element_id the grid hvdc id, side 1 (would saturate 1->2: the flow
         leaving bus 1 exceeds pmax_1to2) or 2 (2->1), value that flow (MW),
         limit pmax (MW).
+    LOW_P / HIGH_P on a GENERATOR / STORAGE (``compute_physical_violations``) :
+        element_id the container id of that family, side 0, value the
+        machine's converged active power -- its target plus its share of the
+        distributed slack (MW, GENERATOR convention for both families), limit
+        its min_p_mw / max_p_mw.
     """
     element_type: ViolationElementType
     element_id: int
@@ -185,6 +205,15 @@ def hvdc_p_violations_from_result(res):
     return _rows_from_flat(res.count, res.capacity, lambda i: LimitViolation(
         ViolationElementType.HVDC, int(hvdc_id[i]), int(side[i]),
         LimitViolationType.HVDC_P_SATURATION, float(value[i]), float(limit[i])))
+
+
+def gen_p_violations_from_result(res):
+    """list[list[LimitViolation]] from a ``GenPViolationsResult`` (the raw
+    output of ``get_gen_p_violations[_n]()`` on a batch session)."""
+    etype, eid, vtype, value, limit = res.element_type, res.element_id, res.type, res.value, res.limit
+    return _rows_from_flat(res.count, res.capacity, lambda i: LimitViolation(
+        ViolationElementType(int(etype[i])), int(eid[i]), 0, LimitViolationType(int(vtype[i])),
+        float(value[i]), float(limit[i])))
 
 
 def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,

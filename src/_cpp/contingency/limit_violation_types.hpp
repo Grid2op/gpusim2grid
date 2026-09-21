@@ -30,10 +30,16 @@
 // THREE places to update for any new code.
 // =============================================================================
 
-// HVDC (=4) is gpusim2grid's own addition (an HVDC line has no counterpart in
-// lightsim2grid's element types yet): the element a droop P-saturation
-// violation is reported on.
-enum class ViolationElementType : int { BUS = 0, LINE = 1, TRAFO = 2, GRID = 3, HVDC = 4 };
+// HVDC (=4): the element a droop P-saturation violation is reported on.
+// GENERATOR (=5) / STORAGE (=6): a machine carrying the distributed slack whose
+// converged ACTIVE power left its own [min_p, max_p] (lightsim2grid's
+// GenPCheck.hpp; the two families take a share under the same rule, so one
+// check walks both). A storage unit's value/limit are in the GENERATOR
+// convention (positive = injected), like an IIDM battery's own min_p/max_p and
+// unlike the LOAD-convention target_p_mw lightsim2grid stores for it.
+enum class ViolationElementType : int {
+    BUS = 0, LINE = 1, TRAFO = 2, GRID = 3, HVDC = 4, GENERATOR = 5, STORAGE = 6
+};
 enum class LimitViolationType  : int {
     LOW_VOLTAGE = 0, HIGH_VOLTAGE = 1, CURRENT = 2,
     NOT_SIMULATED = 3,  // pre-check (graph connectivity) skipped it, solver never invoked
@@ -52,7 +58,15 @@ enum class LimitViolationType  : int {
     // violations). element_type HVDC, element_id the grid hvdc id, side 1
     // (saturates 1->2, p1 > pmax_1to2) or 2 (saturates 2->1, p2 > pmax_2to1),
     // value/limit in MW. Written by check_hvdc_p_violations_kernel.
-    HVDC_P_SATURATION = 7
+    // On a GENERATOR / STORAGE (check_gen_p_violations_kernel): the distributed
+    // slack -- solved inside the Jacobian by participation factors that know
+    // nothing about limits -- asked the machine for more than its max_p_mw
+    // (lightsim2grid's name for both cases, HIGH_P).
+    HVDC_P_SATURATION = 7,
+    HIGH_P = 7,
+    // ... and the other way: a slack GENERATOR / STORAGE below its min_p_mw
+    // (an hvdc line's two directions are two HIGH_P with a different side).
+    LOW_P = 8
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -60,7 +74,7 @@ enum class LimitViolationType  : int {
 //   OPERATIONAL : a limit the grid CAN leave (voltage band, current rating).
 //   PHYSICAL    : a limit of the equipment itself, which nothing can leave: the
 //                 converged solution is not physically realizable (LOW_Q,
-//                 HIGH_Q, HVDC_P_SATURATION).
+//                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
 enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
 
@@ -73,7 +87,8 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
             return ViolationCategory::OPERATIONAL;
         case LimitViolationType::LOW_Q:
         case LimitViolationType::HIGH_Q:
-        case LimitViolationType::HVDC_P_SATURATION:
+        case LimitViolationType::HVDC_P_SATURATION:   // == HIGH_P
+        case LimitViolationType::LOW_P:
             return ViolationCategory::PHYSICAL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;

@@ -216,7 +216,9 @@ void InjectionSweepSession::run()
     // violations); an injection sweep never disconnects a generator (nullptr mask).
     const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
         phys_, *solver_, "InjectionSweepSession", violation_tol_, sn_mva_,
-        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0);
+        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        &gen_p_targets_, gen_p_targets_dirty_);
+    gen_p_targets_dirty_ = false;
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms  = t_base_case_ms_;
@@ -438,4 +440,29 @@ HvdcPViolationsResult InjectionSweepSession::get_hvdc_p_violations_n() const
     if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
     return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
                                          timings_.t_copy_violations_to_host_ms);
+}
+
+void InjectionSweepSession::set_gen_p_capability(const GenPPlanData& plan)
+{
+    phys_.set_gen_p_plan(plan, base_state_->n_bus);
+}
+
+GenPViolationsResult InjectionSweepSession::get_gen_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+GenPViolationsResult InjectionSweepSession::get_gen_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+void InjectionSweepSession::set_gen_p_targets(Eigen::Ref<const RealMatRM> targets)
+{
+    gen_p_targets_       = targets;
+    gen_p_targets_dirty_ = true;
 }

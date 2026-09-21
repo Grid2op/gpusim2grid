@@ -354,7 +354,7 @@ struct BatchTimings {
     double t_copy_violations_to_host_ms = 0.;   // D->H across the 10 get_violation_*() accessors
     // compute_physical_violations only; zero unless enabled: H->D plan upload +
     // buffer alloc + the base ("n") checks (set_bus_q_check / run_bus_q_check_n,
-    // set_hvdc_p_check / run_hvdc_p_check_n)
+    // set_hvdc_p_check / run_hvdc_p_check_n, set_gen_p_check / run_gen_p_check_n)
     double t_physical_setup_ms = 0.;
 
     // --- per-chunk accumulated (TimingEntry: gpu + wall) ---
@@ -379,6 +379,7 @@ struct BatchTimings {
     // unless compute_physical_violations is on.
     TimingEntry t_bus_q_check;
     TimingEntry t_hvdc_p_check;
+    TimingEntry t_gen_p_check;       // check_gen_p_violations_kernel, same gate
     TimingEntry t_flow_computation;
 
     // --- metadata ---
@@ -406,7 +407,6 @@ struct BatchTimings {
     int adjoint_n_refactorize = 0;
     int adjoint_n_solve       = 0;
 
-    // Total wall-clock time for all chunks (excludes one-time setup).
     // --- cuDSS factor statistics of the forward solver's last ANALYSIS
     //     (CudssBatchSolver::factor_stats(); -1 = not reported). Not timings.
     //     lu_nnz is per system (uniform batch: the shared pattern); the memory
@@ -417,13 +417,14 @@ struct BatchTimings {
     long long cudss_mem_host_permanent_bytes   = -1;  // [2]
     long long cudss_mem_host_peak_bytes        = -1;  // [3]
 
+    // Total wall-clock time for all chunks (excludes one-time setup).
     double t_chunks_total_wall_ms() const {
         return (t_tile_V         + t_tile_Ybus      + t_patch_Ybus
               + t_tile_Sbus      + t_spmv           + t_fill_F
               + t_fill_J         + t_first_factorize + t_refactorize
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
-              + t_hvdc_p_check   + t_flow_computation).wall_ms;
+              + t_hvdc_p_check   + t_gen_p_check     + t_flow_computation).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

@@ -671,3 +671,22 @@ HvdcPViolationsResult ContingencyAnalysisSession::get_hvdc_p_violations_n() cons
     return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "ContingencyAnalysisSession",
                                          timings_.t_copy_violations_to_host_ms);
 }
+
+void ContingencyAnalysisSession::set_gen_p_capability(const GenPPlanData& plan)
+{
+    phys_.set_gen_p_plan(plan, base_state_->n_bus);
+}
+
+GenPViolationsResult ContingencyAnalysisSession::get_gen_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/false, "ContingencyAnalysisSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+GenPViolationsResult ContingencyAnalysisSession::get_gen_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/true, "ContingencyAnalysisSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}

@@ -51,6 +51,7 @@
 #include "../acpf_nr_state.cuh"
 #include "../contingency_analysis_helper.hpp"   // ContingencySolverType
 #include "bus_q_check_data.hpp"                   // BusQPlanData
+#include "gen_p_check_data.hpp"                   // GenPPlanData
 #include "strategies/cudss_batch_solver.cuh"
 #include "strategies/policy_refactor_every.cuh"
 #include "strategies/policy_base_case_factors.cuh"
@@ -336,6 +337,42 @@ struct BatchPfDriver {
     thrust::device_vector<int>            d_hp_n_count, d_hp_n_truncated;     // [1]
 
     // -------------------------------------------------------------------------
+    // compute_physical_violations (opt-in; per-machine active power of the
+    // distributed slack, lightsim2grid's GenPCheck.hpp parity -- see
+    // gen_p_check_data.hpp and check_gen_p_violations_kernel). The plan's
+    // participants are regrouped per bus at upload (CSR over the distinct
+    // participating buses, d_gp_part_*; d_gp_bus_slot maps an entry to its
+    // bus' group, -1 when no participant stands there). Outputs
+    // O(n_contingencies * K_g). Allocated only by set_gen_p_check().
+    // -------------------------------------------------------------------------
+    bool           _gen_p_enabled       = false;
+    int            gen_p_n_entries_     = 0;
+    int            gen_p_n_part_bus_    = 0;
+    int            gen_p_capacity_      = 0;   // K_g
+    int            gen_p_n_gen_         = 0;   // columns of d_gp_gen_off_ (0 = none)
+    int            gen_p_target_stride_ = 0;   // columns of d_gp_targets (0 = base targets)
+    cuda_real_type gen_p_tol_mw_        = 0;
+    cuda_real_type gen_p_sn_mva_        = 0;
+    cuda_real_type gen_p_residual_tol_  = 0;
+    const unsigned char* d_gp_gen_off_  = nullptr;   // non-owning, like d_bq_gen_off_
+    double         t_gen_p_setup_ms_    = 0.;
+
+    thrust::device_vector<int>            d_gp_el_type, d_gp_el_id, d_gp_bus_solver, d_gp_bus_slot;
+    thrust::device_vector<cuda_real_type> d_gp_weight, d_gp_min_p, d_gp_max_p, d_gp_target_base;
+    thrust::device_vector<int>            d_gp_part_bus, d_gp_part_start, d_gp_part_el_type, d_gp_part_el_id;
+    thrust::device_vector<cuda_real_type> d_gp_part_weight;
+    // per-row set-points of the plan's entries (upload_gen_p_targets), ORIGINAL
+    // row order, [n_contingencies * n_entries]; empty = base targets everywhere
+    thrust::device_vector<cuda_real_type> d_gp_targets;
+    thrust::device_vector<int>            d_gp_out_element_type, d_gp_out_element_id, d_gp_out_type;  // [n_contingencies * K_g]
+    thrust::device_vector<cuda_real_type> d_gp_out_value, d_gp_out_limit;
+    thrust::device_vector<int>            d_gp_count;        // [n_contingencies]; -1 = never simulated, else 0..K_g
+    thrust::device_vector<int>            d_gp_truncated;    // [n_contingencies]; 0/1
+    thrust::device_vector<int>            d_gp_n_element_type, d_gp_n_element_id, d_gp_n_type;  // [K_g]
+    thrust::device_vector<cuda_real_type> d_gp_n_value, d_gp_n_limit;
+    thrust::device_vector<int>            d_gp_n_count, d_gp_n_truncated;     // [1]
+
+    // -------------------------------------------------------------------------
     // cuSPARSE batched SpMV
     // -------------------------------------------------------------------------
     CuSpMV spmv_batch;
@@ -595,8 +632,24 @@ struct BatchPfDriver {
     void set_hvdc_p_check(double tol_mw, double sn_mva, int K_p, double residual_tol);
     void run_hvdc_p_check_n();
 
+    // compute_physical_violations: same contract as set_bus_q_check for the
+    // per-machine active-power check of the distributed slack (an EMPTY plan is
+    // fine: rows then report count 0). tol_mw in MW. A plan whose entry count
+    // changed drops any per-row set-points uploaded before.
+    void set_gen_p_check(const GenPPlanData& plan, double tol_mw, int K_g, double residual_tol,
+                         const unsigned char* d_gen_off, int n_gen);
+    // Per-row active set-points of the plan's entries (MW, generator convention,
+    // NaN = keep the base one), (n_contingencies x n_entries) in ORIGINAL row
+    // order; an empty matrix drops them (base targets for every row). Requires
+    // set_gen_p_check(). Kept across the re-seeding set_gen_p_check() does on
+    // every run (ScenarioSweep), so the caller uploads only when they changed.
+    void upload_gen_p_targets(const RealMatRM& targets);
+    bool has_gen_p_targets() const { return gen_p_target_stride_ > 0; }
+    void run_gen_p_check_n();
+
     double bus_q_setup_ms()  const { return t_bus_q_setup_ms_; }
     double hvdc_p_setup_ms() const { return t_hvdc_p_setup_ms_; }
+    double gen_p_setup_ms()  const { return t_gen_p_setup_ms_; }
 
     // -------------------------------------------------------------------------
     // DLPack / zero-copy accessors

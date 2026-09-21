@@ -304,4 +304,80 @@ __global__ void check_hvdc_p_violations_kernel(
           int*             __restrict__ d_out_count,
           int*             __restrict__ d_out_truncated);
 
+// -----------------------------------------------------------------------------
+// check_gen_p_violations_kernel  (compute_physical_violations, lightsim2grid's
+// GenPCheck.hpp parity -- generators AND storage units)
+//
+// One thread per row, like the two above. For every machine of the plan
+// (gen_p_check_data.hpp) that the row leaves participating -- its bus not
+// masked, and not a generator the row disconnected (d_gen_off, ORIGINAL row
+// order, nullptr = none) -- its converged active power is
+//
+//   p = target + node_mismatch(bus) * sn_mva * w / bus_raw_w
+//
+// with `target` this row's own set-point (d_targets[out_c * target_stride + k],
+// NaN = the plan's base one; nullptr = base for every row), `w` the machine's
+// raw participation factor, `bus_raw_w` the sum of the factors of the LIVE
+// participants standing on its bus (upstream's `w_norm(bus) * total_raw_w`)
+// and node_mismatch the raw active residual real(V . conj(Ybus . V) - Sbus)
+// plus the angle-droop hvdc flows leaving the bus (see gen_p_check_data.hpp).
+// A row whose live participants sum to (nearly) nothing reports nothing
+// (upstream: "nothing left distributing anything"). Records: element_type 5 /
+// 6, element_id the container id, type HIGH_P (7) above max_p + tol, LOW_P
+// (8) below min_p - tol, value / limit in MW, generator convention. Same row
+// gate, output layout, K-capacity and result-map conventions as
+// check_bus_q_violations_kernel.
+// -----------------------------------------------------------------------------
+__global__ void check_gen_p_violations_kernel(
+    const cudaComplexType* __restrict__ d_V,
+    const cudaComplexType* __restrict__ d_Yvals,
+    const int*             __restrict__ d_Y_outer,
+    const int*             __restrict__ d_Y_inner,
+    const cudaComplexType* __restrict__ d_Sbus,
+    int                                 sbus_stride,
+    const cuda_real_type*  __restrict__ d_residuals,
+    cuda_real_type                      residual_tol,
+    int                                 n_hvdc,
+    const int*             __restrict__ d_hvdc_bus1,
+    const int*             __restrict__ d_hvdc_bus2,
+    const int*             __restrict__ d_hvdc_status,
+    const cuda_real_type*  __restrict__ d_hvdc_p0,
+    const cuda_real_type*  __restrict__ d_hvdc_k,
+    const cuda_real_type*  __restrict__ d_hvdc_lf1,
+    const cuda_real_type*  __restrict__ d_hvdc_lf2,
+    const cuda_real_type*  __restrict__ d_hvdc_r,
+    const cuda_real_type*  __restrict__ d_hvdc_pmax12,
+    const cuda_real_type*  __restrict__ d_hvdc_pmax21,
+    int                                 n_entries,
+    const int*             __restrict__ d_el_type,
+    const int*             __restrict__ d_el_id,
+    const int*             __restrict__ d_bus_solver,
+    const int*             __restrict__ d_bus_slot,
+    const cuda_real_type*  __restrict__ d_weight,
+    const cuda_real_type*  __restrict__ d_min_p,
+    const cuda_real_type*  __restrict__ d_max_p,
+    const cuda_real_type*  __restrict__ d_target_base,
+    int                                 n_part_bus,
+    const int*             __restrict__ d_part_bus,
+    const int*             __restrict__ d_part_start,
+    const int*             __restrict__ d_part_el_type,
+    const int*             __restrict__ d_part_el_id,
+    const cuda_real_type*  __restrict__ d_part_weight,
+    const unsigned char*   __restrict__ d_gen_off,
+    int                                 n_gen,
+    const cuda_real_type*  __restrict__ d_targets,
+    int                                 target_stride,
+    cuda_real_type                      sn_mva,
+    cuda_real_type                      tol_mw,
+    int n_bus, int nnz_Y,
+    int c_start, int actual_batch, int K,
+    const int* __restrict__ d_result_map,
+          int*             __restrict__ d_out_element_type,
+          int*             __restrict__ d_out_element_id,
+          int*             __restrict__ d_out_type,
+          cuda_real_type*  __restrict__ d_out_value,
+          cuda_real_type*  __restrict__ d_out_limit,
+          int*             __restrict__ d_out_count,
+          int*             __restrict__ d_out_truncated);
+
 #endif  // VIOLATION_KERNELS_CUH

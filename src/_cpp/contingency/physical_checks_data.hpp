@@ -6,24 +6,27 @@
 #define PHYSICAL_CHECKS_DATA_HPP
 
 // =============================================================================
-// contingency/physical_checks_data.hpp — the two opt-in post-solve "physical"
-// checks, as the three batch sessions expose them
+// contingency/physical_checks_data.hpp — the three opt-in post-solve
+// "physical" checks, as the three batch sessions expose them
 // =============================================================================
 //
 //   - per-bus reactive capability (lightsim2grid PR #206 parity; LOW_Q /
 //     HIGH_Q on a BUS)
 //   - droop HVDC P-saturation (OpenLoadFlow's HvdcAcEmulationLimits;
 //     HVDC_P_SATURATION on an HVDC)
+//   - per-machine active power of the distributed slack (lightsim2grid's
+//     GenPCheck.hpp: LOW_P / HIGH_P on a GENERATOR or a STORAGE unit)
 //
-// Both say the same kind of thing (ViolationCategory::PHYSICAL): the converged
+// All say the same kind of thing (ViolationCategory::PHYSICAL): the converged
 // solution assumes a control that the equipment cannot actually hold. Neither
 // enforces anything; they only report. Hence ONE opt-in for the category,
 // compute_physical_violations (lightsim2grid's name), one tolerance in MVA and
 // one capacity, in one configuration object (PhysicalChecksConfig, held by
-// each session and bound to Python once); the two result shapes are merged
-// into a single PHYSICAL-only list per row on the Python side. The work itself is in BatchPfDriver (set_bus_q_check /
-// set_hvdc_p_check + the two kernels of violation_kernels.cu) and the session
-// glue in physical_checks_impl.cuh.
+// each session and bound to Python once); the three result shapes are merged
+// into a single PHYSICAL-only list per row on the Python side. The work itself
+// is in BatchPfDriver (set_bus_q_check / set_hvdc_p_check / set_gen_p_check +
+// the three kernels of violation_kernels.cu) and the session glue in
+// physical_checks_impl.cuh.
 //
 // CUDA-free on purpose: included by the session headers, which the host
 // compiler builds into ls2g_bridge.cpp.
@@ -36,6 +39,7 @@
 
 #include "../dtypes.hpp"
 #include "bus_q_check_data.hpp"
+#include "gen_p_check_data.hpp"
 
 // Per-row records of the bus reactive-capability check, flat SoA:
 //   bus_id/type/value/limit : [n_rows * capacity] (row r owns [r*capacity, r*capacity + count[r]))
@@ -60,6 +64,17 @@ struct HvdcPViolationsResult {
     int             capacity = 0;
 };
 
+// Same layout for the distributed-slack active-power check: element_type 5
+// (GENERATOR) or 6 (STORAGE), element_id the container id of that family,
+// type 7 (HIGH_P) or 8 (LOW_P), value the machine's converged active power and
+// limit its max_p_mw / min_p_mw -- MW, GENERATOR convention for both families.
+struct GenPViolationsResult {
+    Eigen::VectorXi element_type, element_id, type;
+    RealVect        value, limit;
+    Eigen::VectorXi count, truncated;
+    int             capacity = 0;
+};
+
 struct PhysicalChecksConfig {
     // ONE opt-in for the whole category (lightsim2grid's compute_physical_
     // violations): every record it produces has ViolationCategory::PHYSICAL,
@@ -75,6 +90,12 @@ struct PhysicalChecksConfig {
     // needs nothing beyond the base state
     BusQPlanData bus_q_plan;
     bool   has_bus_q_plan = false;
+    // the routing of the active check (set_gen_p_capability). OPTIONAL, unlike
+    // the reactive plan: a grid whose machines were never given active limits
+    // has nothing to report (lightsim2grid skips them the same way), so an
+    // unset plan is an empty one, not an error.
+    GenPPlanData gen_p_plan;
+    bool   has_gen_p_plan = false;
     bool   has_result     = false;   // a run() with the flag on has happened
 
     // Setters mirror lightsim2grid's: a no-op when unchanged, otherwise the
@@ -103,6 +124,12 @@ struct PhysicalChecksConfig {
         plan.validate(n_bus);
         bus_q_plan = plan;
         has_bus_q_plan = true;
+        has_result = false;
+    }
+    void set_gen_p_plan(const GenPPlanData& plan, int n_bus) {
+        plan.validate(n_bus);
+        gen_p_plan = plan;
+        has_gen_p_plan = true;
         has_result = false;
     }
 };

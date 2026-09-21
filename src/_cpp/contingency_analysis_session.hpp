@@ -325,6 +325,12 @@ struct ContingencyAnalysisSession {
     BusQViolationsResult  get_bus_q_violations_n()  const;
     HvdcPViolationsResult get_hvdc_p_violations()   const;
     HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ContingencyAnalysisSession(const ContingencyAnalysisSession&)            = delete;

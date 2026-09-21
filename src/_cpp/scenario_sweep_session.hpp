@@ -209,6 +209,10 @@ struct ScenarioSweepSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    // per-row set-points of the active-power check (set_gen_p_targets); empty
+    // = the plan's base ones for every row
+    RealMatRM gen_p_targets_;
+    bool      gen_p_targets_dirty_ = false;
 
     // =========================================================================
     // Host injection data (set_injections()) — (n_scenarios × n_bus)
@@ -225,13 +229,13 @@ struct ScenarioSweepSession {
     // consulted by set_gen_v() below. See that method's own doc.
     // =========================================================================
     std::vector<char> h_is_vm_fixed_bus_;
+    // VoltageControl group regulating each bus (-1: none) -- a gen_v column
+    // whose generator regulates such a bus drives that group's per-row v_set.
+    std::vector<int>  h_vc_group_of_bus_;
 
     // =========================================================================
     // Host generator target-voltage override (set_gen_v()) -- optional; see
     // that method's own doc. Empty (has_gen_v_ == false) means every row
-    // VoltageControl group regulating each bus (-1: none) -- a gen_v column
-    // whose generator regulates such a bus drives that group's per-row v_set.
-    std::vector<int>  h_vc_group_of_bus_;
     // keeps using the grid's own base-case voltage, exactly as before this
     // setter existed.
     // =========================================================================
@@ -448,10 +452,6 @@ struct ScenarioSweepSession {
     int              dim_J() const;
     std::vector<int> get_reserved_buses() const { return reserved_buses_; }
     std::vector<std::vector<int>> get_row_pv_to_pq() const { return row_pv_to_pq_; }
-    bool             has_gen_contingency() const { return has_gen_off_; }
-
-    // =========================================================================
-    // run — solves every scenario. A scenario whose topology change
 
     // VoltageControl structure a gen_v gradient needs: the group regulating
     // each bus (-1: none), each group's bordered voltage row in J, its base
@@ -464,6 +464,10 @@ struct ScenarioSweepSession {
     std::vector<double> vc_v_set() const;
     std::vector<int>    vc_group_has_fixed_member() const;
     std::vector<std::vector<int>> get_row_stranded_vc_groups() const;
+    bool             has_gen_contingency() const { return has_gen_off_; }
+
+    // =========================================================================
+    // run — solves every scenario. A scenario whose topology change
     // disconnects the grid is skipped (NaN residual/voltage) — unless
     // handle_disconnected_grid_ is set, in which case only scenarios stranding
     // the angle reference or a controller bus are left as NaN (the rest solve
@@ -612,6 +616,20 @@ struct ScenarioSweepSession {
     BusQViolationsResult  get_bus_q_violations_n()  const;
     HvdcPViolationsResult get_hvdc_p_violations()   const;
     HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
+    // Per-row active set-points of the machines of that plan (MW, GENERATOR
+    // convention, NaN = keep the grid's own), (n_rows x n_entries) with one
+    // column per entry of the plan in its order, row-aligned with
+    // set_injections: what a row's generator produces is ITS target plus its
+    // share of the slack, and only the caller knows that target (the facades
+    // fill it from set_injections_from_elements' gen_p). Left unset, every row
+    // is checked against the base set-points. An empty matrix drops them.
+    void set_gen_p_targets(Eigen::Ref<const RealMatRM> targets);
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ScenarioSweepSession(const ScenarioSweepSession&)            = delete;

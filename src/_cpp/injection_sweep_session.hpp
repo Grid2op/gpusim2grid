@@ -148,6 +148,10 @@ struct InjectionSweepSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    // per-row set-points of the active-power check (set_gen_p_targets); empty
+    // = the plan's base ones for every row
+    RealMatRM gen_p_targets_;
+    bool      gen_p_targets_dirty_ = false;
     // Residual gate of the physical checks (a row whose ||F||inf is NaN or above
     // it reports nothing), the same role violation_tol_ plays on the other two
     // sessions. Independent of tol_base.
@@ -269,10 +273,6 @@ struct InjectionSweepSession {
     int n_bus() const;
     int n_branches() const;
 
-    // =========================================================================
-    // Result accessors — synchronous D→H copy on demand.
-    // =========================================================================
-    CplxVect get_V_results()  const;   // (n_scenarios * n_bus,)      complex
     // set_gen_v() bus maps (see ScenarioSweepSession's accessors of the same name)
     std::vector<int>    is_vm_fixed_bus() const
     { return std::vector<int>(h_is_vm_fixed_bus_.begin(), h_is_vm_fixed_bus_.end()); }
@@ -280,6 +280,10 @@ struct InjectionSweepSession {
     std::vector<int>    vc_group_has_fixed_member() const { return h_vc_group_fixed_; }
     std::vector<double> vc_v_set() const { return h_vc_v_set_; }
 
+    // =========================================================================
+    // Result accessors — synchronous D→H copy on demand.
+    // =========================================================================
+    CplxVect get_V_results()  const;   // (n_scenarios * n_bus,)      complex
     RealVect get_residuals()  const;   // (n_scenarios,)               real
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
@@ -303,6 +307,20 @@ struct InjectionSweepSession {
     BusQViolationsResult  get_bus_q_violations_n()  const;
     HvdcPViolationsResult get_hvdc_p_violations()   const;
     HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
+    // Per-row active set-points of the machines of that plan (MW, GENERATOR
+    // convention, NaN = keep the grid's own), (n_rows x n_entries) with one
+    // column per entry of the plan in its order, row-aligned with
+    // set_injections: what a row's generator produces is ITS target plus its
+    // share of the slack, and only the caller knows that target (the facades
+    // fill it from set_injections_from_elements' gen_p). Left unset, every row
+    // is checked against the base set-points. An empty matrix drops them.
+    void set_gen_p_targets(Eigen::Ref<const RealMatRM> targets);
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     InjectionSweepSession(const InjectionSweepSession&)            = delete;

@@ -291,6 +291,10 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         is a lightsim2grid grid — it takes per-element data and does this
         assembly for you.
         """
+        # per-bus injections carry no per-generator set-point: the slack
+        # active-power check falls back to the grid's own targets
+        self._gen_p_rows = None
+        self._push_gen_p_targets()
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
@@ -334,6 +338,10 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+        # the slack active-power check needs each row's own generator
+        # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
+        self._gen_p_rows = np.asarray(gen_p, dtype=np.float64)
+        self._push_gen_p_targets()
 
     def set_gen_v(self, gen_v):
         """Store per-scenario generator target voltage magnitude (vm_pu, NOT kV).
