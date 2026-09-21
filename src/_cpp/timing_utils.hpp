@@ -407,6 +407,16 @@ struct BatchTimings {
     int adjoint_n_solve       = 0;
 
     // Total wall-clock time for all chunks (excludes one-time setup).
+    // --- cuDSS factor statistics of the forward solver's last ANALYSIS
+    //     (CudssBatchSolver::factor_stats(); -1 = not reported). Not timings.
+    //     lu_nnz is per system (uniform batch: the shared pattern); the memory
+    //     estimates cover the whole chunk as cuDSS allocates it. ---
+    long long cudss_lu_nnz                     = -1;  // CUDSS_DATA_LU_NNZ, one system
+    long long cudss_mem_device_permanent_bytes = -1;  // CUDSS_DATA_MEMORY_ESTIMATES[0]
+    long long cudss_mem_device_peak_bytes      = -1;  // [1]
+    long long cudss_mem_host_permanent_bytes   = -1;  // [2]
+    long long cudss_mem_host_peak_bytes        = -1;  // [3]
+
     double t_chunks_total_wall_ms() const {
         return (t_tile_V         + t_tile_Ybus      + t_patch_Ybus
               + t_tile_Sbus      + t_spmv           + t_fill_F

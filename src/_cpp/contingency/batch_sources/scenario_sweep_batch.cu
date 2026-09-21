@@ -70,6 +70,7 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
                    gen_v_override_.h_active_bus.size(), cs);
         upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
                    gen_v_override_.h_gen_v_all.size(), cs);
+        gv_vset_.upload(gen_v_override_.h_active_vc_group, cs);
     }
 
     // Per-row slack weights, if any (generator contingencies).
@@ -106,24 +107,31 @@ void ScenarioSweepBatch::set_sbus_from_orig(const cudaComplexType* d_Sbus_orig,
 void ScenarioSweepBatch::set_gen_v(GenVOverride&& gen_v_override_orig, cudaStream_t cs)
 {
     gen_v_override_ = GenVOverride{};
+    gv_vset_.clear();
     if (gen_v_override_orig.k_active() <= 0) return;
     _permute_gen_v_rows(std::move(gen_v_override_orig));
     upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
                gen_v_override_.h_active_bus.size(), cs);
     upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
                gen_v_override_.h_gen_v_all.size(), cs);
+    gv_vset_.upload(gen_v_override_.h_active_vc_group, cs);
 }
 
 void ScenarioSweepBatch::set_gen_v_from_orig(const cuda_real_type* d_gen_v_orig, int n_gen,
                                              const std::vector<int>& active_cols,
                                              const std::vector<int>& active_bus,
+                                             const std::vector<int>& active_vc_group,
                                              cudaStream_t cs)
 {
     gen_v_override_ = GenVOverride{};
+    gv_vset_.clear();
     const int k = static_cast<int>(active_cols.size());
-    if (k <= 0 || active_bus.size() != active_cols.size()) return;
+    if (k <= 0 || active_bus.size() != active_cols.size()
+        || active_vc_group.size() != active_cols.size()) return;
     gen_v_override_.h_active_bus = active_bus;   // k_active() > 0 gates the reseed
+    gen_v_override_.h_active_vc_group = active_vc_group;
     upload_h2d(d_gv_active_bus, active_bus.data(), active_bus.size(), cs);
+    gv_vset_.upload(active_vc_group, cs);
     upload_h2d(d_gv_active_col, active_cols.data(), active_cols.size(), cs);
     const int n_act = n_active();
     d_gv_all.resize(static_cast<size_t>(n_act) * k);
@@ -187,6 +195,11 @@ void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
             thrust::raw_pointer_cast(d_gv_all.data()),
             thrust::raw_pointer_cast(d_gv_active_bus.data()),
             row_offset, k, actual_batch, ctx.n_bus);
+        // ⑤  ... and the VoltageControl set-points those columns drive.
+        gv_vset_.prepare(thrust::raw_pointer_cast(ctx.base.d_vc_vset.data()),
+                         ctx.base.n_vc_grp,
+                         thrust::raw_pointer_cast(d_gv_all.data()), k,
+                         row_offset, actual_batch, ctx.batch_size, cs);
     }
 }
 

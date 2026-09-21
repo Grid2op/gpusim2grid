@@ -155,7 +155,7 @@ struct NrIterBuffers {
     const int*             d_vc_vrow      = nullptr;
     const int*             d_vc_grp_start = nullptr;
     const int*             d_vc_grp_count = nullptr;
-    const cuda_real_type*  d_vc_vset      = nullptr;
+    const cuda_real_type*  d_vc_vset      = nullptr;   // [n_vc_grp], or per slot (vc_vset_stride)
     const int*             d_vc_sh_row    = nullptr;
     const int*             d_vc_sh_first  = nullptr;
     const int*             d_vc_sh_other  = nullptr;
@@ -200,6 +200,12 @@ struct NrIterBuffers {
     // d_slack_w[b * n_slack + k] -- a ScenarioSweep row that disconnected a
     // slack participant re-weights the survivors (lightsim2grid PR #193).
     int                    slack_w_stride = 0;
+
+    // ---- per-slot VoltageControl set-points ---------------------------------
+    // 0 (default): d_vc_vset is the shared [n_vc_grp] base array. n_vc_grp:
+    // d_vc_vset is per slot, [actual_batch * n_vc_grp] -- a batch row whose
+    // gen_v moves a controller's set-point (see GenVOverride).
+    int                    vc_vset_stride = 0;
 
     // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
     // launched) unless enabled. Mirrors lightsim2grid's own
@@ -263,7 +269,7 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
             buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
         vc_vrow_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
-            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
+            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset, buf.vc_vset_stride,
             buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, batch);
         if (buf.n_vc_share > 0)
             vc_share_kernel<<<nr_grid_size((long long)batch * buf.n_vc_share, BS), BS, 0, cs>>>(

@@ -264,13 +264,6 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
             # own build_bus_q_plan); everything else reads the snapshot below.
             self._grid = grid
             self._elements = extract_injection_elements(grid, self._inner.n_bus)
-            # |V|-fixed buses (pv ∪ slack, AC-solver numbering) -- the only
-            # buses set_gen_v() acts on; used to spot two connected generators
-            # asking one bus for two different magnitudes.
-            fixed = np.zeros(self._inner.n_bus, dtype=bool)
-            fixed[np.asarray(grid.get_pv(), dtype=np.int64)] = True
-            fixed[np.asarray(grid.get_slack_ids(), dtype=np.int64)] = True
-            self._is_vm_fixed_bus = fixed
 
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
@@ -358,21 +351,21 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         gen_v : (n_scenarios, n_gens) — target vm_pu per generator,
             row-aligned with :meth:`set_injections_from_elements` /
             :meth:`set_injections`. NaN leaves that (scenario, generator)
-            untouched. Only applied to generators that regulate the voltage
-            of their OWN bus, that bus being voltage-fixed (PV or slack) in
-            this session's base case -- a disconnected, non-regulating
-            (``voltage_regulator_on`` False, even when co-located with a
-            regulating one), treated-as-off, or remotely voltage-regulating
-            (SVC / VoltageControl) generator's column is silently ignored,
-            mirroring lightsim2grid's own ``set_vm`` skips
-            (``InjectionElements.gen_v_bus``). Left unset entirely
-            (the default), every scenario keeps the grid's own base-case
-            voltage. Raises ``ValueError`` when a row asks one bus for two
-            different magnitudes (two connected generators on that bus with
-            set-points further apart than
-            ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``): no V satisfies
-            both, and lightsim2grid's own ``set_vm`` would silently let the
-            last one win.
+            untouched. A column acts on the bus its generator REGULATES
+            (``regulated_bus_id``, ``InjectionElements.gen_v_bus``): when that
+            bus's magnitude is fixed (PV / slack) |V| is re-seeded there; when
+            a VoltageControl group regulates it (a remote regulator) the value
+            is that group's set-point for the row. A disconnected,
+            non-regulating (``voltage_regulator_on`` False, even when
+            co-located with a regulating one) or treated-as-off generator's
+            column is ignored, like lightsim2grid's own ``set_vm`` skips. Left
+            unset entirely (the default), every scenario keeps the grid's own
+            base-case voltage. Raises ``ValueError`` when a row asks one bus
+            for two different magnitudes (two connected generators regulating
+            it with set-points further apart than
+            ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``, or one differing
+            from the set-point of an SVC / hvdc station of the same control
+            group): no V satisfies both.
 
         Notes
         -----
@@ -385,13 +378,15 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
         gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
-        bad = conflicting_gen_v_rows(gen_v, self._elements.gen_v_bus, self._is_vm_fixed_bus)
+        bad = conflicting_gen_v_rows(gen_v, self._elements.gen_v_bus, self._inner.is_vm_fixed_bus,
+                                     vc_group_of_bus=self._inner.vc_group_of_bus,
+                                     vc_pinned_v_set=self._inner.vc_pinned_v_set)
         if bad.any():
             rows = np.flatnonzero(bad)
             raise ValueError(
                 f"set_gen_v: rows {rows[:10].tolist()}{'...' if rows.size > 10 else ''} "
                 "ask one bus for two different voltage magnitudes (two connected "
-                "generators on the same bus with different set-points): no V "
+                "generators regulating the same bus with different set-points): no V "
                 "satisfies both. Give co-located generators the same vm_pu, or "
                 "NaN for all but one of them.")
         self._inner.set_gen_v(gen_v, self._elements.gen_v_bus)

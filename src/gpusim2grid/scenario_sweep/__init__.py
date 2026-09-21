@@ -664,7 +664,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
 
     @property
     def is_vm_fixed_bus(self):
-        """(n_bus,) bool: |V| fixed at that bus (pv or slack)."""
+        """(n_bus,) bool: |V| fixed at that bus (pv or slack without a |V| unknown)."""
         return np.asarray(self._s.is_vm_fixed_bus, dtype=bool)
 
     def get_active_to_orig(self):
@@ -682,6 +682,28 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
 
     def set_injections_dlpack(self, capsule, producer_stream=0):
         """Device path of set_injections(): a DLPack capsule of a
+    @property
+    def vc_group_of_bus(self):
+        """(n_bus,) int64: VoltageControl group regulating the bus, -1 for none."""
+        return np.asarray(self._s.vc_group_of_bus, dtype=np.int64)
+
+    @property
+    def vc_v_row_of_group(self):
+        """(n_groups,) int64: J row of each group's bordered voltage equation."""
+        return np.asarray(self._s.vc_v_row_of_group, dtype=np.int64)
+
+    @property
+    def vc_pinned_v_set(self):
+        """(n_groups,) float: base v_set of a group holding a member no gen_v
+        column can move (SVC / hvdc station), NaN for a free group."""
+        vset = np.asarray(self._s.vc_v_set, dtype=np.float64)
+        fixed = np.asarray(self._s.vc_group_has_fixed_member, dtype=bool)
+        return np.where(fixed, vset, np.nan) if vset.size else vset
+
+    def get_row_stranded_vc_groups(self):
+        """list[list[int]]: per row of the last run(), the stranded VoltageControl groups."""
+        return self._s.get_row_stranded_vc_groups()
+
         (n_scenarios, n_bus) contiguous complex PER-UNIT Sbus tensor on this
         session's device (this build's precision). Consumes the capsule."""
         self._s.set_injections_dlpack(capsule, int(producer_stream))

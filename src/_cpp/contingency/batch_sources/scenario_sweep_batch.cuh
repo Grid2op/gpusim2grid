@@ -73,6 +73,7 @@
 #include "../../contingency_analysis_helper.hpp"
 #include "../../nr_iter_step.cuh"         // BS
 #include "../gen_v_override.hpp"          // GenVOverride
+#include "gen_vset_slots.cuh"             // GenVsetSlots
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
 #include "../mask_streams.cuh"            // MaskStreams
 
@@ -176,6 +177,7 @@ struct ScenarioSweepBatch {
     thrust::device_vector<int>            d_gv_active_bus;
     thrust::device_vector<int>            d_gv_active_col;   // device path only
     thrust::device_vector<cuda_real_type> d_gv_all;
+    GenVsetSlots                          gv_vset_;          // VoltageControl set-point columns
 
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
@@ -317,16 +319,18 @@ struct ScenarioSweepBatch {
     // into active-slot order and upload (replaces whatever was configured).
     // set_gen_v_from_orig — device path: gather the selected generator columns
     //   of the session's original-order (n_scenarios × n_gen) device matrix
-    //   into active-slot order with one kernel. active_cols/active_bus are the
-    //   Vm-fixed generator columns and their buses (GenVOverride's filter).
+    //   into active-slot order with one kernel. active_cols/active_bus/
+    //   active_vc_group are the driven generator columns, the bus each
+    //   regulates and the VoltageControl group it drives (gen_v_active_columns).
     // clear_gen_v — drop any override (rows keep the base-case voltage).
     // -------------------------------------------------------------------------
     void set_gen_v(GenVOverride&& gen_v_override_orig, cudaStream_t cs);
     void set_gen_v_from_orig(const cuda_real_type* d_gen_v_orig, int n_gen,
                              const std::vector<int>& active_cols,
                              const std::vector<int>& active_bus,
+                             const std::vector<int>& active_vc_group,
                              cudaStream_t cs);
-    void clear_gen_v() { gen_v_override_ = GenVOverride{}; }
+    void clear_gen_v() { gen_v_override_ = GenVOverride{}; gv_vset_.clear(); }
 
     // -------------------------------------------------------------------------
     // fill_mask_buffers — write this chunk's handle_disconnected_grid mask
@@ -345,6 +349,16 @@ struct ScenarioSweepBatch {
     // weights (sliced by prepare_Sbus_batch) when some row re-weighted the
     // slack; otherwise leave base's shared array (stride 0, bit-identical).
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // fill_vc_vset_buffers — point buf.d_vc_vset at this chunk's per-slot
+    // VoltageControl set-points (built by prepare_Ybus_batch) when a gen_v
+    // column drives a group; otherwise base's shared array (stride 0).
+    // -------------------------------------------------------------------------
+    void fill_vc_vset_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const
+    {
+        gv_vset_.fill(buf);
+    }
+
     void fill_slack_w_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const
     {
         if (h_slack_w_all_.empty() || n_slack_ <= 0) return;
@@ -414,6 +428,7 @@ private:
     {
         const ptrdiff_t k = orig.k_active();
         gen_v_override_.h_active_bus = std::move(orig.h_active_bus);
+        gen_v_override_.h_active_vc_group = std::move(orig.h_active_vc_group);
         gen_v_override_.h_gen_v_all.resize(active_to_orig_.size() * static_cast<size_t>(k));
         for (size_t slot = 0; slot < active_to_orig_.size(); ++slot) {
             const int o = active_to_orig_[slot];

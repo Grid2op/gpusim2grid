@@ -12,6 +12,7 @@
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/injection_batch.cuh"
 #include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
+#include "ledger_data.hpp"                    // LedgerData (VoltageControl groups)
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
@@ -81,20 +82,18 @@ InjectionSweepSession::InjectionSweepSession(
         scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
 
-    // Vm-fixed bus mask for set_gen_v(): a bus in pv or slack_ids has |V|
-    // fixed by construction (not an NR unknown) in both the bare and the
-    // augmented-ledger system -- see set_gen_v()'s own doc.
-    {
-        const int n_bus = base_state_->n_bus;
-        h_is_vm_fixed_bus_.assign(static_cast<size_t>(n_bus), 0);
-        for (Eigen::Index i = 0; i < pv.size(); ++i) {
-            const int b = pv(i);
-            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
-        }
-        for (Eigen::Index i = 0; i < slack_ids.size(); ++i) {
-            const int b = slack_ids(i);
-            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
-        }
+    // Bus maps for set_gen_v(): Vm-fixed buses and the VoltageControl group
+    // regulating each bus (see build_gen_v_bus_maps / GenVOverride).
+    build_gen_v_bus_maps(base_state_->n_bus, pv, slack_ids,
+                         base_state_->h_vm_col_of_bus,
+                         ledger ? ledger->vc_reg_bus : std::vector<int>{},
+                         h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+    if (ledger) {
+        h_vc_v_set_ = ledger->vc_v_set;
+        h_vc_group_fixed_.assign(ledger->vc_reg_bus.size(), 0);
+        for (size_t j = 0; j < ledger->vc_kind.size(); ++j)
+            if (ledger->vc_kind[j] != 0)
+                h_vc_group_fixed_[static_cast<size_t>(ledger->vc_group[j])] = 1;
     }
 }
 
@@ -192,7 +191,7 @@ void InjectionSweepSession::run()
 
     GenVOverride gen_v_override;
     if (has_gen_v_)
-        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_);
+        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
 
     InjectionBatch source(std::move(h_Sbus_all), n_scenarios_, t_sbus_build_ms_,
                           std::move(gen_v_override));

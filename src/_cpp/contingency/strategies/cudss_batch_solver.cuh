@@ -14,6 +14,8 @@
 //   factor()       — CUDSS_PHASE_FACTORIZATION  (first numeric factorization)
 //   refactor()     — CUDSS_PHASE_REFACTORIZATION (subsequent refactorizations)
 //   solve()        — CUDSS_PHASE_SOLVE
+//   refresh_factor_stats() — read CUDSS_DATA_LU_NNZ / CUDSS_DATA_MEMORY_ESTIMATES
+//                    of the last ANALYSIS into factor_stats()
 //
 // This struct owns only the linear-algebra machinery.  It holds no state about
 // *when* to factorize — that is left entirely to the policy that uses it.
@@ -83,6 +85,18 @@
 #include "../../dtypes.hpp"     // cuda_real_type, CUDSS_R_TYPE
 
 enum class CudssBatchMode { Uniform, BlockDiag, NonUniform };
+
+// What cuDSS reports about the factors after an ANALYSIS (cudssDataGet).
+// -1 = not queried yet, or not reported by this cuDSS build/mode. In Uniform
+// mode lu_nnz is the fill-in of ONE system (the shared pattern), while the
+// memory estimates cover the whole batch as cuDSS allocates it.
+struct CudssFactorStats {
+    long long lu_nnz                 = -1;  // CUDSS_DATA_LU_NNZ
+    long long mem_device_permanent   = -1;  // CUDSS_DATA_MEMORY_ESTIMATES[0], bytes
+    long long mem_device_peak        = -1;  //                            [1]
+    long long mem_host_permanent     = -1;  //                            [2]
+    long long mem_host_peak          = -1;  //                            [3]
+};
 
 inline const char* cudss_batch_mode_name(CudssBatchMode m)
 {
@@ -170,6 +184,8 @@ struct CudssBatchSolver {
     // Wall-clock ms of the handle/config/data creation inside initialize();
     // see context_init_ms() below.
     double t_context_init_ms_ = 0.;
+
+    CudssFactorStats factor_stats_;
 
     // =========================================================================
     // initialize()
@@ -348,7 +364,38 @@ struct CudssBatchSolver {
         ++n_analysis_;
         analysis_pending_          = false;
         factorized_since_analysis_ = false;
+        refresh_factor_stats();
     }
+
+    // =========================================================================
+    // refresh_factor_stats() — query the fill-in (LU non-zeros) and memory
+    // estimates of the last ANALYSIS. Host-synchronizes the stream (the values
+    // are only final once ANALYSIS has run); call it outside timed regions.
+    // Uniform mode: the driver calls it after initialize()'s ANALYSIS; the
+    // other modes refresh it after every per-chunk ANALYSIS (last one wins).
+    // A query cuDSS rejects leaves its field at -1.
+    // =========================================================================
+    void refresh_factor_stats()
+    {
+        if (!dss_.handle || !dss_.data) return;
+        cudaStreamSynchronize(cs_);
+        size_t written = 0;
+        int64_t lu_nnz = -1;
+        if (cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_LU_NNZ,
+                         &lu_nnz, sizeof(lu_nnz), &written) == CUDSS_STATUS_SUCCESS)
+            factor_stats_.lu_nnz = static_cast<long long>(lu_nnz);
+        int64_t mem[16];
+        for (auto& v : mem) v = -1;
+        if (cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_MEMORY_ESTIMATES,
+                         mem, sizeof(mem), &written) == CUDSS_STATUS_SUCCESS) {
+            factor_stats_.mem_device_permanent = static_cast<long long>(mem[0]);
+            factor_stats_.mem_device_peak      = static_cast<long long>(mem[1]);
+            factor_stats_.mem_host_permanent   = static_cast<long long>(mem[2]);
+            factor_stats_.mem_host_peak        = static_cast<long long>(mem[3]);
+        }
+    }
+
+    const CudssFactorStats& factor_stats() const { return factor_stats_; }
 
     // Cumulative wall ms of the ANALYSIS runs done by prepare_factorization()
     // (0 in Uniform mode, whose single ANALYSIS the driver times itself).

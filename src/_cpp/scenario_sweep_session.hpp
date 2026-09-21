@@ -220,7 +220,8 @@ struct ScenarioSweepSession {
     bool   has_injections_ = false;
 
     // =========================================================================
-    // Vm-fixed bus mask (pv ∪ slack_ids, built once at construction) --
+    // Vm-fixed bus mask (pv ∪ slack_ids without a ledger Vm unknown, built
+    // once at construction, see build_gen_v_bus_maps) --
     // consulted by set_gen_v() below. See that method's own doc.
     // =========================================================================
     std::vector<char> h_is_vm_fixed_bus_;
@@ -228,6 +229,9 @@ struct ScenarioSweepSession {
     // =========================================================================
     // Host generator target-voltage override (set_gen_v()) -- optional; see
     // that method's own doc. Empty (has_gen_v_ == false) means every row
+    // VoltageControl group regulating each bus (-1: none) -- a gen_v column
+    // whose generator regulates such a bus drives that group's per-row v_set.
+    std::vector<int>  h_vc_group_of_bus_;
     // keeps using the grid's own base-case voltage, exactly as before this
     // setter existed.
     // =========================================================================
@@ -448,6 +452,18 @@ struct ScenarioSweepSession {
 
     // =========================================================================
     // run — solves every scenario. A scenario whose topology change
+
+    // VoltageControl structure a gen_v gradient needs: the group regulating
+    // each bus (-1: none), each group's bordered voltage row in J, its base
+    // set-point, whether it holds a member no gen_v column can move (SVC /
+    // hvdc station: its v_set is pinned), and per row of the last run() the
+    // groups handle_disconnected_grid stranded (their voltage row no longer
+    // depends on v_set).
+    std::vector<int>    vc_group_of_bus() const;
+    std::vector<int>    vc_v_row_of_group() const;
+    std::vector<double> vc_v_set() const;
+    std::vector<int>    vc_group_has_fixed_member() const;
+    std::vector<std::vector<int>> get_row_stranded_vc_groups() const;
     // disconnects the grid is skipped (NaN residual/voltage) — unless
     // handle_disconnected_grid_ is set, in which case only scenarios stranding
     // the angle reference or a controller bus are left as NaN (the rest solve

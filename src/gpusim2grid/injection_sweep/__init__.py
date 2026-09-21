@@ -500,4 +500,21 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
 
 # Not in __all__: documented separately as gpusim2grid.InjectionSweepGPU (see
 # docs/api.rst) to avoid duplicate autodoc entries for the same class.
-from .gpu_facade import InjectionSweepGPU
+from .gpu_facade import InjectionSweepGPU    @property
+    def is_vm_fixed_bus(self):
+        """(n_bus,) bool: |V| fixed at that bus (pv or slack without a |V| unknown)."""
+        return np.asarray(self._s.is_vm_fixed_bus, dtype=bool)
+
+    @property
+    def vc_group_of_bus(self):
+        """(n_bus,) int64: VoltageControl group regulating the bus, -1 for none."""
+        return np.asarray(self._s.vc_group_of_bus, dtype=np.int64)
+
+    @property
+    def vc_pinned_v_set(self):
+        """(n_groups,) float: base v_set of a group holding a member no gen_v
+        column can move (SVC / hvdc station), NaN for a free group."""
+        vset = np.asarray(self._s.vc_v_set, dtype=np.float64)
+        fixed = np.asarray(self._s.vc_group_has_fixed_member, dtype=bool)
+        return np.where(fixed, vset, np.nan) if vset.size else vset
+

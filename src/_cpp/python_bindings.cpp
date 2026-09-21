@@ -635,6 +635,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
             d2h["copy_V_to_host_ms"]          = t.t_copy_V_to_host_ms;
             d2h["copy_residuals_to_host_ms"]  = t.t_copy_residuals_to_host_ms;
             d2h["copy_violations_to_host_ms"] = t.t_copy_violations_to_host_ms;
+        .def_readonly("cudss_lu_nnz", &BatchTimings::cudss_lu_nnz,
+                      "cuDSS CUDSS_DATA_LU_NNZ after the forward solver's last ANALYSIS "
+                      "(non-zeros of the L+U factors of ONE system, i.e. the fill-in; -1 = not "
+                      "reported). The cudss_mem_* estimates cover the whole chunk.")
+        .def_readonly("cudss_mem_device_permanent_bytes", &BatchTimings::cudss_mem_device_permanent_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[0]: permanent device memory (bytes)")
+        .def_readonly("cudss_mem_device_peak_bytes", &BatchTimings::cudss_mem_device_peak_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[1]: peak device memory (bytes)")
+        .def_readonly("cudss_mem_host_permanent_bytes", &BatchTimings::cudss_mem_host_permanent_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[2]: permanent host memory (bytes)")
+        .def_readonly("cudss_mem_host_peak_bytes", &BatchTimings::cudss_mem_host_peak_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[3]: peak host memory (bytes)")
 
             // Batched adjoint (differentiable path): cumulative over the driver's
             // life, separate from run() -- NOT part of 'total'.
@@ -1364,15 +1376,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("gen_v"),
          pybind11::arg("gen_bus"),
          "Per-scenario generator target voltage magnitude (vm_pu, NOT kV), "
-         "(n_scenarios x n_gen). Unlike set_injections(), this does NOT feed "
-         "Sbus -- it only re-seeds |V| at each generator's own AC-solver bus "
-         "(gen_bus[g]) right before that chunk's solve, and ONLY for "
-         "generators whose own bus is Vm-fixed (PV or slack); a "
-         "disconnected, reactive-only, or remotely voltage-regulating (SVC / "
-         "VoltageControl) generator's column is silently ignored, mirroring "
-         "lightsim2grid's own modify_gen_v / GeneratorContainer::set_vm. NaN "
-         "entries leave that (row, gen) untouched. gen_bus: (n_gen,) "
-         "AC-solver bus id per generator, -1 for a disconnected one.")
+         "(n_scenarios x n_gen). Does NOT feed Sbus. gen_bus[g] is the "
+         "AC-solver bus generator g REGULATES (-1: none). When that bus is "
+         "Vm-fixed (is_vm_fixed_bus) |V| is re-seeded there before the solve "
+         "(lightsim2grid's modify_gen_v / set_vm); when a VoltageControl group "
+         "regulates it (vc_group_of_bus) the value is that group's per-row "
+         "v_set. Any other column is ignored; NaN entries leave that (row, "
+         "gen) untouched.")
     .def("set_branch_data",
          &InjectionSweepSession::set_branch_data,
          pybind11::arg("branch_from"),
@@ -1553,15 +1563,24 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("gen_v"),
          pybind11::arg("gen_bus"),
          "Per-scenario generator target voltage magnitude (vm_pu, NOT kV), "
-         "(n_scenarios x n_gen). Unlike set_injections(), this does NOT feed "
-         "Sbus -- it only re-seeds |V| at each generator's own AC-solver bus "
-         "(gen_bus[g]) right before that chunk's solve, and ONLY for "
-         "generators whose own bus is Vm-fixed (PV or slack); a "
-         "disconnected, reactive-only, or remotely voltage-regulating (SVC / "
-         "VoltageControl) generator's column is silently ignored, mirroring "
-         "lightsim2grid's own modify_gen_v / GeneratorContainer::set_vm. NaN "
-         "entries leave that (row, gen) untouched. gen_bus: (n_gen,) "
-         "AC-solver bus id per generator, -1 for a disconnected one.")
+         "(n_scenarios x n_gen). Does NOT feed Sbus. gen_bus[g] is the "
+         "AC-solver bus generator g REGULATES (-1: none). When that bus is "
+         "Vm-fixed (is_vm_fixed_bus) |V| is re-seeded there before the solve "
+         "(lightsim2grid's modify_gen_v / set_vm); when a VoltageControl group "
+         "regulates it (vc_group_of_bus) the value is that group's per-row "
+         "v_set. Any other column is ignored; NaN entries leave that (row, "
+         "gen) untouched.")
+    .def_property_readonly("is_vm_fixed_bus", &InjectionSweepSession::is_vm_fixed_bus,
+         "(n_bus,) 0/1: pv or slack bus without a |V| unknown -- a gen_v "
+         "column regulating it re-seeds |V| there.")
+    .def_property_readonly("vc_group_of_bus", &InjectionSweepSession::vc_group_of_bus,
+         "(n_bus,) int: VoltageControl group regulating the bus, -1 for none -- "
+         "a gen_v column regulating it sets that group's per-row v_set.")
+    .def_property_readonly("vc_group_has_fixed_member", &InjectionSweepSession::vc_group_has_fixed_member,
+         "(n_groups,) 0/1: the group holds a member no gen_v column can move "
+         "(SVC, hvdc converter station), pinning its v_set.")
+    .def_property_readonly("vc_v_set", &InjectionSweepSession::vc_v_set,
+         "(n_groups,) float: base VoltageControl set-points (pu).")
     .def("set_topology",
          &ScenarioSweepSession::set_topology,
          pybind11::arg("branch_ids_per_scenario"),
@@ -1835,8 +1854,23 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Bus-keyed J column of each bus' |V| unknown (length n_bus, -1 for a "
          "Vm-fixed bus).")
     .def_property_readonly("is_vm_fixed_bus", &ScenarioSweepSession::is_vm_fixed_bus,
-         "(n_bus,) 0/1: the bus' |V| is fixed (pv or slack) -- the only buses "
-         "set_gen_v() acts on and the only ones with a gen_v gradient.")
+         "(n_bus,) 0/1: pv or slack bus without a |V| unknown -- a gen_v "
+         "column regulating it re-seeds |V| there (direct + dS/d|V| gradient).")
+    .def_property_readonly("vc_group_of_bus", &ScenarioSweepSession::vc_group_of_bus,
+         "(n_bus,) int: VoltageControl group regulating the bus, -1 for none -- "
+         "a gen_v column regulating it sets that group's per-row v_set.")
+    .def_property_readonly("vc_v_row_of_group", &ScenarioSweepSession::vc_v_row_of_group,
+         "(n_groups,) int: J row of each group's bordered voltage equation "
+         "|V_reg| + s.Q - v_set = 0 (the v_set gradient is lambda there).")
+    .def_property_readonly("vc_v_set", &ScenarioSweepSession::vc_v_set,
+         "(n_groups,) float: base VoltageControl set-points (pu).")
+    .def_property_readonly("vc_group_has_fixed_member", &ScenarioSweepSession::vc_group_has_fixed_member,
+         "(n_groups,) 0/1: the group holds a member no gen_v column can move "
+         "(SVC, hvdc converter station), pinning its v_set.")
+    .def("get_row_stranded_vc_groups", &ScenarioSweepSession::get_row_stranded_vc_groups,
+         "list[list[int]]: per scenario (original row order), the VoltageControl "
+         "groups the last run() stranded (handle_disconnected_grid: voltage row "
+         "repurposed into Q_c == 0, so it no longer depends on v_set).")
     .def("get_active_to_orig", &ScenarioSweepSession::get_active_to_orig,
          "(n_active,) int: original scenario index of each active batch slot "
          "(identity before run() or without islanded rows).")
@@ -2240,4 +2274,43 @@ PYBIND11_MODULE(_gpusim2grid, m)
 #else
     m.attr("is_fp32") = false;
 #endif
-}
+}    pybind11::class_<CudssBatchBenchResult>(m, "CudssBatchBenchResult",
+        "benchmark_cudss_batch_raw() output: wall-clock ms per cuDSS phase "
+        "(stream-synchronized), cuDSS factor statistics, solution sanity check.")
+        .def_readonly("dim", &CudssBatchBenchResult::dim)
+        .def_readonly("nnz", &CudssBatchBenchResult::nnz)
+        .def_readonly("batch_size", &CudssBatchBenchResult::batch_size)
+        .def_readonly("context_init_ms", &CudssBatchBenchResult::context_init_ms)
+        .def_readonly("analysis_ms", &CudssBatchBenchResult::analysis_ms)
+        .def_readonly("factorize_ms", &CudssBatchBenchResult::factorize_ms)
+        .def_readonly("refactorize_ms", &CudssBatchBenchResult::refactorize_ms,
+                      "Mean REFACTORIZATION wall ms")
+        .def_readonly("solve_ms", &CudssBatchBenchResult::solve_ms, "Mean SOLVE wall ms")
+        .def_readonly("n_refactorize", &CudssBatchBenchResult::n_refactorize)
+        .def_readonly("lu_nnz", &CudssBatchBenchResult::lu_nnz, "CUDSS_DATA_LU_NNZ of one system (-1 = not reported)")
+        .def_readonly("mem_device_permanent", &CudssBatchBenchResult::mem_device_permanent)
+        .def_readonly("mem_device_peak", &CudssBatchBenchResult::mem_device_peak)
+        .def_readonly("mem_host_permanent", &CudssBatchBenchResult::mem_host_permanent)
+        .def_readonly("mem_host_peak", &CudssBatchBenchResult::mem_host_peak)
+        .def_readonly("max_rel_residual", &CudssBatchBenchResult::max_rel_residual,
+                      "max over slots of ||A x - b||inf / ||b||inf (b = A*1)")
+        .def_readonly("n_nonfinite_slots", &CudssBatchBenchResult::n_nonfinite_slots);
+
+    m.def("benchmark_cudss_batch_raw", &benchmark_cudss_batch_raw,
+        pybind11::arg("dim"),
+        pybind11::arg("indptr"),
+        pybind11::arg("indices"),
+        pybind11::arg("data"),
+        pybind11::arg("batch_size"),
+        pybind11::arg("n_refactorize") = 4,
+        pybind11::arg("device") = -1,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
+        pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
+        "same batch-mode env variables and config knobs) on an arbitrary CSR "
+        "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "
+        "n_refactorize REFACTORIZATION + SOLVE pairs. rhs = A*1. Returns a "
+        "CudssBatchBenchResult with per-phase wall ms, CUDSS_DATA_LU_NNZ and "
+        "CUDSS_DATA_MEMORY_ESTIMATES. For sizing a Jacobian no session builds yet.");
+

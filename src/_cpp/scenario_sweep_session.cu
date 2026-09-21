@@ -52,8 +52,9 @@ struct ScenarioSweepDeviceData {
     // contingencies). Session-owned: the driver only keeps the pointer.
     thrust::device_vector<unsigned char>   d_gen_off;
     int              gen_off_n_gen = 0;
-    std::vector<int> gv_active_cols;   // Vm-fixed generator columns (device path)
-    std::vector<int> gv_active_bus;    // ... and their AC-solver buses
+    std::vector<int> gv_active_cols;   // driven generator columns (device path)
+    std::vector<int> gv_active_bus;    // ... and the AC-solver bus each regulates
+    std::vector<int> gv_active_group;  // ... and the VoltageControl group it drives (-1: none)
 };
 
 // =============================================================================
@@ -148,23 +149,15 @@ ScenarioSweepSession::ScenarioSweepSession(
 
     _build_base_state(std::vector<int>{});
 
-    // Vm-fixed bus mask for set_gen_v(): a bus in pv or slack_ids has |V|
-    // fixed by construction (not an NR unknown) in both the bare and the
-    // augmented-ledger system -- see set_gen_v()'s own doc. A switchable bus
-    // (generator contingencies) keeps its reseed too: it is only the NR start
-    // value on a row that releases it.
-    {
-        const int n_bus = base_state_->n_bus;
-        h_is_vm_fixed_bus_.assign(static_cast<size_t>(n_bus), 0);
-        for (Eigen::Index i = 0; i < pv.size(); ++i) {
-            const int b = pv(i);
-            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
-        }
-        for (Eigen::Index i = 0; i < slack_ids.size(); ++i) {
-            const int b = slack_ids(i);
-            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
-        }
-    }
+    // Bus maps for set_gen_v() (see build_gen_v_bus_maps): the Vm-fixed buses
+    // (pv ∪ slack without a Vm unknown in the un-extended ledger -- a
+    // switchable bus reserved later keeps its reseed, it is only the NR start
+    // value on a row that releases it) and the VoltageControl group
+    // regulating each bus, whose per-row v_set a gen_v column drives.
+    build_gen_v_bus_maps(base_state_->n_bus, pv, slack_ids,
+                         base_state_->h_vm_col_of_bus,
+                         base_ledger_ ? base_ledger_->vc_reg_bus : std::vector<int>{},
+                         h_is_vm_fixed_bus_, h_vc_group_of_bus_);
 }
 
 // =============================================================================
@@ -439,17 +432,10 @@ void ScenarioSweepSession::set_gen_v_device(const void* d_ptr, int n_scen, int n
         throw std::runtime_error(
             "ScenarioSweepSession::set_gen_v_device: n_scenarios must be > 0");
 
-    // Vm-fixed column filter (same rule as build_gen_v_override).
-    const int n_bus = base_state_->n_bus;
-    dev_->gv_active_cols.clear();
-    dev_->gv_active_bus.clear();
-    for (int g = 0; g < n_gen; ++g) {
-        const int b = gen_bus(g);
-        if (b >= 0 && b < n_bus && h_is_vm_fixed_bus_[static_cast<size_t>(b)]) {
-            dev_->gv_active_cols.push_back(g);
-            dev_->gv_active_bus.push_back(b);
-        }
-    }
+    // Driven-column filter (same rule as build_gen_v_override).
+    gen_v_active_columns(gen_bus, h_is_vm_fixed_bus_, h_vc_group_of_bus_,
+                         dev_->gv_active_cols, dev_->gv_active_bus,
+                         dev_->gv_active_group);
     dev_->gen_v_n_gen = n_gen;
 
     cudaStream_t cs = static_cast<cudaStream_t>(base_state_->cs);
@@ -865,10 +851,11 @@ void ScenarioSweepSession::run()
         } else if (gen_v_on_device_) {
             solver_->source_.set_gen_v_from_orig(
                 thrust::raw_pointer_cast(dev_->d_gen_v_orig.data()),
-                dev_->gen_v_n_gen, dev_->gv_active_cols, dev_->gv_active_bus, scs);
+                dev_->gen_v_n_gen, dev_->gv_active_cols, dev_->gv_active_bus,
+                dev_->gv_active_group, scs);
         } else {
             solver_->source_.set_gen_v(
-                build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_), scs);
+                build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_), scs);
         }
     }
 
@@ -1016,6 +1003,30 @@ std::vector<int> ScenarioSweepSession::is_vm_fixed_bus()  const
 }
 
 Eigen::VectorXi ScenarioSweepSession::get_active_to_orig() const
+std::vector<int> ScenarioSweepSession::vc_group_of_bus() const { return h_vc_group_of_bus_; }
+std::vector<int> ScenarioSweepSession::vc_v_row_of_group() const { return base_state_->h_vc_vrow; }
+std::vector<double> ScenarioSweepSession::vc_v_set() const
+{
+    return base_ledger_ ? base_ledger_->vc_v_set : std::vector<double>{};
+}
+std::vector<int> ScenarioSweepSession::vc_group_has_fixed_member() const
+{
+    // a member whose set-point no gen_v column can move (an SVC, an hvdc
+    // converter station): the group's v_set is then pinned at its base value
+    std::vector<int> out;
+    if (!base_ledger_) return out;
+    out.assign(base_ledger_->vc_reg_bus.size(), 0);
+    for (size_t j = 0; j < base_ledger_->vc_kind.size(); ++j)
+        if (base_ledger_->vc_kind[j] != 0)
+            out[static_cast<size_t>(base_ledger_->vc_group[j])] = 1;
+    return out;
+}
+std::vector<std::vector<int>> ScenarioSweepSession::get_row_stranded_vc_groups() const
+{
+    std::vector<std::vector<int>> out(contingencies_.size());
+    for (size_t r = 0; r < contingencies_.size(); ++r) out[r] = contingencies_[r].stranded_groups;
+    return out;
+}
 {
     if (!solver_) {
         Eigen::VectorXi out(n_scenarios_);

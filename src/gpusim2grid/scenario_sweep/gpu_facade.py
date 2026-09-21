@@ -396,31 +396,33 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
 
         Mirrors lightsim2grid's ``modify_gen_v``: unlike
         :meth:`set_injections_from_elements`, this does NOT feed Sbus at
-        all -- a PV/slack bus's magnitude is never part of Newton-Raphson's
-        unknown vector, so it never moves during a solve once seeded. This
-        only re-seeds ``|V|`` at each generator's own AC-solver bus,
-        immediately before that scenario's solve, keeping whatever angle is
-        already seeded there.
+        all. A column acts on the bus its generator REGULATES
+        (``regulated_bus_id``): a PV/slack bus's magnitude is never part of
+        Newton-Raphson's unknown vector, so there ``|V|`` is re-seeded right
+        before that scenario's solve (keeping the angle) and stays put; a bus
+        regulated by a VoltageControl group (a remote regulator) keeps its
+        ``|V|`` unknown, and the value becomes that group's set-point in its
+        bordered voltage equation for the row.
 
         Parameters
         ----------
         gen_v : (n_scenarios, n_gens) — target vm_pu per generator,
             row-aligned with :meth:`set_injections_from_elements` /
             :meth:`set_injections` / :meth:`set_topology`. NaN leaves that
-            (scenario, generator) untouched. Only applied to generators
-            that regulate the voltage of their OWN bus, that bus being
-            voltage-fixed (PV or slack) in this session's base case -- a
-            disconnected, non-regulating (``voltage_regulator_on`` False,
-            even when co-located with a regulating one), treated-as-off, or
-            remotely voltage-regulating (SVC / VoltageControl) generator's
-            column is silently ignored, mirroring lightsim2grid's own
-            ``set_vm`` skips (``InjectionElements.gen_v_bus``). Left unset entirely
+            (scenario, generator) untouched. A disconnected, non-regulating
+            (``voltage_regulator_on`` False, even when co-located with a
+            regulating one) or treated-as-off generator's column is ignored,
+            mirroring lightsim2grid's own ``set_vm`` skips
+            (``InjectionElements.gen_v_bus``). Left unset entirely
             (the default), every scenario keeps the grid's own base-case
             voltage.
 
         A row asking one bus for two different magnitudes (two connected
-        generators on that bus, both applied, set-points further apart than
-        ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``) is infeasible -- |V|
+        generators regulating that bus, both applied, set-points further
+        apart than
+        ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``, or one differing from
+        the set-point of an SVC / hvdc station in the same control group) is
+        infeasible -- |V|
         at a bus is unique -- and is reported as NOT SIMULATED (NaN voltage /
         residual, :meth:`get_disconnected` = 1, a ``GRID``/``NOT_SIMULATED``
         violation) rather than letting the last column silently win the way
@@ -451,7 +453,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         if gen_off is not None and gen_off.shape[0] != self._gen_v.shape[0]:
             gen_off = None
         bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_v_bus,
-                                     self._inner.is_vm_fixed_bus, gen_off=gen_off)
+                                     self._inner.is_vm_fixed_bus, gen_off=gen_off,
+                                     vc_group_of_bus=self._inner.vc_group_of_bus,
+                                     vc_pinned_v_set=self._inner.vc_pinned_v_set)
         if bad.any():
             self._inner.set_skipped_rows(bad)
         else:

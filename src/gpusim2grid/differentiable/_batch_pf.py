@@ -91,13 +91,28 @@ depending on ``gen_v`` through ``G``. Hence
 
 where ``∂S_calc/∂Vm_k`` is the dS/dVm column ``fill_J`` never stores for a
 Vm-fixed bus, evaluated on the row's own patched Ybus. The minus sign is the
-implicit-function sign: ``dx/dVm_k = -J⁻¹ ∂S_calc/∂Vm_k``. Only generators
-that write the voltage of their own Vm-fixed (pv or slack) bus
+implicit-function sign: ``dx/dVm_k = -J⁻¹ ∂S_calc/∂Vm_k``.
+
+A generator regulating a bus a VoltageControl group holds (a remote
+regulator: ``regulated_bus_id`` differs from its own bus) does not fix any
+``|V|``: its set-point is the group's ``v_set`` in the bordered equation
+``F_v = |V_reg| + Σ s·Q_c − v_set = 0``. ``∂F_v/∂v_set = −1``, the same sign an
+injection has in its P/Q row, so its gradient is ``λ`` at that group's
+voltage row (0 on a row where ``handle_disconnected_grid`` stranded the group:
+its row then no longer contains ``v_set``; 0 for a group holding an SVC or an
+hvdc station, whose set-point no batch moves).
+
+Tied set-points: generators regulating the same bus must agree on a row (a
+bus has one magnitude, a group one ``v_set``; rows that don't are NOT
+SIMULATED), so only the derivative ALONG the tie exists. It is split equally
+between the columns that actually apply on that row (non-NaN, not taken out by
+``gen_status``) -- they sum to it, as ``lightsim2grid``'s ``get_gen_v_share``.
+
+Only generators whose ``gen_v`` reaches the solve get a non-zero gradient
 (``InjectionElements.gen_v_bus``: connected, voltage regulation on, not
-treated as off) get a non-zero gradient -- exactly the ones ``set_gen_v``
-acts on; a non-regulating generator co-located with a regulating one gets 0
-and its ``gen_v`` never conflicts; a NaN entry (= "keep the base-case voltage")
-gets 0.
+treated as off, keyed on the REGULATED bus); a non-regulating generator
+co-located with a regulating one gets 0 and never conflicts; a NaN entry (=
+"keep the base-case set-point") gets 0.
 
 Row bookkeeping: the session works in *active-slot* order (rows the
 connectivity pre-check drops are compacted out); all of that stays in C++
@@ -128,7 +143,7 @@ import torch
 from torch import Tensor
 
 from .. import _gpusim2grid as _cpp
-from .._ls2g_utils import extract_branch_data, GEN_V_CONFLICT_TOL
+from .._ls2g_utils import extract_branch_data, gen_v_driven_columns, GEN_V_CONFLICT_TOL
 from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
 from ._flows import compute_flows as _compute_flows_torch
 
@@ -184,6 +199,15 @@ class BatchPowerFlow:
         self._gen_v_bus_all = torch.as_tensor(np.asarray(el.gen_v_bus, dtype=np.int64), device=dev)
         self._gen_v_bus_np = np.ascontiguousarray(el.gen_v_bus, dtype=np.int32)
         self._is_vm_fixed = torch.as_tensor(self._solver.is_vm_fixed_bus, device=dev)
+        # VoltageControl: group regulating each bus (-1: none), each group's
+        # bordered voltage row, and the groups whose v_set is pinned by a member
+        # without a gen_v column (SVC / hvdc station)
+        self._vc_group_np = np.asarray(self._solver.vc_group_of_bus, dtype=np.int64)
+        self._vc_group = torch.as_tensor(self._vc_group_np, device=dev)
+        self._vc_v_row = torch.as_tensor(np.asarray(self._solver.vc_v_row_of_group, dtype=np.int64),
+                                         device=dev)
+        self._vc_pinned_np = np.asarray(self._solver.vc_pinned_v_set, dtype=np.float64)
+        self._vc_pinned = torch.as_tensor(np.isfinite(self._vc_pinned_np), device=dev)
         # Generator contingencies (build_bus_injections' gen_off correction):
         # the target Q of a NON-regulating generator sits inside const_mw and
         # leaves with it. Older snapshots (no reactive data) cannot do this.
@@ -221,17 +245,28 @@ class BatchPowerFlow:
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
         self._skip_in_session = False
         self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
-        # Columns that can conflict: voltage-writing generators on a Vm-fixed
-        # bus sharing that bus with another such generator.
+        # Columns the session drives (their regulated bus is Vm-fixed, or held by
+        # a VoltageControl group), and among them the ones that can conflict:
+        # sharing their regulated bus with another driven column, or regulating
+        # a bus whose group set-point is pinned.
         gb = np.asarray(el.gen_v_bus, dtype=np.int64)
-        fixed = np.asarray(self._solver.is_vm_fixed_bus, dtype=bool)
-        ok = gb >= 0
-        ok[ok] = fixed[gb[ok]]
-        _, inv, cnt = np.unique(gb[ok], return_inverse=True, return_counts=True)
-        cols = np.flatnonzero(ok)[cnt[inv] > 1]
+        driven = gen_v_driven_columns(gb, self._solver.is_vm_fixed_bus, self._vc_group_np)
+        self._driven = torch.as_tensor(driven, device=dev)
+        _, inv, cnt = np.unique(gb[driven], return_inverse=True, return_counts=True)
+        shared = np.zeros(driven.size, dtype=bool)
+        shared[np.flatnonzero(driven)[cnt[inv] > 1]] = True
+        ref = np.full(self.n_bus, np.nan)
+        grp_of_col = np.where(driven, self._vc_group_np[np.clip(gb, 0, None)], -1)
+        if self._vc_pinned_np.size:
+            pinned_col = (grp_of_col >= 0) & np.isfinite(
+                self._vc_pinned_np[np.clip(grp_of_col, 0, None)])
+            shared |= pinned_col
+            ref[gb[pinned_col]] = self._vc_pinned_np[grp_of_col[pinned_col]]
+        cols = np.flatnonzero(shared)
         self._shared_cols = torch.as_tensor(cols, device=dev) if cols.size else None
         if self._shared_cols is not None:
             self._shared_bus = torch.as_tensor(gb[cols], device=dev)
+            self._pinned_ref = torch.as_tensor(ref, dtype=rdt, device=dev)
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -470,6 +505,11 @@ class BatchPowerFlow:
             lo = lo.scatter_reduce(1, idx, torch.where(finite, v, torch.full_like(v, big)),
                                    reduce="amin")
             both = (hi > small) & (lo < big)
+            # a pinned group set-point takes part as one more (fixed) value
+            ref = self._pinned_ref.unsqueeze(0).expand(n_scen, -1)
+            has_ref = torch.isfinite(ref) & both
+            hi = torch.where(has_ref, torch.maximum(hi, ref), hi)
+            lo = torch.where(has_ref, torch.minimum(lo, ref), lo)
             conflict = both & ((hi - lo) > self.gen_v_conflict_tol)
             rows = conflict.any(dim=1)
             if bool(rows.any()):
@@ -574,6 +614,18 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                         m[r, torch.as_tensor(buses, device=dev)] = True
                 pf._released = m
 
+        # Rows where handle_disconnected_grid stranded a VoltageControl group:
+        # its voltage row became Q_c == 0 and no longer holds v_set.
+        ctx.stranded = None
+        if want_gen_v and pf._vc_v_row.numel():
+            st = solver.get_row_stranded_vc_groups()
+            if any(st):
+                m = torch.zeros(V.shape[0], pf._vc_v_row.numel(), dtype=torch.bool, device=dev)
+                for r, groups in enumerate(st):
+                    if groups:
+                        m[r, torch.as_tensor(groups, device=dev)] = True
+                ctx.stranded = m
+
         ctx.pf = pf
         ctx.run_id = solver.run_counter
         ctx.source_id = solver.source_build_counter
@@ -656,13 +708,27 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             g_bus = proj_vm + gvm                              # + direct term
             gen_bus = pf._gen_v_bus_all
             safe_bus = gen_bus.clamp(min=0)
-            ok = (gen_bus >= 0) & pf._is_vm_fixed[safe_bus]
-            g = g_bus[:, safe_bus]
-            g = torch.where(ok.unsqueeze(0), g, torch.zeros_like(g))
+            g = torch.where(pf._is_vm_fixed[safe_bus].unsqueeze(0), g_bus[:, safe_bus],
+                            torch.zeros_like(g_bus[:, safe_bus]))
+            if pf._vc_v_row.numel():
+                # a set-point driving a VoltageControl group: lambda at its
+                # voltage row (dF_v/dv_set = -1, the injection sign)
+                g_grp = lam[:, pf._vc_v_row]
+                if ctx.stranded is not None:
+                    g_grp = torch.where(ctx.stranded, torch.zeros_like(g_grp), g_grp)
+                g_grp = torch.where(pf._vc_pinned.unsqueeze(0), torch.zeros_like(g_grp), g_grp)
+                grp = pf._vc_group[safe_bus]
+                is_vc = grp >= 0
+                g = torch.where(is_vc.unsqueeze(0), g_grp[:, grp.clamp(min=0)], g)
             if ctx.released is not None:
                 rel = ctx.released[:, safe_bus]
                 g = torch.where(rel, torch.zeros_like(g), g)
-            g = torch.where(torch.isnan(gen_v), torch.zeros_like(g), g)
-            grad_gen_v = g
+            # tied set-points: the one derivative that exists is split between
+            # the columns that actually applied on that row
+            applied = pf._driven.unsqueeze(0) & ~torch.isnan(gen_v)
+            count = torch.zeros(n_scen, n_bus, dtype=rdtype, device=dev).scatter_add_(
+                1, safe_bus.unsqueeze(0).expand(n_scen, -1), applied.to(rdtype))
+            share = 1.0 / count.gather(1, safe_bus.unsqueeze(0).expand(n_scen, -1)).clamp(min=1.0)
+            grad_gen_v = torch.where(applied, g * share, torch.zeros_like(g))
 
         return grad_P, grad_Q, grad_gen_v, None

@@ -233,9 +233,12 @@ class InjectionElements:
     gen_target_q_mvar: np.ndarray = None
     gen_vreg_on: np.ndarray = None
     # (n_gen,) AC-solver bus whose magnitude each generator's gen_v set-point
-    # writes, -1 where it writes none: lightsim2grid's _for_each_vm_writer skips
+    # regulates -- its regulated_bus_id, so a remote regulator's REMOTE bus --
+    # -1 where it regulates none: lightsim2grid's _for_each_vm_writer skips
     # (disconnected, voltage regulation off, treated as off = pseudo-off while
-    # turnedoff_gen_pv is False), taken at the base case. The only mapping
+    # turnedoff_gen_pv is False), taken at the base case. The session decides
+    # what the set-point drives there: |V| of a Vm-fixed bus, or the v_set of
+    # the VoltageControl group regulating that bus. The only mapping
     # set_gen_v() / conflicting_gen_v_rows() / BatchPowerFlow's gen_v may use:
     # gen_bus would let a non-regulating generator's stale target_vm (often
     # 0.0 in real snapshots) clobber, or conflict with, a co-located regulating
@@ -343,7 +346,14 @@ def extract_injection_elements(grid, n_bus):
     pseudo_off = np.array([(not g.is_slack) and abs(g.slack_weight) < _TOL_EQUAL_FLOAT
                            and abs(g.target_p_mw) < _TOL_EQUAL_FLOAT for g in gens], dtype=bool)
     treated_off = pseudo_off & (not bool(grid.get_turnedoff_gen_pv()))
-    gen_v_bus = np.where(gen_status & gen_vreg_on & ~treated_off, gen_bus, -1)
+    # the bus a set-point regulates is the generator's REGULATED bus, not its
+    # own (lightsim2grid's _for_each_vm_writer: a remote regulator writes the
+    # bus it regulates) -- keying it on the own bus silently dropped every
+    # remote regulator's set-point
+    reg_bus = _relabel_to_solver(
+        me_to_solver, np.array([int(g.regulated_bus_id) for g in gens], dtype=np.int64))
+    reg_bus = np.where((reg_bus >= 0) & (reg_bus < n_bus), reg_bus, -1)
+    gen_v_bus = np.where(gen_status & gen_vreg_on & ~treated_off, reg_bus, -1)
 
     load_bus_out = np.where(load_status, load_bus, -1)
 
@@ -364,50 +374,80 @@ GEN_V_CONFLICT_TOL = 1e-8
 _TOL_EQUAL_FLOAT = 1e-7
 
 
+def gen_v_driven_columns(gen_bus, is_vm_fixed_bus, vc_group_of_bus=None):
+    """``(n_gen,)`` bool: the ``gen_v`` columns a session drives -- a
+    generator regulating (``gen_bus`` = ``InjectionElements.gen_v_bus``) a
+    Vm-fixed bus, or a bus a VoltageControl group regulates."""
+    gen_bus = np.asarray(gen_bus, dtype=np.int64)
+    fixed = np.asarray(is_vm_fixed_bus, dtype=bool)
+    ok = (gen_bus >= 0) & (gen_bus < fixed.shape[0])
+    safe = np.where(ok, gen_bus, 0)
+    driven = ok & fixed[safe]
+    if vc_group_of_bus is not None and np.size(vc_group_of_bus):
+        grp = np.asarray(vc_group_of_bus, dtype=np.int64)
+        driven |= ok & (grp[safe] >= 0)
+    return driven
+
+
 def conflicting_gen_v_rows(gen_v, gen_bus, is_vm_fixed_bus, gen_off=None,
-                           tol=GEN_V_CONFLICT_TOL):
+                           tol=GEN_V_CONFLICT_TOL, vc_group_of_bus=None,
+                           vc_pinned_v_set=None):
     """Rows of a ``(n_rows, n_gen)`` ``gen_v`` matrix that ask one bus for two
     different voltage magnitudes.
 
-    ``gen_bus`` must be ``InjectionElements.gen_v_bus`` (-1 for a generator
-    that writes no voltage), not ``gen_bus``. Only the entries a session would
-    actually apply count: a generator whose AC-solver bus is Vm-fixed
-    (``is_vm_fixed_bus[gen_bus[g]]``), writing a voltage (``gen_bus[g] >= 0``)
-    and not taken out by ``gen_off[row, g]``, with a non-NaN value.
-    Two such generators on the same bus with set-points further apart than
-    ``tol`` (per-unit) make the row infeasible -- |V| at a bus is unique --
-    so the callers report it as NOT SIMULATED instead of letting the last
-    column silently win (lightsim2grid's own ``set_vm`` behaviour).
+    ``gen_bus`` must be ``InjectionElements.gen_v_bus`` (the bus each
+    generator regulates, -1 for none), not ``gen_bus``. Only the entries a
+    session would actually apply count (:func:`gen_v_driven_columns`: the
+    regulated bus is Vm-fixed, or regulated by a VoltageControl group per
+    ``vc_group_of_bus``), not taken out by ``gen_off[row, g]``, with a
+    non-NaN value. Two such generators regulating the same bus with
+    set-points further apart than ``tol`` (per-unit) make the row infeasible
+    -- |V| at a bus is unique -- so the callers report it as NOT SIMULATED
+    instead of letting the last column silently win (lightsim2grid's own
+    ``set_vm`` behaviour). ``vc_pinned_v_set`` (``(n_groups,)``, NaN for a
+    group whose v_set is free) is the set-point a group keeps because one of
+    its members has no gen_v column (an SVC, an hvdc converter station): a
+    generator asking that bus for anything else conflicts with it too
+    (lightsim2grid's ``_row_gen_v_conflicts``).
 
     Returns a ``(n_rows,)`` bool array, True where the row conflicts.
     """
     gen_v = np.asarray(gen_v, dtype=np.float64)
     gen_bus = np.asarray(gen_bus, dtype=np.int64)
-    fixed = np.asarray(is_vm_fixed_bus, dtype=bool)
     n_rows, n_gen = gen_v.shape
-    ok = (gen_bus >= 0)
-    ok[ok] = fixed[gen_bus[ok]]
-    cols = np.flatnonzero(ok)
     out = np.zeros(n_rows, dtype=bool)
-    if cols.size < 2:
+    cols = np.flatnonzero(gen_v_driven_columns(gen_bus, is_vm_fixed_bus, vc_group_of_bus))
+    if cols.size == 0:
         return out
     bus = gen_bus[cols]
-    # only buses with at least two candidate columns can conflict
-    _, inv, cnt = np.unique(bus, return_inverse=True, return_counts=True)
-    multi = cnt[inv] > 1
-    if not multi.any():
-        return out
-    cols, bus = cols[multi], bus[multi]
     vals = gen_v[:, cols]
     active = np.isfinite(vals)
     if gen_off is not None:
         active &= ~np.asarray(gen_off, dtype=bool)[:, cols]
+
+    # a set-point the batch cannot move, per regulated bus
+    pinned = {}
+    if vc_pinned_v_set is not None and vc_group_of_bus is not None:
+        grp = np.asarray(vc_group_of_bus, dtype=np.int64)
+        vset = np.asarray(vc_pinned_v_set, dtype=np.float64)
+        for b in np.unique(bus):
+            g = grp[b]
+            if g >= 0 and np.isfinite(vset[g]):
+                pinned[int(b)] = float(vset[g])
+
     for b in np.unique(bus):
         sel = bus == b
+        if sel.sum() < 2 and int(b) not in pinned:
+            continue
         v = np.where(active[:, sel], vals[:, sel], np.nan)
         with np.errstate(invalid="ignore"):
-            spread = np.nanmax(v, axis=1) - np.nanmin(v, axis=1)
-        out |= np.nan_to_num(spread, nan=0.0) > tol
+            hi = np.nanmax(v, axis=1)
+            lo = np.nanmin(v, axis=1)
+        if int(b) in pinned:
+            ref = pinned[int(b)]
+            hi = np.fmax(hi, ref)
+            lo = np.fmin(lo, ref)
+        out |= np.nan_to_num(hi - lo, nan=0.0) > tol
     return out
 
 

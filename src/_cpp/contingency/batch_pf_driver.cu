@@ -322,6 +322,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
 
     // -------------------------------------------------------------------------
     // Source-specific one-time setup (flat-patch/mask H→D upload for
+    linear_solver_.refresh_factor_stats();   // after the timer: host queries only
     // ContingencyBatch; full Sbus_all H→D upload + one-time Ybus D→D tiling
     // for InjectionBatch). Timed separately from cuDSS ANALYSIS above so
     // t_analysis_ms_ isn't a mix of unrelated GPU compute + transfer.
@@ -1023,6 +1024,13 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     //     SpMV output of step ④ (d_Ibus_batch = Ybus · V_final for the whole
     //     padded batch). Same fill sequence as the loop -- one definition
     //     (nr_fill_J_at_current_V). Must run BEFORE step ⑤'s NaN masking of
+    const CudssFactorStats& fs = linear_solver_.factor_stats();
+    t.cudss_lu_nnz                     = fs.lu_nnz;
+    t.cudss_mem_device_permanent_bytes = fs.mem_device_permanent;
+    t.cudss_mem_device_peak_bytes      = fs.mem_device_peak;
+    t.cudss_mem_host_permanent_bytes   = fs.mem_host_permanent;
+    t.cudss_mem_host_peak_bytes        = fs.mem_host_peak;
+
     //     d_V_batch. The forward factors are untouched (cuDSS keeps them in
     //     its own data object); the batched adjoint reads the values later.
     // -------------------------------------------------------------------------
@@ -1159,6 +1167,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_hp_out_limit.data()),
             thrust::raw_pointer_cast(d_hp_count.data()),
             thrust::raw_pointer_cast(d_hp_truncated.data()));
+    // Per-slot VoltageControl set-points (a gen_v column driving a group's
+    // v_set; no-op otherwise -- base's shared array, stride 0).
+    source_.fill_vc_vset_buffers(buf, chunk);
+
         CHK_CUDA_BPF(cudaGetLastError());
         t.t_hvdc_p_check += timer.stop_ms();
     }

@@ -337,6 +337,43 @@ __global__ void apply_gen_v_kernel(
 }
 
 // =============================================================================
+// tile_vc_vset_kernel / apply_gen_vset_kernel
+// =============================================================================
+__global__ void tile_vc_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_vset_base,
+    int n_grp,
+    int batch_size)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_grp;
+    const int       g   = static_cast<int>(tid % n_grp);
+    if (b >= batch_size) return;
+    d_vset_batch[b * n_grp + g] = d_vset_base[g];
+}
+
+__global__ void apply_gen_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_gen_v_all,
+    const int*            __restrict__ d_active_group,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_grp)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / k_active;
+    const int       j   = static_cast<int>(tid % k_active);
+    if (r >= actual_batch) return;
+    const int g = d_active_group[j];
+    if (g < 0) return;
+    const cuda_real_type target =
+        d_gen_v_all[static_cast<ptrdiff_t>(row_offset + r) * k_active + j];
+    if (isnan(target)) return;
+    d_vset_batch[r * n_grp + g] = target;
+}
+
+// =============================================================================
 // fill_FP_kernel
 // =============================================================================
 __global__ void fill_FP_kernel(
@@ -837,6 +874,7 @@ __global__ void vc_vrow_kernel(
     const int*             __restrict__ d_vc_grp_start,
     const int*             __restrict__ d_vc_grp_count,
     const cuda_real_type*  __restrict__ d_vc_vset,
+    int vset_stride,
     int n_grp,
     int n_ctrl,
     int n_bus,
@@ -858,7 +896,8 @@ __global__ void vc_vrow_kernel(
         slope_term += d_vc_slope[j] * d_vc_q[b * n_ctrl + j];
     }
     // F_v = Vm(reg) + Σ s_c·Q_c − v_set ;  residual d_F = −F_v (custom row: assign)
-    d_F[b * dim_J + d_vc_vrow[g]] = -(vm + slope_term - d_vc_vset[g]);
+    const cuda_real_type vset = d_vc_vset[b * vset_stride + g];
+    d_F[b * dim_J + d_vc_vrow[g]] = -(vm + slope_term - vset);
 }
 
 __global__ void vc_share_kernel(

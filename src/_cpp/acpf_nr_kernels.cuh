@@ -106,6 +106,33 @@ __global__ void apply_gen_v_kernel(
     int n_bus);
 
 // ---------------------------------------------------------------------------
+// tile_vc_vset_kernel / apply_gen_vset_kernel
+//
+// Per-slot VoltageControl set-points: tile the base per-group v_set into
+// [batch_size * n_grp] (phantom slots included), then overwrite
+// d_vset_batch[r * n_grp + group[j]] with each non-NaN gen_v column j that
+// drives a group (d_active_group[j] >= 0; -1 columns are plain reseeds and
+// are skipped). Rows agreeing within a group is the caller's contract
+// (conflicting rows are skipped before they get here), so the write order
+// within a group does not matter. Consumed by vc_vrow_kernel with
+// vset_stride = n_grp.
+// ---------------------------------------------------------------------------
+__global__ void tile_vc_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_vset_base,
+    int n_grp,
+    int batch_size);
+
+__global__ void apply_gen_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_gen_v_all,
+    const int*            __restrict__ d_active_group,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_grp);
+
+// ---------------------------------------------------------------------------
 // fill_FP_kernel
 //
 // Stores −ΔP at the ledger P-equation row of each P bus.
@@ -460,7 +487,8 @@ __global__ void vc_vrow_kernel(
     const int*             __restrict__ d_vc_vrow,     // [n_grp]
     const int*             __restrict__ d_vc_grp_start,// [n_grp]
     const int*             __restrict__ d_vc_grp_count,// [n_grp]
-    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp]
+    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp] or [actual_batch * n_grp]
+    int vset_stride,                                   // 0: shared, n_grp: per slot
     int n_grp,
     int n_ctrl,
     int n_bus,
