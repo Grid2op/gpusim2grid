@@ -417,25 +417,36 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
         upload_h2d(d_branch_to,   h_to.data(),   n_branches_, cs);
 
         const double sqrt3 = std::sqrt(3.0);
-        std::vector<cuda_real_type> h_base(n_branches_);
+        // One current base per terminal: |I| in pu is converted to A with the
+        // nominal voltage of the bus the terminal sits on (as lightsim2grid
+        // does), so on a transformer (or any branch joining two voltage
+        // levels) the two sides get different bases.
+        std::vector<cuda_real_type> h_base(n_branches_), h_base_ex(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
-            // branch_from can be -1 (Kron-reduced / half-open-line endpoint,
+            // An endpoint can be -1 (Kron-reduced / half-open-line endpoint,
             // see check_limit_violations_kernel's own bf/bt>=0 guard) --
             // bus_vn_kv(-1) is an out-of-bounds read (UB, not caught by
             // Eigen without assertions), and if it happens to read something
-            // near zero it makes h_base[l] = +inf, which then poisons the
+            // near zero it makes the base +inf, which then poisons the
             // *live* side's reported current (ka_or/ka_ex = finite * inf)
             // into an "infinite" CURRENT violation. Fall back to the other
-            // endpoint, which is always valid when branch_from isn't (a
+            // endpoint, which is always valid when this one isn't (a
             // branch can't have both ends Kron-reduced and still appear
-            // here).
-            const int vn_bus = (h_from[l] >= 0) ? h_from[l] : h_to[l];
-            const double vn = (vn_bus >= 0) ? bus_vn_kv(vn_bus) : 0.0;
-            h_base[l] = (vn_bus >= 0)
-                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn * 1e3))
+            // here). The current on the -1 side itself is 0 in the kernels,
+            // so its base only has to be finite.
+            const int vn_bus_or = (h_from[l] >= 0) ? h_from[l] : h_to[l];
+            const int vn_bus_ex = (h_to[l]   >= 0) ? h_to[l]   : h_from[l];
+            const double vn_or = (vn_bus_or >= 0) ? bus_vn_kv(vn_bus_or) : 0.0;
+            const double vn_ex = (vn_bus_ex >= 0) ? bus_vn_kv(vn_bus_ex) : 0.0;
+            h_base[l] = (vn_bus_or >= 0)
+                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn_or * 1e3))
+                : cuda_real_type(0);
+            h_base_ex[l] = (vn_bus_ex >= 0)
+                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn_ex * 1e3))
                 : cuda_real_type(0);
         }
         upload_h2d(d_base_current_A, h_base.data(), n_branches_, cs);
+        upload_h2d(d_base_current_ex_A, h_base_ex.data(), n_branches_, cs);
     }
 
     {
@@ -1288,6 +1299,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_ytf_eff.data()),
             thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
+            thrust::raw_pointer_cast(d_base_current_ex_A.data()),
             thrust::raw_pointer_cast(d_branch_limit_a1_ka.data()),
             thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
             trip.d_start, trip.d_count, trip.d_branch_flat,
@@ -1471,6 +1483,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_ytf_eff.data()),
             thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
+            thrust::raw_pointer_cast(d_base_current_ex_A.data()),
             thrust::raw_pointer_cast(d_or_amps_results.data()),
             thrust::raw_pointer_cast(d_ex_amps_results.data()),
             n_bus, n_branches_, c_start, actual_batch, d_result_map);

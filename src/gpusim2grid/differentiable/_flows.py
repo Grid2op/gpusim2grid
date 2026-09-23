@@ -12,7 +12,12 @@ compute_flows — differentiable branch-flow computation in pure PyTorch.
     S_or = V[from] * conj(I_or)      (complex apparent power, per-unit)
     S_ex = V[to]   * conj(I_ex)
 
-    base_A = sn_mva * 1e6 / (sqrt(3) * vn_kv[from] * 1e3)
+    base_or_A = sn_mva * 1e6 / (sqrt(3) * vn_kv[from] * 1e3)
+    base_ex_A = sn_mva * 1e6 / (sqrt(3) * vn_kv[to]   * 1e3)
+
+Each terminal current is converted to amperes with the nominal voltage of
+its own bus (as lightsim2grid and the CUDA kernels do): the two bases differ
+on a transformer or on any branch joining two voltage levels.
 
 All operations are natively differentiable via PyTorch autograd. ``V`` may
 carry any number of leading batch dimensions (``(..., n_bus)``, e.g. the
@@ -59,13 +64,14 @@ def compute_flows(
     S_or = Vi * I_or.conj()     # complex apparent power (pu), origin
     S_ex = Vj * I_ex.conj()     # complex apparent power (pu), extremity
 
-    base_A = sn_mva * 1e6 / (math.sqrt(3.0) * bus_vn_kv[branch_from] * 1e3)
+    base_or_A = sn_mva * 1e6 / (math.sqrt(3.0) * bus_vn_kv[branch_from] * 1e3)
+    base_ex_A = sn_mva * 1e6 / (math.sqrt(3.0) * bus_vn_kv[branch_to] * 1e3)
 
     return {
         "p_or_mw":   S_or.real * sn_mva,
         "q_or_mvar": S_or.imag * sn_mva,
         "p_ex_mw":   S_ex.real * sn_mva,
         "q_ex_mvar": S_ex.imag * sn_mva,
-        "i_or_a":    I_or.abs() * base_A,
-        "i_ex_a":    I_ex.abs() * base_A,
+        "i_or_a":    I_or.abs() * base_or_A,
+        "i_ex_a":    I_ex.abs() * base_ex_A,
     }

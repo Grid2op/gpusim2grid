@@ -93,6 +93,7 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
     int n_bus,
@@ -139,7 +140,7 @@ __global__ void compute_branch_flows_kernel(
     const int out_c   = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
     const ptrdiff_t out_idx = static_cast<ptrdiff_t>(out_c) * n_branches + l;
     d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
-    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_A[l];
+    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
 }
 
 // =============================================================================

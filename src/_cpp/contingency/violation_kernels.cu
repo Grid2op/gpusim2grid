@@ -70,6 +70,7 @@ __global__ void check_limit_violations_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
     const cuda_real_type*  __restrict__ d_branch_limit_a1_ka,
     const cuda_real_type*  __restrict__ d_branch_limit_a2_ka,
     const int*             __restrict__ d_trip_start,
@@ -183,7 +184,7 @@ __global__ void check_limit_violations_kernel(
             : CudaFunHelper::my_make_cuComplex(0., 0.);
         // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
         const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l] * cuda_real_type(0.001);
-        const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_A[l] * cuda_real_type(0.001);
+        const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l] * cuda_real_type(0.001);
 
         const int etype = (l < n_lines) ? ELEM_LINE : ELEM_TRAFO;
         const int eid    = (l < n_lines) ? l : (l - n_lines);

@@ -69,11 +69,12 @@
 //        GLOBAL active-slot id c_start+local_c -- typically 0-4 entries,
 //        linear scan).
 //        I_or = yff_eff[l]*V[from] + yft_eff[l]*V[to];  ka_or = |I_or|*base_current_A[l]*0.001
-//        I_ex = ytf_eff[l]*V[from] + ytt_eff[l]*V[to];  ka_ex = |I_ex|*base_current_A[l]*0.001
+//        I_ex = ytf_eff[l]*V[from] + ytt_eff[l]*V[to];  ka_ex = |I_ex|*base_current_ex_A[l]*0.001
 //        (the /1000 converts gpusim2grid's existing Amps-basis
-//        d_base_current_A into kA, matching branch_limit_a1_ka/a2_ka's units;
-//        base_current_A itself is untouched, this kernel is the only place
-//        that rescales it.)
+//        d_base_current_A / d_base_current_ex_A (origin / extremity bus
+//        nominal voltage, see compute_branch_flows_kernel) into kA, matching
+//        branch_limit_a1_ka/a2_ka's units; the bases themselves are
+//        untouched, this kernel is the only place that rescales them.)
 //        if !isnan(limit1[l]) && ka_or > limit1[l] -> CURRENT, side=1 (d_out_count_current++)
 //        if !isnan(limit2[l]) && ka_ex > limit2[l] -> CURRENT, side=2 (d_out_count_current++)
 //
@@ -111,7 +112,8 @@
 // d_bus_vmin_kv/d_bus_vmax_kv : [n_bus] real, kV, NaN = unconfigured
 // d_branch_from/to : [n_branches] int, terminal bus indices
 // d_yff_eff/yft_eff/ytf_eff/ytt_eff: [n_branches] complex, pi-model admittances
-// d_base_current_A : [n_branches] real, Amps-basis (kernel /1000 for kA)
+// d_base_current_A : [n_branches] real, Amps-basis, origin side (kernel /1000 for kA)
+// d_base_current_ex_A : [n_branches] real, same, extremity side
 // d_branch_limit_a1_ka/a2_ka : [n_branches] real, kA, NaN = unconfigured
 // d_trip_start/d_trip_count/d_trip_branch_flat : tripped-branch lookup table,
 //                    indexed by GLOBAL active-slot id (c_start + local_c), or
@@ -147,6 +149,7 @@ __global__ void check_limit_violations_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
     const cuda_real_type*  __restrict__ d_branch_limit_a1_ka,
     const cuda_real_type*  __restrict__ d_branch_limit_a2_ka,
     const int*             __restrict__ d_trip_start,

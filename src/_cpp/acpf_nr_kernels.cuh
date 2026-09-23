@@ -667,9 +667,13 @@ __global__ void scatter_V_results_kernel(
 //   I_or = yff_eff * V[from] + yft_eff * V[to]   (origin / from-bus terminal)
 //   I_ex = ytf_eff * V[from] + ytt_eff * V[to]   (extremity / to-bus terminal)
 //
-// The per-unit magnitude is multiplied by d_base_current_A[l] to give A:
-//   d_base_current_A[l] = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[from[l]] * 1e3)
-// (pre-computed on the host in set_branch_data and uploaded once).
+// The per-unit magnitude is multiplied by the terminal's own current base
+// to give A (each side uses the nominal voltage of ITS bus, as lightsim2grid
+// does -- they differ on a transformer or any branch joining two voltage levels):
+//   d_base_current_A[l]    = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[from[l]] * 1e3)
+//   d_base_current_ex_A[l] = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[to[l]]   * 1e3)
+// (pre-computed on the host in set_branch_data and uploaded once; a -1
+// endpoint falls back to the other end's nominal voltage).
 //
 // Thread layout: one thread per (b, l) pair.
 //   b = tid / n_branches  — contingency index in batch [0, actual_batch)
@@ -684,7 +688,8 @@ __global__ void scatter_V_results_kernel(
 // d_V              : [actual_batch * n_bus] complex — converged voltages
 // d_branch_from/to : [n_branches] int — terminal bus indices
 // d_yff_eff/yft_eff/ytf_eff/ytt_eff: [n_branches] complex — π-model admittances
-// d_base_current_A : [n_branches] real — pre-computed I_base in A per branch
+// d_base_current_A : [n_branches] real — pre-computed I_base in A per branch, origin side
+// d_base_current_ex_A : [n_branches] real — same, extremity side
 // d_or_amps        : [n_contingencies * n_branches] real — output origin amps
 // d_ex_amps        : [n_contingencies * n_branches] real — output extremity amps
 // n_bus, n_branches, c_start, actual_batch : dimensions / offsets
@@ -700,6 +705,7 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
     int n_bus,

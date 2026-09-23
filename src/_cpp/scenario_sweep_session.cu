@@ -1106,6 +1106,7 @@ void ScenarioSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_ytf_eff.data()),
         thrust::raw_pointer_cast(solver_->d_ytt_eff.data()),
         thrust::raw_pointer_cast(solver_->d_base_current_A.data()),
+        thrust::raw_pointer_cast(solver_->d_base_current_ex_A.data()),
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_scen, /*d_result_map=*/nullptr);

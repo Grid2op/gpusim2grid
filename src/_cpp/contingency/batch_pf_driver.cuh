@@ -245,7 +245,8 @@ struct BatchPfDriver {
     thrust::device_vector<cudaComplexType> d_yft_eff;
     thrust::device_vector<cudaComplexType> d_ytf_eff;
     thrust::device_vector<cudaComplexType> d_ytt_eff;
-    thrust::device_vector<cuda_real_type>  d_base_current_A;
+    thrust::device_vector<cuda_real_type>  d_base_current_A;      // [n_branches], origin-bus nominal kV base
+    thrust::device_vector<cuda_real_type>  d_base_current_ex_A;   // [n_branches], extremity-bus nominal kV base
     thrust::device_vector<cuda_real_type>  d_bus_vn_kv;   // [n_bus], per-bus nominal kV
 
     thrust::device_vector<cuda_real_type>  d_or_amps_results;
