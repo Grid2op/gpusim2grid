@@ -43,6 +43,7 @@
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 
 #include <memory>
 #include <vector>
@@ -101,10 +102,14 @@ struct InjectionSweepSession {
     bool   has_injections_   = false;
 
     // =========================================================================
-    // Vm-fixed bus mask (pv ∪ slack_ids, built once at construction) --
+    // Vm-fixed bus mask (pv ∪ slack_ids without a ledger Vm unknown, built
+    // once at construction, see build_gen_v_bus_maps) --
     // consulted by set_gen_v() below. See that method's own doc.
     // =========================================================================
     std::vector<char> h_is_vm_fixed_bus_;
+    std::vector<int>  h_vc_group_of_bus_;   // VoltageControl group regulating each bus, -1: none
+    std::vector<int>    h_vc_group_fixed_;  // per group: holds a member gen_v cannot move (SVC / station)
+    std::vector<double> h_vc_v_set_;        // per group: base set-point (pu)
 
     // =========================================================================
     // Host generator target-voltage override (set_gen_v()) -- optional; see
@@ -140,6 +145,17 @@ struct InjectionSweepSession {
     // transfer time (t_copy_V_to_host_ms / t_copy_residuals_to_host_ms)
     // without relaxing their constness.
     mutable BatchTimings timings_;
+
+    // post-solve physical checks (see physical_checks() above)
+    PhysicalChecksConfig phys_;
+    // per-row set-points of the active-power check (set_gen_p_targets); empty
+    // = the plan's base ones for every row
+    RealMatRM gen_p_targets_;
+    bool      gen_p_targets_dirty_ = false;
+    // Residual gate of the physical checks (a row whose ||F||inf is NaN or above
+    // it reports nothing), the same role violation_tol_ plays on the other two
+    // sessions. Independent of tol_base.
+    double violation_tol_ = 1e-6;
 
     // =========================================================================
     // Constructor — runs base-case NR to convergence (AcPfNrState construction).
@@ -196,23 +212,21 @@ struct InjectionSweepSession {
     // set_gen_v
     //   Per-scenario generator target voltage magnitude (vm_pu, NOT kV),
     //   (n_scenarios x n_gen). Unlike set_injections(), this does NOT feed
-    //   Sbus -- it only re-seeds |V| at each generator's own AC-solver bus
-    //   (gen_bus[g]) right before that chunk's solve, keeping whatever angle
-    //   is already there, and ONLY for generators whose own bus is Vm-fixed
-    //   (a member of h_is_vm_fixed_bus_, built from this session's pv ∪
-    //   slack_ids at construction). A PV/slack bus's magnitude is never part
-    //   of Newton-Raphson's unknown vector in either the bare or the
-    //   augmented-ledger system, so it never moves once seeded -- this
-    //   mirrors lightsim2grid's own modify_gen_v /
-    //   GeneratorContainer::set_vm exactly. A generator that is disconnected,
-    //   reactive-only ("PQ"), or remotely voltage-regulating (SVC /
-    //   VoltageControl -- PQ-classified with its own border row, so never in
-    //   pv/slack) is silently ignored, matching lightsim2grid's own
-    //   voltage_regulator_on_-gated skip. NaN entries in gen_v leave that
-    //   (row, gen) untouched. Left unset entirely (the default), every row
-    //   keeps the grid's own base-case voltage.
-    //   gen_bus must have one entry per generator (AC-solver bus id, -1 for
-    //   a disconnected generator). May be called repeatedly, and in either
+    //   Sbus. gen_bus[g] is the AC-solver bus generator g REGULATES
+    //   (InjectionElements.gen_v_bus: its regulated_bus_id, -1 when it
+    //   regulates nothing). Two cases are driven:
+    //     * that bus is Vm-fixed (h_is_vm_fixed_bus_: pv ∪ slack with no Vm
+    //       unknown): |V| is re-seeded there right before the chunk's solve,
+    //       keeping the angle -- never an NR unknown, so it stays put
+    //       (lightsim2grid's modify_gen_v / GeneratorContainer::set_vm);
+    //     * that bus is regulated by a VoltageControl group (a remote
+    //       regulator, or a local one on a group-controlled bus): the value is
+    //       that group's v_set for the row, in the bordered row
+    //       |V_reg| + s.Q - v_set = 0 (and |V_reg| is re-seeded as a start).
+    //   Any other column is ignored. NaN entries in gen_v leave that (row,
+    //   gen) untouched. Left unset entirely (the default), every row keeps
+    //   the grid's own base-case voltage and set-points.
+    //   gen_bus must have one entry per generator. May be called repeatedly, and in either
     //   order relative to set_injections() -- the row count is only checked
     //   against set_injections()'s n_scenarios at the next run().
     // =========================================================================
@@ -259,6 +273,13 @@ struct InjectionSweepSession {
     int n_bus() const;
     int n_branches() const;
 
+    // set_gen_v() bus maps (see ScenarioSweepSession's accessors of the same name)
+    std::vector<int>    is_vm_fixed_bus() const
+    { return std::vector<int>(h_is_vm_fixed_bus_.begin(), h_is_vm_fixed_bus_.end()); }
+    std::vector<int>    vc_group_of_bus() const { return h_vc_group_of_bus_; }
+    std::vector<int>    vc_group_has_fixed_member() const { return h_vc_group_fixed_; }
+    std::vector<double> vc_v_set() const { return h_vc_v_set_; }
+
     // =========================================================================
     // Result accessors — synchronous D→H copy on demand.
     // =========================================================================
@@ -267,6 +288,39 @@ struct InjectionSweepSession {
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
+
+    // =========================================================================
+    // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
+    // .hpp): the per-bus reactive capability (compute_physical_violations,
+    // lightsim2grid PR #206 parity) and the droop hvdc P-saturation
+    // (compute_physical_violations). Flags / tolerances / capacities live on
+    // physical_checks(); mutable, taken into account at the next run().
+    // set_bus_q_capability() hands in the plan the reactive check needs (built
+    // by lightsim2grid's own build_bus_q_plan through the bridge, or by the
+    // caller in array mode). The get_* accessors are synchronous D->H copies
+    // and throw unless the last run() had the corresponding flag on.
+    // =========================================================================
+    PhysicalChecksConfig&       physical_checks()       { return phys_; }
+    const PhysicalChecksConfig& physical_checks() const { return phys_; }
+    void set_bus_q_capability(const BusQPlanData& plan);
+    BusQViolationsResult  get_bus_q_violations()    const;
+    BusQViolationsResult  get_bus_q_violations_n()  const;
+    HvdcPViolationsResult get_hvdc_p_violations()   const;
+    HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
+    // Per-row active set-points of the machines of that plan (MW, GENERATOR
+    // convention, NaN = keep the grid's own), (n_rows x n_entries) with one
+    // column per entry of the plan in its order, row-aligned with
+    // set_injections: what a row's generator produces is ITS target plus its
+    // share of the slack, and only the caller knows that target (the facades
+    // fill it from set_injections_from_elements' gen_p). Left unset, every row
+    // is checked against the base set-points. An empty matrix drops them.
+    void set_gen_p_targets(Eigen::Ref<const RealMatRM> targets);
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     InjectionSweepSession(const InjectionSweepSession&)            = delete;

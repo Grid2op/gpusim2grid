@@ -106,6 +106,33 @@ __global__ void apply_gen_v_kernel(
     int n_bus);
 
 // ---------------------------------------------------------------------------
+// tile_vc_vset_kernel / apply_gen_vset_kernel
+//
+// Per-slot VoltageControl set-points: tile the base per-group v_set into
+// [batch_size * n_grp] (phantom slots included), then overwrite
+// d_vset_batch[r * n_grp + group[j]] with each non-NaN gen_v column j that
+// drives a group (d_active_group[j] >= 0; -1 columns are plain reseeds and
+// are skipped). Rows agreeing within a group is the caller's contract
+// (conflicting rows are skipped before they get here), so the write order
+// within a group does not matter. Consumed by vc_vrow_kernel with
+// vset_stride = n_grp.
+// ---------------------------------------------------------------------------
+__global__ void tile_vc_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_vset_base,
+    int n_grp,
+    int batch_size);
+
+__global__ void apply_gen_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_gen_v_all,
+    const int*            __restrict__ d_active_group,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_grp);
+
+// ---------------------------------------------------------------------------
 // fill_FP_kernel
 //
 // Stores −ΔP at the ledger P-equation row of each P bus.
@@ -334,8 +361,14 @@ __global__ void update_slack_absorbed_kernel(
 // GPU (mirroring lightsim2grid's Hvdc extension):
 //   • hvdc_adjust_mismatch_kernel : the theta-dependent droop flows leaving each
 //       end bus into the HVDC  ⇒  d_F[p_row(end)] -= p_flow
-//   • hvdc_fill_feature_kernel    : the (piecewise-constant) dP/dtheta slopes
-//       ADDED onto the four (p_row(end), theta_col(end)) J positions.
+//   • hvdc_fill_feature_kernel    : the dP/dtheta slopes ADDED onto the four
+//       (p_row(end), theta_col(end)) J positions -- the exact derivative of the
+//       flows above: k on the controller side, k·(1-lf1)(1-lf2)·(1 - 2·r·line_in)
+//       on the receiving side (the resistive loss is quadratic in the line
+//       current, so its slope is not constant). lightsim2grid's own stamp
+//       (NRSystem.hpp, Hvdc::fill_feature_values) drops that last factor; NR
+//       converges either way, but an adjoint solved on the inexact Jacobian
+//       inherits the error (~1e-4 relative on the P gradients of a real grid).
 //
 // Two lines may share an end bus / J position, so both kernels use atomicAdd.
 // Because the feature slopes ACCUMULATE onto (and some HVDC-only positions are
@@ -346,6 +379,41 @@ __global__ void update_slack_absorbed_kernel(
 // frozen (0 linear, +1 sat 1→2, -1 sat 2→1). h11/h12/h21/h22 and prow1/prow2 are
 // -1 when the corresponding row/column does not exist (a slack end).
 // ===========================================================================
+// Active power received by the non-controller side (HvdcDroopSolverData::recv_pu)
+__device__ __forceinline__ cuda_real_type hvdc_recv_pu(
+    cuda_real_type p_ctrl_abs, bool side1_ctrl,
+    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r)
+{
+    const cuda_real_type lf_ctrl = side1_ctrl ? lf1 : lf2;
+    const cuda_real_type lf_recv = side1_ctrl ? lf2 : lf1;
+    const cuda_real_type line_in = (static_cast<cuda_real_type>(1.) - lf_ctrl) * p_ctrl_abs;
+    return (static_cast<cuda_real_type>(1.) - lf_recv) * (line_in - r * line_in * line_in);
+}
+
+// The two active flows leaving the AC buses into the HVDC (HvdcDroopSolverData::flows_pu)
+__device__ __forceinline__ void hvdc_flows_pu(
+    int st, cuda_real_type raw,
+    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r,
+    cuda_real_type pmax12, cuda_real_type pmax21,
+    cuda_real_type& p1_flow, cuda_real_type& p2_flow)
+{
+    if (st == 0) {
+        if (raw >= static_cast<cuda_real_type>(0.)) {
+            p1_flow =  raw;
+            p2_flow = -hvdc_recv_pu(raw, true, lf1, lf2, r);
+        } else {
+            p1_flow = -hvdc_recv_pu(-raw, false, lf1, lf2, r);
+            p2_flow = -raw;
+        }
+    } else if (st > 0) {
+        p1_flow =  pmax12;
+        p2_flow = -hvdc_recv_pu(pmax12, true, lf1, lf2, r);
+    } else {
+        p1_flow = -hvdc_recv_pu(pmax21, false, lf1, lf2, r);
+        p2_flow =  pmax21;
+    }
+}
+
 __global__ void hvdc_adjust_mismatch_kernel(
           cuda_real_type*  __restrict__ d_F,
     const cudaComplexType* __restrict__ d_V,
@@ -376,6 +444,7 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
     const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
     const int*             __restrict__ h11,
     const int*             __restrict__ h12,
     const int*             __restrict__ h21,
@@ -418,7 +487,8 @@ __global__ void vc_vrow_kernel(
     const int*             __restrict__ d_vc_vrow,     // [n_grp]
     const int*             __restrict__ d_vc_grp_start,// [n_grp]
     const int*             __restrict__ d_vc_grp_count,// [n_grp]
-    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp]
+    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp] or [actual_batch * n_grp]
+    int vset_stride,                                   // 0: shared, n_grp: per slot
     int n_grp,
     int n_ctrl,
     int n_bus,
@@ -597,9 +667,13 @@ __global__ void scatter_V_results_kernel(
 //   I_or = yff_eff * V[from] + yft_eff * V[to]   (origin / from-bus terminal)
 //   I_ex = ytf_eff * V[from] + ytt_eff * V[to]   (extremity / to-bus terminal)
 //
-// The per-unit magnitude is multiplied by d_base_current_A[l] to give A:
-//   d_base_current_A[l] = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[from[l]] * 1e3)
-// (pre-computed on the host in set_branch_data and uploaded once).
+// The per-unit magnitude is multiplied by the terminal's own current base
+// to give A (each side uses the nominal voltage of ITS bus, as lightsim2grid
+// does -- they differ on a transformer or any branch joining two voltage levels):
+//   d_base_current_A[l]    = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[from[l]] * 1e3)
+//   d_base_current_ex_A[l] = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[to[l]]   * 1e3)
+// (pre-computed on the host in set_branch_data and uploaded once; a -1
+// endpoint falls back to the other end's nominal voltage).
 //
 // Thread layout: one thread per (b, l) pair.
 //   b = tid / n_branches  — contingency index in batch [0, actual_batch)
@@ -614,7 +688,8 @@ __global__ void scatter_V_results_kernel(
 // d_V              : [actual_batch * n_bus] complex — converged voltages
 // d_branch_from/to : [n_branches] int — terminal bus indices
 // d_yff_eff/yft_eff/ytf_eff/ytt_eff: [n_branches] complex — π-model admittances
-// d_base_current_A : [n_branches] real — pre-computed I_base in A per branch
+// d_base_current_A : [n_branches] real — pre-computed I_base in A per branch, origin side
+// d_base_current_ex_A : [n_branches] real — same, extremity side
 // d_or_amps        : [n_contingencies * n_branches] real — output origin amps
 // d_ex_amps        : [n_contingencies * n_branches] real — output extremity amps
 // n_bus, n_branches, c_start, actual_batch : dimensions / offsets
@@ -630,6 +705,7 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
     int n_bus,
@@ -685,6 +761,107 @@ inline void launch_tile(T* dst, const T* src, int n, int batch_size, cudaStream_
     const dim3 grid(static_cast<unsigned>((n + block - 1) / block),
                     static_cast<unsigned>(batch_size < 65535 ? batch_size : 65535));
     tile_kernel<T><<<grid, block, 0, cs>>>(dst, src, n, batch_size);
+}
+
+// =============================================================================
+// gather_rows_kernel / launch_gather_rows
+//   dst[r * n_cols + c] = src[map[r] * n_cols + c]   for r in [0, n_rows)
+//   (map == nullptr → identity: dst row r = src row r). Used to move the
+//   ORIGINAL-row-order per-scenario data (Sbus rows, adjoint right-hand sides)
+//   into ACTIVE-slot order on the device, replacing the host permutation the
+//   batch sources used to do. zero_nonfinite replaces NaN/inf source entries
+//   by 0 (adjoint rhs of masked/NaN buses).
+// scatter_rows_kernel / launch_scatter_rows
+//   dst[map[r] * n_cols + c] = src[r * n_cols + c]   (the inverse move).
+// Both have a plain complex / real overload path through the templates below;
+// only the real one supports zero_nonfinite.
+// =============================================================================
+template <typename T>
+__device__ __forceinline__ T gather_sanitize(T v, bool) { return v; }
+template <>
+__device__ __forceinline__ float gather_sanitize<float>(float v, bool zero_nonfinite)
+{ return (zero_nonfinite && !isfinite(v)) ? 0.f : v; }
+template <>
+__device__ __forceinline__ double gather_sanitize<double>(double v, bool zero_nonfinite)
+{ return (zero_nonfinite && !isfinite(v)) ? 0. : v; }
+
+template <typename T>
+__global__ void gather_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                   const int* __restrict__ map,
+                                   int n_cols, int n_rows, bool zero_nonfinite)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / n_cols;
+    const int       c   = static_cast<int>(tid % n_cols);
+    if (r >= n_rows) return;
+    const ptrdiff_t src_r = map ? map[r] : r;
+    dst[r * n_cols + c] = gather_sanitize<T>(src[src_r * n_cols + c], zero_nonfinite);
+}
+
+template <typename T>
+inline void launch_gather_rows(T* dst, const T* src, const int* map,
+                               int n_cols, int n_rows, bool zero_nonfinite, cudaStream_t cs)
+{
+    if (n_cols <= 0 || n_rows <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(n_cols) * n_rows;
+    gather_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, map, n_cols, n_rows, zero_nonfinite);
+}
+
+template <typename T>
+__global__ void scatter_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                    const int* __restrict__ map, int n_cols, int n_rows)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / n_cols;
+    const int       c   = static_cast<int>(tid % n_cols);
+    if (r >= n_rows) return;
+    const ptrdiff_t dst_r = map ? map[r] : r;
+    dst[dst_r * n_cols + c] = src[r * n_cols + c];
+}
+
+template <typename T>
+inline void launch_scatter_rows(T* dst, const T* src, const int* map,
+                                int n_cols, int n_rows, cudaStream_t cs)
+{
+    if (n_cols <= 0 || n_rows <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(n_cols) * n_rows;
+    scatter_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, map, n_cols, n_rows);
+}
+
+// =============================================================================
+// gather_cols_rows_kernel / launch_gather_cols_rows
+//   dst[r * k + j] = src[map[r] * n_cols_src + cols[j]]: row gather (active-
+//   slot order, map nullable = identity) combined with a column selection --
+//   the device path of set_gen_v(), which keeps only the generators whose own
+//   bus is Vm-fixed (see GenVOverride).
+// =============================================================================
+template <typename T>
+__global__ void gather_cols_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                        const int* __restrict__ map,
+                                        const int* __restrict__ cols,
+                                        int n_cols_src, int k, int n_rows)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / k;
+    const int       j   = static_cast<int>(tid % k);
+    if (r >= n_rows) return;
+    const ptrdiff_t src_r = map ? map[r] : r;
+    dst[r * k + j] = src[src_r * n_cols_src + cols[j]];
+}
+
+template <typename T>
+inline void launch_gather_cols_rows(T* dst, const T* src, const int* map, const int* cols,
+                                    int n_cols_src, int k, int n_rows, cudaStream_t cs)
+{
+    if (k <= 0 || n_rows <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(k) * n_rows;
+    gather_cols_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, map, cols, n_cols_src, k, n_rows);
 }
 
 #endif // ACPF_NR_KERNELS_CUH

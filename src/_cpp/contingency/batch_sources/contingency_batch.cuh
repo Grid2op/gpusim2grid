@@ -222,6 +222,7 @@ struct ContingencyBatch {
     // BatchSource concept: contingency analysis keeps the shared base-case
     // slack weights on every slot (no per-row generator contingencies).
     void fill_slack_w_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
+    void fill_vc_vset_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
 
     // -------------------------------------------------------------------------
     // Active-set interface (consumed by BatchPfDriver to compact the batch).

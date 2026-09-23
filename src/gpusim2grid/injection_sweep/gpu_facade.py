@@ -9,7 +9,10 @@ re-solves the network on the GPU for many (P, Q) injection profiles in parallel.
 It is a thin facade over :class:`_InjectionSweepSolver`.
 """
 
+import numpy as np
+
 from . import (
+    PhysicalChecksFacadeMixin,
     _InjectionSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -21,6 +24,7 @@ from .._ls2g_utils import (
     extract_branch_data,
     extract_injection_elements,
     build_bus_injections,
+    conflicting_gen_v_rows,
     grid_from_pandapower,
     _validate_precision,
 )
@@ -33,7 +37,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class InjectionSweepGPU:
+class InjectionSweepGPU(PhysicalChecksFacadeMixin):
     """Batch injection sweep on the GPU, seeded from a CPU base-case solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -165,7 +169,8 @@ class InjectionSweepGPU:
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
-                 use_distributed_slack=True):
+                 use_distributed_slack=True,
+                 compute_physical_violations=False):
         _validate_precision(precision)
 
         # Single source of truth, resolved once here and applied at
@@ -252,11 +257,19 @@ class InjectionSweepGPU:
         # `self._grid`) so the session stays independent of the grid object.
         if isinstance(grid, (tuple, list)):
             self._elements = None   # no loads/generators to read
+            self._grid = None
         else:
+            # The grid itself is kept ONLY for set_bus_q_capability_from_grid()
+            # (the plan of compute_physical_violations is built by lightsim2grid's
+            # own build_bus_q_plan); everything else reads the snapshot below.
+            self._grid = grid
             self._elements = extract_injection_elements(grid, self._inner.n_bus)
 
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
+
+        # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        self._apply_physical_checks_kwargs(compute_physical_violations)
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
@@ -278,6 +291,10 @@ class InjectionSweepGPU:
         is a lightsim2grid grid — it takes per-element data and does this
         assembly for you.
         """
+        # per-bus injections carry no per-generator set-point: the slack
+        # active-power check falls back to the grid's own targets
+        self._gen_p_rows = None
+        self._push_gen_p_targets()
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
@@ -321,6 +338,10 @@ class InjectionSweepGPU:
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+        # the slack active-power check needs each row's own generator
+        # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
+        self._gen_p_rows = np.asarray(gen_p, dtype=np.float64)
+        self._push_gen_p_targets()
 
     def set_gen_v(self, gen_v):
         """Store per-scenario generator target voltage magnitude (vm_pu, NOT kV).
@@ -338,14 +359,21 @@ class InjectionSweepGPU:
         gen_v : (n_scenarios, n_gens) — target vm_pu per generator,
             row-aligned with :meth:`set_injections_from_elements` /
             :meth:`set_injections`. NaN leaves that (scenario, generator)
-            untouched. Only applied to generators whose OWN bus is
-            voltage-fixed (PV or slack) in this session's base case -- a
-            disconnected, reactive-only ("PQ"), or remotely
-            voltage-regulating (SVC / VoltageControl) generator's column is
-            silently ignored, mirroring lightsim2grid's own
-            ``voltage_regulator_on_``-gated behavior. Left unset entirely
-            (the default), every scenario keeps the grid's own base-case
-            voltage.
+            untouched. A column acts on the bus its generator REGULATES
+            (``regulated_bus_id``, ``InjectionElements.gen_v_bus``): when that
+            bus's magnitude is fixed (PV / slack) |V| is re-seeded there; when
+            a VoltageControl group regulates it (a remote regulator) the value
+            is that group's set-point for the row. A disconnected,
+            non-regulating (``voltage_regulator_on`` False, even when
+            co-located with a regulating one) or treated-as-off generator's
+            column is ignored, like lightsim2grid's own ``set_vm`` skips. Left
+            unset entirely (the default), every scenario keeps the grid's own
+            base-case voltage. Raises ``ValueError`` when a row asks one bus
+            for two different magnitudes (two connected generators regulating
+            it with set-points further apart than
+            ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``, or one differing
+            from the set-point of an SVC / hvdc station of the same control
+            group): no V satisfies both.
 
         Notes
         -----
@@ -357,7 +385,19 @@ class InjectionSweepGPU:
             raise RuntimeError(
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
-        self._inner.set_gen_v(gen_v, self._elements.gen_bus)
+        gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
+        bad = conflicting_gen_v_rows(gen_v, self._elements.gen_v_bus, self._inner.is_vm_fixed_bus,
+                                     vc_group_of_bus=self._inner.vc_group_of_bus,
+                                     vc_pinned_v_set=self._inner.vc_pinned_v_set)
+        if bad.any():
+            rows = np.flatnonzero(bad)
+            raise ValueError(
+                f"set_gen_v: rows {rows[:10].tolist()}{'...' if rows.size > 10 else ''} "
+                "ask one bus for two different voltage magnitudes (two connected "
+                "generators regulating the same bus with different set-points): no V "
+                "satisfies both. Give co-located generators the same vm_pu, or "
+                "NaN for all but one of them.")
+        self._inner.set_gen_v(gen_v, self._elements.gen_v_bus)
 
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.

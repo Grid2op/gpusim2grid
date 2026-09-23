@@ -27,8 +27,11 @@
 #include <cusparse.h>
 #include <cudss.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <numeric>
+#include <vector>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -96,6 +99,20 @@ __global__ void blockdiag_csr_kernel(
     }
 }
 
+// Declared in strategies/cudss_batch_solver.cuh: the same skeleton, for the
+// Jacobian of the experimental block-diagonal cuDSS mode.
+void cudss_blockdiag_csr(int n, int nnz, int batch,
+                         const int* outer, const int* inner,
+                         int* batch_outer, int* batch_inner,
+                         cudaStream_t cs)
+{
+    const long long n_outer = static_cast<long long>(batch) * n + 1;
+    const long long n_inner = static_cast<long long>(batch) * nnz;
+    blockdiag_csr_kernel<<<nr_grid_size(std::max(n_outer, n_inner), BS), BS, 0, cs>>>(
+        n, nnz, batch, outer, inner, batch_outer, batch_inner);
+    CHK_CUDA_BPF(cudaGetLastError());
+}
+
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -126,6 +143,9 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     , scaling_max_voltage_change_(scaling_max_voltage_change)
     , max_dVa_(static_cast<cuda_real_type>(max_dVa))
     , max_dVm_(static_cast<cuda_real_type>(max_dVm))
+    , reordering_alg_(reordering_alg)
+    , matching_alg_(matching_alg)
+    , pivot_epsilon_alg_(pivot_epsilon_alg)
 {
     // Pin this driver's stream and allocations to the same device as base.
     CHK_CUDA_BPF(cudaSetDevice(base.device_id_));
@@ -302,6 +322,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     // CudssBatchSolver::context_init_ms() and BatchTimings::t_context_init_ms.
     t_context_init_ms_ = linear_solver_.context_init_ms();
     t_analysis_ms_ = bpf_ms_since(t_cudss_start) - t_context_init_ms_;
+    linear_solver_.refresh_factor_stats();   // after the timer: host queries only
 
     // -------------------------------------------------------------------------
     // Source-specific one-time setup (flat-patch/mask H→D upload for
@@ -396,25 +417,36 @@ void BatchPfDriver<BatchSource>::upload_branch_admittances(
         upload_h2d(d_branch_to,   h_to.data(),   n_branches_, cs);
 
         const double sqrt3 = std::sqrt(3.0);
-        std::vector<cuda_real_type> h_base(n_branches_);
+        // One current base per terminal: |I| in pu is converted to A with the
+        // nominal voltage of the bus the terminal sits on (as lightsim2grid
+        // does), so on a transformer (or any branch joining two voltage
+        // levels) the two sides get different bases.
+        std::vector<cuda_real_type> h_base(n_branches_), h_base_ex(n_branches_);
         for (int l = 0; l < n_branches_; ++l) {
-            // branch_from can be -1 (Kron-reduced / half-open-line endpoint,
+            // An endpoint can be -1 (Kron-reduced / half-open-line endpoint,
             // see check_limit_violations_kernel's own bf/bt>=0 guard) --
             // bus_vn_kv(-1) is an out-of-bounds read (UB, not caught by
             // Eigen without assertions), and if it happens to read something
-            // near zero it makes h_base[l] = +inf, which then poisons the
+            // near zero it makes the base +inf, which then poisons the
             // *live* side's reported current (ka_or/ka_ex = finite * inf)
             // into an "infinite" CURRENT violation. Fall back to the other
-            // endpoint, which is always valid when branch_from isn't (a
+            // endpoint, which is always valid when this one isn't (a
             // branch can't have both ends Kron-reduced and still appear
-            // here).
-            const int vn_bus = (h_from[l] >= 0) ? h_from[l] : h_to[l];
-            const double vn = (vn_bus >= 0) ? bus_vn_kv(vn_bus) : 0.0;
-            h_base[l] = (vn_bus >= 0)
-                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn * 1e3))
+            // here). The current on the -1 side itself is 0 in the kernels,
+            // so its base only has to be finite.
+            const int vn_bus_or = (h_from[l] >= 0) ? h_from[l] : h_to[l];
+            const int vn_bus_ex = (h_to[l]   >= 0) ? h_to[l]   : h_from[l];
+            const double vn_or = (vn_bus_or >= 0) ? bus_vn_kv(vn_bus_or) : 0.0;
+            const double vn_ex = (vn_bus_ex >= 0) ? bus_vn_kv(vn_bus_ex) : 0.0;
+            h_base[l] = (vn_bus_or >= 0)
+                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn_or * 1e3))
+                : cuda_real_type(0);
+            h_base_ex[l] = (vn_bus_ex >= 0)
+                ? static_cast<cuda_real_type>(sn_mva * 1e6 / (sqrt3 * vn_ex * 1e3))
                 : cuda_real_type(0);
         }
         upload_h2d(d_base_current_A, h_base.data(), n_branches_, cs);
+        upload_h2d(d_base_current_ex_A, h_base_ex.data(), n_branches_, cs);
     }
 
     {
@@ -540,6 +572,395 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
     _fused_violations_enabled = true;
 }
 
+// =============================================================================
+// set_bus_q_check / run_bus_q_check_n  (compute_physical_violations)
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::set_bus_q_check(
+    const BusQPlanData& plan, double tol_mvar, int K_q, double residual_tol,
+    const unsigned char* d_gen_off, int n_gen)
+{
+    plan.validate(base.n_bus);
+    if (K_q <= 0)
+        throw std::runtime_error("BatchPfDriver::set_bus_q_check: K_q (physical_violation_capacity) must be > 0.");
+    if (!(tol_mvar >= 0.) || !std::isfinite(tol_mvar))
+        throw std::runtime_error("BatchPfDriver::set_bus_q_check: tol_mvar must be a finite, non-negative number.");
+    if (d_gen_off != nullptr && n_gen > 0) {
+        for (int p = 0; p < plan.n_gen_entries(); ++p)
+            if (plan.gen_id(p) >= n_gen)
+                throw std::runtime_error(
+                    "BatchPfDriver::set_bus_q_check: a generator id of the plan is outside the "
+                    "generator-contingency mask's columns.");
+    }
+
+    auto t_setup_start = std::chrono::steady_clock::now();
+
+    auto to_dev_r = [&](thrust::device_vector<cuda_real_type>& d, const RealVect& h) {
+        std::vector<cuda_real_type> tmp(static_cast<size_t>(h.size()));
+        for (Eigen::Index i = 0; i < h.size(); ++i) tmp[static_cast<size_t>(i)] = static_cast<cuda_real_type>(h(i));
+        upload_h2d(d, tmp.data(), static_cast<int>(h.size()), cs);
+    };
+    auto to_dev_i = [&](thrust::device_vector<int>& d, const Eigen::VectorXi& h) {
+        upload_h2d(d, h.data(), static_cast<int>(h.size()), cs);
+    };
+    to_dev_i(d_bq_bus_solver, plan.bus_solver);
+    to_dev_i(d_bq_n_fixed,    plan.n_fixed);
+    to_dev_i(d_bq_gen_start,  plan.gen_start);
+    to_dev_i(d_bq_gen_id,     plan.gen_id);
+    to_dev_r(d_bq_qmin_fixed, plan.qmin_fixed_mvar);
+    to_dev_r(d_bq_qmax_fixed, plan.qmax_fixed_mvar);
+    to_dev_r(d_bq_bmin_sum,   plan.bmin_sum_pu);
+    to_dev_r(d_bq_bmax_sum,   plan.bmax_sum_pu);
+    to_dev_r(d_bq_gen_qmin,   plan.gen_qmin_mvar);
+    to_dev_r(d_bq_gen_qmax,   plan.gen_qmax_mvar);
+
+    bus_q_n_check_      = plan.n_check;
+    bus_q_capacity_     = K_q;
+    bus_q_n_gen_        = (d_gen_off != nullptr) ? n_gen : 0;
+    d_bq_gen_off_       = (n_gen > 0) ? d_gen_off : nullptr;
+    bus_q_tol_mvar_     = static_cast<cuda_real_type>(tol_mvar);
+    bus_q_sn_mva_       = static_cast<cuda_real_type>(plan.sn_mva);
+    bus_q_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
+
+    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K_q);
+    d_bq_out_bus_id.assign(n_out, 0);
+    d_bq_out_type.assign(n_out, 0);
+    d_bq_out_value.assign(n_out, cuda_real_type(0));
+    d_bq_out_limit.assign(n_out, cuda_real_type(0));
+    // -1 sentinel: "never simulated" (a slot compacted out of the active set);
+    // every simulated row overwrites it with 0..K_q.
+    d_bq_count.assign(static_cast<size_t>(n_contingencies), -1);
+    d_bq_truncated.assign(static_cast<size_t>(n_contingencies), 0);
+    d_bq_n_bus_id.assign(static_cast<size_t>(K_q), 0);
+    d_bq_n_type.assign(static_cast<size_t>(K_q), 0);
+    d_bq_n_value.assign(static_cast<size_t>(K_q), cuda_real_type(0));
+    d_bq_n_limit.assign(static_cast<size_t>(K_q), cuda_real_type(0));
+    d_bq_n_count.assign(1, 0);
+    d_bq_n_truncated.assign(1, 0);
+
+    cs.synchronize();
+    t_bus_q_setup_ms_ = bpf_ms_since(t_setup_start);
+    _bus_q_enabled = true;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::run_bus_q_check_n()
+{
+    if (!_bus_q_enabled)
+        throw std::runtime_error("BatchPfDriver::run_bus_q_check_n: call set_bus_q_check first.");
+    auto t_start = std::chrono::steady_clock::now();
+    check_bus_q_violations_kernel<<<1, BS, 0, cs>>>(
+        thrust::raw_pointer_cast(base.d_V_base.data()),
+        thrust::raw_pointer_cast(base.d_Ybus_values.data()),
+        thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+        thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+        thrust::raw_pointer_cast(base.d_Sbus.data()), /*sbus_stride=*/0,
+        /*d_residuals=*/nullptr, bus_q_residual_tol_,
+        bus_q_n_check_,
+        thrust::raw_pointer_cast(d_bq_bus_solver.data()),
+        thrust::raw_pointer_cast(d_bq_qmin_fixed.data()),
+        thrust::raw_pointer_cast(d_bq_qmax_fixed.data()),
+        thrust::raw_pointer_cast(d_bq_n_fixed.data()),
+        thrust::raw_pointer_cast(d_bq_bmin_sum.data()),
+        thrust::raw_pointer_cast(d_bq_bmax_sum.data()),
+        thrust::raw_pointer_cast(d_bq_gen_start.data()),
+        thrust::raw_pointer_cast(d_bq_gen_id.data()),
+        thrust::raw_pointer_cast(d_bq_gen_qmin.data()),
+        thrust::raw_pointer_cast(d_bq_gen_qmax.data()),
+        /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        bus_q_sn_mva_, bus_q_tol_mvar_,
+        base.n_bus, base.nnz_Y,
+        /*c_start=*/0, /*actual_batch=*/1, bus_q_capacity_,
+        /*d_result_map=*/nullptr,
+        thrust::raw_pointer_cast(d_bq_n_bus_id.data()),
+        thrust::raw_pointer_cast(d_bq_n_type.data()),
+        thrust::raw_pointer_cast(d_bq_n_value.data()),
+        thrust::raw_pointer_cast(d_bq_n_limit.data()),
+        thrust::raw_pointer_cast(d_bq_n_count.data()),
+        thrust::raw_pointer_cast(d_bq_n_truncated.data()));
+    CHK_CUDA_BPF(cudaGetLastError());
+    cs.synchronize();
+    t_bus_q_setup_ms_ += bpf_ms_since(t_start);
+}
+
+// =============================================================================
+// set_hvdc_p_check / run_hvdc_p_check_n  (compute_physical_violations)
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::set_hvdc_p_check(double tol_mw, double sn_mva, int K_p, double residual_tol)
+{
+    if (K_p <= 0)
+        throw std::runtime_error("BatchPfDriver::set_hvdc_p_check: K_p (physical_violation_capacity) must be > 0.");
+    if (!(tol_mw >= 0.) || !std::isfinite(tol_mw))
+        throw std::runtime_error("BatchPfDriver::set_hvdc_p_check: tol_mw must be a finite, non-negative number.");
+    if (!(sn_mva > 0.))
+        throw std::runtime_error("BatchPfDriver::set_hvdc_p_check: sn_mva must be > 0.");
+
+    auto t_setup_start = std::chrono::steady_clock::now();
+    hvdc_p_capacity_     = K_p;
+    hvdc_p_tol_pu_       = static_cast<cuda_real_type>(tol_mw / sn_mva);
+    hvdc_p_sn_mva_       = static_cast<cuda_real_type>(sn_mva);
+    hvdc_p_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
+
+    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K_p);
+    d_hp_out_hvdc_id.assign(n_out, 0);
+    d_hp_out_side.assign(n_out, 0);
+    d_hp_out_value.assign(n_out, cuda_real_type(0));
+    d_hp_out_limit.assign(n_out, cuda_real_type(0));
+    d_hp_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
+    d_hp_truncated.assign(static_cast<size_t>(n_contingencies), 0);
+    d_hp_n_hvdc_id.assign(static_cast<size_t>(K_p), 0);
+    d_hp_n_side.assign(static_cast<size_t>(K_p), 0);
+    d_hp_n_value.assign(static_cast<size_t>(K_p), cuda_real_type(0));
+    d_hp_n_limit.assign(static_cast<size_t>(K_p), cuda_real_type(0));
+    d_hp_n_count.assign(1, 0);
+    d_hp_n_truncated.assign(1, 0);
+
+    cs.synchronize();
+    t_hvdc_p_setup_ms_ = bpf_ms_since(t_setup_start);
+    _hvdc_p_enabled = true;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::run_hvdc_p_check_n()
+{
+    if (!_hvdc_p_enabled)
+        throw std::runtime_error("BatchPfDriver::run_hvdc_p_check_n: call set_hvdc_p_check first.");
+    auto t_start = std::chrono::steady_clock::now();
+    check_hvdc_p_violations_kernel<<<1, BS, 0, cs>>>(
+        thrust::raw_pointer_cast(base.d_V_base.data()),
+        /*d_residuals=*/nullptr, hvdc_p_residual_tol_,
+        base.n_hvdc,
+        thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_status.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_k.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_r.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_id.data()),
+        hvdc_p_sn_mva_, hvdc_p_tol_pu_,
+        base.n_bus,
+        /*c_start=*/0, /*actual_batch=*/1, hvdc_p_capacity_,
+        /*d_result_map=*/nullptr,
+        thrust::raw_pointer_cast(d_hp_n_hvdc_id.data()),
+        thrust::raw_pointer_cast(d_hp_n_side.data()),
+        thrust::raw_pointer_cast(d_hp_n_value.data()),
+        thrust::raw_pointer_cast(d_hp_n_limit.data()),
+        thrust::raw_pointer_cast(d_hp_n_count.data()),
+        thrust::raw_pointer_cast(d_hp_n_truncated.data()));
+    CHK_CUDA_BPF(cudaGetLastError());
+    cs.synchronize();
+    t_hvdc_p_setup_ms_ += bpf_ms_since(t_start);
+}
+
+// =============================================================================
+// set_gen_p_check / upload_gen_p_targets / run_gen_p_check_n
+// (compute_physical_violations, lightsim2grid's GenPCheck.hpp parity)
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::set_gen_p_check(
+    const GenPPlanData& plan, double tol_mw, int K_g, double residual_tol,
+    const unsigned char* d_gen_off, int n_gen)
+{
+    plan.validate(base.n_bus);
+    if (K_g <= 0)
+        throw std::runtime_error("BatchPfDriver::set_gen_p_check: K_g (physical_violation_capacity) must be > 0.");
+    if (!(tol_mw >= 0.) || !std::isfinite(tol_mw))
+        throw std::runtime_error("BatchPfDriver::set_gen_p_check: tol_mw must be a finite, non-negative number.");
+    if (d_gen_off != nullptr && n_gen > 0) {
+        auto check = [&](int type, int id) {
+            if (type == 5 && id >= n_gen)
+                throw std::runtime_error(
+                    "BatchPfDriver::set_gen_p_check: a generator id of the plan is outside the "
+                    "generator-contingency mask's columns.");
+        };
+        for (int k = 0; k < plan.n_entries; ++k) check(plan.el_type(k), plan.el_id(k));
+        for (int q = 0; q < plan.n_part; ++q)    check(plan.part_el_type(q), plan.part_el_id(q));
+    }
+
+    auto t_setup_start = std::chrono::steady_clock::now();
+
+    // Regroup the participants per bus: a CSR over the distinct participating
+    // buses (sorted), so that a row can sum the live raw participation of one
+    // bus in O(machines on that bus) instead of scanning every participant.
+    std::vector<int> order(static_cast<size_t>(plan.n_part));
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return plan.part_bus_solver(a) < plan.part_bus_solver(b);
+    });
+    std::vector<int> part_bus, part_start, part_el_type, part_el_id;
+    std::vector<cuda_real_type> part_weight;
+    for (size_t i = 0; i < order.size(); ++i) {
+        const int idx = order[i];
+        const int b   = plan.part_bus_solver(idx);
+        if (part_bus.empty() || part_bus.back() != b) {
+            part_bus.push_back(b);
+            part_start.push_back(static_cast<int>(i));
+        }
+        part_el_type.push_back(plan.part_el_type(idx));
+        part_el_id.push_back(plan.part_el_id(idx));
+        part_weight.push_back(static_cast<cuda_real_type>(plan.part_weight(idx)));
+    }
+    part_start.push_back(plan.n_part);
+    std::vector<int> bus_slot(static_cast<size_t>(plan.n_entries), -1);
+    for (int k = 0; k < plan.n_entries; ++k) {
+        const int b = plan.bus_solver(k);
+        auto it = std::lower_bound(part_bus.begin(), part_bus.end(), b);
+        if (it != part_bus.end() && *it == b)
+            bus_slot[static_cast<size_t>(k)] = static_cast<int>(it - part_bus.begin());
+    }
+
+    auto to_dev_r = [&](thrust::device_vector<cuda_real_type>& d, const RealVect& h) {
+        std::vector<cuda_real_type> tmp(static_cast<size_t>(h.size()));
+        for (Eigen::Index i = 0; i < h.size(); ++i) tmp[static_cast<size_t>(i)] = static_cast<cuda_real_type>(h(i));
+        upload_h2d(d, tmp.data(), static_cast<int>(h.size()), cs);
+    };
+    auto to_dev_i = [&](thrust::device_vector<int>& d, const Eigen::VectorXi& h) {
+        upload_h2d(d, h.data(), static_cast<int>(h.size()), cs);
+    };
+    to_dev_i(d_gp_el_type,     plan.el_type);
+    to_dev_i(d_gp_el_id,       plan.el_id);
+    to_dev_i(d_gp_bus_solver,  plan.bus_solver);
+    to_dev_r(d_gp_weight,      plan.slack_weight);
+    to_dev_r(d_gp_min_p,       plan.min_p_mw);
+    to_dev_r(d_gp_max_p,       plan.max_p_mw);
+    to_dev_r(d_gp_target_base, plan.target_p_mw);
+    upload_h2d(d_gp_bus_slot,     bus_slot.data(),     static_cast<int>(bus_slot.size()),     cs);
+    upload_h2d(d_gp_part_bus,     part_bus.data(),     static_cast<int>(part_bus.size()),     cs);
+    upload_h2d(d_gp_part_start,   part_start.data(),   static_cast<int>(part_start.size()),   cs);
+    upload_h2d(d_gp_part_el_type, part_el_type.data(), static_cast<int>(part_el_type.size()), cs);
+    upload_h2d(d_gp_part_el_id,   part_el_id.data(),   static_cast<int>(part_el_id.size()),   cs);
+    upload_h2d(d_gp_part_weight,  part_weight.data(),  static_cast<int>(part_weight.size()),  cs);
+
+    // per-row set-points uploaded for another plan no longer line up
+    if (gen_p_target_stride_ != 0 && gen_p_target_stride_ != plan.n_entries) {
+        d_gp_targets.clear();
+        d_gp_targets.shrink_to_fit();
+        gen_p_target_stride_ = 0;
+    }
+
+    gen_p_n_entries_    = plan.n_entries;
+    gen_p_n_part_bus_   = static_cast<int>(part_bus.size());
+    gen_p_capacity_     = K_g;
+    gen_p_n_gen_        = (d_gen_off != nullptr) ? n_gen : 0;
+    d_gp_gen_off_       = (n_gen > 0) ? d_gen_off : nullptr;
+    gen_p_tol_mw_       = static_cast<cuda_real_type>(tol_mw);
+    gen_p_sn_mva_       = static_cast<cuda_real_type>(plan.sn_mva);
+    gen_p_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
+
+    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K_g);
+    d_gp_out_element_type.assign(n_out, 0);
+    d_gp_out_element_id.assign(n_out, 0);
+    d_gp_out_type.assign(n_out, 0);
+    d_gp_out_value.assign(n_out, cuda_real_type(0));
+    d_gp_out_limit.assign(n_out, cuda_real_type(0));
+    d_gp_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
+    d_gp_truncated.assign(static_cast<size_t>(n_contingencies), 0);
+    d_gp_n_element_type.assign(static_cast<size_t>(K_g), 0);
+    d_gp_n_element_id.assign(static_cast<size_t>(K_g), 0);
+    d_gp_n_type.assign(static_cast<size_t>(K_g), 0);
+    d_gp_n_value.assign(static_cast<size_t>(K_g), cuda_real_type(0));
+    d_gp_n_limit.assign(static_cast<size_t>(K_g), cuda_real_type(0));
+    d_gp_n_count.assign(1, 0);
+    d_gp_n_truncated.assign(1, 0);
+
+    cs.synchronize();
+    t_gen_p_setup_ms_ = bpf_ms_since(t_setup_start);
+    _gen_p_enabled = true;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::upload_gen_p_targets(const RealMatRM& targets)
+{
+    if (!_gen_p_enabled)
+        throw std::runtime_error("BatchPfDriver::upload_gen_p_targets: call set_gen_p_check first.");
+    auto t_start = std::chrono::steady_clock::now();
+    if (targets.size() == 0) {
+        d_gp_targets.clear();
+        d_gp_targets.shrink_to_fit();
+        gen_p_target_stride_ = 0;
+        return;
+    }
+    if (static_cast<int>(targets.cols()) != gen_p_n_entries_)
+        throw std::runtime_error(
+            "set_gen_p_targets: the per-row set-points have " + std::to_string(targets.cols()) +
+            " columns, but the active-power plan has " + std::to_string(gen_p_n_entries_) +
+            " entries (one column per entry of the plan, in its order; call "
+            "set_gen_p_targets again after changing the plan).");
+    if (static_cast<int>(targets.rows()) != n_contingencies)
+        throw std::runtime_error(
+            "set_gen_p_targets: the per-row set-points have " + std::to_string(targets.rows()) +
+            " rows, but the batch has " + std::to_string(n_contingencies) + " rows.");
+    std::vector<cuda_real_type> tmp(static_cast<size_t>(targets.size()));
+    const eigen_real_type* src = targets.data();   // row-major, contiguous
+    for (size_t i = 0; i < tmp.size(); ++i) tmp[i] = static_cast<cuda_real_type>(src[i]);
+    upload_h2d(d_gp_targets, tmp.data(), static_cast<int>(tmp.size()), cs);
+    gen_p_target_stride_ = static_cast<int>(targets.cols());
+    cs.synchronize();
+    t_gen_p_setup_ms_ += bpf_ms_since(t_start);
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::run_gen_p_check_n()
+{
+    if (!_gen_p_enabled)
+        throw std::runtime_error("BatchPfDriver::run_gen_p_check_n: call set_gen_p_check first.");
+    auto t_start = std::chrono::steady_clock::now();
+    check_gen_p_violations_kernel<<<1, BS, 0, cs>>>(
+        thrust::raw_pointer_cast(base.d_V_base.data()),
+        thrust::raw_pointer_cast(base.d_Ybus_values.data()),
+        thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+        thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+        thrust::raw_pointer_cast(base.d_Sbus.data()), /*sbus_stride=*/0,
+        /*d_residuals=*/nullptr, gen_p_residual_tol_,
+        base.n_hvdc,
+        thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_status.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_k.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_r.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
+        gen_p_n_entries_,
+        thrust::raw_pointer_cast(d_gp_el_type.data()),
+        thrust::raw_pointer_cast(d_gp_el_id.data()),
+        thrust::raw_pointer_cast(d_gp_bus_solver.data()),
+        thrust::raw_pointer_cast(d_gp_bus_slot.data()),
+        thrust::raw_pointer_cast(d_gp_weight.data()),
+        thrust::raw_pointer_cast(d_gp_min_p.data()),
+        thrust::raw_pointer_cast(d_gp_max_p.data()),
+        thrust::raw_pointer_cast(d_gp_target_base.data()),
+        gen_p_n_part_bus_,
+        thrust::raw_pointer_cast(d_gp_part_bus.data()),
+        thrust::raw_pointer_cast(d_gp_part_start.data()),
+        thrust::raw_pointer_cast(d_gp_part_el_type.data()),
+        thrust::raw_pointer_cast(d_gp_part_el_id.data()),
+        thrust::raw_pointer_cast(d_gp_part_weight.data()),
+        /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        /*d_targets=*/nullptr, /*target_stride=*/0,
+        gen_p_sn_mva_, gen_p_tol_mw_,
+        base.n_bus, base.nnz_Y,
+        /*c_start=*/0, /*actual_batch=*/1, gen_p_capacity_,
+        /*d_result_map=*/nullptr,
+        thrust::raw_pointer_cast(d_gp_n_element_type.data()),
+        thrust::raw_pointer_cast(d_gp_n_element_id.data()),
+        thrust::raw_pointer_cast(d_gp_n_type.data()),
+        thrust::raw_pointer_cast(d_gp_n_value.data()),
+        thrust::raw_pointer_cast(d_gp_n_limit.data()),
+        thrust::raw_pointer_cast(d_gp_n_count.data()),
+        thrust::raw_pointer_cast(d_gp_n_truncated.data()));
+    CHK_CUDA_BPF(cudaGetLastError());
+    cs.synchronize();
+    t_gen_p_setup_ms_ += bpf_ms_since(t_start);
+}
+
 template <typename BatchSource>
 void BatchPfDriver<BatchSource>::copy_flow_results_to_host(
     RealVect& or_amps_out, RealVect& ex_amps_out) const
@@ -572,6 +993,13 @@ template <typename BatchSource>
 BatchTimings BatchPfDriver<BatchSource>::solve()
 {
     BatchTimings t;
+    ++n_solves_;
+    if (keep_final_jacobian_ && n_chunks_ > 1)
+        throw std::runtime_error(
+            "[batch_pf] keep_final_jacobian requires the whole batch to be "
+            "solved in ONE chunk (only the last chunk's Jacobian survives in "
+            "the chunk buffer): raise batch_size to at least the number of "
+            "active elements (" + std::to_string(n_active_) + ").");
     t.n_contingencies  = n_contingencies;
     t.n_chunks         = n_chunks_;
     t.chunk_size       = batch_size_;
@@ -598,11 +1026,21 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
 
     // Chunk loop runs over the ACTIVE set (c_start / actual_batch in active-slot
     // space); _solve_chunk scatters each result to its original index.
+    // Per-chunk ANALYSIS of the non-uniform cuDSS modes (0 in uniform mode).
+    const double t_chunk_analysis_start = linear_solver_.analysis_ms();
     for (int chunk = 0; chunk < n_chunks_; ++chunk) {
         const int c_start      = chunk * batch_size_;
         const int actual_batch = std::min(batch_size_, n_active_ - c_start);
         _solve_chunk(c_start, actual_batch, t);
     }
+    t.t_analysis_ms += linear_solver_.analysis_ms() - t_chunk_analysis_start;
+
+    const CudssFactorStats& fs = linear_solver_.factor_stats();
+    t.cudss_lu_nnz                     = fs.lu_nnz;
+    t.cudss_mem_device_permanent_bytes = fs.mem_device_permanent;
+    t.cudss_mem_device_peak_bytes      = fs.mem_device_peak;
+    t.cudss_mem_host_permanent_bytes   = fs.mem_host_permanent;
+    t.cudss_mem_host_peak_bytes        = fs.mem_host_peak;
 
     cs.synchronize();
     return t;
@@ -740,6 +1178,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // shared array with slack_w_stride 0).
     source_.fill_slack_w_buffers(buf, chunk);
 
+    // Per-slot VoltageControl set-points (a gen_v column driving a group's
+    // v_set; no-op otherwise -- base's shared array, stride 0).
+    source_.fill_vc_vset_buffers(buf, chunk);
+
     // Re-initialise the per-slot feature state for this chunk (slack_absorbed =
     // Re(Σ Sbus_slot); controller reactive injection = 0). The NR loop runs over
     // the full padded batch, so initialise batch_size_ slots.
@@ -806,6 +1248,21 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     t.t_residual += timer.stop_ms();
 
     // -------------------------------------------------------------------------
+    // ④b Converged Jacobian (opt-in, differentiable wrapper): the loop left
+    //     J(V_{nb_iter-1}) in d_J_values_batch; refill it at V_final using the
+    //     SpMV output of step ④ (d_Ibus_batch = Ybus · V_final for the whole
+    //     padded batch). Same fill sequence as the loop -- one definition
+    //     (nr_fill_J_at_current_V). Must run BEFORE step ⑤'s NaN masking of
+    //     d_V_batch. The forward factors are untouched (cuDSS keeps them in
+    //     its own data object); the batched adjoint reads the values later.
+    // -------------------------------------------------------------------------
+    if (keep_final_jacobian_) {
+        timer.start();
+        nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, batch_size_, cs);
+        t.t_fill_J += timer.stop_ms();
+    }
+
+    // -------------------------------------------------------------------------
     // ⑤  Store V results.  Without compaction the active slots map contiguously
     //     to result indices (single D→D memcpy).  With compaction the original
     //     indices are non-contiguous, so scatter through d_result_map instead.
@@ -842,6 +1299,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_ytf_eff.data()),
             thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
+            thrust::raw_pointer_cast(d_base_current_ex_A.data()),
             thrust::raw_pointer_cast(d_branch_limit_a1_ka.data()),
             thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
             trip.d_start, trip.d_count, trip.d_branch_flat,
@@ -861,6 +1319,135 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_violation_count_current.data()));
         CHK_CUDA_BPF(cudaGetLastError());
         t.t_violation_check += timer.stop_ms();
+    }
+
+    // compute_physical_violations: the per-bus reactive-capability check on the
+    // converged, post mask-NaN chunk voltages, this chunk's patched Ybus values
+    // and its Sbus (shared or per slot, see sbus_stride). Launched whenever the
+    // check is on -- even with an empty plan -- so every simulated row gets a
+    // count (0), distinct from the -1 "never simulated" sentinel.
+    if (actual_batch > 0 && _bus_q_enabled) {
+        timer.start();
+        check_bus_q_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()),
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+            d_Sbus_for_NR, sbus_stride,
+            thrust::raw_pointer_cast(d_residuals.data()), bus_q_residual_tol_,
+            bus_q_n_check_,
+            thrust::raw_pointer_cast(d_bq_bus_solver.data()),
+            thrust::raw_pointer_cast(d_bq_qmin_fixed.data()),
+            thrust::raw_pointer_cast(d_bq_qmax_fixed.data()),
+            thrust::raw_pointer_cast(d_bq_n_fixed.data()),
+            thrust::raw_pointer_cast(d_bq_bmin_sum.data()),
+            thrust::raw_pointer_cast(d_bq_bmax_sum.data()),
+            thrust::raw_pointer_cast(d_bq_gen_start.data()),
+            thrust::raw_pointer_cast(d_bq_gen_id.data()),
+            thrust::raw_pointer_cast(d_bq_gen_qmin.data()),
+            thrust::raw_pointer_cast(d_bq_gen_qmax.data()),
+            d_bq_gen_off_, bus_q_n_gen_,
+            bus_q_sn_mva_, bus_q_tol_mvar_,
+            n_bus, nnz_Y,
+            c_start, actual_batch, bus_q_capacity_,
+            d_result_map,
+            thrust::raw_pointer_cast(d_bq_out_bus_id.data()),
+            thrust::raw_pointer_cast(d_bq_out_type.data()),
+            thrust::raw_pointer_cast(d_bq_out_value.data()),
+            thrust::raw_pointer_cast(d_bq_out_limit.data()),
+            thrust::raw_pointer_cast(d_bq_count.data()),
+            thrust::raw_pointer_cast(d_bq_truncated.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
+        t.t_bus_q_check += timer.stop_ms();
+    }
+
+    // compute_physical_violations: droop P-saturation check on the same voltages
+    // (the per-line data is the base state's own, shared across slots).
+    if (actual_batch > 0 && _hvdc_p_enabled) {
+        timer.start();
+        check_hvdc_p_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()),
+            thrust::raw_pointer_cast(d_residuals.data()), hvdc_p_residual_tol_,
+            base.n_hvdc,
+            thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_bus2.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_status.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_p0.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_k.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_lf1.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_lf2.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_r.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_id.data()),
+            hvdc_p_sn_mva_, hvdc_p_tol_pu_,
+            n_bus,
+            c_start, actual_batch, hvdc_p_capacity_,
+            d_result_map,
+            thrust::raw_pointer_cast(d_hp_out_hvdc_id.data()),
+            thrust::raw_pointer_cast(d_hp_out_side.data()),
+            thrust::raw_pointer_cast(d_hp_out_value.data()),
+            thrust::raw_pointer_cast(d_hp_out_limit.data()),
+            thrust::raw_pointer_cast(d_hp_count.data()),
+            thrust::raw_pointer_cast(d_hp_truncated.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
+        t.t_hvdc_p_check += timer.stop_ms();
+    }
+
+    // compute_physical_violations: the per-machine active power of the
+    // distributed slack (generators and storage units), on the same voltages,
+    // this chunk's patched Ybus values and its Sbus.
+    if (actual_batch > 0 && _gen_p_enabled) {
+        timer.start();
+        check_gen_p_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()),
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+            d_Sbus_for_NR, sbus_stride,
+            thrust::raw_pointer_cast(d_residuals.data()), gen_p_residual_tol_,
+            base.n_hvdc,
+            thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_bus2.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_status.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_p0.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_k.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_lf1.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_lf2.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_r.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
+            gen_p_n_entries_,
+            thrust::raw_pointer_cast(d_gp_el_type.data()),
+            thrust::raw_pointer_cast(d_gp_el_id.data()),
+            thrust::raw_pointer_cast(d_gp_bus_solver.data()),
+            thrust::raw_pointer_cast(d_gp_bus_slot.data()),
+            thrust::raw_pointer_cast(d_gp_weight.data()),
+            thrust::raw_pointer_cast(d_gp_min_p.data()),
+            thrust::raw_pointer_cast(d_gp_max_p.data()),
+            thrust::raw_pointer_cast(d_gp_target_base.data()),
+            gen_p_n_part_bus_,
+            thrust::raw_pointer_cast(d_gp_part_bus.data()),
+            thrust::raw_pointer_cast(d_gp_part_start.data()),
+            thrust::raw_pointer_cast(d_gp_part_el_type.data()),
+            thrust::raw_pointer_cast(d_gp_part_el_id.data()),
+            thrust::raw_pointer_cast(d_gp_part_weight.data()),
+            d_gp_gen_off_, gen_p_n_gen_,
+            has_gen_p_targets() ? thrust::raw_pointer_cast(d_gp_targets.data()) : nullptr,
+            gen_p_target_stride_,
+            gen_p_sn_mva_, gen_p_tol_mw_,
+            n_bus, nnz_Y,
+            c_start, actual_batch, gen_p_capacity_,
+            d_result_map,
+            thrust::raw_pointer_cast(d_gp_out_element_type.data()),
+            thrust::raw_pointer_cast(d_gp_out_element_id.data()),
+            thrust::raw_pointer_cast(d_gp_out_type.data()),
+            thrust::raw_pointer_cast(d_gp_out_value.data()),
+            thrust::raw_pointer_cast(d_gp_out_limit.data()),
+            thrust::raw_pointer_cast(d_gp_count.data()),
+            thrust::raw_pointer_cast(d_gp_truncated.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
+        t.t_gen_p_check += timer.stop_ms();
     }
 
     timer.start();
@@ -896,12 +1483,345 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_ytf_eff.data()),
             thrust::raw_pointer_cast(d_ytt_eff.data()),
             thrust::raw_pointer_cast(d_base_current_A.data()),
+            thrust::raw_pointer_cast(d_base_current_ex_A.data()),
             thrust::raw_pointer_cast(d_or_amps_results.data()),
             thrust::raw_pointer_cast(d_ex_amps_results.data()),
             n_bus, n_branches_, c_start, actual_batch, d_result_map);
         CHK_CUDA_BPF(cudaGetLastError());
         t.t_flow_computation += timer.stop_ms();
     }
+}
+
+// =============================================================================
+// Batched adjoint kernels
+// =============================================================================
+
+// JT_values[b*nnz + perm[i]] = J_values[b*nnz + i] for every slot b: the
+// value permutation of the shared J→Jᵀ position map (BatchAdjoint::d_J_to_JT).
+__global__ void transpose_gather_values_kernel(
+          cuda_real_type* __restrict__ dst,
+    const cuda_real_type* __restrict__ src,
+    const int*            __restrict__ perm,
+    int nnz, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / nnz;
+    const int       i   = static_cast<int>(tid % nnz);
+    if (b >= batch) return;
+    dst[b * nnz + perm[i]] = src[b * nnz + i];
+}
+
+// Zero the adjoint vector at this chunk's identity rows (handle_disconnected_
+// grid masked P/Q rows and the PV-pinned Q rows of generator contingencies).
+// An identity row r = e_c decouples: λ_r appears in the single Jᵀ equation of
+// its column c, so it absorbs x̄_c − Σ_{r'≠r} J[r',c] λ_{r'} and every other λ
+// is exactly the reduced (unpinned) system's. That λ_r is not a real
+// sensitivity -- the equation is frozen, F_r ≡ 0 whatever Sbus -- and it must
+// not reach the outputs: as λ_{q_k} it would be reported as a Q gradient at a
+// bus whose Q equation is off, and gen_v_adjoint_kernel would contract it
+// with ∂Q_k/∂Vm_j for every neighbour j (a row the bare system never has).
+// For a masked row the value is already 0 (its column carries no live entry).
+__global__ void zero_identity_rows_kernel(
+          cuda_real_type* __restrict__ d_sol,       // [batch × dim_J] (slot order)
+    const int*            __restrict__ d_mask_slot,
+    const int*            __restrict__ d_mask_row,
+    int dim_J, int n_entries)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_entries) return;
+    d_sol[static_cast<ptrdiff_t>(d_mask_slot[i]) * dim_J + d_mask_row[i]] = cuda_real_type(0);
+}
+
+// gen_v adjoint: for every (slot, Vm-fixed bus k) the contraction of the
+// adjoint vector with the dS_calc/dVm_k column (which J never stores for a
+// Vm-fixed bus):
+//   λ̃_i = λ[p_row(i)] + j λ[q_row(i)]      (0 where the bus owns no row)
+//   w_i  = conj(λ̃_i) V_i
+//   g_k  = − Re( e^{−jθ_k} · Σ_{i∈col k} conj(Y_ik) w_i + conj(λ̃_k) e^{jθ_k} conj(I_k) )
+// Y_ik is read through the Ybus transpose-position map (row k's pattern is
+// column k's pattern: the pattern is symmetric); I_k = Σ_j Y_kj V_j is
+// recomputed inline from row k. Non-finite V (masked buses) count as 0; a
+// non-finite V_k gives g_k = 0. The minus sign is the implicit-function
+// sign: dx/dVm_k = −J⁻¹ c_k (see _batch_pf.py's docstring).
+__global__ void gen_v_adjoint_kernel(
+          cuda_real_type*  __restrict__ d_gvm,          // [batch × n_bus] out (slot order)
+    const cuda_real_type*  __restrict__ d_lam,          // [batch × dim_J] (slot order)
+    const cudaComplexType* __restrict__ d_V,            // [batch × n_bus] (slot order)
+    const cudaComplexType* __restrict__ d_Yvals,        // [batch × nnz_Y] (slot order)
+    const int*             __restrict__ d_Y_outer,
+    const int*             __restrict__ d_Y_inner,
+    const int*             __restrict__ d_YT_pos,
+    const int*             __restrict__ d_p_row_of_bus,
+    const int*             __restrict__ d_q_row_of_bus,
+    const char*            __restrict__ d_is_vm_fixed,
+    int n_bus, int nnz_Y, int dim_J, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_bus;
+    const int       k   = static_cast<int>(tid % n_bus);
+    if (b >= batch) return;
+
+    cuda_real_type g = 0;
+    if (d_is_vm_fixed[k]) {
+        const cudaComplexType* V  = d_V + b * n_bus;
+        const cudaComplexType* Yv = d_Yvals + b * nnz_Y;
+        const cuda_real_type*  lam = d_lam + b * dim_J;
+
+        auto lam_tilde = [&](int i) -> cudaComplexType {
+            const int pr = d_p_row_of_bus[i], qr = d_q_row_of_bus[i];
+            return CudaFunHelper::my_make_cuComplex(
+                pr >= 0 ? lam[pr] : cuda_real_type(0),
+                qr >= 0 ? lam[qr] : cuda_real_type(0));
+        };
+        auto finite_or_zero = [](cudaComplexType v) -> cudaComplexType {
+            if (!isfinite(v.x) || !isfinite(v.y))
+                return CudaFunHelper::my_make_cuComplex(cuda_real_type(0), cuda_real_type(0));
+            return v;
+        };
+
+        const cudaComplexType Vk = V[k];
+        const cuda_real_type  mag = CudaFunHelper::my_cuCabs(Vk);
+        if (isfinite(Vk.x) && isfinite(Vk.y) && mag > cuda_real_type(0)) {
+            const cudaComplexType e = CudaFunHelper::my_make_cuComplex(Vk.x / mag, Vk.y / mag);
+            cudaComplexType Ik  = CudaFunHelper::my_make_cuComplex(cuda_real_type(0), cuda_real_type(0));
+            cudaComplexType acc = Ik;
+            for (int p = d_Y_outer[k]; p < d_Y_outer[k + 1]; ++p) {
+                const int j = d_Y_inner[p];
+                const cudaComplexType Vj = finite_or_zero(V[j]);
+                Ik = CudaFunHelper::my_cuCadd(Ik, CudaFunHelper::my_cuCmul(Yv[p], Vj));
+                const int pT = d_YT_pos[p];
+                if (pT >= 0) {
+                    const cudaComplexType Yjk = Yv[pT];
+                    const cudaComplexType wj  = CudaFunHelper::my_cuCmul(
+                        CudaFunHelper::my_cuConj(lam_tilde(j)), Vj);
+                    acc = CudaFunHelper::my_cuCadd(acc,
+                        CudaFunHelper::my_cuCmul(CudaFunHelper::my_cuConj(Yjk), wj));
+                }
+            }
+            const cudaComplexType t1 = CudaFunHelper::my_cuCmul(CudaFunHelper::my_cuConj(e), acc);
+            const cudaComplexType t2 = CudaFunHelper::my_cuCmul(
+                CudaFunHelper::my_cuCmul(CudaFunHelper::my_cuConj(lam_tilde(k)), e),
+                CudaFunHelper::my_cuConj(Ik));
+            g = -(t1.x + t2.x);
+        }
+    }
+    d_gvm[b * n_bus + k] = g;
+}
+
+// =============================================================================
+// _prepare_adjoint — first solve_JT_batch() call only.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_prepare_adjoint()
+{
+    auto t_build_start = std::chrono::steady_clock::now();
+    adjoint_ = std::make_unique<BatchAdjoint>();
+    BatchAdjoint& A = *adjoint_;
+
+    const int dim_J = base.dim_J;
+    const int nnz_J = base.nnz_J;
+
+    // Host transpose of the shared J skeleton: counting sort over columns.
+    thrust::host_vector<int> h_outer(base.d_J_outer);
+    thrust::host_vector<int> h_inner(base.d_J_inner);
+    std::vector<int> h_JT_outer(static_cast<size_t>(dim_J) + 1, 0);
+    std::vector<int> h_JT_inner(static_cast<size_t>(nnz_J), 0);
+    std::vector<int> h_map(static_cast<size_t>(nnz_J), 0);
+    for (int p = 0; p < nnz_J; ++p) ++h_JT_outer[static_cast<size_t>(h_inner[p]) + 1];
+    for (int j = 0; j < dim_J; ++j) h_JT_outer[static_cast<size_t>(j) + 1] += h_JT_outer[static_cast<size_t>(j)];
+    std::vector<int> fill(h_JT_outer.begin(), h_JT_outer.end() - 1);
+    for (int i = 0; i < dim_J; ++i)
+        for (int p = h_outer[i]; p < h_outer[i + 1]; ++p) {
+            const int j   = h_inner[p];
+            const int pos = fill[static_cast<size_t>(j)]++;
+            h_JT_inner[static_cast<size_t>(pos)] = i;   // rows come out sorted
+            h_map[static_cast<size_t>(p)] = pos;
+        }
+    upload_h2d(A.d_JT_outer, h_JT_outer.data(), h_JT_outer.size(), cs);
+    upload_h2d(A.d_JT_inner, h_JT_inner.data(), h_JT_inner.size(), cs);
+    upload_h2d(A.d_J_to_JT,  h_map.data(),      h_map.size(),      cs);
+
+    A.d_JT_values.resize(static_cast<size_t>(batch_size_) * nnz_J);
+    A.d_rhs.resize(static_cast<size_t>(batch_size_) * dim_J);
+    A.d_sol.resize(static_cast<size_t>(batch_size_) * dim_J);
+    A.d_sol_full.resize(static_cast<size_t>(n_contingencies) * dim_J);
+    zero_d(A.d_rhs, cs);
+    zero_d(A.d_sol, cs);
+    zero_d(A.d_sol_full, cs);
+
+    // Second uniform-batch cuDSS context over the transposed skeleton, same
+    // config as the forward (so a reordering workaround applies to both).
+    A.solver.initialize(
+        batch_size_, dim_J, nnz_J,
+        thrust::raw_pointer_cast(A.d_JT_outer.data()),
+        thrust::raw_pointer_cast(A.d_JT_inner.data()),
+        thrust::raw_pointer_cast(A.d_JT_values.data()),
+        thrust::raw_pointer_cast(A.d_rhs.data()),
+        thrust::raw_pointer_cast(A.d_sol.data()),
+        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_);
+    A.n_analysis = 1;
+    cs.synchronize();
+    A.t_build_ms = bpf_ms_since(t_build_start);
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_prepare_gen_v_adjoint(const std::vector<char>& is_vm_fixed_bus)
+{
+    BatchAdjoint& A = *adjoint_;
+    const int n_bus = base.n_bus;
+    const int nnz_Y = base.nnz_Y;
+    if (static_cast<int>(is_vm_fixed_bus.size()) != n_bus)
+        throw std::runtime_error(
+            "[batch_pf] solve_JT_batch: is_vm_fixed_bus must have n_bus entries");
+
+    // Ybus transpose-position map: for entry p = (i, j), the position of
+    // (j, i) in the same CSR (−1 if the pattern is not symmetric there).
+    thrust::host_vector<int> h_outer(base.d_Ybus_outer);
+    thrust::host_vector<int> h_inner(base.d_Ybus_inner);
+    std::vector<int> h_pos(static_cast<size_t>(nnz_Y), -1);
+    for (int i = 0; i < n_bus; ++i)
+        for (int p = h_outer[i]; p < h_outer[i + 1]; ++p) {
+            const int j = h_inner[p];
+            // binary search for column i in row j (rows are column-sorted)
+            int lo = h_outer[j], hi = h_outer[j + 1] - 1;
+            while (lo <= hi) {
+                const int mid = (lo + hi) / 2;
+                const int c   = h_inner[mid];
+                if (c == i)     { h_pos[static_cast<size_t>(p)] = mid; break; }
+                else if (c < i) lo = mid + 1;
+                else            hi = mid - 1;
+            }
+        }
+    upload_h2d(A.d_Ybus_T_pos, h_pos.data(), h_pos.size(), cs);
+    upload_h2d(A.d_p_row_of_bus, base.h_p_row_of_bus.data(), base.h_p_row_of_bus.size(), cs);
+    upload_h2d(A.d_q_row_of_bus, base.h_q_row_of_bus.data(), base.h_q_row_of_bus.size(), cs);
+    upload_h2d(A.d_is_vm_fixed_bus, is_vm_fixed_bus.data(), is_vm_fixed_bus.size(), cs);
+    A.d_gvm.resize(static_cast<size_t>(batch_size_) * n_bus);
+    A.d_gvm_full.resize(static_cast<size_t>(n_contingencies) * n_bus);
+    zero_d(A.d_gvm, cs);
+    zero_d(A.d_gvm_full, cs);
+    cs.synchronize();
+    A.gen_v_ready = true;
+}
+
+// =============================================================================
+// solve_JT_batch
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::solve_JT_batch(
+    const cuda_real_type*    d_rhs_orig,
+    const cuda_real_type*    d_J_ext,
+    bool                     want_gen_v_grad,
+    const cudaComplexType*   d_Ybus_ext,
+    const cudaComplexType*   d_V_ext_orig,
+    const std::vector<char>& is_vm_fixed_bus)
+{
+    if (n_solves_ == 0)
+        throw std::runtime_error(
+            "[batch_pf] solve_JT_batch: call solve() (a forward run) first");
+    if (!adjoint_) _prepare_adjoint();
+    BatchAdjoint& A = *adjoint_;
+
+    const int dim_J = base.dim_J;
+    const int nnz_J = base.nnz_J;
+    const int n_bus = base.n_bus;
+    const int nnz_Y = base.nnz_Y;
+    const int* d_map = source_.d_result_map();   // nullptr → identity
+    CudaTimer timer(cs);
+
+    // ① Permute J → Jᵀ values and (re)factorize, unless this driver's own J
+    //    was already permuted + factorized since its last solve() (a second
+    //    backward on the same forward, e.g. retain_graph=True).
+    const bool own_J = (d_J_ext == nullptr);
+    const bool need_refactor = !A.factorized || !own_J || A.factorized_for_solve != n_solves_;
+    if (need_refactor) {
+        const cuda_real_type* src = own_J ? thrust::raw_pointer_cast(d_J_values_batch.data()) : d_J_ext;
+        transpose_gather_values_kernel<<<
+            nr_grid_size((long long)batch_size_ * nnz_J, BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(A.d_JT_values.data()), src,
+            thrust::raw_pointer_cast(A.d_J_to_JT.data()), nnz_J, batch_size_);
+        CHK_CUDA_BPF(cudaGetLastError());
+        A.solver.set_values(thrust::raw_pointer_cast(A.d_JT_values.data()));
+        A.solver.prepare_factorization();
+        timer.start();
+        if (!A.factorized) {
+            A.solver.factor();
+            A.t_first_factorize += timer.stop_ms();
+            ++A.n_factorize;
+            A.factorized = true;
+        } else {
+            A.solver.refactor();
+            A.t_refactorize += timer.stop_ms();
+            ++A.n_refactorize;
+        }
+        A.factorized_for_solve = own_J ? n_solves_ : -1;
+    }
+
+    // ② Right-hand side: original order → slot order (non-finite → 0), phantom
+    //    slots zero (their base-case Jᵀ then yields λ = 0).
+    zero_d(A.d_rhs, cs);
+    launch_gather_rows(thrust::raw_pointer_cast(A.d_rhs.data()), d_rhs_orig, d_map,
+                       dim_J, n_active_, /*zero_nonfinite=*/true, cs);
+    CHK_CUDA_BPF(cudaGetLastError());
+
+    // ③ Solve, drop the identity-row components (see zero_identity_rows_kernel;
+    //    the driver is one chunk here -- keep_final_jacobian requires it -- so
+    //    the chunk-0 slice is the whole batch) and scatter back to original order.
+    timer.start();
+    A.solver.solve();
+    A.t_solve += timer.stop_ms();
+    ++A.n_solve;
+    {
+        NrIterBuffers mb{};
+        source_.fill_mask_buffers(mb, /*chunk_idx=*/0,
+                                  thrust::raw_pointer_cast(base.d_J_outer.data()));
+        if (mb.n_mask_rows > 0) {
+            zero_identity_rows_kernel<<<(mb.n_mask_rows + BS - 1) / BS, BS, 0, cs>>>(
+                thrust::raw_pointer_cast(A.d_sol.data()),
+                mb.d_mask_slot, mb.d_mask_row, dim_J, mb.n_mask_rows);
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
+    }
+    zero_d(A.d_sol_full, cs);
+    launch_scatter_rows(thrust::raw_pointer_cast(A.d_sol_full.data()),
+                        thrust::raw_pointer_cast(A.d_sol.data()), d_map,
+                        dim_J, n_active_, cs);
+    CHK_CUDA_BPF(cudaGetLastError());
+
+    // ④ gen_v contraction (optional).
+    if (want_gen_v_grad) {
+        if (!A.gen_v_ready) _prepare_gen_v_adjoint(is_vm_fixed_bus);
+        const cudaComplexType* d_V_slots;
+        if (d_V_ext_orig) {
+            A.d_V_ext_slots.resize(static_cast<size_t>(batch_size_) * n_bus);
+            launch_gather_rows(thrust::raw_pointer_cast(A.d_V_ext_slots.data()), d_V_ext_orig,
+                               d_map, n_bus, n_active_, /*zero_nonfinite=*/false, cs);
+            d_V_slots = thrust::raw_pointer_cast(A.d_V_ext_slots.data());
+        } else {
+            d_V_slots = thrust::raw_pointer_cast(d_V_batch.data());
+        }
+        const cudaComplexType* d_Y_slots =
+            d_Ybus_ext ? d_Ybus_ext : thrust::raw_pointer_cast(d_Ybus_values_batch.data());
+        gen_v_adjoint_kernel<<<nr_grid_size((long long)n_active_ * n_bus, BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(A.d_gvm.data()),
+            thrust::raw_pointer_cast(A.d_sol.data()),
+            d_V_slots, d_Y_slots,
+            thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+            thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+            thrust::raw_pointer_cast(A.d_Ybus_T_pos.data()),
+            thrust::raw_pointer_cast(A.d_p_row_of_bus.data()),
+            thrust::raw_pointer_cast(A.d_q_row_of_bus.data()),
+            thrust::raw_pointer_cast(A.d_is_vm_fixed_bus.data()),
+            n_bus, nnz_Y, dim_J, n_active_);
+        CHK_CUDA_BPF(cudaGetLastError());
+        zero_d(A.d_gvm_full, cs);
+        launch_scatter_rows(thrust::raw_pointer_cast(A.d_gvm_full.data()),
+                            thrust::raw_pointer_cast(A.d_gvm.data()), d_map,
+                            n_bus, n_active_, cs);
+        CHK_CUDA_BPF(cudaGetLastError());
+    }
+
+    cs.synchronize();
 }
 
 // =============================================================================

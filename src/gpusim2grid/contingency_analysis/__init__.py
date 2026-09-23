@@ -5,6 +5,8 @@
 __all__ = [
     "ViolationElementType",
     "LimitViolationType",
+    "ViolationCategory",
+    "violation_category",
     "LimitViolation",
 ]
 
@@ -16,7 +18,9 @@ from .._gpusim2grid import (
     PivotEpsilonAlg as _PivotEpsilonAlg,
 )
 
-from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
+from ._limit_violations import (ViolationElementType, LimitViolationType, ViolationCategory,
+                                violation_category, LimitViolation)
+from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -159,7 +163,7 @@ class DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _ContingencyAnalysisSolver:
+class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin):
     """Stateful GPU N-k contingency analysis solver.
 
     Parameters

@@ -401,6 +401,70 @@ def test_distributed_slack_participant_off(solver_atol):
                                    err_msg=f"slack generator {g} off")
 
 
+def _solved_storage_slack_grid():
+    """IEEE 14 (pypowsybl) with a battery on bus B3 sharing the distributed slack
+    with generators B1-G and B2-G. Returns (grid, V)."""
+    pypo = pytest.importorskip("pypowsybl")
+    from lightsim2grid.network import init_from_pypowsybl
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+    net = pypo.network.create_ieee14()
+    net.create_batteries(id="BAT", voltage_level_id="VL3", bus_id="B3", target_p=10.,
+                         target_q=0., min_p=-300., max_p=300.)
+    net.update_loads(id="B3-L", p0=net.get_loads().at["B3-L", "p0"] + 50.)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        grid = init_from_pypowsybl(net, gen_slack_id={"B1-G": 1., "B2-G": 1.},
+                                   sort_index=False, buses_for_sub=False)
+    if not hasattr(grid, "add_storage_slackbus"):
+        pytest.skip("this lightsim2grid build has no storage slack participants")
+    grid.add_storage_slackbus(0, 0.25)
+    grid.change_algorithm(AlgorithmType.NR_KLU)
+    n_bus = grid.get_bus_vn_kv().shape[0]
+    v0 = grid.dc_pf(np.ones(n_bus, dtype=complex), 1, 1e-6)
+    V = grid.ac_pf(v0.copy(), MAX_IT, TOL)
+    assert V.shape[0] > 0
+    return grid, V
+
+
+@requires_gpu
+@needs_bridge
+def test_storage_slack_participant_survives_a_generator_off(solver_atol):
+    """A storage unit taking part in the distributed slack keeps its share on a
+    row that disconnects a participating generator: the row's weights are the
+    survivors' -- the storage unit included -- renormalised, like a one-off
+    solve without that generator."""
+    from gpusim2grid import ScenarioSweepGPU
+
+    grid, V_n = _solved_storage_slack_grid()
+    gens = grid.get_generators()
+    n_gen = len(gens)
+    b2 = [g.name for g in gens].index("B2-G")
+    n_bus = grid.get_Ybus_solver().shape[0]
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    load_p, load_q = grid.get_loads_res_full()[:2]
+    gen_p = np.asarray(grid.get_gen_target_p())
+
+    mask = np.zeros((2, n_gen), dtype=bool)
+    mask[0, b2] = True
+    sw = ScenarioSweepGPU(grid, nb_iter=12, tol_base=TOL)
+    rep = lambda a: np.repeat(np.asarray(a)[None, :], 2, axis=0)   # noqa: E731
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+    sw.set_contingency_gens(mask)
+    sw.compute(batch_size=4)
+    assert np.all(sw.last_residuals() < 100 * solver_atol)
+    V = _V(sw, 2, n_bus)
+
+    grid_off, _ = _solved_storage_slack_grid()
+    grid_off.deactivate_gen(int(b2))
+    grid_off.tell_solver_need_reset()
+    ref = grid_off.ac_pf(V_n.copy(), 30, TOL)
+    assert ref.shape[0] > 0, "the reference itself diverged"
+    np.testing.assert_allclose(V[0], ref[buses], atol=10 * solver_atol,
+                               err_msg="generator B2-G off, the storage unit still in the slack")
+    np.testing.assert_allclose(V[1], V_n[buses], atol=10 * solver_atol)
+
+
 @requires_gpu
 @needs_bridge
 def test_with_handle_disconnected_grid(solver_atol):

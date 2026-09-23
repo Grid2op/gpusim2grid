@@ -81,6 +81,7 @@ inline void run_nr_loop(
     BatchTimings&  t)
 {
     policy.begin_chunk();
+    linear_solver.begin_chunk();
 
     for (int iter = 0; iter < nb_iter; ++iter) {
         NrIterTimings step;
@@ -110,30 +111,17 @@ inline void run_nr_loop(
         //   needs_fresh_jacobian = true  → fill every iteration
         //   needs_iter0_jacobian = true  → fill only at iter == 0
         //   both false                   → never fill (policy reuses base factors)
+        //   The fill sequence itself (zero / dS fill / feature stamps / per-slot
+        //   overrides + mask) lives in nr_fill_J_at_current_V (nr_iter_step.cuh),
+        //   shared with the post-loop converged-J refill of the batched adjoint.
         if constexpr (Policy::needs_fresh_jacobian) {
             timer.start();
-            nr_feature_zero_J(buf, nnz_J, batch_size, cs);
-            fill_J_kernel<<<nr_grid_size((long long)batch_size * nnz_Y, BS), BS, 0, cs>>>(
-                buf.d_J_values, buf.d_V, buf.d_Ibus,
-                buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
-                buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
-                n_bus, nnz_Y, nnz_J, batch_size);
-            nr_feature_fill_J(buf, n_bus, nnz_J, batch_size, cs);
-            // Per-slot overrides + mask AFTER the feature stamps so they win.
-            nr_apply_J_masks(buf, nnz_J, dim_J, batch_size, cs);
+            nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, batch_size, cs);
             step.t_fill_J = timer.stop_ms();
         } else if constexpr (Policy::needs_iter0_jacobian) {
             if (iter == 0) {
                 timer.start();
-                nr_feature_zero_J(buf, nnz_J, batch_size, cs);
-                fill_J_kernel<<<nr_grid_size((long long)batch_size * nnz_Y, BS), BS, 0, cs>>>(
-                    buf.d_J_values, buf.d_V, buf.d_Ibus,
-                    buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
-                    buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
-                    n_bus, nnz_Y, nnz_J, batch_size);
-                nr_feature_fill_J(buf, n_bus, nnz_J, batch_size, cs);
-                // Per-slot overrides + mask AFTER the feature stamps so they win.
-                nr_apply_J_masks(buf, nnz_J, dim_J, batch_size, cs);
+                nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, batch_size, cs);
                 step.t_fill_J = timer.stop_ms();
             }
         }

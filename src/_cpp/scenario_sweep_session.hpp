@@ -44,6 +44,7 @@
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType, Contingency
 #include "gen_contingency_data.hpp"          // GenContingencyData
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -51,15 +52,54 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 // Forward-declare CUDA-dependent types to keep CUDA headers out of this file.
 struct AcPfNrState;
 struct LedgerData;
 struct ScenarioSweepBatch;
+struct ScenarioSweepDeviceData;   // session-owned device buffers (defined in the .cu)
 template <typename BatchSource> struct BatchPfDriver;
 using ScenarioSweepSolver = BatchPfDriver<ScenarioSweepBatch>;
+
+// =============================================================================
+// ScenarioSweepDriverConfig — the construction-time shape of the live batch
+// driver. run() compares the current settings against the snapshot taken when
+// solver_ was built: any difference means the driver cannot be reused (a
+// "cold" run rebuilds it, with a new cuDSS ANALYSIS); otherwise run() only
+// swaps the source (new topology, "warm") or the injections ("hot"). The
+// config members are plain read/write attributes on the Python side, so a
+// snapshot comparison is the only robust way to notice a change.
+// =============================================================================
+struct ScenarioSweepDriverConfig {
+    int    n_scenarios     = -1;
+    int    batch_size      = 0;
+    int    refactor_period = 1;
+    ContingencySolverType strategy = ContingencySolverType::DirectRefactorEvery;
+    ReorderingAlg   reordering_alg    = ReorderingAlg::Default;
+    MatchingAlg     matching_alg      = MatchingAlg::None;
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default;
+    bool   scaling_max_voltage_change = false;
+    double max_dVa = 0.5, max_dVm = 0.1;
+    bool   mask_mode            = false;   // handle_disconnected_grid
+    bool   fixed_batch_capacity = false;
+    int    base_state_generation = -1;
+
+    bool operator==(const ScenarioSweepDriverConfig& o) const {
+        return n_scenarios == o.n_scenarios && batch_size == o.batch_size
+            && refactor_period == o.refactor_period && strategy == o.strategy
+            && reordering_alg == o.reordering_alg && matching_alg == o.matching_alg
+            && pivot_epsilon_alg == o.pivot_epsilon_alg
+            && scaling_max_voltage_change == o.scaling_max_voltage_change
+            && max_dVa == o.max_dVa && max_dVm == o.max_dVm
+            && mask_mode == o.mask_mode && fixed_batch_capacity == o.fixed_batch_capacity
+            && base_state_generation == o.base_state_generation;
+    }
+    bool operator!=(const ScenarioSweepDriverConfig& o) const { return !(*this == o); }
+};
 
 struct ScenarioSweepSession {
 
@@ -71,7 +111,45 @@ struct ScenarioSweepSession {
     // Owned GPU state
     // =========================================================================
     std::unique_ptr<AcPfNrState>          base_state_;
-    std::unique_ptr<ScenarioSweepSolver>  solver_;   // null until run()
+    std::unique_ptr<ScenarioSweepSolver>  solver_;   // null until the first run(); then PERSISTENT
+    std::unique_ptr<ScenarioSweepDeviceData> dev_;   // canonical original-order Sbus / gen_v device buffers
+
+    // =========================================================================
+    // Driver persistence (see ScenarioSweepDriverConfig and run()).
+    //
+    //   *_dirty_            : which inputs changed since the last run().
+    //   injections_on_device_ / gen_v_on_device_ : the canonical buffer was
+    //                         last filled straight from a device tensor
+    //                         (set_injections_dlpack / set_gen_v_dlpack), so
+    //                         run() must not overwrite it from the host copies.
+    //   fixed_batch_capacity_ : when true, batch_size_ is used verbatim as the
+    //                         driver's chunk capacity (no rebalancing over the
+    //                         active count), so with batch_size_ >= n_scenarios
+    //                         the whole batch is always ONE chunk whatever
+    //                         rows get islanded -- what the differentiable
+    //                         wrapper needs (the adjoint reads the last chunk's
+    //                         Jacobian). Default false keeps the historic
+    //                         rebalancing for the plain sweep API.
+    //   keep_final_jacobian_ : refill J at the converged V after the NR loop
+    //                         (forwarded to the driver; see BatchPfDriver).
+    //   run_counter_ etc.   : observability for callers/tests (a torch
+    //                         autograd backward checks run_counter_ against
+    //                         the forward it belongs to).
+    // =========================================================================
+    bool injections_dirty_     = false;
+    bool topology_dirty_       = false;
+    bool gen_v_dirty_          = false;
+    bool gen_off_dirty_        = false;
+    bool injections_on_device_ = false;
+    bool gen_v_on_device_      = false;
+    bool fixed_batch_capacity_ = false;
+    bool keep_final_jacobian_  = false;
+    bool last_run_kept_jacobian_ = false;
+    int  run_counter_          = 0;
+    int  driver_build_counter_ = 0;
+    int  source_build_counter_ = 0;
+    int  base_state_generation_ = 0;
+    ScenarioSweepDriverConfig driver_cfg_;
 
     // RowMajor Ybus copy — needed to build the block-diag CSR + resolve_indices.
     Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm_;
@@ -129,6 +207,13 @@ struct ScenarioSweepSession {
     RealVect h_bus_vmin_kv_, h_bus_vmax_kv_;               // [n_bus], solver numbering
     RealVect h_branch_limit_a1_ka_, h_branch_limit_a2_ka_; // [n_branches], lines-then-trafos
 
+    // post-solve physical checks (see physical_checks() above)
+    PhysicalChecksConfig phys_;
+    // per-row set-points of the active-power check (set_gen_p_targets); empty
+    // = the plan's base ones for every row
+    RealMatRM gen_p_targets_;
+    bool      gen_p_targets_dirty_ = false;
+
     // =========================================================================
     // Host injection data (set_injections()) — (n_scenarios × n_bus)
     // row-major physical-unit arrays, AC-solver bus numbering.
@@ -139,10 +224,14 @@ struct ScenarioSweepSession {
     bool   has_injections_ = false;
 
     // =========================================================================
-    // Vm-fixed bus mask (pv ∪ slack_ids, built once at construction) --
+    // Vm-fixed bus mask (pv ∪ slack_ids without a ledger Vm unknown, built
+    // once at construction, see build_gen_v_bus_maps) --
     // consulted by set_gen_v() below. See that method's own doc.
     // =========================================================================
     std::vector<char> h_is_vm_fixed_bus_;
+    // VoltageControl group regulating each bus (-1: none) -- a gen_v column
+    // whose generator regulates such a bus drives that group's per-row v_set.
+    std::vector<int>  h_vc_group_of_bus_;
 
     // =========================================================================
     // Host generator target-voltage override (set_gen_v()) -- optional; see
@@ -163,6 +252,13 @@ struct ScenarioSweepSession {
     std::vector<Contingency>      contingencies_;
     std::vector<std::vector<int>> tripped_branches_per_scenario_;
     bool has_topology_ = false;
+
+    // Caller-declared not-simulable rows (set_skipped_rows(); ORIGINAL row
+    // order, n_scenarios entries). Copied into Contingency::skip by run(); a
+    // change is a warm source rebuild (the compaction changes).
+    std::vector<char> skip_rows_;
+    bool has_skip_   = false;
+    bool skip_dirty_ = false;
 
     // =========================================================================
     // Generator contingencies (set_contingency_gens(), lightsim2grid PR #193
@@ -185,6 +281,11 @@ struct ScenarioSweepSession {
     BoolMat            gen_off_;
     bool               has_gen_off_  = false;
     std::vector<int>   reserved_buses_;
+    // Per-row buses turned PV->PQ by the last run() (ORIGINAL row order,
+    // n_scenarios entries; all empty without a generator mask). Exposed for the
+    // differentiable wrapper: a released bus' voltage set-point is only an NR
+    // start value there, so its gen_v gradient is 0 on that row.
+    std::vector<std::vector<int>> row_pv_to_pq_;
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
     CplxVect        Vinit_, Sbus_;
@@ -263,12 +364,37 @@ struct ScenarioSweepSession {
     );
 
     // =========================================================================
+    // set_injections_device — the device path of set_injections(): d_ptr is a
+    // (n_scen × n_bus) row-major PER-UNIT complex buffer (the build's
+    // cudaComplexType) on this session's device, e.g. a torch tensor handed
+    // over through DLPack (see dlpack_export.cu). One D2D copy into the
+    // canonical original-order buffer; producer_stream (a cudaStream_t
+    // handle, 0 = none) is waited on through an event first, and the copy is
+    // host-synchronized before returning so the caller may free/reuse the
+    // source immediately. Fixes n_scenarios().
+    // =========================================================================
+    void set_injections_device(const void* d_ptr, int n_scen, int n_bus,
+                               std::uintptr_t producer_stream);
+
+    // =========================================================================
     // set_topology — one branch-id list per scenario (lines-then-trafos),
     // row-aligned with set_injections(). Requires set_branch_data() first.
     // Optional: if never called, run() defaults every scenario to "no
     // branches tripped".
     // =========================================================================
     void set_topology(const std::vector<std::vector<int>>& branch_ids_per_scenario);
+
+    // =========================================================================
+    // set_skipped_rows — (n_scenarios,) bool, row-aligned with
+    // set_injections(): True drops that row from the batch as NOT SIMULATED
+    // (NaN voltage / residual, disconnected flag = 1, GRID/NOT_SIMULATED
+    // violation) without touching the graph. Used by the Python facades for a
+    // row whose connected generators on one bus carry different voltage
+    // set-points (no V satisfies both). clear_skipped_rows() drops the mask.
+    // =========================================================================
+    void set_skipped_rows(const std::vector<char>& mask);
+    void clear_skipped_rows();
+    bool has_skipped_rows() const { return has_skip_; }
 
     // =========================================================================
     // set_gen_v -- see InjectionSweepSession::set_gen_v's doc (identical
@@ -281,6 +407,19 @@ struct ScenarioSweepSession {
     void set_gen_v(
         Eigen::Ref<const Eigen::Matrix<eigen_real_type, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> gen_v,
         Eigen::Ref<const Eigen::VectorXi> gen_bus);
+
+    // Device path of set_gen_v(): d_ptr is a (n_scen × n_gen) row-major real
+    // buffer (the build's cuda_real_type) on this device; the Vm-fixed column
+    // filter is derived from gen_bus on the host (cheap, O(n_gen)) and the
+    // selected columns are gathered on the device at run(). Same stream /
+    // sync contract as set_injections_device.
+    void set_gen_v_device(const void* d_ptr, int n_scen, int n_gen,
+                          Eigen::Ref<const Eigen::VectorXi> gen_bus,
+                          std::uintptr_t producer_stream);
+
+    // Drop any gen_v override: every row keeps the grid's base-case voltage
+    // again (the state before set_gen_v was ever called).
+    void clear_gen_v();
 
     // =========================================================================
     // set_gen_contingency_data — per-generator snapshot (bridge factory only;
@@ -312,17 +451,69 @@ struct ScenarioSweepSession {
     // caller observe when run() rebuilt the base state.
     int              dim_J() const;
     std::vector<int> get_reserved_buses() const { return reserved_buses_; }
+    std::vector<std::vector<int>> get_row_pv_to_pq() const { return row_pv_to_pq_; }
+
+    // VoltageControl structure a gen_v gradient needs: the group regulating
+    // each bus (-1: none), each group's bordered voltage row in J, its base
+    // set-point, whether it holds a member no gen_v column can move (SVC /
+    // hvdc station: its v_set is pinned), and per row of the last run() the
+    // groups handle_disconnected_grid stranded (their voltage row no longer
+    // depends on v_set).
+    std::vector<int>    vc_group_of_bus() const;
+    std::vector<int>    vc_v_row_of_group() const;
+    std::vector<double> vc_v_set() const;
+    std::vector<int>    vc_group_has_fixed_member() const;
+    std::vector<std::vector<int>> get_row_stranded_vc_groups() const;
     bool             has_gen_contingency() const { return has_gen_off_; }
 
     // =========================================================================
-    // run — constructs BatchPfDriver<ScenarioSweepBatch> + runs the chunk
-    // loop. A scenario whose topology change disconnects the grid is skipped
-    // (NaN residual/voltage) — unless handle_disconnected_grid_ is set, in
-    // which case only scenarios stranding the angle reference or a
-    // controller bus are left as NaN (the rest solve on their largest
-    // connected component, masked buses reported as NaN).
+    // run — solves every scenario. A scenario whose topology change
+    // disconnects the grid is skipped (NaN residual/voltage) — unless
+    // handle_disconnected_grid_ is set, in which case only scenarios stranding
+    // the angle reference or a controller bus are left as NaN (the rest solve
+    // on their largest connected component, masked buses reported as NaN).
+    //
+    // Three paths, decided against the live driver (see
+    // ScenarioSweepDriverConfig):
+    //   cold : no driver yet, or its shape/config changed (n_scenarios,
+    //          batch_size, strategy, cuDSS config, base state, ...) → build a
+    //          new BatchPfDriver<ScenarioSweepBatch> (allocation + cuDSS
+    //          ANALYSIS + first FACTORIZATION on the first iteration).
+    //   warm : only the topology / generator mask changed → new
+    //          ScenarioSweepBatch (CPU connectivity + patches) swapped into
+    //          the live driver; no analysis, REFACTORIZATION only.
+    //   hot  : only injections / gen_v changed → one device gather of the new
+    //          rows; nothing else touched.
+    // The result buffers (v_results_dlpack) are then overwritten IN PLACE
+    // across runs (they only move on a cold rebuild).
     // =========================================================================
     void run();
+
+    // =========================================================================
+    // solve_JT_batch — batched adjoint (see BatchPfDriver::solve_JT_batch;
+    // pointer arguments are device buffers of the documented shapes, nullptr
+    // where optional). Requires the last run() to have been made with
+    // keep_final_jacobian_ = true (alias mode) or an external J snapshot.
+    // Builds the transposed system lazily on the first call.
+    // =========================================================================
+    void solve_JT_batch(const void* d_rhs_orig, const void* d_J_ext,
+                        bool want_gen_v_grad,
+                        const void* d_Ybus_ext, const void* d_V_ext_orig,
+                        std::uintptr_t producer_stream);
+
+    // Adjoint / structure accessors (see the bindings for the shapes).
+    bool adjoint_ready() const;
+    int  capacity()      const;   // live driver's chunk capacity (0 before run())
+    int  n_active()      const;   // rows actually solved by the last run()
+    int  nnz_J()         const;
+    int  nnz_Y()         const;
+    std::vector<int> p_row_of_bus()     const;
+    std::vector<int> q_row_of_bus()     const;
+    std::vector<int> theta_col_of_bus() const;
+    std::vector<int> vm_col_of_bus()    const;
+    std::vector<int> is_vm_fixed_bus()  const;
+    Eigen::VectorXi  get_active_to_orig() const;
+    std::pair<std::vector<int>, std::vector<int>> j_skeleton() const;   // (outer, inner)
 
     // =========================================================================
     // compute_flows — branch flows for ALL scenarios at once from
@@ -378,7 +569,7 @@ struct ScenarioSweepSession {
     RealVect get_residuals()  const;   // (n_scenarios,)               real
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
-    BatchTimings get_timings() const { return timings_; }
+    BatchTimings get_timings() const;  // run() timings + cumulative adjoint counters
 
     // Per-scenario disconnected flag (1 == topology change islanded the grid,
     // scenario skipped/NaN; 0 == solved). Size n_scenarios(); empty before
@@ -407,6 +598,39 @@ struct ScenarioSweepSession {
     Eigen::VectorXi get_violation_count_high_voltage() const;
     Eigen::VectorXi get_violation_count_current()      const;
 
+    // =========================================================================
+    // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
+    // .hpp): the per-bus reactive capability (compute_physical_violations,
+    // lightsim2grid PR #206 parity) and the droop hvdc P-saturation
+    // (compute_physical_violations). Flags / tolerances / capacities live on
+    // physical_checks(); mutable, taken into account at the next run().
+    // set_bus_q_capability() hands in the plan the reactive check needs (built
+    // by lightsim2grid's own build_bus_q_plan through the bridge, or by the
+    // caller in array mode). The get_* accessors are synchronous D->H copies
+    // and throw unless the last run() had the corresponding flag on.
+    // =========================================================================
+    PhysicalChecksConfig&       physical_checks()       { return phys_; }
+    const PhysicalChecksConfig& physical_checks() const { return phys_; }
+    void set_bus_q_capability(const BusQPlanData& plan);
+    BusQViolationsResult  get_bus_q_violations()    const;
+    BusQViolationsResult  get_bus_q_violations_n()  const;
+    HvdcPViolationsResult get_hvdc_p_violations()   const;
+    HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
+    // Per-row active set-points of the machines of that plan (MW, GENERATOR
+    // convention, NaN = keep the grid's own), (n_rows x n_entries) with one
+    // column per entry of the plan in its order, row-aligned with
+    // set_injections: what a row's generator produces is ITS target plus its
+    // share of the slack, and only the caller knows that target (the facades
+    // fill it from set_injections_from_elements' gen_p). Left unset, every row
+    // is checked against the base set-points. An empty matrix drops them.
+    void set_gen_p_targets(Eigen::Ref<const RealMatRM> targets);
+
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ScenarioSweepSession(const ScenarioSweepSession&)            = delete;
     ScenarioSweepSession& operator=(const ScenarioSweepSession&) = delete;
@@ -418,6 +642,14 @@ private:
     // given switchable buses (empty: the un-extended ledger). Drops solver_
     // first (it references *base_state_).
     void _build_base_state(const std::vector<int>& switchable_buses);
+
+    // Snapshot of the settings the live driver depends on (see
+    // ScenarioSweepDriverConfig).
+    ScenarioSweepDriverConfig _current_config() const;
+
+    // Make an external stream's pending work visible to `cs` (event record +
+    // wait); 0 = nothing to wait for.
+    static void _wait_producer(std::uintptr_t producer_stream, void* cs);
 
     // Derive, from gen_off_, the buses that lose every local controller per
     // row (row_pv_to_pq), the union of those (required, sorted, restricted to

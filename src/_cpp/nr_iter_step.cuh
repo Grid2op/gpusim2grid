@@ -155,7 +155,7 @@ struct NrIterBuffers {
     const int*             d_vc_vrow      = nullptr;
     const int*             d_vc_grp_start = nullptr;
     const int*             d_vc_grp_count = nullptr;
-    const cuda_real_type*  d_vc_vset      = nullptr;
+    const cuda_real_type*  d_vc_vset      = nullptr;   // [n_vc_grp], or per slot (vc_vset_stride)
     const int*             d_vc_sh_row    = nullptr;
     const int*             d_vc_sh_first  = nullptr;
     const int*             d_vc_sh_other  = nullptr;
@@ -200,6 +200,12 @@ struct NrIterBuffers {
     // d_slack_w[b * n_slack + k] -- a ScenarioSweep row that disconnected a
     // slack participant re-weights the survivors (lightsim2grid PR #193).
     int                    slack_w_stride = 0;
+
+    // ---- per-slot VoltageControl set-points ---------------------------------
+    // 0 (default): d_vc_vset is the shared [n_vc_grp] base array. n_vc_grp:
+    // d_vc_vset is per slot, [actual_batch * n_vc_grp] -- a batch row whose
+    // gen_v moves a controller's set-point (see GenVOverride).
+    int                    vc_vset_stride = 0;
 
     // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
     // launched) unless enabled. Mirrors lightsim2grid's own
@@ -263,7 +269,7 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
             buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
         vc_vrow_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
-            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
+            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset, buf.vc_vset_stride,
             buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, batch);
         if (buf.n_vc_share > 0)
             vc_share_kernel<<<nr_grid_size((long long)batch * buf.n_vc_share, BS), BS, 0, cs>>>(
@@ -290,7 +296,7 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
     if (buf.n_hvdc > 0)
         hvdc_fill_feature_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
             buf.n_hvdc, n_bus, nnz_J, batch);
     if (buf.n_vc_feat > 0)
@@ -375,6 +381,35 @@ inline void nr_apply_J_masks(const NrIterBuffers& buf,
 {
     nr_apply_J_overrides(buf, nnz_J, cs);
     nr_apply_bus_mask(buf, nnz_J, dim_J, batch, cs);
+}
+
+// -----------------------------------------------------------------------------
+// nr_fill_J_at_current_V
+//
+// Step ③ alone: the numeric Jacobian at whatever d_V / d_Ibus currently hold
+// (d_Ibus must be Ybus · d_V, i.e. the SpMV must have run since the last V
+// update). The single definition of the fill sequence -- zero (additive
+// features), dS/dx fill, feature stamps, per-slot overrides + bus mask -- used
+// by the single-system step, the batched NR loop (driver.cuh), and the
+// post-loop refill of J at the CONVERGED V that the batched adjoint needs
+// (BatchPfDriver::keep_final_jacobian_).
+// -----------------------------------------------------------------------------
+inline void nr_fill_J_at_current_V(
+    const NrIterBuffers& buf,
+    int n_bus, int dim_J, int nnz_Y, int nnz_J,
+    int batch,
+    cudaStream_t cs)
+{
+    nr_feature_zero_J(buf, nnz_J, batch, cs);
+    fill_J_kernel<<<nr_grid_size((long long)batch * nnz_Y, BS), BS, 0, cs>>>(
+        buf.d_J_values, buf.d_V, buf.d_Ibus,
+        buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
+        buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
+        n_bus, nnz_Y, nnz_J, batch);
+    nr_feature_fill_J(buf, n_bus, nnz_J, batch, cs);
+    // Per-slot overrides + identity-pinned / masked rows win over every stamp
+    // above (no-op unless the buffers carry mask entries).
+    nr_apply_J_masks(buf, nnz_J, dim_J, batch, cs);
 }
 
 // -----------------------------------------------------------------------------
@@ -464,16 +499,7 @@ inline void nr_iter_step_prepare(
     //     When an additive feature (HVDC droop) is active, J must be zeroed first
     //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
-    nr_feature_zero_J(buf, nnz_J, actual_batch, cs);
-    fill_J_kernel<<<nr_grid_size((long long)actual_batch * nnz_Y, BS), BS, 0, cs>>>(
-        buf.d_J_values, buf.d_V, buf.d_Ibus,
-        buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
-        buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
-        n_bus, nnz_Y, nnz_J, actual_batch);
-    nr_feature_fill_J(buf, n_bus, nnz_J, actual_batch, cs);
-    // Identity-pinned / masked rows win over every stamp above (no-op unless
-    // the buffers carry mask entries).
-    nr_apply_J_masks(buf, nnz_J, dim_J, actual_batch, cs);
+    nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, actual_batch, cs);
     if (use_cudss) dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 

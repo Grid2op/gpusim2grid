@@ -598,18 +598,21 @@ AcPfNrState::AcPfNrState(
             lf1_all=to_real(ledger->hvdc_lf1), lf2_all=to_real(ledger->hvdc_lf2),
             rr_all=to_real(ledger->hvdc_r), pm12_all=to_real(ledger->hvdc_pmax12),
             pm21_all=to_real(ledger->hvdc_pmax21);
-        std::vector<int> bus1(n_hvdc), bus2(n_hvdc), status(n_hvdc);
+        std::vector<int> bus1(n_hvdc), bus2(n_hvdc), status(n_hvdc), hid(n_hvdc);
+        const bool have_ids = static_cast<int>(ledger->hvdc_id.size()) == nh_raw;
         std::vector<cuda_real_type> p0(n_hvdc), kk(n_hvdc), lf1(n_hvdc), lf2(n_hvdc),
             rr(n_hvdc), pm12(n_hvdc), pm21(n_hvdc);
         for (int i = 0; i < n_hvdc; ++i) {
             const int e = keep[i];
             bus1[i] = ledger->hvdc_bus1[e]; bus2[i] = ledger->hvdc_bus2[e]; status[i] = ledger->hvdc_status[e];
+            hid[i]  = have_ids ? ledger->hvdc_id[e] : e;
             p0[i] = p0_all[e]; kk[i] = kk_all[e]; lf1[i] = lf1_all[e]; lf2[i] = lf2_all[e];
             rr[i] = rr_all[e]; pm12[i] = pm12_all[e]; pm21[i] = pm21_all[e];
         }
         upload_h2d(d_hvdc_bus1,   bus1.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_id,     hid.data(),    n_hvdc, cs);
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);

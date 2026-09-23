@@ -237,3 +237,42 @@ def test_flows_on_half_open_branches(half_open_case, n1_results):
     tb = c["trafo_branch"]
     assert np.all(ex_amps[solved, tb] == 0)
     assert np.all(or_amps[solved, tb] == 0)
+
+
+def test_base_case_flows_cpu_helper_on_half_open_branches(half_open_case):
+    """``compute_branch_flows_cpu`` (the numpy helper behind
+    ``get_violations_n()`` / ``compute_violations_n``) must follow the GPU
+    kernels' convention on a ``-1`` endpoint: 0 A on the open terminal, the
+    live terminal's current computed with V=0 on the open side and the live
+    bus' amp base, and every other branch unchanged. Before the guard, numpy
+    read ``V[-1]`` / ``bus_vn_kv[-1]`` (the last bus) and reported a wrong,
+    limit-violating, current on the live side of every half-open branch."""
+    from gpusim2grid.acpf_nr._branch_flows import compute_branch_flows_cpu
+    from gpusim2grid._ls2g_utils import extract_branch_data
+
+    c = half_open_case
+    grid = c["grid"]
+    (branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva), n_lines, _ = extract_branch_data(grid)
+    lb, tb = c["line_branch"], c["trafo_branch"]
+    assert branch_from[lb] == -1 and branch_to[lb] >= 0
+    assert branch_to[tb] == -1 and branch_from[tb] >= 0
+
+    V = np.asarray(grid.get_V_solver())
+    or_amps, ex_amps = compute_branch_flows_cpu(V, branch_from, branch_to, yff, yft, ytf, ytt, vn_kv, sn_mva)
+    assert np.all(np.isfinite(or_amps)) and np.all(np.isfinite(ex_amps))
+
+    # lightsim2grid's own base-case currents (kA) on every branch
+    lines, trafos = grid.get_lines(), grid.get_trafos()
+    ref_or = 1e3 * np.array([el.res_a1_ka for el in lines] + [el.res_a1_ka for el in trafos])
+    ref_ex = 1e3 * np.array([el.res_a2_ka for el in lines] + [el.res_a2_ka for el in trafos])
+    np.testing.assert_allclose(or_amps, ref_or, rtol=1e-6, atol=1e-3)
+    # extremity side too: each terminal is converted to amps with its own
+    # bus' nominal voltage, so transformers (and the two IEEE 118 "lines"
+    # joining two voltage levels) agree with lightsim2grid as well
+    np.testing.assert_allclose(ex_amps, ref_ex, rtol=1e-6, atol=1e-3)
+
+    # line: side 1 open -> 0 A, side 2 carries only its charging current
+    assert or_amps[lb] == 0
+    assert 0 < ex_amps[lb] < 100
+    # transformer: side 2 open -> 0 A, no shunt -> side 1 also 0 A
+    assert ex_amps[tb] == 0 and or_amps[tb] == 0

@@ -52,6 +52,7 @@ void InjectionBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
                    gen_v_override_.h_active_bus.size(), cs);
         upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
                    gen_v_override_.h_gen_v_all.size(), cs);
+        gv_vset_.upload(gen_v_override_.h_active_vc_group, cs);
     }
 }
 
@@ -80,6 +81,10 @@ void InjectionBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
             thrust::raw_pointer_cast(d_gv_all.data()),
             thrust::raw_pointer_cast(d_gv_active_bus.data()),
             row_offset, k, actual_batch, ctx.n_bus);
+        gv_vset_.prepare(thrust::raw_pointer_cast(ctx.base.d_vc_vset.data()),
+                         ctx.base.n_vc_grp,
+                         thrust::raw_pointer_cast(d_gv_all.data()), k,
+                         row_offset, actual_batch, ctx.batch_size, cs);
     }
 }
 

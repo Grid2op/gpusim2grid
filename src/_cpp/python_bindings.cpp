@@ -9,6 +9,7 @@
 #include "injection_sweep.hpp"               // run_injection_sweep_gpu
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "scenario_sweep_session.hpp"        // ScenarioSweepSession
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
 #include "warmup.hpp"                        // warmup
@@ -27,6 +28,262 @@
 #include <vector>
 
 
+// -----------------------------------------------------------------------------
+// Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+// violations): the same five entries on the three batch sessions. The config
+// and result types are bound once (bind_physical_checks_types); this wraps a
+// session class_ at the head of its definition chain.
+// -----------------------------------------------------------------------------
+template <class Cls>
+Cls bind_physical_checks(Cls cls)
+{
+    using Session = typename Cls::type;
+    cls.def_property_readonly("physical_checks",
+            [](Session& self) -> PhysicalChecksConfig& { return self.physical_checks(); },
+            pybind11::return_value_policy::reference_internal,
+            "Configuration of the opt-in post-solve PHYSICAL checks (a "
+            "PhysicalChecksConfig, live: set its attributes before run()): one flag, "
+            "compute_physical_violations, for the per-bus reactive capability "
+            "(lightsim2grid PR #206) and the droop hvdc P-saturation together.")
+       .def("set_bus_q_capability", &Session::set_bus_q_capability, pybind11::arg("plan"),
+            "Hand in the BusQPlanData the reactive-capability check needs (which "
+            "buses are held by a machine, and what each can produce). Built from a "
+            "solved lightsim2grid grid by _extract_bus_q_plan_from_lsgrid, or by "
+            "hand in array mode. Validated against n_bus; drops any previous report.")
+       .def("get_bus_q_violations", &Session::get_bus_q_violations,
+            "BusQViolationsResult of the last run(): per row, the buses whose "
+            "machines had to produce more (or less) reactive power than the SUM of "
+            "what they own (the BUS part of the physical report). Requires "
+            "compute_physical_violations to have been on.")
+       .def("get_bus_q_violations_n", &Session::get_bus_q_violations_n,
+            "The same for the base (\"n\") case every row is solved from (one row; "
+            "count 0 when the base solve did not converge).")
+       .def("get_hvdc_p_violations", &Session::get_hvdc_p_violations,
+            "HvdcPViolationsResult of the last run(): per row, the linear-regime "
+            "droop hvdc lines whose flow exceeds pmax in the direction it flows. "
+            "(the HVDC part of the physical report). Requires "
+            "compute_physical_violations to have been on.")
+       .def("get_hvdc_p_violations_n", &Session::get_hvdc_p_violations_n,
+            "The same for the base (\"n\") case.")
+       .def("set_gen_p_capability", &Session::set_gen_p_capability, pybind11::arg("plan"),
+            "Hand in the GenPPlanData the active-power check of the distributed slack "
+            "needs (which generators and storage units take a share of it, their raw "
+            "participation factor, their [min_p, max_p] in MW and their base set-point, "
+            "generator convention). Built from a solved lightsim2grid grid by "
+            "_extract_gen_p_plan_from_lsgrid (lightsim2grid's own build_gen_p_plan), or "
+            "by hand in array mode. OPTIONAL: left unset, nothing has a limit and "
+            "nothing is reported. Validated against n_bus; drops any previous report.")
+       .def("get_gen_p_violations", &Session::get_gen_p_violations,
+            "GenPViolationsResult of the last run(): per row, the slack generators / "
+            "storage units whose converged active power (target + share of the slack) "
+            "left their [min_p, max_p] (the GENERATOR / STORAGE part of the physical "
+            "report). Requires compute_physical_violations to have been on.")
+       .def("get_gen_p_violations_n", &Session::get_gen_p_violations_n,
+            "The same for the base (\"n\") case.");
+    return cls;
+}
+
+static void bind_physical_checks_types(pybind11::module_& m)
+{
+    pybind11::class_<BusQPlanData>(m, "BusQPlanData",
+        "Flattened plan of the per-bus reactive-capability check "
+        "(compute_physical_violations): per checked bus (SOLVER numbering) the summed "
+        "fixed capability of its hvdc converter stations and voltage-regulating storage "
+        "units (MVAr), how many always-live machines (stations + storage units + "
+        "voltage-mode SVCs) hold it, the summed SVC susceptance "
+        "range (pu, worth b*|V|^2*sn_mva MVAr at the row's voltage) and a CSR of its "
+        "voltage-regulating generators (container id, min_q/max_q MVAr). Built from a "
+        "solved lightsim2grid grid by _extract_bus_q_plan_from_lsgrid (lightsim2grid's "
+        "own build_bus_q_plan), or from arrays here.")
+        .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> bus_solver,
+                               Eigen::Ref<const RealVect> qmin_fixed_mvar,
+                               Eigen::Ref<const RealVect> qmax_fixed_mvar,
+                               Eigen::Ref<const Eigen::VectorXi> n_fixed,
+                               Eigen::Ref<const RealVect> bmin_sum_pu,
+                               Eigen::Ref<const RealVect> bmax_sum_pu,
+                               Eigen::Ref<const Eigen::VectorXi> gen_start,
+                               Eigen::Ref<const Eigen::VectorXi> gen_id,
+                               Eigen::Ref<const RealVect> gen_qmin_mvar,
+                               Eigen::Ref<const RealVect> gen_qmax_mvar,
+                               double sn_mva) {
+                 BusQPlanData p;
+                 p.n_check = static_cast<int>(bus_solver.size());
+                 p.bus_solver = bus_solver; p.qmin_fixed_mvar = qmin_fixed_mvar;
+                 p.qmax_fixed_mvar = qmax_fixed_mvar; p.n_fixed = n_fixed;
+                 p.bmin_sum_pu = bmin_sum_pu; p.bmax_sum_pu = bmax_sum_pu;
+                 p.gen_start = gen_start; p.gen_id = gen_id;
+                 p.gen_qmin_mvar = gen_qmin_mvar; p.gen_qmax_mvar = gen_qmax_mvar;
+                 p.sn_mva = sn_mva;
+                 return p;
+             }),
+             pybind11::arg("bus_solver"), pybind11::arg("qmin_fixed_mvar"),
+             pybind11::arg("qmax_fixed_mvar"), pybind11::arg("n_fixed"),
+             pybind11::arg("bmin_sum_pu"), pybind11::arg("bmax_sum_pu"),
+             pybind11::arg("gen_start"), pybind11::arg("gen_id"),
+             pybind11::arg("gen_qmin_mvar"), pybind11::arg("gen_qmax_mvar"),
+             pybind11::arg("sn_mva"))
+        .def_readonly("n_check",         &BusQPlanData::n_check)
+        .def_readonly("bus_solver",      &BusQPlanData::bus_solver)
+        .def_readonly("qmin_fixed_mvar", &BusQPlanData::qmin_fixed_mvar)
+        .def_readonly("qmax_fixed_mvar", &BusQPlanData::qmax_fixed_mvar)
+        .def_readonly("n_fixed",         &BusQPlanData::n_fixed)
+        .def_readonly("bmin_sum_pu",     &BusQPlanData::bmin_sum_pu)
+        .def_readonly("bmax_sum_pu",     &BusQPlanData::bmax_sum_pu)
+        .def_readonly("gen_start",       &BusQPlanData::gen_start)
+        .def_readonly("gen_id",          &BusQPlanData::gen_id)
+        .def_readonly("gen_qmin_mvar",   &BusQPlanData::gen_qmin_mvar)
+        .def_readonly("gen_qmax_mvar",   &BusQPlanData::gen_qmax_mvar)
+        .def_readonly("sn_mva",          &BusQPlanData::sn_mva);
+
+    pybind11::class_<GenPPlanData>(m, "GenPPlanData",
+        "Flattened plan of the per-machine active-power check of the distributed slack "
+        "(compute_physical_violations; lightsim2grid's GenPCheck.hpp -- generators AND "
+        "storage units). `entries` are the machines that can be reported: el_type 5 "
+        "(GENERATOR) / 6 (STORAGE), el_id the container id, bus_solver (SOLVER "
+        "numbering), slack_weight the raw participation factor, min_p_mw / max_p_mw "
+        "(NaN = none) and target_p_mw the base set-point -- MW, GENERATOR convention for "
+        "both families (a storage unit's load-convention target negated). `participants` "
+        "are EVERY machine taking a share, limits or not (part_*): the share of a "
+        "machine is a fraction of the raw participation of its whole bus, both families "
+        "included. Built from a solved lightsim2grid grid by _extract_gen_p_plan_from_"
+        "lsgrid (lightsim2grid's own build_gen_p_plan), or from arrays here.")
+        .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> el_type,
+                               Eigen::Ref<const Eigen::VectorXi> el_id,
+                               Eigen::Ref<const Eigen::VectorXi> bus_solver,
+                               Eigen::Ref<const RealVect> slack_weight,
+                               Eigen::Ref<const RealVect> min_p_mw,
+                               Eigen::Ref<const RealVect> max_p_mw,
+                               Eigen::Ref<const RealVect> target_p_mw,
+                               Eigen::Ref<const Eigen::VectorXi> part_el_type,
+                               Eigen::Ref<const Eigen::VectorXi> part_el_id,
+                               Eigen::Ref<const Eigen::VectorXi> part_bus_solver,
+                               Eigen::Ref<const RealVect> part_weight,
+                               double sn_mva) {
+                 GenPPlanData p;
+                 p.n_entries = static_cast<int>(el_type.size());
+                 p.el_type = el_type; p.el_id = el_id; p.bus_solver = bus_solver;
+                 p.slack_weight = slack_weight; p.min_p_mw = min_p_mw; p.max_p_mw = max_p_mw;
+                 p.target_p_mw = target_p_mw;
+                 p.n_part = static_cast<int>(part_el_type.size());
+                 p.part_el_type = part_el_type; p.part_el_id = part_el_id;
+                 p.part_bus_solver = part_bus_solver; p.part_weight = part_weight;
+                 p.sn_mva = sn_mva;
+                 return p;
+             }),
+             pybind11::arg("el_type"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
+             pybind11::arg("slack_weight"), pybind11::arg("min_p_mw"), pybind11::arg("max_p_mw"),
+             pybind11::arg("target_p_mw"), pybind11::arg("part_el_type"), pybind11::arg("part_el_id"),
+             pybind11::arg("part_bus_solver"), pybind11::arg("part_weight"), pybind11::arg("sn_mva"))
+        .def_readonly("n_entries",       &GenPPlanData::n_entries)
+        .def_readonly("el_type",         &GenPPlanData::el_type)
+        .def_readonly("el_id",           &GenPPlanData::el_id)
+        .def_readonly("bus_solver",      &GenPPlanData::bus_solver)
+        .def_readonly("slack_weight",    &GenPPlanData::slack_weight)
+        .def_readonly("min_p_mw",        &GenPPlanData::min_p_mw)
+        .def_readonly("max_p_mw",        &GenPPlanData::max_p_mw)
+        .def_readonly("target_p_mw",     &GenPPlanData::target_p_mw)
+        .def_readonly("n_part",          &GenPPlanData::n_part)
+        .def_readonly("part_el_type",    &GenPPlanData::part_el_type)
+        .def_readonly("part_el_id",      &GenPPlanData::part_el_id)
+        .def_readonly("part_bus_solver", &GenPPlanData::part_bus_solver)
+        .def_readonly("part_weight",     &GenPPlanData::part_weight)
+        .def_readonly("sn_mva",          &GenPPlanData::sn_mva);
+
+    pybind11::class_<PhysicalChecksConfig>(m, "PhysicalChecksConfig",
+        "Settings of the opt-in post-solve PHYSICAL checks of a batch session "
+        "(mutable, taken into account at the next run()). One flag for the whole "
+        "category (lightsim2grid's compute_physical_violations): every record has "
+        "category PHYSICAL -- a state the grid cannot reach -- whatever the element. "
+        "They only REPORT: nothing is enforced, no row is re-solved.\n\n"
+        "Today two checks: every converged row reports (a) the buses whose "
+        "voltage-holding machines (regulating generators, hvdc converter stations, "
+        "voltage-mode SVCs) had to produce more (or less) reactive power than the SUM "
+        "of what they own (LOW_Q / HIGH_Q on a BUS; OpenLoadFlow's ReactiveLimits "
+        "outer loop; per bus, not per machine; needs set_bus_q_capability()), and (b) "
+        "the linear-regime droop hvdc lines whose theta-driven flow exceeds pmax in "
+        "the direction it flows (HVDC_P_SATURATION on an HVDC, side 1 = would "
+        "saturate 1->2, 2 = 2->1; OpenLoadFlow's HvdcAcEmulationLimits), and (c) the "
+        "generators and storage units carrying the distributed slack whose converged "
+        "active power (target + share of the slack) left their [min_p, max_p] (LOW_P / "
+        "HIGH_P on a GENERATOR / STORAGE, MW, generator convention; OpenLoadFlow's "
+        "DistributedSlack outer loop; needs set_gen_p_capability() -- optional, unset = "
+        "no limit anywhere).")
+        .def_property("compute_physical_violations",
+                      [](const PhysicalChecksConfig& c) { return c.compute_physical_violations; },
+                      &PhysicalChecksConfig::set_compute_physical_violations,
+                      "Opt-in flag of the physical checks (default False). Changing it "
+                      "drops the previous report.")
+        .def_property("physical_violation_tol_mva",
+                      [](const PhysicalChecksConfig& c) { return c.physical_violation_tol_mva; },
+                      &PhysicalChecksConfig::set_physical_violation_tol_mva,
+                      "Slack (MVA) on every comparison -- MVAr for the reactive check "
+                      "(q_bus < sum(min_q) - tol or q_bus > sum(max_q) + tol), MW for the "
+                      "hvdc one (p_flow > pmax + tol). Default 1e-4; must be finite and >= 0.")
+        .def_property("physical_violation_capacity",
+                      [](const PhysicalChecksConfig& c) { return c.physical_violation_capacity; },
+                      &PhysicalChecksConfig::set_physical_violation_capacity,
+                      "Records kept per row and per check (bounds each output at n_rows * "
+                      "capacity); a row with more is flagged truncated. Default 16.")
+        .def_property_readonly("has_bus_q_capability",
+                      [](const PhysicalChecksConfig& c) { return c.has_bus_q_plan; },
+                      "Whether set_bus_q_capability() was called on the session.")
+        .def_property_readonly("bus_q_plan",
+                      [](const PhysicalChecksConfig& c) { return c.bus_q_plan; },
+                      "A copy of the BusQPlanData in use (empty if none was set).")
+        .def_property_readonly("has_gen_p_capability",
+                      [](const PhysicalChecksConfig& c) { return c.has_gen_p_plan; },
+                      "Whether set_gen_p_capability() was called on the session.")
+        .def_property_readonly("gen_p_plan",
+                      [](const PhysicalChecksConfig& c) { return c.gen_p_plan; },
+                      "A copy of the GenPPlanData in use (empty if none was set).");
+
+    pybind11::class_<BusQViolationsResult>(m, "BusQViolationsResult",
+        "Flat per-row records of the reactive-capability check: row r owns "
+        "bus_id/type/value/limit[r*capacity : r*capacity + count[r]]; count -1 = the "
+        "row was never simulated (compacted out), 0 = simulated, no violation (or not "
+        "converged); type 5 = LOW_Q, 6 = HIGH_Q; bus_id the SOLVER bus id; value the "
+        "reactive power the machines holding that bus had to produce (MVAr), limit "
+        "their SUMMED capability (MVAr); truncated 1 when more than `capacity` buses "
+        "violated on that row.")
+        .def_readonly("bus_id",    &BusQViolationsResult::bus_id)
+        .def_readonly("type",      &BusQViolationsResult::type)
+        .def_readonly("value",     &BusQViolationsResult::value)
+        .def_readonly("limit",     &BusQViolationsResult::limit)
+        .def_readonly("count",     &BusQViolationsResult::count)
+        .def_readonly("truncated", &BusQViolationsResult::truncated)
+        .def_readonly("capacity",  &BusQViolationsResult::capacity);
+
+    pybind11::class_<HvdcPViolationsResult>(m, "HvdcPViolationsResult",
+        "Flat per-row records of the droop hvdc P-saturation check, same layout as "
+        "BusQViolationsResult: hvdc_id the GRID hvdc id, side 1 (would saturate 1->2: "
+        "p1 > pmax_1to2) or 2 (2->1), value the flow leaving the AC bus into the hvdc "
+        "(MW), limit pmax (MW). Every record is element type HVDC (4), violation type "
+        "HVDC_P_SATURATION (7).")
+        .def_readonly("hvdc_id",   &HvdcPViolationsResult::hvdc_id)
+        .def_readonly("side",      &HvdcPViolationsResult::side)
+        .def_readonly("value",     &HvdcPViolationsResult::value)
+        .def_readonly("limit",     &HvdcPViolationsResult::limit)
+        .def_readonly("count",     &HvdcPViolationsResult::count)
+        .def_readonly("truncated", &HvdcPViolationsResult::truncated)
+        .def_readonly("capacity",  &HvdcPViolationsResult::capacity);
+
+    pybind11::class_<GenPViolationsResult>(m, "GenPViolationsResult",
+        "Flat per-row records of the distributed-slack active-power check, same layout "
+        "as BusQViolationsResult: element_type 5 (GENERATOR) or 6 (STORAGE), element_id "
+        "the container id of that family, type 7 (HIGH_P, above max_p) or 8 (LOW_P, "
+        "below min_p), value the machine's converged active power (its target plus its "
+        "share of the slack, MW, GENERATOR convention for both families) and limit the "
+        "bound it crossed (MW).")
+        .def_readonly("element_type", &GenPViolationsResult::element_type)
+        .def_readonly("element_id",   &GenPViolationsResult::element_id)
+        .def_readonly("type",         &GenPViolationsResult::type)
+        .def_readonly("value",        &GenPViolationsResult::value)
+        .def_readonly("limit",        &GenPViolationsResult::limit)
+        .def_readonly("count",        &GenPViolationsResult::count)
+        .def_readonly("truncated",    &GenPViolationsResult::truncated)
+        .def_readonly("capacity",     &GenPViolationsResult::capacity);
+}
+
 PYBIND11_MODULE(_gpusim2grid, m)
 {
     m.doc() =
@@ -34,6 +291,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "contingency analysis and injection sweeps, plus zero-copy DLPack "
         "export. End users should normally import the Python wrappers from the "
         "gpusim2grid package rather than calling this module directly.";
+
+    bind_physical_checks_types(m);
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
     // Guard against the exact bug lightsim2grid itself hit (see its
@@ -277,6 +536,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall-clock: H->D upload of bus/branch limit arrays + device buffer "
                       "allocation (set_violation_limits()); zero unless "
                       "compute_limit_violations is enabled (ms)")
+        .def_readonly("t_physical_setup_ms", &BatchTimings::t_physical_setup_ms,
+                      "Wall-clock: H->D upload of the reactive-capability plan + device buffer "
+                      "allocation + the base-case (\"n\") physical checks; zero unless "
+                      "compute_physical_violations is enabled (ms)")
         .def_readonly("t_base_case_solve_only_ms", &BatchTimings::t_base_case_solve_only_ms,
                       "Wall-clock: non-overlapping remainder of t_base_case_ms -- cuDSS analyze "
                       "+ NR iterations (or the presolved_v validation step) only, excluding the "
@@ -332,6 +595,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_violation_check", &BatchTimings::t_violation_check,
                       "check_limit_violations_kernel — total across all chunks; zero "
                       "unless compute_limit_violations is enabled")
+        .def_readonly("t_bus_q_check", &BatchTimings::t_bus_q_check,
+                      "check_bus_q_violations_kernel (the reactive part of compute_physical_"
+                      "violations) — total across all chunks; zero unless enabled")
+        .def_readonly("t_hvdc_p_check", &BatchTimings::t_hvdc_p_check,
+                      "check_hvdc_p_violations_kernel (the hvdc part of compute_physical_"
+                      "violations) — total across all chunks; zero unless enabled")
+        .def_readonly("t_gen_p_check", &BatchTimings::t_gen_p_check,
+                      "check_gen_p_violations_kernel (the generator / storage part of "
+                      "compute_physical_violations) — total across all chunks; zero unless enabled")
         .def_readonly("t_flow_computation", &BatchTimings::t_flow_computation,
                       "compute_branch_flows_kernel — total across all chunks (0 if no branch data)")
         // --- metadata ---
@@ -345,6 +617,36 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Fixed NR iterations per chunk (no convergence check mid-loop)")
         .def_readonly("n_refactorize",   &BatchTimings::n_refactorize,
                       "Number of REFACTORIZATION calls (n_chunks × nb_iter − 1)")
+        // --- batched adjoint (ScenarioSweepSession only; cumulative per driver life) ---
+        .def_readonly("t_adjoint_build_ms", &BatchTimings::t_adjoint_build_ms,
+                      "Wall-clock: transposed-Jacobian skeleton + position map + buffers + "
+                      "cuDSS ANALYSIS of J^T -- paid by the FIRST backward only (ms)")
+        .def_readonly("t_adjoint_first_factorize", &BatchTimings::t_adjoint_first_factorize,
+                      "cuDSS FACTORIZATION of J^T -- first backward only")
+        .def_readonly("t_adjoint_refactorize", &BatchTimings::t_adjoint_refactorize,
+                      "cuDSS REFACTORIZATION of J^T -- every later backward after a new run() -- total")
+        .def_readonly("t_adjoint_solve", &BatchTimings::t_adjoint_solve,
+                      "cuDSS SOLVE with J^T -- every backward -- total")
+        .def_readonly("adjoint_n_analysis", &BatchTimings::adjoint_n_analysis,
+                      "Number of J^T ANALYSIS calls over the driver's life (0 or 1)")
+        .def_readonly("adjoint_n_factorize", &BatchTimings::adjoint_n_factorize,
+                      "Number of J^T FACTORIZATION calls over the driver's life (0 or 1)")
+        .def_readonly("adjoint_n_refactorize", &BatchTimings::adjoint_n_refactorize,
+                      "Number of J^T REFACTORIZATION calls over the driver's life")
+        .def_readonly("adjoint_n_solve", &BatchTimings::adjoint_n_solve,
+                      "Number of J^T SOLVE calls over the driver's life")
+        .def_readonly("cudss_lu_nnz", &BatchTimings::cudss_lu_nnz,
+                      "cuDSS CUDSS_DATA_LU_NNZ after the forward solver's last ANALYSIS "
+                      "(non-zeros of the L+U factors of ONE system, i.e. the fill-in; -1 = not "
+                      "reported). The cudss_mem_* estimates cover the whole chunk.")
+        .def_readonly("cudss_mem_device_permanent_bytes", &BatchTimings::cudss_mem_device_permanent_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[0]: permanent device memory (bytes)")
+        .def_readonly("cudss_mem_device_peak_bytes", &BatchTimings::cudss_mem_device_peak_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[1]: peak device memory (bytes)")
+        .def_readonly("cudss_mem_host_permanent_bytes", &BatchTimings::cudss_mem_host_permanent_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[2]: permanent host memory (bytes)")
+        .def_readonly("cudss_mem_host_peak_bytes", &BatchTimings::cudss_mem_host_peak_bytes,
+                      "cuDSS CUDSS_DATA_MEMORY_ESTIMATES[3]: peak host memory (bytes)")
         .def_readonly("n_disconnected",  &BatchTimings::n_disconnected,
                       "Contingencies skipped because they would disconnect the Ybus graph; "
                       "their residuals are set to NaN in the output. With "
@@ -409,6 +711,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             h2d["source_init_ms"]         = t.t_source_init_ms;
             h2d["branch_data_upload_ms"]  = t.t_branch_data_upload_ms;
             h2d["violation_setup_ms"]     = t.t_violation_setup_ms;
+            h2d["physical_setup_ms"]      = t.t_physical_setup_ms;
 
             // One-time CUDA/cuSPARSE/cuDSS warm-up, kept out of gpu_compute on
             // purpose -- see BatchTimings::t_context_init_ms.
@@ -433,6 +736,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["residual"]          = entry_dict(t.t_residual);
             gpu_compute["store_V"]           = entry_dict(t.t_store_V);
             gpu_compute["violation_check"]   = entry_dict(t.t_violation_check);
+            gpu_compute["bus_q_check"]       = entry_dict(t.t_bus_q_check);
+            gpu_compute["hvdc_p_check"]      = entry_dict(t.t_hvdc_p_check);
+            gpu_compute["gen_p_check"]       = entry_dict(t.t_gen_p_check);
             gpu_compute["flow_computation"]  = entry_dict(t.t_flow_computation);
 
             py::dict d2h;
@@ -442,6 +748,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
             d2h["copy_residuals_to_host_ms"]  = t.t_copy_residuals_to_host_ms;
             d2h["copy_violations_to_host_ms"] = t.t_copy_violations_to_host_ms;
 
+            // Batched adjoint (differentiable path): cumulative over the driver's
+            // life, separate from run() -- NOT part of 'total'.
+            py::dict adjoint;
+            adjoint["build_ms"]        = t.t_adjoint_build_ms;
+            adjoint["first_factorize"] = entry_dict(t.t_adjoint_first_factorize);
+            adjoint["refactorize"]     = entry_dict(t.t_adjoint_refactorize);
+            adjoint["solve"]           = entry_dict(t.t_adjoint_solve);
+            adjoint["n_analysis"]      = t.adjoint_n_analysis;
+            adjoint["n_factorize"]     = t.adjoint_n_factorize;
+            adjoint["n_refactorize"]   = t.adjoint_n_refactorize;
+            adjoint["n_solve"]         = t.adjoint_n_solve;
+
             py::dict result;
             result["total"]        = t.t_grand_total_ms();
             result["cpu_preproc"]  = cpu_preproc;
@@ -449,6 +767,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             result["context_init"] = context_init;
             result["gpu_compute"]  = gpu_compute;
             result["d2h"]          = d2h;
+            result["adjoint"]      = adjoint;
             return result;
         }, "Nested dict view of the coarse timing buckets: "
            "{'total': ms, 'cpu_preproc': {'total': ms, ...}, 'h2d': {'total': ms, ...}, "
@@ -841,7 +1160,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // ContingencyAnalysisSession (exposed as ContingencyAnalysisSession;
   // the recommended Python entry point is gpusim2grid.ContingencyAnalysisGPU)
   // -----------------------------------------------------------------
-  pybind11::class_<ContingencyAnalysisSession,
+  bind_physical_checks(pybind11::class_<ContingencyAnalysisSession,
                    std::shared_ptr<ContingencyAnalysisSession>>(
       m, "ContingencyAnalysisSession",
       "Stateful GPU N-k contingency analysis solver (low-level binding).\n\n"
@@ -852,7 +1171,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       "which adds string strategy selection, device parsing, and lazy "
       "host-transfer result buffers.\n\n"
       "Lifecycle: set_branch_data() -> build_contingencies() -> run() -> "
-      "compute_flows().")
+      "compute_flows()."))
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1093,14 +1412,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // Base-case NR runs once at construction; set_injections() + run() may be
   // called repeatedly to sweep different injection sets reusing that base.
   // -----------------------------------------------------------------
-  pybind11::class_<InjectionSweepSession,
+  bind_physical_checks(pybind11::class_<InjectionSweepSession,
                    std::shared_ptr<InjectionSweepSession>>(
       m, "InjectionSweepSession",
       "Stateful GPU batched-injection power flow solver (low-level binding).\n\n"
       "Solves the base case once at construction; set_injections() + run() may "
       "be called repeatedly to sweep different (P, Q) injection sets reusing "
       "that base case. Prefer the Python facade "
-      ":class:`gpusim2grid.InjectionSweepGPU`.")
+      ":class:`gpusim2grid.InjectionSweepGPU`."))
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1152,20 +1471,31 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("sn_mva"),
          "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
          "(converted to per-unit on run()). May be called repeatedly.")
+    .def("set_gen_p_targets", &InjectionSweepSession::set_gen_p_targets, pybind11::arg("targets"),
+         "Per-row active set-points of the machines of the active-power plan (set_gen_p_capability): (n_rows x n_entries) float64, one column per entry of the plan in its order, MW in the GENERATOR convention, NaN = keep the grid's own; row-aligned with set_injections. What a row's generator produces is ITS target plus its share of the slack, and only the caller knows that target (the *GPU facades fill it from set_injections_from_elements' gen_p). Left unset, every row is checked against the base set-points. An empty array drops them. Taken into account at the next run().")
     .def("set_gen_v",
          &InjectionSweepSession::set_gen_v,
          pybind11::arg("gen_v"),
          pybind11::arg("gen_bus"),
          "Per-scenario generator target voltage magnitude (vm_pu, NOT kV), "
-         "(n_scenarios x n_gen). Unlike set_injections(), this does NOT feed "
-         "Sbus -- it only re-seeds |V| at each generator's own AC-solver bus "
-         "(gen_bus[g]) right before that chunk's solve, and ONLY for "
-         "generators whose own bus is Vm-fixed (PV or slack); a "
-         "disconnected, reactive-only, or remotely voltage-regulating (SVC / "
-         "VoltageControl) generator's column is silently ignored, mirroring "
-         "lightsim2grid's own modify_gen_v / GeneratorContainer::set_vm. NaN "
-         "entries leave that (row, gen) untouched. gen_bus: (n_gen,) "
-         "AC-solver bus id per generator, -1 for a disconnected one.")
+         "(n_scenarios x n_gen). Does NOT feed Sbus. gen_bus[g] is the "
+         "AC-solver bus generator g REGULATES (-1: none). When that bus is "
+         "Vm-fixed (is_vm_fixed_bus) |V| is re-seeded there before the solve "
+         "(lightsim2grid's modify_gen_v / set_vm); when a VoltageControl group "
+         "regulates it (vc_group_of_bus) the value is that group's per-row "
+         "v_set. Any other column is ignored; NaN entries leave that (row, "
+         "gen) untouched.")
+    .def_property_readonly("is_vm_fixed_bus", &InjectionSweepSession::is_vm_fixed_bus,
+         "(n_bus,) 0/1: pv or slack bus without a |V| unknown -- a gen_v "
+         "column regulating it re-seeds |V| there.")
+    .def_property_readonly("vc_group_of_bus", &InjectionSweepSession::vc_group_of_bus,
+         "(n_bus,) int: VoltageControl group regulating the bus, -1 for none -- "
+         "a gen_v column regulating it sets that group's per-row v_set.")
+    .def_property_readonly("vc_group_has_fixed_member", &InjectionSweepSession::vc_group_has_fixed_member,
+         "(n_groups,) 0/1: the group holds a member no gen_v column can move "
+         "(SVC, hvdc converter station), pinning its v_set.")
+    .def_property_readonly("vc_v_set", &InjectionSweepSession::vc_v_set,
+         "(n_groups,) float: base VoltageControl set-points (pu).")
     .def("set_branch_data",
          &InjectionSweepSession::set_branch_data,
          pybind11::arg("branch_from"),
@@ -1261,7 +1591,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // + set_injections() (+ optional set_topology()) + run() may be called
   // repeatedly reusing that base.
   // -----------------------------------------------------------------
-  pybind11::class_<ScenarioSweepSession,
+  bind_physical_checks(pybind11::class_<ScenarioSweepSession,
                    std::shared_ptr<ScenarioSweepSession>>(
       m, "ScenarioSweepSession",
       "Stateful GPU row-aligned combined topology + injection sweep "
@@ -1275,7 +1605,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       "solved on its largest connected component instead (masked buses "
       "reported as NaN) -- same convention as ContingencyAnalysisSession. "
       "compute_limit_violations enables the fused per-chunk voltage/current/"
-      "divergence check, also mirroring ContingencyAnalysisSession.")
+      "divergence check, also mirroring ContingencyAnalysisSession."))
     .def(pybind11::init(
            [](const Eigen::SparseMatrix<eigen_cplx_type>& Ybus,
               Eigen::Ref<const CplxVect>                  Vinit,
@@ -1341,20 +1671,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Store the (n_scenarios × n_bus) MW / MVAr injection arrays "
          "(converted to per-unit on run()). Fixes n_scenarios. May be "
          "called repeatedly.")
+    .def("set_gen_p_targets", &ScenarioSweepSession::set_gen_p_targets, pybind11::arg("targets"),
+         "Per-row active set-points of the machines of the active-power plan (set_gen_p_capability): (n_rows x n_entries) float64, one column per entry of the plan in its order, MW in the GENERATOR convention, NaN = keep the grid's own; row-aligned with set_injections. What a row's generator produces is ITS target plus its share of the slack, and only the caller knows that target (the *GPU facades fill it from set_injections_from_elements' gen_p). Left unset, every row is checked against the base set-points. An empty array drops them. Taken into account at the next run().")
     .def("set_gen_v",
          &ScenarioSweepSession::set_gen_v,
          pybind11::arg("gen_v"),
          pybind11::arg("gen_bus"),
          "Per-scenario generator target voltage magnitude (vm_pu, NOT kV), "
-         "(n_scenarios x n_gen). Unlike set_injections(), this does NOT feed "
-         "Sbus -- it only re-seeds |V| at each generator's own AC-solver bus "
-         "(gen_bus[g]) right before that chunk's solve, and ONLY for "
-         "generators whose own bus is Vm-fixed (PV or slack); a "
-         "disconnected, reactive-only, or remotely voltage-regulating (SVC / "
-         "VoltageControl) generator's column is silently ignored, mirroring "
-         "lightsim2grid's own modify_gen_v / GeneratorContainer::set_vm. NaN "
-         "entries leave that (row, gen) untouched. gen_bus: (n_gen,) "
-         "AC-solver bus id per generator, -1 for a disconnected one.")
+         "(n_scenarios x n_gen). Does NOT feed Sbus. gen_bus[g] is the "
+         "AC-solver bus generator g REGULATES (-1: none). When that bus is "
+         "Vm-fixed (is_vm_fixed_bus) |V| is re-seeded there before the solve "
+         "(lightsim2grid's modify_gen_v / set_vm); when a VoltageControl group "
+         "regulates it (vc_group_of_bus) the value is that group's per-row "
+         "v_set. Any other column is ignored; NaN entries leave that (row, "
+         "gen) untouched.")
     .def("set_topology",
          &ScenarioSweepSession::set_topology,
          pybind11::arg("branch_ids_per_scenario"),
@@ -1363,6 +1693,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "row-aligned with set_injections(). Requires set_branch_data() "
          "first. Optional: if never called, run() defaults every scenario "
          "to \"no branches tripped\" (a plain injection sweep).")
+    .def("set_skipped_rows",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 1)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_skipped_rows: mask must be 1-D (n_scenarios,)");
+             const bool* p = mask.data();
+             std::vector<char> m(static_cast<size_t>(mask.shape(0)));
+             for (size_t i = 0; i < m.size(); ++i) m[i] = p[i] ? 1 : 0;
+             self.set_skipped_rows(m);
+         },
+         pybind11::arg("mask"),
+         "(n_scenarios,) bool, row-aligned with set_injections(): True drops "
+         "that row from the batch as NOT SIMULATED (NaN voltage / residual, "
+         "disconnected flag = 1, GRID/NOT_SIMULATED violation) without "
+         "touching the graph -- e.g. two connected generators on one bus with "
+         "different voltage set-points. Takes effect on the next run() (a warm "
+         "source rebuild).")
+    .def("clear_skipped_rows", &ScenarioSweepSession::clear_skipped_rows,
+         "Drop any set_skipped_rows() mask.")
+    .def_property_readonly("has_skipped_rows", &ScenarioSweepSession::has_skipped_rows)
     .def("set_contingency_gens",
          [](ScenarioSweepSession& self,
             pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
@@ -1404,6 +1755,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "some from set_contingency_gens' mask).")
     .def_property_readonly("has_gen_contingency", &ScenarioSweepSession::has_gen_contingency,
          "True once set_contingency_gens() has been called.")
+    .def("get_row_pv_to_pq", &ScenarioSweepSession::get_row_pv_to_pq,
+         "list[list[int]]: per scenario (original row order), the AC-solver "
+         "buses the last run() turned PV->PQ because set_contingency_gens' "
+         "mask took out every generator locally regulating them. All empty "
+         "without a mask; empty before run().")
     .def("run",            &ScenarioSweepSession::run,
          "Solve all scenarios. Fills the device-side voltage and residual "
          "buffers. Requires set_injections() first. A scenario whose "
@@ -1552,7 +1908,126 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Syncs the base-case stream before returning.")
     .def("v_results_dlpack", &export_v_results_dlpack_ss,
          "Export batch voltages as DLPack capsule, shape [n_scenarios, n_bus].\n"
-         "Requires run() to have been called.  Syncs the solver stream.");
+         "Requires run() to have been called.  Syncs the solver stream. The "
+         "memory is overwritten IN PLACE by the next run() that reuses the "
+         "batch driver (same n_scenarios and settings) and freed by one that "
+         "rebuilds it -- clone the tensor for a snapshot either way.")
+    // -------------------------------------------------------------------
+    // Driver persistence + differentiable path (see the Python
+    // gpusim2grid.differentiable.BatchPowerFlow wrapper).
+    // -------------------------------------------------------------------
+    .def_readwrite("fixed_batch_capacity", &ScenarioSweepSession::fixed_batch_capacity_,
+                   "When True, batch_size is used verbatim as the batch driver's "
+                   "chunk capacity (no rebalancing over the active count): with "
+                   "batch_size >= n_scenarios the whole batch is always solved as "
+                   "ONE chunk whatever rows get islanded. Needed by the adjoint "
+                   "(keep_final_jacobian). Default False. Takes effect on the "
+                   "next run() (rebuilds the driver when changed).")
+    .def_readwrite("keep_final_jacobian", &ScenarioSweepSession::keep_final_jacobian_,
+                   "When True, run() refills the batched Jacobian at the CONVERGED "
+                   "voltages after the NR loop (one extra fill_J), so that "
+                   "solve_JT_batch_dlpack() can use it. Requires the batch to be "
+                   "solved in one chunk (see fixed_batch_capacity). Default False.")
+    .def_readonly("run_counter", &ScenarioSweepSession::run_counter_,
+                  "Number of run() calls so far (an autograd backward checks it "
+                  "against the forward it belongs to).")
+    .def_readonly("driver_build_counter", &ScenarioSweepSession::driver_build_counter_,
+                  "Number of batch-driver (cold) builds so far: allocation + cuDSS "
+                  "ANALYSIS. Stays constant across run() calls that reuse the driver.")
+    .def_readonly("source_build_counter", &ScenarioSweepSession::source_build_counter_,
+                  "Number of batch-source builds so far (cold + warm runs: topology "
+                  "preprocessing + patch upload). Constant across hot runs.")
+    .def_property_readonly("adjoint_ready", &ScenarioSweepSession::adjoint_ready,
+         "True once the batched transposed system exists (first solve_JT_batch_dlpack()).")
+    .def_property_readonly("capacity", &ScenarioSweepSession::capacity,
+         "Live driver's chunk capacity (0 before run()).")
+    .def_property_readonly("n_active", &ScenarioSweepSession::n_active,
+         "Rows actually solved by the last run() (n_scenarios minus the islanded ones).")
+    .def_property_readonly("nnz_J", &ScenarioSweepSession::nnz_J,
+         "Non-zeros of one (augmented) Jacobian.")
+    .def_property_readonly("nnz_Y", &ScenarioSweepSession::nnz_Y,
+         "Non-zeros of Ybus.")
+    .def_property_readonly("p_row_of_bus", &ScenarioSweepSession::p_row_of_bus,
+         "Bus-keyed J row of each bus' P equation (length n_bus, -1 if none). "
+         "Re-read after every run(): set_contingency_gens can grow dim_J.")
+    .def_property_readonly("q_row_of_bus", &ScenarioSweepSession::q_row_of_bus,
+         "Bus-keyed J row of each bus' Q equation (length n_bus, -1 if none).")
+    .def_property_readonly("theta_col_of_bus", &ScenarioSweepSession::theta_col_of_bus,
+         "Bus-keyed J column of each bus' angle unknown (length n_bus, -1 if none).")
+    .def_property_readonly("vm_col_of_bus", &ScenarioSweepSession::vm_col_of_bus,
+         "Bus-keyed J column of each bus' |V| unknown (length n_bus, -1 for a "
+         "Vm-fixed bus).")
+    .def_property_readonly("is_vm_fixed_bus", &ScenarioSweepSession::is_vm_fixed_bus,
+         "(n_bus,) 0/1: pv or slack bus without a |V| unknown -- a gen_v "
+         "column regulating it re-seeds |V| there (direct + dS/d|V| gradient).")
+    .def_property_readonly("vc_group_of_bus", &ScenarioSweepSession::vc_group_of_bus,
+         "(n_bus,) int: VoltageControl group regulating the bus, -1 for none -- "
+         "a gen_v column regulating it sets that group's per-row v_set.")
+    .def_property_readonly("vc_v_row_of_group", &ScenarioSweepSession::vc_v_row_of_group,
+         "(n_groups,) int: J row of each group's bordered voltage equation "
+         "|V_reg| + s.Q - v_set = 0 (the v_set gradient is lambda there).")
+    .def_property_readonly("vc_v_set", &ScenarioSweepSession::vc_v_set,
+         "(n_groups,) float: base VoltageControl set-points (pu).")
+    .def_property_readonly("vc_group_has_fixed_member", &ScenarioSweepSession::vc_group_has_fixed_member,
+         "(n_groups,) 0/1: the group holds a member no gen_v column can move "
+         "(SVC, hvdc converter station), pinning its v_set.")
+    .def("get_row_stranded_vc_groups", &ScenarioSweepSession::get_row_stranded_vc_groups,
+         "list[list[int]]: per scenario (original row order), the VoltageControl "
+         "groups the last run() stranded (handle_disconnected_grid: voltage row "
+         "repurposed into Q_c == 0, so it no longer depends on v_set).")
+    .def("get_active_to_orig", &ScenarioSweepSession::get_active_to_orig,
+         "(n_active,) int: original scenario index of each active batch slot "
+         "(identity before run() or without islanded rows).")
+    .def("j_skeleton", &ScenarioSweepSession::j_skeleton,
+         "(outer, inner) int32 CSR structure of one Jacobian (host copies), "
+         "for tests / external assembly of j_values_dlpack().")
+    .def("clear_gen_v", &ScenarioSweepSession::clear_gen_v,
+         "Drop any set_gen_v() override: every row keeps the base-case voltage "
+         "again. Takes effect on the next run().")
+    .def("set_injections_dlpack", &import_injections_dlpack_ss,
+         pybind11::arg("capsule"), pybind11::arg("producer_stream") = 0,
+         "Device path of set_injections(): a DLPack capsule of a (n_scenarios, "
+         "n_bus) contiguous complex tensor (this build's precision) of PER-UNIT "
+         "Sbus rows (AC-solver bus numbering) on this session's device. One "
+         "device-to-device copy, host-synchronized before returning; the capsule "
+         "is consumed. producer_stream: the CUDA stream handle the tensor was "
+         "produced on (torch.cuda.current_stream().cuda_stream), 0 = default. "
+         "Fixes n_scenarios.")
+    .def("set_gen_v_dlpack", &import_gen_v_dlpack_ss,
+         pybind11::arg("capsule"), pybind11::arg("gen_bus"),
+         pybind11::arg("producer_stream") = 0,
+         "Device path of set_gen_v(): (n_scenarios, n_gen) contiguous real "
+         "tensor of vm_pu (this build's precision) on this device; same "
+         "semantics as set_gen_v(gen_v, gen_bus). Capsule consumed.")
+    .def("solve_JT_batch_dlpack", &export_solve_jt_batch_dlpack_ss,
+         pybind11::arg("rhs"),
+         pybind11::arg("j_values") = pybind11::none(),
+         pybind11::arg("ybus_values") = pybind11::none(),
+         pybind11::arg("v") = pybind11::none(),
+         pybind11::arg("want_gen_v_grad") = false,
+         pybind11::arg("producer_stream") = 0,
+         "Batched adjoint solve J_s^T lambda_s = rhs_s for every scenario s, "
+         "with the Jacobians at the converged voltages of the last run() "
+         "(keep_final_jacobian=True) -- or with the j_values / ybus_values / v "
+         "snapshots taken right after that run (j_values_dlpack(), "
+         "ybus_values_dlpack(), v_results_dlpack(), cloned). rhs: (n_scenarios, "
+         "dim_J) real, original row order, non-finite entries treated as 0. "
+         "Returns (lambda, gvm): lambda (n_scenarios, dim_J); gvm (n_scenarios, "
+         "n_bus) when want_gen_v_grad else None -- the adjoint contraction of "
+         "each Vm-fixed bus' dS/dVm column (the indirect part of d/d gen_v, "
+         "sign included), 0 elsewhere. Rows of islanded scenarios are 0. Both "
+         "capsules alias driver buffers overwritten by the next call: clone. "
+         "The first call builds the transposed system (J->J^T position map, "
+         "buffers, one cuDSS ANALYSIS + FACTORIZATION); later calls only "
+         "permute values, REFACTORIZE (once per new run()) and SOLVE. The "
+         "capsules given are consumed.")
+    .def("j_values_dlpack", &export_j_values_dlpack_ss,
+         "(capacity, nnz_J) real: the batched Jacobian values of the last chunk "
+         "(active-slot order; rows >= n_active are phantom base-case copies). "
+         "Aliases the chunk buffer: clone right after run() for a snapshot.")
+    .def("ybus_values_dlpack", &export_ybus_values_dlpack_ss,
+         "(capacity, nnz_Y) complex: the per-slot patched Ybus values of the last "
+         "chunk (active-slot order). Aliases the chunk buffer: clone for a snapshot.");
 
     // -----------------------------------------------------------------
     // Zero-copy construction from a solved lightsim2grid LSGrid
@@ -1628,6 +2103,35 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "LSGrid: (bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka). Bus "
         "arrays are relabeled to AC-solver bus numbering (size n_bus_solver); "
         "branch arrays are lines-then-trafos. NaN = not configured.");
+
+    m.def("_extract_bus_q_plan_from_lsgrid",
+        [](pybind11::object grid_py, int n_bus_solver) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return extract_bus_q_plan_from_lsgrid(grid, n_bus_solver);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("n_bus_solver"),
+        "BusQPlanData of compute_physical_violations off a solved lightsim2grid LSGrid, "
+        "built by lightsim2grid's own bus_q_check::build_bus_q_plan (so the routing "
+        "-- which machines hold which bus -- is identical to its batch classes'): "
+        "voltage-regulating generators (min_q/max_q MVAr), storage units and hvdc "
+        "converter stations (MVAr) and voltage-mode SVCs (b_min/b_max, pu). Solver bus "
+        "numbering; n_bus_solver "
+        "is the session's n_bus.");
+
+    m.def("_extract_gen_p_plan_from_lsgrid",
+        [](pybind11::object grid_py, int n_bus_solver) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return extract_gen_p_plan_from_lsgrid(grid, n_bus_solver);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("n_bus_solver"),
+        "GenPPlanData of compute_physical_violations off a solved lightsim2grid LSGrid, "
+        "built by lightsim2grid's own gen_p_check::build_gen_p_plan (so which machines "
+        "take a share of the distributed slack, and which of them can be reported, is "
+        "decided exactly as its batch classes do): generators (set_gen_p_limits) and "
+        "storage units (set_storage_p_limits), MW in the GENERATOR convention. Solver "
+        "bus numbering; n_bus_solver is the session's n_bus.");
 
     m.def("_make_is_session_from_lsgrid",
         [](pybind11::object grid_py, bool init_from_n_powerflow,
@@ -1862,6 +2366,46 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "choice for the ANALYSIS phase. "
         "For validating cuDSS on an arbitrary dumped (J, F) pair (e.g. from "
         "AcPfNrSession::get_J()/get_F()), see repro_cudss_bug_standalone.py.");
+
+    pybind11::class_<CudssBatchBenchResult>(m, "CudssBatchBenchResult",
+        "benchmark_cudss_batch_raw() output: wall-clock ms per cuDSS phase "
+        "(stream-synchronized), cuDSS factor statistics, solution sanity check.")
+        .def_readonly("dim", &CudssBatchBenchResult::dim)
+        .def_readonly("nnz", &CudssBatchBenchResult::nnz)
+        .def_readonly("batch_size", &CudssBatchBenchResult::batch_size)
+        .def_readonly("context_init_ms", &CudssBatchBenchResult::context_init_ms)
+        .def_readonly("analysis_ms", &CudssBatchBenchResult::analysis_ms)
+        .def_readonly("factorize_ms", &CudssBatchBenchResult::factorize_ms)
+        .def_readonly("refactorize_ms", &CudssBatchBenchResult::refactorize_ms,
+                      "Mean REFACTORIZATION wall ms")
+        .def_readonly("solve_ms", &CudssBatchBenchResult::solve_ms, "Mean SOLVE wall ms")
+        .def_readonly("n_refactorize", &CudssBatchBenchResult::n_refactorize)
+        .def_readonly("lu_nnz", &CudssBatchBenchResult::lu_nnz, "CUDSS_DATA_LU_NNZ of one system (-1 = not reported)")
+        .def_readonly("mem_device_permanent", &CudssBatchBenchResult::mem_device_permanent)
+        .def_readonly("mem_device_peak", &CudssBatchBenchResult::mem_device_peak)
+        .def_readonly("mem_host_permanent", &CudssBatchBenchResult::mem_host_permanent)
+        .def_readonly("mem_host_peak", &CudssBatchBenchResult::mem_host_peak)
+        .def_readonly("max_rel_residual", &CudssBatchBenchResult::max_rel_residual,
+                      "max over slots of ||A x - b||inf / ||b||inf (b = A*1)")
+        .def_readonly("n_nonfinite_slots", &CudssBatchBenchResult::n_nonfinite_slots);
+
+    m.def("benchmark_cudss_batch_raw", &benchmark_cudss_batch_raw,
+        pybind11::arg("dim"),
+        pybind11::arg("indptr"),
+        pybind11::arg("indices"),
+        pybind11::arg("data"),
+        pybind11::arg("batch_size"),
+        pybind11::arg("n_refactorize") = 4,
+        pybind11::arg("device") = -1,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
+        pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
+        "same batch-mode env variables and config knobs) on an arbitrary CSR "
+        "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "
+        "n_refactorize REFACTORIZATION + SOLVE pairs. rhs = A*1. Returns a "
+        "CudssBatchBenchResult with per-phase wall ms, CUDSS_DATA_LU_NNZ and "
+        "CUDSS_DATA_MEMORY_ESTIMATES. For sizing a Jacobian no session builds yet.");
 
     m.def("warmup", &warmup,
         pybind11::arg("device") = -1,

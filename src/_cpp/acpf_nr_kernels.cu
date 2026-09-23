@@ -93,6 +93,7 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
     int n_bus,
@@ -139,7 +140,7 @@ __global__ void compute_branch_flows_kernel(
     const int out_c   = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
     const ptrdiff_t out_idx = static_cast<ptrdiff_t>(out_c) * n_branches + l;
     d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
-    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_A[l];
+    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
 }
 
 // =============================================================================
@@ -334,6 +335,43 @@ __global__ void apply_gen_v_kernel(
     d_V_batch[r * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
         CudaFunHelper::my_cuCreal(v) * scale,
         CudaFunHelper::my_cuCimag(v) * scale);
+}
+
+// =============================================================================
+// tile_vc_vset_kernel / apply_gen_vset_kernel
+// =============================================================================
+__global__ void tile_vc_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_vset_base,
+    int n_grp,
+    int batch_size)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_grp;
+    const int       g   = static_cast<int>(tid % n_grp);
+    if (b >= batch_size) return;
+    d_vset_batch[b * n_grp + g] = d_vset_base[g];
+}
+
+__global__ void apply_gen_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_gen_v_all,
+    const int*            __restrict__ d_active_group,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_grp)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / k_active;
+    const int       j   = static_cast<int>(tid % k_active);
+    if (r >= actual_batch) return;
+    const int g = d_active_group[j];
+    if (g < 0) return;
+    const cuda_real_type target =
+        d_gen_v_all[static_cast<ptrdiff_t>(row_offset + r) * k_active + j];
+    if (isnan(target)) return;
+    d_vset_batch[r * n_grp + g] = target;
 }
 
 // =============================================================================
@@ -706,40 +744,8 @@ __global__ void update_slack_absorbed_kernel(
 // HVDC angle-droop kernels (Phase 3)
 // =============================================================================
 
-// Active power received by the non-controller side (HvdcDroopSolverData::recv_pu)
-__device__ __forceinline__ cuda_real_type hvdc_recv_pu(
-    cuda_real_type p_ctrl_abs, bool side1_ctrl,
-    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r)
-{
-    const cuda_real_type lf_ctrl = side1_ctrl ? lf1 : lf2;
-    const cuda_real_type lf_recv = side1_ctrl ? lf2 : lf1;
-    const cuda_real_type line_in = (static_cast<cuda_real_type>(1.) - lf_ctrl) * p_ctrl_abs;
-    return (static_cast<cuda_real_type>(1.) - lf_recv) * (line_in - r * line_in * line_in);
-}
-
-// The two active flows leaving the AC buses into the HVDC (HvdcDroopSolverData::flows_pu)
-__device__ __forceinline__ void hvdc_flows_pu(
-    int st, cuda_real_type raw,
-    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r,
-    cuda_real_type pmax12, cuda_real_type pmax21,
-    cuda_real_type& p1_flow, cuda_real_type& p2_flow)
-{
-    if (st == 0) {
-        if (raw >= static_cast<cuda_real_type>(0.)) {
-            p1_flow =  raw;
-            p2_flow = -hvdc_recv_pu(raw, true, lf1, lf2, r);
-        } else {
-            p1_flow = -hvdc_recv_pu(-raw, false, lf1, lf2, r);
-            p2_flow = -raw;
-        }
-    } else if (st > 0) {
-        p1_flow =  pmax12;
-        p2_flow = -hvdc_recv_pu(pmax12, true, lf1, lf2, r);
-    } else {
-        p1_flow = -hvdc_recv_pu(pmax21, false, lf1, lf2, r);
-        p2_flow =  pmax21;
-    }
-}
+// hvdc_recv_pu / hvdc_flows_pu live in acpf_nr_kernels.cuh (shared with the
+// droop P-saturation check, violation_kernels.cu).
 
 __global__ void hvdc_adjust_mismatch_kernel(
           cuda_real_type*  __restrict__ d_F,
@@ -794,6 +800,7 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
     const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
     const int*             __restrict__ h11,
     const int*             __restrict__ h12,
     const int*             __restrict__ h21,
@@ -817,11 +824,20 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type th2 = CudaFunHelper::my_atan2(
         CudaFunHelper::my_cuCimag(V2), CudaFunHelper::my_cuCreal(V2));
     const cuda_real_type raw = p0[e] + k[e] * (th1 - th2);
-    const cuda_real_type loss_mult =
-        (static_cast<cuda_real_type>(1.) - lf1[e]) * (static_cast<cuda_real_type>(1.) - lf2[e]);
-    // dp1 = dp_side1/dtheta1, dp2 = dp_side2/dtheta1; d/dtheta2 = -d/dtheta1
-    const cuda_real_type dp1 = (raw >= static_cast<cuda_real_type>(0.)) ? k[e] : k[e] * loss_mult;
-    const cuda_real_type dp2 = (raw <  static_cast<cuda_real_type>(0.)) ? -k[e] : -k[e] * loss_mult;
+    const cuda_real_type one = static_cast<cuda_real_type>(1.);
+    const bool side1_ctrl = raw >= static_cast<cuda_real_type>(0.);
+    // Exact derivative of hvdc_recv_pu w.r.t. the controller flow |raw|:
+    //   recv = (1-lf_recv)·(line_in - r·line_in²),  line_in = (1-lf_ctrl)·|raw|
+    //   recv' = (1-lf_recv)(1-lf_ctrl)·(1 - 2·r·line_in)
+    const cuda_real_type lf_ctrl = side1_ctrl ? lf1[e] : lf2[e];
+    const cuda_real_type line_in = (one - lf_ctrl) * (side1_ctrl ? raw : -raw);
+    const cuda_real_type recv_slope =
+        (one - lf1[e]) * (one - lf2[e]) * (one - static_cast<cuda_real_type>(2.) * r[e] * line_in);
+    // dp1 = dp_side1/dtheta1, dp2 = dp_side2/dtheta1; d/dtheta2 = -d/dtheta1.
+    // Controller side: p = ±raw, slope ±k. Receiving side: p = -recv(|raw|),
+    // and d|raw|/dtheta1 = ±k, so its slope is ∓k·recv'.
+    const cuda_real_type dp1 = side1_ctrl ?  k[e] :  k[e] * recv_slope;
+    const cuda_real_type dp2 = side1_ctrl ? -k[e] * recv_slope : -k[e];
 
     if (h11[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h11[e]],  dp1);
     if (h12[e] >= 0) atomic_add_real(&d_J_values[b * nnz_J + h12[e]], -dp1);
@@ -859,6 +875,7 @@ __global__ void vc_vrow_kernel(
     const int*             __restrict__ d_vc_grp_start,
     const int*             __restrict__ d_vc_grp_count,
     const cuda_real_type*  __restrict__ d_vc_vset,
+    int vset_stride,
     int n_grp,
     int n_ctrl,
     int n_bus,
@@ -880,7 +897,8 @@ __global__ void vc_vrow_kernel(
         slope_term += d_vc_slope[j] * d_vc_q[b * n_ctrl + j];
     }
     // F_v = Vm(reg) + Σ s_c·Q_c − v_set ;  residual d_F = −F_v (custom row: assign)
-    d_F[b * dim_J + d_vc_vrow[g]] = -(vm + slope_term - d_vc_vset[g]);
+    const cuda_real_type vset = d_vc_vset[b * vset_stride + g];
+    d_F[b * dim_J + d_vc_vrow[g]] = -(vm + slope_term - vset);
 }
 
 __global__ void vc_share_kernel(
@@ -949,21 +967,27 @@ __global__ void compute_residuals_kernel(
     const cuda_real_type* F_b = d_F + b * dim_J;
     cuda_real_type local_max = cuda_real_type(0);
 
-    // Each thread scans its portion of F_b.
+    // Each thread scans its portion of F_b. NaN must PROPAGATE: a plain
+    // `v > local_max` is false for NaN, so a slot whose F is entirely NaN
+    // (e.g. a NaN cuDSS solve poisoning V) would otherwise report residual 0
+    // and look converged. `nan_max` is a sticky-NaN max: once any element of
+    // F_b is NaN the slot's residual is NaN. (The lambda is a plain __device__
+    // helper; keeping it local avoids adding a header symbol for one use.)
+    auto nan_max = [](cuda_real_type a, cuda_real_type b) -> cuda_real_type {
+        return (isnan(a) || isnan(b)) ? cuda_real_type(NAN) : (b > a ? b : a);
+    };
     for (int i = threadIdx.x; i < dim_J; i += blockDim.x) {
         cuda_real_type v = F_b[i];
         if (v < cuda_real_type(0)) v = -v;
-        if (v > local_max) local_max = v;
+        local_max = nan_max(local_max, v);
     }
     sdata[threadIdx.x] = local_max;
     __syncthreads();
 
-    // Tree reduction within the block.
+    // Tree reduction within the block (NaN-propagating, see above).
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            if (sdata[threadIdx.x + stride] > sdata[threadIdx.x])
-                sdata[threadIdx.x] = sdata[threadIdx.x + stride];
-        }
+        if (threadIdx.x < stride)
+            sdata[threadIdx.x] = nan_max(sdata[threadIdx.x], sdata[threadIdx.x + stride]);
         __syncthreads();
     }
 

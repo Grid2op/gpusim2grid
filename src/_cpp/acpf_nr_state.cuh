@@ -228,6 +228,7 @@ struct AcPfNrState {
     // -------------------------------------------------------------------------
     int n_hvdc = 0;
     thrust::device_vector<int>            d_hvdc_bus1, d_hvdc_bus2, d_hvdc_status;
+    thrust::device_vector<int>            d_hvdc_id;   // grid hvdc id per entry (reporting only)
     thrust::device_vector<cuda_real_type> d_hvdc_p0, d_hvdc_k, d_hvdc_lf1, d_hvdc_lf2,
                                           d_hvdc_r, d_hvdc_pmax12, d_hvdc_pmax21;
     thrust::device_vector<int>            d_hvdc_prow1, d_hvdc_prow2;          // end P rows

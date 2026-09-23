@@ -14,6 +14,7 @@ import numpy as np
 
 from . import (
     _ContingencyAnalysisSolver,
+    PhysicalChecksFacadeMixin,
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
@@ -82,7 +83,7 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
     return ref
 
 
-class ContingencyAnalysisGPU:
+class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin):
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -225,7 +226,8 @@ class ContingencyAnalysisGPU:
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
-                 use_distributed_slack=True):
+                 use_distributed_slack=True,
+                 compute_physical_violations=False):
         _validate_precision(precision)
 
         # Single source of truth, resolved once here and applied at
@@ -349,6 +351,11 @@ class ContingencyAnalysisGPU:
         # as NaN) instead of skipping such contingencies. Works on both the bridge
         # and the array path (mutable property on the underlying session).
         self._inner.handle_disconnected_grid = bool(handle_disconnected_grid)
+
+        # Post-solve physical checks (compute_physical_violations: bus reactive
+        # capability + hvdc droop saturation): the bus-Q plan is pulled off the
+        # grid here when there is one -- see PhysicalChecksFacadeMixin.
+        self._apply_physical_checks_kwargs(compute_physical_violations)
 
         self._nb_iter = int(nb_iter)
         self._init_from_n_powerflow = bool(init_from_n_powerflow)

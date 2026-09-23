@@ -52,6 +52,10 @@ from ..contingency_analysis import (
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
 )
+from ..contingency_analysis._physical_checks import (
+    PhysicalChecksEngineMixin,
+    PhysicalChecksFacadeMixin,
+)
 
 
 _STRATEGY_MAP = {
@@ -168,7 +172,7 @@ class _DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _InjectionSweepSolver:
+class _InjectionSweepSolver(PhysicalChecksEngineMixin):
     """Stateful GPU batched-injection power flow solver.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -401,6 +405,21 @@ class _InjectionSweepSolver:
         q = np.ascontiguousarray(q_mvar, dtype=np.float64)
         self._s.set_injections(p, q, float(sn_mva))
 
+    def set_gen_p_targets(self, targets):
+        """Per-row active set-points of the machines of the slack active-power
+        plan (``set_gen_p_capability``): ``(n_scenarios, n_entries)`` MW in the
+        GENERATOR convention, one column per entry of the plan in its order,
+        NaN = keep the grid's own set-point; row-aligned with
+        :meth:`set_injections`. A row's generator produces ITS target plus its
+        share of the slack, and only the caller knows that target -- the
+        facade fills this from ``set_injections_from_elements``' ``gen_p``.
+        Left unset (or given an empty array), every row is checked against the
+        base set-points. Takes effect on the next run()."""
+        t = np.ascontiguousarray(targets, dtype=np.float64)
+        if t.size == 0:
+            t = np.zeros((0, 0), dtype=np.float64)
+        self._s.set_gen_p_targets(t)
+
     def set_gen_v(self, gen_v, gen_bus):
         """Per-scenario generator target voltage magnitude (vm_pu, NOT kV),
         (n_scenarios, n_gen). Does NOT feed Sbus -- see the C++
@@ -488,6 +507,24 @@ class _InjectionSweepSolver:
     @property
     def n_scenarios(self):
         return self._s.n_scenarios
+
+    @property
+    def is_vm_fixed_bus(self):
+        """(n_bus,) bool: |V| fixed at that bus (pv or slack without a |V| unknown)."""
+        return np.asarray(self._s.is_vm_fixed_bus, dtype=bool)
+
+    @property
+    def vc_group_of_bus(self):
+        """(n_bus,) int64: VoltageControl group regulating the bus, -1 for none."""
+        return np.asarray(self._s.vc_group_of_bus, dtype=np.int64)
+
+    @property
+    def vc_pinned_v_set(self):
+        """(n_groups,) float: base v_set of a group holding a member no gen_v
+        column can move (SVC / hvdc station), NaN for a free group."""
+        vset = np.asarray(self._s.vc_v_set, dtype=np.float64)
+        fixed = np.asarray(self._s.vc_group_has_fixed_member, dtype=bool)
+        return np.where(fixed, vset, np.nan) if vset.size else vset
 
     @property
     def n_bus(self):

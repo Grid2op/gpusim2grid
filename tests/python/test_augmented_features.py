@@ -75,9 +75,12 @@ _BIG_Q = 1.0e6
 
 
 def _solved_hvdc_droop_grid(b1=3, b2=9, p0=10.0, droop_mw_per_deg=5.0,
-                            lf1=0.01, lf2=0.02):
+                            lf1=0.01, lf2=0.02, r_ohm=0.0, nominal_v_kv=0.0):
     """case14 with one droop-enabled HVDC line, ac-solved (mirrors the
-    lightsim2grid HVDC test helper ``make_case14_hvdc``)."""
+    lightsim2grid HVDC test helper ``make_case14_hvdc``). ``r_ohm`` /
+    ``nominal_v_kv`` (both 0 by default: a lossless dc line) give the line a
+    resistive loss ``r_ohm * line_in^2 / nominal_v_kv^2``, quadratic in the
+    flow -- what makes the droop Jacobian slope depend on the operating point."""
     pp = pytest.importorskip("pandapower")
     import pandapower.networks as pn
     from lightsim2grid.network import init_from_pandapower
@@ -100,8 +103,8 @@ def _solved_hvdc_droop_grid(b1=3, b2=9, p0=10.0, droop_mw_per_deg=5.0,
             np.array([-_BIG_Q]), np.array([_BIG_Q]),
             np.array([1.0]), np.array([1.0]),
             [0],
-            np.array([20.0]),
-            np.array([0.0]), np.array([0.0]),
+            np.array([20.0]),                          # p_setpoint_mw
+            np.array([r_ohm]), np.array([nominal_v_kv]),
             [True],                                    # droop enabled
             np.array([p0]), np.array([droop_mw_per_deg]),
             np.array([300.0]), np.array([300.0]),

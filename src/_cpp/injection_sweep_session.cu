@@ -7,10 +7,12 @@
 // =============================================================================
 
 #include "injection_sweep_session.hpp"
+#include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/injection_batch.cuh"
 #include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
+#include "ledger_data.hpp"                    // LedgerData (VoltageControl groups)
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
@@ -80,20 +82,18 @@ InjectionSweepSession::InjectionSweepSession(
         scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
 
-    // Vm-fixed bus mask for set_gen_v(): a bus in pv or slack_ids has |V|
-    // fixed by construction (not an NR unknown) in both the bare and the
-    // augmented-ledger system -- see set_gen_v()'s own doc.
-    {
-        const int n_bus = base_state_->n_bus;
-        h_is_vm_fixed_bus_.assign(static_cast<size_t>(n_bus), 0);
-        for (Eigen::Index i = 0; i < pv.size(); ++i) {
-            const int b = pv(i);
-            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
-        }
-        for (Eigen::Index i = 0; i < slack_ids.size(); ++i) {
-            const int b = slack_ids(i);
-            if (b >= 0 && b < n_bus) h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
-        }
+    // Bus maps for set_gen_v(): Vm-fixed buses and the VoltageControl group
+    // regulating each bus (see build_gen_v_bus_maps / GenVOverride).
+    build_gen_v_bus_maps(base_state_->n_bus, pv, slack_ids,
+                         base_state_->h_vm_col_of_bus,
+                         ledger ? ledger->vc_reg_bus : std::vector<int>{},
+                         h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+    if (ledger) {
+        h_vc_v_set_ = ledger->vc_v_set;
+        h_vc_group_fixed_.assign(ledger->vc_reg_bus.size(), 0);
+        for (size_t j = 0; j < ledger->vc_kind.size(); ++j)
+            if (ledger->vc_kind[j] != 0)
+                h_vc_group_fixed_[static_cast<size_t>(ledger->vc_group[j])] = 1;
     }
 }
 
@@ -191,7 +191,7 @@ void InjectionSweepSession::run()
 
     GenVOverride gen_v_override;
     if (has_gen_v_)
-        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_);
+        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
 
     InjectionBatch source(std::move(h_Sbus_all), n_scenarios_, t_sbus_build_ms_,
                           std::move(gen_v_override));
@@ -211,6 +211,14 @@ void InjectionSweepSession::run()
         scaling_max_voltage_change_,
         max_dVa_,
         max_dVm_);
+
+    // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+    // violations); an injection sweep never disconnects a generator (nullptr mask).
+    const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
+        phys_, *solver_, "InjectionSweepSession", violation_tol_, sn_mva_,
+        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        &gen_p_targets_, gen_p_targets_dirty_);
+    gen_p_targets_dirty_ = false;
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms  = t_base_case_ms_;
@@ -235,6 +243,7 @@ void InjectionSweepSession::run()
     // AcPfTimings::t_ground_truth_check_ms.
     timings_.t_ground_truth_check_ms = base_state_->timings.t_ground_truth_check_ms;
     timings_.n_disconnected   = 0;
+    physical_checks::after_solve(phys_, timings_, t_phys);
 
     solver_->cs.synchronize();
 }
@@ -303,6 +312,7 @@ void InjectionSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_ytf_eff.data()),
         thrust::raw_pointer_cast(solver_->d_ytt_eff.data()),
         thrust::raw_pointer_cast(solver_->d_base_current_A.data()),
+        thrust::raw_pointer_cast(solver_->d_base_current_ex_A.data()),
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_scen, /*d_result_map=*/nullptr);
@@ -394,4 +404,66 @@ RealVect InjectionSweepSession::get_ex_amps() const
         throw std::runtime_error(
             "InjectionSweepSession: call run() and compute_flows() first");
     return h_ex_amps_;
+}
+
+// =============================================================================
+// Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
+// violations) -- shared glue in contingency/physical_checks_impl.cuh
+// =============================================================================
+void InjectionSweepSession::set_bus_q_capability(const BusQPlanData& plan)
+{
+    phys_.set_bus_q_plan(plan, base_state_->n_bus);
+}
+
+BusQViolationsResult InjectionSweepSession::get_bus_q_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+BusQViolationsResult InjectionSweepSession::get_bus_q_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_bus_q(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult InjectionSweepSession::get_hvdc_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                         timings_.t_copy_violations_to_host_ms);
+}
+
+HvdcPViolationsResult InjectionSweepSession::get_hvdc_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_hvdc_p(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                         timings_.t_copy_violations_to_host_ms);
+}
+
+void InjectionSweepSession::set_gen_p_capability(const GenPPlanData& plan)
+{
+    phys_.set_gen_p_plan(plan, base_state_->n_bus);
+}
+
+GenPViolationsResult InjectionSweepSession::get_gen_p_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+GenPViolationsResult InjectionSweepSession::get_gen_p_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                        timings_.t_copy_violations_to_host_ms);
+}
+
+void InjectionSweepSession::set_gen_p_targets(Eigen::Ref<const RealMatRM> targets)
+{
+    gen_p_targets_       = targets;
+    gen_p_targets_dirty_ = true;
 }

@@ -352,6 +352,10 @@ struct BatchTimings {
     // compute_limit_violations only; zero unless enabled.
     double t_violation_setup_ms         = 0.;   // H->D limits upload + buffer alloc (set_violation_limits())
     double t_copy_violations_to_host_ms = 0.;   // D->H across the 10 get_violation_*() accessors
+    // compute_physical_violations only; zero unless enabled: H->D plan upload +
+    // buffer alloc + the base ("n") checks (set_bus_q_check / run_bus_q_check_n,
+    // set_hvdc_p_check / run_hvdc_p_check_n, set_gen_p_check / run_gen_p_check_n)
+    double t_physical_setup_ms = 0.;
 
     // --- per-chunk accumulated (TimingEntry: gpu + wall) ---
     TimingEntry t_tile_V;
@@ -371,6 +375,11 @@ struct BatchTimings {
     // is enabled -- see t_store_V for the rest of that phase (nr_mask_v_nan +
     // the V-results store, both unconditional).
     TimingEntry t_violation_check;
+    // check_bus_q_violations_kernel / check_hvdc_p_violations_kernel only; zero
+    // unless compute_physical_violations is on.
+    TimingEntry t_bus_q_check;
+    TimingEntry t_hvdc_p_check;
+    TimingEntry t_gen_p_check;       // check_gen_p_violations_kernel, same gate
     TimingEntry t_flow_computation;
 
     // --- metadata ---
@@ -385,13 +394,37 @@ struct BatchTimings {
     int n_refactorize    = 0;   // number of refactorize calls (n_chunks * nb_iter - 1)
     int n_disconnected   = 0;   // contingencies skipped (would disconnect the grid)
 
+    // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
+    //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
+    //     until the first backward pass; NOT part of any aggregate above (the
+    //     adjoint is a separate call from run()). ---
+    double      t_adjoint_build_ms = 0.;   // Jᵀ skeleton/map + buffers + cuDSS ANALYSIS (first backward only)
+    TimingEntry t_adjoint_first_factorize; // single FACTORIZATION of Jᵀ (first backward only)
+    TimingEntry t_adjoint_refactorize;     // REFACTORIZATION of Jᵀ (every later backward after a new forward)
+    TimingEntry t_adjoint_solve;           // SOLVE with Jᵀ (every backward)
+    int adjoint_n_analysis    = 0;         // 0 or 1 per driver life
+    int adjoint_n_factorize   = 0;         // 0 or 1 per driver life
+    int adjoint_n_refactorize = 0;
+    int adjoint_n_solve       = 0;
+
+    // --- cuDSS factor statistics of the forward solver's last ANALYSIS
+    //     (CudssBatchSolver::factor_stats(); -1 = not reported). Not timings.
+    //     lu_nnz is per system (uniform batch: the shared pattern); the memory
+    //     estimates cover the whole chunk as cuDSS allocates it. ---
+    long long cudss_lu_nnz                     = -1;  // CUDSS_DATA_LU_NNZ, one system
+    long long cudss_mem_device_permanent_bytes = -1;  // CUDSS_DATA_MEMORY_ESTIMATES[0]
+    long long cudss_mem_device_peak_bytes      = -1;  // [1]
+    long long cudss_mem_host_permanent_bytes   = -1;  // [2]
+    long long cudss_mem_host_peak_bytes        = -1;  // [3]
+
     // Total wall-clock time for all chunks (excludes one-time setup).
     double t_chunks_total_wall_ms() const {
         return (t_tile_V         + t_tile_Ybus      + t_patch_Ybus
               + t_tile_Sbus      + t_spmv           + t_fill_F
               + t_fill_J         + t_first_factorize + t_refactorize
               + t_solve          + t_update_V       + t_residual
-              + t_store_V        + t_violation_check + t_flow_computation).wall_ms;
+              + t_store_V        + t_violation_check + t_bus_q_check
+              + t_hvdc_p_check   + t_gen_p_check     + t_flow_computation).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).
@@ -406,7 +439,7 @@ struct BatchTimings {
 
     double t_host_to_device_ms() const {
         return t_alloc_ms + t_source_init_ms + t_branch_data_upload_ms
-             + t_violation_setup_ms;
+             + t_violation_setup_ms + t_physical_setup_ms;
     }
 
     double t_device_to_host_ms() const {
