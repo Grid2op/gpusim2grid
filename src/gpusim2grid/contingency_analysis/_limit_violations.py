@@ -175,16 +175,16 @@ class LimitViolation:
         return violation_category(self.violation_type)
 
 
-def _rows_from_flat(count, capacity, make):
+def _rows_from_flat(count, stride, make):
     """Split a flat per-row record buffer into one list per row: row r owns
-    slots [r*capacity, r*capacity + count[r]); a negative count (the row was
+    slots [r*stride, r*stride + count[r]); a negative count (the row was
     never simulated) and a zero one (simulated, nothing to report -- or not
     converged: upstream reports an EMPTY entry there, never a sentinel) both
     give an empty list."""
     out = []
     for r, cnt in enumerate(count):
         cnt = int(cnt)
-        base = r * capacity
+        base = r * stride
         out.append([make(base + i) for i in range(max(cnt, 0))])
     return out
 
@@ -193,7 +193,7 @@ def bus_q_violations_from_result(res):
     """list[list[LimitViolation]] from a ``BusQViolationsResult`` (the raw
     output of ``get_bus_q_violations[_n]()`` on a batch session)."""
     bus_id, vtype, value, limit = res.bus_id, res.type, res.value, res.limit
-    return _rows_from_flat(res.count, res.capacity, lambda i: LimitViolation(
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
         ViolationElementType.BUS, int(bus_id[i]), 0, LimitViolationType(int(vtype[i])),
         float(value[i]), float(limit[i])))
 
@@ -202,7 +202,7 @@ def hvdc_p_violations_from_result(res):
     """list[list[LimitViolation]] from an ``HvdcPViolationsResult`` (the raw
     output of ``get_hvdc_p_violations[_n]()`` on a batch session)."""
     hvdc_id, side, value, limit = res.hvdc_id, res.side, res.value, res.limit
-    return _rows_from_flat(res.count, res.capacity, lambda i: LimitViolation(
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
         ViolationElementType.HVDC, int(hvdc_id[i]), int(side[i]),
         LimitViolationType.HVDC_P_SATURATION, float(value[i]), float(limit[i])))
 
@@ -211,7 +211,7 @@ def gen_p_violations_from_result(res):
     """list[list[LimitViolation]] from a ``GenPViolationsResult`` (the raw
     output of ``get_gen_p_violations[_n]()`` on a batch session)."""
     etype, eid, vtype, value, limit = res.element_type, res.element_id, res.type, res.value, res.limit
-    return _rows_from_flat(res.count, res.capacity, lambda i: LimitViolation(
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
         ViolationElementType(int(etype[i])), int(eid[i]), 0, LimitViolationType(int(vtype[i])),
         float(value[i]), float(limit[i])))
 

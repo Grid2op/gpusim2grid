@@ -124,7 +124,7 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     bool     compute_limit_violations_ = false;
     double   violation_tol_            = 1e-6;   // dedicated; independent of tol_base
-    int      violation_capacity_       = 16;     // K; bounds memory at n_ctg*K regardless
+    int      violation_capacity_       = 16;     // K per type; bounds memory at n_ctg*3*K regardless
                                                   // of n_bus/n_branches -- see set_limits()
     bool     has_limits_               = false;
     bool     has_violations_result_    = false;

@@ -444,9 +444,12 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
 
     @property
     def violation_capacity(self):
-        """int: max violation records kept per scenario (K). Bounds the
-        compact output at n_scenarios * K regardless of grid size. Takes
-        effect on the next run(); default 16."""
+        """int: violation records kept per scenario AND per violation type
+        (K): the K most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones,
+        ranked by ``|value / limit - 1|`` (so a LOW_VOLTAGE ranks by how far
+        below its limit it fell). Bounds the compact output at
+        n_scenarios * 3 * K regardless of grid size. Takes effect on the next
+        run(); default 16."""
         return self._s.violation_capacity
 
     @violation_capacity.setter
@@ -460,6 +463,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
         GRID/NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
         single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        Otherwise the records of a scenario come type after type -- CURRENT,
+        then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
+        violation_capacity) most severe violations, most severe first.
         Requires run() with compute_limit_violations=True."""
         if not self.compute_limit_violations:
             raise RuntimeError(
@@ -472,7 +478,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
         vtype  = self._s.get_violation_type()
         value  = self._s.get_violation_value()
         limit  = self._s.get_violation_limit()
-        K = self.violation_capacity
+        # row c owns slots [c*stride, c*stride + count[c]) -- stride is
+        # 3 * the violation_capacity of the run that produced the buffers
+        stride = len(etype) // max(len(counts), 1)
         out = []
         for c, cnt in enumerate(counts):
             if cnt < 0:
@@ -484,7 +492,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
                                             LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
-            base = c * K
+            base = c * stride
             out.append([
                 LimitViolation(ViolationElementType(int(etype[base + i])), int(eid[base + i]),
                                int(side[base + i]), LimitViolationType(int(vtype[base + i])),
@@ -495,9 +503,10 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
 
     def get_violations_truncated(self):
         """(n_scenarios,) bool ndarray: True where more than
-        violation_capacity violations were found for that scenario
-        (clamped -- raise violation_capacity if this matters for your use
-        case). Requires run() with compute_limit_violations=True."""
+        violation_capacity violations of one type were found for that
+        scenario (only the most severe were kept -- raise violation_capacity
+        if this matters for your use case; get_violation_counts() has the
+        exact totals). Requires run() with compute_limit_violations=True."""
         return self._s.get_violation_truncated().astype(bool)
 
     def get_violation_counts(self):

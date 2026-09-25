@@ -100,9 +100,12 @@ class PhysicalChecksEngineMixin:
 
     @property
     def physical_violation_capacity(self):
-        """int: records kept per row and per check (bounds each compact output
-        at n_rows * capacity; a row with more is flagged by
-        :meth:`get_physical_violations_truncated`). Default 16."""
+        """int: records kept per row, per check AND per violation type -- the
+        most severe ones, by ``|value - limit|`` (MVAr / MW), most severe
+        first (bounds each compact output at n_rows * n_types * capacity; a
+        row where a type had more is flagged by
+        :meth:`get_physical_violations_truncated`). LOW_P and HIGH_P each rank
+        generators and storage units together. Default 16."""
         return self._s.physical_checks.physical_violation_capacity
 
     @physical_violation_capacity.setter
@@ -193,7 +196,10 @@ class PhysicalChecksEngineMixin:
         GENERATOR / STORAGE, element_id the container id, LOW_P / HIGH_P,
         value the machine's converged active power -- its target plus its share
         of the slack -- and limit its min_p / max_p, MW, generator convention
-        for both families). A row that was never simulated (compacted out) or
+        for both families). Within each check the records come type after
+        type (LOW_Q then HIGH_Q; LOW_P then HIGH_P), each type holding its (at
+        most physical_violation_capacity) largest ``|value - limit|``, most
+        severe first. A row that was never simulated (compacted out) or
         did not converge has an EMPTY entry, not a sentinel -- ask
         ``converged()`` / ``get_disconnected()`` to tell that apart from
         "converged, no violation" (lightsim2grid parity). Requires run() with
@@ -211,7 +217,8 @@ class PhysicalChecksEngineMixin:
 
     def get_physical_violations_truncated(self):
         """(n_rows,) bool ndarray: True where one of the checks found more than
-        physical_violation_capacity violations on that row (records clamped)."""
+        physical_violation_capacity violations of one type on that row (only
+        the most severe were kept)."""
         bq = np.asarray(self._s.get_bus_q_violations().truncated).astype(bool)
         hp = np.asarray(self._s.get_hvdc_p_violations().truncated).astype(bool)
         gp = np.asarray(self._s.get_gen_p_violations().truncated).astype(bool)

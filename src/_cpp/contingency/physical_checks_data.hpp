@@ -40,39 +40,48 @@
 #include "../dtypes.hpp"
 #include "bus_q_check_data.hpp"
 #include "gen_p_check_data.hpp"
+#include "limit_violation_types.hpp"   // N_*_VIOLATION_GROUPS
 
 // Per-row records of the bus reactive-capability check, flat SoA:
-//   bus_id/type/value/limit : [n_rows * capacity] (row r owns [r*capacity, r*capacity + count[r]))
-//   count                   : [n_rows]; -1 = never simulated (compacted out), else 0..capacity
-//   truncated               : [n_rows]; 1 when more than `capacity` buses violated
+//   bus_id/type/value/limit : [n_rows * stride] (row r owns [r*stride, r*stride + count[r]))
+//   count                   : [n_rows]; -1 = never simulated (compacted out), else 0..stride
+//   truncated               : [n_rows]; 1 when a type had more than `capacity` violations
+// Per type, the `capacity` records of largest |value - limit| are kept, most
+// severe first; types follow each other (LOW_Q, then HIGH_Q), so
+// stride = N_BUS_Q_VIOLATION_GROUPS * capacity.
 // type is 5 (LOW_Q) or 6 (HIGH_Q); bus_id the SOLVER bus id; value/limit MVAr.
 // For the base ("n") case n_rows == 1.
 struct BusQViolationsResult {
     Eigen::VectorXi bus_id, type;
     RealVect        value, limit;
     Eigen::VectorXi count, truncated;
-    int             capacity = 0;
+    int             capacity = 0;   // records kept per row and per type
+    int             stride   = 0;   // slots per row in the flat arrays
 };
 
-// Same layout for the droop P-saturation check: hvdc_id is the GRID hvdc id,
-// side 1 (saturates 1->2) or 2 (saturates 2->1), value/limit MW. Every record
-// is element type HVDC (4), violation type HVDC_P_SATURATION (7).
+// Same layout for the droop P-saturation check (one type, so stride ==
+// capacity): hvdc_id is the GRID hvdc id, side 1 (saturates 1->2) or 2
+// (saturates 2->1), value/limit MW. Every record is element type HVDC (4),
+// violation type HVDC_P_SATURATION (7).
 struct HvdcPViolationsResult {
     Eigen::VectorXi hvdc_id, side;
     RealVect        value, limit;
     Eigen::VectorXi count, truncated;
     int             capacity = 0;
+    int             stride   = 0;
 };
 
 // Same layout for the distributed-slack active-power check: element_type 5
 // (GENERATOR) or 6 (STORAGE), element_id the container id of that family,
 // type 7 (HIGH_P) or 8 (LOW_P), value the machine's converged active power and
 // limit its max_p_mw / min_p_mw -- MW, GENERATOR convention for both families.
+// Groups: LOW_P, then HIGH_P, generators and storage units ranked together.
 struct GenPViolationsResult {
     Eigen::VectorXi element_type, element_id, type;
     RealVect        value, limit;
     Eigen::VectorXi count, truncated;
     int             capacity = 0;
+    int             stride   = 0;
 };
 
 struct PhysicalChecksConfig {
@@ -84,7 +93,8 @@ struct PhysicalChecksConfig {
     // slack on every comparison, in MVA (MVAr for the reactive check, MW for the
     // active one); upstream default
     double physical_violation_tol_mva = 1e-4;
-    // records kept per row AND per check (bounds each output at n_rows * capacity)
+    // records kept per row, per check AND per violation type (bounds each
+    // output at n_rows * n_types * capacity)
     int    physical_violation_capacity = 16;
     // the routing the reactive check needs (set_bus_q_capability); the hvdc check
     // needs nothing beyond the base state

@@ -111,6 +111,7 @@ BusQViolationsResult fetch_bus_q(const PhysicalChecksConfig& cfg, const Driver& 
     auto t0 = std::chrono::steady_clock::now();
     BusQViolationsResult r;
     r.capacity  = drv.bus_q_capacity_;
+    r.stride    = N_BUS_Q_VIOLATION_GROUPS * drv.bus_q_capacity_;
     r.bus_id    = detail::to_int (n_case ? drv.d_bq_n_bus_id    : drv.d_bq_out_bus_id);
     r.type      = detail::to_int (n_case ? drv.d_bq_n_type      : drv.d_bq_out_type);
     r.value     = detail::to_real(n_case ? drv.d_bq_n_value     : drv.d_bq_out_value);
@@ -133,6 +134,7 @@ HvdcPViolationsResult fetch_hvdc_p(const PhysicalChecksConfig& cfg, const Driver
     auto t0 = std::chrono::steady_clock::now();
     HvdcPViolationsResult r;
     r.capacity  = drv.hvdc_p_capacity_;
+    r.stride    = N_HVDC_P_VIOLATION_GROUPS * drv.hvdc_p_capacity_;
     r.hvdc_id   = detail::to_int (n_case ? drv.d_hp_n_hvdc_id   : drv.d_hp_out_hvdc_id);
     r.side      = detail::to_int (n_case ? drv.d_hp_n_side      : drv.d_hp_out_side);
     r.value     = detail::to_real(n_case ? drv.d_hp_n_value     : drv.d_hp_out_value);
@@ -155,6 +157,7 @@ GenPViolationsResult fetch_gen_p(const PhysicalChecksConfig& cfg, const Driver& 
     auto t0 = std::chrono::steady_clock::now();
     GenPViolationsResult r;
     r.capacity     = drv.gen_p_capacity_;
+    r.stride       = N_GEN_P_VIOLATION_GROUPS * drv.gen_p_capacity_;
     r.element_type = detail::to_int (n_case ? drv.d_gp_n_element_type : drv.d_gp_out_element_type);
     r.element_id   = detail::to_int (n_case ? drv.d_gp_n_element_id   : drv.d_gp_out_element_id);
     r.type         = detail::to_int (n_case ? drv.d_gp_n_type         : drv.d_gp_out_type);

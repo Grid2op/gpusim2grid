@@ -551,7 +551,8 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
     violation_capacity_ = K;
     n_lines_            = n_lines;
 
-    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K);
+    // K records kept per row AND per type (check_limit_violations_kernel)
+    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(N_OPERATIONAL_VIOLATION_GROUPS * K);
     d_viol_element_type.assign(n_out, 0);
     d_viol_element_id.assign(n_out, 0);
     d_viol_side.assign(n_out, 0);
@@ -622,7 +623,9 @@ void BatchPfDriver<BatchSource>::set_bus_q_check(
     bus_q_sn_mva_       = static_cast<cuda_real_type>(plan.sn_mva);
     bus_q_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
 
-    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K_q);
+    // K_q records kept per row AND per type (check_bus_q_violations_kernel)
+    const size_t row_q = static_cast<size_t>(N_BUS_Q_VIOLATION_GROUPS * K_q);
+    const size_t n_out = static_cast<size_t>(n_contingencies) * row_q;
     d_bq_out_bus_id.assign(n_out, 0);
     d_bq_out_type.assign(n_out, 0);
     d_bq_out_value.assign(n_out, cuda_real_type(0));
@@ -631,10 +634,10 @@ void BatchPfDriver<BatchSource>::set_bus_q_check(
     // every simulated row overwrites it with 0..K_q.
     d_bq_count.assign(static_cast<size_t>(n_contingencies), -1);
     d_bq_truncated.assign(static_cast<size_t>(n_contingencies), 0);
-    d_bq_n_bus_id.assign(static_cast<size_t>(K_q), 0);
-    d_bq_n_type.assign(static_cast<size_t>(K_q), 0);
-    d_bq_n_value.assign(static_cast<size_t>(K_q), cuda_real_type(0));
-    d_bq_n_limit.assign(static_cast<size_t>(K_q), cuda_real_type(0));
+    d_bq_n_bus_id.assign(row_q, 0);
+    d_bq_n_type.assign(row_q, 0);
+    d_bq_n_value.assign(row_q, cuda_real_type(0));
+    d_bq_n_limit.assign(row_q, cuda_real_type(0));
     d_bq_n_count.assign(1, 0);
     d_bq_n_truncated.assign(1, 0);
 
@@ -702,17 +705,18 @@ void BatchPfDriver<BatchSource>::set_hvdc_p_check(double tol_mw, double sn_mva, 
     hvdc_p_sn_mva_       = static_cast<cuda_real_type>(sn_mva);
     hvdc_p_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
 
-    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K_p);
+    const size_t row_p = static_cast<size_t>(N_HVDC_P_VIOLATION_GROUPS * K_p);
+    const size_t n_out = static_cast<size_t>(n_contingencies) * row_p;
     d_hp_out_hvdc_id.assign(n_out, 0);
     d_hp_out_side.assign(n_out, 0);
     d_hp_out_value.assign(n_out, cuda_real_type(0));
     d_hp_out_limit.assign(n_out, cuda_real_type(0));
     d_hp_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
     d_hp_truncated.assign(static_cast<size_t>(n_contingencies), 0);
-    d_hp_n_hvdc_id.assign(static_cast<size_t>(K_p), 0);
-    d_hp_n_side.assign(static_cast<size_t>(K_p), 0);
-    d_hp_n_value.assign(static_cast<size_t>(K_p), cuda_real_type(0));
-    d_hp_n_limit.assign(static_cast<size_t>(K_p), cuda_real_type(0));
+    d_hp_n_hvdc_id.assign(row_p, 0);
+    d_hp_n_side.assign(row_p, 0);
+    d_hp_n_value.assign(row_p, cuda_real_type(0));
+    d_hp_n_limit.assign(row_p, cuda_real_type(0));
     d_hp_n_count.assign(1, 0);
     d_hp_n_truncated.assign(1, 0);
 
@@ -852,7 +856,8 @@ void BatchPfDriver<BatchSource>::set_gen_p_check(
     gen_p_sn_mva_       = static_cast<cuda_real_type>(plan.sn_mva);
     gen_p_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
 
-    const size_t n_out = static_cast<size_t>(n_contingencies) * static_cast<size_t>(K_g);
+    const size_t row_g = static_cast<size_t>(N_GEN_P_VIOLATION_GROUPS * K_g);
+    const size_t n_out = static_cast<size_t>(n_contingencies) * row_g;
     d_gp_out_element_type.assign(n_out, 0);
     d_gp_out_element_id.assign(n_out, 0);
     d_gp_out_type.assign(n_out, 0);
@@ -860,11 +865,11 @@ void BatchPfDriver<BatchSource>::set_gen_p_check(
     d_gp_out_limit.assign(n_out, cuda_real_type(0));
     d_gp_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
     d_gp_truncated.assign(static_cast<size_t>(n_contingencies), 0);
-    d_gp_n_element_type.assign(static_cast<size_t>(K_g), 0);
-    d_gp_n_element_id.assign(static_cast<size_t>(K_g), 0);
-    d_gp_n_type.assign(static_cast<size_t>(K_g), 0);
-    d_gp_n_value.assign(static_cast<size_t>(K_g), cuda_real_type(0));
-    d_gp_n_limit.assign(static_cast<size_t>(K_g), cuda_real_type(0));
+    d_gp_n_element_type.assign(row_g, 0);
+    d_gp_n_element_id.assign(row_g, 0);
+    d_gp_n_type.assign(row_g, 0);
+    d_gp_n_value.assign(row_g, cuda_real_type(0));
+    d_gp_n_limit.assign(row_g, cuda_real_type(0));
     d_gp_n_count.assign(1, 0);
     d_gp_n_truncated.assign(1, 0);
 

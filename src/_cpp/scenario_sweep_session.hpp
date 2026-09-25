@@ -199,7 +199,7 @@ struct ScenarioSweepSession {
     // =========================================================================
     bool     compute_limit_violations_ = false;
     double   violation_tol_            = 1e-6;   // dedicated; independent of tol_base
-    int      violation_capacity_       = 16;     // K; bounds memory at n_scenarios*K
+    int      violation_capacity_       = 16;     // K per type; bounds memory at n_scenarios*3*K
     bool     has_limits_               = false;
     bool     has_violations_result_    = false;
     int      n_lines_                  = 0;      // branch ordering split (lines-then-trafos)

@@ -193,9 +193,26 @@ def _p_records(rows):
              for v in row if int(v.element_type) in (GEN, STO)] for row in rows]
 
 
+def _assert_ranked(rows):
+    """gpusim2grid's documented order: LOW_P records, then HIGH_P ones
+    (generators and storage units ranked together), each type sorted by
+    |value - limit|, largest first."""
+    group = {LOW_P: 0, HIGH_P: 1}
+    for r, row in enumerate(rows):
+        groups = [group[x[2]] for x in row]
+        assert groups == sorted(groups), f"row {r}: types not grouped LOW_P then HIGH_P: {row}"
+        for x, y in zip(row, row[1:]):
+            if x[2] == y[2]:
+                assert abs(x[3] - x[4]) >= abs(y[3] - y[4]), f"row {r}: not most severe first: {row}"
+
+
 def _assert_same(ref, got, atol_mw):
+    """Same records as lightsim2grid (which reports them in container order;
+    ours are ranked by type and severity, so compared as sets)."""
     assert len(ref) == len(got)
+    _assert_ranked(got)
     for r, (a, b) in enumerate(zip(ref, got)):
+        a, b = sorted(a), sorted(b)
         assert [x[:3] for x in a] == [x[:3] for x in b], f"row {r}: {a} vs {b}"
         for x, y in zip(a, b):
             np.testing.assert_allclose(y[3], x[3], atol=atol_mw, err_msg=f"row {r} value")
@@ -323,13 +340,14 @@ def test_reports_the_power_ac_pf_publishes(solver_atol):
 @needs_bridge
 def test_each_machine_at_its_own_share(solver_atol):
     """uneven weights (1 / 3): gen 1 takes three quarters of the imbalance --
-    both reported, each against its own limit, in container order"""
+    both reported, each against its own limit"""
     grid = _feeder_grid(1., 3.)
     p_ref, _ = _ac_pf_res_p(grid)
     np.testing.assert_allclose(p_ref[1] - 10., 3. * p_ref[0], rtol=1e-6)   # three times gen 0's share
     grid.set_gen_p_limits(np.full(2, np.nan), p_ref - 1.)
     grid.tell_solver_need_reset(); _solve(grid)
-    recs = _p_records([_one_row_is(grid).get_physical_violations_n()])[0]
+    # both 1 MW above their max_p: a tie in severity, so compare by id
+    recs = sorted(_p_records([_one_row_is(grid).get_physical_violations_n()])[0])
     assert [r[:3] for r in recs] == [(GEN, 0, HIGH_P), (GEN, 1, HIGH_P)]
     np.testing.assert_allclose([r[3] for r in recs], p_ref, atol=_mw_atol(grid, solver_atol))
 

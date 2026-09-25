@@ -22,13 +22,14 @@
 #include "../cu_complex_utils.h"
 #include "../acpf_nr_kernels.cuh"   // hvdc_flows_pu (shared with the NR loop)
 #include "tripped_branch_table.hpp"
+#include "limit_violation_types.hpp"   // N_*_VIOLATION_GROUPS
 
 // -----------------------------------------------------------------------------
 // check_limit_violations_kernel
 //
 // One thread PER CONTINGENCY (active slot) in the current chunk -- not per
 // bus, not per (contingency, branch). Each thread owns output slice
-// [out_c*K, out_c*K+K) exclusively (out_c = original contingency index), so
+// [out_c*3K, out_c*3K+3K) exclusively (out_c = original contingency index), so
 // there is no cross-thread write hazard and no atomics anywhere in this
 // kernel. n_contingencies is typically large enough on its own to saturate
 // the GPU at one-thread-per-contingency; total FLOPs are identical to a
@@ -87,13 +88,16 @@
 //        if !isnan(vmin[b]) && vm_kv < vmin[b]  -> LOW_VOLTAGE (d_out_count_low_voltage++)
 //        else if !isnan(vmax[b]) && vm_kv > vmax[b] -> HIGH_VOLTAGE (d_out_count_high_voltage++)
 //
-// Detail-record capacity: on the (K+1)-th write attempt for a contingency,
-// stop writing further detail records (clamp) and set d_out_truncated[out_c]
-// = 1 -- but keep SCANNING every bus/branch regardless, so the three
-// per-type totals (d_out_count_low_voltage/high_voltage/current) are always
-// the TRUE, uncapped violation counts for that contingency, independent of
-// violation_capacity (K). This is the reason these loops do not stop early
-// on truncation like the detail-record buffer does.
+// Records kept: for EACH violation type (CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE)
+// the K most severe, severity = |value/limit - 1| (relative, so a large bus
+// or line does not outrank a small one by its size alone), sorted most
+// severe first; ties keep scan order. Each type fills its own K-slot range of
+// the row's slice while the row is scanned, and the kept records are then
+// packed to the front of the slice in that type order (d_out_count of them).
+// A type with more than K violations sets d_out_truncated[out_c] = 1. Every
+// bus/branch is scanned whatever is already kept, so the three per-type
+// totals (d_out_count_low_voltage/high_voltage/current) are always the TRUE,
+// uncapped violation counts, independent of violation_capacity (K).
 //
 // element_id de-concatenation (lines-then-trafos -> lightsim2grid's own-type
 // local id, per LimitViolation.hpp's documented convention):
@@ -122,14 +126,15 @@
 //                    from that path, but the parameters stay generic)
 // n_bus, n_branches, n_lines : dimensions
 // c_start, actual_batch : this chunk's active-slot offset / size
-// K                : violation_capacity, output slots per contingency
+// K                : violation_capacity, records kept per contingency AND
+//                    per type (3K output slots per contingency)
 // d_result_map     : [n_active] active-slot -> original-index map, or nullptr
 //                    for identity (c_start + local_c directly)
-// d_out_*          : [n_contingencies * K] compact SoA output (see
+// d_out_*          : [n_contingencies * 3K] compact SoA output (see
 //                    ContingencyAnalysisSession::get_violation_*())
-// d_out_count      : [n_contingencies]; -1 = not simulated, else 0..K
-//                    (number of DETAIL records written, capped at K)
-// d_out_truncated  : [n_contingencies]; 0/1
+// d_out_count      : [n_contingencies]; -1 = not simulated, else 0..3K
+//                    (number of DETAIL records kept, at most K per type)
+// d_out_truncated  : [n_contingencies]; 0/1 (a type had more than K)
 // d_out_count_low_voltage/high_voltage/current : [n_contingencies]; -1 = not
 //                    simulated, else the TRUE, UNCAPPED count of violations
 //                    of that type (independent of K / violation_capacity --
@@ -176,8 +181,10 @@ __global__ void check_limit_violations_kernel(
 //
 // One thread PER active slot, same ownership / no-atomics layout as
 // check_limit_violations_kernel above: records land in this row's exclusive
-// slice [out_c*K, out_c*K+K) in PLAN order (the order build_bus_q_plan lists
-// the buses, ascending grid bus id), so the output is deterministic.
+// slice [out_c*2K, out_c*2K+2K), LOW_Q ones then HIGH_Q ones, each type
+// holding its K largest |value - limit| (MVAr), most severe first; ties keep
+// PLAN order (the order build_bus_q_plan lists the buses, ascending grid bus
+// id), so the output is deterministic.
 //
 // For each checked bus k (solver id b = d_bus_solver[k]):
 //
@@ -220,8 +227,9 @@ __global__ void check_limit_violations_kernel(
 // n_check == 0 so every simulated row gets count 0 (distinct from the -1
 // "never simulated" sentinel seeded by BatchPfDriver::set_bus_q_check).
 //
-// Capacity: the (K+1)-th record sets d_out_truncated[out_c] = 1 and is
-// dropped (upstream has no cap; ours is bus_q_violation_capacity).
+// Capacity: a type with more than K violations sets d_out_truncated[out_c]
+// = 1, its least severe records dropped (upstream has no cap; ours is
+// physical_violation_capacity, per type).
 // -----------------------------------------------------------------------------
 __global__ void check_bus_q_violations_kernel(
     const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order, post mask-NaN
@@ -276,8 +284,10 @@ __global__ void check_bus_q_violations_kernel(
 // value / limit are reported in MW (x sn_mva); element_id is the GRID hvdc id
 // (d_hvdc_id); element_type HVDC. A saturated line (status != 0) is pinned at
 // pmax by construction and is not checked; a line with a NaN end voltage
-// (masked) is skipped. Same row gate / result map / capacity / sentinel
-// conventions as check_bus_q_violations_kernel above.
+// (masked) is skipped. One type, so the row's slice is [out_c*K, out_c*K+K):
+// the K largest |value - limit| (MW), either side, most severe first. Same
+// row gate / result map / capacity / sentinel conventions as
+// check_bus_q_violations_kernel above.
 // -----------------------------------------------------------------------------
 __global__ void check_hvdc_p_violations_kernel(
     const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order
@@ -328,8 +338,9 @@ __global__ void check_hvdc_p_violations_kernel(
 // (upstream: "nothing left distributing anything"). Records: element_type 5 /
 // 6, element_id the container id, type HIGH_P (7) above max_p + tol, LOW_P
 // (8) below min_p - tol, value / limit in MW, generator convention. Same row
-// gate, output layout, K-capacity and result-map conventions as
-// check_bus_q_violations_kernel.
+// gate, output layout (LOW_P then HIGH_P, K largest |value - limit| each,
+// generators and storage units ranked together), capacity and result-map
+// conventions as check_bus_q_violations_kernel.
 // -----------------------------------------------------------------------------
 __global__ void check_gen_p_violations_kernel(
     const cudaComplexType* __restrict__ d_V,

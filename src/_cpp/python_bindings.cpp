@@ -222,8 +222,10 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_property("physical_violation_capacity",
                       [](const PhysicalChecksConfig& c) { return c.physical_violation_capacity; },
                       &PhysicalChecksConfig::set_physical_violation_capacity,
-                      "Records kept per row and per check (bounds each output at n_rows * "
-                      "capacity); a row with more is flagged truncated. Default 16.")
+                      "Records kept per row, per check and per violation type -- the most "
+                      "severe ones, by |value - limit|, sorted most severe first (bounds each "
+                      "output at n_rows * n_types * capacity); a row with more is flagged "
+                      "truncated. Default 16.")
         .def_property_readonly("has_bus_q_capability",
                       [](const PhysicalChecksConfig& c) { return c.has_bus_q_plan; },
                       "Whether set_bus_q_capability() was called on the session.")
@@ -239,19 +241,22 @@ static void bind_physical_checks_types(pybind11::module_& m)
 
     pybind11::class_<BusQViolationsResult>(m, "BusQViolationsResult",
         "Flat per-row records of the reactive-capability check: row r owns "
-        "bus_id/type/value/limit[r*capacity : r*capacity + count[r]]; count -1 = the "
+        "bus_id/type/value/limit[r*stride : r*stride + count[r]]; per violation type, "
+        "the `capacity` records of largest |value - limit| are kept, most severe first, "
+        "types one after the other (LOW_Q, then HIGH_Q; stride = 2 * capacity); count -1 = the "
         "row was never simulated (compacted out), 0 = simulated, no violation (or not "
         "converged); type 5 = LOW_Q, 6 = HIGH_Q; bus_id the SOLVER bus id; value the "
         "reactive power the machines holding that bus had to produce (MVAr), limit "
         "their SUMMED capability (MVAr); truncated 1 when more than `capacity` buses "
-        "violated on that row.")
+        "violated with one type on that row.")
         .def_readonly("bus_id",    &BusQViolationsResult::bus_id)
         .def_readonly("type",      &BusQViolationsResult::type)
         .def_readonly("value",     &BusQViolationsResult::value)
         .def_readonly("limit",     &BusQViolationsResult::limit)
         .def_readonly("count",     &BusQViolationsResult::count)
         .def_readonly("truncated", &BusQViolationsResult::truncated)
-        .def_readonly("capacity",  &BusQViolationsResult::capacity);
+        .def_readonly("capacity",  &BusQViolationsResult::capacity)
+        .def_readonly("stride",    &BusQViolationsResult::stride);
 
     pybind11::class_<HvdcPViolationsResult>(m, "HvdcPViolationsResult",
         "Flat per-row records of the droop hvdc P-saturation check, same layout as "
@@ -265,11 +270,13 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("limit",     &HvdcPViolationsResult::limit)
         .def_readonly("count",     &HvdcPViolationsResult::count)
         .def_readonly("truncated", &HvdcPViolationsResult::truncated)
-        .def_readonly("capacity",  &HvdcPViolationsResult::capacity);
+        .def_readonly("capacity",  &HvdcPViolationsResult::capacity)
+        .def_readonly("stride",    &HvdcPViolationsResult::stride);
 
     pybind11::class_<GenPViolationsResult>(m, "GenPViolationsResult",
         "Flat per-row records of the distributed-slack active-power check, same layout "
-        "as BusQViolationsResult: element_type 5 (GENERATOR) or 6 (STORAGE), element_id "
+        "as BusQViolationsResult (groups LOW_P then HIGH_P, generators and storage units "
+        "ranked together): element_type 5 (GENERATOR) or 6 (STORAGE), element_id "
         "the container id of that family, type 7 (HIGH_P, above max_p) or 8 (LOW_P, "
         "below min_p), value the machine's converged active power (its target plus its "
         "share of the slack, MW, GENERATOR convention for both families) and limit the "
@@ -281,7 +288,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("limit",        &GenPViolationsResult::limit)
         .def_readonly("count",        &GenPViolationsResult::count)
         .def_readonly("truncated",    &GenPViolationsResult::truncated)
-        .def_readonly("capacity",     &GenPViolationsResult::capacity);
+        .def_readonly("capacity",     &GenPViolationsResult::capacity)
+        .def_readonly("stride",       &GenPViolationsResult::stride);
 }
 
 PYBIND11_MODULE(_gpusim2grid, m)
@@ -1359,31 +1367,34 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "Residual tolerance for the fused kernel's DIVERGED check "
                    "(independent of tol_base). Takes effect on the next run().")
     .def_readwrite("violation_capacity", &ContingencyAnalysisSession::violation_capacity_,
-                   "Max violation records kept per contingency (K). Bounds the "
-                   "compact output at n_contingencies * K regardless of grid "
+                   "Violation records kept per contingency AND per type (K): the K "
+                   "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
+                   "|value/limit - 1|, each type sorted most severe first. Bounds "
+                   "the compact output at n_contingencies * 3 * K regardless of grid "
                    "size. Takes effect on the next run(); default 16.")
     .def("get_violation_element_type", &ContingencyAnalysisSession::get_violation_element_type,
-         "(n_contingencies * violation_capacity,) int: 0=BUS,1=LINE,2=TRAFO per slot.")
+         "(n_contingencies * 3 * violation_capacity,) int: 0=BUS,1=LINE,2=TRAFO per slot.")
     .def("get_violation_element_id",   &ContingencyAnalysisSession::get_violation_element_id,
-         "(n_contingencies * violation_capacity,) int: grid-model bus id for BUS "
+         "(n_contingencies * 3 * violation_capacity,) int: grid-model bus id for BUS "
          "(solver numbering); local (own-type, 0-based) id for LINE/TRAFO; -1 for DIVERGED.")
     .def("get_violation_side",         &ContingencyAnalysisSession::get_violation_side,
-         "(n_contingencies * violation_capacity,) int: 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO.")
+         "(n_contingencies * 3 * violation_capacity,) int: 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO.")
     .def("get_violation_type",         &ContingencyAnalysisSession::get_violation_type,
-         "(n_contingencies * violation_capacity,) int: "
+         "(n_contingencies * 3 * violation_capacity,) int: "
          "0=LOW_VOLTAGE,1=HIGH_VOLTAGE,2=CURRENT,3=DIVERGED per slot.")
     .def("get_violation_value",        &ContingencyAnalysisSession::get_violation_value,
-         "(n_contingencies * violation_capacity,) float: value reached "
+         "(n_contingencies * 3 * violation_capacity,) float: value reached "
          "(kV for voltage, kA for current, residual for DIVERGED).")
     .def("get_violation_limit",        &ContingencyAnalysisSession::get_violation_limit,
-         "(n_contingencies * violation_capacity,) float: limit that was "
+         "(n_contingencies * 3 * violation_capacity,) float: limit that was "
          "violated (kV, kA, or tol for DIVERGED).")
     .def("get_violation_count",        &ContingencyAnalysisSession::get_violation_count,
          "(n_contingencies,) int: -1 = not simulated (disconnected/masked-skip), "
-         "else number of valid slots in [0, violation_capacity].")
+         "else number of valid slots in [0, 3 * violation_capacity].")
     .def("get_violation_truncated",    &ContingencyAnalysisSession::get_violation_truncated,
          "(n_contingencies,) int (0/1): 1 if more than violation_capacity "
-         "violations were found for that contingency (clamped).")
+         "violations of one type were found for that contingency (records clamped "
+         "to the most severe; the exact per-type totals are get_violation_count_*()).")
     .def("get_violation_count_low_voltage", &ContingencyAnalysisSession::get_violation_count_low_voltage,
          "(n_contingencies,) int: -1 = not simulated, else the TRUE, uncapped "
          "count of LOW_VOLTAGE violations (independent of violation_capacity, "
@@ -1865,31 +1876,34 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "Residual tolerance for the fused kernel's DIVERGED check "
                    "(independent of tol_base). Takes effect on the next run().")
     .def_readwrite("violation_capacity", &ScenarioSweepSession::violation_capacity_,
-                   "Max violation records kept per scenario (K). Bounds the "
-                   "compact output at n_scenarios * K regardless of grid "
+                   "Violation records kept per scenario AND per type (K): the K "
+                   "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
+                   "|value/limit - 1|, each type sorted most severe first. Bounds "
+                   "the compact output at n_scenarios * 3 * K regardless of grid "
                    "size. Takes effect on the next run(); default 16.")
     .def("get_violation_element_type", &ScenarioSweepSession::get_violation_element_type,
-         "(n_scenarios * violation_capacity,) int: 0=BUS,1=LINE,2=TRAFO per slot.")
+         "(n_scenarios * 3 * violation_capacity,) int: 0=BUS,1=LINE,2=TRAFO per slot.")
     .def("get_violation_element_id",   &ScenarioSweepSession::get_violation_element_id,
-         "(n_scenarios * violation_capacity,) int: grid-model bus id for BUS "
+         "(n_scenarios * 3 * violation_capacity,) int: grid-model bus id for BUS "
          "(solver numbering); local (own-type, 0-based) id for LINE/TRAFO; -1 for DIVERGED.")
     .def("get_violation_side",         &ScenarioSweepSession::get_violation_side,
-         "(n_scenarios * violation_capacity,) int: 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO.")
+         "(n_scenarios * 3 * violation_capacity,) int: 0 for BUS/DIVERGED; 1 or 2 for LINE/TRAFO.")
     .def("get_violation_type",         &ScenarioSweepSession::get_violation_type,
-         "(n_scenarios * violation_capacity,) int: "
+         "(n_scenarios * 3 * violation_capacity,) int: "
          "0=LOW_VOLTAGE,1=HIGH_VOLTAGE,2=CURRENT,3=DIVERGED per slot.")
     .def("get_violation_value",        &ScenarioSweepSession::get_violation_value,
-         "(n_scenarios * violation_capacity,) float: value reached "
+         "(n_scenarios * 3 * violation_capacity,) float: value reached "
          "(kV for voltage, kA for current, residual for DIVERGED).")
     .def("get_violation_limit",        &ScenarioSweepSession::get_violation_limit,
-         "(n_scenarios * violation_capacity,) float: limit that was "
+         "(n_scenarios * 3 * violation_capacity,) float: limit that was "
          "violated (kV, kA, or tol for DIVERGED).")
     .def("get_violation_count",        &ScenarioSweepSession::get_violation_count,
          "(n_scenarios,) int: -1 = not simulated (disconnected/masked-skip), "
-         "else number of valid slots in [0, violation_capacity].")
+         "else number of valid slots in [0, 3 * violation_capacity].")
     .def("get_violation_truncated",    &ScenarioSweepSession::get_violation_truncated,
          "(n_scenarios,) int (0/1): 1 if more than violation_capacity "
-         "violations were found for that scenario (clamped).")
+         "violations of one type were found for that scenario (records clamped "
+         "to the most severe; the exact per-type totals are get_violation_count_*()).")
     .def("get_violation_count_low_voltage", &ScenarioSweepSession::get_violation_count_low_voltage,
          "(n_scenarios,) int: -1 = not simulated, else the TRUE, uncapped "
          "count of LOW_VOLTAGE violations (independent of violation_capacity, "

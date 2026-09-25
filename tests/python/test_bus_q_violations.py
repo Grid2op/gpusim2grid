@@ -30,6 +30,7 @@ needs_bridge = pytest.mark.skipif(
     reason="the reactive-capability plan is built by lightsim2grid through the C++ bridge")
 
 MAX_IT, TOL = 20, 1e-11
+LOW_Q, HIGH_Q = 5, 6     # LimitViolationType
 
 
 # ------------------------------------------------------------------ grids
@@ -174,9 +175,24 @@ def _got_rows(rows):
              for v in row] for row in rows]
 
 
+def _assert_ranked(rows):
+    """gpusim2grid's documented order: LOW_Q records, then HIGH_Q ones, each
+    type sorted by |value - limit|, largest first."""
+    for r, row in enumerate(rows):
+        types = [x[1] for x in row]
+        assert types == sorted(types), f"row {r}: types not grouped LOW_Q then HIGH_Q: {row}"
+        for x, y in zip(row, row[1:]):
+            if x[1] == y[1]:
+                assert abs(x[2] - x[3]) >= abs(y[2] - y[3]), f"row {r}: not most severe first: {row}"
+
+
 def _assert_same(ref, got, atol_mvar):
+    """Same records as lightsim2grid (which reports them in plan order; ours
+    are ranked by type and severity, so compared as sets)."""
     assert len(ref) == len(got)
+    _assert_ranked(got)
     for r, (a, b) in enumerate(zip(ref, got)):
+        a, b = sorted(a), sorted(b)
         assert [x[:2] for x in a] == [x[:2] for x in b], f"row {r}: {a} vs {b}"
         for x, y in zip(a, b):
             np.testing.assert_allclose(y[2], x[2], atol=atol_mvar, err_msg=f"row {r} value")
@@ -353,11 +369,19 @@ def test_capacity_truncation(solver_atol):
     got = ca.get_physical_violations()
     trunc = ca.get_physical_violations_truncated()
     ref_rows = _ref_rows(ref.get_physical_violations(), _me2s(grid))
+    saw_truncation = False
     for r, (a, b) in enumerate(zip(ref_rows, got)):
-        assert len(b) == min(len(a), 1)
-        assert bool(trunc[r]) == (len(a) > 1)
-        if b:
-            assert (b[0].element_id, int(b[0].violation_type)) == a[0][:2]   # plan order kept
+        # capacity 1 is per TYPE: the single most severe LOW_Q and HIGH_Q
+        kept = []
+        for vtype in (LOW_Q, HIGH_Q):
+            of_type = [x for x in a if x[1] == vtype]
+            if of_type:
+                kept.append(max(of_type, key=lambda x: abs(x[2] - x[3]))[:2])
+        assert [(v.element_id, int(v.violation_type)) for v in b] == kept, f"row {r}"
+        n_of = [sum(x[1] == t for x in a) for t in (LOW_Q, HIGH_Q)]
+        assert bool(trunc[r]) == (max(n_of) > 1)
+        saw_truncation |= bool(trunc[r])
+    assert saw_truncation, "the test grid must have a row with several violations of one type"
 
 
 @needs_bridge

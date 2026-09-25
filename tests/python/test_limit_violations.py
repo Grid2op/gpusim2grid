@@ -325,6 +325,67 @@ def test_truncation(ieee14_grid, ieee14_base_case):
 
 
 @requires_gpu
+def test_truncation_keeps_most_severe_per_type(ieee14_grid, ieee14_base_case):
+    """violation_capacity is per TYPE: with several violations of each type,
+    the kept records are, for CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE each, the
+    violation_capacity of largest |value / limit - 1|, most severe first, the
+    types one after the other in that order -- checked against an uncapped
+    run of the same batch."""
+    from gpusim2grid.contingency_analysis import LimitViolationType
+    cont_branch_ids = [[0], [3], [5]]
+    baseline, n_lines, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids)
+    n_branches = baseline._s.n_branches
+    baseline.run()
+    n_bus = ieee14_base_case["n_bus"]
+    V0 = baseline.V_results.to_numpy().reshape(len(cont_branch_ids), n_bus)[0]
+    assert np.all(np.isfinite(V0))
+    vm_kv0 = np.abs(V0) * ieee14_grid.get_bus_vn_kv()
+
+    # even buses: vmax below the solved voltage, odd ones: vmin above it, each
+    # by a different margin (so every row has several of both, no tie)
+    rng = np.random.default_rng(0)
+    bus_vmin_kv = np.full(n_bus, np.nan)
+    bus_vmax_kv = np.full(n_bus, np.nan)
+    even, odd = np.arange(0, n_bus, 2), np.arange(1, n_bus, 2)
+    bus_vmax_kv[even] = vm_kv0[even] * (1. - rng.uniform(0.01, 0.2, even.size))
+    bus_vmin_kv[odd] = vm_kv0[odd] * (1. + rng.uniform(0.01, 0.2, odd.size))
+    # tiny, varied current limits: most branch ends violate
+    limit_a1_ka = rng.uniform(1e-3, 5e-2, n_branches)
+    limit_a2_ka = rng.uniform(1e-3, 5e-2, n_branches)
+
+    def run(capacity):
+        solver, _, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids,
+                                     violation_capacity=capacity)
+        solver.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        solver.compute_limit_violations = True
+        solver.run()
+        return solver
+
+    full = run(n_bus + 2 * n_branches)   # nothing dropped
+    assert not full.get_violations_truncated().any()
+    K = 2
+    capped = run(K)
+    trunc = capped.get_violations_truncated()
+    order = [LimitViolationType.CURRENT, LimitViolationType.LOW_VOLTAGE,
+             LimitViolationType.HIGH_VOLTAGE]
+    sev = lambda v: abs(v.value / v.limit - 1.)
+    key = lambda v: (int(v.element_type), v.element_id, v.side, int(v.violation_type))
+    for r, (all_rows, kept) in enumerate(zip(full.get_violations(), capped.get_violations())):
+        expected, n_of = [], []
+        for t in order:
+            of_type = [v for v in all_rows if v.violation_type == t]
+            n_of.append(len(of_type))
+            expected += sorted(of_type, key=sev, reverse=True)[:K]
+        assert min(n_of) > K, f"row {r}: the test needs more than K violations of each type"
+        assert [key(v) for v in kept] == [key(v) for v in expected], f"row {r}"
+        np.testing.assert_allclose([v.value for v in kept], [v.value for v in expected], rtol=1e-9)
+        assert trunc[r]
+    # the exact per-type totals do not depend on the capacity
+    for name, got in capped.get_violation_counts().items():
+        np.testing.assert_array_equal(got, full.get_violation_counts()[name])
+
+
+@requires_gpu
 def test_compute_limit_violations_clear_on_change(ieee14_grid, ieee14_base_case):
     """Mirrors lightsim2grid's set_compute_limit_violations: no-op if
     unchanged, else clears previous results; get_violation_*() raises after

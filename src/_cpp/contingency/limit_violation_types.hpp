@@ -95,4 +95,15 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
     }
 }
 
+// Record groups per row of each batched check: the kernels keep, for EACH
+// violation type, the `capacity` most severe records (sorted most severe
+// first), so a row's slice of the flat output buffers is
+// N_*_VIOLATION_GROUPS * capacity long (the records themselves packed at its
+// front, group after group, `count` of them). DIVERGENCE (a single record
+// replacing everything else) needs no group of its own.
+constexpr int N_OPERATIONAL_VIOLATION_GROUPS = 3;   // CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE
+constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
+constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
+constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
+
 #endif  // LIMIT_VIOLATION_TYPES_HPP

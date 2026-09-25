@@ -43,6 +43,12 @@ constexpr int VIOL_HIGH_Q       = 6;
 constexpr int VIOL_HIGH_P       = 7;
 constexpr int VIOL_LOW_P        = 8;
 
+// check_limit_violations_kernel's record groups, in output order (one per
+// type; see N_OPERATIONAL_VIOLATION_GROUPS)
+constexpr int GRP_CURRENT      = 0;
+constexpr int GRP_LOW_VOLTAGE  = 1;
+constexpr int GRP_HIGH_VOLTAGE = 2;
+
 // Row gate shared by the two post-solve "physical" checks: a row the solver ran
 // on but that did not converge gets an EMPTY report (upstream parity), never a
 // record. nullptr residuals = no gate (the base-case "n" report).
@@ -53,6 +59,93 @@ __device__ __forceinline__ bool row_not_converged(const cuda_real_type* d_residu
     const cuda_real_type r = d_residuals[out_c];
     return isnan(r) || r > residual_tol;
 }
+
+// Keeps, per violation type ("group"), the K most severe records of ONE row, each
+// group sorted most severe first (see violation_kernels.cuh, "Records kept").
+// While the row is scanned, group g owns slots [base + g*K, base + g*K + K) of
+// the row's exclusive slice; finish() then packs the groups to the front of the
+// slice, in group order, and returns the record count. Severity is recomputed
+// from the stored value/limit (sev), so no key is stored; mv(dst, src) moves
+// the kernel's own extra fields (value/limit are moved here). A candidate is
+// rejected in O(1) once its group is full and it is no more severe than the
+// group's least severe record; ties keep the record seen first (scan order), so
+// the output stays deterministic.
+template <int NG, class Sev, class Move>
+struct TopKByType {
+    ptrdiff_t       base;
+    int             K;
+    cuda_real_type* value;
+    cuda_real_type* limit;
+    Sev             sev;
+    Move            mv;
+    int             cnt[NG];
+    bool            truncated;
+
+    __device__ TopKByType(ptrdiff_t base_, int K_, cuda_real_type* value_,
+                          cuda_real_type* limit_, Sev sev_, Move mv_)
+        : base(base_), K(K_), value(value_), limit(limit_), sev(sev_), mv(mv_), truncated(false)
+    {
+        for (int g = 0; g < NG; ++g) cnt[g] = 0;
+    }
+
+    __device__ void move(ptrdiff_t dst, ptrdiff_t src) {
+        value[dst] = value[src];
+        limit[dst] = limit[src];
+        mv(dst, src);
+    }
+
+    // The slot a record of group g with severity `key` goes to (the records it
+    // outranks already shifted down by one), or -1 to drop it.
+    __device__ ptrdiff_t reserve(int g, cuda_real_type key) {
+        const ptrdiff_t gb = base + static_cast<ptrdiff_t>(g) * K;
+        int n = cnt[g];
+        if (n == K) {
+            truncated = true;
+            if (!(key > sev(value[gb + K - 1], limit[gb + K - 1]))) return -1;
+            n = K - 1;   // the least severe kept record makes room
+        } else {
+            cnt[g] = n + 1;
+        }
+        int pos = n;
+        while (pos > 0 && key > sev(value[gb + pos - 1], limit[gb + pos - 1])) {
+            move(gb + pos, gb + pos - 1);
+            --pos;
+        }
+        return gb + pos;
+    }
+
+    __device__ int finish() {
+        int out = 0;
+        for (int g = 0; g < NG; ++g) {
+            const ptrdiff_t gb = base + static_cast<ptrdiff_t>(g) * K;
+            for (int i = 0; i < cnt[g]; ++i, ++out)
+                if (base + out != gb + i) move(base + out, gb + i);
+        }
+        return out;
+    }
+};
+
+template <int NG, class Sev, class Move>
+__device__ TopKByType<NG, Sev, Move> make_topk(ptrdiff_t base, int K, cuda_real_type* value,
+                                               cuda_real_type* limit, Sev sev, Move mv)
+{
+    return TopKByType<NG, Sev, Move>(base, K, value, limit, sev, mv);
+}
+
+// Severity keys. Voltage and current: how far the ratio value/limit is from 1
+// (|value/limit - 1|, so a LOW_VOLTAGE ranks by how far BELOW its limit it
+// fell) -- a relative measure, so a 400 kV bus does not outrank a 63 kV one
+// by its size alone. The physical checks (MVAr, MW): the absolute excess.
+struct SevRatio {
+    __device__ __forceinline__ cuda_real_type operator()(cuda_real_type value, cuda_real_type limit) const {
+        return fabs(value / limit - cuda_real_type(1));
+    }
+};
+struct SevAbs {
+    __device__ __forceinline__ cuda_real_type operator()(cuda_real_type value, cuda_real_type limit) const {
+        return fabs(value - limit);
+    }
+};
 
 }  // namespace
 
@@ -104,27 +197,32 @@ __global__ void check_limit_violations_kernel(
     // base widened to ptrdiff_t: out_c * K (this contingency's output slice
     // offset) is the same at-risk product as fill_J_kernel's own J_base once
     // n_contingencies * K grows large.
-    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * K;
-    int  cnt       = 0;      // DETAIL records written so far, capped at K
-    bool truncated = false;
+    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_OPERATIONAL_VIOLATION_GROUPS * K);
     // TRUE, uncapped per-type totals -- incremented on every violation found,
-    // independent of whether a detail record could still be written.
+    // independent of whether a detail record could still be kept.
     int n_low = 0, n_high = 0, n_current = 0;
 
-    // Local (single-thread-owned, no atomics needed) push into this
-    // contingency's exclusive output slice. Silently stops writing DETAIL
-    // records past K (sets `truncated`); callers still bump the relevant
-    // n_low/n_high/n_current counter themselves regardless of this return.
-    auto push = [&](int etype, int eid, int side, int vtype,
+    // The K most severe records of each type (groups: GRP_CURRENT,
+    // GRP_LOW_VOLTAGE, GRP_HIGH_VOLTAGE), in this contingency's exclusive
+    // output slice -- single-thread-owned, no atomics.
+    auto topk = make_topk<N_OPERATIONAL_VIOLATION_GROUPS>(
+        base, K, d_out_value, d_out_limit, SevRatio{},
+        [&](ptrdiff_t dst, ptrdiff_t src) {
+            d_out_element_type[dst] = d_out_element_type[src];
+            d_out_element_id[dst]   = d_out_element_id[src];
+            d_out_side[dst]         = d_out_side[src];
+            d_out_type[dst]         = d_out_type[src];
+        });
+    auto push = [&](int group, int etype, int eid, int side, int vtype,
                     cuda_real_type value, cuda_real_type limit) {
-        if (cnt >= K) { truncated = true; return; }
-        d_out_element_type[base + cnt] = etype;
-        d_out_element_id[base + cnt]   = eid;
-        d_out_side[base + cnt]         = side;
-        d_out_type[base + cnt]         = vtype;
-        d_out_value[base + cnt]        = value;
-        d_out_limit[base + cnt]        = limit;
-        ++cnt;
+        const ptrdiff_t at = topk.reserve(group, SevRatio{}(value, limit));
+        if (at < 0) return;
+        d_out_element_type[at] = etype;
+        d_out_element_id[at]   = eid;
+        d_out_side[at]         = side;
+        d_out_type[at]         = vtype;
+        d_out_value[at]        = value;
+        d_out_limit[at]        = limit;
     };
 
     // ---- 1. DIVERGENCE --------------------------------------------------
@@ -138,8 +236,13 @@ __global__ void check_limit_violations_kernel(
     // session layer instead -- see this file's own top-of-file note).
     const cuda_real_type residual = d_residuals[out_c];
     if (isnan(residual) || residual > tol) {
-        push(ELEM_GRID, -1, 0, VIOL_DIVERGENCE, residual, tol);
-        d_out_count[out_c]              = cnt;
+        d_out_element_type[base] = ELEM_GRID;
+        d_out_element_id[base]   = -1;
+        d_out_side[base]         = 0;
+        d_out_type[base]         = VIOL_DIVERGENCE;
+        d_out_value[base]        = residual;
+        d_out_limit[base]        = tol;
+        d_out_count[out_c]              = 1;
         d_out_truncated[out_c]          = 0;
         d_out_count_low_voltage[out_c]  = 0;
         d_out_count_high_voltage[out_c] = 0;
@@ -149,8 +252,8 @@ __global__ void check_limit_violations_kernel(
 
     // ---- 2. Branch current (checked first: thermal/current violations are
     // generally first-order operational concerns, voltage second-order) ----
-    // Scans every branch regardless of `truncated` so n_current stays exact
-    // even once the K-slot detail buffer is full.
+    // Scans every branch whatever is already kept, so n_current stays exact
+    // (and the kept records are the most severe ones).
     const int t_start = d_trip_start ? d_trip_start[slot_global] : 0;
     const int t_count = d_trip_count ? d_trip_count[slot_global] : 0;
     for (int l = 0; l < n_branches; ++l) {
@@ -188,12 +291,12 @@ __global__ void check_limit_violations_kernel(
 
         const int etype = (l < n_lines) ? ELEM_LINE : ELEM_TRAFO;
         const int eid    = (l < n_lines) ? l : (l - n_lines);
-        if (!isnan(lim1) && ka_or > lim1) { ++n_current; push(etype, eid, 1, VIOL_CURRENT, ka_or, lim1); }
-        if (!isnan(lim2) && ka_ex > lim2) { ++n_current; push(etype, eid, 2, VIOL_CURRENT, ka_ex, lim2); }
+        if (!isnan(lim1) && ka_or > lim1) { ++n_current; push(GRP_CURRENT, etype, eid, 1, VIOL_CURRENT, ka_or, lim1); }
+        if (!isnan(lim2) && ka_ex > lim2) { ++n_current; push(GRP_CURRENT, etype, eid, 2, VIOL_CURRENT, ka_ex, lim2); }
     }
 
     // ---- 3. Bus voltage --------------------------------------------------
-    // Scans every bus regardless of `truncated`, same reason as above.
+    // Scans every bus, same reason as above.
     for (int b = 0; b < n_bus; ++b) {
         const cuda_real_type vmin = d_bus_vmin_kv[b];
         const cuda_real_type vmax = d_bus_vmax_kv[b];
@@ -206,15 +309,15 @@ __global__ void check_limit_violations_kernel(
         const cuda_real_type vm_kv = CudaFunHelper::my_cuCabs(Vb) * d_bus_vn_kv[b];
         if (!isnan(vmin) && vm_kv < vmin) {
             ++n_low;
-            push(ELEM_BUS, b, 0, VIOL_LOW_VOLTAGE, vm_kv, vmin);
+            push(GRP_LOW_VOLTAGE, ELEM_BUS, b, 0, VIOL_LOW_VOLTAGE, vm_kv, vmin);
         } else if (!isnan(vmax) && vm_kv > vmax) {
             ++n_high;
-            push(ELEM_BUS, b, 0, VIOL_HIGH_VOLTAGE, vm_kv, vmax);
+            push(GRP_HIGH_VOLTAGE, ELEM_BUS, b, 0, VIOL_HIGH_VOLTAGE, vm_kv, vmax);
         }
     }
 
-    d_out_count[out_c]              = cnt;
-    d_out_truncated[out_c]          = truncated ? 1 : 0;
+    d_out_count[out_c]              = topk.finish();
+    d_out_truncated[out_c]          = topk.truncated ? 1 : 0;
     d_out_count_low_voltage[out_c]  = n_low;
     d_out_count_high_voltage[out_c] = n_high;
     d_out_count_current[out_c]      = n_current;
@@ -264,7 +367,7 @@ __global__ void check_bus_q_violations_kernel(
 
     const int slot_global = c_start + static_cast<int>(local_c);
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
-    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * K;
+    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_BUS_Q_VIOLATION_GROUPS * K);
 
     if (row_not_converged(d_residuals, out_c, residual_tol)) {
         d_out_count[out_c]     = 0;
@@ -277,15 +380,20 @@ __global__ void check_bus_q_violations_kernel(
     const cudaComplexType* Sb = d_Sbus  + local_c * sbus_stride;
     const unsigned char*   off = d_gen_off ? d_gen_off + static_cast<ptrdiff_t>(out_c) * n_gen : nullptr;
 
-    int  cnt       = 0;
-    bool truncated = false;
-    auto push = [&](int bus, int vtype, cuda_real_type value, cuda_real_type limit) {
-        if (cnt >= K) { truncated = true; return; }
-        d_out_bus_id[base + cnt] = bus;
-        d_out_type[base + cnt]   = vtype;
-        d_out_value[base + cnt]  = value;
-        d_out_limit[base + cnt]  = limit;
-        ++cnt;
+    // the K largest excesses of each type (groups: LOW_Q, then HIGH_Q)
+    auto topk = make_topk<N_BUS_Q_VIOLATION_GROUPS>(
+        base, K, d_out_value, d_out_limit, SevAbs{},
+        [&](ptrdiff_t dst, ptrdiff_t src) {
+            d_out_bus_id[dst] = d_out_bus_id[src];
+            d_out_type[dst]   = d_out_type[src];
+        });
+    auto push = [&](int group, int bus, int vtype, cuda_real_type value, cuda_real_type limit) {
+        const ptrdiff_t at = topk.reserve(group, SevAbs{}(value, limit));
+        if (at < 0) return;
+        d_out_bus_id[at] = bus;
+        d_out_type[at]   = vtype;
+        d_out_value[at]  = value;
+        d_out_limit[at]  = limit;
     };
     auto finite_or_zero = [](cudaComplexType v) -> cudaComplexType {
         if (!isfinite(v.x) || !isfinite(v.y))
@@ -324,14 +432,14 @@ __global__ void check_bus_q_violations_kernel(
         if (!isfinite(q_bus)) continue;
 
         if (isfinite(q_min) && q_bus < q_min - tol_mvar) {
-            push(b, VIOL_LOW_Q, q_bus, q_min);
+            push(0, b, VIOL_LOW_Q, q_bus, q_min);
         } else if (isfinite(q_max) && q_bus > q_max + tol_mvar) {
-            push(b, VIOL_HIGH_Q, q_bus, q_max);
+            push(1, b, VIOL_HIGH_Q, q_bus, q_max);
         }
     }
 
-    d_out_count[out_c]     = cnt;
-    d_out_truncated[out_c] = truncated ? 1 : 0;
+    d_out_count[out_c]     = topk.finish();
+    d_out_truncated[out_c] = topk.truncated ? 1 : 0;
 }
 
 // =============================================================================
@@ -370,7 +478,7 @@ __global__ void check_hvdc_p_violations_kernel(
 
     const int slot_global = c_start + static_cast<int>(local_c);
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
-    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * K;
+    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_HVDC_P_VIOLATION_GROUPS * K);
 
     if (row_not_converged(d_residuals, out_c, residual_tol)) {
         d_out_count[out_c]     = 0;
@@ -379,15 +487,20 @@ __global__ void check_hvdc_p_violations_kernel(
     }
 
     const cudaComplexType* V = d_V + local_c * n_bus;
-    int  cnt       = 0;
-    bool truncated = false;
+    // the K largest excesses (one type: HIGH_P, either side)
+    auto topk = make_topk<N_HVDC_P_VIOLATION_GROUPS>(
+        base, K, d_out_value, d_out_limit, SevAbs{},
+        [&](ptrdiff_t dst, ptrdiff_t src) {
+            d_out_hvdc_id[dst] = d_out_hvdc_id[src];
+            d_out_side[dst]    = d_out_side[src];
+        });
     auto push = [&](int hid, int side, cuda_real_type value, cuda_real_type limit) {
-        if (cnt >= K) { truncated = true; return; }
-        d_out_hvdc_id[base + cnt] = hid;
-        d_out_side[base + cnt]    = side;
-        d_out_value[base + cnt]   = value;
-        d_out_limit[base + cnt]   = limit;
-        ++cnt;
+        const ptrdiff_t at = topk.reserve(0, SevAbs{}(value, limit));
+        if (at < 0) return;
+        d_out_hvdc_id[at] = hid;
+        d_out_side[at]    = side;
+        d_out_value[at]   = value;
+        d_out_limit[at]   = limit;
     };
 
     for (int e = 0; e < n_hvdc; ++e) {
@@ -411,8 +524,8 @@ __global__ void check_hvdc_p_violations_kernel(
         }
     }
 
-    d_out_count[out_c]     = cnt;
-    d_out_truncated[out_c] = truncated ? 1 : 0;
+    d_out_count[out_c]     = topk.finish();
+    d_out_truncated[out_c] = topk.truncated ? 1 : 0;
 }
 
 
@@ -477,7 +590,7 @@ __global__ void check_gen_p_violations_kernel(
 
     const int slot_global = c_start + static_cast<int>(local_c);
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
-    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * K;
+    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_GEN_P_VIOLATION_GROUPS * K);
 
     d_out_count[out_c]     = 0;
     d_out_truncated[out_c] = 0;
@@ -522,16 +635,23 @@ __global__ void check_gen_p_violations_kernel(
     }
     if (!(fabs(total_raw_w) > eps)) return;
 
-    int  cnt       = 0;
-    bool truncated = false;
-    auto push = [&](int etype, int eid, int vtype, cuda_real_type value, cuda_real_type limit) {
-        if (cnt >= K) { truncated = true; return; }
-        d_out_element_type[base + cnt] = etype;
-        d_out_element_id[base + cnt]   = eid;
-        d_out_type[base + cnt]         = vtype;
-        d_out_value[base + cnt]        = value;
-        d_out_limit[base + cnt]        = limit;
-        ++cnt;
+    // the K largest excesses of each type (groups: LOW_P, then HIGH_P),
+    // generators and storage units ranked together
+    auto topk = make_topk<N_GEN_P_VIOLATION_GROUPS>(
+        base, K, d_out_value, d_out_limit, SevAbs{},
+        [&](ptrdiff_t dst, ptrdiff_t src) {
+            d_out_element_type[dst] = d_out_element_type[src];
+            d_out_element_id[dst]   = d_out_element_id[src];
+            d_out_type[dst]         = d_out_type[src];
+        });
+    auto push = [&](int group, int etype, int eid, int vtype, cuda_real_type value, cuda_real_type limit) {
+        const ptrdiff_t at = topk.reserve(group, SevAbs{}(value, limit));
+        if (at < 0) return;
+        d_out_element_type[at] = etype;
+        d_out_element_id[at]   = eid;
+        d_out_type[at]         = vtype;
+        d_out_value[at]        = value;
+        d_out_limit[at]        = limit;
     };
 
     for (int k = 0; k < n_entries; ++k) {
@@ -588,12 +708,12 @@ __global__ void check_gen_p_violations_kernel(
         const cuda_real_type pmin = d_min_p[k];
         const cuda_real_type pmax = d_max_p[k];
         if (isfinite(pmin) && p_mw < pmin - tol_mw) {
-            push(etype, eid, VIOL_LOW_P, p_mw, pmin);
+            push(0, etype, eid, VIOL_LOW_P, p_mw, pmin);
         } else if (isfinite(pmax) && p_mw > pmax + tol_mw) {
-            push(etype, eid, VIOL_HIGH_P, p_mw, pmax);
+            push(1, etype, eid, VIOL_HIGH_P, p_mw, pmax);
         }
     }
 
-    d_out_count[out_c]     = cnt;
-    d_out_truncated[out_c] = truncated ? 1 : 0;
+    d_out_count[out_c]     = topk.finish();
+    d_out_truncated[out_c] = topk.truncated ? 1 : 0;
 }
