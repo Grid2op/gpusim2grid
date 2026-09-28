@@ -213,31 +213,41 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "regulate (reg_bus_solver) and its own (gen_bus_solver), at_min (1 = at min_q, "
         "reported when the regulated voltage is BELOW the target; 0 = at max_q, reported "
         "when ABOVE), the grid's target_vm_pu and the nominal kV of the regulated bus "
-        "(value / limit are reported in kV).")
+        "(value / limit are reported in kV).\n\n"
+        "The same plan routes lightsim2grid's standby SVC check: el_type (optional, "
+        "empty = every entry a generator) says 5 for a GENERATOR entry and 7 for an "
+        "SVC one. An idle SVC flagged as carrying a standby automaton "
+        "(LSGrid.set_svc_standby) is two SVC entries, gen_id its svc id: at_min = 1 "
+        "with target_vm_pu its low threshold, at_min = 0 with its high one, reported "
+        "as LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY on the SVC.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> gen_id,
                                Eigen::Ref<const Eigen::VectorXi> reg_bus_solver,
                                Eigen::Ref<const Eigen::VectorXi> gen_bus_solver,
                                Eigen::Ref<const Eigen::VectorXi> at_min,
                                Eigen::Ref<const RealVect> target_vm_pu,
-                               Eigen::Ref<const RealVect> vn_kv) {
+                               Eigen::Ref<const RealVect> vn_kv,
+                               Eigen::Ref<const Eigen::VectorXi> el_type) {
                  GenPvReleasePlanData p;
                  p.n_entries = static_cast<int>(gen_id.size());
                  p.gen_id = gen_id; p.reg_bus_solver = reg_bus_solver;
                  p.gen_bus_solver = gen_bus_solver; p.at_min = at_min;
                  p.target_vm_pu = target_vm_pu; p.vn_kv = vn_kv;
+                 p.el_type = el_type;
                  return p;
              }),
              pybind11::arg("gen_id"), pybind11::arg("reg_bus_solver"),
              pybind11::arg("gen_bus_solver"), pybind11::arg("at_min"),
-             pybind11::arg("target_vm_pu"), pybind11::arg("vn_kv"))
+             pybind11::arg("target_vm_pu"), pybind11::arg("vn_kv"),
+             pybind11::arg("el_type") = Eigen::VectorXi())
         .def_readonly("n_entries",      &GenPvReleasePlanData::n_entries)
         .def_readonly("gen_id",         &GenPvReleasePlanData::gen_id)
         .def_readonly("reg_bus_solver", &GenPvReleasePlanData::reg_bus_solver)
         .def_readonly("gen_bus_solver", &GenPvReleasePlanData::gen_bus_solver)
         .def_readonly("at_min",         &GenPvReleasePlanData::at_min)
         .def_readonly("target_vm_pu",   &GenPvReleasePlanData::target_vm_pu)
-        .def_readonly("vn_kv",          &GenPvReleasePlanData::vn_kv);
+        .def_readonly("vn_kv",          &GenPvReleasePlanData::vn_kv)
+        .def_readonly("el_type",        &GenPvReleasePlanData::el_type);
 
     pybind11::class_<SlackRedistributionData>(m, "SlackRedistributionData",
         "The distributed-slack participants of the redistribute_slack pre-pass "

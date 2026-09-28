@@ -16,6 +16,10 @@
 #include <batch_algorithm/GenPvReleaseCheck.hpp>   // ls2g::gen_pv_release_check (lightsim2grid PR #216)
 #define GPUSIM2GRID_HAVE_LS2G_GEN_PV_RELEASE 1
 #endif
+#if __has_include(<batch_algorithm/SvcStandbyCheck.hpp>)
+#include <batch_algorithm/SvcStandbyCheck.hpp>   // ls2g::svc_standby_check (LSGrid::set_svc_standby)
+#define GPUSIM2GRID_HAVE_LS2G_SVC_STANDBY 1
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -1062,7 +1066,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     ls2g::gen_pv_release_check::build_gen_pv_release_plan(
         grid, grid.id_me_to_ac_solver(), static_cast<ls2g::real_type>(tol_mva), plan);
 
-    std::vector<int>    gen_id, reg_bus, gen_bus, at_min;
+    std::vector<int>    gen_id, reg_bus, gen_bus, at_min, el_type;
     std::vector<double> target, vn;
     for (const ls2g::gen_pv_release_check::GenPvReleaseEntry& e : plan.gens) {
         if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;   // not in the solved system
@@ -1073,7 +1077,29 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
         at_min.push_back(e.at_min ? 1 : 0);
         target.push_back(static_cast<double>(e.target_vm_pu));
         vn.push_back(static_cast<double>(e.vn_kv));
+        el_type.push_back(GenPvReleasePlanData::EL_GENERATOR);
     }
+#ifdef GPUSIM2GRID_HAVE_LS2G_SVC_STANDBY
+    // the idle standby SVCs the caller flagged (LSGrid::set_svc_standby), lightsim2grid's
+    // own selection: two entries each, the low threshold reported below and the high
+    // one above -- the release test (see gen_pv_release_check_data.hpp)
+    ls2g::svc_standby_check::SvcStandbyPlan svc_plan;
+    ls2g::svc_standby_check::build_svc_standby_plan(grid, grid.id_me_to_ac_solver(), svc_plan);
+    for (const ls2g::svc_standby_check::SvcStandbyEntry& e : svc_plan.svcs) {
+        if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;
+        if (e.svc_bus_solver < 0 || e.svc_bus_solver >= n_bus_solver) continue;
+        for (int side = 0; side < 2; ++side) {
+            const bool low = (side == 0);
+            gen_id.push_back(e.svc_id);
+            reg_bus.push_back(e.reg_bus_solver);
+            gen_bus.push_back(e.svc_bus_solver);
+            at_min.push_back(low ? 1 : 0);
+            target.push_back(static_cast<double>(low ? e.low_vm_pu : e.high_vm_pu));
+            vn.push_back(static_cast<double>(e.vn_kv));
+            el_type.push_back(GenPvReleasePlanData::EL_SVC);
+        }
+    }
+#endif
     auto iv = [](const std::vector<int>& v) { return Eigen::VectorXi::Map(v.data(), static_cast<Eigen::Index>(v.size())).eval(); };
     auto rv = [](const std::vector<double>& v) {
         RealVect r(static_cast<Eigen::Index>(v.size()));
@@ -1088,6 +1114,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     out.at_min         = iv(at_min);
     out.target_vm_pu   = rv(target);
     out.vn_kv          = rv(vn);
+    out.el_type        = iv(el_type);
     out.validate(n_bus_solver);
     return out;
 #else

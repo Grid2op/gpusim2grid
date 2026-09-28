@@ -23,6 +23,8 @@ constexpr int ELEM_GRID  = 3;
 // compute_physical_violations (check_gen_p_violations_kernel)
 constexpr int ELEM_GENERATOR = 5;
 constexpr int ELEM_STORAGE   = 6;
+// the standby SVC entries of the release plan (check_gen_pv_release_violations_kernel)
+constexpr int ELEM_SVC       = 7;
 
 constexpr int VIOL_LOW_VOLTAGE  = 0;
 constexpr int VIOL_HIGH_VOLTAGE = 1;
@@ -45,6 +47,9 @@ constexpr int VIOL_LOW_P        = 8;
 // compute_physical_violations (check_gen_pv_release_violations_kernel)
 constexpr int VIOL_LOW_VOLTAGE_AT_MIN_Q  = 9;
 constexpr int VIOL_HIGH_VOLTAGE_AT_MAX_Q = 10;
+// the standby SVC check, on the SVC entries of the same plan (see limit_violation_types.hpp)
+constexpr int VIOL_LOW_VOLTAGE_SVC_STANDBY  = 11;
+constexpr int VIOL_HIGH_VOLTAGE_SVC_STANDBY = 12;
 
 // check_limit_violations_kernel's record groups, in output order (one per
 // type; see N_OPERATIONAL_VIOLATION_GROUPS)
@@ -551,6 +556,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const int*             __restrict__ d_at_min,
     const cuda_real_type*  __restrict__ d_target_base,
     const cuda_real_type*  __restrict__ d_vn_kv,
+    const int*             __restrict__ d_el_type,
     const unsigned char*   __restrict__ d_gen_off,
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,
@@ -582,7 +588,8 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cudaComplexType* V = d_V + local_c * n_bus;
     const unsigned char* off = d_gen_off ? d_gen_off + static_cast<ptrdiff_t>(out_c) * n_gen : nullptr;
     const cuda_real_type* tgt = d_targets ? d_targets + static_cast<ptrdiff_t>(out_c) * target_stride : nullptr;
-    // groups: LOW_VOLTAGE_AT_MIN_Q (0), HIGH_VOLTAGE_AT_MAX_Q (1)
+    // groups: LOW_VOLTAGE_AT_MIN_Q (0), HIGH_VOLTAGE_AT_MAX_Q (1) on the generators,
+    // LOW_VOLTAGE_SVC_STANDBY (2), HIGH_VOLTAGE_SVC_STANDBY (3) on the SVCs
     auto topk = make_topk<N_GEN_PV_RELEASE_VIOLATION_GROUPS>(
         base, K, d_out_value, d_out_limit, SevRatio{},
         [&](ptrdiff_t dst, ptrdiff_t src) {
@@ -600,13 +607,15 @@ __global__ void check_gen_pv_release_violations_kernel(
 
     for (int k = 0; k < n_entries; ++k) {
         const int gid = d_gen_id[k];
-        if (off != nullptr && gid < n_gen && off[gid]) continue;   // disconnected by the row
+        // an SVC entry: no row disconnects it nor moves its thresholds
+        const bool is_svc = (d_el_type != nullptr) && (d_el_type[k] == ELEM_SVC);
+        if (!is_svc && off != nullptr && gid < n_gen && off[gid]) continue;   // disconnected by the row
         const cudaComplexType Vr = V[d_reg_bus[k]];
         const cudaComplexType Vg = V[d_gen_bus[k]];
         // masked (stranded) regulated bus or own bus: nothing to release
         if (!isfinite(Vr.x) || !isfinite(Vr.y) || !isfinite(Vg.x) || !isfinite(Vg.y)) continue;
         cuda_real_type target = d_target_base[k];
-        if (tgt != nullptr) {
+        if (!is_svc && tgt != nullptr) {
             const cuda_real_type t_row = tgt[k];
             if (!isnan(t_row)) target = t_row;
         }
@@ -614,11 +623,15 @@ __global__ void check_gen_pv_release_violations_kernel(
         const cuda_real_type vm = CudaFunHelper::my_cuCabs(Vr);
         const cuda_real_type vn = d_vn_kv[k];
         if (d_at_min[k]) {
-            // absorbing all it can, still below the target: absorbs too much
-            if (vm < target - tol_vm_pu)
-                push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, vm * vn, target * vn);
+            // a generator absorbing all it can, still below the target: absorbs too
+            // much; an idle SVC below its low threshold: its automaton switches it on
+            if (vm < target - tol_vm_pu) {
+                if (is_svc) push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, vm * vn, target * vn);
+                else        push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, vm * vn, target * vn);
+            }
         } else if (vm > target + tol_vm_pu) {
-            push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, vm * vn, target * vn);
+            if (is_svc) push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, vm * vn, target * vn);
+            else        push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, vm * vn, target * vn);
         }
     }
 

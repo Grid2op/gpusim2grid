@@ -37,8 +37,10 @@
 // check walks both). A storage unit's value/limit are in the GENERATOR
 // convention (positive = injected), like an IIDM battery's own min_p/max_p and
 // unlike the LOAD-convention target_p_mw lightsim2grid stores for it.
+// SVC (=7): an idle SVC carrying a standby automaton that the voltage of the
+// bus it regulates would switch on (lightsim2grid's SvcStandbyCheck.hpp).
 enum class ViolationElementType : int {
-    BUS = 0, LINE = 1, TRAFO = 2, GRID = 3, HVDC = 4, GENERATOR = 5, STORAGE = 6
+    BUS = 0, LINE = 1, TRAFO = 2, GRID = 3, HVDC = 4, GENERATOR = 5, STORAGE = 6, SVC = 7
 };
 enum class LimitViolationType  : int {
     LOW_VOLTAGE = 0, HIGH_VOLTAGE = 1, CURRENT = 2,
@@ -76,7 +78,17 @@ enum class LimitViolationType  : int {
     // the target, both in kV. Written by check_gen_pv_release_violations_kernel.
     LOW_VOLTAGE_AT_MIN_Q = 9,
     // ... and the mirror: pinned at its MAXIMUM, regulated bus ABOVE the target.
-    HIGH_VOLTAGE_AT_MAX_Q = 10
+    HIGH_VOLTAGE_AT_MAX_Q = 10,
+    // A non-regulating SVC the caller flagged as left idle under its standby
+    // automaton (lightsim2grid's LSGrid::set_svc_standby) whose regulated bus
+    // sits BELOW the automaton's low threshold: OpenLoadFlow's
+    // MonitoringVoltageOuterLoop would switch it to voltage control.
+    // element_type SVC, element_id the svc id, value the regulated bus'
+    // voltage and limit the threshold, both in kV. Written by
+    // check_gen_pv_release_violations_kernel (the SVC entries of its plan).
+    LOW_VOLTAGE_SVC_STANDBY = 11,
+    // ... and the mirror: regulated bus ABOVE the high threshold.
+    HIGH_VOLTAGE_SVC_STANDBY = 12
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -85,7 +97,8 @@ enum class LimitViolationType  : int {
 //   PHYSICAL    : a limit of the equipment itself, which nothing can leave: the
 //                 converged solution is not physically realizable (LOW_Q,
 //                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
-//                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q).
+//                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
+//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
 enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
 
@@ -102,6 +115,8 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::LOW_P:
         case LimitViolationType::LOW_VOLTAGE_AT_MIN_Q:
         case LimitViolationType::HIGH_VOLTAGE_AT_MAX_Q:
+        case LimitViolationType::LOW_VOLTAGE_SVC_STANDBY:
+        case LimitViolationType::HIGH_VOLTAGE_SVC_STANDBY:
             return ViolationCategory::PHYSICAL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;
@@ -118,6 +133,8 @@ constexpr int N_OPERATIONAL_VIOLATION_GROUPS = 3;   // CURRENT, LOW_VOLTAGE, HIG
 constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
 constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
 constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
-constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 2; // LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q
+// LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q (generators), then
+// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan)
+constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 4;
 
 #endif  // LIMIT_VIOLATION_TYPES_HPP

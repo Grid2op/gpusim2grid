@@ -43,6 +43,21 @@
 //   target_vm_pu   the grid's own target (a row may hand its own)
 //   vn_kv          nominal voltage of the regulated bus (value / limit in kV)
 //
+//   el_type        OPTIONAL (empty = every entry a GENERATOR): the kind of
+//                  element, 5 = GENERATOR, 7 = SVC (ViolationElementType).
+//
+// The same plan also routes lightsim2grid's standby SVC check
+// (SvcStandbyCheck.hpp): an idle SVC flagged as carrying a standby automaton
+// (LSGrid::set_svc_standby), which OpenLoadFlow's MonitoringVoltageOuterLoop
+// switches to voltage control once the voltage of the bus it regulates leaves
+// the automaton's [low, high] thresholds. Such an SVC is TWO entries of
+// el_type SVC, gen_id its svc id: one at_min = 1 with target_vm_pu the low
+// threshold, one at_min = 0 with the high one -- exactly the release test,
+// reported as LOW_VOLTAGE_SVC_STANDBY (11) / HIGH_VOLTAGE_SVC_STANDBY (12) on
+// the SVC. No row varies an SVC's thresholds (a row's own targets are
+// ignored for them) and no contingency disconnects one (the generator mask
+// does not apply).
+//
 // Deliberately NOT carried, compared to lightsim2grid's plan: the grid bus id
 // of the regulated bus and the element names (gpusim2grid's records carry
 // neither).
@@ -60,15 +75,21 @@
 #include "../dtypes.hpp"
 
 struct GenPvReleasePlanData {
+    // ViolationElementType codes of the entries (limit_violation_types.hpp)
+    static constexpr int EL_GENERATOR = 5;
+    static constexpr int EL_SVC       = 7;
+
     int             n_entries = 0;
-    Eigen::VectorXi gen_id;          // [n_entries]
+    Eigen::VectorXi gen_id;          // [n_entries] generator id, or svc id for an SVC entry
     Eigen::VectorXi reg_bus_solver;  // [n_entries]
     Eigen::VectorXi gen_bus_solver;  // [n_entries]
     Eigen::VectorXi at_min;          // [n_entries] 1 = at min_q, 0 = at max_q
     RealVect        target_vm_pu;    // [n_entries] the grid's own target
     RealVect        vn_kv;           // [n_entries] nominal kV of the regulated bus
+    Eigen::VectorXi el_type;         // [n_entries] EL_GENERATOR / EL_SVC, or empty = all generators
 
     bool empty() const { return n_entries == 0; }
+    bool is_svc(int k) const { return el_type.size() != 0 && el_type(k) == EL_SVC; }
 
     // Structural checks only (sizes / index ranges); throws std::runtime_error.
     void validate(int n_bus) const {
@@ -89,6 +110,7 @@ struct GenPvReleasePlanData {
         need(at_min.size(),         "at_min");
         need(target_vm_pu.size(),   "target_vm_pu");
         need(vn_kv.size(),          "vn_kv");
+        if (el_type.size() != 0) need(el_type.size(), "el_type");
         for (int k = 0; k < n_entries; ++k) {
             std::ostringstream m;
             if (gen_id(k) < 0) {
@@ -102,6 +124,11 @@ struct GenPvReleasePlanData {
             }
             if (at_min(k) != 0 && at_min(k) != 1) {
                 m << "at_min[" << k << "] must be 0 or 1";
+                fail(m.str());
+            }
+            if (el_type.size() != 0 && el_type(k) != EL_GENERATOR && el_type(k) != EL_SVC) {
+                m << "el_type[" << k << "] must be " << EL_GENERATOR << " (GENERATOR) or "
+                  << EL_SVC << " (SVC)";
                 fail(m.str());
             }
             if (!std::isfinite(static_cast<double>(target_vm_pu(k))) ||

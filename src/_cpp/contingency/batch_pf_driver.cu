@@ -1011,7 +1011,7 @@ void BatchPfDriver<BatchSource>::set_gen_pv_release_check(
         throw std::runtime_error("BatchPfDriver::set_gen_pv_release_check: tol_vm_pu must be a finite, non-negative number.");
     if (d_gen_off != nullptr && n_gen > 0)
         for (int k = 0; k < plan.n_entries; ++k)
-            if (plan.gen_id(k) >= n_gen)
+            if (!plan.is_svc(k) && plan.gen_id(k) >= n_gen)
                 throw std::runtime_error(
                     "BatchPfDriver::set_gen_pv_release_check: a generator id of the plan is outside "
                     "the generator-contingency mask's columns.");
@@ -1031,6 +1031,12 @@ void BatchPfDriver<BatchSource>::set_gen_pv_release_check(
     to_dev_i(d_gr_at_min,      plan.at_min);
     to_dev_r(d_gr_target_base, plan.target_vm_pu);
     to_dev_r(d_gr_vn_kv,       plan.vn_kv);
+    if (plan.el_type.size() != 0) {
+        to_dev_i(d_gr_el_type, plan.el_type);
+    } else {
+        d_gr_el_type.clear();
+        d_gr_el_type.shrink_to_fit();
+    }
 
     // per-row targets uploaded for another plan no longer line up
     if (gen_pv_release_target_stride_ != 0 && gen_pv_release_target_stride_ != plan.n_entries) {
@@ -1113,6 +1119,7 @@ void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
         thrust::raw_pointer_cast(d_gr_at_min.data()),
         thrust::raw_pointer_cast(d_gr_target_base.data()),
         thrust::raw_pointer_cast(d_gr_vn_kv.data()),
+        d_gr_el_type.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_el_type.data()),
         /*d_gen_off=*/nullptr, /*n_gen=*/0,
         /*d_targets=*/nullptr, /*target_stride=*/0,
         gen_pv_release_tol_vm_pu_,
@@ -1638,6 +1645,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_gr_at_min.data()),
             thrust::raw_pointer_cast(d_gr_target_base.data()),
             thrust::raw_pointer_cast(d_gr_vn_kv.data()),
+            d_gr_el_type.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_el_type.data()),
             d_gr_gen_off_, gen_pv_release_n_gen_,
             has_gen_pv_release_targets() ? thrust::raw_pointer_cast(d_gr_targets.data()) : nullptr,
             gen_pv_release_target_stride_,

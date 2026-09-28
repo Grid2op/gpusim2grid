@@ -10,7 +10,7 @@ has ``category == ViolationCategory.PHYSICAL`` -- the converged solution
 assumes a control the equipment cannot hold -- and the next physical limit
 needs no new flag.
 
-Today the category holds four checks, all detection-only (no bus is switched
+Today the category holds five checks, all detection-only (no bus is switched
 PV -> PQ or back, no line is saturated, no machine is taken out of the slack,
 no row is re-solved):
 
@@ -24,6 +24,16 @@ no row is re-solved):
   regulate again. Only generators flagged with lightsim2grid's
   ``LSGrid.set_gen_can_be_pv`` are candidates (``init_from_pypowsybl``'s
   ``can_be_pv``); value / limit in kV, compared with
+  ``physical_violation_tol_vm_pu``;
+- the switch on of the idle SVCs a caller flagged as carrying a standby
+  automaton (``LOW_VOLTAGE_SVC_STANDBY`` / ``HIGH_VOLTAGE_SVC_STANDBY`` on an
+  ``SVC``, lightsim2grid's ``SvcStandbyCheck``): OpenLoadFlow's
+  ``MonitoringVoltageOuterLoop`` switches such an SVC to voltage control once
+  the bus it regulates leaves the automaton's thresholds. Only SVCs flagged
+  with lightsim2grid's ``LSGrid.set_svc_standby`` are candidates (what
+  ``bake_outer_loops`` returns, handed to ``init_from_pypowsybl``'s
+  ``can_be_pv``); routed through the release plan (two entries per SVC, see
+  ``GenPvReleasePlanData``), value / limit in kV, compared with
   ``physical_violation_tol_vm_pu``;
 - droop hvdc P-saturation (``HVDC_P_SATURATION`` on an ``HVDC``):
   OpenLoadFlow's ``HvdcAcEmulationLimits`` outer loop;
@@ -157,23 +167,27 @@ class PhysicalChecksEngineMixin:
         lightsim2grid's own ``build_gen_pv_release_plan``; the facades'
         ``set_gen_pv_release_capability_from_grid()`` does that call) or, in
         array mode, the tuple of its constructor arguments ``(gen_id,
-        reg_bus_solver, gen_bus_solver, at_min, target_vm_pu, vn_kv)``: one
-        entry per PQ generator pinned at a reactive limit, the SOLVER bus it
-        would regulate and its own, 1 when it sits at min_q (0: at max_q), the
-        grid's target (pu) and the regulated bus' nominal kV. OPTIONAL: left
-        unset, nothing is flagged and nothing is reported. Validated against
-        n_bus; drops any previous report.
+        reg_bus_solver, gen_bus_solver, at_min, target_vm_pu, vn_kv[,
+        el_type])``: one entry per PQ generator pinned at a reactive limit, the
+        SOLVER bus it would regulate and its own, 1 when it sits at min_q (0: at
+        max_q), the grid's target (pu) and the regulated bus' nominal kV; the
+        optional ``el_type`` (5 GENERATOR / 7 SVC, all generators when absent)
+        also routes the idle standby SVCs, two entries each (the low threshold
+        with at_min 1, the high one with at_min 0). OPTIONAL: left unset,
+        nothing is flagged and nothing is reported. Validated against n_bus;
+        drops any previous report.
 
         On the two sweep engines, the per-row targets that complete it go
         through ``set_gen_pv_release_targets`` (the facades fill them from
         ``set_gen_v``)."""
         from .._gpusim2grid import GenPvReleasePlanData
         if not isinstance(plan, GenPvReleasePlanData):
-            gen_id, reg_bus, gen_bus, at_min, target_vm_pu, vn_kv = plan
+            gen_id, reg_bus, gen_bus, at_min, target_vm_pu, vn_kv, *el_type = plan
             i32 = lambda a: np.ascontiguousarray(a, dtype=np.int32)
             f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
             plan = GenPvReleasePlanData(i32(gen_id), i32(reg_bus), i32(gen_bus), i32(at_min),
-                                        f64(target_vm_pu), f64(vn_kv))
+                                        f64(target_vm_pu), f64(vn_kv),
+                                        i32(el_type[0] if el_type else []))
         self._s.set_gen_pv_release_capability(plan)
 
     def set_gen_p_capability(self, plan):
@@ -246,7 +260,11 @@ class PhysicalChecksEngineMixin:
         had to produce in MVAr, limit their summed capability), then the PQ ->
         PV release ones (element_type GENERATOR, element_id the generator id,
         LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q, value the voltage of the
-        bus the flagged machine would regulate and limit its target, kV), then
+        bus the flagged machine would regulate and limit its target, kV) and
+        the standby SVC ones (element_type SVC, element_id the svc id,
+        LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY, value the voltage of
+        the bus the flagged idle SVC regulates and limit the automaton's
+        threshold, kV), then
         the hvdc ones (element_type HVDC, element_id the grid hvdc id, side 1 = would
         saturate 1->2 / 2 = 2->1, value the flow leaving that AC bus in MW,
         limit pmax), then the slack machines' active power (element_type
@@ -330,8 +348,9 @@ class PhysicalChecksFacadeMixin:
         (``self._gen_v``, ``(n_rows, n_gen)`` pu, NaN = the grid's own; None
         when never set). One column per entry of the plan in its order: the
         target a flagged PQ machine would hold if released, as lightsim2grid
-        reads it off ``modify_gen_v``. Called from both sides -- gen_v set,
-        plan (re)set -- so the two may come in either order."""
+        reads it off ``modify_gen_v``; NaN for a standby SVC entry (no row
+        moves its thresholds). Called from both sides -- gen_v set, plan
+        (re)set -- so the two may come in either order."""
         sess = self._inner._s
         if not hasattr(sess, "set_gen_pv_release_targets"):
             return   # ContingencyAnalysisGPU: every row has the grid's targets
@@ -341,7 +360,11 @@ class PhysicalChecksFacadeMixin:
             sess.set_gen_pv_release_targets(np.zeros((0, 0), dtype=np.float64))
             return
         gen_id = np.asarray(plan.gen_id, dtype=int)
-        sess.set_gen_pv_release_targets(np.ascontiguousarray(gen_v[:, gen_id], dtype=np.float64))
+        el_type = np.asarray(plan.el_type, dtype=int)
+        is_gen = (el_type == 5) if el_type.size else np.ones(plan.n_entries, dtype=bool)
+        targets = np.full((gen_v.shape[0], plan.n_entries), np.nan, dtype=np.float64)
+        targets[:, is_gen] = gen_v[:, gen_id[is_gen]]
+        sess.set_gen_pv_release_targets(np.ascontiguousarray(targets))
 
     def set_gen_pv_release_capability_from_grid(self, grid=None):
         """Build the machines of the PQ -> PV release check off the
@@ -349,9 +372,12 @@ class PhysicalChecksFacadeMixin:
         ``grid`` is given) with lightsim2grid's OWN
         ``build_gen_pv_release_plan`` -- the PQ generators flagged with
         ``LSGrid.set_gen_can_be_pv`` whose reactive set-point sits (within
-        ``physical_violation_tol_mva``) at one of their limits -- and hand it
-        to the session. Needs the compiled bridge, built against a
-        lightsim2grid that has ``can_be_pv`` (PR #216). Done automatically
+        ``physical_violation_tol_mva``) at one of their limits, followed by
+        the idle standby SVCs flagged with ``LSGrid.set_svc_standby``
+        (lightsim2grid's own ``build_svc_standby_plan``, when the lightsim2grid
+        built against has it) -- and hand it to the session. Needs the compiled
+        bridge, built against a lightsim2grid that has ``can_be_pv`` (PR #216).
+        Done automatically
         when ``compute_physical_violations`` is turned on and no plan was set
         yet, and again when ``physical_violation_tol_mva`` changes (it decides
         which limit a machine sits at); call it again if the flags changed on
@@ -529,8 +555,10 @@ class PhysicalChecksFacadeMixin:
         less) reactive power than the SUM of what they own (LOW_Q / HIGH_Q,
         element_id the SOLVER bus id, MVAr), then the flagged PQ generators
         whose regulated bus sits on the release side of their target
-        (LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR, kV), then
-        the linear-regime droop
+        (LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR, kV) and
+        the flagged idle standby SVCs whose regulated bus left the automaton's
+        thresholds (LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY on an
+        SVC, kV), then the linear-regime droop
         hvdc lines whose flow exceeds pmax (HVDC_P_SATURATION, element_id the
         grid hvdc id, side 1 = would saturate 1->2 / 2 = 2->1, MW), then the
         generators and storage units carrying the distributed slack whose

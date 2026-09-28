@@ -400,6 +400,8 @@ struct BatchPfDriver {
 
     thrust::device_vector<int>            d_gr_gen_id, d_gr_reg_bus, d_gr_gen_bus, d_gr_at_min;
     thrust::device_vector<cuda_real_type> d_gr_target_base, d_gr_vn_kv;
+    // the kind of each entry (GENERATOR / standby SVC); empty = every entry a generator
+    thrust::device_vector<int>            d_gr_el_type;
     // per-row targets of the plan's entries (upload_gen_pv_release_targets),
     // ORIGINAL row order, [n_contingencies * n_entries]; empty = base targets
     thrust::device_vector<cuda_real_type> d_gr_targets;
