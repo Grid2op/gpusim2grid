@@ -1081,11 +1081,13 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
 {
 #ifdef GPUSIM2GRID_HAVE_LS2G_GEN_PV_RELEASE
     // lightsim2grid's own selection (flagged can_be_pv, PQ, a reactive range of
-    // at least 1 MVAr, target_q within tol_mva of a limit), on the labelling
+    // at least 1 MVAr, pinned at the nearer of its limits), on the labelling
     // the session solves in
     ls2g::gen_pv_release_check::GenPvReleasePlan plan;
-    ls2g::gen_pv_release_check::build_gen_pv_release_plan(
-        grid, grid.id_me_to_ac_solver(), static_cast<ls2g::real_type>(tol_mva), plan);
+    // tol_mva no longer decides anything: a flagged machine is pinned at the nearer of
+    // its limits (kept in the signature for the callers)
+    (void)tol_mva;
+    ls2g::gen_pv_release_check::build_gen_pv_release_plan(grid, grid.id_me_to_ac_solver(), plan);
 
     std::vector<int>    gen_id, reg_bus, gen_bus, at_min, el_type, standby;
     std::vector<double> target, vn;

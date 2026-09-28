@@ -27,7 +27,7 @@
 // ONCE (no batch axis varies a reactive set-point) -- by the bridge through
 // lightsim2grid's own build_gen_pv_release_plan (extract_gen_pv_release_plan_
 // from_lsgrid, ls2g_bridge.cpp: flagged, connected, not regulating, a reactive
-// range of at least 1 MVAr, a target_q within tol_mva of one of its limits),
+// range of at least 1 MVAr, pinned at the nearer of its limits),
 // or handed in as raw arrays by a caller in array/tuple mode. Per row only the
 // regulated voltage, the row's own target (a sweep's gen_v, see
 // set_gen_pv_release_targets), the mask and a generator contingency vary; the

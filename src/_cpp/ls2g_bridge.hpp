@@ -257,8 +257,8 @@ GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
 // The plan of the PQ -> PV release check (compute_physical_violations,
 // lightsim2grid's GenPvReleaseCheck.hpp, PR #216) off a solved LSGrid, built by
 // lightsim2grid's OWN build_gen_pv_release_plan -- the PQ generators the caller
-// flagged with LSGrid::set_gen_can_be_pv whose target_q sits within tol_mva of
-// one of their reactive limits -- and flattened into GenPvReleasePlanData
+// flagged with LSGrid::set_gen_can_be_pv, pinned at the nearer of their reactive
+// limits (`tol_mva` is ignored, kept for the callers) -- and flattened into GenPvReleasePlanData
 // (solver bus numbering), followed by the idle standby SVCs the caller flagged
 // with LSGrid::set_svc_standby (lightsim2grid's own build_svc_standby_plan, two
 // entries each, el_type SVC; only when the lightsim2grid built against has

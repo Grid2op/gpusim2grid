@@ -376,8 +376,8 @@ class PhysicalChecksFacadeMixin:
         lightsim2grid grid (the one this object was built from, unless
         ``grid`` is given) with lightsim2grid's OWN
         ``build_gen_pv_release_plan`` -- the PQ generators flagged with
-        ``LSGrid.set_gen_can_be_pv`` whose reactive set-point sits (within
-        ``physical_violation_tol_mva``) at one of their limits, followed by
+        ``LSGrid.set_gen_can_be_pv``, pinned at the nearer of their reactive
+        limits, followed by
         the SVCs flagged as frozen at a limit with ``LSGrid.set_svc_can_be_pv``
         (the same ``build_gen_pv_release_plan``) and the idle standby SVCs
         flagged with ``LSGrid.set_svc_standby`` (lightsim2grid's own
@@ -385,9 +385,7 @@ class PhysicalChecksFacadeMixin:
         bridge, built against a lightsim2grid that has ``can_be_pv`` (PR #216).
         Done automatically
         when ``compute_physical_violations`` is turned on and no plan was set
-        yet, and again when ``physical_violation_tol_mva`` changes (it decides
-        which limit a machine sits at); call it again if the flags changed on
-        the grid. In explicit-array mode use
+        yet; call it again if the flags changed on the grid. In explicit-array mode use
         :meth:`set_gen_pv_release_capability` instead (or nothing: an unset
         plan means nothing is flagged)."""
         from .. import _gpusim2grid as _cpp
@@ -519,17 +517,12 @@ class PhysicalChecksFacadeMixin:
 
     @property
     def physical_violation_tol_mva(self):
-        """float: slack (MVA) on every physical comparison; default 1e-4. It
-        also decides which reactive limit a flagged machine of the release
-        check sits at, so a release plan built from the grid is rebuilt."""
+        """float: slack (MVA) on every physical comparison; default 1e-4."""
         return self._inner.physical_violation_tol_mva
 
     @physical_violation_tol_mva.setter
     def physical_violation_tol_mva(self, value):
         self._inner.physical_violation_tol_mva = value
-        grid = getattr(self, "_gen_pv_release_from_grid", None)
-        if grid is not None:
-            self.set_gen_pv_release_capability_from_grid(grid)
 
     @property
     def physical_violation_tol_vm_pu(self):

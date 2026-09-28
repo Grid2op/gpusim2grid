@@ -28,3 +28,6 @@ Change Log
 - [ADDED] ``redistribute_slack`` shares on the units lightsim2grid flags "can participate in the
   slack" (``LSGrid.set_gen_can_participate_slack``) too, in the pre-pass only
   (``SlackRedistributionData.in_slack``).
+- [FIXED] The PQ -> PV release plan (lightsim2grid's ``build_gen_pv_release_plan``) pins a flagged
+  generator at the nearer of its reactive limits, not only within ``physical_violation_tol_mva`` of
+  one: the facades no longer rebuild it when that tolerance changes.

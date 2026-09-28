@@ -2545,8 +2545,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("tol_mva") = 1e-4,
         "GenPvReleasePlanData of compute_physical_violations off a solved lightsim2grid "
         "LSGrid, built by lightsim2grid's own gen_pv_release_check::build_gen_pv_release_plan: "
-        "the PQ generators flagged with LSGrid.set_gen_can_be_pv whose target_q sits within "
-        "tol_mva of one of their reactive limits (and at which one). Solver bus numbering. "
+        "the PQ generators flagged with LSGrid.set_gen_can_be_pv, each pinned at the nearer of "
+        "its reactive limits (tol_mva is ignored, kept for the callers). Solver bus numbering. "
         "Raises when the lightsim2grid built against predates PR #216.");
 
     m.def("_extract_gen_p_plan_from_lsgrid",
