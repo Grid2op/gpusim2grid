@@ -149,6 +149,7 @@ def test_plan_carries_two_svc_entries():
     me2s = np.asarray(grid.id_me_to_ac_solver())
     assert plan.n_entries == 2
     assert list(plan.el_type) == [SVC, SVC]
+    assert list(plan.standby) == [1, 1]
     assert list(plan.gen_id) == [0, 0]
     assert list(plan.at_min) == [1, 0]
     assert list(plan.reg_bus_solver) == [int(me2s[SVC_BUS])] * 2
@@ -197,7 +198,8 @@ def test_array_mode_plan_equals_grid_plan(solver_atol):
     assert len(ref) == 1
     ca = ContingencyAnalysisGPU(grid, nb_iter=10)
     ca.set_gen_pv_release_capability((plan.gen_id, plan.reg_bus_solver, plan.gen_bus_solver,
-                                      plan.at_min, plan.target_vm_pu, plan.vn_kv, plan.el_type))
+                                      plan.at_min, plan.target_vm_pu, plan.vn_kv, plan.el_type,
+                                      plan.standby))
     ca.compute_physical_violations = True
     ca.physical_violation_tol_mva = 0.
     ca.physical_violation_tol_vm_pu = 0.

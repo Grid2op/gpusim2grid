@@ -208,6 +208,7 @@ GenPvReleaseViolationsResult fetch_gen_pv_release(const PhysicalChecksConfig& cf
     r.stride    = N_GEN_PV_RELEASE_VIOLATION_GROUPS * drv.gen_pv_release_capacity_;
     r.gen_id    = detail::to_int (n_case ? drv.d_gr_n_gen_id    : drv.d_gr_out_gen_id);
     r.type      = detail::to_int (n_case ? drv.d_gr_n_type      : drv.d_gr_out_type);
+    r.el_type   = detail::to_int (n_case ? drv.d_gr_n_el_type   : drv.d_gr_out_el_type);
     r.value     = detail::to_real(n_case ? drv.d_gr_n_value     : drv.d_gr_out_value);
     r.limit     = detail::to_real(n_case ? drv.d_gr_n_limit     : drv.d_gr_out_limit);
     r.count     = detail::to_int (n_case ? drv.d_gr_n_count     : drv.d_gr_count);

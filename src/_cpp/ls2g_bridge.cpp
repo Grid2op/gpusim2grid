@@ -1066,7 +1066,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     ls2g::gen_pv_release_check::build_gen_pv_release_plan(
         grid, grid.id_me_to_ac_solver(), static_cast<ls2g::real_type>(tol_mva), plan);
 
-    std::vector<int>    gen_id, reg_bus, gen_bus, at_min, el_type;
+    std::vector<int>    gen_id, reg_bus, gen_bus, at_min, el_type, standby;
     std::vector<double> target, vn;
     for (const ls2g::gen_pv_release_check::GenPvReleaseEntry& e : plan.gens) {
         if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;   // not in the solved system
@@ -1077,7 +1077,10 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
         at_min.push_back(e.at_min ? 1 : 0);
         target.push_back(static_cast<double>(e.target_vm_pu));
         vn.push_back(static_cast<double>(e.vn_kv));
-        el_type.push_back(GenPvReleasePlanData::EL_GENERATOR);
+        // a generator, or an SVC frozen at a limit (LSGrid::set_svc_can_be_pv)
+        el_type.push_back(e.el_type == ls2g::ViolationElementType::SVC ? GenPvReleasePlanData::EL_SVC
+                                                                         : GenPvReleasePlanData::EL_GENERATOR);
+        standby.push_back(0);
     }
 #ifdef GPUSIM2GRID_HAVE_LS2G_SVC_STANDBY
     // the idle standby SVCs the caller flagged (LSGrid::set_svc_standby), lightsim2grid's
@@ -1097,6 +1100,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
             target.push_back(static_cast<double>(low ? e.low_vm_pu : e.high_vm_pu));
             vn.push_back(static_cast<double>(e.vn_kv));
             el_type.push_back(GenPvReleasePlanData::EL_SVC);
+            standby.push_back(1);
         }
     }
 #endif
@@ -1115,6 +1119,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     out.target_vm_pu   = rv(target);
     out.vn_kv          = rv(vn);
     out.el_type        = iv(el_type);
+    out.standby        = iv(standby);
     out.validate(n_bus_solver);
     return out;
 #else

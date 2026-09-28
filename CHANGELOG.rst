@@ -17,3 +17,11 @@ Change Log
   stay live.
 - [FIXED] ``ScenarioSweepGPU``: a hot re-run lost the row masks, so ``BatchPowerFlow`` gave a
   stranded voltage-control group a ``gen_v`` gradient.
+- [ADDED] Physical check of the idle SVCs under a standby automaton (lightsim2grid's
+  ``SvcStandbyCheck``, ``LSGrid.set_svc_standby``): a regulated bus outside the automaton's
+  thresholds is reported as ``LOW_VOLTAGE_SVC_STANDBY`` / ``HIGH_VOLTAGE_SVC_STANDBY`` on the new
+  ``ViolationElementType.SVC``. Routed through the PQ -> PV release plan.
+- [ADDED] The PQ -> PV release check for the SVCs lightsim2grid flags as frozen at a reactive limit
+  (``LSGrid.set_svc_can_be_pv``): reported as ``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``
+  on the SVC. The records of the release plan carry their element type (``el_type``), the standby
+  entries are marked by ``GenPvReleasePlanData.standby``.

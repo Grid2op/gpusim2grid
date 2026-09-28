@@ -291,3 +291,59 @@ def test_injection_sweep_row_targets(solver_atol):
     ref = _release(grid.get_physical_violations(True, 0., 0.))
     _assert_same(ref, got[0], _kv_atol(solver_atol))
     assert got[1] == []
+
+
+# ------------------------------------------------------ an SVC frozen at a limit
+SVC_EL = 7   # ViolationElementType.SVC
+
+
+def _frozen_svc_grid(target_vm=1.0, flagged=True):
+    """The feeder with gen 0 alone, and a fixed-Q SVC on bus 2 frozen at the absorbing end
+    of its range at `target_vm` -- lightsim2grid's own test_svc_can_be_pv grid, solved."""
+    from lightsim2grid.lightsim2grid_cpp import LSGrid
+    b_min, b_max = -0.05, 0.5
+    grid = LSGrid()
+    grid.set_sn_mva(100.)
+    grid.set_init_vm_pu(1.0)
+    grid.init_bus(4, 1, np.full(4, VN_KV), 0, 0)
+    grid.init_powerlines(np.full(3, 0.01), np.full(3, 0.1), np.zeros(3, dtype=complex),
+                         np.array([0, 1, 2]), np.array([1, 2, 3]))
+    grid.init_loads(np.array([80.]), np.array([60.]), np.array([3]))
+    grid.init_generators_full(np.array([0.]), np.array([1.02]), np.array([0.]), [True],
+                              np.array([-1e3]), np.array([1e3]), np.array([0]))
+    grid.add_gen_slackbus(0, 1.)
+    grid.init_svcs([2], np.array([target_vm]), np.array([b_min * target_vm ** 2 * 100.]),
+                   np.array([0.]), np.array([b_min]), np.array([b_max]),
+                   np.array([2], dtype=np.int32), np.array([2], dtype=np.int32))
+    if flagged:
+        grid.set_svc_can_be_pv(np.array([True]))
+    grid.tell_solver_need_reset()
+    V = grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, TOL)
+    assert V.shape[0] > 0
+    return grid, V
+
+
+def _svc_release(viols):
+    return [(int(v.element_id), int(v.violation_type), float(v.value), float(v.limit))
+            for v in viols
+            if int(v.element_type) == SVC_EL and int(v.violation_type) in (LOW_VM, HIGH_VM)]
+
+
+@pytest.mark.skipif(not hasattr(__import__("lightsim2grid.lightsim2grid_cpp", fromlist=["LSGrid"]).LSGrid,
+                                "set_svc_can_be_pv"),
+                    reason="needs a lightsim2grid with LSGrid.set_svc_can_be_pv")
+def test_frozen_svc_release_matches_single_solve(solver_atol):
+    grid, V = _frozen_svc_grid(1.0)
+    n_bus = grid.get_Ybus_solver().shape[0]
+    plan = _cpp._extract_gen_pv_release_plan_from_lsgrid(grid, n_bus, 1e-4)
+    assert list(plan.el_type) == [SVC_EL] and list(plan.standby) == [0] and list(plan.at_min) == [1]
+    ref = _svc_release(grid.get_physical_violations(True, 0., 0.))
+    assert len(ref) == 1 and ref[0][1] == LOW_VM
+    gpu = _gpu_ca(grid, [2])
+    _assert_same(ref, _svc_release(gpu.get_physical_violations_n()), _kv_atol(solver_atol))
+    assert _release(gpu.get_physical_violations_n()) == []   # not reported on a generator
+    # not flagged, or on the other side of its target: nothing
+    grid, _ = _frozen_svc_grid(1.0, flagged=False)
+    assert _svc_release(_gpu_ca(grid, [2]).get_physical_violations_n()) == []
+    grid, _ = _frozen_svc_grid(0.5)
+    assert _svc_release(_gpu_ca(grid, [2]).get_physical_violations_n()) == []

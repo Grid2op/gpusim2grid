@@ -95,7 +95,8 @@ struct GenPViolationsResult {
 // record is element type GENERATOR (5). Groups: LOW_VOLTAGE_AT_MIN_Q, then
 // HIGH_VOLTAGE_AT_MAX_Q.
 struct GenPvReleaseViolationsResult {
-    Eigen::VectorXi gen_id, type;
+    // gen_id: the element id, of the element type el_type (5 GENERATOR / 7 SVC)
+    Eigen::VectorXi gen_id, type, el_type;
     RealVect        value, limit;
     Eigen::VectorXi count, truncated;
     int             capacity = 0;

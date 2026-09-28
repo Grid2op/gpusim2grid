@@ -333,11 +333,14 @@ __global__ void check_hvdc_p_violations_kernel(
 // Skipped: a machine whose regulated bus OR own bus is masked (NaN V -- a
 // stranded machine releases nothing, like a disconnected one) and a generator
 // the row disconnects (d_gen_off, ORIGINAL row order, nullptr = none).
-// An entry whose d_el_type is SVC (7; nullptr = every entry a generator) is
-// an idle standby SVC (lightsim2grid's SvcStandbyCheck.hpp): the same test
-// against its low (at_min) / high threshold, reported as
-// LOW_VOLTAGE_SVC_STANDBY (11) / HIGH_VOLTAGE_SVC_STANDBY (12), element_id the
-// svc id, never masked by d_gen_off nor moved by d_targets. Four groups
+// An entry whose d_el_type is SVC (7; nullptr = every entry a generator) is an
+// SVC, never masked by d_gen_off nor moved by d_targets: an SVC frozen at a
+// reactive limit (the generators' test, reported as LOW_VOLTAGE_AT_MIN_Q /
+// HIGH_VOLTAGE_AT_MAX_Q), or, when d_standby says so (nullptr = none), an idle
+// standby SVC (lightsim2grid's SvcStandbyCheck.hpp): the same test against its
+// low (at_min) / high threshold, reported as LOW_VOLTAGE_SVC_STANDBY (11) /
+// HIGH_VOLTAGE_SVC_STANDBY (12). d_out_el_type says which element each record
+// is on (5 GENERATOR / 7 SVC), d_out_gen_id its id. Four groups
 // (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
 // HIGH_VOLTAGE_SVC_STANDBY), each keeping the K largest |value / limit - 1|
 // (a relative measure, like every voltage check), most severe first. Same row gate / result map / capacity / sentinel
@@ -355,6 +358,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cuda_real_type*  __restrict__ d_target_base,
     const cuda_real_type*  __restrict__ d_vn_kv,
     const int*             __restrict__ d_el_type,      // [n_entries] 5 / 7, or nullptr = all generators
+    const int*             __restrict__ d_standby,      // [n_entries] 1 = standby SVC entry, or nullptr = none
     const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,      // [n_rows × target_stride] ORIGINAL order, or nullptr
@@ -365,6 +369,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const int* __restrict__ d_result_map,
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
+          int*             __restrict__ d_out_el_type,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,

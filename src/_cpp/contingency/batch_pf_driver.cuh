@@ -400,16 +400,19 @@ struct BatchPfDriver {
 
     thrust::device_vector<int>            d_gr_gen_id, d_gr_reg_bus, d_gr_gen_bus, d_gr_at_min;
     thrust::device_vector<cuda_real_type> d_gr_target_base, d_gr_vn_kv;
-    // the kind of each entry (GENERATOR / standby SVC); empty = every entry a generator
-    thrust::device_vector<int>            d_gr_el_type;
+    // the element of each entry (GENERATOR / SVC), empty = every entry a generator; and
+    // whether an SVC entry is of the standby check, empty = none
+    thrust::device_vector<int>            d_gr_el_type, d_gr_standby;
     // per-row targets of the plan's entries (upload_gen_pv_release_targets),
     // ORIGINAL row order, [n_contingencies * n_entries]; empty = base targets
     thrust::device_vector<cuda_real_type> d_gr_targets;
     thrust::device_vector<int>            d_gr_out_gen_id, d_gr_out_type;     // [n_contingencies * K_r]
+    thrust::device_vector<int>            d_gr_out_el_type;                   // [n_contingencies * K_r]
     thrust::device_vector<cuda_real_type> d_gr_out_value, d_gr_out_limit;
     thrust::device_vector<int>            d_gr_count;        // [n_contingencies]; -1 = never simulated, else 0..K_r
     thrust::device_vector<int>            d_gr_truncated;    // [n_contingencies]; 0/1
     thrust::device_vector<int>            d_gr_n_gen_id, d_gr_n_type;         // [K_r]
+    thrust::device_vector<int>            d_gr_n_el_type;                     // [K_r]
     thrust::device_vector<cuda_real_type> d_gr_n_value, d_gr_n_limit;
     thrust::device_vector<int>            d_gr_n_count, d_gr_n_truncated;     // [1]
 

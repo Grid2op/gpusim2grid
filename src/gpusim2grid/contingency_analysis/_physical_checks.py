@@ -24,7 +24,8 @@ no row is re-solved):
   regulate again. Only generators flagged with lightsim2grid's
   ``LSGrid.set_gen_can_be_pv`` are candidates (``init_from_pypowsybl``'s
   ``can_be_pv``); value / limit in kV, compared with
-  ``physical_violation_tol_vm_pu``;
+  ``physical_violation_tol_vm_pu``. The same for the SVCs an outer loop froze
+  at a reactive limit (``LSGrid.set_svc_can_be_pv``), reported on the ``SVC``;
 - the switch on of the idle SVCs a caller flagged as carrying a standby
   automaton (``LOW_VOLTAGE_SVC_STANDBY`` / ``HIGH_VOLTAGE_SVC_STANDBY`` on an
   ``SVC``, lightsim2grid's ``SvcStandbyCheck``): OpenLoadFlow's
@@ -168,26 +169,29 @@ class PhysicalChecksEngineMixin:
         ``set_gen_pv_release_capability_from_grid()`` does that call) or, in
         array mode, the tuple of its constructor arguments ``(gen_id,
         reg_bus_solver, gen_bus_solver, at_min, target_vm_pu, vn_kv[,
-        el_type])``: one entry per PQ generator pinned at a reactive limit, the
+        el_type[, standby]])``: one entry per PQ generator pinned at a reactive limit, the
         SOLVER bus it would regulate and its own, 1 when it sits at min_q (0: at
         max_q), the grid's target (pu) and the regulated bus' nominal kV; the
         optional ``el_type`` (5 GENERATOR / 7 SVC, all generators when absent)
-        also routes the idle standby SVCs, two entries each (the low threshold
-        with at_min 1, the high one with at_min 0). OPTIONAL: left unset,
-        nothing is flagged and nothing is reported. Validated against n_bus;
-        drops any previous report.
+        also routes the SVCs frozen at a limit (one entry each, the release
+        test) and, with the optional ``standby`` (1 for such an entry), the idle
+        standby SVCs, two entries each (the low threshold with at_min 1, the
+        high one with at_min 0). OPTIONAL: left unset, nothing is flagged and
+        nothing is reported. Validated against n_bus; drops any previous
+        report.
 
         On the two sweep engines, the per-row targets that complete it go
         through ``set_gen_pv_release_targets`` (the facades fill them from
         ``set_gen_v``)."""
         from .._gpusim2grid import GenPvReleasePlanData
         if not isinstance(plan, GenPvReleasePlanData):
-            gen_id, reg_bus, gen_bus, at_min, target_vm_pu, vn_kv, *el_type = plan
+            gen_id, reg_bus, gen_bus, at_min, target_vm_pu, vn_kv, *optional = plan
             i32 = lambda a: np.ascontiguousarray(a, dtype=np.int32)
             f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
+            el_type = optional[0] if len(optional) > 0 else []
+            standby = optional[1] if len(optional) > 1 else []
             plan = GenPvReleasePlanData(i32(gen_id), i32(reg_bus), i32(gen_bus), i32(at_min),
-                                        f64(target_vm_pu), f64(vn_kv),
-                                        i32(el_type[0] if el_type else []))
+                                        f64(target_vm_pu), f64(vn_kv), i32(el_type), i32(standby))
         self._s.set_gen_pv_release_capability(plan)
 
     def set_gen_p_capability(self, plan):
@@ -260,8 +264,9 @@ class PhysicalChecksEngineMixin:
         had to produce in MVAr, limit their summed capability), then the PQ ->
         PV release ones (element_type GENERATOR, element_id the generator id,
         LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q, value the voltage of the
-        bus the flagged machine would regulate and limit its target, kV) and
-        the standby SVC ones (element_type SVC, element_id the svc id,
+        bus the flagged machine would regulate and limit its target, kV; also
+        element_type SVC, element_id the svc id, for an SVC flagged as frozen at
+        a reactive limit) and the standby SVC ones (element_type SVC, element_id the svc id,
         LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY, value the voltage of
         the bus the flagged idle SVC regulates and limit the automaton's
         threshold, kV), then
@@ -373,9 +378,10 @@ class PhysicalChecksFacadeMixin:
         ``build_gen_pv_release_plan`` -- the PQ generators flagged with
         ``LSGrid.set_gen_can_be_pv`` whose reactive set-point sits (within
         ``physical_violation_tol_mva``) at one of their limits, followed by
-        the idle standby SVCs flagged with ``LSGrid.set_svc_standby``
-        (lightsim2grid's own ``build_svc_standby_plan``, when the lightsim2grid
-        built against has it) -- and hand it to the session. Needs the compiled
+        the SVCs flagged as frozen at a limit with ``LSGrid.set_svc_can_be_pv``
+        (the same ``build_gen_pv_release_plan``) and the idle standby SVCs
+        flagged with ``LSGrid.set_svc_standby`` (lightsim2grid's own
+        ``build_svc_standby_plan``, when the lightsim2grid built against has it) -- and hand it to the session. Needs the compiled
         bridge, built against a lightsim2grid that has ``can_be_pv`` (PR #216).
         Done automatically
         when ``compute_physical_violations`` is turned on and no plan was set

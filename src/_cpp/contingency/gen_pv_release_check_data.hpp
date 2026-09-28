@@ -43,20 +43,26 @@
 //   target_vm_pu   the grid's own target (a row may hand its own)
 //   vn_kv          nominal voltage of the regulated bus (value / limit in kV)
 //
-//   el_type        OPTIONAL (empty = every entry a GENERATOR): the kind of
-//                  element, 5 = GENERATOR, 7 = SVC (ViolationElementType).
+//   el_type        OPTIONAL (empty = every entry a GENERATOR): the element the
+//                  entry is reported on, 5 = GENERATOR, 7 = SVC
+//                  (ViolationElementType); gen_id is then its svc id.
+//   standby        OPTIONAL (empty = none): 1 for an entry of the standby SVC
+//                  check below, 0 for a release.
 //
-// The same plan also routes lightsim2grid's standby SVC check
-// (SvcStandbyCheck.hpp): an idle SVC flagged as carrying a standby automaton
-// (LSGrid::set_svc_standby), which OpenLoadFlow's MonitoringVoltageOuterLoop
-// switches to voltage control once the voltage of the bus it regulates leaves
-// the automaton's [low, high] thresholds. Such an SVC is TWO entries of
-// el_type SVC, gen_id its svc id: one at_min = 1 with target_vm_pu the low
-// threshold, one at_min = 0 with the high one -- exactly the release test,
-// reported as LOW_VOLTAGE_SVC_STANDBY (11) / HIGH_VOLTAGE_SVC_STANDBY (12) on
-// the SVC. No row varies an SVC's thresholds (a row's own targets are
-// ignored for them) and no contingency disconnects one (the generator mask
-// does not apply).
+// An SVC entry is either of two lightsim2grid checks, neither varied by a row
+// (a row's own targets are ignored for them) nor disconnected by a contingency
+// (the generator mask does not apply):
+//   - the release of an SVC an outer loop froze at a reactive limit
+//     (LSGrid::set_svc_can_be_pv, lightsim2grid's GenPvReleaseCheck.hpp): the
+//     generators' test verbatim, one entry, reported as LOW_VOLTAGE_AT_MIN_Q
+//     (9) / HIGH_VOLTAGE_AT_MAX_Q (10) on the SVC;
+//   - the switch on of an idle SVC flagged as carrying a standby automaton
+//     (LSGrid::set_svc_standby, SvcStandbyCheck.hpp), which OpenLoadFlow's
+//     MonitoringVoltageOuterLoop switches to voltage control once the voltage
+//     of the bus it regulates leaves the automaton's [low, high] thresholds:
+//     TWO entries with standby = 1, at_min = 1 with target_vm_pu the low
+//     threshold and at_min = 0 with the high one -- the release test again --
+//     reported as LOW_VOLTAGE_SVC_STANDBY (11) / HIGH_VOLTAGE_SVC_STANDBY (12).
 //
 // Deliberately NOT carried, compared to lightsim2grid's plan: the grid bus id
 // of the regulated bus and the element names (gpusim2grid's records carry
@@ -87,9 +93,11 @@ struct GenPvReleasePlanData {
     RealVect        target_vm_pu;    // [n_entries] the grid's own target
     RealVect        vn_kv;           // [n_entries] nominal kV of the regulated bus
     Eigen::VectorXi el_type;         // [n_entries] EL_GENERATOR / EL_SVC, or empty = all generators
+    Eigen::VectorXi standby;         // [n_entries] 1 = a standby SVC check entry, or empty = none
 
     bool empty() const { return n_entries == 0; }
     bool is_svc(int k) const { return el_type.size() != 0 && el_type(k) == EL_SVC; }
+    bool is_standby(int k) const { return standby.size() != 0 && standby(k) != 0; }
 
     // Structural checks only (sizes / index ranges); throws std::runtime_error.
     void validate(int n_bus) const {
@@ -111,6 +119,7 @@ struct GenPvReleasePlanData {
         need(target_vm_pu.size(),   "target_vm_pu");
         need(vn_kv.size(),          "vn_kv");
         if (el_type.size() != 0) need(el_type.size(), "el_type");
+        if (standby.size() != 0) need(standby.size(), "standby");
         for (int k = 0; k < n_entries; ++k) {
             std::ostringstream m;
             if (gen_id(k) < 0) {
@@ -129,6 +138,10 @@ struct GenPvReleasePlanData {
             if (el_type.size() != 0 && el_type(k) != EL_GENERATOR && el_type(k) != EL_SVC) {
                 m << "el_type[" << k << "] must be " << EL_GENERATOR << " (GENERATOR) or "
                   << EL_SVC << " (SVC)";
+                fail(m.str());
+            }
+            if (standby.size() != 0 && standby(k) != 0 && (standby(k) != 1 || !is_svc(k))) {
+                m << "standby[" << k << "] must be 0, or 1 on an SVC entry";
                 fail(m.str());
             }
             if (!std::isfinite(static_cast<double>(target_vm_pu(k))) ||

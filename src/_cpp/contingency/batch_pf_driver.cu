@@ -1037,6 +1037,12 @@ void BatchPfDriver<BatchSource>::set_gen_pv_release_check(
         d_gr_el_type.clear();
         d_gr_el_type.shrink_to_fit();
     }
+    if (plan.standby.size() != 0) {
+        to_dev_i(d_gr_standby, plan.standby);
+    } else {
+        d_gr_standby.clear();
+        d_gr_standby.shrink_to_fit();
+    }
 
     // per-row targets uploaded for another plan no longer line up
     if (gen_pv_release_target_stride_ != 0 && gen_pv_release_target_stride_ != plan.n_entries) {
@@ -1056,12 +1062,14 @@ void BatchPfDriver<BatchSource>::set_gen_pv_release_check(
     const size_t n_out = static_cast<size_t>(n_contingencies) * row_r;
     d_gr_out_gen_id.assign(n_out, 0);
     d_gr_out_type.assign(n_out, 0);
+    d_gr_out_el_type.assign(n_out, 0);
     d_gr_out_value.assign(n_out, cuda_real_type(0));
     d_gr_out_limit.assign(n_out, cuda_real_type(0));
     d_gr_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
     d_gr_truncated.assign(static_cast<size_t>(n_contingencies), 0);
     d_gr_n_gen_id.assign(row_r, 0);
     d_gr_n_type.assign(row_r, 0);
+    d_gr_n_el_type.assign(row_r, 0);
     d_gr_n_value.assign(row_r, cuda_real_type(0));
     d_gr_n_limit.assign(row_r, cuda_real_type(0));
     d_gr_n_count.assign(1, 0);
@@ -1120,6 +1128,7 @@ void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
         thrust::raw_pointer_cast(d_gr_target_base.data()),
         thrust::raw_pointer_cast(d_gr_vn_kv.data()),
         d_gr_el_type.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_el_type.data()),
+        d_gr_standby.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_standby.data()),
         /*d_gen_off=*/nullptr, /*n_gen=*/0,
         /*d_targets=*/nullptr, /*target_stride=*/0,
         gen_pv_release_tol_vm_pu_,
@@ -1128,6 +1137,7 @@ void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
         /*d_result_map=*/nullptr,
         thrust::raw_pointer_cast(d_gr_n_gen_id.data()),
         thrust::raw_pointer_cast(d_gr_n_type.data()),
+        thrust::raw_pointer_cast(d_gr_n_el_type.data()),
         thrust::raw_pointer_cast(d_gr_n_value.data()),
         thrust::raw_pointer_cast(d_gr_n_limit.data()),
         thrust::raw_pointer_cast(d_gr_n_count.data()),
@@ -1646,6 +1656,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_gr_target_base.data()),
             thrust::raw_pointer_cast(d_gr_vn_kv.data()),
             d_gr_el_type.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_el_type.data()),
+            d_gr_standby.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_standby.data()),
             d_gr_gen_off_, gen_pv_release_n_gen_,
             has_gen_pv_release_targets() ? thrust::raw_pointer_cast(d_gr_targets.data()) : nullptr,
             gen_pv_release_target_stride_,
@@ -1655,6 +1666,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             d_result_map,
             thrust::raw_pointer_cast(d_gr_out_gen_id.data()),
             thrust::raw_pointer_cast(d_gr_out_type.data()),
+            thrust::raw_pointer_cast(d_gr_out_el_type.data()),
             thrust::raw_pointer_cast(d_gr_out_value.data()),
             thrust::raw_pointer_cast(d_gr_out_limit.data()),
             thrust::raw_pointer_cast(d_gr_count.data()),

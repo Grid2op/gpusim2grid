@@ -214,12 +214,14 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "reported when the regulated voltage is BELOW the target; 0 = at max_q, reported "
         "when ABOVE), the grid's target_vm_pu and the nominal kV of the regulated bus "
         "(value / limit are reported in kV).\n\n"
-        "The same plan routes lightsim2grid's standby SVC check: el_type (optional, "
-        "empty = every entry a generator) says 5 for a GENERATOR entry and 7 for an "
-        "SVC one. An idle SVC flagged as carrying a standby automaton "
-        "(LSGrid.set_svc_standby) is two SVC entries, gen_id its svc id: at_min = 1 "
-        "with target_vm_pu its low threshold, at_min = 0 with its high one, reported "
-        "as LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY on the SVC.")
+        "The same plan routes the SVCs: el_type (optional, empty = every entry a "
+        "generator) says 5 for a GENERATOR entry and 7 for an SVC one (gen_id its svc "
+        "id). An SVC frozen at a reactive limit (LSGrid.set_svc_can_be_pv) is one entry, "
+        "the generators' release test, reported on the SVC. An idle SVC flagged as "
+        "carrying a standby automaton (LSGrid.set_svc_standby) is two entries with "
+        "standby = 1 (optional, empty = none): at_min = 1 with target_vm_pu its low "
+        "threshold, at_min = 0 with its high one, reported as LOW_VOLTAGE_SVC_STANDBY / "
+        "HIGH_VOLTAGE_SVC_STANDBY.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> gen_id,
                                Eigen::Ref<const Eigen::VectorXi> reg_bus_solver,
@@ -227,19 +229,22 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const Eigen::VectorXi> at_min,
                                Eigen::Ref<const RealVect> target_vm_pu,
                                Eigen::Ref<const RealVect> vn_kv,
-                               Eigen::Ref<const Eigen::VectorXi> el_type) {
+                               Eigen::Ref<const Eigen::VectorXi> el_type,
+                               Eigen::Ref<const Eigen::VectorXi> standby) {
                  GenPvReleasePlanData p;
                  p.n_entries = static_cast<int>(gen_id.size());
                  p.gen_id = gen_id; p.reg_bus_solver = reg_bus_solver;
                  p.gen_bus_solver = gen_bus_solver; p.at_min = at_min;
                  p.target_vm_pu = target_vm_pu; p.vn_kv = vn_kv;
                  p.el_type = el_type;
+                 p.standby = standby;
                  return p;
              }),
              pybind11::arg("gen_id"), pybind11::arg("reg_bus_solver"),
              pybind11::arg("gen_bus_solver"), pybind11::arg("at_min"),
              pybind11::arg("target_vm_pu"), pybind11::arg("vn_kv"),
-             pybind11::arg("el_type") = Eigen::VectorXi())
+             pybind11::arg("el_type") = Eigen::VectorXi(),
+             pybind11::arg("standby") = Eigen::VectorXi())
         .def_readonly("n_entries",      &GenPvReleasePlanData::n_entries)
         .def_readonly("gen_id",         &GenPvReleasePlanData::gen_id)
         .def_readonly("reg_bus_solver", &GenPvReleasePlanData::reg_bus_solver)
@@ -247,7 +252,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("at_min",         &GenPvReleasePlanData::at_min)
         .def_readonly("target_vm_pu",   &GenPvReleasePlanData::target_vm_pu)
         .def_readonly("vn_kv",          &GenPvReleasePlanData::vn_kv)
-        .def_readonly("el_type",        &GenPvReleasePlanData::el_type);
+        .def_readonly("el_type",        &GenPvReleasePlanData::el_type)
+        .def_readonly("standby",        &GenPvReleasePlanData::standby);
 
     pybind11::class_<SlackRedistributionData>(m, "SlackRedistributionData",
         "The distributed-slack participants of the redistribute_slack pre-pass "
@@ -501,13 +507,16 @@ static void bind_physical_checks_types(pybind11::module_& m)
 
     pybind11::class_<GenPvReleaseViolationsResult>(m, "GenPvReleaseViolationsResult",
         "Flat per-row records of the PQ -> PV release check, same layout as "
-        "BusQViolationsResult (groups LOW_VOLTAGE_AT_MIN_Q then HIGH_VOLTAGE_AT_MAX_Q, "
-        "each ranked by |value / limit - 1|): gen_id the generator id, type 9 "
-        "(LOW_VOLTAGE_AT_MIN_Q) or 10 (HIGH_VOLTAGE_AT_MAX_Q), value the voltage of the "
-        "bus it would regulate and limit the target it would hold, both in kV. Every "
-        "record is element type GENERATOR (5).")
+        "BusQViolationsResult (groups LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, "
+        "LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY, each ranked by |value / limit "
+        "- 1|): gen_id the element id, of element type el_type (5 GENERATOR, or 7 SVC for "
+        "a frozen SVC's release or a standby SVC's switch on), type 9 "
+        "(LOW_VOLTAGE_AT_MIN_Q) / 10 (HIGH_VOLTAGE_AT_MAX_Q) / 11 / 12 (the standby "
+        "ones), value the voltage of the bus it would regulate and limit the target it "
+        "would hold (the threshold for a standby SVC), both in kV.")
         .def_readonly("gen_id",    &GenPvReleaseViolationsResult::gen_id)
         .def_readonly("type",      &GenPvReleaseViolationsResult::type)
+        .def_readonly("el_type",   &GenPvReleaseViolationsResult::el_type)
         .def_readonly("value",     &GenPvReleaseViolationsResult::value)
         .def_readonly("limit",     &GenPvReleaseViolationsResult::limit)
         .def_readonly("count",     &GenPvReleaseViolationsResult::count)

@@ -54,7 +54,9 @@ class ViolationElementType(IntEnum):
     STORAGE = 6
     #: A static var compensator, by its own id: an idle SVC flagged as carrying
     #: a standby automaton, which the voltage of the bus it regulates would
-    #: switch on (LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY).
+    #: switch on (LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY), or a
+    #: fixed-Q SVC flagged as frozen at a reactive limit that would regulate
+    #: again (LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q).
     SVC = 7
 
 
@@ -246,24 +248,16 @@ def gen_p_violations_from_result(res):
         float(value[i]), float(limit[i])))
 
 
-_SVC_STANDBY_TYPES = (int(LimitViolationType.LOW_VOLTAGE_SVC_STANDBY),
-                      int(LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY))
-
-
 def gen_pv_release_violations_from_result(res):
     """list[list[LimitViolation]] from a ``GenPvReleaseViolationsResult`` (the
     raw output of ``get_gen_pv_release_violations[_n]()`` on a batch session):
-    the PQ -> PV release of the flagged generators, and the switch on of the
-    flagged standby SVCs routed through the same plan -- the type code says
-    which element ``gen_id`` names."""
-    gen_id, vtype, value, limit = res.gen_id, res.type, res.value, res.limit
-
-    def _one(i):
-        t = int(vtype[i])
-        el = ViolationElementType.SVC if t in _SVC_STANDBY_TYPES else ViolationElementType.GENERATOR
-        return LimitViolation(el, int(gen_id[i]), 0, LimitViolationType(t),
-                              float(value[i]), float(limit[i]))
-    return _rows_from_flat(res.count, res.stride, _one)
+    the PQ -> PV release of the flagged generators and SVCs, and the switch on
+    of the flagged standby SVCs routed through the same plan -- ``el_type``
+    says which element ``gen_id`` names."""
+    gen_id, el_type, vtype, value, limit = res.gen_id, res.el_type, res.type, res.value, res.limit
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
+        ViolationElementType(int(el_type[i])), int(gen_id[i]), 0, LimitViolationType(int(vtype[i])),
+        float(value[i]), float(limit[i])))
 
 
 def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
