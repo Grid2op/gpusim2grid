@@ -531,6 +531,11 @@ void ScenarioSweepSession::_check_redistribute_slack() const
 std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepass() const
 {
     const bool has_rows = gen_p_rows_.size() > 0;
+    // each row's total active injection (MW): term (c), what its injections take
+    // out of the balance of the grid's set-points
+    std::vector<double> row_p_mw(static_cast<size_t>(n_scenarios_), 0.);
+    for (int r = 0; r < n_scenarios_; ++r)
+        row_p_mw[static_cast<size_t>(r)] = static_cast<double>(p_mw_.row(r).sum());
     return slack_redistribution::prepass_all(
         slack_rd_, n_scenarios_, base_state_->n_bus,
         [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; },
@@ -539,7 +544,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
         [this, has_rows](int r, int g) {
             return has_rows ? static_cast<double>(gen_p_rows_(r, g))
                             : static_cast<double>(slack_rd_.gen_target_p_mw(g)); },
-        [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); });
+        [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); },
+        [&row_p_mw](int r) { return row_p_mw[static_cast<size_t>(r)]; });
 }
 
 // =============================================================================

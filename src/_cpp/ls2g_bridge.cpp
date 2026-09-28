@@ -525,6 +525,11 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         d.shunt_p_mw(b) += static_cast<eigen_real_type>(sh_p(k));
     }
     d.sn_mva = static_cast<double>(grid.get_sn_mva());
+    // the active injection of the grid's own set-points (what a scenario row's
+    // injection change is measured against): its solver Sbus, when it has one
+    const CplxVect sbus = grid.get_Sbus_solver();
+    if (sbus.size() == n_bus_solver && n_bus_solver > 0)
+        d.base_p_mw = static_cast<double>(sbus.real().sum()) * d.sn_mva;
     d.validate(n_bus_solver);
     return d;
 }

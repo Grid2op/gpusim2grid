@@ -6,6 +6,9 @@ Change Log
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.
+- [IMPROVED] ``redistribute_slack`` on a scenario sweep (``ScenarioSweepGPU``, ``BatchPowerFlow``)
+  also shares the active imbalance each row's injections create against the grid's set-points
+  (``SlackRedistributionData.base_p_mw``), as lightsim2grid.
 - [ADDED] ``reference_slack="auto"`` (default with ``handle_disconnected_grid``): the angle
   reference is the slack unit stranded by the fewest rows.
 - [ADDED] PQ -> PV release check (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``) and

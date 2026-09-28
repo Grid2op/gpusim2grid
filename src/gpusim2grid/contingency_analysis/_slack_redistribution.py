@@ -63,7 +63,7 @@ class SlackRedistributionEngineMixin:
         redistribution_data_from_lsgrid``; the facades do it from the grid) or,
         in array mode, the tuple of its constructor arguments ``(kind, el_id,
         bus_solver, weight, min_p_mw, max_p_mw, target_p_mw, gen_bus_solver,
-        gen_target_p_mw, n_sto, shunt_p_mw, sn_mva[, in_slack])``: one entry per
+        gen_target_p_mw, n_sto, shunt_p_mw, sn_mva[, in_slack[, base_p_mw]])``: one entry per
         unit of the distributed slack (generators then storage units, by id;
         kind 5 / 6, container id, solver bus, raw weight, limits with NaN =
         none, set-point in the GENERATOR convention), then every generator's
@@ -72,7 +72,10 @@ class SlackRedistributionEngineMixin:
         the optional ``in_slack`` (one per unit, all 1 when absent) is 0 for a
         unit of the pre-pass only (lightsim2grid's "can participate in the
         slack", left out of the slack only because it sat at an active
-        limit)."""
+        limit); the optional ``base_p_mw`` (NaN when absent) is the active
+        injection of the grid's own set-points summed over the solved system
+        (MW): a scenario sweep pre-shares what each row's injections take out
+        of it, and shares no such term without it."""
         from .._gpusim2grid import SlackRedistributionData
         if not isinstance(data, SlackRedistributionData):
             (kind, el_id, bus_solver, weight, min_p, max_p, target_p,
@@ -82,7 +85,8 @@ class SlackRedistributionEngineMixin:
             data = SlackRedistributionData(i32(kind), i32(el_id), i32(bus_solver), f64(weight),
                                            f64(min_p), f64(max_p), f64(target_p), i32(gen_bus),
                                            f64(gen_target_p), int(n_sto), f64(shunt_p),
-                                           float(sn_mva), i32(optional[0] if optional else []))
+                                           float(sn_mva), i32(optional[0] if optional else []),
+                                           float(optional[1]) if len(optional) > 1 else float("nan"))
         self._s.set_slack_redistribution_data(data)
 
     @property
@@ -164,13 +168,15 @@ class SlackRedistributionFacadeMixin:
     def redistribute_slack(self):
         """bool: share what each row loses -- the island a contingency cuts
         off with ``handle_disconnected_grid``, and (scenario sweep) the
-        generators a row disconnects -- on the remaining units of the
+        generators a row disconnects and the imbalance its own injections
+        create against the grid's set-points -- on the remaining units of the
         distributed slack BEFORE the solve, as OpenLoadFlow's
         ``DistributedSlack`` outer loop does: proportionally to their weight,
         each one clamped to its ``[min_p, max_p]`` and never crossing 0 MW, a
         clamped unit leaving the pool and that row's distributed slack; the
         solve then only shares what is left (the change in the losses) on the
-        units that can still move. lightsim2grid's option of the same name
+        units that can still move (a line / trafo that leaves the grid
+        connected loses no injection). lightsim2grid's option of the same name
         (``ContingencyAnalysis`` / ``ScenarioSweep``). Needs the distributed
         slack (``use_distributed_slack=True``) and limits on the grid
         (``set_gen_p_limits`` / ``set_storage_p_limits``) to clamp anything;

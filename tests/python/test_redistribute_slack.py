@@ -6,7 +6,8 @@
 (lightsim2grid PR #216 parity, ``slack_redistribution.hpp``).
 
 With it, the active power a row loses (an island cut off with
-``handle_disconnected_grid``, a scenario-sweep generator contingency) is shared
+``handle_disconnected_grid``, a scenario-sweep generator contingency, and what a
+scenario's own injections take out of the balance of the grid's set-points) is shared
 on the remaining slack units BEFORE the solve, OpenLoadFlow-style: each unit
 clamped to its ``[min_p, max_p]`` and never crossing 0 MW, a clamped unit
 leaving the pool and that row's distributed slack. The batch must land where
@@ -367,12 +368,15 @@ class SweepCase(Case14):
         return rep(load_p), rep(load_q), gp
 
 
-def _gpu_ss(case, gen_mask, gen_p_rows=None, topology=None, redistribute=True, **kw):
+def _gpu_ss(case, gen_mask, gen_p_rows=None, topology=None, redistribute=True,
+            load_p_rows=None, **kw):
     from gpusim2grid import ScenarioSweepGPU
     n = gen_mask.shape[0]
     load_p, load_q, gen_p = case.elements(n)
     if gen_p_rows is not None:
         gen_p = gen_p_rows
+    if load_p_rows is not None:
+        load_p = load_p_rows
     sw = ScenarioSweepGPU(case.grid, nb_iter=10, tol_base=1e-10,
                           redistribute_slack=redistribute, **kw)
     sw.set_injections_from_elements(load_p, load_q, gen_p)
@@ -383,12 +387,13 @@ def _gpu_ss(case, gen_mask, gen_p_rows=None, topology=None, redistribute=True, *
     return sw, sw.solver.V_results.to_numpy().reshape(n, case.n_bus)
 
 
-def _ls_ss(case, gen_mask, gen_p_rows=None, branches_off=None, redistribute=True):
+def _ls_ss(case, gen_mask, gen_p_rows=None, branches_off=None, redistribute=True,
+           load_p_rows=None):
     from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
     n = gen_mask.shape[0]
     load_p, load_q, gen_p = case.elements(n)
     sw = ScenarioSweepCPP(case.grid)
-    sw.modify_load_p(load_p)
+    sw.modify_load_p(load_p if load_p_rows is None else load_p_rows)
     sw.modify_load_q(load_q)
     sw.modify_gen_p(gen_p if gen_p_rows is None else gen_p_rows)
     sw.set_contingency_gens(gen_mask)
@@ -405,10 +410,13 @@ def _ls_ss(case, gen_mask, gen_p_rows=None, branches_off=None, redistribute=True
 
 def _one_off_gen_off(case, gen_off, row_p=None):
     ref = case.grid.copy()
+    lost = 0.
     if row_p is not None:
         for g in range(case.n_gen):
             ref.change_p_gen(g, float(row_p[g]))
-    lost = float(row_p[gen_off]) if row_p is not None else float(case.targets[gen_off])
+        # what the row's own set-points take out of the balance of the grid's targets
+        lost += float(np.sum(case.targets - row_p))
+    lost += float(row_p[gen_off]) if row_p is not None else float(case.targets[gen_off])
     ref.deactivate_gen(gen_off)
     report = ref.redistribute_active_power(lost)
     return _solve(ref), report
@@ -462,6 +470,117 @@ def test_ss_row_setpoints_are_the_rows_own(solver_atol):
         _assert_same_state(V[r], _in_solver(V_ls[r], case.s2me), every, 10 * solver_atol)
         V_one, _ = _one_off_gen_off(case, case.slack_gen, row_p=gen_p[r])
         _assert_same_state(V[r], _in_solver(V_one, case.s2me), every, 10 * solver_atol)
+
+
+def _injection_change_rows(case):
+    """four rows (load_p, gen_p, gen off mask, trips): the base case; a load
+    raised by 15 MW; the non-slack generator producing 30 MW more; and one row
+    raising a load, moving every set-point by 5 %, disconnecting the slack
+    generator of bus 1 and islanding the leaf bus."""
+    load_p, _, gen_p = case.elements(4)
+    load_p[1, 1] += 15.
+    gen_p[2, case.non_slack] += 30.
+    load_p[3, 1] += 12.
+    gen_p[3] *= 1.05
+    mask = np.zeros((4, case.n_gen), dtype=bool)
+    mask[3, case.slack_gen] = True
+    n_branch = case.n_line + len(case.grid.get_trafos())
+    branches_off = np.zeros((4, n_branch), dtype=bool)
+    branches_off[3, case.leaf_branch] = True
+    topology = [[], [], [], [case.leaf_branch]]
+    return load_p, gen_p, mask, branches_off, topology
+
+
+def _injection_change_limits(case):
+    """one unit that stays in every row can only move 2 MW each way"""
+    others = [g for g in range(case.n_gen)
+              if g not in (case.slack_gen, case.non_slack, case.leaf_gen)]
+    case.clamped_gen = max(others, key=lambda g: case.targets[g])
+    lo = np.full(case.n_gen, -np.inf)
+    hi = np.full(case.n_gen, np.inf)
+    lo[case.clamped_gen] = case.targets[case.clamped_gen] - 2.
+    hi[case.clamped_gen] = case.targets[case.clamped_gen] + 2.
+    return lo, hi
+
+
+def test_ss_injection_change_matches_lightsim2grid(solver_atol):
+    """What a row's own load_p / gen_p take out of the balance of the grid's
+    set-points is shared too (with the generators it disconnects and its
+    island) -- as lightsim2grid's batch."""
+    _needs_upstream()
+    case = SweepCase(_injection_change_limits)
+    load_p, gen_p, mask, branches_off, topology = _injection_change_rows(case)
+    sw, V = _gpu_ss(case, mask, gen_p_rows=gen_p, load_p_rows=load_p, topology=topology,
+                    handle_disconnected_grid=True)
+    V_ls = _ls_ss(case, mask, gen_p_rows=gen_p, load_p_rows=load_p, branches_off=branches_off)
+    live = np.arange(case.n_bus) != LEAF_BUS
+    for r in range(4):
+        _assert_same_state(V[r], _in_solver(V_ls[r], case.s2me), live, 10 * solver_atol)
+    base_load = case.elements(1)[0][0]
+    expected = np.sum(case.targets - gen_p, axis=1) - np.sum(base_load - load_p, axis=1)
+    expected[3] += gen_p[3, case.slack_gen] + gen_p[3, case.leaf_gen]
+    rep = sw.get_slack_redistribution_report()
+    np.testing.assert_allclose(rep["mismatch_mw"][1:], expected[1:], rtol=0., atol=1e-8)
+    assert rep["nb_rounds"][0] == 0   # the base case: nothing to share
+    assert rep["nb_saturated"][1] == 1 and rep["nb_saturated"][2] >= 1
+    # ... and it is not what the unbounded slack gives
+    _, V_off = _gpu_ss(case, mask, gen_p_rows=gen_p, load_p_rows=load_p, topology=topology,
+                       handle_disconnected_grid=True, redistribute=False)
+    assert np.max(np.abs(V_off[1] - V[1])) > 1e-6
+    np.testing.assert_allclose(V_off[0], V[0], rtol=0., atol=10 * solver_atol)
+
+
+def test_ss_injection_change_per_bus_injections(solver_atol):
+    """set_injections (per bus) carries the rows' totals all the same: the
+    same result as set_injections_from_elements."""
+    _needs_upstream()
+    from gpusim2grid import ScenarioSweepGPU
+    from gpusim2grid._ls2g_utils import build_bus_injections, extract_injection_elements
+    case = SweepCase(_injection_change_limits)
+    load_p, _, gen_p = case.elements(3)
+    load_p[1, 1] += 15.
+    load_p[2, 3] -= 10.
+    mask = np.zeros((3, case.n_gen), dtype=bool)
+    sw_el, V_ref = _gpu_ss(case, mask, gen_p_rows=gen_p, load_p_rows=load_p)
+    el = extract_injection_elements(case.grid, case.n_bus)
+    load_q = case.elements(3)[1]
+    p_mw, q_mvar = build_bus_injections(el, load_p, load_q, gen_p, gen_off=mask)
+    sw = ScenarioSweepGPU(case.grid, nb_iter=10, tol_base=1e-10, redistribute_slack=True)
+    sw.set_injections(p_mw, q_mvar, el.sn_mva)
+    sw.set_contingency_gens(mask)
+    sw.compute(batch_size=3)
+    np.testing.assert_allclose(sw.solver.V_results.to_numpy().reshape(3, case.n_bus), V_ref,
+                               rtol=0., atol=10 * solver_atol)
+    np.testing.assert_allclose(sw.get_slack_redistribution_report()["mismatch_mw"],
+                               sw_el.get_slack_redistribution_report()["mismatch_mw"],
+                               rtol=0., atol=1e-8)
+
+
+def test_ss_injection_change_needs_base_p_mw():
+    """Array-mode participants without base_p_mw: no injection-change term."""
+    _needs_upstream()
+    from gpusim2grid import ScenarioSweepGPU
+    from gpusim2grid import _gpusim2grid as _cpp
+    case = SweepCase(_injection_change_limits)
+    load_p, load_q, gen_p = case.elements(2)
+    load_p[1, 1] += 15.
+    data = _cpp._extract_slack_redistribution_data_from_lsgrid(case.grid, case.n_bus)
+    assert data.base_p_mw == pytest.approx(
+        float(np.sum(np.asarray(case.grid.get_Sbus_solver()).real)) * data.sn_mva, abs=1e-9)
+    sw = ScenarioSweepGPU(case.grid, nb_iter=10, tol_base=1e-10, redistribute_slack=True)
+    sw.set_injections_from_elements(load_p, load_q, gen_p)
+    sw.set_slack_redistribution_data((
+        data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
+        data.target_p_mw, data.gen_bus_solver, data.gen_target_p_mw, data.n_sto,
+        data.shunt_p_mw, data.sn_mva, data.in_slack))
+    sw.compute(batch_size=2)
+    assert list(sw.get_slack_redistribution_report()["nb_rounds"]) == [0, 0]
+    sw.set_slack_redistribution_data((
+        data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
+        data.target_p_mw, data.gen_bus_solver, data.gen_target_p_mw, data.n_sto,
+        data.shunt_p_mw, data.sn_mva, data.in_slack, data.base_p_mw))
+    sw.compute(batch_size=2)
+    assert sw.get_slack_redistribution_report()["mismatch_mw"][1] == pytest.approx(15., abs=1e-8)
 
 
 def test_ss_island_and_gen_off_in_one_row(solver_atol):
@@ -685,6 +804,24 @@ def test_batch_power_flow_forward_matches_the_sweep(solver_atol):
     assert np.nanmax(np.abs(V_off[1] - V[1])) > 1e-6
 
 
+def test_batch_power_flow_injection_change_matches_the_sweep(solver_atol):
+    """BatchPowerFlow's own pre-pass shares the rows' injection change too."""
+    _needs_upstream()
+    torch = pytest.importorskip("torch")
+    case = SweepCase(_injection_change_limits)
+    load_p, gen_p, mask, _, topology = _injection_change_rows(case)
+    load_q = case.elements(4)[1]
+    trafo_status = np.ones((4, len(case.grid.get_trafos())), dtype=bool)
+    trafo_status[3, case.leaf_branch - case.n_line] = False
+    pf = _bpf(case, redistribute_slack=True)
+    cuda = lambda a: torch.as_tensor(a, device="cuda")   # noqa: E731
+    V = pf(load_p=cuda(load_p), load_q=cuda(load_q), gen_p=cuda(gen_p),
+           trafo_status=cuda(trafo_status), gen_status=cuda(~mask)).detach().cpu().numpy()
+    _, V_sw = _gpu_ss(case, mask, gen_p_rows=gen_p, load_p_rows=load_p, topology=topology,
+                      handle_disconnected_grid=True, reference_slack="grid")
+    np.testing.assert_allclose(np.nan_to_num(V), np.nan_to_num(V_sw), rtol=0., atol=10 * solver_atol)
+
+
 @pytest.mark.skipif(bool(__import__("gpusim2grid._gpusim2grid", fromlist=["x"]).is_fp32),
                     reason="finite-difference gradient checks need the FP64 build")
 def test_batch_power_flow_gradient_is_the_finite_difference():
@@ -710,6 +847,12 @@ def test_batch_power_flow_gradient_is_the_finite_difference():
     gs = torch.as_tensor(gen_status, device="cuda")
     gen_buses = {g.bus_id for g in case.grid.get_generators()}
     loads = [ld.id for ld in case.grid.get_loads() if ld.bus_id not in gen_buses]   # on PQ buses
+    # row 2 only raises a load (its injection change is shared): away from a row
+    # that loses exactly nothing, where the units at 0 MW (the synchronous
+    # condensers) leave the slack as soon as the lost power turns negative -- a
+    # jump a central difference there would straddle
+    load_p = load_p.clone()
+    load_p[2, loads[2]] += 5.
 
     def loss(lp, lq, gp, gv):
         V = pf(load_p=lp, load_q=lq, gen_p=gp, gen_v=gv, trafo_status=ts, gen_status=gs)
@@ -733,7 +876,7 @@ def test_batch_power_flow_gradient_is_the_finite_difference():
         (2, 1, case.clamped_gen, 1e-3, "zero"),
         (2, 0, case.slack_gen, 1e-3, "live"),    # free units (40 MW each)
         (2, 1, case.leaf_gen, 1e-3, "live"),
-        (2, 2, case.slack_gen, 1e-3, "live"),    # a row that loses nothing
+        (2, 2, case.slack_gen, 1e-3, "live"),    # a row that only raises a load
         (2, 2, case.clamped_gen, 1e-3, "live"),  # ... where nothing is clamped
         (0, 0, loads[0], 1e-3, "live"),
         (0, 1, loads[1], 1e-3, "live"),

@@ -26,7 +26,16 @@
 //           row's Sbus) minus their shunts' active power at 1 pu, which the
 //           AC Sbus does not carry. Upstream sums the same terms element by
 //           element; the total is the same up to rounding. (A droop hvdc end
-//           is never masked here: stranding one skips the row.)
+//           is never masked here: stranding one skips the row.) Plus, on a
+//           scenario sweep,
+//       (c) what the row's own injections take out of the balance of the
+//           grid's (injection_change_lost_mw): base_p_mw - sn * sum Re(Sbus_row)
+//           over every bus, the generators the row disconnects put back at
+//           their row set-point ((a) counts them) -- upstream's
+//           sum(target - row) over the generators and static generators minus
+//           the same over the loads. A line or transformer that leaves the
+//           grid connected loses no injection: the change in the losses stays
+//           with the Newton solve.
 //   * the participants are the slack units (generators, then storage units,
 //     by id) left in the main component and not disconnected by the row, with
 //     a weight above 1e-7, in GENERATOR convention;
@@ -94,6 +103,10 @@ struct SlackRedistributionData {
     // convention): not in the AC Sbus, lost with the bus all the same
     RealVect        shunt_p_mw;       // [n_bus]
     double          sn_mva = 100.0;
+    // ---- the active injection of the grid's own set-points, summed over the
+    // solved system (sn * sum Re(grid Sbus), MW): what term (c) of a scenario
+    // row is measured against. NaN: unknown, no term (c)
+    double          base_p_mw = std::numeric_limits<double>::quiet_NaN();
 
     bool empty() const { return n_units == 0; }
     bool unit_in_slack(int k) const { return in_slack.size() == 0 || in_slack(k) != 0; }
@@ -270,6 +283,25 @@ double lost_mw(const SlackRedistributionData& d, const std::vector<int>& masked,
     return lost;
 }
 
+// Term (c) of a scenario row (MW, generator convention): what its injections
+// take out of the balance of the grid's set-points, d.base_p_mw minus the row's
+// total active injection `row_p_mw` (sn * sum Re(Sbus_row), which the
+// generators it disconnects already left: put back here at their row set-point
+// gen_p_row(g), term (a) counts them). 0 when either total is unknown (NaN).
+template <class GenOff, class GenPRow>
+double injection_change_lost_mw(const SlackRedistributionData& d, double row_p_mw,
+                                GenOff gen_off, GenPRow gen_p_row)
+{
+    if (!std::isfinite(d.base_p_mw) || !std::isfinite(row_p_mw)) return 0.;
+    double row = row_p_mw;
+    for (int g = 0; g < d.n_gen; ++g) {
+        if (d.gen_bus_solver(g) < 0) continue;
+        if (!gen_off(g)) continue;
+        row += gen_p_row(g);
+    }
+    return d.base_p_mw - row;
+}
+
 // The pre-pass of one row: share `lost` on the units that stay in the main
 // component (bus_masked(b) false) and that the row does not disconnect
 // (gen_off(g) false for a generator), at their row set-point (gen_p_row(g) for
@@ -371,11 +403,12 @@ inline void row_slack_weights(const SlackRedistributionData& d, const std::vecto
 // The pre-pass of every row (ORIGINAL order): skipped(r) rows are left empty;
 // masked(r) the row's masked solver buses; gen_off(r, g) whether it
 // disconnects generator g; gen_p_row(r, g) its set-point of generator g (MW);
-// sbus_p_mw(r, b) the real part of its Sbus at bus b, in MW.
-template <class Skipped, class Masked, class GenOff, class GenPRow, class SbusPMw>
+// sbus_p_mw(r, b) the real part of its Sbus at bus b, in MW; row_p_mw(r) its
+// total active injection (MW, NaN: no term (c), see injection_change_lost_mw).
+template <class Skipped, class Masked, class GenOff, class GenPRow, class SbusPMw, class RowPMw>
 std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows, int n_bus,
                                    Skipped skipped, Masked masked, GenOff gen_off,
-                                   GenPRow gen_p_row, SbusPMw sbus_p_mw)
+                                   GenPRow gen_p_row, SbusPMw sbus_p_mw, RowPMw row_p_mw)
 {
     std::vector<RowResult> out(static_cast<size_t>(std::max(n_rows, 0)));
     std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
@@ -384,7 +417,8 @@ std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows,
         const std::vector<int>& m = masked(r);
         auto g_off = [&](int g) { return gen_off(r, g); };
         auto g_p   = [&](int g) { return gen_p_row(r, g); };
-        const double lost = lost_mw(d, m, g_off, g_p, [&](int b) { return sbus_p_mw(r, b); });
+        const double lost = lost_mw(d, m, g_off, g_p, [&](int b) { return sbus_p_mw(r, b); })
+                          + injection_change_lost_mw(d, row_p_mw(r), g_off, g_p);
         for (int b : m) is_masked[static_cast<size_t>(b)] = 1;
         out[static_cast<size_t>(r)] = redistribute_row(
             d, lost, [&](int b) { return b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)] != 0; },
@@ -392,6 +426,17 @@ std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows,
         for (int b : m) is_masked[static_cast<size_t>(b)] = 0;
     }
     return out;
+}
+
+// ... without term (c): a batch whose rows all inject the grid's set-points
+// (the contingency analysis)
+template <class Skipped, class Masked, class GenOff, class GenPRow, class SbusPMw>
+std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows, int n_bus,
+                                   Skipped skipped, Masked masked, GenOff gen_off,
+                                   GenPRow gen_p_row, SbusPMw sbus_p_mw)
+{
+    return prepass_all(d, n_rows, n_bus, skipped, masked, gen_off, gen_p_row, sbus_p_mw,
+                       [](int) { return std::numeric_limits<double>::quiet_NaN(); });
 }
 
 // Per-row normalised slack weights ([n_rows * n_slack], ORIGINAL order) without

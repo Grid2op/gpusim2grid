@@ -116,8 +116,9 @@ co-located with a regulating one gets 0 and never conflicts; a NaN entry (=
 "keep the base-case set-point") gets 0.
 
 ``redistribute_slack`` (lightsim2grid PR #216, ``ScenarioSweepGPU``'s option
-of the same name): what a row loses -- the generators ``gen_status`` takes out
-and the island ``handle_disconnected_grid`` masks -- is shared on the remaining
+of the same name): what a row loses -- the generators ``gen_status`` takes out,
+the island ``handle_disconnected_grid`` masks, and the imbalance its own
+``load_p`` / ``gen_p`` create against the grid's set-points -- is shared on the remaining
 slack units BEFORE the solve, OpenLoadFlow-style (clamped to ``[min_p,
 max_p]``, a clamped unit leaving that row's slack). Here the pre-pass runs in
 the forward itself, so that its correction is part of the autograd graph: the
@@ -366,6 +367,7 @@ class BatchPowerFlow:
                 "max_np": np.ascontiguousarray(data.max_p_mw, dtype=np.float64),
                 "gen_in_grid": torch.as_tensor(np.asarray(data.gen_bus_solver) >= 0, device=dev),
                 "shunt": torch.as_tensor(np.asarray(data.shunt_p_mw), dtype=rdt, device=dev),
+                "base_p_mw": float(data.base_p_mw),
             }
         elif self._ext_sat_in_session:
             self._pending_ext_sat = "clear"
@@ -469,11 +471,17 @@ class BatchPowerFlow:
         masked, dropped = self._row_masks(n_scen)
         Mf = masked.to(P.dtype)
         # what each row loses: its island's net injection (minus the shunts the
-        # AC Sbus does not carry) and the generators it disconnects
+        # AC Sbus does not carry), the generators it disconnects and what its
+        # injections take out of the balance of the grid's set-points (P left
+        # the disconnected generators out: put back, the line above counts them)
         lost = (P * Mf).sum(1) * sn - Mf @ rd["shunt"]
         if gen_off is not None:
             off = gen_off & rd["gen_in_grid"].unsqueeze(0)
             lost = lost + (gen_p_in * off.to(P.dtype)).sum(1)
+        if np.isfinite(rd["base_p_mw"]):
+            lost = lost + rd["base_p_mw"] - P.sum(1) * sn
+            if gen_off is not None:
+                lost = lost - (gen_p_in * off.to(P.dtype)).sum(1)
         lost = torch.where(dropped, torch.zeros_like(lost), lost)
         if rd["n"] == 0:
             self._queue_ext_sat([[] for _ in range(n_scen)])

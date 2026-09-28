@@ -269,7 +269,9 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "empty = all 1): 0 for a unit of the pre-pass only -- lightsim2grid's \"can "
         "participate in the slack\" flag (LSGrid.set_gen_can_participate_slack), a unit left "
         "out of the slack only because it sat at an active limit -- which never enters the "
-        "solve's slack weights.")
+        "solve's slack weights. Optional base_p_mw: the active injection of the grid's own "
+        "set-points summed over the solved system (MW), what a scenario row's injection "
+        "change is pre-shared against (NaN = unknown: no such term).")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> kind,
                                Eigen::Ref<const Eigen::VectorXi> el_id,
@@ -283,7 +285,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                int n_sto,
                                Eigen::Ref<const RealVect> shunt_p_mw,
                                double sn_mva,
-                               Eigen::Ref<const Eigen::VectorXi> in_slack) {
+                               Eigen::Ref<const Eigen::VectorXi> in_slack,
+                               double base_p_mw) {
                  SlackRedistributionData d;
                  d.n_units = static_cast<int>(kind.size());
                  d.kind = kind; d.el_id = el_id; d.bus_solver = bus_solver;
@@ -293,6 +296,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  d.gen_bus_solver = gen_bus_solver; d.gen_target_p_mw = gen_target_p_mw;
                  d.n_sto = n_sto; d.shunt_p_mw = shunt_p_mw; d.sn_mva = sn_mva;
                  d.in_slack = in_slack;
+                 d.base_p_mw = base_p_mw;
                  return d;
              }),
              pybind11::arg("kind"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
@@ -300,7 +304,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
              pybind11::arg("target_p_mw"), pybind11::arg("gen_bus_solver"),
              pybind11::arg("gen_target_p_mw"), pybind11::arg("n_sto"),
              pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"),
-             pybind11::arg("in_slack") = Eigen::VectorXi())
+             pybind11::arg("in_slack") = Eigen::VectorXi(),
+             pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN())
         .def_readonly("n_units",         &SlackRedistributionData::n_units)
         .def_readonly("kind",            &SlackRedistributionData::kind)
         .def_readonly("el_id",           &SlackRedistributionData::el_id)
@@ -315,7 +320,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("gen_target_p_mw", &SlackRedistributionData::gen_target_p_mw)
         .def_readonly("n_sto",           &SlackRedistributionData::n_sto)
         .def_readonly("shunt_p_mw",      &SlackRedistributionData::shunt_p_mw)
-        .def_readonly("sn_mva",          &SlackRedistributionData::sn_mva);
+        .def_readonly("sn_mva",          &SlackRedistributionData::sn_mva)
+        .def_readonly("base_p_mw",       &SlackRedistributionData::base_p_mw);
 
     pybind11::class_<SlackRedistributionReport>(m, "SlackRedistributionReport",
         "Per row (ORIGINAL order) of the last run(), what the redistribute_slack pre-pass "
