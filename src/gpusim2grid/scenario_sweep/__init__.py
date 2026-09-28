@@ -54,6 +54,10 @@ from ..contingency_analysis._physical_checks import (
     PhysicalChecksEngineMixin,
     PhysicalChecksFacadeMixin,
 )
+from ..contingency_analysis._slack_redistribution import (
+    SlackRedistributionEngineMixin,
+    SlackRedistributionFacadeMixin,
+)
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
 
@@ -82,7 +86,7 @@ def _resolve_strategy(strategy):
     )
 
 
-class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
+class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin):
     """Stateful GPU row-aligned combined topology + injection sweep.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -271,10 +275,13 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
     @property
     def handle_disconnected_grid(self):
         """bool: solve the largest connected component of a scenario's split
-        grid (masking the rest as NaN) instead of skipping it. Scenarios that
-        strand the angle reference or a controller bus are still skipped.
-        Incompatible with the 'direct_base_case_factors' strategy. Takes
-        effect on the next run()."""
+        grid (masking the rest as NaN) instead of skipping it. A
+        voltage-control group whose controllers are all stranded releases the
+        bus it regulates (their reactive power is pinned to 0). Scenarios that
+        strand the angle reference, an HVDC droop end, or a regulated bus one
+        of whose controllers stays live are still skipped. Incompatible with
+        the 'direct_base_case_factors' strategy. Takes effect on the next
+        run()."""
         return self._s.handle_disconnected_grid
 
     @handle_disconnected_grid.setter
@@ -441,6 +448,27 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin):
     @violation_tol.setter
     def violation_tol(self, value):
         self._s.violation_tol = float(value)
+
+    @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by compute_limit_violations (lightsim2grid's
+        ``violation_rel_tol``, default ``1e-9``): CURRENT when
+        ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when ``v > vmax * (1 + tol)``,
+        LOW_VOLTAGE when ``v < vmin * (1 - tol)``. A value on its limit up to
+        rounding -- a bus a regulator holds exactly at its vmax -- is then not
+        reported, whichever side of the limit the last bit of the solve put it
+        on. ``0`` gives the bare strict comparisons. In [0, 1[; takes effect on
+        the next run(). (An FP32 build cannot resolve 1e-9: there, a value
+        needs a tolerance of ~1e-6 to be absorbed.)"""
+        return self._s.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        value = float(value)
+        if not (0. <= value < 1.):
+            raise ValueError(f"violation_rel_tol must be in [0, 1[ (got {value}).")
+        self._s.violation_rel_tol = value
 
     @property
     def violation_capacity(self):

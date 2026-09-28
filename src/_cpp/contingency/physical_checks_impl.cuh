@@ -6,7 +6,7 @@
 #define PHYSICAL_CHECKS_IMPL_CUH
 
 // =============================================================================
-// contingency/physical_checks_impl.cuh — session-side glue of the three post-
+// contingency/physical_checks_impl.cuh — session-side glue of the four post-
 // solve physical checks (see physical_checks_data.hpp), shared by the three
 // batch sessions. Templated on the driver (BatchPfDriver<Source>).
 // =============================================================================
@@ -22,21 +22,40 @@
 
 namespace physical_checks {
 
-struct SetupTimes { double bus_q_ms = 0.; double hvdc_p_ms = 0.; double gen_p_ms = 0.; };
+struct SetupTimes {
+    double bus_q_ms = 0.; double hvdc_p_ms = 0.; double gen_p_ms = 0.; double gen_pv_release_ms = 0.;
+};
 
-// Before solve(): hand the driver what the three checks need and (re)seed
+// Per-row set-points a session hands the checks, and whether they changed
+// since the driver last saw them (nullptr / empty = none).
+struct RowTargets {
+    const RealMatRM* gen_p = nullptr;            // active check, MW
+    bool             gen_p_dirty = false;
+    const RealMatRM* gen_pv_release = nullptr;   // release check, pu
+    bool             gen_pv_release_dirty = false;
+};
+
+namespace detail {
+// upload `targets` when they changed or the driver has none yet (a cold
+// driver), drop them when the session has none any more
+template <class Upload>
+void sync_targets(const RealMatRM* targets, bool dirty, bool driver_has, Upload upload)
+{
+    const bool has = (targets != nullptr) && targets->size() > 0;
+    if (has && (dirty || !driver_has)) upload(*targets);
+    else if (!has && driver_has)        upload(RealMatRM());
+}
+}  // namespace detail
+
+// Before solve(): hand the driver what the four checks need and (re)seed
 // their outputs, then produce the base ("n") case's own report when the base
 // solve converged. Re-callable on a live driver (ScenarioSweep's persistent
 // one): that is what resets the -1 "never simulated" sentinels between runs.
-// gen_p_targets (nullptr / empty = none) are the per-row set-points of the
-// active check, uploaded only when `gen_p_targets_dirty` or the driver has
-// none yet (a cold driver).
 template <class Driver>
 SetupTimes before_solve(PhysicalChecksConfig& cfg, Driver& drv, const char* who,
                         double residual_tol, double sn_mva, bool base_converged,
                         const unsigned char* d_gen_off, int n_gen,
-                        const RealMatRM* gen_p_targets = nullptr,
-                        bool gen_p_targets_dirty = false)
+                        const RowTargets& targets = RowTargets())
 {
     SetupTimes t;
     if (!cfg.compute_physical_violations) return t;
@@ -58,13 +77,18 @@ SetupTimes before_solve(PhysicalChecksConfig& cfg, Driver& drv, const char* who,
     // limits), see PhysicalChecksConfig::gen_p_plan
     drv.set_gen_p_check(cfg.gen_p_plan, cfg.physical_violation_tol_mva,
                         cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
-    const bool has_targets = (gen_p_targets != nullptr) && gen_p_targets->size() > 0;
-    if (has_targets && (gen_p_targets_dirty || !drv.has_gen_p_targets()))
-        drv.upload_gen_p_targets(*gen_p_targets);
-    else if (!has_targets && drv.has_gen_p_targets())
-        drv.upload_gen_p_targets(RealMatRM());
+    detail::sync_targets(targets.gen_p, targets.gen_p_dirty, drv.has_gen_p_targets(),
+                         [&](const RealMatRM& m) { drv.upload_gen_p_targets(m); });
     if (base_converged) drv.run_gen_p_check_n();
     t.gen_p_ms = drv.gen_p_setup_ms();
+    // the release check: an unset plan is an empty one (nothing was flagged)
+    drv.set_gen_pv_release_check(cfg.gen_pv_release_plan, cfg.physical_violation_tol_vm_pu,
+                                 cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
+    detail::sync_targets(targets.gen_pv_release, targets.gen_pv_release_dirty,
+                         drv.has_gen_pv_release_targets(),
+                         [&](const RealMatRM& m) { drv.upload_gen_pv_release_targets(m); });
+    if (base_converged) drv.run_gen_pv_release_check_n();
+    t.gen_pv_release_ms = drv.gen_pv_release_setup_ms();
     return t;
 }
 
@@ -72,7 +96,7 @@ SetupTimes before_solve(PhysicalChecksConfig& cfg, Driver& drv, const char* who,
 // assignment would drop them) and mark the report as available.
 inline void after_solve(PhysicalChecksConfig& cfg, BatchTimings& tm, const SetupTimes& t)
 {
-    tm.t_physical_setup_ms += t.bus_q_ms + t.hvdc_p_ms + t.gen_p_ms;
+    tm.t_physical_setup_ms += t.bus_q_ms + t.hvdc_p_ms + t.gen_p_ms + t.gen_pv_release_ms;
     cfg.has_result = cfg.compute_physical_violations;
 }
 
@@ -165,6 +189,29 @@ GenPViolationsResult fetch_gen_p(const PhysicalChecksConfig& cfg, const Driver& 
     r.limit        = detail::to_real(n_case ? drv.d_gp_n_limit        : drv.d_gp_out_limit);
     r.count        = detail::to_int (n_case ? drv.d_gp_n_count        : drv.d_gp_count);
     r.truncated    = detail::to_int (n_case ? drv.d_gp_n_truncated    : drv.d_gp_truncated);
+    t_acc += detail::ms_since_(t0);
+    return r;
+}
+
+template <class Driver>
+GenPvReleaseViolationsResult fetch_gen_pv_release(const PhysicalChecksConfig& cfg, const Driver& drv,
+                                                  bool n_case, const char* who, double& t_acc)
+{
+    if (!cfg.has_result)
+        throw std::runtime_error(std::string(who) +
+            ": the physical checks were not requested. Set "
+            "compute_physical_violations = True before run() to use this feature.");
+    drv.cs.synchronize();
+    auto t0 = std::chrono::steady_clock::now();
+    GenPvReleaseViolationsResult r;
+    r.capacity  = drv.gen_pv_release_capacity_;
+    r.stride    = N_GEN_PV_RELEASE_VIOLATION_GROUPS * drv.gen_pv_release_capacity_;
+    r.gen_id    = detail::to_int (n_case ? drv.d_gr_n_gen_id    : drv.d_gr_out_gen_id);
+    r.type      = detail::to_int (n_case ? drv.d_gr_n_type      : drv.d_gr_out_type);
+    r.value     = detail::to_real(n_case ? drv.d_gr_n_value     : drv.d_gr_out_value);
+    r.limit     = detail::to_real(n_case ? drv.d_gr_n_limit     : drv.d_gr_out_limit);
+    r.count     = detail::to_int (n_case ? drv.d_gr_n_count     : drv.d_gr_count);
+    r.truncated = detail::to_int (n_case ? drv.d_gr_n_truncated : drv.d_gr_truncated);
     t_acc += detail::ms_since_(t0);
     return r;
 }

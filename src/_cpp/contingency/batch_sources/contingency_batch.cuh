@@ -39,6 +39,7 @@
 #include "../../nr_iter_step.cuh"         // BS
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
 #include "../mask_streams.cuh"            // MaskStreams
+#include "slot_slack_redistribution.cuh"  // SlotSlackRedistribution
 
 // Forward declaration to avoid circular include.
 struct BatchPfDriverContext;
@@ -54,9 +55,12 @@ struct ContingencyBatch {
 
     // -------------------------------------------------------------------------
     // sbus_stride = 0  → fill_FP/FQ kernels treat d_Sbus as a single-system
-    // shared (n_bus,) buffer.  This matches the historic contingency behaviour.
+    // shared (n_bus,) buffer, the historic contingency behaviour. Only when the
+    // redistribute_slack pre-pass corrected some row's injection does every
+    // slot get its own Sbus row (d_Sbus_batch, stride n_bus) -- a batch that
+    // needs none keeps the shared buffer, bit-identical.
     // -------------------------------------------------------------------------
-    static int sbus_stride(int /*n_bus*/) { return 0; }
+    int sbus_stride(int n_bus) const { return slack_.has_dp() ? n_bus : 0; }
 
     // -------------------------------------------------------------------------
     // Host-side preprocessing results (filled in the ctor; uploaded in initialize)
@@ -106,6 +110,16 @@ struct ContingencyBatch {
     // -------------------------------------------------------------------------
     std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
     thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
+
+    // -------------------------------------------------------------------------
+    // Per-row distributed slack (redistribute_slack, see
+    // slot_slack_redistribution.cuh): the saturated units' per-row weights and
+    // the per-row Sbus correction; empty = base weights / shared base Sbus.
+    // Set on the host (set_slack_redistribution_host) BEFORE the source is
+    // handed to its driver, uploaded by initialize().
+    // -------------------------------------------------------------------------
+    SlotSlackRedistribution                slack_;
+    thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus, only with a correction
 
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
@@ -169,6 +183,17 @@ struct ContingencyBatch {
 
     // Effective per-chunk size (rebalanced over the active/simulated count).
     int used_batch_size() const { return used_batch_size_; }
+    const std::vector<int>& active_to_orig() const { return active_to_orig_; }
+
+    // redistribute_slack: per-row weights ([n_ctg * n_slack], ORIGINAL order;
+    // empty = base weights) and Sbus corrections (per ORIGINAL row, sorted
+    // (bus, dP pu); empty = none). Host only -- initialize() uploads.
+    void set_slack_redistribution_host(const std::vector<cuda_real_type>& w_orig, int n_slack,
+                                       const std::vector<std::vector<std::pair<int, double>>>& dp_orig)
+    {
+        slack_.set_weights_host(w_orig, n_slack, active_to_orig_, n_total_);
+        slack_.set_dp_host(dp_orig, active_to_orig_, used_batch_size_);
+    }
 
     ContingencyBatch(ContingencyBatch&&) noexcept = default;
     ContingencyBatch(const ContingencyBatch&) = delete;
@@ -179,7 +204,8 @@ struct ContingencyBatch {
     // initialize  — upload flat-patch SoA arrays to device on the driver's stream.
     // Called once from BatchPfDriver's ctor after `cs` exists.
     // -------------------------------------------------------------------------
-    void initialize(BatchPfDriverContext& /*ctx*/, cudaStream_t cs) {
+    void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
+    void initialize_patches(cudaStream_t cs) {
         upload_h2d(d_flat_ctg_id,   h_flat_ctg_id_.data(),   h_flat_ctg_id_.size(),   cs);
         upload_h2d(d_flat_k,         h_flat_k_.data(),         h_flat_k_.size(),         cs);
         upload_h2d(d_flat_delta_re,  h_flat_delta_re_.data(),  h_flat_delta_re_.size(),  cs);
@@ -219,9 +245,10 @@ struct ContingencyBatch {
         mask_.fill(buf, chunk_idx, d_J_outer);
     }
 
-    // BatchSource concept: contingency analysis keeps the shared base-case
-    // slack weights on every slot (no per-row generator contingencies).
-    void fill_slack_w_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
+    // BatchSource concept: the shared base-case slack weights on every slot,
+    // unless the redistribute_slack pre-pass took saturated units out of some
+    // row's distributed slack.
+    void fill_slack_w_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const { slack_.fill(buf); }
     void fill_vc_vset_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
 
     // -------------------------------------------------------------------------
@@ -302,24 +329,24 @@ struct ContingencyBatch {
     }
 
     // -------------------------------------------------------------------------
-    // prepare_Sbus_batch  — no-op for contingency analysis.  Sbus is the shared
-    // base-case (d_Sbus_ptr returns base.d_Sbus; sbus_stride = 0).
+    // prepare_Sbus_batch  — a no-op for a plain contingency analysis (Sbus is
+    // the shared base case: d_Sbus_ptr returns base.d_Sbus, sbus_stride = 0).
+    // With a redistribute_slack correction: base Sbus tiled into every slot,
+    // this chunk's corrections added, and the per-row weights sliced.
     // -------------------------------------------------------------------------
-    void prepare_Sbus_batch(BatchPfDriverContext& /*ctx*/,
-                            int                  /*chunk_idx*/,
-                            int                  /*actual_batch*/,
-                            cudaStream_t         /*cs*/,
-                            CudaTimer&           /*timer*/,
-                            BatchTimings&  /*t*/)
-    { }
+    void prepare_Sbus_batch(BatchPfDriverContext& ctx,
+                            int                  chunk_idx,
+                            int                  actual_batch,
+                            cudaStream_t         cs,
+                            CudaTimer&           timer,
+                            BatchTimings&        t);
 
     // -------------------------------------------------------------------------
-    // d_Sbus_ptr  — returns the base-case Sbus pointer (shared across all
-    // batch elements).  Used by the driver to populate NrIterBuffers.d_Sbus.
+    // d_Sbus_ptr  — the base-case Sbus pointer (shared across all batch
+    // elements), or this chunk's per-slot copy when some row was corrected.
+    // Used by the driver to populate NrIterBuffers.d_Sbus.
     // -------------------------------------------------------------------------
-    const cudaComplexType* d_Sbus_ptr(const BatchPfDriverContext& ctx) const {
-        return thrust::raw_pointer_cast(ctx.base.d_Sbus.data());
-    }
+    const cudaComplexType* d_Sbus_ptr(const BatchPfDriverContext& ctx) const;
 
     // CPU preprocess time captured at construction.
     double cpu_preprocess_ms() const { return t_preprocess_ms; }

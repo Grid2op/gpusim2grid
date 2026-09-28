@@ -52,6 +52,7 @@
 #include "../contingency_analysis_helper.hpp"   // ContingencySolverType
 #include "bus_q_check_data.hpp"                   // BusQPlanData
 #include "gen_p_check_data.hpp"                   // GenPPlanData
+#include "gen_pv_release_check_data.hpp"          // GenPvReleasePlanData
 #include "strategies/cudss_batch_solver.cuh"
 #include "strategies/policy_refactor_every.cuh"
 #include "strategies/policy_base_case_factors.cuh"
@@ -261,6 +262,7 @@ struct BatchPfDriver {
     bool           _fused_violations_enabled = false;
     int            violation_capacity_       = 0;   // K
     cuda_real_type violation_tol_            = 0;
+    cuda_real_type violation_rel_tol_        = 0;   // violation_rel_tol (relative margin past a limit)
     int            n_lines_                  = 0;   // branch ordering split (lines-then-trafos)
 
     thrust::device_vector<cuda_real_type> d_bus_vmin_kv;         // [n_bus]
@@ -365,6 +367,11 @@ struct BatchPfDriver {
     // per-row set-points of the plan's entries (upload_gen_p_targets), ORIGINAL
     // row order, [n_contingencies * n_entries]; empty = base targets everywhere
     thrust::device_vector<cuda_real_type> d_gp_targets;
+    // redistribute_slack: the units a row's pre-pass saturated take no share
+    // (upload_gen_p_no_share), per container id, ORIGINAL row order,
+    // [n_contingencies * n_gen] / [n_contingencies * n_sto]; empty = none
+    thrust::device_vector<unsigned char>  d_gp_no_share_gen, d_gp_no_share_sto;
+    int            gen_p_ns_gen_ = 0, gen_p_ns_sto_ = 0;
     thrust::device_vector<int>            d_gp_out_element_type, d_gp_out_element_id, d_gp_out_type;  // [n_contingencies * K_g]
     thrust::device_vector<cuda_real_type> d_gp_out_value, d_gp_out_limit;
     thrust::device_vector<int>            d_gp_count;        // [n_contingencies]; -1 = never simulated, else 0..K_g
@@ -372,6 +379,37 @@ struct BatchPfDriver {
     thrust::device_vector<int>            d_gp_n_element_type, d_gp_n_element_id, d_gp_n_type;  // [K_g]
     thrust::device_vector<cuda_real_type> d_gp_n_value, d_gp_n_limit;
     thrust::device_vector<int>            d_gp_n_count, d_gp_n_truncated;     // [1]
+
+    // -------------------------------------------------------------------------
+    // compute_physical_violations (opt-in; PQ -> PV release of the generators
+    // flagged as pinned at a reactive limit, lightsim2grid's GenPvReleaseCheck
+    // parity -- see gen_pv_release_check_data.hpp and
+    // check_gen_pv_release_violations_kernel). Plan arrays O(n_entries),
+    // outputs O(n_contingencies * K_r). Allocated only by
+    // set_gen_pv_release_check().
+    // -------------------------------------------------------------------------
+    bool           _gen_pv_release_enabled      = false;
+    int            gen_pv_release_n_entries_    = 0;
+    int            gen_pv_release_capacity_     = 0;   // K_r
+    int            gen_pv_release_n_gen_        = 0;   // columns of d_gr_gen_off_ (0 = none)
+    int            gen_pv_release_target_stride_ = 0;  // columns of d_gr_targets (0 = base targets)
+    cuda_real_type gen_pv_release_tol_vm_pu_    = 0;
+    cuda_real_type gen_pv_release_residual_tol_ = 0;
+    const unsigned char* d_gr_gen_off_          = nullptr;   // non-owning, like d_bq_gen_off_
+    double         t_gen_pv_release_setup_ms_   = 0.;
+
+    thrust::device_vector<int>            d_gr_gen_id, d_gr_reg_bus, d_gr_gen_bus, d_gr_at_min;
+    thrust::device_vector<cuda_real_type> d_gr_target_base, d_gr_vn_kv;
+    // per-row targets of the plan's entries (upload_gen_pv_release_targets),
+    // ORIGINAL row order, [n_contingencies * n_entries]; empty = base targets
+    thrust::device_vector<cuda_real_type> d_gr_targets;
+    thrust::device_vector<int>            d_gr_out_gen_id, d_gr_out_type;     // [n_contingencies * K_r]
+    thrust::device_vector<cuda_real_type> d_gr_out_value, d_gr_out_limit;
+    thrust::device_vector<int>            d_gr_count;        // [n_contingencies]; -1 = never simulated, else 0..K_r
+    thrust::device_vector<int>            d_gr_truncated;    // [n_contingencies]; 0/1
+    thrust::device_vector<int>            d_gr_n_gen_id, d_gr_n_type;         // [K_r]
+    thrust::device_vector<cuda_real_type> d_gr_n_value, d_gr_n_limit;
+    thrust::device_vector<int>            d_gr_n_count, d_gr_n_truncated;     // [1]
 
     // -------------------------------------------------------------------------
     // cuSPARSE batched SpMV
@@ -604,6 +642,7 @@ struct BatchPfDriver {
         Eigen::Ref<const RealVect> branch_limit_a1_ka,
         Eigen::Ref<const RealVect> branch_limit_a2_ka,
         double tol,
+        double rel_tol,
         int    K,
         int    n_lines);
 
@@ -646,11 +685,31 @@ struct BatchPfDriver {
     // every run (ScenarioSweep), so the caller uploads only when they changed.
     void upload_gen_p_targets(const RealMatRM& targets);
     bool has_gen_p_targets() const { return gen_p_target_stride_ > 0; }
+    // redistribute_slack: per row, the generators / storage units its pre-pass
+    // saturated -- they produce their (clamped) set-point and take no share.
+    // uint8 (n_contingencies x n_gen) / (n_contingencies x n_sto), ORIGINAL row
+    // order; an empty vector clears that family. Kept across set_gen_p_check.
+    void upload_gen_p_no_share(const std::vector<unsigned char>& gen_mask, int n_gen,
+                               const std::vector<unsigned char>& sto_mask, int n_sto);
     void run_gen_p_check_n();
+
+    // compute_physical_violations: same contract as set_bus_q_check for the
+    // PQ -> PV release check (an EMPTY plan is fine: rows then report count 0).
+    // tol_vm_pu in pu. A plan whose entry count changed drops any per-row
+    // targets uploaded before.
+    void set_gen_pv_release_check(const GenPvReleasePlanData& plan, double tol_vm_pu, int K_r,
+                                  double residual_tol, const unsigned char* d_gen_off, int n_gen);
+    // Per-row voltage targets of the plan's entries (pu, NaN = keep the base
+    // one), (n_contingencies x n_entries) in ORIGINAL row order; an empty
+    // matrix drops them. Same lifetime rules as upload_gen_p_targets.
+    void upload_gen_pv_release_targets(const RealMatRM& targets);
+    bool has_gen_pv_release_targets() const { return gen_pv_release_target_stride_ > 0; }
+    void run_gen_pv_release_check_n();
 
     double bus_q_setup_ms()  const { return t_bus_q_setup_ms_; }
     double hvdc_p_setup_ms() const { return t_hvdc_p_setup_ms_; }
     double gen_p_setup_ms()  const { return t_gen_p_setup_ms_; }
+    double gen_pv_release_setup_ms() const { return t_gen_pv_release_setup_ms_; }
 
     // -------------------------------------------------------------------------
     // DLPack / zero-copy accessors

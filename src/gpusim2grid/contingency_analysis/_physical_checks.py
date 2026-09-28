@@ -10,12 +10,21 @@ has ``category == ViolationCategory.PHYSICAL`` -- the converged solution
 assumes a control the equipment cannot hold -- and the next physical limit
 needs no new flag.
 
-Today the category holds three checks, all detection-only (no bus is switched
-PV -> PQ, no line is saturated, no machine is taken out of the slack, no row
-is re-solved):
+Today the category holds four checks, all detection-only (no bus is switched
+PV -> PQ or back, no line is saturated, no machine is taken out of the slack,
+no row is re-solved):
 
 - per-bus reactive capability (``LOW_Q`` / ``HIGH_Q`` on a ``BUS``): the
   condition PowSyBl OpenLoadFlow's ``ReactiveLimits`` outer loop acts on;
+- the PQ -> PV release of the generators a caller flagged as pinned at a
+  reactive limit (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q`` on a
+  ``GENERATOR``, lightsim2grid's ``GenPvReleaseCheck``, PR #216): the other
+  direction of the same loop -- a machine absorbing (producing) all it can
+  while the bus it would regulate is still below (above) its target would
+  regulate again. Only generators flagged with lightsim2grid's
+  ``LSGrid.set_gen_can_be_pv`` are candidates (``init_from_pypowsybl``'s
+  ``can_be_pv``); value / limit in kV, compared with
+  ``physical_violation_tol_vm_pu``;
 - droop hvdc P-saturation (``HVDC_P_SATURATION`` on an ``HVDC``):
   OpenLoadFlow's ``HvdcAcEmulationLimits`` outer loop;
 - per-machine active power of the distributed slack (``LOW_P`` / ``HIGH_P``
@@ -30,8 +39,8 @@ is re-solved):
   convention, like its limits themselves.
 
 The work happens on the device, fused into each chunk
-(``check_bus_q_violations_kernel`` / ``check_hvdc_p_violations_kernel`` /
-``check_gen_p_violations_kernel``), and
+(``check_bus_q_violations_kernel`` / ``check_gen_pv_release_violations_kernel``
+/ ``check_hvdc_p_violations_kernel`` / ``check_gen_p_violations_kernel``), and
 the records are kept apart from ``get_violations()`` (operational limits)
 exactly as lightsim2grid keeps them. Lives under ``contingency_analysis/``
 next to ``_limit_violations`` for the same historical reason; it is
@@ -43,6 +52,7 @@ import numpy as np
 from ._limit_violations import (
     bus_q_violations_from_result,
     gen_p_violations_from_result,
+    gen_pv_release_violations_from_result,
     hvdc_p_violations_from_result,
 )
 
@@ -51,9 +61,9 @@ __all__ = ["PhysicalChecksEngineMixin", "PhysicalChecksFacadeMixin"]
 
 def _merge_rows(*per_check):
     """One PHYSICAL list per row: the checks' records concatenated in a fixed
-    order (bus reactive capability first, then hvdc saturation, then the slack
-    machines' active power -- generators before storage units, each family in
-    container order, as lightsim2grid's plan lists them)."""
+    order (bus reactive capability first, then the PQ -> PV release -- right
+    after it, like lightsim2grid --, then hvdc saturation, then the slack
+    machines' active power)."""
     return [sum(rows, []) for rows in zip(*per_check)]
 
 
@@ -99,6 +109,19 @@ class PhysicalChecksEngineMixin:
         self._s.physical_checks.physical_violation_tol_mva = float(value)
 
     @property
+    def physical_violation_tol_vm_pu(self):
+        """float: slack (pu) on the one comparison made on a voltage -- the PQ ->
+        PV release check reports a flagged machine whose regulated voltage is
+        below (at min_q) or above (at max_q) its target by more than this
+        (lightsim2grid's property of the same name). Default 1e-4; finite and
+        >= 0, any change drops the previous report."""
+        return self._s.physical_checks.physical_violation_tol_vm_pu
+
+    @physical_violation_tol_vm_pu.setter
+    def physical_violation_tol_vm_pu(self, value):
+        self._s.physical_checks.physical_violation_tol_vm_pu = float(value)
+
+    @property
     def physical_violation_capacity(self):
         """int: records kept per row, per check AND per violation type -- the
         most severe ones, by ``|value - limit|`` (MVAr / MW), most severe
@@ -121,6 +144,37 @@ class PhysicalChecksEngineMixin:
     def has_gen_p_capability(self):
         """bool: whether :meth:`set_gen_p_capability` was called."""
         return self._s.physical_checks.has_gen_p_capability
+
+    @property
+    def has_gen_pv_release_capability(self):
+        """bool: whether :meth:`set_gen_pv_release_capability` was called."""
+        return self._s.physical_checks.has_gen_pv_release_capability
+
+    def set_gen_pv_release_capability(self, plan):
+        """Hand in the machines of the PQ -> PV release check -- a
+        ``GenPvReleasePlanData`` (as returned by
+        ``_gpusim2grid._extract_gen_pv_release_plan_from_lsgrid``, i.e.
+        lightsim2grid's own ``build_gen_pv_release_plan``; the facades'
+        ``set_gen_pv_release_capability_from_grid()`` does that call) or, in
+        array mode, the tuple of its constructor arguments ``(gen_id,
+        reg_bus_solver, gen_bus_solver, at_min, target_vm_pu, vn_kv)``: one
+        entry per PQ generator pinned at a reactive limit, the SOLVER bus it
+        would regulate and its own, 1 when it sits at min_q (0: at max_q), the
+        grid's target (pu) and the regulated bus' nominal kV. OPTIONAL: left
+        unset, nothing is flagged and nothing is reported. Validated against
+        n_bus; drops any previous report.
+
+        On the two sweep engines, the per-row targets that complete it go
+        through ``set_gen_pv_release_targets`` (the facades fill them from
+        ``set_gen_v``)."""
+        from .._gpusim2grid import GenPvReleasePlanData
+        if not isinstance(plan, GenPvReleasePlanData):
+            gen_id, reg_bus, gen_bus, at_min, target_vm_pu, vn_kv = plan
+            i32 = lambda a: np.ascontiguousarray(a, dtype=np.int32)
+            f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
+            plan = GenPvReleasePlanData(i32(gen_id), i32(reg_bus), i32(gen_bus), i32(at_min),
+                                        f64(target_vm_pu), f64(vn_kv))
+        self._s.set_gen_pv_release_capability(plan)
 
     def set_gen_p_capability(self, plan):
         """Hand in the routing of the distributed-slack active-power check:
@@ -189,8 +243,11 @@ class PhysicalChecksEngineMixin:
         every record of category PHYSICAL -- the reactive-capability records
         first (element_type BUS, element_id the SOLVER bus id, violation_type
         LOW_Q / HIGH_Q, value the reactive power the machines holding that bus
-        had to produce in MVAr, limit their summed capability), then the hvdc
-        ones (element_type HVDC, element_id the grid hvdc id, side 1 = would
+        had to produce in MVAr, limit their summed capability), then the PQ ->
+        PV release ones (element_type GENERATOR, element_id the generator id,
+        LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q, value the voltage of the
+        bus the flagged machine would regulate and limit its target, kV), then
+        the hvdc ones (element_type HVDC, element_id the grid hvdc id, side 1 = would
         saturate 1->2 / 2 = 2->1, value the flow leaving that AC bus in MW,
         limit pmax), then the slack machines' active power (element_type
         GENERATOR / STORAGE, element_id the container id, LOW_P / HIGH_P,
@@ -205,6 +262,8 @@ class PhysicalChecksEngineMixin:
         "converged, no violation" (lightsim2grid parity). Requires run() with
         compute_physical_violations=True."""
         return _merge_rows(bus_q_violations_from_result(self._s.get_bus_q_violations()),
+                           gen_pv_release_violations_from_result(
+                               self._s.get_gen_pv_release_violations()),
                            hvdc_p_violations_from_result(self._s.get_hvdc_p_violations()),
                            gen_p_violations_from_result(self._s.get_gen_p_violations()))
 
@@ -212,6 +271,8 @@ class PhysicalChecksEngineMixin:
         """list[LimitViolation]: the same for the base ("n") case every row is
         solved from (empty when the base solve did not converge)."""
         return _merge_rows(bus_q_violations_from_result(self._s.get_bus_q_violations_n()),
+                           gen_pv_release_violations_from_result(
+                               self._s.get_gen_pv_release_violations_n()),
                            hvdc_p_violations_from_result(self._s.get_hvdc_p_violations_n()),
                            gen_p_violations_from_result(self._s.get_gen_p_violations_n()))[0]
 
@@ -222,7 +283,8 @@ class PhysicalChecksEngineMixin:
         bq = np.asarray(self._s.get_bus_q_violations().truncated).astype(bool)
         hp = np.asarray(self._s.get_hvdc_p_violations().truncated).astype(bool)
         gp = np.asarray(self._s.get_gen_p_violations().truncated).astype(bool)
-        return bq | hp | gp
+        gr = np.asarray(self._s.get_gen_pv_release_violations().truncated).astype(bool)
+        return bq | hp | gp | gr
 
 
 class PhysicalChecksFacadeMixin:
@@ -261,6 +323,71 @@ class PhysicalChecksFacadeMixin:
         targets = np.full((gen_p.shape[0], plan.n_entries), np.nan, dtype=np.float64)
         targets[:, is_gen] = gen_p[:, el_id[is_gen]]
         sess.set_gen_p_targets(np.ascontiguousarray(targets))
+
+    def _push_gen_pv_release_targets(self):
+        """Sweep facades only: hand the session the per-row targets of the
+        release plan's machines, taken from the last ``set_gen_v``
+        (``self._gen_v``, ``(n_rows, n_gen)`` pu, NaN = the grid's own; None
+        when never set). One column per entry of the plan in its order: the
+        target a flagged PQ machine would hold if released, as lightsim2grid
+        reads it off ``modify_gen_v``. Called from both sides -- gen_v set,
+        plan (re)set -- so the two may come in either order."""
+        sess = self._inner._s
+        if not hasattr(sess, "set_gen_pv_release_targets"):
+            return   # ContingencyAnalysisGPU: every row has the grid's targets
+        plan = sess.physical_checks.gen_pv_release_plan
+        gen_v = getattr(self, "_gen_v", None)
+        if gen_v is None or plan.n_entries == 0:
+            sess.set_gen_pv_release_targets(np.zeros((0, 0), dtype=np.float64))
+            return
+        gen_id = np.asarray(plan.gen_id, dtype=int)
+        sess.set_gen_pv_release_targets(np.ascontiguousarray(gen_v[:, gen_id], dtype=np.float64))
+
+    def set_gen_pv_release_capability_from_grid(self, grid=None):
+        """Build the machines of the PQ -> PV release check off the
+        lightsim2grid grid (the one this object was built from, unless
+        ``grid`` is given) with lightsim2grid's OWN
+        ``build_gen_pv_release_plan`` -- the PQ generators flagged with
+        ``LSGrid.set_gen_can_be_pv`` whose reactive set-point sits (within
+        ``physical_violation_tol_mva``) at one of their limits -- and hand it
+        to the session. Needs the compiled bridge, built against a
+        lightsim2grid that has ``can_be_pv`` (PR #216). Done automatically
+        when ``compute_physical_violations`` is turned on and no plan was set
+        yet, and again when ``physical_violation_tol_mva`` changes (it decides
+        which limit a machine sits at); call it again if the flags changed on
+        the grid. In explicit-array mode use
+        :meth:`set_gen_pv_release_capability` instead (or nothing: an unset
+        plan means nothing is flagged)."""
+        from .. import _gpusim2grid as _cpp
+        grid = self._grid if grid is None else grid
+        if grid is None:
+            raise RuntimeError(
+                "set_gen_pv_release_capability_from_grid() requires a lightsim2grid grid "
+                "(this session was built from an explicit-array tuple); use "
+                "set_gen_pv_release_capability(...) with the plan arrays instead.")
+        if not getattr(_cpp, "have_ls2g_gen_pv_release", False):
+            raise RuntimeError(
+                "set_gen_pv_release_capability_from_grid() needs gpusim2grid compiled with the "
+                "lightsim2grid bridge, against a lightsim2grid that has can_be_pv (PR #216); "
+                "use set_gen_pv_release_capability(...) with the plan arrays.")
+        self._inner.set_gen_pv_release_capability(
+            _cpp._extract_gen_pv_release_plan_from_lsgrid(
+                grid, self._inner._s.n_bus, float(self._inner.physical_violation_tol_mva)))
+        self._gen_pv_release_from_grid = grid
+        self._push_gen_pv_release_targets()
+
+    def set_gen_pv_release_capability(self, plan):
+        """Explicit-array mode counterpart of
+        :meth:`set_gen_pv_release_capability_from_grid` -- see the engine's
+        ``set_gen_pv_release_capability`` for the arrays."""
+        self._inner.set_gen_pv_release_capability(plan)
+        self._gen_pv_release_from_grid = None
+        self._push_gen_pv_release_targets()
+
+    @property
+    def has_gen_pv_release_capability(self):
+        """bool: whether the release plan is set."""
+        return self._inner.has_gen_pv_release_capability
 
     def set_gen_p_capability_from_grid(self, grid=None):
         """Build the routing of the distributed-slack active-power check off the
@@ -346,22 +473,41 @@ class PhysicalChecksFacadeMixin:
 
     @compute_physical_violations.setter
     def compute_physical_violations(self, value):
+        from .. import _gpusim2grid as _cpp
         value = bool(value)
         if value and self._grid is not None:
             if not self._inner.has_bus_q_capability:
                 self.set_bus_q_capability_from_grid()
             if not self._inner.has_gen_p_capability:
                 self.set_gen_p_capability_from_grid()
+            if (not self._inner.has_gen_pv_release_capability
+                    and getattr(_cpp, "have_ls2g_gen_pv_release", False)):
+                self.set_gen_pv_release_capability_from_grid()
         self._inner.compute_physical_violations = value
 
     @property
     def physical_violation_tol_mva(self):
-        """float: slack (MVA) on every physical comparison; default 1e-4."""
+        """float: slack (MVA) on every physical comparison; default 1e-4. It
+        also decides which reactive limit a flagged machine of the release
+        check sits at, so a release plan built from the grid is rebuilt."""
         return self._inner.physical_violation_tol_mva
 
     @physical_violation_tol_mva.setter
     def physical_violation_tol_mva(self, value):
         self._inner.physical_violation_tol_mva = value
+        grid = getattr(self, "_gen_pv_release_from_grid", None)
+        if grid is not None:
+            self.set_gen_pv_release_capability_from_grid(grid)
+
+    @property
+    def physical_violation_tol_vm_pu(self):
+        """float: slack (pu) on the voltage comparison of the PQ -> PV release
+        check; default 1e-4."""
+        return self._inner.physical_violation_tol_vm_pu
+
+    @physical_violation_tol_vm_pu.setter
+    def physical_violation_tol_vm_pu(self, value):
+        self._inner.physical_violation_tol_vm_pu = value
 
     @property
     def physical_violation_capacity(self):
@@ -381,7 +527,10 @@ class PhysicalChecksFacadeMixin:
         """list[list[LimitViolation]]: per row (caller's row order), every
         PHYSICAL violation -- the buses whose machines had to produce more (or
         less) reactive power than the SUM of what they own (LOW_Q / HIGH_Q,
-        element_id the SOLVER bus id, MVAr), then the linear-regime droop
+        element_id the SOLVER bus id, MVAr), then the flagged PQ generators
+        whose regulated bus sits on the release side of their target
+        (LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR, kV), then
+        the linear-regime droop
         hvdc lines whose flow exceeds pmax (HVDC_P_SATURATION, element_id the
         grid hvdc id, side 1 = would saturate 1->2 / 2 = 2->1, MW), then the
         generators and storage units carrying the distributed slack whose

@@ -354,7 +354,8 @@ struct BatchTimings {
     double t_copy_violations_to_host_ms = 0.;   // D->H across the 10 get_violation_*() accessors
     // compute_physical_violations only; zero unless enabled: H->D plan upload +
     // buffer alloc + the base ("n") checks (set_bus_q_check / run_bus_q_check_n,
-    // set_hvdc_p_check / run_hvdc_p_check_n, set_gen_p_check / run_gen_p_check_n)
+    // set_hvdc_p_check / run_hvdc_p_check_n, set_gen_p_check / run_gen_p_check_n,
+    // set_gen_pv_release_check / run_gen_pv_release_check_n)
     double t_physical_setup_ms = 0.;
 
     // --- per-chunk accumulated (TimingEntry: gpu + wall) ---
@@ -380,6 +381,7 @@ struct BatchTimings {
     TimingEntry t_bus_q_check;
     TimingEntry t_hvdc_p_check;
     TimingEntry t_gen_p_check;       // check_gen_p_violations_kernel, same gate
+    TimingEntry t_gen_pv_release_check;   // check_gen_pv_release_violations_kernel, same gate
     TimingEntry t_flow_computation;
 
     // --- metadata ---
@@ -424,7 +426,8 @@ struct BatchTimings {
               + t_fill_J         + t_first_factorize + t_refactorize
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
-              + t_hvdc_p_check   + t_gen_p_check     + t_flow_computation).wall_ms;
+              + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
+              + t_flow_computation).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

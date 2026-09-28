@@ -12,6 +12,10 @@
 
 #include <batch_algorithm/BusQCheck.hpp>   // ls2g::bus_q_check::build_bus_q_plan (lightsim2grid >= PR #206)
 #include <batch_algorithm/GenPCheck.hpp>   // ls2g::gen_p_check::build_gen_p_plan (lightsim2grid >= 1.1.0)
+#if __has_include(<batch_algorithm/GenPvReleaseCheck.hpp>)
+#include <batch_algorithm/GenPvReleaseCheck.hpp>   // ls2g::gen_pv_release_check (lightsim2grid PR #216)
+#define GPUSIM2GRID_HAVE_LS2G_GEN_PV_RELEASE 1
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -410,6 +414,96 @@ LedgerData drop_multislack_augmentation(const LedgerData& in,
     return out;
 }
 
+int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    const int forced = grid.get_reference_slack_bus();   // grid bus id, -1 when none
+    if (forced < 0) return -1;
+    const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
+    int b = forced;
+    if (!me_to_solver.empty())
+        b = (forced < static_cast<int>(me_to_solver.size())) ? me_to_solver[forced] : -1;
+    return (b >= 0 && b < n_bus_solver) ? b : -1;
+}
+
+SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
+    auto to_solver = [&](int bus_me) -> int {
+        int b = bus_me;
+        if (!me_to_solver.empty())
+            b = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size())) ? me_to_solver[bus_me] : -1;
+        return (b >= 0 && b < n_bus_solver) ? b : -1;
+    };
+    std::vector<int>    kind, el_id, bus;
+    std::vector<double> weight, min_p, max_p, target;
+
+    // generators by id, then storage units by id (upstream's append_participants
+    // order): connected, flagged slack, nonzero weight, in the solved system
+    const ls2g::GeneratorContainer& gens = grid.get_generators();
+    SlackRedistributionData d;
+    d.n_gen = gens.nb();
+    d.gen_bus_solver.resize(d.n_gen);
+    d.gen_target_p_mw.resize(d.n_gen);
+    for (int g = 0; g < d.n_gen; ++g) {
+        const ls2g::GenInfo gi(gens, g);
+        const int b = gi.connected ? to_solver(gi.bus_id) : -1;
+        d.gen_bus_solver(g)  = b;
+        d.gen_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
+        if (b < 0 || !gi.is_slack || std::abs(static_cast<double>(gi.slack_weight)) <= 1e-12) continue;
+        kind.push_back(SLACK_UNIT_GENERATOR);
+        el_id.push_back(g);
+        bus.push_back(b);
+        weight.push_back(static_cast<double>(gi.slack_weight));
+        min_p.push_back(static_cast<double>(gi.min_p_mw));
+        max_p.push_back(static_cast<double>(gi.max_p_mw));
+        target.push_back(static_cast<double>(gi.target_p_mw));
+    }
+    const ls2g::StorageContainer& stos = grid.get_storages();
+    d.n_sto = stos.nb();
+    for (int s = 0; s < d.n_sto; ++s) {
+        const ls2g::StorageInfo si(stos, s);
+        const int b = si.connected ? to_solver(si.bus_id) : -1;
+        if (b < 0 || !si.is_slack || std::abs(static_cast<double>(si.slack_weight)) <= 1e-12) continue;
+        kind.push_back(SLACK_UNIT_STORAGE);
+        el_id.push_back(s);
+        bus.push_back(b);
+        weight.push_back(static_cast<double>(si.slack_weight));
+        min_p.push_back(static_cast<double>(si.min_p_mw));
+        max_p.push_back(static_cast<double>(si.max_p_mw));
+        target.push_back(-static_cast<double>(si.target_p_mw));   // load -> generator convention
+    }
+    auto iv = [](const std::vector<int>& v) { return Eigen::VectorXi::Map(v.data(), static_cast<Eigen::Index>(v.size())).eval(); };
+    auto rv = [](const std::vector<double>& v) {
+        RealVect r(static_cast<Eigen::Index>(v.size()));
+        for (size_t i = 0; i < v.size(); ++i) r(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(v[i]);
+        return r;
+    };
+    d.n_units     = static_cast<int>(kind.size());
+    d.kind        = iv(kind);
+    d.el_id       = iv(el_id);
+    d.bus_solver  = iv(bus);
+    d.weight      = rv(weight);
+    d.min_p_mw    = rv(min_p);
+    d.max_p_mw    = rv(max_p);
+    d.target_p_mw = rv(target);
+
+    // the shunts' active power at 1 pu per solver bus: not in the AC Sbus
+    d.shunt_p_mw = RealVect::Zero(std::max(n_bus_solver, 0));
+    const ls2g::ShuntContainer& shunts = grid.get_shunts();
+    const std::vector<bool>& sh_status = shunts.get_status();
+    const auto& sh_bus = shunts.get_bus_id();
+    const auto sh_p = shunts.get_target_p();
+    for (int k = 0; k < shunts.nb(); ++k) {
+        if (!sh_status[static_cast<size_t>(k)]) continue;
+        const int b = to_solver(sh_bus(k).cast_int());
+        if (b < 0) continue;
+        d.shunt_p_mw(b) += static_cast<eigen_real_type>(sh_p(k));
+    }
+    d.sn_mva = static_cast<double>(grid.get_sn_mva());
+    d.validate(n_bus_solver);
+    return d;
+}
+
 GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
     const ls2g::GeneratorContainer& gens = grid.get_generators();
@@ -801,6 +895,13 @@ make_ca_session_from_lsgrid(
                              bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
 
+    // The slack participants of the redistribute_slack pre-pass (cheap, always).
+    session->set_slack_redistribution_data(
+        extract_slack_redistribution_data(grid, static_cast<int>(Ybus.rows())));
+    // A reference the caller forced on the grid is kept by the automatic
+    // reference slack (lightsim2grid keeps it for the whole batch too).
+    session->set_forced_reference_bus(forced_reference_bus_solver(grid, static_cast<int>(Ybus.rows())));
+
     if (compute_limit_violations) {
         session->set_compute_limit_violations(true);
         LimitData ld = extract_limits(grid, static_cast<int>(Ybus.rows()));
@@ -941,6 +1042,64 @@ GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
     return out;
 }
 
+bool bridge_has_gen_pv_release()
+{
+#ifdef GPUSIM2GRID_HAVE_LS2G_GEN_PV_RELEASE
+    return true;
+#else
+    return false;
+#endif
+}
+
+GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid& grid,
+                                                             int n_bus_solver, double tol_mva)
+{
+#ifdef GPUSIM2GRID_HAVE_LS2G_GEN_PV_RELEASE
+    // lightsim2grid's own selection (flagged can_be_pv, PQ, a reactive range of
+    // at least 1 MVAr, target_q within tol_mva of a limit), on the labelling
+    // the session solves in
+    ls2g::gen_pv_release_check::GenPvReleasePlan plan;
+    ls2g::gen_pv_release_check::build_gen_pv_release_plan(
+        grid, grid.id_me_to_ac_solver(), static_cast<ls2g::real_type>(tol_mva), plan);
+
+    std::vector<int>    gen_id, reg_bus, gen_bus, at_min;
+    std::vector<double> target, vn;
+    for (const ls2g::gen_pv_release_check::GenPvReleaseEntry& e : plan.gens) {
+        if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;   // not in the solved system
+        if (e.gen_bus_solver < 0 || e.gen_bus_solver >= n_bus_solver) continue;
+        gen_id.push_back(e.gen_id);
+        reg_bus.push_back(e.reg_bus_solver);
+        gen_bus.push_back(e.gen_bus_solver);
+        at_min.push_back(e.at_min ? 1 : 0);
+        target.push_back(static_cast<double>(e.target_vm_pu));
+        vn.push_back(static_cast<double>(e.vn_kv));
+    }
+    auto iv = [](const std::vector<int>& v) { return Eigen::VectorXi::Map(v.data(), static_cast<Eigen::Index>(v.size())).eval(); };
+    auto rv = [](const std::vector<double>& v) {
+        RealVect r(static_cast<Eigen::Index>(v.size()));
+        for (size_t i = 0; i < v.size(); ++i) r(static_cast<Eigen::Index>(i)) = static_cast<eigen_real_type>(v[i]);
+        return r;
+    };
+    GenPvReleasePlanData out;
+    out.n_entries      = static_cast<int>(gen_id.size());
+    out.gen_id         = iv(gen_id);
+    out.reg_bus_solver = iv(reg_bus);
+    out.gen_bus_solver = iv(gen_bus);
+    out.at_min         = iv(at_min);
+    out.target_vm_pu   = rv(target);
+    out.vn_kv          = rv(vn);
+    out.validate(n_bus_solver);
+    return out;
+#else
+    (void)grid; (void)n_bus_solver; (void)tol_mva;
+    throw std::runtime_error(
+        "extract_gen_pv_release_plan_from_lsgrid: the lightsim2grid gpusim2grid was built "
+        "against has no GenPvReleaseCheck.hpp (it needs lightsim2grid PR #216, the can_be_pv "
+        "flag); rebuild against a newer lightsim2grid or hand the plan in with "
+        "set_gen_pv_release_capability(...).");
+#endif
+}
+
 std::shared_ptr<InjectionSweepSession>
 make_is_session_from_lsgrid(
     const ls2g::LSGrid& grid,
@@ -1054,6 +1213,13 @@ make_ss_session_from_lsgrid(
     session->set_branch_data(bd.branch_from, bd.branch_to,
                              bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
+
+    // The slack participants of the redistribute_slack pre-pass (cheap, always).
+    session->set_slack_redistribution_data(
+        extract_slack_redistribution_data(grid, static_cast<int>(Ybus.rows())));
+    // A reference the caller forced on the grid is kept by the automatic
+    // reference slack (lightsim2grid keeps it for the whole batch too).
+    session->set_forced_reference_bus(forced_reference_bus_solver(grid, static_cast<int>(Ybus.rows())));
 
     if (compute_limit_violations) {
         session->set_compute_limit_violations(true);

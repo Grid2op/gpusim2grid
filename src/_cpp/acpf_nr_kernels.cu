@@ -236,7 +236,8 @@ __global__ void vc_stranded_vrow_kernel(
     if (tid >= n_entries) return;
     const ptrdiff_t slot = d_str_slot[tid];
     const int       g    = d_str_grp[tid];
-    // F_v = Q_c (pin the lone controller's reactive injection to 0);
+    // F_v = Q_first (pin the first controller's reactive injection to 0; the
+    // group's sharing rows pin the others);
     // residual d_F = -F_v (custom row: assign), replacing vc_vrow_kernel's.
     d_F[slot * dim_J + d_vc_vrow[g]] = -d_vc_q[slot * n_ctrl + d_vc_grp_start[g]];
 }

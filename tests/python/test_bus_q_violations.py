@@ -164,15 +164,21 @@ def _me2s(grid):
     return np.asarray(grid.id_me_to_ac_solver(), dtype=int)
 
 
+def _is_bus_q(v):
+    # the reactive records only: a generator's PQ -> PV release records
+    # (LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q) share the report
+    return int(v.violation_type) in (5, 6)   # LOW_Q, HIGH_Q
+
+
 def _ref_rows(rows, me2s):
     """lightsim2grid records -> [(solver bus, type, value, limit)] per row."""
     return [[(int(me2s[v.element_id]), int(v.violation_type), float(v.value), float(v.limit))
-             for v in row] for row in rows]
+             for v in row if _is_bus_q(v)] for row in rows]
 
 
 def _got_rows(rows):
     return [[(int(v.element_id), int(v.violation_type), float(v.value), float(v.limit))
-             for v in row] for row in rows]
+             for v in row if _is_bus_q(v)] for row in rows]
 
 
 def _assert_ranked(rows):
@@ -404,6 +410,24 @@ def test_islanding_contingency(solver_atol):
     assert np.isfinite(gpu.last_residuals()[0])
     _assert_same(_ref_rows(ref.get_physical_violations(), _me2s(grid)),
                  _got_rows(gpu.get_physical_violations()), _mvar_atol(grid, solver_atol))
+
+
+@needs_bridge
+def test_stranded_group_reports_what_lightsim2grid_reports(solver_atol):
+    """handle_disconnected_grid, a group of two remote regulators both
+    stranded (lightsim2grid PR #216): the row is solved, the stranded machines
+    report nothing, and every row equals lightsim2grid's own batch."""
+    from test_stranded_controller import LEAF_BUS, TRAFO_BEHIND, _group_of_two
+    grid, v0, _ = _group_of_two()
+    n_line = len(grid.get_lines())
+    ctgs = [[0], [n_line + TRAFO_BEHIND]]
+    ref = _ref_ca(grid, v0, ctgs, handle_disconnected_grid=True)
+    gpu = _gpu_ca(grid, ctgs, handle_disconnected_grid=True)
+    assert np.all(np.isfinite(gpu.last_residuals()))
+    got = _got_rows(gpu.get_physical_violations())
+    assert all(x[0] != int(_me2s(grid)[LEAF_BUS]) for x in got[1])
+    _assert_same(_ref_rows(ref.get_physical_violations(), _me2s(grid)), got,
+                 _mvar_atol(grid, solver_atol))
 
 
 @needs_bridge

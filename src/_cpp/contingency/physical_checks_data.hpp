@@ -6,12 +6,15 @@
 #define PHYSICAL_CHECKS_DATA_HPP
 
 // =============================================================================
-// contingency/physical_checks_data.hpp — the three opt-in post-solve
+// contingency/physical_checks_data.hpp — the four opt-in post-solve
 // "physical" checks, as the three batch sessions expose them
 // =============================================================================
 //
 //   - per-bus reactive capability (lightsim2grid PR #206 parity; LOW_Q /
 //     HIGH_Q on a BUS)
+//   - PQ -> PV release of the generators flagged as pinned at a reactive
+//     limit (lightsim2grid's GenPvReleaseCheck.hpp, PR #216;
+//     LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR)
 //   - droop HVDC P-saturation (OpenLoadFlow's HvdcAcEmulationLimits;
 //     HVDC_P_SATURATION on an HVDC)
 //   - per-machine active power of the distributed slack (lightsim2grid's
@@ -22,11 +25,12 @@
 // enforces anything; they only report. Hence ONE opt-in for the category,
 // compute_physical_violations (lightsim2grid's name), one tolerance in MVA and
 // one capacity, in one configuration object (PhysicalChecksConfig, held by
-// each session and bound to Python once); the three result shapes are merged
-// into a single PHYSICAL-only list per row on the Python side. The work itself
-// is in BatchPfDriver (set_bus_q_check / set_hvdc_p_check / set_gen_p_check +
-// the three kernels of violation_kernels.cu) and the session glue in
-// physical_checks_impl.cuh.
+// each session and bound to Python once) -- plus, for the one comparison made
+// on a voltage (the release check), a tolerance in pu; the four result shapes
+// are merged into a single PHYSICAL-only list per row on the Python side. The
+// work itself is in BatchPfDriver (set_bus_q_check / set_gen_pv_release_check /
+// set_hvdc_p_check / set_gen_p_check + the four kernels of
+// violation_kernels.cu) and the session glue in physical_checks_impl.cuh.
 //
 // CUDA-free on purpose: included by the session headers, which the host
 // compiler builds into ls2g_bridge.cpp.
@@ -40,6 +44,7 @@
 #include "../dtypes.hpp"
 #include "bus_q_check_data.hpp"
 #include "gen_p_check_data.hpp"
+#include "gen_pv_release_check_data.hpp"
 #include "limit_violation_types.hpp"   // N_*_VIOLATION_GROUPS
 
 // Per-row records of the bus reactive-capability check, flat SoA:
@@ -84,6 +89,19 @@ struct GenPViolationsResult {
     int             stride   = 0;
 };
 
+// Same layout for the PQ -> PV release check: gen_id the generator id, type
+// 9 (LOW_VOLTAGE_AT_MIN_Q) or 10 (HIGH_VOLTAGE_AT_MAX_Q), value the regulated
+// bus' voltage and limit the target the machine would hold, both in kV. Every
+// record is element type GENERATOR (5). Groups: LOW_VOLTAGE_AT_MIN_Q, then
+// HIGH_VOLTAGE_AT_MAX_Q.
+struct GenPvReleaseViolationsResult {
+    Eigen::VectorXi gen_id, type;
+    RealVect        value, limit;
+    Eigen::VectorXi count, truncated;
+    int             capacity = 0;
+    int             stride   = 0;
+};
+
 struct PhysicalChecksConfig {
     // ONE opt-in for the whole category (lightsim2grid's compute_physical_
     // violations): every record it produces has ViolationCategory::PHYSICAL,
@@ -93,6 +111,9 @@ struct PhysicalChecksConfig {
     // slack on every comparison, in MVA (MVAr for the reactive check, MW for the
     // active one); upstream default
     double physical_violation_tol_mva = 1e-4;
+    // the same, in pu, for the one comparison made on a voltage (the PQ -> PV
+    // release check); upstream default
+    double physical_violation_tol_vm_pu = 1e-4;
     // records kept per row, per check AND per violation type (bounds each
     // output at n_rows * n_types * capacity)
     int    physical_violation_capacity = 16;
@@ -106,6 +127,12 @@ struct PhysicalChecksConfig {
     // unset plan is an empty one, not an error.
     GenPPlanData gen_p_plan;
     bool   has_gen_p_plan = false;
+    // the machines the release check can report (set_gen_pv_release_capability).
+    // OPTIONAL like the active one: only generators a caller flagged as pinned
+    // at a reactive limit (lightsim2grid's can_be_pv) are candidates, so an
+    // unset plan is an empty one.
+    GenPvReleasePlanData gen_pv_release_plan;
+    bool   has_gen_pv_release_plan = false;
     bool   has_result     = false;   // a run() with the flag on has happened
 
     // Setters mirror lightsim2grid's: a no-op when unchanged, otherwise the
@@ -125,6 +152,16 @@ struct PhysicalChecksConfig {
         if (v != physical_violation_tol_mva) has_result = false;
         physical_violation_tol_mva = v;
     }
+    void set_physical_violation_tol_vm_pu(double v) {
+        if (!(v >= 0.) || !std::isfinite(v)) {
+            std::ostringstream exc_;
+            exc_ << "physical_violation_tol_vm_pu: the tolerance should be a finite, "
+                    "non-negative number of pu (got " << v << ").";
+            throw std::runtime_error(exc_.str());
+        }
+        if (v != physical_violation_tol_vm_pu) has_result = false;
+        physical_violation_tol_vm_pu = v;
+    }
     void set_physical_violation_capacity(int k) {
         if (k <= 0) throw std::runtime_error("physical_violation_capacity must be > 0");
         if (k != physical_violation_capacity) has_result = false;
@@ -140,6 +177,12 @@ struct PhysicalChecksConfig {
         plan.validate(n_bus);
         gen_p_plan = plan;
         has_gen_p_plan = true;
+        has_result = false;
+    }
+    void set_gen_pv_release_plan(const GenPvReleasePlanData& plan, int n_bus) {
+        plan.validate(n_bus);
+        gen_pv_release_plan = plan;
+        has_gen_pv_release_plan = true;
         has_result = false;
     }
 };

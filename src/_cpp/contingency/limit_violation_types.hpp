@@ -66,7 +66,17 @@ enum class LimitViolationType  : int {
     HIGH_P = 7,
     // ... and the other way: a slack GENERATOR / STORAGE below its min_p_mw
     // (an hvdc line's two directions are two HIGH_P with a different side).
-    LOW_P = 8
+    LOW_P = 8,
+    // A PQ GENERATOR the caller flagged as pinned at its MINIMUM reactive power
+    // by an outer loop (lightsim2grid's can_be_pv) whose regulated bus sits
+    // BELOW the target it would hold: it absorbs too much for that target, and
+    // OpenLoadFlow's ReactiveLimits loop would switch it back to PV (its
+    // PQ -> PV direction, the mirror of LOW_Q / HIGH_Q; lightsim2grid PR #216).
+    // element_id the generator id, value the regulated bus' voltage and limit
+    // the target, both in kV. Written by check_gen_pv_release_violations_kernel.
+    LOW_VOLTAGE_AT_MIN_Q = 9,
+    // ... and the mirror: pinned at its MAXIMUM, regulated bus ABOVE the target.
+    HIGH_VOLTAGE_AT_MAX_Q = 10
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -74,7 +84,8 @@ enum class LimitViolationType  : int {
 //   OPERATIONAL : a limit the grid CAN leave (voltage band, current rating).
 //   PHYSICAL    : a limit of the equipment itself, which nothing can leave: the
 //                 converged solution is not physically realizable (LOW_Q,
-//                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P).
+//                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
+//                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
 enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
 
@@ -89,6 +100,8 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::HIGH_Q:
         case LimitViolationType::HVDC_P_SATURATION:   // == HIGH_P
         case LimitViolationType::LOW_P:
+        case LimitViolationType::LOW_VOLTAGE_AT_MIN_Q:
+        case LimitViolationType::HIGH_VOLTAGE_AT_MAX_Q:
             return ViolationCategory::PHYSICAL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;
@@ -105,5 +118,6 @@ constexpr int N_OPERATIONAL_VIOLATION_GROUPS = 3;   // CURRENT, LOW_VOLTAGE, HIG
 constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
 constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
 constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
+constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 2; // LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q
 
 #endif  // LIMIT_VIOLATION_TYPES_HPP

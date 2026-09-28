@@ -193,9 +193,14 @@ struct AcPfNrState {
     //                                   ledger reserved no such slot
     //   h_vc_vrow_vmcol_pos           : per group, nnz pos of (v_row,
     //                                   vm_col(reg_bus)), -1 if absent
+    //   h_vc_ctrl_vrow_qcol_pos       : per CONTROLLER, nnz pos of (v_row of
+    //                                   its group, its own q_col), -1 if
+    //                                   absent (only an SVC's slope slot and a
+    //                                   group's reserved first slot exist)
     std::vector<int>            h_slack_bus;
     std::vector<cuda_real_type> h_slack_w;
     std::vector<int>            h_vc_vrow, h_vc_vrow_qcol_pos, h_vc_vrow_vmcol_pos;
+    std::vector<int>            h_vc_ctrl_vrow_qcol_pos;
 
     // Switchable Vm buses (LedgerData::switchable_vm_buses, sorted): their Q
     // rows are identity-PINNED in this single-system base solve (the base

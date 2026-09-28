@@ -73,15 +73,8 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
         gv_vset_.upload(gen_v_override_.h_active_vc_group, cs);
     }
 
-    // Per-row slack weights, if any (generator contingencies).
-    if (!h_slack_w_all_.empty() && n_slack_ > 0) {
-        if (n_slack_ != ctx.base.n_slack)
-            throw std::runtime_error(
-                "[scenario_sweep_batch] per-row slack weight count does not "
-                "match the base case's participant count");
-        upload_h2d(d_slack_w_all, h_slack_w_all_.data(), h_slack_w_all_.size(), cs);
-        d_slack_w_batch.resize(static_cast<size_t>(ctx.batch_size) * n_slack_);
-    }
+    // Per-row slack weights / Sbus correction: set on the live source by
+    // set_slack_redistribution (the session does, on every run() path).
 }
 
 // =============================================================================
@@ -247,29 +240,13 @@ void ScenarioSweepBatch::prepare_Sbus_batch(BatchPfDriverContext& ctx,
         }
     }
 
+    // The redistribute_slack Sbus correction of this chunk's rows, on top.
+    slack_.apply_dp(thrust::raw_pointer_cast(d_Sbus_batch.data()), chunk_idx, n_bus, cs);
+
     // Per-row slack weights: same row-slice + phantom-pad as Sbus above, the
     // phantom slots taking base's shared weights.
-    if (!h_slack_w_all_.empty() && n_slack_ > 0) {
-        const int nsl = n_slack_;
-        if (actual_batch > 0) {
-            _chk_cuda(cudaMemcpyAsync(
-                thrust::raw_pointer_cast(d_slack_w_batch.data()),
-                thrust::raw_pointer_cast(d_slack_w_all.data())
-                    + static_cast<ptrdiff_t>(c_start) * nsl,
-                static_cast<size_t>(actual_batch) * nsl * sizeof(cuda_real_type),
-                cudaMemcpyDeviceToDevice, cs),
-                "slack weight row-slice copy");
-        }
-        for (int b = actual_batch; b < ctx.batch_size; ++b) {
-            _chk_cuda(cudaMemcpyAsync(
-                thrust::raw_pointer_cast(d_slack_w_batch.data())
-                    + static_cast<ptrdiff_t>(b) * nsl,
-                thrust::raw_pointer_cast(ctx.base.d_slack_w.data()),
-                static_cast<size_t>(nsl) * sizeof(cuda_real_type),
-                cudaMemcpyDeviceToDevice, cs),
-                "slack weight phantom pad");
-        }
-    }
+    slack_.prepare_weights(chunk_idx, actual_batch, ctx.batch_size,
+                           thrust::raw_pointer_cast(ctx.base.d_slack_w.data()), cs);
 
     t.t_tile_Sbus += timer.stop_ms();
 }

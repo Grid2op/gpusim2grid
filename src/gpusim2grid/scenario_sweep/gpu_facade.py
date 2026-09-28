@@ -29,6 +29,7 @@ import numpy as np
 
 from . import (
     PhysicalChecksFacadeMixin,
+    SlackRedistributionFacadeMixin,
     _ScenarioSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -53,7 +54,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
+class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -138,7 +139,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
-                 compute_physical_violations=False):
+                 compute_physical_violations=False, redistribute_slack=False,
+                 reference_slack="auto"):
         _validate_precision(precision)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
@@ -263,6 +265,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         # versa) can re-derive which rows ask one bus for two different |V|.
         self._gen_v = None
 
+        # OLF-style bounded slack redistribution of what a row loses, and the
+        # reference slack the fewest rows strand -- see
+        # SlackRedistributionFacadeMixin.
+        if redistribute_slack:
+            self.redistribute_slack = True
+        self.reference_slack = reference_slack
+
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
@@ -294,9 +303,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         self._pending_elements = None
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
         # per-bus injections carry no per-generator set-point: the slack
-        # active-power check falls back to the grid's own targets
+        # active-power check and the redistribute_slack pre-pass fall back to
+        # the grid's own targets
         self._gen_p_rows = None
         self._push_gen_p_targets()
+        self._inner._s.set_gen_p_rows(np.zeros((0, 0), dtype=np.float64))
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
         """Store per-element injections, mirroring lightsim2grid's own batch API.
@@ -335,6 +346,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
         self._gen_p_rows = gen_p
         self._push_gen_p_targets()
+        # ... and so does the redistribute_slack pre-pass (what a row
+        # disconnects, where a participant starts from)
+        self._inner._s.set_gen_p_rows(np.ascontiguousarray(gen_p, dtype=np.float64))
 
     def set_contingency_gens(self, mask):
         """Per-row generator contingency mask, shape ``(n_scenarios, n_gen)``,
@@ -451,6 +465,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         self._inner.set_gen_v(gen_v, self._elements.gen_v_bus)
         self._gen_v = gen_v
         self._update_skipped_rows()
+        self._push_gen_pv_release_targets()
 
     def _update_skipped_rows(self):
         """Re-derive the not-simulable rows from set_gen_v() (and the
@@ -583,6 +598,26 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
     def compute_limit_violations(self, value):
         self._inner.compute_limit_violations = value
 
+    @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by :attr:`compute_limit_violations` -- lightsim2grid's
+        ``violation_rel_tol``, same default (``1e-9``) and semantics:
+        CURRENT when ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when
+        ``v > vmax * (1 + tol)``, LOW_VOLTAGE when ``v < vmin * (1 - tol)``.
+        It keeps a value that sits ON its limit by construction (a bus a
+        regulator holds exactly at its vmax) from being reported or not
+        depending on the last bit of the solve -- which made the GPU, the
+        lightsim2grid batch and its one-off solve disagree. ``0`` gives the
+        bare strict comparisons. Also applies to :meth:`get_violations_n`.
+        In [0, 1[; takes effect on the next compute(). An FP32 build cannot
+        resolve 1e-9 (use ~1e-6 there)."""
+        return self._inner.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        self._inner.violation_rel_tol = value
+
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per scenario (row order
         matches set_injections()/set_topology()'s input rows). Requires
@@ -640,7 +675,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin):
         return compute_violations_n(
             V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
             branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
-            limit_a1_ka, limit_a2_ka, sn_mva, n_lines)
+            limit_a1_ka, limit_a2_ka, sn_mva, n_lines,
+            rel_tol=self._inner.violation_rel_tol)
 
     # ----------------------------------------------------------- pass-through
     @property

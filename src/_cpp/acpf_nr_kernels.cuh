@@ -549,12 +549,13 @@ __global__ void apply_bus_mask_kernel(
     int n_entries);
 
 // ---------------------------------------------------------------------------
-// apply_J_overrides_kernel  (stranded lone VoltageControl controller)
+// apply_J_overrides_kernel  (stranded VoltageControl group)
 //
 // Per-slot J value overrides: d_J_values[slot * nnz_J + pos] = val, one thread
-// per entry. Used to repurpose a stranded lone controller's bordered voltage
-// row into "Q_c == 0" -- (v_row, q_col) = 1 and (v_row, vm_col(reg)) = 0 --
-// on the slots whose contingency masks that controller's own bus. Must run
+// per entry. Used to repurpose a stranded group's bordered voltage row into
+// "Q_first == 0" -- (v_row, q_col_first) = 1, (v_row, vm_col(reg)) = 0 and 0
+// on the other controllers' slope slots -- on the slots whose contingency
+// masks the own bus of every controller of that group. Must run
 // AFTER every feature stamp (which assign the normal values on every slot)
 // and BEFORE apply_bus_mask_kernel. No-op when n_entries == 0.
 // ---------------------------------------------------------------------------
@@ -567,7 +568,7 @@ __global__ void apply_J_overrides_kernel(
     int n_entries);
 
 // ---------------------------------------------------------------------------
-// vc_stranded_vrow_kernel  (stranded lone VoltageControl controller)
+// vc_stranded_vrow_kernel  (stranded VoltageControl group)
 //
 // For each (slot, group) entry: d_F[slot * dim_J + v_row(g)] = -Q_c(slot,
 // first controller of g), replacing the voltage-constraint residual

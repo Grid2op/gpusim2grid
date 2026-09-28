@@ -2,21 +2,23 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""handle_disconnected_grid + a stranded lone remote voltage controller.
+"""handle_disconnected_grid + stranded remote voltage controllers.
 
-The GPU counterpart of lightsim2grid PR #192: in ``handle_disconnected_grid``
-mode, a contingency that islands the OWN bus of a remote voltage controller
-(a remotely-regulating generator or a voltage-mode SVC, the ``VoltageControl``
-extension) while its regulated bus stays live used to be NaN-skipped. For a
-control group with exactly one controller, its bordered voltage row is now
-repurposed by value into ``Q_c == 0`` (a structural zero reserved once in the
-J skeleton), and the regulated bus floats as an ordinary PQ bus -- what a
-rebuilt topology without that controller gives.
+The GPU counterpart of lightsim2grid PRs #192 and #216: in
+``handle_disconnected_grid`` mode, a contingency that islands the OWN bus of
+every controller of a voltage-control group (remotely-regulating generators or
+voltage-mode SVCs, the ``VoltageControl`` extension) used to be NaN-skipped.
+Whatever the group's size, its bordered voltage row is now repurposed by value
+into ``Q_first == 0`` (a structural zero reserved once in the J skeleton), its
+sharing rows pin the other controllers to 0, and the regulated bus floats as an
+ordinary PQ bus -- what a rebuilt topology without those controllers gives.
+The regulated bus may be islanded with them. A group with a live controller is
+left alone when only some of its controllers are stranded, and stays a skip
+(NaN row) when its REGULATED bus is.
 
 Oracle: a one-off ``ac_pf`` on a fresh grid with the branch AND the stranded
-controller actually deactivated (the reference lightsim2grid's own C++ test
-of the feature uses). Islanding the REGULATED bus itself, or every controller
-of a group, stays a skip (NaN row).
+controllers actually deactivated (the reference lightsim2grid's own tests of
+the feature use), and lightsim2grid's own batch where it is the same row.
 
 case14 geometry: bus 7 is a leaf hanging off bus 6 through trafo 3; gen 3
 sits on bus 7. Tripping that trafo (branch id n_lines + 3) strands bus 7.
@@ -258,3 +260,146 @@ def test_flag_off_still_skips():
     g.add_contingencies_by_branch_id([[int(_branch_id(model, TRAFO_BEHIND))]])
     g.compute(batch_size=8)
     assert np.isnan(g.last_residuals()[0])
+
+
+# ---------------------------------------------------------------------------
+# a group of SEVERAL controllers, all stranded (lightsim2grid PR #216)
+# ---------------------------------------------------------------------------
+
+GROUP_VSET = 1.09
+
+
+def _group_of_two(model_setup=None):
+    """case14 with a second generator on bus 7, both generators of bus 7
+    regulating bus 9: ONE voltage-control group of two controllers (lightsim2grid's
+    TestStrandedRemoteGroup). Returns (model, V, gen_ids)."""
+    pp = pytest.importorskip("pandapower")
+    import pandapower.networks as pn
+    from lightsim2grid.gridmodel import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        pp.create_gen(net, LEAF_BUS, p_mw=0., vm_pu=GROUP_VSET, min_q_mvar=-10., max_q_mvar=30.)
+        model = init_from_pandapower(net)
+    gen_ids = [g.id for g in model.get_generators() if g.bus_id == LEAF_BUS]
+    assert len(gen_ids) == 2
+    for g in gen_ids:
+        model.set_gen_regulated_bus(g, REG_BUS)
+    if model_setup is not None:
+        model_setup(model, gen_ids)
+    model.tell_solver_need_reset()
+    model.change_algorithm(AlgorithmType.NR_KLU)
+    V = model.ac_pf(np.ones(net.bus.shape[0], dtype=complex), MAX_IT, TOL)
+    assert V.shape[0] > 0, "lightsim2grid diverged"
+    return model, V, gen_ids
+
+
+def _group_of_two_reference(trafo=None, line=None):
+    def off(model, gen_ids):
+        if trafo is not None:
+            model.deactivate_trafo(int(trafo))
+            for g in gen_ids:
+                model.deactivate_gen(int(g))
+        if line is not None:
+            model.deactivate_powerline(int(line))
+    return _group_of_two(off)[1]
+
+
+@requires_gpu
+@needs_bridge
+@pytest.mark.parametrize("path", ["contingency_analysis", "scenario_sweep"])
+def test_stranded_group_of_two_is_recovered(solver_atol, path):
+    """Tripping the trafo behind bus 7 strands both controllers: the row
+    converges (it used to be NaN-skipped), bus 7 is NaN, and bus 9 is no longer
+    held -- the one-off solve without the two machines."""
+    model, V0, gen_ids = _group_of_two()
+    assert abs(abs(V0[REG_BUS]) - GROUP_VSET) < 1e-8     # the group holds bus 9
+    n_bus = model.get_Ybus_solver().shape[0]
+    branch = _branch_id(model, TRAFO_BEHIND)
+    ref = _group_of_two_reference(trafo=TRAFO_BEHIND)
+    assert abs(abs(ref[REG_BUS]) - GROUP_VSET) > 1e-3    # really released
+
+    if path == "contingency_analysis":
+        V, res = _gpu_ca(model, branch)
+    else:
+        V, res, disc = _gpu_ss(model, branch)
+        assert disc == 0
+    assert np.isfinite(res) and res < 100 * solver_atol
+    assert np.isnan(V[LEAF_BUS])
+    main = np.ones(n_bus, dtype=bool)
+    main[LEAF_BUS] = False
+    np.testing.assert_allclose(V[main], ref[main], atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_stranded_group_of_two_matches_lightsim2grid_batch(solver_atol):
+    """Same rows as lightsim2grid's own ContingencyAnalysis in
+    handle_disconnected_grid mode: the stranding row and a row that strands
+    nothing (whose group still holds bus 9 through the extra reserved slot)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
+    model, V0, _ = _group_of_two()
+    n_bus = model.get_Ybus_solver().shape[0]
+    mesh = 0                                             # line 0-1: nothing islanded
+    branches = [mesh, _branch_id(model, TRAFO_BEHIND)]
+
+    ls = ContingencyAnalysisCPP(model)
+    ls.handle_disconnected_grid = True
+    for b in branches:
+        ls.add_n1(int(b))
+    ls.compute(1.0 * V0, MAX_IT, TOL)
+    assert list(ls.converged_mask()) == [True, True]
+    rows = {int(list(c)[0]): i for i, c in enumerate(ls.my_defaults())}
+    V_ls = np.asarray(ls.get_voltages())
+
+    g = ContingencyAnalysisGPU(model, handle_disconnected_grid=True, nb_iter=15, tol_base=1e-10)
+    g.add_contingencies_by_branch_id([[int(b)] for b in branches])
+    g.compute(batch_size=8)
+    V = g.V_results.to_numpy().reshape(len(branches), n_bus)
+    assert np.all(np.isfinite(g.last_residuals()))
+    live = np.ones(n_bus, dtype=bool)
+    live[LEAF_BUS] = False
+    for i, b in enumerate(branches):
+        expected = V_ls[rows[b]]
+        on = live if b != mesh else np.ones(n_bus, dtype=bool)
+        np.testing.assert_allclose(V[i][on], expected[on], atol=10 * solver_atol)
+    assert abs(abs(V[0][REG_BUS]) - GROUP_VSET) < 10 * solver_atol
+    np.testing.assert_allclose(V[0], _group_of_two_reference(line=mesh), atol=10 * solver_atol)
+
+
+def _local_svc_on_leaf(net, model):
+    # an SVC on the leaf holding the leaf itself: stranding bus 7 strands the
+    # group AND its regulated bus
+    model.deactivate_gen(GEN_REMOTE)
+    model.init_svcs([1], np.array([1.03]), np.array([0.0]), np.array([0.0]),
+                    np.array([-100.0]), np.array([100.0]),
+                    np.array([LEAF_BUS], dtype=np.int32),
+                    np.array([LEAF_BUS], dtype=np.int32))
+
+
+@requires_gpu
+@needs_bridge
+@pytest.mark.parametrize("path", ["contingency_analysis", "scenario_sweep"])
+def test_group_stranded_with_its_regulated_bus_is_recovered(solver_atol, path):
+    """Controllers and regulated bus islanded together: no live controller is
+    asked to hold a frozen magnitude, so the row is solved (it used to be
+    skipped as a stranded regulated bus)."""
+    model, V0 = _case14(_local_svc_on_leaf)
+    if model.get_controller_q_col_solver().shape[0] != 1:
+        pytest.skip("the local SVC is not a VoltageControl controller in this build")
+    n_bus = model.get_Ybus_solver().shape[0]
+    branch = _branch_id(model, TRAFO_BEHIND)
+    ref = _reference(_local_svc_on_leaf, TRAFO_BEHIND, svcs_off=[0])
+    if path == "contingency_analysis":
+        V, res = _gpu_ca(model, branch)
+    else:
+        V, res, disc = _gpu_ss(model, branch)
+        assert disc == 0
+    assert np.isfinite(res) and res < 100 * solver_atol
+    assert np.isnan(V[LEAF_BUS])
+    main = np.ones(n_bus, dtype=bool)
+    main[LEAF_BUS] = False
+    np.testing.assert_allclose(V[main], ref[main], atol=10 * solver_atol)

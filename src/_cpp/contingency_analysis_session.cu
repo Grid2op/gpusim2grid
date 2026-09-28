@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "contingency_analysis_session.hpp"
+#include "ledger_extend.hpp"     // move_reference, ledger_reference_bus
 #include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
@@ -71,25 +72,79 @@ ContingencyAnalysisSession::ContingencyAnalysisSession(
 {
     (void)slack_ids;
     (void)slack_weights;
+    h_Sbus_base_ = Sbus;   // what the redistribute_slack pre-pass reads a row's island off
+    Ybus_cm_         = Ybus;
+    Vinit_           = Vinit;
+    pv_              = pv;
+    pq_              = pq;
+    max_iter_base_   = max_iter_base;
+    tol_base_        = tol_base;
+    device_          = device;
+    presolved_v_     = presolved_v;
+    debug_base_case_ = debug_base_case;
+    if (ledger != nullptr) base_ledger_ = std::make_unique<LedgerData>(*ledger);
+    grid_ref_bus_ = base_ledger_ ? ledger_reference_bus(*base_ledger_) : -1;
+    ref_bus_      = grid_ref_bus_;
+    _build_base_state();
+}
 
+// =============================================================================
+// _build_base_state — base-case NR on the stored inputs (the ledger's angle
+// reference moved to ref_bus_ when the automatic reference picked another).
+// =============================================================================
+void ContingencyAnalysisSession::_build_base_state()
+{
+    solver_.reset();   // it references *base_state_
+    const LedgerData* ledger_ptr = nullptr;
+    LedgerData moved;
+    if (base_ledger_) {
+        ledger_ptr = base_ledger_.get();
+        if (ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) {
+            moved = *base_ledger_;
+            move_reference(moved, ref_bus_, Ybus_rm_);
+            ledger_ptr = &moved;
+        }
+    }
     auto t_base_start = std::chrono::steady_clock::now();
     base_state_ = std::make_unique<AcPfNrState>(
-        Ybus, Vinit, Sbus, pv, pq,
-        max_iter_base,
-        static_cast<eigen_real_type>(tol_base),
-        device, ledger, presolved_v,
+        Ybus_cm_, Vinit_, h_Sbus_base_, pv_, pq_,
+        max_iter_base_,
+        static_cast<eigen_real_type>(tol_base_),
+        device_, ledger_ptr, presolved_v_,
         /*diag_stop_before_state_correction=*/false,
-        reordering_alg, matching_alg, pivot_epsilon_alg,
-        debug_base_case, /*base_case_only=*/true,
-        scaling_max_voltage_change, max_dVa, max_dVm);
+        reordering_alg_, matching_alg_, pivot_epsilon_alg_,
+        debug_base_case_, /*base_case_only=*/true,
+        scaling_max_voltage_change_, max_dVa_, max_dVm_);
     t_base_case_ms_ = ms_since(t_base_start);
 
-    // Build the handle_disconnected_grid mask configuration once from the base
-    // case (per-bus identity-row metadata + angle reference + VC row positions)
-    // and the ledger (HVDC ends / regulated buses → skip-if-stranded, VC group
-    // topology → a stranded LONE controller is recovered instead). Cheap; only
+    // Build the handle_disconnected_grid mask configuration from the base case
+    // (per-bus identity-row metadata + angle reference + VC row positions) and
+    // the ledger (HVDC ends → skip-if-stranded, VC group topology → a group
+    // whose controllers are all stranded is recovered instead). Cheap; only
     // consulted by run() when handle_disconnected_grid_ is enabled.
-    mask_cfg_ = build_mask_config(*base_state_, ledger);
+    mask_cfg_ = build_mask_config(*base_state_, ledger_ptr);
+}
+
+int ContingencyAnalysisSession::_wanted_reference_bus()
+{
+    if (grid_ref_bus_ < 0 || !auto_reference_slack_ || !handle_disconnected_grid_ || !has_contingencies_)
+        return grid_ref_bus_;
+    if (!auto_ref_valid_) {
+        std::vector<int>    cand_bus;
+        std::vector<double> cand_w;
+        const LedgerData& ld = *base_ledger_;
+        for (int b = 0; b < ld.n_bus && b < static_cast<int>(ld.slack_weights.size()); ++b)
+            if (ld.p_row_of_bus[static_cast<size_t>(b)] >= 0 && ld.slack_weights[static_cast<size_t>(b)] != 0.) {
+                cand_bus.push_back(b);
+                cand_w.push_back(ld.slack_weights[static_cast<size_t>(b)]);
+            }
+        auto_ref_choice_ = choose_reference_bus(contingencies_, Ybus_rm_.outerIndexPtr(),
+                                                Ybus_rm_.innerIndexPtr(), Ybus_rm_,
+                                                cand_bus, cand_w, forced_ref_bus_);
+        if (auto_ref_choice_ < 0) auto_ref_choice_ = grid_ref_bus_;
+        auto_ref_valid_ = true;
+    }
+    return auto_ref_choice_;
 }
 
 // =============================================================================
@@ -141,6 +196,7 @@ void ContingencyAnalysisSession::build_contingencies(
         disconnected_per_ctg_.push_back(branch_ids_per_ctg[c]);
     }
     has_contingencies_ = true;
+    auto_ref_valid_    = false;
 }
 
 // =============================================================================
@@ -159,6 +215,14 @@ void ContingencyAnalysisSession::run()
             "with the 'direct_base_case_factors' strategy (it reuses the unmasked "
             "base-case factors). Use 'direct_refactor_every' (default), "
             "'direct_iter0_only', or 'direct_refactor_every_n'.");
+
+    // Automatic reference slack: the participant the fewest contingencies
+    // strand; a change moves it in the ledger and rebuilds the base state.
+    const int want_ref = _wanted_reference_bus();
+    if (want_ref != ref_bus_) {
+        ref_bus_ = want_ref;
+        _build_base_state();
+    }
 
     // Reset any masking flags set on a previous run() (the contingency list is
     // mutated in place across runs; compute_component_masks / check_connectivity
@@ -183,6 +247,34 @@ void ContingencyAnalysisSession::run()
         batch_size_,
         handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
     used_batch_size_ = source.used_batch_size();
+
+    // redistribute_slack: the pre-pass of what each contingency's island took
+    // out, on the masks the source just computed -- handed to the source
+    // before its driver uploads it.
+    if (redistribute_slack_) {
+        _check_redistribute_slack();
+        const int n_bus = base_state_->n_bus;
+        const double sn = slack_rd_.sn_mva;
+        const auto no_gen_off = [](int, int) { return false; };
+        slack_rows_ = slack_redistribution::prepass_all(
+            slack_rd_, static_cast<int>(contingencies_.size()), n_bus,
+            [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; },
+            [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; },
+            no_gen_off,
+            [this](int, int g) { return static_cast<double>(slack_rd_.gen_target_p_mw(g)); },
+            [this, sn](int, int b) { return static_cast<double>(h_Sbus_base_(b).real()) * sn; });
+        int ref_bus = -1;
+        for (int b = 0; b < n_bus && b < static_cast<int>(mask_cfg_.is_reference_bus.size()); ++b)
+            if (mask_cfg_.is_reference_bus[static_cast<size_t>(b)]) { ref_bus = b; break; }
+        const std::vector<cuda_real_type> w_rows = slack_redistribution::build_row_weights(
+            slack_rd_, slack_rows_, static_cast<int>(contingencies_.size()), no_gen_off, n_bus,
+            base_state_->h_slack_bus, base_state_->h_slack_w, ref_bus);
+        std::vector<std::vector<std::pair<int, double>>> dp_rows(slack_rows_.size());
+        for (size_t r = 0; r < slack_rows_.size(); ++r) dp_rows[r] = slack_rows_[r].dp_pu;
+        source.set_slack_redistribution_host(w_rows, base_state_->n_slack, dp_rows);
+    } else {
+        slack_rows_.clear();
+    }
 
     // (Re-)construct the solver — allows run() to be called multiple times.
     solver_ = std::make_unique<ContingencyAnalysisSolver>(
@@ -227,16 +319,27 @@ void ContingencyAnalysisSession::run()
         solver_->set_violation_limits(
             h_bus_vmin_kv_, h_bus_vmax_kv_,
             h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
-            violation_tol_, violation_capacity_, n_lines_);
+            violation_tol_, violation_rel_tol_, violation_capacity_, n_lines_);
         t_limits_setup_ms = solver_->violation_setup_ms();
     }
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
     // violations): plan / outputs on device before the chunk loop, base-case
     // report now. No generator contingencies here (nullptr mask).
+    // redistribute_slack: a unit the pre-pass moved is checked at its new
+    // set-point, and one it saturated takes no share (upstream's GenPCheck).
+    RealMatRM rd_targets;
+    std::vector<unsigned char> rd_ns_gen, rd_ns_sto;
+    const bool rd_gp = redistribute_slack_ && phys_.compute_physical_violations &&
+        gen_p_check_inputs(slack_rd_, slack_rows_, phys_.gen_p_plan.el_type, phys_.gen_p_plan.el_id,
+                           RealMatRM(), rd_targets, rd_ns_gen, rd_ns_sto);
     const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
         phys_, *solver_, "ContingencyAnalysisSession", violation_tol_, sn_mva_,
-        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0);
+        base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        physical_checks::RowTargets{(rd_gp && rd_targets.size() > 0) ? &rd_targets : nullptr, true,
+                                    nullptr, false});
+    if (rd_gp)
+        solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
 
     // Run all chunks; fills d_V_results and d_residuals on device (and, when
     // compute_limit_violations_ is set, the compact violation buffers too —
@@ -673,6 +776,36 @@ HvdcPViolationsResult ContingencyAnalysisSession::get_hvdc_p_violations_n() cons
                                          timings_.t_copy_violations_to_host_ms);
 }
 
+void ContingencyAnalysisSession::set_slack_redistribution_data(const SlackRedistributionData& data)
+{
+    data.validate(base_state_->n_bus);
+    slack_rd_     = data;
+    has_slack_rd_ = true;
+}
+
+SlackRedistributionReport ContingencyAnalysisSession::get_slack_redistribution_report() const
+{
+    return make_slack_redistribution_report(slack_rows_);
+}
+
+void ContingencyAnalysisSession::_check_redistribute_slack() const
+{
+    if (!has_slack_rd_)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: redistribute_slack needs the slack participants -- call "
+            "set_slack_redistribution_data() first (the ContingencyAnalysisGPU facade does it "
+            "from a lightsim2grid grid).");
+    if (base_state_->n_slack <= 0)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: redistribute_slack needs the distributed slack "
+            "(use_distributed_slack=True): without it no participant takes a share.");
+    if (strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: redistribute_slack is incompatible with the "
+            "'direct_base_case_factors' strategy (it reuses the base-case factors, which cannot "
+            "take a saturated unit out of a contingency's slack).");
+}
+
 void ContingencyAnalysisSession::set_gen_p_capability(const GenPPlanData& plan)
 {
     phys_.set_gen_p_plan(plan, base_state_->n_bus);
@@ -690,4 +823,23 @@ GenPViolationsResult ContingencyAnalysisSession::get_gen_p_violations_n() const
     if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
     return physical_checks::fetch_gen_p(phys_, *solver_, /*n_case=*/true, "ContingencyAnalysisSession",
                                         timings_.t_copy_violations_to_host_ms);
+}
+
+void ContingencyAnalysisSession::set_gen_pv_release_capability(const GenPvReleasePlanData& plan)
+{
+    phys_.set_gen_pv_release_plan(plan, base_state_->n_bus);
+}
+
+GenPvReleaseViolationsResult ContingencyAnalysisSession::get_gen_pv_release_violations() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_gen_pv_release(phys_, *solver_, /*n_case=*/false, "ContingencyAnalysisSession",
+                                                 timings_.t_copy_violations_to_host_ms);
+}
+
+GenPvReleaseViolationsResult ContingencyAnalysisSession::get_gen_pv_release_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    return physical_checks::fetch_gen_pv_release(phys_, *solver_, /*n_case=*/true, "ContingencyAnalysisSession",
+                                                 timings_.t_copy_violations_to_host_ms);
 }

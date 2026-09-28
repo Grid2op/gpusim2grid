@@ -207,6 +207,58 @@ def test_stranded_remote_setpoint_has_no_gradient(solver_atol):
     assert abs(fd1) < 1e-6 and an1 == 0.0
 
 
+@needs_bridge
+@fp64_only
+def test_stranded_group_of_two_setpoint_has_no_gradient(solver_atol):
+    """A group of TWO remote regulators (both on bus 7, holding bus 9), both
+    stranded by the trafo behind bus 7 (lightsim2grid PR #216): the row is
+    solved, its voltage row is Q_first == 0, and v_set -- moved on both columns
+    together, the only feasible direction -- has a zero derivative there, while
+    the row that strands nothing keeps its (finite-difference-checked) one."""
+    from test_stranded_controller import GROUP_VSET, _group_of_two
+    model, _, gen_ids = _group_of_two()
+    pf = _pf(model, handle_disconnected_grid=True)
+    n = 2
+    gen_v = torch.full((n, pf.n_gen), float("nan"), dtype=RDT, device="cuda")
+    gen_v[:, gen_ids] = GROUP_VSET
+    line_status = torch.ones(n, pf.n_line, dtype=torch.bool, device="cuda")
+    trafo_status = torch.ones(n, pf.n_trafo, dtype=torch.bool, device="cuda")
+    trafo_status[1, TRAFO_BEHIND] = False
+    grad, pairs = _analytic_and_fd(pf, gen_v, [(0, gen_ids), (1, gen_ids)],
+                                   line_status=line_status, trafo_status=trafo_status)
+    assert pf.get_disconnected().tolist() == [0, 0]
+    (an0, fd0), (an1, fd1) = pairs
+    assert abs(fd0) > 1e-3 and an0 == pytest.approx(fd0, rel=1e-5, abs=1e-7)
+    assert abs(fd1) < 1e-6 and an1 == 0.0
+
+
+@needs_bridge
+@fp64_only
+def test_stranded_remote_setpoint_has_no_gradient_after_a_hot_forward(solver_atol):
+    """Same as above, but the differentiated forward is a HOT run (same topology
+    as the previous call: the session keeps its batch source). The stranded
+    groups are an output of the source build and must survive it -- they used to
+    be wiped by every run, so a hot forward gave the stranded row a gradient."""
+    model, _ = _remote_case14()
+    pf = _pf(model, handle_disconnected_grid=True)
+    n = 2
+    gen_v = torch.full((n, len(model.get_generators())), float("nan"), dtype=RDT, device="cuda")
+    gen_v[:, GEN_REMOTE] = 1.04
+    line_status = torch.ones(n, pf.n_line, dtype=torch.bool, device="cuda")
+    trafo_status = torch.ones(n, pf.n_trafo, dtype=torch.bool, device="cuda")
+    trafo_status[1, TRAFO_BEHIND] = False
+    with torch.no_grad():
+        pf(gen_v=gen_v, line_status=line_status, trafo_status=trafo_status)
+    n_built = pf._sweep.source_build_counter
+    grad, pairs = _analytic_and_fd(pf, gen_v, [(0, [GEN_REMOTE]), (1, [GEN_REMOTE])],
+                                   line_status=line_status, trafo_status=trafo_status)
+    assert pf._sweep.source_build_counter == n_built      # every forward was hot
+    assert pf.get_disconnected().tolist() == [0, 0]
+    (an0, fd0), (an1, fd1) = pairs
+    assert abs(fd0) > 1e-3 and an0 == pytest.approx(fd0, rel=1e-5, abs=1e-7)
+    assert abs(fd1) < 1e-6 and an1 == 0.0
+
+
 def _two_gen_case14():
     """case14 with a 2nd generator on bus 5, regulating it with the first."""
     pp = pytest.importorskip("pandapower")

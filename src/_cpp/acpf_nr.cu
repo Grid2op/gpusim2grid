@@ -725,18 +725,21 @@ AcPfNrState::AcPfNrState(
             push_feat(find_J_pos(qrow[j], qcol[j]), static_cast<cuda_real_type>(-1.));  // (q_row, q_col)
             if (ledger->vc_kind[j] == 1)  // SVC slope coupling (v_row, q_col)
                 push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]), slope[j]);
-            else if (ledger->vc_grp_count[ledger->vc_group[j]] == 1)
-                // lone GEN controller: the (v_row, q_col) slot exists only when
-                // the ledger reserved it (reserve_stranded_controller_slots);
-                // stamp its normal value 0 every fill so the per-slot stranded
-                // override (value 1) always starts from a known state.
-                // push_feat skips a missing slot.
+            else if (j == ledger->vc_grp_start[ledger->vc_group[j]])
+                // first (non-SVC) controller of its group: the (v_row, q_col)
+                // slot exists only when the ledger reserved it
+                // (reserve_stranded_controller_slots); stamp its normal value 0
+                // every fill so the per-slot stranded override (value 1) always
+                // starts from a known state. push_feat skips a missing slot.
                 push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]),
                           static_cast<cuda_real_type>(0.));
         }
         h_vc_vrow = vrow;
         h_vc_vrow_qcol_pos.assign(n_vc_grp, -1);
         h_vc_vrow_vmcol_pos.assign(n_vc_grp, -1);
+        h_vc_ctrl_vrow_qcol_pos.assign(n_vc_ctrl, -1);
+        for (int j = 0; j < n_vc_ctrl; ++j)
+            h_vc_ctrl_vrow_qcol_pos[j] = find_J_pos(vrow[ledger->vc_group[j]], qcol[j]);
         for (int g = 0; g < n_vc_grp; ++g) {
             const int vmcol = ledger->vm_col_of_bus[ledger->vc_reg_bus[g]];
             h_vc_vrow_vmcol_pos[g] = find_J_pos(vrow[g], vmcol);

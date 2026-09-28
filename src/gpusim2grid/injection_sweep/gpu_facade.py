@@ -398,6 +398,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
                 "satisfies both. Give co-located generators the same vm_pu, or "
                 "NaN for all but one of them.")
         self._inner.set_gen_v(gen_v, self._elements.gen_v_bus)
+        self._gen_v = gen_v
+        self._push_gen_pv_release_targets()
 
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.

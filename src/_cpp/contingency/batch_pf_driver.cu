@@ -519,6 +519,7 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
     Eigen::Ref<const RealVect> branch_limit_a1_ka,
     Eigen::Ref<const RealVect> branch_limit_a2_ka,
     double tol,
+    double rel_tol,
     int    K,
     int    n_lines)
 {
@@ -548,6 +549,7 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
     to_dev(d_branch_limit_a2_ka, branch_limit_a2_ka, n_branches_);
 
     violation_tol_      = static_cast<cuda_real_type>(tol);
+    violation_rel_tol_  = static_cast<cuda_real_type>(rel_tol);
     violation_capacity_ = K;
     n_lines_            = n_lines;
 
@@ -910,6 +912,31 @@ void BatchPfDriver<BatchSource>::upload_gen_p_targets(const RealMatRM& targets)
 }
 
 template <typename BatchSource>
+void BatchPfDriver<BatchSource>::upload_gen_p_no_share(const std::vector<unsigned char>& gen_mask, int n_gen,
+                                                       const std::vector<unsigned char>& sto_mask, int n_sto)
+{
+    auto t_start = std::chrono::steady_clock::now();
+    auto put = [&](thrust::device_vector<unsigned char>& d, int& cols,
+                   const std::vector<unsigned char>& h, int n, const char* what) {
+        if (h.empty() || n <= 0) {
+            d.clear();
+            d.shrink_to_fit();
+            cols = 0;
+            return;
+        }
+        if (static_cast<long long>(h.size()) != static_cast<long long>(n_contingencies) * n)
+            throw std::runtime_error(std::string("BatchPfDriver::upload_gen_p_no_share: the ") + what +
+                                     " mask must be (n_rows x n) in ORIGINAL row order.");
+        upload_h2d(d, h.data(), h.size(), cs);
+        cols = n;
+    };
+    put(d_gp_no_share_gen, gen_p_ns_gen_, gen_mask, n_gen, "generator");
+    put(d_gp_no_share_sto, gen_p_ns_sto_, sto_mask, n_sto, "storage");
+    cs.synchronize();
+    t_gen_p_setup_ms_ += bpf_ms_since(t_start);
+}
+
+template <typename BatchSource>
 void BatchPfDriver<BatchSource>::run_gen_p_check_n()
 {
     if (!_gen_p_enabled)
@@ -950,6 +977,7 @@ void BatchPfDriver<BatchSource>::run_gen_p_check_n()
         thrust::raw_pointer_cast(d_gp_part_weight.data()),
         /*d_gen_off=*/nullptr, /*n_gen=*/0,
         /*d_targets=*/nullptr, /*target_stride=*/0,
+        /*d_no_share_gen=*/nullptr, 0, /*d_no_share_sto=*/nullptr, 0,
         gen_p_sn_mva_, gen_p_tol_mw_,
         base.n_bus, base.nnz_Y,
         /*c_start=*/0, /*actual_batch=*/1, gen_p_capacity_,
@@ -964,6 +992,142 @@ void BatchPfDriver<BatchSource>::run_gen_p_check_n()
     CHK_CUDA_BPF(cudaGetLastError());
     cs.synchronize();
     t_gen_p_setup_ms_ += bpf_ms_since(t_start);
+}
+
+// =============================================================================
+// set_gen_pv_release_check / upload_gen_pv_release_targets /
+// run_gen_pv_release_check_n (compute_physical_violations, lightsim2grid's
+// GenPvReleaseCheck.hpp parity)
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::set_gen_pv_release_check(
+    const GenPvReleasePlanData& plan, double tol_vm_pu, int K_r, double residual_tol,
+    const unsigned char* d_gen_off, int n_gen)
+{
+    plan.validate(base.n_bus);
+    if (K_r <= 0)
+        throw std::runtime_error("BatchPfDriver::set_gen_pv_release_check: K_r (physical_violation_capacity) must be > 0.");
+    if (!(tol_vm_pu >= 0.) || !std::isfinite(tol_vm_pu))
+        throw std::runtime_error("BatchPfDriver::set_gen_pv_release_check: tol_vm_pu must be a finite, non-negative number.");
+    if (d_gen_off != nullptr && n_gen > 0)
+        for (int k = 0; k < plan.n_entries; ++k)
+            if (plan.gen_id(k) >= n_gen)
+                throw std::runtime_error(
+                    "BatchPfDriver::set_gen_pv_release_check: a generator id of the plan is outside "
+                    "the generator-contingency mask's columns.");
+
+    auto t_setup_start = std::chrono::steady_clock::now();
+    auto to_dev_r = [&](thrust::device_vector<cuda_real_type>& d, const RealVect& h) {
+        std::vector<cuda_real_type> tmp(static_cast<size_t>(h.size()));
+        for (Eigen::Index i = 0; i < h.size(); ++i) tmp[static_cast<size_t>(i)] = static_cast<cuda_real_type>(h(i));
+        upload_h2d(d, tmp.data(), static_cast<int>(h.size()), cs);
+    };
+    auto to_dev_i = [&](thrust::device_vector<int>& d, const Eigen::VectorXi& h) {
+        upload_h2d(d, h.data(), static_cast<int>(h.size()), cs);
+    };
+    to_dev_i(d_gr_gen_id,      plan.gen_id);
+    to_dev_i(d_gr_reg_bus,     plan.reg_bus_solver);
+    to_dev_i(d_gr_gen_bus,     plan.gen_bus_solver);
+    to_dev_i(d_gr_at_min,      plan.at_min);
+    to_dev_r(d_gr_target_base, plan.target_vm_pu);
+    to_dev_r(d_gr_vn_kv,       plan.vn_kv);
+
+    // per-row targets uploaded for another plan no longer line up
+    if (gen_pv_release_target_stride_ != 0 && gen_pv_release_target_stride_ != plan.n_entries) {
+        d_gr_targets.clear();
+        d_gr_targets.shrink_to_fit();
+        gen_pv_release_target_stride_ = 0;
+    }
+
+    gen_pv_release_n_entries_    = plan.n_entries;
+    gen_pv_release_capacity_     = K_r;
+    gen_pv_release_n_gen_        = (d_gen_off != nullptr) ? n_gen : 0;
+    d_gr_gen_off_                = (n_gen > 0) ? d_gen_off : nullptr;
+    gen_pv_release_tol_vm_pu_    = static_cast<cuda_real_type>(tol_vm_pu);
+    gen_pv_release_residual_tol_ = static_cast<cuda_real_type>(residual_tol);
+
+    const size_t row_r = static_cast<size_t>(N_GEN_PV_RELEASE_VIOLATION_GROUPS * K_r);
+    const size_t n_out = static_cast<size_t>(n_contingencies) * row_r;
+    d_gr_out_gen_id.assign(n_out, 0);
+    d_gr_out_type.assign(n_out, 0);
+    d_gr_out_value.assign(n_out, cuda_real_type(0));
+    d_gr_out_limit.assign(n_out, cuda_real_type(0));
+    d_gr_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
+    d_gr_truncated.assign(static_cast<size_t>(n_contingencies), 0);
+    d_gr_n_gen_id.assign(row_r, 0);
+    d_gr_n_type.assign(row_r, 0);
+    d_gr_n_value.assign(row_r, cuda_real_type(0));
+    d_gr_n_limit.assign(row_r, cuda_real_type(0));
+    d_gr_n_count.assign(1, 0);
+    d_gr_n_truncated.assign(1, 0);
+
+    cs.synchronize();
+    t_gen_pv_release_setup_ms_ = bpf_ms_since(t_setup_start);
+    _gen_pv_release_enabled = true;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::upload_gen_pv_release_targets(const RealMatRM& targets)
+{
+    if (!_gen_pv_release_enabled)
+        throw std::runtime_error("BatchPfDriver::upload_gen_pv_release_targets: call set_gen_pv_release_check first.");
+    auto t_start = std::chrono::steady_clock::now();
+    if (targets.size() == 0) {
+        d_gr_targets.clear();
+        d_gr_targets.shrink_to_fit();
+        gen_pv_release_target_stride_ = 0;
+        return;
+    }
+    if (static_cast<int>(targets.cols()) != gen_pv_release_n_entries_)
+        throw std::runtime_error(
+            "set_gen_pv_release_targets: the per-row targets have " + std::to_string(targets.cols()) +
+            " columns, but the release plan has " + std::to_string(gen_pv_release_n_entries_) +
+            " entries (one column per entry of the plan, in its order; call "
+            "set_gen_pv_release_targets again after changing the plan).");
+    if (static_cast<int>(targets.rows()) != n_contingencies)
+        throw std::runtime_error(
+            "set_gen_pv_release_targets: the per-row targets have " + std::to_string(targets.rows()) +
+            " rows, but the batch has " + std::to_string(n_contingencies) + " rows.");
+    std::vector<cuda_real_type> tmp(static_cast<size_t>(targets.size()));
+    const eigen_real_type* src = targets.data();   // row-major, contiguous
+    for (size_t i = 0; i < tmp.size(); ++i) tmp[i] = static_cast<cuda_real_type>(src[i]);
+    upload_h2d(d_gr_targets, tmp.data(), static_cast<int>(tmp.size()), cs);
+    gen_pv_release_target_stride_ = static_cast<int>(targets.cols());
+    cs.synchronize();
+    t_gen_pv_release_setup_ms_ += bpf_ms_since(t_start);
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
+{
+    if (!_gen_pv_release_enabled)
+        throw std::runtime_error("BatchPfDriver::run_gen_pv_release_check_n: call set_gen_pv_release_check first.");
+    auto t_start = std::chrono::steady_clock::now();
+    check_gen_pv_release_violations_kernel<<<1, BS, 0, cs>>>(
+        thrust::raw_pointer_cast(base.d_V_base.data()),
+        /*d_residuals=*/nullptr, gen_pv_release_residual_tol_,
+        gen_pv_release_n_entries_,
+        thrust::raw_pointer_cast(d_gr_gen_id.data()),
+        thrust::raw_pointer_cast(d_gr_reg_bus.data()),
+        thrust::raw_pointer_cast(d_gr_gen_bus.data()),
+        thrust::raw_pointer_cast(d_gr_at_min.data()),
+        thrust::raw_pointer_cast(d_gr_target_base.data()),
+        thrust::raw_pointer_cast(d_gr_vn_kv.data()),
+        /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        /*d_targets=*/nullptr, /*target_stride=*/0,
+        gen_pv_release_tol_vm_pu_,
+        base.n_bus,
+        /*c_start=*/0, /*actual_batch=*/1, gen_pv_release_capacity_,
+        /*d_result_map=*/nullptr,
+        thrust::raw_pointer_cast(d_gr_n_gen_id.data()),
+        thrust::raw_pointer_cast(d_gr_n_type.data()),
+        thrust::raw_pointer_cast(d_gr_n_value.data()),
+        thrust::raw_pointer_cast(d_gr_n_limit.data()),
+        thrust::raw_pointer_cast(d_gr_n_count.data()),
+        thrust::raw_pointer_cast(d_gr_n_truncated.data()));
+    CHK_CUDA_BPF(cudaGetLastError());
+    cs.synchronize();
+    t_gen_pv_release_setup_ms_ += bpf_ms_since(t_start);
 }
 
 template <typename BatchSource>
@@ -1086,7 +1250,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // ③  Fixed NR loop
     // -------------------------------------------------------------------------
     const cudaComplexType* d_Sbus_for_NR = source_.d_Sbus_ptr(ctx);
-    const int sbus_stride = BatchSource::sbus_stride(n_bus);
+    const int sbus_stride = source_.sbus_stride(n_bus);   // may depend on the source's own state
 
     NrIterBuffers buf {
         thrust::raw_pointer_cast(d_J_values_batch.data()),
@@ -1294,6 +1458,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_residuals.data()),
             violation_tol_,
+            violation_rel_tol_,
             thrust::raw_pointer_cast(d_bus_vn_kv.data()),
             thrust::raw_pointer_cast(d_bus_vmin_kv.data()),
             thrust::raw_pointer_cast(d_bus_vmax_kv.data()),
@@ -1440,6 +1605,10 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             d_gp_gen_off_, gen_p_n_gen_,
             has_gen_p_targets() ? thrust::raw_pointer_cast(d_gp_targets.data()) : nullptr,
             gen_p_target_stride_,
+            gen_p_ns_gen_ > 0 ? thrust::raw_pointer_cast(d_gp_no_share_gen.data()) : nullptr,
+            gen_p_ns_gen_,
+            gen_p_ns_sto_ > 0 ? thrust::raw_pointer_cast(d_gp_no_share_sto.data()) : nullptr,
+            gen_p_ns_sto_,
             gen_p_sn_mva_, gen_p_tol_mw_,
             n_bus, nnz_Y,
             c_start, actual_batch, gen_p_capacity_,
@@ -1453,6 +1622,37 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_gp_truncated.data()));
         CHK_CUDA_BPF(cudaGetLastError());
         t.t_gen_p_check += timer.stop_ms();
+    }
+
+    // compute_physical_violations: the PQ -> PV release of the generators the
+    // caller flagged as pinned at a reactive limit, on the same voltages.
+    if (actual_batch > 0 && _gen_pv_release_enabled) {
+        timer.start();
+        check_gen_pv_release_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()),
+            thrust::raw_pointer_cast(d_residuals.data()), gen_pv_release_residual_tol_,
+            gen_pv_release_n_entries_,
+            thrust::raw_pointer_cast(d_gr_gen_id.data()),
+            thrust::raw_pointer_cast(d_gr_reg_bus.data()),
+            thrust::raw_pointer_cast(d_gr_gen_bus.data()),
+            thrust::raw_pointer_cast(d_gr_at_min.data()),
+            thrust::raw_pointer_cast(d_gr_target_base.data()),
+            thrust::raw_pointer_cast(d_gr_vn_kv.data()),
+            d_gr_gen_off_, gen_pv_release_n_gen_,
+            has_gen_pv_release_targets() ? thrust::raw_pointer_cast(d_gr_targets.data()) : nullptr,
+            gen_pv_release_target_stride_,
+            gen_pv_release_tol_vm_pu_,
+            n_bus,
+            c_start, actual_batch, gen_pv_release_capacity_,
+            d_result_map,
+            thrust::raw_pointer_cast(d_gr_out_gen_id.data()),
+            thrust::raw_pointer_cast(d_gr_out_type.data()),
+            thrust::raw_pointer_cast(d_gr_out_value.data()),
+            thrust::raw_pointer_cast(d_gr_out_limit.data()),
+            thrust::raw_pointer_cast(d_gr_count.data()),
+            thrust::raw_pointer_cast(d_gr_truncated.data()));
+        CHK_CUDA_BPF(cudaGetLastError());
+        t.t_gen_pv_release_check += timer.stop_ms();
     }
 
     timer.start();

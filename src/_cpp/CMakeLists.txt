@@ -20,6 +20,7 @@ pybind11_add_module(
     contingency_analysis_session.cu
     contingency/batch_pf_driver.cu
     contingency/violation_kernels.cu
+    contingency/batch_sources/contingency_batch.cu
     contingency/batch_sources/injection_batch.cu
     contingency/batch_sources/scenario_sweep_batch.cu
     injection_sweep.cu

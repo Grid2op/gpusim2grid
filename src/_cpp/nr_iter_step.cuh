@@ -179,13 +179,14 @@ struct NrIterBuffers {
     const int*             d_maskv_bus    = nullptr;   // [n_mask_v]
     int                    n_mask_v       = 0;
 
-    // ---- stranded lone VoltageControl controllers (per-chunk slice) --------
+    // ---- stranded VoltageControl groups (per-chunk slice) ------------------
     // Per-slot J value overrides (slot, nnz pos, value) written AFTER every
     // feature stamp and BEFORE the bus mask, and stranded rows (slot, group)
-    // whose F[v_row] is rewritten to -Q_c after the VC mismatch kernels. Both
-    // repurpose a lone controller's bordered voltage row into "Q_c == 0" when
-    // handle_disconnected_grid masks that controller's own bus (lightsim2grid
-    // PR #192 parity). All null / 0 when unused → launches skipped.
+    // whose F[v_row] is rewritten to -Q_first after the VC mismatch kernels.
+    // Both repurpose a group's bordered voltage row into "Q_first == 0" when
+    // handle_disconnected_grid masks the own bus of EVERY controller of that
+    // group (lightsim2grid PR #192 / #216 parity; the sharing rows then pin the
+    // other controllers to 0). All null / 0 when unused → launches skipped.
     const int*             d_jov_slot     = nullptr;   // [n_jov]
     const int*             d_jov_pos      = nullptr;   // [n_jov]
     const cuda_real_type*  d_jov_val      = nullptr;   // [n_jov]
@@ -341,7 +342,7 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 }
 
 // -----------------------------------------------------------------------------
-// Stranded lone-controller helpers (no-ops when n_jov / n_str == 0).
+// Stranded-group helpers (no-ops when n_jov / n_str == 0).
 //   nr_apply_J_overrides   : per-slot J value overrides. Must run AFTER every
 //                            feature stamp (they assign the normal values) and
 //                            BEFORE nr_apply_bus_mask (the masked rows win).

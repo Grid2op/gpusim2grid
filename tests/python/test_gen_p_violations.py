@@ -187,10 +187,12 @@ def _ieee14_storage_slack(margin_mw=0.05):
 # ------------------------------------------------------------------ helpers
 def _p_records(rows):
     """[(element_type, element_id, type, value, limit)] per row, the active
-    records only (the bus reactive ones share the report)."""
+    records only (the bus reactive ones and a generator's PQ -> PV release
+    ones share the report)."""
     return [[(int(v.element_type), int(v.element_id), int(v.violation_type),
               float(v.value), float(v.limit))
-             for v in row if int(v.element_type) in (GEN, STO)] for row in rows]
+             for v in row if int(v.element_type) in (GEN, STO)
+             and int(v.violation_type) in (LOW_P, HIGH_P)] for row in rows]
 
 
 def _assert_ranked(rows):

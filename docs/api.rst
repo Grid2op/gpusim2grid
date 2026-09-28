@@ -62,6 +62,21 @@ a ``GRID``/``DIVERGENCE`` entry instead of needing a separate convergence
 check; one the pre-check dropped before it was ever solved gets a ``GRID``/
 ``NOT_SIMULATED`` entry instead.
 
+A value is reported only when it is past its limit by more than a relative
+margin, ``violation_rel_tol`` (default ``1e-9``, lightsim2grid's name and
+rule): ``CURRENT`` when ``ka > limit * (1 + tol)``, ``HIGH_VOLTAGE`` when
+``v > vmax * (1 + tol)``, ``LOW_VOLTAGE`` when ``v < vmin * (1 - tol)``. A bus
+a regulator holds exactly at its ``vmax`` comes out of the solve a few ulps on
+either side of it; without the margin the last bit of rounding would decide
+whether it is reported, and the GPU and lightsim2grid would disagree. Set it
+to ``0`` for the bare strict comparisons (an FP32 build cannot resolve
+``1e-9``; use about ``1e-6`` there):
+
+.. code-block:: python
+
+    ca = ContingencyAnalysisGPU(grid, compute_limit_violations=True)
+    ca.violation_rel_tol = 1e-6       # takes effect on the next compute()
+
 Per contingency, branch current is checked **before** bus voltage (thermal
 violations are generally a first-order operational concern, voltage a
 second-order one), so :meth:`~gpusim2grid.ContingencyAnalysisGPU.get_violations`

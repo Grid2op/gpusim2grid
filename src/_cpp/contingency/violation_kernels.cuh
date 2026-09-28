@@ -144,6 +144,7 @@ __global__ void check_limit_violations_kernel(
     const cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_residuals,
     cuda_real_type          tol,
+    cuda_real_type          rel_tol,
     const cuda_real_type*  __restrict__ d_bus_vn_kv,
     const cuda_real_type*  __restrict__ d_bus_vmin_kv,
     const cuda_real_type*  __restrict__ d_bus_vmax_kv,
@@ -318,6 +319,52 @@ __global__ void check_hvdc_p_violations_kernel(
           int*             __restrict__ d_out_truncated);
 
 // -----------------------------------------------------------------------------
+// check_gen_pv_release_violations_kernel  (compute_physical_violations,
+// lightsim2grid's GenPvReleaseCheck.hpp parity, PR #216)
+//
+// The PQ -> PV direction of OpenLoadFlow's ReactiveLimits loop, as a post-solve
+// detection: for every PQ generator of the plan (gen_pv_release_check_data.hpp,
+// flagged by the caller as pinned at a reactive limit), with Vm = |V| of the
+// bus it would regulate and `target` this row's own target (d_targets[out_c *
+// target_stride + k] when non-NaN, the plan's base target otherwise):
+//     at min_q and Vm < target - tol_vm_pu -> LOW_VOLTAGE_AT_MIN_Q  (9)
+//     at max_q and Vm > target + tol_vm_pu -> HIGH_VOLTAGE_AT_MAX_Q (10)
+// value Vm and limit target, both x vn_kv (kV); element_id the generator id.
+// Skipped: a machine whose regulated bus OR own bus is masked (NaN V -- a
+// stranded machine releases nothing, like a disconnected one) and a generator
+// the row disconnects (d_gen_off, ORIGINAL row order, nullptr = none). Two
+// groups (LOW_VOLTAGE_AT_MIN_Q, then HIGH_VOLTAGE_AT_MAX_Q), each keeping the
+// K largest |value / limit - 1| (a relative measure, like every voltage
+// check), most severe first. Same row gate / result map / capacity / sentinel
+// conventions as check_bus_q_violations_kernel above.
+// -----------------------------------------------------------------------------
+__global__ void check_gen_pv_release_violations_kernel(
+    const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order
+    const cuda_real_type*  __restrict__ d_residuals,    // [n_rows] ORIGINAL order, or nullptr
+    cuda_real_type                      residual_tol,
+    int                                 n_entries,
+    const int*             __restrict__ d_gen_id,
+    const int*             __restrict__ d_reg_bus,
+    const int*             __restrict__ d_gen_bus,
+    const int*             __restrict__ d_at_min,
+    const cuda_real_type*  __restrict__ d_target_base,
+    const cuda_real_type*  __restrict__ d_vn_kv,
+    const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
+    int                                 n_gen,
+    const cuda_real_type*  __restrict__ d_targets,      // [n_rows × target_stride] ORIGINAL order, or nullptr
+    int                                 target_stride,
+    cuda_real_type                      tol_vm_pu,
+    int n_bus,
+    int c_start, int actual_batch, int K,
+    const int* __restrict__ d_result_map,
+          int*             __restrict__ d_out_gen_id,
+          int*             __restrict__ d_out_type,
+          cuda_real_type*  __restrict__ d_out_value,
+          cuda_real_type*  __restrict__ d_out_limit,
+          int*             __restrict__ d_out_count,
+          int*             __restrict__ d_out_truncated);
+
+// -----------------------------------------------------------------------------
 // check_gen_p_violations_kernel  (compute_physical_violations, lightsim2grid's
 // GenPCheck.hpp parity -- generators AND storage units)
 //
@@ -334,8 +381,12 @@ __global__ void check_hvdc_p_violations_kernel(
 // participants standing on its bus (upstream's `w_norm(bus) * total_raw_w`)
 // and node_mismatch the raw active residual real(V . conj(Ybus . V) - Sbus)
 // plus the angle-droop hvdc flows leaving the bus (see gen_p_check_data.hpp).
-// A row whose live participants sum to (nearly) nothing reports nothing
-// (upstream: "nothing left distributing anything"). Records: element_type 5 /
+// A unit the row's redistribute_slack pre-pass saturated (d_no_share_gen /
+// d_no_share_sto, per container id, ORIGINAL row order, nullptr = none) sits
+// at its (clamped) target and takes no share: it is left out of bus_raw_w and
+// gets no share itself (upstream's takes_no_share). A row whose live sharing
+// participants sum to (nearly) nothing checks every unit at its target
+// (upstream's anything_shared). Records: element_type 5 /
 // 6, element_id the container id, type HIGH_P (7) above max_p + tol, LOW_P
 // (8) below min_p - tol, value / limit in MW, generator convention. Same row
 // gate, output layout (LOW_P then HIGH_P, K largest |value - limit| each,
@@ -381,6 +432,10 @@ __global__ void check_gen_p_violations_kernel(
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,
     int                                 target_stride,
+    const unsigned char*   __restrict__ d_no_share_gen,   // [n_rows × n_ns_gen] ORIGINAL order, or nullptr
+    int                                 n_ns_gen,
+    const unsigned char*   __restrict__ d_no_share_sto,   // [n_rows × n_ns_sto] ORIGINAL order, or nullptr
+    int                                 n_ns_sto,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mw,
     int n_bus, int nnz_Y,

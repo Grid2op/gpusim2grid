@@ -217,8 +217,10 @@ void InjectionSweepSession::run()
     const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
         phys_, *solver_, "InjectionSweepSession", violation_tol_, sn_mva_,
         base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0,
-        &gen_p_targets_, gen_p_targets_dirty_);
+        physical_checks::RowTargets{&gen_p_targets_, gen_p_targets_dirty_,
+                                    &gen_pv_release_targets_, gen_pv_release_targets_dirty_});
     gen_p_targets_dirty_ = false;
+    gen_pv_release_targets_dirty_ = false;
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms  = t_base_case_ms_;
@@ -466,4 +468,29 @@ void InjectionSweepSession::set_gen_p_targets(Eigen::Ref<const RealMatRM> target
 {
     gen_p_targets_       = targets;
     gen_p_targets_dirty_ = true;
+}
+
+void InjectionSweepSession::set_gen_pv_release_capability(const GenPvReleasePlanData& plan)
+{
+    phys_.set_gen_pv_release_plan(plan, base_state_->n_bus);
+}
+
+GenPvReleaseViolationsResult InjectionSweepSession::get_gen_pv_release_violations() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_gen_pv_release(phys_, *solver_, /*n_case=*/false, "InjectionSweepSession",
+                                                 timings_.t_copy_violations_to_host_ms);
+}
+
+GenPvReleaseViolationsResult InjectionSweepSession::get_gen_pv_release_violations_n() const
+{
+    if (!solver_) throw std::runtime_error("InjectionSweepSession: call run() first");
+    return physical_checks::fetch_gen_pv_release(phys_, *solver_, /*n_case=*/true, "InjectionSweepSession",
+                                                 timings_.t_copy_violations_to_host_ms);
+}
+
+void InjectionSweepSession::set_gen_pv_release_targets(Eigen::Ref<const RealMatRM> targets)
+{
+    gen_pv_release_targets_       = targets;
+    gen_pv_release_targets_dirty_ = true;
 }

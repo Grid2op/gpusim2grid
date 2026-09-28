@@ -152,6 +152,10 @@ struct InjectionSweepSession {
     // = the plan's base ones for every row
     RealMatRM gen_p_targets_;
     bool      gen_p_targets_dirty_ = false;
+    // per-row targets of the release check (set_gen_pv_release_targets); empty
+    // = the grid's own for every row
+    RealMatRM gen_pv_release_targets_;
+    bool      gen_pv_release_targets_dirty_ = false;
     // Residual gate of the physical checks (a row whose ||F||inf is NaN or above
     // it reports nothing), the same role violation_tol_ plays on the other two
     // sessions. Independent of tol_base.
@@ -313,6 +317,13 @@ struct InjectionSweepSession {
     void set_gen_p_capability(const GenPPlanData& plan);
     GenPViolationsResult  get_gen_p_violations()    const;
     GenPViolationsResult  get_gen_p_violations_n()  const;
+    // The PQ -> PV release check of the generators a caller flagged as pinned at
+    // a reactive limit (lightsim2grid's GenPvReleaseCheck.hpp, PR #216:
+    // LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR). The plan is
+    // OPTIONAL (unset = nothing flagged = nothing to report).
+    void set_gen_pv_release_capability(const GenPvReleasePlanData& plan);
+    GenPvReleaseViolationsResult get_gen_pv_release_violations()   const;
+    GenPvReleaseViolationsResult get_gen_pv_release_violations_n() const;
     // Per-row active set-points of the machines of that plan (MW, GENERATOR
     // convention, NaN = keep the grid's own), (n_rows x n_entries) with one
     // column per entry of the plan in its order, row-aligned with
@@ -321,6 +332,12 @@ struct InjectionSweepSession {
     // fill it from set_injections_from_elements' gen_p). Left unset, every row
     // is checked against the base set-points. An empty matrix drops them.
     void set_gen_p_targets(Eigen::Ref<const RealMatRM> targets);
+    // Per-row voltage targets of the machines of that plan (pu, NaN = keep the
+    // grid's own), (n_rows x n_entries), one column per entry of the plan in
+    // its order, row-aligned with set_injections: the target a flagged machine
+    // would hold if released (the facades fill it from set_gen_v). An empty
+    // matrix drops them.
+    void set_gen_pv_release_targets(Eigen::Ref<const RealMatRM> targets);
 
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     InjectionSweepSession(const InjectionSweepSession&)            = delete;
