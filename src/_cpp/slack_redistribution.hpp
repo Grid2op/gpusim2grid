@@ -77,6 +77,12 @@ struct SlackRedistributionData {
     RealVect        min_p_mw;      // [n_units] NaN = unbounded below
     RealVect        max_p_mw;      // [n_units] NaN = unbounded above
     RealVect        target_p_mw;   // [n_units] grid's set-point, GENERATOR convention
+    // [n_units] 1: a participant of the Newton solve's distributed slack too (a saturated
+    // one leaves it); 0: of this pre-pass only -- a unit lightsim2grid flags "can
+    // participate in the slack" (LSGrid::set_gen_can_participate_slack: left out of the
+    // slack only because it sat at an active limit), which never enters the solve's
+    // slack weights. Empty: every unit is in the slack.
+    Eigen::VectorXi in_slack;
     // ---- every generator: whether it is in the solved system (its solver bus,
     // -1 otherwise) and its grid set-point -- what a row that disconnects it
     // loses when the row gives no set-point of its own
@@ -90,6 +96,7 @@ struct SlackRedistributionData {
     double          sn_mva = 100.0;
 
     bool empty() const { return n_units == 0; }
+    bool unit_in_slack(int k) const { return in_slack.size() == 0 || in_slack(k) != 0; }
 
     void validate(int n_bus) const {
         auto fail = [&](const std::string& what) {
@@ -110,6 +117,7 @@ struct SlackRedistributionData {
         need(min_p_mw.size(),    n_units, "min_p_mw");
         need(max_p_mw.size(),    n_units, "max_p_mw");
         need(target_p_mw.size(), n_units, "target_p_mw");
+        if (in_slack.size() != 0) need(in_slack.size(), n_units, "in_slack");
         need(gen_bus_solver.size(),  n_gen, "gen_bus_solver");
         need(gen_target_p_mw.size(), n_gen, "gen_target_p_mw");
         need(shunt_p_mw.size(),  n_bus, "shunt_p_mw");
@@ -303,7 +311,8 @@ RowResult redistribute_row(const SlackRedistributionData& d, double lost,
             out.moved.emplace_back(p.unit, new_inj[i]);
             out.dp_pu.emplace_back(d.bus_solver(p.unit), dp_mw / d.sn_mva);
         }
-        if (saturated[i]) out.saturated_units.push_back(p.unit);
+        // a pre-pass-only unit was never in the solve's slack: nothing to leave
+        if (saturated[i] && d.unit_in_slack(p.unit)) out.saturated_units.push_back(p.unit);
     }
     // one entry per bus: merge the units sharing one
     std::sort(out.dp_pu.begin(), out.dp_pu.end(),
@@ -335,6 +344,7 @@ inline void row_slack_weights(const SlackRedistributionData& d, const std::vecto
     double sum = 0.0;
     for (int k = 0; k < d.n_units; ++k) {
         if (excluded[static_cast<size_t>(k)]) continue;
+        if (!d.unit_in_slack(k)) continue;   // a pre-pass-only unit: not in the solve's slack
         w_scratch[static_cast<size_t>(d.bus_solver(k))] += static_cast<double>(d.weight(k));
         sum += static_cast<double>(d.weight(k));
     }
@@ -406,12 +416,13 @@ std::vector<cuda_real_type> build_row_weights(const SlackRedistributionData& d,
         std::fill(excluded.begin(), excluded.end(), 0);
         bool row_any = false;
         for (int k = 0; k < d.n_units; ++k)
-            if (d.kind(k) == SLACK_UNIT_GENERATOR && gen_off(r, d.el_id(k))) {
+            if (d.unit_in_slack(k) && d.kind(k) == SLACK_UNIT_GENERATOR && gen_off(r, d.el_id(k))) {
                 excluded[static_cast<size_t>(k)] = 1;
                 row_any = true;
             }
         if (static_cast<size_t>(r) < rows.size())
             for (int k : rows[static_cast<size_t>(r)].saturated_units) {
+                if (!d.unit_in_slack(k)) continue;   // e.g. handed in by set_external_slack_saturation
                 excluded[static_cast<size_t>(k)] = 1;
                 row_any = true;
             }

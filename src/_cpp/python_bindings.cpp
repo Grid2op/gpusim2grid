@@ -261,7 +261,11 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "kind (5 GENERATOR / 6 STORAGE), container id, solver bus, raw weight, [min_p, "
         "max_p] (NaN = unbounded) and set-point (MW, GENERATOR convention); every "
         "generator's solver bus (-1 = not in the solved system) and set-point; the shunts' "
-        "active power at 1 pu per solver bus (MW); sn_mva.")
+        "active power at 1 pu per solver bus (MW); sn_mva. Optional in_slack (one per unit, "
+        "empty = all 1): 0 for a unit of the pre-pass only -- lightsim2grid's \"can "
+        "participate in the slack\" flag (LSGrid.set_gen_can_participate_slack), a unit left "
+        "out of the slack only because it sat at an active limit -- which never enters the "
+        "solve's slack weights.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> kind,
                                Eigen::Ref<const Eigen::VectorXi> el_id,
@@ -274,7 +278,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const RealVect> gen_target_p_mw,
                                int n_sto,
                                Eigen::Ref<const RealVect> shunt_p_mw,
-                               double sn_mva) {
+                               double sn_mva,
+                               Eigen::Ref<const Eigen::VectorXi> in_slack) {
                  SlackRedistributionData d;
                  d.n_units = static_cast<int>(kind.size());
                  d.kind = kind; d.el_id = el_id; d.bus_solver = bus_solver;
@@ -283,13 +288,15 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  d.n_gen = static_cast<int>(gen_bus_solver.size());
                  d.gen_bus_solver = gen_bus_solver; d.gen_target_p_mw = gen_target_p_mw;
                  d.n_sto = n_sto; d.shunt_p_mw = shunt_p_mw; d.sn_mva = sn_mva;
+                 d.in_slack = in_slack;
                  return d;
              }),
              pybind11::arg("kind"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
              pybind11::arg("weight"), pybind11::arg("min_p_mw"), pybind11::arg("max_p_mw"),
              pybind11::arg("target_p_mw"), pybind11::arg("gen_bus_solver"),
              pybind11::arg("gen_target_p_mw"), pybind11::arg("n_sto"),
-             pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"))
+             pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"),
+             pybind11::arg("in_slack") = Eigen::VectorXi())
         .def_readonly("n_units",         &SlackRedistributionData::n_units)
         .def_readonly("kind",            &SlackRedistributionData::kind)
         .def_readonly("el_id",           &SlackRedistributionData::el_id)
@@ -298,6 +305,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("min_p_mw",        &SlackRedistributionData::min_p_mw)
         .def_readonly("max_p_mw",        &SlackRedistributionData::max_p_mw)
         .def_readonly("target_p_mw",     &SlackRedistributionData::target_p_mw)
+        .def_readonly("in_slack",        &SlackRedistributionData::in_slack)
         .def_readonly("n_gen",           &SlackRedistributionData::n_gen)
         .def_readonly("gen_bus_solver",  &SlackRedistributionData::gen_bus_solver)
         .def_readonly("gen_target_p_mw", &SlackRedistributionData::gen_target_p_mw)

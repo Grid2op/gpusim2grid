@@ -25,3 +25,6 @@ Change Log
   (``LSGrid.set_svc_can_be_pv``): reported as ``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``
   on the SVC. The records of the release plan carry their element type (``el_type``), the standby
   entries are marked by ``GenPvReleasePlanData.standby``.
+- [ADDED] ``redistribute_slack`` shares on the units lightsim2grid flags "can participate in the
+  slack" (``LSGrid.set_gen_can_participate_slack``) too, in the pre-pass only
+  (``SlackRedistributionData.in_slack``).

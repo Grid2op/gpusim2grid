@@ -63,22 +63,26 @@ class SlackRedistributionEngineMixin:
         redistribution_data_from_lsgrid``; the facades do it from the grid) or,
         in array mode, the tuple of its constructor arguments ``(kind, el_id,
         bus_solver, weight, min_p_mw, max_p_mw, target_p_mw, gen_bus_solver,
-        gen_target_p_mw, n_sto, shunt_p_mw, sn_mva)``: one entry per unit of the
-        distributed slack (generators then storage units, by id; kind 5 /
-        6, container id, solver bus, raw weight, limits with NaN = none,
-        set-point in the GENERATOR convention), then every generator's solver
-        bus (-1: not in the solved system) and set-point, the storage count,
-        the shunts' active power at 1 pu per solver bus (MW) and sn_mva."""
+        gen_target_p_mw, n_sto, shunt_p_mw, sn_mva[, in_slack])``: one entry per
+        unit of the distributed slack (generators then storage units, by id;
+        kind 5 / 6, container id, solver bus, raw weight, limits with NaN =
+        none, set-point in the GENERATOR convention), then every generator's
+        solver bus (-1: not in the solved system) and set-point, the storage
+        count, the shunts' active power at 1 pu per solver bus (MW) and sn_mva;
+        the optional ``in_slack`` (one per unit, all 1 when absent) is 0 for a
+        unit of the pre-pass only (lightsim2grid's "can participate in the
+        slack", left out of the slack only because it sat at an active
+        limit)."""
         from .._gpusim2grid import SlackRedistributionData
         if not isinstance(data, SlackRedistributionData):
             (kind, el_id, bus_solver, weight, min_p, max_p, target_p,
-             gen_bus, gen_target_p, n_sto, shunt_p, sn_mva) = data
+             gen_bus, gen_target_p, n_sto, shunt_p, sn_mva, *optional) = data
             i32 = lambda a: np.ascontiguousarray(a, dtype=np.int32)       # noqa: E731
             f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)     # noqa: E731
             data = SlackRedistributionData(i32(kind), i32(el_id), i32(bus_solver), f64(weight),
                                            f64(min_p), f64(max_p), f64(target_p), i32(gen_bus),
                                            f64(gen_target_p), int(n_sto), f64(shunt_p),
-                                           float(sn_mva))
+                                           float(sn_mva), i32(optional[0] if optional else []))
         self._s.set_slack_redistribution_data(data)
 
     @property

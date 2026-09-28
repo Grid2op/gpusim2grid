@@ -429,6 +429,15 @@ int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver)
     return (b >= 0 && b < n_bus_solver) ? b : -1;
 }
 
+// the weight a unit flagged "can participate in the slack" takes in the pre-pass
+// (lightsim2grid's LSGrid::set_gen_can_participate_slack); 0 against a lightsim2grid
+// that predates the flag
+#ifdef LS2G_HAS_CAN_PARTICIPATE_SLACK
+#define GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(info) static_cast<double>((info).can_participate_slack_weight)
+#else
+#define GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(info) 0.
+#endif
+
 SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
     const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
@@ -438,11 +447,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
             b = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size())) ? me_to_solver[bus_me] : -1;
         return (b >= 0 && b < n_bus_solver) ? b : -1;
     };
-    std::vector<int>    kind, el_id, bus;
+    std::vector<int>    kind, el_id, bus, in_slack;
     std::vector<double> weight, min_p, max_p, target;
 
     // generators by id, then storage units by id (upstream's append_participants
-    // order): connected, flagged slack, nonzero weight, in the solved system
+    // order): connected, flagged slack with a nonzero weight -- or flagged "can
+    // participate in the slack" (in the pre-pass only, in_slack 0) -- in the solved system
     const ls2g::GeneratorContainer& gens = grid.get_generators();
     SlackRedistributionData d;
     d.n_gen = gens.nb();
@@ -453,11 +463,16 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         const int b = gi.connected ? to_solver(gi.bus_id) : -1;
         d.gen_bus_solver(g)  = b;
         d.gen_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
-        if (b < 0 || !gi.is_slack || std::abs(static_cast<double>(gi.slack_weight)) <= 1e-12) continue;
+        if (b < 0) continue;
+        const bool g_in_slack = gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12;
+        const double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)
+                                      : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(gi);
+        if (!(g_w > 1e-12)) continue;
         kind.push_back(SLACK_UNIT_GENERATOR);
         el_id.push_back(g);
         bus.push_back(b);
-        weight.push_back(static_cast<double>(gi.slack_weight));
+        in_slack.push_back(g_in_slack ? 1 : 0);
+        weight.push_back(g_w);
         min_p.push_back(static_cast<double>(gi.min_p_mw));
         max_p.push_back(static_cast<double>(gi.max_p_mw));
         target.push_back(static_cast<double>(gi.target_p_mw));
@@ -467,11 +482,16 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     for (int s = 0; s < d.n_sto; ++s) {
         const ls2g::StorageInfo si(stos, s);
         const int b = si.connected ? to_solver(si.bus_id) : -1;
-        if (b < 0 || !si.is_slack || std::abs(static_cast<double>(si.slack_weight)) <= 1e-12) continue;
+        if (b < 0) continue;
+        const bool s_in_slack = si.is_slack && std::abs(static_cast<double>(si.slack_weight)) > 1e-12;
+        const double s_w = s_in_slack ? static_cast<double>(si.slack_weight)
+                                      : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(si);
+        if (!(s_w > 1e-12)) continue;
         kind.push_back(SLACK_UNIT_STORAGE);
         el_id.push_back(s);
         bus.push_back(b);
-        weight.push_back(static_cast<double>(si.slack_weight));
+        in_slack.push_back(s_in_slack ? 1 : 0);
+        weight.push_back(s_w);
         min_p.push_back(static_cast<double>(si.min_p_mw));
         max_p.push_back(static_cast<double>(si.max_p_mw));
         target.push_back(-static_cast<double>(si.target_p_mw));   // load -> generator convention
@@ -490,6 +510,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     d.min_p_mw    = rv(min_p);
     d.max_p_mw    = rv(max_p);
     d.target_p_mw = rv(target);
+    d.in_slack    = iv(in_slack);
 
     // the shunts' active power at 1 pu per solver bus: not in the AC Sbus
     d.shunt_p_mw = RealVect::Zero(std::max(n_bus_solver, 0));
