@@ -347,3 +347,56 @@ def test_frozen_svc_release_matches_single_solve(solver_atol):
     assert _svc_release(_gpu_ca(grid, [2]).get_physical_violations_n()) == []
     grid, _ = _frozen_svc_grid(0.5)
     assert _svc_release(_gpu_ca(grid, [2]).get_physical_violations_n()) == []
+
+
+# ------------------------------------------- a VSC converter station frozen at a limit
+HVDC_EL = 4   # ViolationElementType.HVDC
+
+
+def _has_hvdc_flag():
+    try:
+        from lightsim2grid.lightsim2grid_cpp import LSGrid
+        import pypowsybl  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(LSGrid, "set_hvdc_can_be_pv")
+
+
+@pytest.mark.skipif(not _has_hvdc_flag(), reason="needs pypowsybl and a lightsim2grid with LSGrid.set_hvdc_can_be_pv")
+def test_frozen_vsc_station_release_matches_single_solve(solver_atol):
+    """lightsim2grid's own test_hvdc_can_be_pv case: VSC2 (side 2 of HVDC1 of the four
+    substations network) frozen by the bake at its max_q, its target then lowered below the
+    voltage it leaves: released, reported on the HVDC line with side 2."""
+    import pypowsybl as pp
+    import pypowsybl.loadflow as lf
+    from lightsim2grid.network import bake_outer_loops, init_from_pypowsybl
+    n = pp.network.create_four_substations_node_breaker_network()
+    n.update_vsc_converter_stations(id="VSC2", target_v=412., max_q=130.)
+    n.update_vsc_converter_stations(id="VSC2", voltage_regulator_on=True)
+    lf.run_ac(n)
+    pinned = bake_outer_loops(n)
+    n.update_vsc_converter_stations(id="VSC2", target_v=409.)
+    grid = init_from_pypowsybl(n, sort_index=False, buses_for_sub=False, can_be_pv=pinned)
+    V = grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, 1e-10)
+    assert V.shape[0] > 0
+
+    n_bus = grid.get_Ybus_solver().shape[0]
+    plan = _cpp._extract_gen_pv_release_plan_from_lsgrid(grid, n_bus, 1e-4)
+    hv = [k for k in range(plan.n_entries) if int(plan.el_type[k]) == HVDC_EL]
+    assert len(hv) == 1 and int(plan.side[hv[0]]) == 2 and int(plan.gen_id[hv[0]]) == 0
+
+    def rel(viols):
+        return [(int(v.element_id), int(v.side), int(v.violation_type), float(v.value), float(v.limit))
+                for v in viols if int(v.element_type) == HVDC_EL and int(v.violation_type) in (LOW_VM, HIGH_VM)]
+    ref = rel(grid.get_physical_violations(True, 0., 0.))
+    assert [x[:3] for x in ref] == [(0, 2, HIGH_VM)]
+    from gpusim2grid import ContingencyAnalysisGPU
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10, compute_physical_violations=True)
+    ca.physical_violation_tol_mva = 0.
+    ca.physical_violation_tol_vm_pu = 0.
+    ca.add_contingencies_by_branch_id([[0]])
+    ca.compute(batch_size=8)
+    got = rel(ca.get_physical_violations_n())
+    assert [x[:3] for x in got] == [x[:3] for x in ref]
+    np.testing.assert_allclose(got[0][3], ref[0][3], atol=10. * 400. * solver_atol)
+    np.testing.assert_allclose(got[0][4], ref[0][4], rtol=solver_atol)

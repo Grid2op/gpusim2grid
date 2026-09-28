@@ -253,10 +253,12 @@ def gen_pv_release_violations_from_result(res):
     raw output of ``get_gen_pv_release_violations[_n]()`` on a batch session):
     the PQ -> PV release of the flagged generators and SVCs, and the switch on
     of the flagged standby SVCs routed through the same plan -- ``el_type``
-    says which element ``gen_id`` names."""
+    says which element ``gen_id`` names (an HVDC one: the hvdc line of a frozen VSC
+    station, ``side`` the station's end)."""
     gen_id, el_type, vtype, value, limit = res.gen_id, res.el_type, res.type, res.value, res.limit
+    side = res.side
     return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
-        ViolationElementType(int(el_type[i])), int(gen_id[i]), 0, LimitViolationType(int(vtype[i])),
+        ViolationElementType(int(el_type[i])), int(gen_id[i]), int(side[i]), LimitViolationType(int(vtype[i])),
         float(value[i]), float(limit[i])))
 
 

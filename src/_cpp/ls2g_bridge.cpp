@@ -1076,6 +1076,14 @@ bool bridge_has_gen_pv_release()
 #endif
 }
 
+// the station's end of a release entry (an HVDC one: a VSC station frozen at a limit);
+// 0 against a lightsim2grid whose entries have no side yet
+#ifdef LS2G_HAS_RELEASE_ENTRY_SIDE
+#define GPUSIM2GRID_RELEASE_ENTRY_SIDE(e) ((e).side)
+#else
+#define GPUSIM2GRID_RELEASE_ENTRY_SIDE(e) 0
+#endif
+
 GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid& grid,
                                                              int n_bus_solver, double tol_mva)
 {
@@ -1089,7 +1097,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     (void)tol_mva;
     ls2g::gen_pv_release_check::build_gen_pv_release_plan(grid, grid.id_me_to_ac_solver(), plan);
 
-    std::vector<int>    gen_id, reg_bus, gen_bus, at_min, el_type, standby;
+    std::vector<int>    gen_id, reg_bus, gen_bus, at_min, el_type, standby, side;
     std::vector<double> target, vn;
     for (const ls2g::gen_pv_release_check::GenPvReleaseEntry& e : plan.gens) {
         if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;   // not in the solved system
@@ -1100,10 +1108,13 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
         at_min.push_back(e.at_min ? 1 : 0);
         target.push_back(static_cast<double>(e.target_vm_pu));
         vn.push_back(static_cast<double>(e.vn_kv));
-        // a generator, or an SVC frozen at a limit (LSGrid::set_svc_can_be_pv)
+        // a generator, an SVC frozen at a limit (LSGrid::set_svc_can_be_pv), or a VSC
+        // station frozen at a limit (LSGrid::set_hvdc_can_be_pv: its hvdc line and side)
         el_type.push_back(e.el_type == ls2g::ViolationElementType::SVC ? GenPvReleasePlanData::EL_SVC
-                                                                         : GenPvReleasePlanData::EL_GENERATOR);
+                          : e.el_type == ls2g::ViolationElementType::HVDC ? GenPvReleasePlanData::EL_HVDC
+                                                                            : GenPvReleasePlanData::EL_GENERATOR);
         standby.push_back(0);
+        side.push_back(GPUSIM2GRID_RELEASE_ENTRY_SIDE(e));
     }
 #ifdef GPUSIM2GRID_HAVE_LS2G_SVC_STANDBY
     // the idle standby SVCs the caller flagged (LSGrid::set_svc_standby), lightsim2grid's
@@ -1114,8 +1125,8 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     for (const ls2g::svc_standby_check::SvcStandbyEntry& e : svc_plan.svcs) {
         if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;
         if (e.svc_bus_solver < 0 || e.svc_bus_solver >= n_bus_solver) continue;
-        for (int side = 0; side < 2; ++side) {
-            const bool low = (side == 0);
+        for (int bound = 0; bound < 2; ++bound) {
+            const bool low = (bound == 0);
             gen_id.push_back(e.svc_id);
             reg_bus.push_back(e.reg_bus_solver);
             gen_bus.push_back(e.svc_bus_solver);
@@ -1124,6 +1135,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
             vn.push_back(static_cast<double>(e.vn_kv));
             el_type.push_back(GenPvReleasePlanData::EL_SVC);
             standby.push_back(1);
+            side.push_back(0);
         }
     }
 #endif
@@ -1143,6 +1155,7 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
     out.vn_kv          = rv(vn);
     out.el_type        = iv(el_type);
     out.standby        = iv(standby);
+    out.side           = iv(side);
     out.validate(n_bus_solver);
     return out;
 #else

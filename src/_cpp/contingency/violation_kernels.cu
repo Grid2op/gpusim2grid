@@ -558,6 +558,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cuda_real_type*  __restrict__ d_vn_kv,
     const int*             __restrict__ d_el_type,
     const int*             __restrict__ d_standby,
+    const int*             __restrict__ d_side,
     const unsigned char*   __restrict__ d_gen_off,
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,
@@ -569,6 +570,7 @@ __global__ void check_gen_pv_release_violations_kernel(
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
           int*             __restrict__ d_out_el_type,
+          int*             __restrict__ d_out_side,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,
@@ -599,31 +601,34 @@ __global__ void check_gen_pv_release_violations_kernel(
             d_out_gen_id[dst]  = d_out_gen_id[src];
             d_out_type[dst]    = d_out_type[src];
             d_out_el_type[dst] = d_out_el_type[src];
+            d_out_side[dst]    = d_out_side[src];
         });
-    auto push = [&](int grp, int gid, int type, int el, cuda_real_type value, cuda_real_type limit) {
+    auto push = [&](int grp, int gid, int type, int el, int side, cuda_real_type value, cuda_real_type limit) {
         const ptrdiff_t at = topk.reserve(grp, SevRatio{}(value, limit));
         if (at < 0) return;
         d_out_gen_id[at]  = gid;
         d_out_type[at]    = type;
         d_out_el_type[at] = el;
+        d_out_side[at]    = side;
         d_out_value[at]   = value;
         d_out_limit[at]   = limit;
     };
 
     for (int k = 0; k < n_entries; ++k) {
         const int gid = d_gen_id[k];
-        // an SVC entry (frozen at a limit, or standby): no row disconnects it nor moves
-        // its target / thresholds
-        const bool is_svc = (d_el_type != nullptr) && (d_el_type[k] == ELEM_SVC);
-        const bool is_standby = is_svc && (d_standby != nullptr) && (d_standby[k] != 0);
-        const int el = is_svc ? ELEM_SVC : ELEM_GENERATOR;
-        if (!is_svc && off != nullptr && gid < n_gen && off[gid]) continue;   // disconnected by the row
+        // an SVC entry (frozen at a limit, or standby) or an HVDC one (a frozen VSC
+        // station): no row disconnects it nor moves its target / thresholds
+        const int el = (d_el_type != nullptr) ? d_el_type[k] : ELEM_GENERATOR;
+        const bool is_gen = (el == ELEM_GENERATOR);
+        const bool is_standby = (el == ELEM_SVC) && (d_standby != nullptr) && (d_standby[k] != 0);
+        const int side = (d_side != nullptr) ? d_side[k] : 0;
+        if (is_gen && off != nullptr && gid < n_gen && off[gid]) continue;   // disconnected by the row
         const cudaComplexType Vr = V[d_reg_bus[k]];
         const cudaComplexType Vg = V[d_gen_bus[k]];
         // masked (stranded) regulated bus or own bus: nothing to release
         if (!isfinite(Vr.x) || !isfinite(Vr.y) || !isfinite(Vg.x) || !isfinite(Vg.y)) continue;
         cuda_real_type target = d_target_base[k];
-        if (!is_svc && tgt != nullptr) {
+        if (is_gen && tgt != nullptr) {
             const cuda_real_type t_row = tgt[k];
             if (!isnan(t_row)) target = t_row;
         }
@@ -634,12 +639,12 @@ __global__ void check_gen_pv_release_violations_kernel(
             // a generator absorbing all it can, still below the target: absorbs too
             // much; an idle SVC below its low threshold: its automaton switches it on
             if (vm < target - tol_vm_pu) {
-                if (is_standby) push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, el, vm * vn, target * vn);
-                else            push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, el, vm * vn, target * vn);
+                if (is_standby) push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
+                else            push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, el, side, vm * vn, target * vn);
             }
         } else if (vm > target + tol_vm_pu) {
-            if (is_standby) push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, el, vm * vn, target * vn);
-            else            push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, el, vm * vn, target * vn);
+            if (is_standby) push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
+            else            push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, el, side, vm * vn, target * vn);
         }
     }
 

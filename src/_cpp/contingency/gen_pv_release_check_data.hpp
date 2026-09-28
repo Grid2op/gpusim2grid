@@ -44,10 +44,18 @@
 //   vn_kv          nominal voltage of the regulated bus (value / limit in kV)
 //
 //   el_type        OPTIONAL (empty = every entry a GENERATOR): the element the
-//                  entry is reported on, 5 = GENERATOR, 7 = SVC
-//                  (ViolationElementType); gen_id is then its svc id.
+//                  entry is reported on, 5 = GENERATOR, 7 = SVC, 4 = HVDC
+//                  (ViolationElementType); gen_id is then its svc id / its
+//                  hvdc line id.
+//   side           OPTIONAL (empty = all 0): for an HVDC entry, the end (1 or 2)
+//                  of the VSC station it stands for -- the record's side.
 //   standby        OPTIONAL (empty = none): 1 for an entry of the standby SVC
 //                  check below, 0 for a release.
+//
+// An HVDC entry is a VSC converter station an outer loop froze at a reactive
+// limit (LSGrid::set_hvdc_can_be_pv): the generators' test verbatim on the
+// bus the station stands on, reported on the hvdc line with `side` the
+// station's end; no row varies it nor disconnects it either.
 //
 // An SVC entry is either of two lightsim2grid checks, neither varied by a row
 // (a row's own targets are ignored for them) nor disconnected by a contingency
@@ -84,6 +92,7 @@ struct GenPvReleasePlanData {
     // ViolationElementType codes of the entries (limit_violation_types.hpp)
     static constexpr int EL_GENERATOR = 5;
     static constexpr int EL_SVC       = 7;
+    static constexpr int EL_HVDC      = 4;
 
     int             n_entries = 0;
     Eigen::VectorXi gen_id;          // [n_entries] generator id, or svc id for an SVC entry
@@ -94,10 +103,12 @@ struct GenPvReleasePlanData {
     RealVect        vn_kv;           // [n_entries] nominal kV of the regulated bus
     Eigen::VectorXi el_type;         // [n_entries] EL_GENERATOR / EL_SVC, or empty = all generators
     Eigen::VectorXi standby;         // [n_entries] 1 = a standby SVC check entry, or empty = none
+    Eigen::VectorXi side;            // [n_entries] 1 / 2 for an HVDC entry, or empty = all 0
 
     bool empty() const { return n_entries == 0; }
     bool is_svc(int k) const { return el_type.size() != 0 && el_type(k) == EL_SVC; }
     bool is_standby(int k) const { return standby.size() != 0 && standby(k) != 0; }
+    bool is_generator(int k) const { return el_type.size() == 0 || el_type(k) == EL_GENERATOR; }
 
     // Structural checks only (sizes / index ranges); throws std::runtime_error.
     void validate(int n_bus) const {
@@ -120,6 +131,7 @@ struct GenPvReleasePlanData {
         need(vn_kv.size(),          "vn_kv");
         if (el_type.size() != 0) need(el_type.size(), "el_type");
         if (standby.size() != 0) need(standby.size(), "standby");
+        if (side.size() != 0) need(side.size(), "side");
         for (int k = 0; k < n_entries; ++k) {
             std::ostringstream m;
             if (gen_id(k) < 0) {
@@ -135,9 +147,14 @@ struct GenPvReleasePlanData {
                 m << "at_min[" << k << "] must be 0 or 1";
                 fail(m.str());
             }
-            if (el_type.size() != 0 && el_type(k) != EL_GENERATOR && el_type(k) != EL_SVC) {
-                m << "el_type[" << k << "] must be " << EL_GENERATOR << " (GENERATOR) or "
-                  << EL_SVC << " (SVC)";
+            if (el_type.size() != 0 && el_type(k) != EL_GENERATOR && el_type(k) != EL_SVC &&
+                el_type(k) != EL_HVDC) {
+                m << "el_type[" << k << "] must be " << EL_GENERATOR << " (GENERATOR), "
+                  << EL_SVC << " (SVC) or " << EL_HVDC << " (HVDC)";
+                fail(m.str());
+            }
+            if (side.size() != 0 && side(k) != 0 && side(k) != 1 && side(k) != 2) {
+                m << "side[" << k << "] must be 0, 1 or 2";
                 fail(m.str());
             }
             if (standby.size() != 0 && standby(k) != 0 && (standby(k) != 1 || !is_svc(k))) {

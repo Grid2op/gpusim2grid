@@ -31,3 +31,6 @@ Change Log
 - [FIXED] The PQ -> PV release plan (lightsim2grid's ``build_gen_pv_release_plan``) pins a flagged
   generator at the nearer of its reactive limits, not only within ``physical_violation_tol_mva`` of
   one: the facades no longer rebuild it when that tolerance changes.
+- [ADDED] The PQ -> PV release of the VSC converter stations lightsim2grid flags as frozen at a
+  reactive limit (``LSGrid.set_hvdc_can_be_pv``): reported on the HVDC line with ``side`` the
+  station's end (``GenPvReleasePlanData.side``, ``GenPvReleaseViolationsResult.side``).

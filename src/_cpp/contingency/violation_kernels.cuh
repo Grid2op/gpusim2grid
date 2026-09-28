@@ -340,7 +340,10 @@ __global__ void check_hvdc_p_violations_kernel(
 // standby SVC (lightsim2grid's SvcStandbyCheck.hpp): the same test against its
 // low (at_min) / high threshold, reported as LOW_VOLTAGE_SVC_STANDBY (11) /
 // HIGH_VOLTAGE_SVC_STANDBY (12). d_out_el_type says which element each record
-// is on (5 GENERATOR / 7 SVC), d_out_gen_id its id. Four groups
+// is on (5 GENERATOR / 7 SVC / 4 HVDC), d_out_gen_id its id and d_out_side its
+// side (the station's end for an HVDC one, 0 otherwise). An HVDC entry (a VSC
+// station frozen at a reactive limit) runs the generators' test, never masked
+// by d_gen_off nor moved by d_targets. Four groups
 // (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
 // HIGH_VOLTAGE_SVC_STANDBY), each keeping the K largest |value / limit - 1|
 // (a relative measure, like every voltage check), most severe first. Same row gate / result map / capacity / sentinel
@@ -359,6 +362,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cuda_real_type*  __restrict__ d_vn_kv,
     const int*             __restrict__ d_el_type,      // [n_entries] 5 / 7, or nullptr = all generators
     const int*             __restrict__ d_standby,      // [n_entries] 1 = standby SVC entry, or nullptr = none
+    const int*             __restrict__ d_side,         // [n_entries] 1 / 2 for an HVDC entry, or nullptr = all 0
     const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,      // [n_rows × target_stride] ORIGINAL order, or nullptr
@@ -370,6 +374,7 @@ __global__ void check_gen_pv_release_violations_kernel(
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
           int*             __restrict__ d_out_el_type,
+          int*             __restrict__ d_out_side,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,

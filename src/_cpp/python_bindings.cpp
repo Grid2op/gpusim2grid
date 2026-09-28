@@ -230,7 +230,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const RealVect> target_vm_pu,
                                Eigen::Ref<const RealVect> vn_kv,
                                Eigen::Ref<const Eigen::VectorXi> el_type,
-                               Eigen::Ref<const Eigen::VectorXi> standby) {
+                               Eigen::Ref<const Eigen::VectorXi> standby,
+                               Eigen::Ref<const Eigen::VectorXi> side) {
                  GenPvReleasePlanData p;
                  p.n_entries = static_cast<int>(gen_id.size());
                  p.gen_id = gen_id; p.reg_bus_solver = reg_bus_solver;
@@ -238,13 +239,15 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  p.target_vm_pu = target_vm_pu; p.vn_kv = vn_kv;
                  p.el_type = el_type;
                  p.standby = standby;
+                 p.side = side;
                  return p;
              }),
              pybind11::arg("gen_id"), pybind11::arg("reg_bus_solver"),
              pybind11::arg("gen_bus_solver"), pybind11::arg("at_min"),
              pybind11::arg("target_vm_pu"), pybind11::arg("vn_kv"),
              pybind11::arg("el_type") = Eigen::VectorXi(),
-             pybind11::arg("standby") = Eigen::VectorXi())
+             pybind11::arg("standby") = Eigen::VectorXi(),
+             pybind11::arg("side") = Eigen::VectorXi())
         .def_readonly("n_entries",      &GenPvReleasePlanData::n_entries)
         .def_readonly("gen_id",         &GenPvReleasePlanData::gen_id)
         .def_readonly("reg_bus_solver", &GenPvReleasePlanData::reg_bus_solver)
@@ -253,7 +256,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("target_vm_pu",   &GenPvReleasePlanData::target_vm_pu)
         .def_readonly("vn_kv",          &GenPvReleasePlanData::vn_kv)
         .def_readonly("el_type",        &GenPvReleasePlanData::el_type)
-        .def_readonly("standby",        &GenPvReleasePlanData::standby);
+        .def_readonly("standby",        &GenPvReleasePlanData::standby)
+        .def_readonly("side",           &GenPvReleasePlanData::side);
 
     pybind11::class_<SlackRedistributionData>(m, "SlackRedistributionData",
         "The distributed-slack participants of the redistribute_slack pre-pass "
@@ -525,6 +529,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("gen_id",    &GenPvReleaseViolationsResult::gen_id)
         .def_readonly("type",      &GenPvReleaseViolationsResult::type)
         .def_readonly("el_type",   &GenPvReleaseViolationsResult::el_type)
+        .def_readonly("side",      &GenPvReleaseViolationsResult::side)
         .def_readonly("value",     &GenPvReleaseViolationsResult::value)
         .def_readonly("limit",     &GenPvReleaseViolationsResult::limit)
         .def_readonly("count",     &GenPvReleaseViolationsResult::count)

@@ -169,12 +169,14 @@ class PhysicalChecksEngineMixin:
         ``set_gen_pv_release_capability_from_grid()`` does that call) or, in
         array mode, the tuple of its constructor arguments ``(gen_id,
         reg_bus_solver, gen_bus_solver, at_min, target_vm_pu, vn_kv[,
-        el_type[, standby]])``: one entry per PQ generator pinned at a reactive limit, the
+        el_type[, standby[, side]]])``: one entry per PQ generator pinned at a reactive limit, the
         SOLVER bus it would regulate and its own, 1 when it sits at min_q (0: at
         max_q), the grid's target (pu) and the regulated bus' nominal kV; the
-        optional ``el_type`` (5 GENERATOR / 7 SVC, all generators when absent)
-        also routes the SVCs frozen at a limit (one entry each, the release
-        test) and, with the optional ``standby`` (1 for such an entry), the idle
+        optional ``el_type`` (5 GENERATOR / 7 SVC / 4 HVDC, all generators when
+        absent) also routes the SVCs and the VSC stations frozen at a limit (one
+        entry each, the release test; a station's hvdc line id in ``gen_id`` and
+        its end in the optional ``side``) and, with the optional ``standby`` (1
+        for such an entry), the idle
         standby SVCs, two entries each (the low threshold with at_min 1, the
         high one with at_min 0). OPTIONAL: left unset, nothing is flagged and
         nothing is reported. Validated against n_bus; drops any previous
@@ -190,8 +192,10 @@ class PhysicalChecksEngineMixin:
             f64 = lambda a: np.ascontiguousarray(a, dtype=np.float64)
             el_type = optional[0] if len(optional) > 0 else []
             standby = optional[1] if len(optional) > 1 else []
+            side = optional[2] if len(optional) > 2 else []
             plan = GenPvReleasePlanData(i32(gen_id), i32(reg_bus), i32(gen_bus), i32(at_min),
-                                        f64(target_vm_pu), f64(vn_kv), i32(el_type), i32(standby))
+                                        f64(target_vm_pu), f64(vn_kv), i32(el_type), i32(standby),
+                                        i32(side))
         self._s.set_gen_pv_release_capability(plan)
 
     def set_gen_p_capability(self, plan):
