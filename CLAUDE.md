@@ -74,6 +74,10 @@ pytest tests/python/ -m "not slow"                 # skip >10s tests
 
 Tests **require a CUDA GPU and the installed extension** — `conftest.py` defines a `requires_gpu` skip marker. Reference values come from lightsim2grid (KLU CPU solver, `ContingencyAnalysisCPP`). Tolerances are precision-aware via the `solver_atol` / `residual_atol` fixtures (`1e-4` FP32, `1e-6` FP64) — never hardcode tolerances in new tests. The shared IEEE 14-bus grid and its solved base case are session-scoped fixtures.
 
+## CI
+
+`.github/workflows/build.yml` (every push/PR) compiles FP64 × FP32 and CUDA 12 × CUDA 13 on a free, **GPU-less** runner inside `nvidia/cuda:*-devel-ubuntu22.04` containers (all on ubuntu22.04, so one lightsim2grid wheel serves every leg), then runs pytest there — so every `requires_gpu` test skips (the marker checks for an actual CUDA device, not just an importable extension). lightsim2grid is built from source at `LS2G_REF` and cached on its commit SHA. cuDSS comes from the `nvidia-cudss-cu12`/`-cu13` pip wheel matching the image, which ships no CMake config: `ci/cmake/cudss/` is a small `cudss-config.cmake` shim for it (`cudss_DIR` points there; `CUDSS_WHEEL_ROOT`, else the wheel matching nvcc's CUDA major). The real GPU test suite is not run by CI.
+
 ## Benchmarks
 
 ```bash

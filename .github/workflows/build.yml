@@ -1,0 +1,180 @@
+# Level-1 CI: compile the CUDA extension (FP64 and FP32, CUDA 12 and 13) on
+# a free GitHub runner. No GPU is needed to *build*: the job runs in an NVIDIA
+# CUDA "devel" container, which ships nvcc and the CUDA libraries but no driver. The
+# pytest step then runs on that GPU-less machine: every test marked
+# `requires_gpu` (conftest.py) is skipped, but all test modules are still
+# imported and any pure-Python test still runs.
+#
+# CMAKE_CUDA_ARCHITECTURES is not pinned by the project, so CMake falls back
+# to nvcc's default architecture and needs no device to detect one.
+
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # lightsim2grid is built from source (gpusim2grid is compiled against its
+  # C++ core with --no-build-isolation). Its build is cached on the commit
+  # this ref resolves to, so moving the ref triggers exactly one rebuild.
+  LS2G_REPO: https://github.com/Grid2op/lightsim2grid
+  LS2G_REF: master
+  VENV: /opt/venv
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build (or restore from cache) a lightsim2grid wheel plus the SuiteSparse
+  # headers gpusim2grid's lightsim2grid bridge needs, once for both matrix
+  # legs. This is the slow step (~7 min uncached).
+  # ---------------------------------------------------------------------------
+  lightsim2grid:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - name: Install system packages
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            python3-pip python3-venv python3-dev git cmake zstd
+
+      - name: Resolve lightsim2grid commit
+        id: ls2g
+        run: |
+          sha=$(git ls-remote "$LS2G_REPO" "$LS2G_REF" | head -n1 | cut -f1)
+          if [ -z "$sha" ]; then sha="$LS2G_REF"; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "lightsim2grid $LS2G_REF -> $sha"
+
+      - name: Restore lightsim2grid build cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/ls2g-dist
+          # Bump the version prefix (or the image tag) when the build recipe changes.
+          key: ls2g-v1-cuda12.6.3-ubuntu22.04-${{ steps.ls2g.outputs.sha }}
+
+      - name: Build lightsim2grid wheel
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SHA: ${{ steps.ls2g.outputs.sha }}
+        run: |
+          python3 -m venv "$VENV"
+          . "$VENV/bin/activate"
+          pip install -q -U pip
+          pip install -q scikit-build-core pybind11 numpy setuptools wheel
+          git init -q /opt/ls2g-src
+          cd /opt/ls2g-src
+          git remote add origin "$LS2G_REPO"
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --depth 1 SuiteSparse eigen
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+            pip wheel --no-build-isolation --no-deps -w /opt/ls2g-dist/wheels .
+          # Only the SuiteSparse headers are needed downstream, in the
+          # per-module Include/ layout src/_cpp/CMakeLists.txt expects.
+          for d in CXSparse/Include KLU/Include AMD/Include COLAMD/Include \
+                   BTF/Include SuiteSparse_config; do
+            mkdir -p "/opt/ls2g-dist/SuiteSparse/$d"
+            cp SuiteSparse/$d/*.h "/opt/ls2g-dist/SuiteSparse/$d/"
+          done
+
+      - name: Upload lightsim2grid build
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightsim2grid-dist
+          path: /opt/ls2g-dist
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Compile gpusim2grid in both precisions and run the (GPU-less) test suite.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (CUDA ${{ matrix.cuda }}, ${{ matrix.precision }})
+    needs: lightsim2grid
+    runs-on: ubuntu-latest
+    # Keep every image on ubuntu22.04: the lightsim2grid wheel above is built
+    # for its Python (3.10) and contains no CUDA, so all legs can share it.
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12.6.3", "13.4.2"]
+        precision: [fp64, fp32]
+        include:
+          - precision: fp64
+            precision_env: CUDA_REAL_DOUBLE
+            expect_fp32: "False"
+          - precision: fp32
+            precision_env: CUDA_REAL_FLOAT
+            expect_fp32: "True"
+    steps:
+      - name: Install system packages
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            python3-pip python3-venv python3-dev git cmake
+
+      - uses: actions/checkout@v4
+
+      - name: Download lightsim2grid build
+        uses: actions/download-artifact@v4
+        with:
+          name: lightsim2grid-dist
+          path: /opt/ls2g-dist
+
+      - name: Set up Python environment
+        run: |
+          python3 -m venv "$VENV"
+          . "$VENV/bin/activate"
+          pip install -q -U pip
+          # cuDSS wheel matching the image's CUDA major (CUDA_VERSION is set by
+          # the nvidia/cuda image), installed under <site-packages>/nvidia/cuXX.
+          cu="cu${CUDA_VERSION%%.*}"
+          pip install -q "nvidia-cudss-${cu}>=0.8" scikit-build-core pybind11 \
+            numpy scipy pytest pandapower
+          pip install /opt/ls2g-dist/wheels/lightsim2grid-*.whl
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          root=$(python -c "import nvidia.${cu}; print(list(nvidia.${cu}.__path__)[0])")
+          echo "CUDSS_WHEEL_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Build gpusim2grid (${{ matrix.precision }})
+        env:
+          # The cuDSS wheel ships no CMake config; ci/cmake/cudss provides one.
+          cudss_DIR: ${{ github.workspace }}/ci/cmake/cudss
+          CMAKE_ARGS: -DGPUSIM2GRID_SUITESPARSE_DIR=/opt/ls2g-dist/SuiteSparse
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+        run: |
+          export ${{ matrix.precision_env }}=1
+          pip install -v --no-build-isolation .
+
+      - name: Check the installed extension
+        run: |
+          export LD_LIBRARY_PATH="$CUDSS_WHEEL_ROOT/lib:${LD_LIBRARY_PATH:-}"
+          cd /
+          python - <<'EOF'
+          import gpusim2grid
+          from gpusim2grid import _gpusim2grid as m
+          print("gpusim2grid", gpusim2grid.__version__, "is_fp32 =", m.is_fp32)
+          assert str(bool(m.is_fp32)) == "${{ matrix.expect_fp32 }}", "wrong precision"
+          # The zero-copy lightsim2grid bridge is only compiled when
+          # lightsim2grid_core is found; make sure it was.
+          assert hasattr(m, "_make_ca_session_from_lsgrid"), "ls2g bridge not built"
+          EOF
+
+      - name: Run tests (GPU tests skip)
+        run: |
+          export LD_LIBRARY_PATH="$CUDSS_WHEEL_ROOT/lib:${LD_LIBRARY_PATH:-}"
+          pytest tests/python -m "not slow" -q -p no:cacheprovider
