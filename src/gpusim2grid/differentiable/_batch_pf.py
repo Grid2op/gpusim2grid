@@ -206,13 +206,19 @@ class BatchPowerFlow:
 
         # Call-to-call state.
         self._last_n_scen = None
+        # The *_mask attributes describe what the session actually holds: they
+        # are only updated by the op once the session accepted the pending
+        # value, so a call that raises in between cannot leave them claiming
+        # a topology / generator mask the session never received.
         self._topology_mask = None      # (n_scen, n_branch) bool, True = tripped
         self._topology_in_session = False
         self._pending_topology = None   # ragged list to hand to the session on the next run
+        self._pending_topology_mask = None  # _topology_mask once _pending_topology is set
         self._gen_v_in_session = False
         self._gen_off_mask = None       # (n_scen, n_gen) bool, True = disconnected
         self._gen_off_in_session = False
         self._pending_gen_off = None    # mask to hand to the session on the next run
+        self._pending_gen_off_mask = None   # _gen_off_mask once _pending_gen_off is set
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
         self._skip_in_session = False
         self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
@@ -418,13 +424,13 @@ class BatchPowerFlow:
         ragged list (if any) is handed over by the op AFTER the injections
         (the session checks the row counts against them)."""
         self._pending_topology = None
+        self._pending_topology_mask = None
         if line_status is None and trafo_status is None:
             # No trips wanted. Only touch the session if it still holds trips
             # or its row count is stale.
             if self._topology_mask is not None or (
                     self._topology_in_session and n_scen != self._last_n_scen):
                 self._pending_topology = [[] for _ in range(n_scen)]
-            self._topology_mask = None
             return
 
         tripped = torch.cat([
@@ -445,7 +451,7 @@ class BatchPowerFlow:
         else:
             ragged = [[] for _ in range(n_scen)]
         self._pending_topology = ragged
-        self._topology_mask = tripped.clone()
+        self._pending_topology_mask = tripped.clone()
 
     def _apply_gen_v_conflicts(self, gen_v, n_scen):
         """Rows asking one bus for two different |V| (see the module docstring)
@@ -482,11 +488,11 @@ class BatchPowerFlow:
         all-False mask over (bit-identical to no mask for the session, which
         also drops the reserved structure it no longer needs)."""
         self._pending_gen_off = None
+        self._pending_gen_off_mask = None
         if gen_status is None:
             if self._gen_off_mask is not None or (
                     self._gen_off_in_session and n_scen != self._last_n_scen):
                 self._pending_gen_off = np.zeros((n_scen, self.n_gen), dtype=bool)
-            self._gen_off_mask = None
             return None
 
         gen_off = ~self._as_status(gen_status, self.n_gen, n_scen, "gen_status")
@@ -498,7 +504,7 @@ class BatchPowerFlow:
         prev = self._gen_off_mask
         if prev is None or prev.shape != gen_off.shape or not torch.equal(prev, gen_off):
             self._pending_gen_off = np.ascontiguousarray(gen_off.cpu().numpy(), dtype=bool)
-            self._gen_off_mask = gen_off.clone()
+            self._pending_gen_off_mask = gen_off.clone()
         return gen_off if bool(gen_off.any()) else None
 
 
@@ -525,8 +531,10 @@ class _BatchPowerFlowOp(torch.autograd.Function):
         solver.set_injections_dlpack(S.__dlpack__(), stream)
         if pf._pending_topology is not None:
             pf._sweep.set_topology(pf._pending_topology)
+            pf._topology_mask = pf._pending_topology_mask
             pf._topology_in_session = True
             pf._pending_topology = None
+            pf._pending_topology_mask = None
         if pf._pending_skip is not None:
             if isinstance(pf._pending_skip, str):
                 solver.clear_skipped_rows()
@@ -541,8 +549,10 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             # only for set_injections_from_elements inputs, which this path
             # never uses -- the injections above already carry the correction).
             pf._sweep.set_contingency_gens(pf._pending_gen_off)
+            pf._gen_off_mask = pf._pending_gen_off_mask
             pf._gen_off_in_session = True
             pf._pending_gen_off = None
+            pf._pending_gen_off_mask = None
         if gen_v is not None:
             solver.set_gen_v_dlpack(gen_v.detach().contiguous().__dlpack__(), pf._gen_bus_np, stream)
             pf._gen_v_in_session = True

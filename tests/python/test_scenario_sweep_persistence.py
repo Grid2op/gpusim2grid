@@ -349,3 +349,61 @@ class TestDevicePath:
         wrong_dtype = torch.zeros(3, sw.n_bus, dtype=torch.float64, device="cuda")
         with pytest.raises(RuntimeError, match="dtype"):
             sw.solver.set_injections_dlpack(wrong_dtype.__dlpack__())
+
+
+class TestStateKeptAcrossRuns:
+    """Session state that must survive (or be refreshed by) a reused driver."""
+
+    @needs_bridge
+    @pytest.mark.parametrize("change", ["injections", "gen_v"])
+    def test_disconnected_flags_survive_a_hot_run(self, change):
+        # Only a new batch source recomputes which rows are islanded; a hot
+        # run keeps the live source, so it must keep those flags too.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        scales = [1.0, 1.05, 0.95]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.set_topology([[], [int(spur_line)], []])        # row 1 islands the spur bus
+        V1 = _np(sw.compute(batch_size=3))
+        assert list(sw.get_disconnected()) == [0, 1, 0]
+        assert sw.timings.n_disconnected == 1
+        assert np.all(np.isnan(V1[1]))
+
+        if change == "injections":
+            sw.set_injections_from_elements(*_rows(grid, [0.9, 1.1, 1.02]))
+        else:
+            gen_v = np.full((3, len(grid.get_gen_target_p())), np.nan)
+            gen_v[:, 0] = 1.02
+            sw.set_gen_v(gen_v)
+        V2 = _np(sw.compute(batch_size=3))
+        assert sw.driver_build_counter == 1 and sw.source_build_counter == 1   # hot
+        assert np.all(np.isnan(V2[1]))
+        assert list(sw.get_disconnected()) == [0, 1, 0]
+        assert sw.timings.n_disconnected == 1
+
+    def test_set_branch_data_after_a_run_reaches_the_driver(self, ieee14_base_case, solver_atol):
+        # The driver uploads the branch admittances once and survives across
+        # runs: a later set_branch_data() must still reach it.
+        from gpusim2grid import ScenarioSweepGPU
+        from gpusim2grid._ls2g_utils import extract_branch_data
+        grid = ieee14_base_case["grid"]
+        scales = [1.0, 1.1]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.compute(batch_size=2)
+        sw.compute_flows()
+        or1 = sw.or_amps.to_numpy().copy()
+        ex1 = sw.ex_amps.to_numpy().copy()
+        assert np.all(np.isfinite(or1)) and np.any(or1 > 0.0)
+
+        # Branch currents are linear in the admittances; Ybus (hence V) is
+        # untouched by set_branch_data, so doubling them doubles the currents.
+        (b_from, b_to, yff, yft, ytf, ytt, vn_kv, sn_mva), _, _ = extract_branch_data(grid)
+        sw.set_branch_data(b_from, b_to, 2 * np.asarray(yff), 2 * np.asarray(yft),
+                           2 * np.asarray(ytf), 2 * np.asarray(ytt), vn_kv, sn_mva)
+        sw.compute(batch_size=2)
+        assert sw.driver_build_counter == 1                 # same driver
+        sw.compute_flows()
+        np.testing.assert_allclose(sw.or_amps.to_numpy(), 2 * or1, rtol=solver_atol, atol=solver_atol)
+        np.testing.assert_allclose(sw.ex_amps.to_numpy(), 2 * ex1, rtol=solver_atol, atol=solver_atol)

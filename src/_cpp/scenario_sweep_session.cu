@@ -488,6 +488,16 @@ void ScenarioSweepSession::set_branch_data(
     h_bus_vn_kv_     = bus_vn_kv;
     sn_mva_          = sn_mva;
     has_branch_data_ = true;
+
+    // A live driver caches the admittances / flow buffers it uploaded (once
+    // per driver, see compute_flows() and run()). Invalidate them so the new
+    // data -- possibly a different branch count -- is re-uploaded; otherwise
+    // flows / limit violations keep using the old admittances, and a new
+    // tripped-branch id >= the old count indexes past the flow buffers.
+    if (solver_) {
+        solver_->_has_branch_admittances = false;
+        solver_->_has_branch_data        = false;
+    }
 }
 
 // =============================================================================
@@ -708,7 +718,19 @@ void ScenarioSweepSession::run()
                 "'direct_refactor_every_n'.");
     }
 
-    if (!has_topology_) {
+    // -------------------------------------------------------------------------
+    // Cold / warm / hot path selection against the live driver. Decided
+    // before touching contingencies_: only a cold or warm run builds a new
+    // batch source, which is what (re)computes the per-row disconnected /
+    // masked_buses flags. A hot run keeps the live source, so it must also
+    // keep those flags (get_disconnected(), n_disconnected) as they are.
+    // -------------------------------------------------------------------------
+    const ScenarioSweepDriverConfig cfg = _current_config();
+    const bool cold = !solver_ || cfg != driver_cfg_;
+    const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_);
+    const bool new_source = cold || warm;
+
+    if (new_source && !has_topology_) {
         // Default: no branches tripped for any scenario (pure injection sweep).
         contingencies_.assign(static_cast<size_t>(n_scenarios_), Contingency{});
         tripped_branches_per_scenario_.assign(
@@ -716,19 +738,22 @@ void ScenarioSweepSession::run()
     }
 
     // Reset disconnected flags from any previous run() — contingencies_ is
-    // mutated in place across runs.
-    for (size_t r = 0; r < contingencies_.size(); ++r) {
-        Contingency& ctg = contingencies_[r];
-        ctg.disconnected = false;
-        ctg.masked_buses.clear();
-        ctg.stranded_groups.clear();
-        ctg.pinned_buses.clear();
-        ctg.skip = has_skip_ && skip_rows_[r] != 0;
+    // mutated in place across runs, and the new source recomputes them.
+    if (new_source) {
+        for (size_t r = 0; r < contingencies_.size(); ++r) {
+            Contingency& ctg = contingencies_[r];
+            ctg.disconnected = false;
+            ctg.masked_buses.clear();
+            ctg.stranded_groups.clear();
+            ctg.pinned_buses.clear();
+            ctg.skip = has_skip_ && skip_rows_[r] != 0;
+        }
     }
 
     // Per-row PV pins: every reserved bus stays PV (identity Q row) except
-    // the ones this row turned PQ. Nothing reserved → nothing to pin.
-    if (!reserved_buses_.empty()) {
+    // the ones this row turned PQ. Nothing reserved → nothing to pin. (A hot
+    // run has the same mask, hence the same pins, as the live source.)
+    if (new_source && !reserved_buses_.empty()) {
         for (int r = 0; r < n_scenarios_; ++r) {
             const std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
             std::vector<int>& pinned = contingencies_[static_cast<size_t>(r)].pinned_buses;
@@ -770,13 +795,6 @@ void ScenarioSweepSession::run()
         throw std::runtime_error(
             "ScenarioSweepSession: injection buffer size does not match "
             "n_scenarios x n_bus (call set_injections() again)");
-
-    // -------------------------------------------------------------------------
-    // Cold / warm / hot path selection against the live driver.
-    // -------------------------------------------------------------------------
-    const ScenarioSweepDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_;
-    const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_);
 
     if (cold) {
         // Host preprocessing (resolve_indices + connectivity/masking +

@@ -652,6 +652,35 @@ class TestCallToCallState:
         V6 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
         torch.testing.assert_close(V6, V0, atol=solver_atol, rtol=0)
 
+    def test_failed_call_does_not_desync_topology(self, ieee14_base_case, solver_atol):
+        # A call that raises after the topology was decided (here: a bad
+        # gen_status shape, validated after line_status) must not leave the
+        # cached mask claiming a topology the session never received --
+        # otherwise the next call with that line_status looks "unchanged" and
+        # silently solves on the old trips.
+        grid = ieee14_base_case["grid"]
+        pf, ref = _pf(grid), _pf(grid)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        ls, ts = _all_connected(pf, n)
+        ls[1, 3] = False
+        pf(load_p=load_p, load_q=load_q, gen_p=gen_p, line_status=ls, trafo_status=ts)
+        assert pf.sweep.source_build_counter == 1
+
+        ls2 = ls.clone()
+        ls2[2, 0] = False
+        bad_gs = torch.ones(n, pf.n_gen + 1, dtype=torch.bool, device="cuda")
+        with pytest.raises(ValueError, match="gen_status"):
+            pf(load_p=load_p, load_q=load_q, gen_p=gen_p,
+               line_status=ls2, trafo_status=ts, gen_status=bad_gs)
+
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p,
+               line_status=ls2, trafo_status=ts).clone()
+        assert pf.sweep.source_build_counter == 2          # new topology: warm
+        V_ref = ref(load_p=load_p, load_q=load_q, gen_p=gen_p,
+                    line_status=ls2, trafo_status=ts)
+        torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
+
 
 # ---------------------------------------------------------------------------
 # Generator contingencies (gen_status)
