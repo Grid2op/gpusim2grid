@@ -479,6 +479,20 @@ void ScenarioSweepSession::set_branch_data(
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double sn_mva)
 {
+    // The trip lists refer to branch ids: refuse data that no longer holds
+    // one of them before anything is replaced (the session stays usable).
+    const int n_bra_new = static_cast<int>(branch_from.size());
+    if (has_topology_) {
+        for (const auto& ids : tripped_branches_per_scenario_)
+            for (int id : ids)
+                if (id >= n_bra_new)
+                    throw std::runtime_error(
+                        "ScenarioSweepSession::set_branch_data: the current topology "
+                        "trips branch " + std::to_string(id) + ", out of range for "
+                        "the new " + std::to_string(n_bra_new) + " branches -- call "
+                        "set_topology() with valid ids first");
+    }
+
     h_branch_from_   = branch_from;
     h_branch_to_     = branch_to;
     h_yff_eff_           = yff_eff;
@@ -488,6 +502,24 @@ void ScenarioSweepSession::set_branch_data(
     h_bus_vn_kv_     = bus_vn_kv;
     sn_mva_          = sn_mva;
     has_branch_data_ = true;
+
+    // Branch limits are per branch: a different count makes them stale, so
+    // compute_limit_violations asks for set_limits() again instead of
+    // reading past their end.
+    if (has_limits_ && h_branch_limit_a1_ka_.size() != n_bra_new) {
+        has_limits_            = false;
+        has_violations_result_ = false;
+    }
+
+    // The per-row Ybus patches were built from the previous admittances:
+    // rebuild them from the same trip lists (also marks the topology dirty,
+    // so the next run() builds a new source). A trip list whose row count no
+    // longer matches the injections is left as is: run() refuses it anyway.
+    if (has_topology_ && (!has_injections_ ||
+            static_cast<int>(tripped_branches_per_scenario_.size()) == n_scenarios_)) {
+        const std::vector<std::vector<int>> trips = tripped_branches_per_scenario_;
+        set_topology(trips);
+    }
 
     // A live driver caches the admittances / flow buffers it uploaded (once
     // per driver, see compute_flows() and run()). Invalidate them so the new
@@ -737,9 +769,14 @@ void ScenarioSweepSession::run()
             static_cast<size_t>(n_scenarios_), std::vector<int>{});
     }
 
-    // Reset disconnected flags from any previous run() — contingencies_ is
-    // mutated in place across runs, and the new source recomputes them.
-    if (new_source) {
+    // Per-row state a new batch source computes from scratch: reset the
+    // disconnected flags from any previous run() (contingencies_ is mutated
+    // in place across runs, and the connectivity checks only ever set them)
+    // and re-derive the per-row PV pins -- every reserved bus stays PV
+    // (identity Q row) except the ones this row turned PQ; nothing reserved
+    // → nothing to pin. A hot run has the same mask, hence the same pins, as
+    // the live source, so it leaves all of this alone.
+    auto reset_rows = [&]() {
         for (size_t r = 0; r < contingencies_.size(); ++r) {
             Contingency& ctg = contingencies_[r];
             ctg.disconnected = false;
@@ -748,19 +785,16 @@ void ScenarioSweepSession::run()
             ctg.pinned_buses.clear();
             ctg.skip = has_skip_ && skip_rows_[r] != 0;
         }
-    }
-
-    // Per-row PV pins: every reserved bus stays PV (identity Q row) except
-    // the ones this row turned PQ. Nothing reserved → nothing to pin. (A hot
-    // run has the same mask, hence the same pins, as the live source.)
-    if (new_source && !reserved_buses_.empty()) {
-        for (int r = 0; r < n_scenarios_; ++r) {
-            const std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
-            std::vector<int>& pinned = contingencies_[static_cast<size_t>(r)].pinned_buses;
-            for (int b : reserved_buses_)
-                if (!std::binary_search(to_pq.begin(), to_pq.end(), b)) pinned.push_back(b);
+        if (!reserved_buses_.empty()) {
+            for (int r = 0; r < n_scenarios_; ++r) {
+                const std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
+                std::vector<int>& pinned = contingencies_[static_cast<size_t>(r)].pinned_buses;
+                for (int b : reserved_buses_)
+                    if (!std::binary_search(to_pq.begin(), to_pq.end(), b)) pinned.push_back(b);
+            }
         }
-    }
+    };
+    if (new_source) reset_rows();
     std::vector<cuda_real_type> h_slack_w_rows = _row_slack_weights(row_slack_off);
 
     const int n_bus = base_state_->n_bus;
@@ -796,7 +830,49 @@ void ScenarioSweepSession::run()
             "ScenarioSweepSession: injection buffer size does not match "
             "n_scenarios x n_bus (call set_injections() again)");
 
-    if (cold) {
+    // A warm run keeps the live driver's chunk capacity, which the cold run
+    // sized for ITS active rows. If this topology leaves many more rows
+    // active (e.g. the cold run had most rows islanded or skipped), that
+    // capacity would split them into far more chunks than a fresh driver
+    // would use -- rebuild the driver instead once it would take more than
+    // twice a fresh driver's chunk count (a small growth is cheaper served by
+    // one extra chunk than by a new cuDSS analysis). fixed_batch_capacity
+    // keeps batch_size verbatim, so it never needs this.
+    bool build_driver = cold;
+    if (warm) {
+        // New topology / generator mask on the live driver: rebuild only the
+        // source (CPU connectivity + patches + H→D of those) at the driver's
+        // capacity; no analysis, no allocation of the chunk buffers.
+        const int live_capacity = solver_->batch_size_;
+        ScenarioSweepBatch source(
+            contingencies_,
+            Ybus_rm_.outerIndexPtr(),
+            Ybus_rm_.innerIndexPtr(),
+            Ybus_rm_,
+            batch_size_,
+            mask_cfg_,
+            handle_disconnected_grid_,
+            GenVOverride{},
+            std::vector<cuda_real_type>(h_slack_w_rows),
+            base_state_->n_slack,
+            /*forced_batch_size=*/live_capacity);
+        int n_active = 0;
+        for (const auto& ctg : contingencies_)
+            if (!ctg.disconnected) ++n_active;
+        const int chunks_live  = (n_active + live_capacity - 1) / live_capacity;
+        const int chunks_fresh = (n_active + batch_size_ - 1) / batch_size_;
+        if (!fixed_batch_capacity_ && chunks_live > 2 * chunks_fresh) {
+            build_driver = true;
+            reset_rows();          // the cold source below recomputes them
+        } else {
+            solver_->replace_source(std::move(source));
+            used_batch_size_ = live_capacity;
+            solver_->mark_reused(/*hot=*/false);
+            ++source_build_counter_;
+        }
+    }
+
+    if (build_driver) {
         // Host preprocessing (resolve_indices + connectivity/masking +
         // build_flat_patches), mutates contingencies_ in-place so the
         // disconnected flags are observable below. gen_v is set afterwards
@@ -816,6 +892,8 @@ void ScenarioSweepSession::run()
         used_batch_size_ = source.used_batch_size();
 
         // New driver: allocation, block-diagonal structure, cuDSS ANALYSIS.
+        // Free the old one first so the two never coexist on the device.
+        solver_.reset();
         solver_ = std::make_unique<ScenarioSweepSolver>(
             *base_state_,
             std::move(source),
@@ -833,27 +911,7 @@ void ScenarioSweepSession::run()
         driver_cfg_ = cfg;
         ++driver_build_counter_;
         ++source_build_counter_;
-    } else if (warm) {
-        // New topology / generator mask on the live driver: rebuild only the
-        // source (CPU connectivity + patches + H→D of those) at the driver's
-        // capacity; no analysis, no allocation of the chunk buffers.
-        ScenarioSweepBatch source(
-            contingencies_,
-            Ybus_rm_.outerIndexPtr(),
-            Ybus_rm_.innerIndexPtr(),
-            Ybus_rm_,
-            batch_size_,
-            mask_cfg_,
-            handle_disconnected_grid_,
-            GenVOverride{},
-            std::move(h_slack_w_rows),
-            base_state_->n_slack,
-            /*forced_batch_size=*/solver_->batch_size_);
-        solver_->replace_source(std::move(source));
-        used_batch_size_ = solver_->batch_size_;
-        solver_->mark_reused(/*hot=*/false);
-        ++source_build_counter_;
-    } else {
+    } else if (!warm) {
         // Hot: only injections / gen_v changed (or nothing at all).
         solver_->mark_reused(/*hot=*/true);
     }
@@ -911,6 +969,10 @@ void ScenarioSweepSession::run()
             h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
             violation_tol_, violation_capacity_, n_lines_);
         t_limits_setup_ms = solver_->violation_setup_ms();
+    } else {
+        // The driver outlives the flag: a previous run's set_violation_limits
+        // left the fused check armed, so disarm it explicitly.
+        solver_->_fused_violations_enabled = false;
     }
 
     timings_ = solver_->solve();

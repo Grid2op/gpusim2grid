@@ -681,6 +681,36 @@ class TestCallToCallState:
                     line_status=ls2, trafo_status=ts)
         torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
 
+    def test_failed_call_with_a_new_row_count_does_not_stick(self, ieee14_base_case,
+                                                             solver_atol, monkeypatch):
+        # The session holds an (all-empty) trip list for 3 rows. A 5-row call
+        # fails inside the op after the injections were handed over; the next
+        # 5-row call without status must still replace that 3-row list rather
+        # than trust a row count the session never received (it would refuse
+        # every such call with "row count no longer matches").
+        grid = ieee14_base_case["grid"]
+        pf, ref = _pf(grid), _pf(grid)
+        lp3, lq3, gp3 = _base_inputs(pf, 3)
+        ls3, ts3 = _all_connected(pf, 3)
+        ls3[1, 3] = False
+        pf(load_p=lp3, load_q=lq3, gen_p=gp3, line_status=ls3, trafo_status=ts3)
+        pf(load_p=lp3, load_q=lq3, gen_p=gp3)              # trips cleared, 3 rows
+
+        lp5, lq5, gp5 = _base_inputs(pf, 5, [1.0, 1.02, 0.98, 1.05, 0.95])
+        ls5, ts5 = _all_connected(pf, 5)
+        ls5[4, 6] = False
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("injected failure")
+        with monkeypatch.context() as m:
+            m.setattr(pf.sweep, "set_topology", boom)
+            with pytest.raises(RuntimeError, match="injected failure"):
+                pf(load_p=lp5, load_q=lq5, gen_p=gp5, line_status=ls5, trafo_status=ts5)
+
+        V = pf(load_p=lp5, load_q=lq5, gen_p=gp5).clone()
+        V_ref = ref(load_p=lp5, load_q=lq5, gen_p=gp5)
+        torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
+
 
 # ---------------------------------------------------------------------------
 # Generator contingencies (gen_status)
