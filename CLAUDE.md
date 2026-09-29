@@ -76,7 +76,7 @@ Tests **require a CUDA GPU and the installed extension** — `conftest.py` defin
 
 ## CI
 
-`.github/workflows/build.yml` (every push/PR) compiles FP64 and FP32 on a free, **GPU-less** runner inside an `nvidia/cuda:*-devel` container, then runs pytest there — so every `requires_gpu` test skips (the marker checks for an actual CUDA device, not just an importable extension). lightsim2grid is built from source at `LS2G_REF` and cached on its commit SHA. cuDSS comes from the `nvidia-cudss-cu12` pip wheel, which ships no CMake config: `ci/cmake/cudss/` is a small `cudss-config.cmake` shim for it (`cudss_DIR` points there). The real GPU test suite is not run by CI.
+`.github/workflows/build.yml` (every push/PR) compiles FP64 × FP32 and CUDA 12 × CUDA 13 on a free, **GPU-less** runner inside `nvidia/cuda:*-devel-ubuntu22.04` containers (all on ubuntu22.04, so one lightsim2grid wheel serves every leg), then runs pytest there — so every `requires_gpu` test skips (the marker checks for an actual CUDA device, not just an importable extension). lightsim2grid is built from source at `LS2G_REF` and cached on its commit SHA. cuDSS comes from the `nvidia-cudss-cu12`/`-cu13` pip wheel matching the image, which ships no CMake config: `ci/cmake/cudss/` is a small `cudss-config.cmake` shim for it (`cudss_DIR` points there; `CUDSS_WHEEL_ROOT`, else the wheel matching nvcc's CUDA major). The real GPU test suite is not run by CI.
 
 ## Benchmarks
 

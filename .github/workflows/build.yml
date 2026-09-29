@@ -1,6 +1,6 @@
-# Level-1 CI: compile the CUDA extension (FP64 and FP32) on a free GitHub
-# runner. No GPU is needed to *build*: the job runs in an NVIDIA CUDA "devel"
-# container, which ships nvcc and the CUDA libraries but no driver. The
+# Level-1 CI: compile the CUDA extension (FP64 and FP32, CUDA 12 and 13) on
+# a free GitHub runner. No GPU is needed to *build*: the job runs in an NVIDIA
+# CUDA "devel" container, which ships nvcc and the CUDA libraries but no driver. The
 # pytest step then runs on that GPU-less machine: every test marked
 # `requires_gpu` (conftest.py) is skipped, but all test modules are still
 # imported and any pure-Python test still runs.
@@ -102,13 +102,17 @@ jobs:
   # Compile gpusim2grid in both precisions and run the (GPU-less) test suite.
   # ---------------------------------------------------------------------------
   build:
-    name: build (${{ matrix.precision }})
+    name: build (CUDA ${{ matrix.cuda }}, ${{ matrix.precision }})
     needs: lightsim2grid
     runs-on: ubuntu-latest
-    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    # Keep every image on ubuntu22.04: the lightsim2grid wheel above is built
+    # for its Python (3.10) and contains no CUDA, so all legs can share it.
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu22.04
     strategy:
       fail-fast: false
       matrix:
+        cuda: ["12.6.3", "13.4.2"]
+        precision: [fp64, fp32]
         include:
           - precision: fp64
             precision_env: CUDA_REAL_DOUBLE
@@ -136,12 +140,14 @@ jobs:
           python3 -m venv "$VENV"
           . "$VENV/bin/activate"
           pip install -q -U pip
-          pip install -q "nvidia-cudss-cu12>=0.8" scikit-build-core pybind11 \
+          # cuDSS wheel matching the image's CUDA major (CUDA_VERSION is set by
+          # the nvidia/cuda image), installed under <site-packages>/nvidia/cuXX.
+          cu="cu${CUDA_VERSION%%.*}"
+          pip install -q "nvidia-cudss-${cu}>=0.8" scikit-build-core pybind11 \
             numpy scipy pytest pandapower
           pip install /opt/ls2g-dist/wheels/lightsim2grid-*.whl
           echo "$VENV/bin" >> "$GITHUB_PATH"
-          # The cuDSS pip wheel installs under <site-packages>/nvidia/cu12.
-          root=$(python -c "import nvidia.cu12; print(list(nvidia.cu12.__path__)[0])")
+          root=$(python -c "import nvidia.${cu}; print(list(nvidia.${cu}.__path__)[0])")
           echo "CUDSS_WHEEL_ROOT=$root" >> "$GITHUB_ENV"
 
       - name: Build gpusim2grid (${{ matrix.precision }})

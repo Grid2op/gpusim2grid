@@ -1,25 +1,18 @@
-# Minimal CMake package config for the cuDSS *pip wheel* (nvidia-cudss-cu12).
+# Minimal CMake package config for the cuDSS *pip wheel* (nvidia-cudss-cu12/-cu13).
 #
 # NVIDIA's tarball / apt packages of cuDSS ship a real cudss-config.cmake; the
 # pip wheel ships only the headers and libcudss.so.0, so find_package(cudss)
 # can't find it. This shim lets `find_package(cudss 0.8.0 REQUIRED)` in
 # src/_cpp/CMakeLists.txt resolve against the wheel. Used by CI
 # (.github/workflows/build.yml); point cudss_DIR (or cudss_ROOT) at this
-# directory and CUDSS_WHEEL_ROOT at the wheel's <site-packages>/nvidia/cu12.
+# directory and CUDSS_WHEEL_ROOT at the wheel's <site-packages>/nvidia/cuXX
+# (otherwise the wheel matching nvcc's CUDA major is used).
 
 if(TARGET cudss)
     return()
 endif()
 
-set(_cudss_root "$ENV{CUDSS_WHEEL_ROOT}")
-if(NOT _cudss_root)
-    execute_process(
-        COMMAND "${Python_EXECUTABLE}" -c
-                "import nvidia.cu12, os; print(list(nvidia.cu12.__path__)[0])"
-        OUTPUT_VARIABLE _cudss_root
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-endif()
+include("${CMAKE_CURRENT_LIST_DIR}/cudss-wheel-root.cmake")
 
 find_path(cudss_INCLUDE_DIR cudss.h HINTS "${_cudss_root}/include" NO_DEFAULT_PATH)
 find_file(cudss_LIBRARY NAMES libcudss.so libcudss.so.0

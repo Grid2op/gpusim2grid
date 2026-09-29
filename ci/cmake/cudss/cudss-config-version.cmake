@@ -1,15 +1,7 @@
 # Version file for the cuDSS pip-wheel shim (see cudss-config.cmake): reads the
 # version from cudss.h so `find_package(cudss 0.8.0)` checks the real wheel.
 
-set(_cudss_root "$ENV{CUDSS_WHEEL_ROOT}")
-if(NOT _cudss_root)
-    execute_process(
-        COMMAND "${Python_EXECUTABLE}" -c
-                "import nvidia.cu12, os; print(list(nvidia.cu12.__path__)[0])"
-        OUTPUT_VARIABLE _cudss_root
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-endif()
+include("${CMAKE_CURRENT_LIST_DIR}/cudss-wheel-root.cmake")
 
 set(PACKAGE_VERSION "0.0.0")
 if(EXISTS "${_cudss_root}/include/cudss.h")
