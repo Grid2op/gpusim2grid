@@ -348,6 +348,45 @@ class TestAdjointPrimitives:
             np.testing.assert_allclose(lam[r], expected, atol=1e-8, rtol=1e-8)
         assert np.all(lam[2] == 0.0)                     # dropped row
 
+    def test_solve_JT_batch_refuses_a_multi_chunk_forward(self, ieee14_base_case):
+        # The adjoint buffers hold one chunk: a snapshot J passes the shape
+        # check (it IS one chunk's worth), but gathering the n_active rows of
+        # a two-chunk forward into them would write out of bounds.
+        from gpusim2grid import ScenarioSweepGPU
+        grid = ieee14_base_case["grid"]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        n = 4
+        load_p, load_q = (np.asarray(a) for a in grid.get_loads_res_full()[:2])
+        gen_p = np.asarray(grid.get_gen_target_p())
+        rep = lambda a: np.repeat(a[None, :], n, axis=0)   # noqa: E731
+        sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+        sw.compute(batch_size=2)
+        sol = sw.solver
+        assert sol.capacity == 2 and sol.n_active == 4
+        J = torch.from_dlpack(sol.j_values_dlpack()).clone()
+        rhs = torch.zeros(n, sol.dim_J, dtype=RDT, device="cuda")
+        with pytest.raises(RuntimeError, match="one chunk"):
+            sol.solve_JT_batch_dlpack(rhs.__dlpack__(), J.__dlpack__())
+
+    def test_failed_forward_invalidates_a_pending_alias_backward(self, ieee14_base_case):
+        # A forward that throws after the session already replaced its driver
+        # (here: keep_final_jacobian on a batch forced into two chunks) must
+        # still bump run_counter, or the pending backward would read the new
+        # driver's buffers as if they were its own.
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        lp = load_p.clone().requires_grad_(True)
+        V = pf(load_p=lp, load_q=load_q, gen_p=gen_p)
+
+        pf.sweep.solver.batch_size = 1                  # cold rebuild, 3 chunks
+        lp2 = load_p.clone().requires_grad_(True)
+        with pytest.raises(RuntimeError, match="keep_final_jacobian"):
+            pf(load_p=lp2, load_q=load_q, gen_p=gen_p)
+        with pytest.raises(RuntimeError, match="another forward"):
+            V.real.sum().backward()
+
 
 # ---------------------------------------------------------------------------
 # Gradients vs finite differences

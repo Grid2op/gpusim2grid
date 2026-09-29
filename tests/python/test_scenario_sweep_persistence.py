@@ -521,3 +521,27 @@ class TestStateKeptAcrossRuns:
         np.testing.assert_allclose(or2[:, :n_bra], or1, rtol=solver_atol, atol=solver_atol)
         assert np.all(or2[:, n_bra] == 0.0)
         assert or2[0, 3] == 0.0                             # still tripped in row 0
+
+    @needs_bridge
+    def test_keep_final_jacobian_rebuilds_when_one_chunk_is_possible(self, solver_atol):
+        # keep_final_jacobian needs one chunk. The cold run's capacity (2: two
+        # of four rows islanded) would split a later all-active topology in two
+        # chunks, which is under the "twice as many chunks" rebuild threshold;
+        # the forward must still get the one chunk batch_size allows.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        spur = int(spur_line)
+        scales = [1.0, 1.05, 0.95, 1.1]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.solver.keep_final_jacobian = True
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.set_topology([[spur], [spur], [], []])
+        sw.compute(batch_size=4)
+        assert sw.solver.capacity == 2
+
+        topo = [[]] * 4
+        sw.set_topology(topo)
+        V = _np(sw.compute(batch_size=4))                # used to raise
+        assert sw.driver_build_counter == 2 and sw.solver.capacity == 4
+        np.testing.assert_allclose(V, _fresh(grid, scales, topology=topo)[0],
+                                   atol=solver_atol)

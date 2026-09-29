@@ -1156,6 +1156,18 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
     if (n_solves_ == 0)
         throw std::runtime_error(
             "[batch_pf] solve_JT_batch: call solve() (a forward run) first");
+    // Every adjoint buffer (rhs, λ, the Jᵀ values, the gen_v scratch) holds
+    // ONE chunk: a forward split over several chunks has no single J to
+    // transpose, and gathering its n_active rows would write past them --
+    // with the driver's own J (keep_final_jacobian refuses that forward) and
+    // with a caller-supplied snapshot alike.
+    if (n_active_ > batch_size_)
+        throw std::runtime_error(
+            "[batch_pf] solve_JT_batch: the last forward ran in several chunks ("
+            + std::to_string(n_active_) + " active rows, chunk capacity "
+            + std::to_string(batch_size_) + "); the adjoint needs one chunk -- raise "
+            "batch_size to at least the number of scenarios (or set "
+            "fixed_batch_capacity) and run() again");
     if (!adjoint_) _prepare_adjoint();
     BatchAdjoint& A = *adjoint_;
 

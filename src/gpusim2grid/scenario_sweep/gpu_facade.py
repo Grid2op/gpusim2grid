@@ -371,6 +371,8 @@ class ScenarioSweepGPU:
         self._gen_off = mask
         if self._pending_elements is not None:
             self._assemble_injections()
+        if self._gen_v is not None:
+            self._push_gen_v()      # the off columns changed
         self._update_skipped_rows()
 
     @property
@@ -431,9 +433,22 @@ class ScenarioSweepGPU:
                 "set_gen_v() needs a lightsim2grid grid; explicit-array "
                 "(tuple) mode has no generators to read.")
         gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
-        self._inner.set_gen_v(gen_v, self._elements.gen_bus)
         self._gen_v = gen_v
+        self._push_gen_v()
         self._update_skipped_rows()
+
+    def _push_gen_v(self):
+        """Hand set_gen_v()'s input to the session with the generators that
+        set_contingency_gens() takes out of a row NaN'd there (NaN = leave
+        untouched): a disconnected generator must not impose its set-point on
+        a bus another, still-connected generator keeps PV -- the conflict
+        check already ignores it, so the session must too. A row-count
+        mismatch is left to the C++ session, like _update_skipped_rows."""
+        gen_v = self._gen_v
+        gen_off = self._gen_off
+        if gen_off is not None and gen_off.shape == gen_v.shape and gen_off.any():
+            gen_v = np.where(gen_off, np.nan, gen_v)
+        self._inner.set_gen_v(gen_v, self._elements.gen_bus)
 
     def _update_skipped_rows(self):
         """Re-derive the not-simulable rows from set_gen_v() (and the

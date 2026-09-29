@@ -66,6 +66,7 @@
 #include <iostream>
 #include <vector>
 #include <cassert>
+#include <cmath>       // isnan / NAN (NanMaxFunctor)
 
 // ---------------------------------------------------------------------------
 // Error-checking macros — throw on failure so the AcPfNrState constructor
@@ -107,6 +108,17 @@
 struct AbsFunctor {
     __host__ __device__
     cuda_real_type operator()(cuda_real_type x) const { return fabs(x); }
+};
+
+// NaN-propagating max for the ‖F‖∞ reductions below. thrust::maximum is
+// `a < b ? b : a`, which drops a NaN `b`: an all-NaN F would reduce to the
+// initial 0 and read as converged. Same sticky-NaN rule as the batched
+// compute_residuals_kernel.
+struct NanMaxFunctor {
+    __host__ __device__
+    cuda_real_type operator()(cuda_real_type a, cuda_real_type b) const {
+        return (isnan(a) || isnan(b)) ? cuda_real_type(NAN) : (b > a ? b : a);
+    }
 };
 
 // =============================================================================
@@ -1181,7 +1193,7 @@ AcPfNrState::AcPfNrState(
             d_F.begin(), d_F.end(),
             AbsFunctor{},
             cuda_real_type(0.),
-            thrust::maximum<cuda_real_type>());
+            NanMaxFunctor{});
         timings.t_mismatch += timer.stop_ms();
 
         // Guard against tol being tuned for lightsim2grid's FP64 CPU check
@@ -1236,7 +1248,7 @@ AcPfNrState::AcPfNrState(
                 d_F.begin(), d_F.end(),
                 AbsFunctor{},
                 cuda_real_type(0.),
-                thrust::maximum<cuda_real_type>());
+                NanMaxFunctor{});
             timings.t_mismatch += timer.stop_ms();
 
             if (norm_F < static_cast<cuda_real_type>(tol)) {

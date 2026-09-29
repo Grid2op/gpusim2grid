@@ -687,6 +687,13 @@ void ScenarioSweepSession::set_limits(
 // =============================================================================
 void ScenarioSweepSession::run()
 {
+    // Counted on entry, not on success: a run() that throws part-way may
+    // already have swapped the batch source or overwritten the chunk
+    // buffers, so a pending alias-mode backward (run_counter guard) must no
+    // longer trust them -- nor the Jacobian of the previous forward.
+    ++run_counter_;
+    last_run_kept_jacobian_ = false;
+
     if (!has_injections_)
         throw std::runtime_error(
             "ScenarioSweepSession: call set_injections() before run()");
@@ -861,7 +868,13 @@ void ScenarioSweepSession::run()
             if (!ctg.disconnected) ++n_active;
         const int chunks_live  = (n_active + live_capacity - 1) / live_capacity;
         const int chunks_fresh = (n_active + batch_size_ - 1) / batch_size_;
-        if (!fixed_batch_capacity_ && chunks_live > 2 * chunks_fresh) {
+        // keep_final_jacobian needs ONE chunk: rebuild whenever a fresh driver
+        // would give it one and the live capacity would not (the forward
+        // would otherwise refuse a batch_size that is already large enough).
+        const bool too_many_chunks =
+            chunks_live > 2 * chunks_fresh
+            || (keep_final_jacobian_ && chunks_live > 1 && chunks_fresh <= 1);
+        if (!fixed_batch_capacity_ && too_many_chunks) {
             build_driver = true;
             reset_rows();          // the cold source below recomputes them
         } else {
@@ -1007,7 +1020,6 @@ void ScenarioSweepSession::run()
     injections_dirty_ = topology_dirty_ = gen_v_dirty_ = gen_off_dirty_ = false;
     skip_dirty_ = false;
     last_run_kept_jacobian_ = keep_final_jacobian_;
-    ++run_counter_;
 
     solver_->cs.synchronize();
 }
