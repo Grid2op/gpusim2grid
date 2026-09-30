@@ -160,21 +160,39 @@ LimitData extract_limits(const ls2g::LSGrid& grid, int n_bus_solver)
 
     LimitData ld;
 
+    const eigen_real_type nan_val = std::numeric_limits<eigen_real_type>::quiet_NaN();
+
     // Branch limits: bulk C++ accessor exists (TwoSidesContainer_rxh_A::
     // get_limit_a1_ka/a2_ka) -- straight concat, same head/tail pattern as
     // concat_cplx above. NaN entries ("not configured") pass through as-is.
+    // Like the bus limits below, a container whose limits were NEVER
+    // configured hands back an EMPTY vector, not a NaN-filled nb() one (e.g.
+    // any pandapower case without thermal limits): pad it to nb() NaNs per
+    // container, so the concatenation is always n_lines + n_trafos long and
+    // lines/trafos never misalign when only one of the two is configured.
     {
-        Eigen::Ref<const ls2g::RealVect> l1_lines  = lines.get_limit_a1_ka();
-        Eigen::Ref<const ls2g::RealVect> l1_trafos = trafos.get_limit_a1_ka();
-        ld.limit_a1_ka.resize(l1_lines.size() + l1_trafos.size());
-        ld.limit_a1_ka.head(l1_lines.size())  = l1_lines;
-        ld.limit_a1_ka.tail(l1_trafos.size()) = l1_trafos;
+        auto padded = [&](Eigen::Ref<const ls2g::RealVect> v, Eigen::Index nb) -> RealVect {
+            if (v.size() == nb) return RealVect(v);
+            if (v.size() != 0)
+                throw std::runtime_error(
+                    "extract_limits: a branch current-limit vector has " +
+                    std::to_string(v.size()) + " entries for " + std::to_string(nb) +
+                    " elements");
+            return RealVect::Constant(nb, nan_val);
+        };
+        const Eigen::Index nl = static_cast<Eigen::Index>(lines.nb());
+        const Eigen::Index nt = static_cast<Eigen::Index>(trafos.nb());
+        const RealVect l1_lines  = padded(lines.get_limit_a1_ka(),  nl);
+        const RealVect l1_trafos = padded(trafos.get_limit_a1_ka(), nt);
+        ld.limit_a1_ka.resize(nl + nt);
+        ld.limit_a1_ka.head(nl) = l1_lines;
+        ld.limit_a1_ka.tail(nt) = l1_trafos;
 
-        Eigen::Ref<const ls2g::RealVect> l2_lines  = lines.get_limit_a2_ka();
-        Eigen::Ref<const ls2g::RealVect> l2_trafos = trafos.get_limit_a2_ka();
-        ld.limit_a2_ka.resize(l2_lines.size() + l2_trafos.size());
-        ld.limit_a2_ka.head(l2_lines.size())  = l2_lines;
-        ld.limit_a2_ka.tail(l2_trafos.size()) = l2_trafos;
+        const RealVect l2_lines  = padded(lines.get_limit_a2_ka(),  nl);
+        const RealVect l2_trafos = padded(trafos.get_limit_a2_ka(), nt);
+        ld.limit_a2_ka.resize(nl + nt);
+        ld.limit_a2_ka.head(nl) = l2_lines;
+        ld.limit_a2_ka.tail(nt) = l2_trafos;
     }
 
     // Bus limits: grid.get_bus_vmin_kv()/get_bus_vmax_kv() return an EMPTY
@@ -188,7 +206,6 @@ LimitData extract_limits(const ls2g::LSGrid& grid, int n_bus_solver)
     ls2g::RealVect vmax_model = grid.get_bus_vmax_kv();
     std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
 
-    const eigen_real_type nan_val = std::numeric_limits<eigen_real_type>::quiet_NaN();
     ld.bus_vmin_kv = RealVect::Constant(n_bus_solver, nan_val);
     ld.bus_vmax_kv = RealVect::Constant(n_bus_solver, nan_val);
     if (vmin_model.size() > 0) {

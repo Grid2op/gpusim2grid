@@ -4,5 +4,6 @@
 
 from ._power_flow_op import PowerFlowFunction, solve_power_flow
 from ._flows import compute_flows
+from ._batch_pf import BatchPowerFlow
 
-__all__ = ["PowerFlowFunction", "solve_power_flow", "compute_flows"]
+__all__ = ["PowerFlowFunction", "solve_power_flow", "compute_flows", "BatchPowerFlow"]

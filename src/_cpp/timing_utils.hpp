@@ -385,6 +385,19 @@ struct BatchTimings {
     int n_refactorize    = 0;   // number of refactorize calls (n_chunks * nb_iter - 1)
     int n_disconnected   = 0;   // contingencies skipped (would disconnect the grid)
 
+    // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
+    //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
+    //     until the first backward pass; NOT part of any aggregate above (the
+    //     adjoint is a separate call from run()). ---
+    double      t_adjoint_build_ms = 0.;   // Jᵀ skeleton/map + buffers + cuDSS ANALYSIS (first backward only)
+    TimingEntry t_adjoint_first_factorize; // single FACTORIZATION of Jᵀ (first backward only)
+    TimingEntry t_adjoint_refactorize;     // REFACTORIZATION of Jᵀ (every later backward after a new forward)
+    TimingEntry t_adjoint_solve;           // SOLVE with Jᵀ (every backward)
+    int adjoint_n_analysis    = 0;         // 0 or 1 per driver life
+    int adjoint_n_factorize   = 0;         // 0 or 1 per driver life
+    int adjoint_n_refactorize = 0;
+    int adjoint_n_solve       = 0;
+
     // Total wall-clock time for all chunks (excludes one-time setup).
     double t_chunks_total_wall_ms() const {
         return (t_tile_V         + t_tile_Ybus      + t_patch_Ybus

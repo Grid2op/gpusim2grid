@@ -92,3 +92,16 @@ power flow, using the adjoint method via the PyTorch integration.
 
 .. literalinclude:: ../examples/differentiable_pf.py
    :language: python
+
+Batched differentiable power flow
+---------------------------------
+
+A whole batch of scenarios (random load scalings and random N-1 line trips) as
+one differentiable PyTorch layer (``BatchPowerFlow``): a few optimisation steps
+learn a generator redispatch and voltage set-points that flatten the voltage
+profile. The reuse counters printed at each step show the GPU batch driver
+being built once, the Jacobians being refactorized (never re-analysed) on
+later calls, and the transposed system being built on the first backward only.
+
+.. literalinclude:: ../examples/batch_differentiable_pf.py
+   :language: python

@@ -444,6 +444,34 @@ class TestInjectionSweepSolver:
             max_iter_base=10, tol_base=1e-6,
         )
 
+    def test_nan_scenario_reports_nan_residual(self, ieee14_base_case, residual_atol):
+        """A scenario whose NR state is NaN must report a NaN residual, not 0.
+
+        Regression for ``compute_residuals_kernel``: its ‖F‖∞ reduction used a
+        plain ``v > local_max`` compare, which is false for NaN, so a slot whose
+        F was entirely NaN (e.g. after a NaN cuDSS solve poisoned V) reported
+        residual 0 and looked converged. A NaN injection is the simplest way to
+        force such a slot deterministically; the neighbouring scenarios must
+        still solve and report finite residuals.
+        """
+        scales = [0.9, 1.0, 1.1]
+        p_mw, q_mvar, sn_mva = _build_scenarios(ieee14_base_case, scales)
+        p_mw = p_mw.copy()
+        p_mw[1, :] = np.nan
+
+        solver = self._make_solver(ieee14_base_case, batch_size=3, nb_iter=10)
+        solver.set_injections(p_mw, q_mvar, sn_mva)
+        solver.run()
+        V = solver.V_results.to_numpy().reshape(3, ieee14_base_case["n_bus"])
+        res = solver.residuals.to_numpy()
+
+        assert np.isnan(V[1]).any(), "the NaN injection did not poison scenario 1's V"
+        assert np.isnan(res[1]), (
+            f"scenario 1 has NaN voltages but residual {res[1]!r} (NaN dropped by the max reduction)")
+        for s in (0, 2):
+            assert np.all(np.isfinite(V[s]))
+            assert np.isfinite(res[s]) and res[s] < residual_atol
+
     def test_run_matches_one_shot(self, ieee14_base_case):
         """Stateful solver result must match the one-shot acpf_nr_gpu_injection."""
         scales = [0.9, 1.0, 1.1]

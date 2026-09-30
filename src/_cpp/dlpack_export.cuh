@@ -92,23 +92,24 @@ inline DLManagedTensor* make_dl_tensor(
 // make_dl_tensor_real
 //   Real-valued (float32 or float64) variant of make_dl_tensor.
 //   Used for solve_JT_dlpack where the solution vector is real, not complex.
-//   Always 1-D (no shape_1 parameter).
+//   shape_1 == 0 → 1-D; otherwise 2-D [shape_0, shape_1] compact row-major.
 // =============================================================================
 inline DLManagedTensor* make_dl_tensor_real(
     void*                 data,
     int                   device_id,
     int64_t               n,
-    std::shared_ptr<void> owner)
+    std::shared_ptr<void> owner,
+    int64_t               shape_1 = 0)
 {
     auto* ctx     = new DLPackCtx;
     ctx->owner    = std::move(owner);
     ctx->shape[0] = n;
-    ctx->shape[1] = 0;
+    ctx->shape[1] = shape_1;
 
     auto* mt = new DLManagedTensor;
     mt->dl_tensor.data        = data;
     mt->dl_tensor.device      = {kDLCUDA, device_id};
-    mt->dl_tensor.ndim        = 1;
+    mt->dl_tensor.ndim        = (shape_1 == 0) ? 1 : 2;
     mt->dl_tensor.dtype       = {kDLFloat,
                                   static_cast<uint8_t>(kDLPackRealBits),
                                   1};

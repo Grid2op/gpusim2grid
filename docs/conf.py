@@ -25,7 +25,7 @@ try:
     import gpusim2grid
     release = gpusim2grid.__version__
 except Exception:  # pragma: no cover - best effort
-    release = "0.1.2"
+    release = "0.2.0.rc0"
 version = release
 
 # -- General configuration ---------------------------------------------------

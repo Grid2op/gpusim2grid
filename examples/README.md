@@ -21,6 +21,7 @@ importable.)
 | `limit_violations.py` | N-1 screen with `compute_limit_violations=True`: fused, on-device per-contingency bus voltage / branch current / divergence check, reported as a bounded per-contingency violation list. Takes an optional `<case>` argument. |
 | `distributed_slack.py` | Augmented solve: distributed slack carried in the Jacobian (via the lightsim2grid C++ bridge), matched against the CPU reference. Same path also covers HVDC droop, SVC, and remote voltage control. Needs a bridge-enabled build. |
 | `differentiable_pf.py` | Derivatives through a single power flow (adjoint method) via the PyTorch autograd integration. Requires PyTorch with CUDA. |
+| `batch_differentiable_pf.py` | `BatchPowerFlow`: a whole batch of scenarios (load / generator injections, generator set-points, line / trafo statuses) as one differentiable PyTorch layer; a few optimisation steps, with the GPU-reuse counters printed at each call. Requires PyTorch with CUDA. |
 
 `_common.py` is a shared helper (not a standalone example): it wraps
 lightsim2grid/pandapower to produce the plain NumPy/SciPy arrays the solver

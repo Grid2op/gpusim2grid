@@ -89,6 +89,14 @@ struct Contingency {
     std::vector<Triplet> triplets;
     bool disconnected = false;
 
+    // Caller-declared "not simulable" (ScenarioSweepSession::set_skipped_rows:
+    // e.g. two connected generators on one bus with different voltage
+    // set-points -- no V satisfies both). check_connectivity /
+    // compute_component_masks turn it into `disconnected` without looking at
+    // the graph, so the row is compacted out exactly like an islanded one
+    // (NaN voltage / residual, NOT_SIMULATED violation, disconnected flag).
+    bool skip = false;
+
     // handle_disconnected_grid mode (see compute_component_masks):
     //   masked_buses — solver bus ids OUTSIDE the largest connected component
     //                  of the patched graph (empty when the grid stays connected).

@@ -378,6 +378,35 @@ inline void nr_apply_J_masks(const NrIterBuffers& buf,
 }
 
 // -----------------------------------------------------------------------------
+// nr_fill_J_at_current_V
+//
+// Step ③ alone: the numeric Jacobian at whatever d_V / d_Ibus currently hold
+// (d_Ibus must be Ybus · d_V, i.e. the SpMV must have run since the last V
+// update). The single definition of the fill sequence -- zero (additive
+// features), dS/dx fill, feature stamps, per-slot overrides + bus mask -- used
+// by the single-system step, the batched NR loop (driver.cuh), and the
+// post-loop refill of J at the CONVERGED V that the batched adjoint needs
+// (BatchPfDriver::keep_final_jacobian_).
+// -----------------------------------------------------------------------------
+inline void nr_fill_J_at_current_V(
+    const NrIterBuffers& buf,
+    int n_bus, int dim_J, int nnz_Y, int nnz_J,
+    int batch,
+    cudaStream_t cs)
+{
+    nr_feature_zero_J(buf, nnz_J, batch, cs);
+    fill_J_kernel<<<nr_grid_size((long long)batch * nnz_Y, BS), BS, 0, cs>>>(
+        buf.d_J_values, buf.d_V, buf.d_Ibus,
+        buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
+        buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
+        n_bus, nnz_Y, nnz_J, batch);
+    nr_feature_fill_J(buf, n_bus, nnz_J, batch, cs);
+    // Per-slot overrides + identity-pinned / masked rows win over every stamp
+    // above (no-op unless the buffers carry mask entries).
+    nr_apply_J_masks(buf, nnz_J, dim_J, batch, cs);
+}
+
+// -----------------------------------------------------------------------------
 // nr_iter_step_fill_F
 //
 // Step ② alone: −[ΔP(pvpq), ΔQ(pq)] scattered into the ledger P/Q rows, at
@@ -464,16 +493,7 @@ inline void nr_iter_step_prepare(
     //     When an additive feature (HVDC droop) is active, J must be zeroed first
     //     (the dS fill assigns; the droop slopes accumulate onto / beside it).
     timer.start();
-    nr_feature_zero_J(buf, nnz_J, actual_batch, cs);
-    fill_J_kernel<<<nr_grid_size((long long)actual_batch * nnz_Y, BS), BS, 0, cs>>>(
-        buf.d_J_values, buf.d_V, buf.d_Ibus,
-        buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
-        buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
-        n_bus, nnz_Y, nnz_J, actual_batch);
-    nr_feature_fill_J(buf, n_bus, nnz_J, actual_batch, cs);
-    // Identity-pinned / masked rows win over every stamp above (no-op unless
-    // the buffers carry mask entries).
-    nr_apply_J_masks(buf, nnz_J, dim_J, actual_batch, cs);
+    nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, actual_batch, cs);
     if (use_cudss) dss_A.set_values(buf.d_J_values);
     t.t_fill_J += timer.stop_ms();
 

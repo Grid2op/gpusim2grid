@@ -438,3 +438,30 @@ def test_not_simulated_contingency_reports_grid_entry():
     assert v.violation_type == LimitViolationType.NOT_SIMULATED
     assert v.element_id == -1
     assert np.isnan(v.value) and np.isnan(v.limit)
+
+
+@requires_gpu
+def test_set_limits_from_grid_without_configured_limits(ieee14_base_case):
+    """A grid whose current limits were never configured (lightsim2grid then
+    returns EMPTY limit vectors, not NaN-filled ones) must still give
+    n_lines + n_trafos NaN entries, so set_limits_from_grid() works and the
+    fused check reports no violation."""
+    from gpusim2grid import ScenarioSweepGPU, ContingencyAnalysisGPU
+    grid = ieee14_base_case["grid"]
+    n_branch = len(grid.get_lines()) + len(grid.get_trafos())
+    sw = ScenarioSweepGPU(grid, nb_iter=6, tol_base=1e-10)
+    _, _, a1, a2, n_lines = sw._extract_limits_arrays()
+    assert a1.shape == (n_branch,) and a2.shape == (n_branch,)
+    assert np.all(np.isnan(a1)) and np.all(np.isnan(a2))
+    assert n_lines == len(grid.get_lines())
+    sw.set_limits_from_grid()
+    sw.compute_limit_violations = True
+    load_p, load_q = grid.get_loads_res_full()[:2]
+    gen_p = np.asarray(grid.get_gen_target_p())
+    rep = lambda a: np.repeat(np.asarray(a)[None, :], 2, axis=0)   # noqa: E731
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+    sw.compute(batch_size=2)
+    assert sw.get_violations() == [[], []]
+    # the constructor-time path (bridge factory) must accept it too
+    ca = ContingencyAnalysisGPU(grid, nb_iter=6, tol_base=1e-10, compute_limit_violations=True)
+    assert ca is not None

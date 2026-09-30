@@ -186,6 +186,22 @@ V = sweep.compute(batch_size=512)
 disconnected = sweep.get_disconnected()  # which rows a topology trip islanded
 ```
 
+For PyTorch users, the same batch is available as a differentiable layer that
+takes lightsim2grid-style per-element inputs (`True = connected` statuses),
+solves every row in one GPU pass and back-propagates through it with the
+adjoint method — consecutive calls with the same batch size reuse the whole GPU
+setup (no new cuDSS analysis, refactorization only), and the transposed system
+the backward needs is built lazily on the first `backward()`:
+
+```python
+from gpusim2grid.differentiable import BatchPowerFlow
+pf = BatchPowerFlow.from_lsgrid(grid, nb_iter=8)
+V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v,   # (n_scen, n_elem) tensors
+       line_status=line_status, trafo_status=trafo_status)        # bool, True = connected
+loss = (V.abs() - 1.0).pow(2).sum()
+loss.backward()   # gradients w.r.t. load_p, load_q, gen_p and gen_v
+```
+
 See [`examples/`](examples/):
 
 - `ieee14_basic.py` — end-to-end AC power flow on the IEEE 14-bus case.
@@ -196,6 +212,7 @@ See [`examples/`](examples/):
 - `limit_violations.py` — fused per-contingency bus voltage / branch current limit checking.
 - `distributed_slack.py` — augmented solve (distributed slack in the Jacobian) via the lightsim2grid bridge.
 - `differentiable_pf.py` — derivatives through a single power flow via the adjoint method.
+- `batch_differentiable_pf.py` — `BatchPowerFlow`: a batch of scenarios (injections, set-points, branch statuses) as one differentiable PyTorch layer, trained over a few steps.
 
 ## How it works
 
@@ -253,8 +270,9 @@ design. See the [roadmap](#roadmap) below for areas where help is especially wel
 
 Directions we plan to pursue — **any help or ideas are very welcome**:
 
-- **Extend derivatives to the injection sweep**, and later to the full contingency
-  analysis path (currently differentiation is limited to a single power flow).
+- **Extend derivatives** beyond `BatchPowerFlow`'s inputs (`load_p`, `load_q`,
+  `gen_p`, `gen_v`): generator contingencies (`gen_status`), a JAX front-end on the
+  same DLPack primitives, and the plain contingency-analysis path.
 - **Best action selector** — given one or several grid snapshots and a list of
   candidate actions, find the best action(s) to apply, by evaluating the candidates in
   batch on the GPU.
