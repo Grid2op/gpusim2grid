@@ -207,6 +207,98 @@ class TestInjectionSweepGenV:
 
 
 # ---------------------------------------------------------------------------
+# A generator that does not regulate voltage writes no |V|, even on a PV bus
+# held by a co-located regulating generator (lightsim2grid's
+# _for_each_vm_writer skips it). Real snapshots are full of these, many with a
+# stale target_vm of 0.0, and gating on the bus alone refused their rows.
+# ---------------------------------------------------------------------------
+
+def _ieee14_with_colocated_pq_gen():
+    """pypowsybl IEEE 14 with a non voltage-regulating generator (target_v 0)
+    on the bus of the regulating B2-G. Returns (solved grid, id of B2-G, id of
+    the added generator)."""
+    pytest.importorskip("pypowsybl")
+    import warnings
+    import pypowsybl.network as ppn
+    from lightsim2grid.network import init_from_pypowsybl
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = ppn.create_ieee14()
+        net.create_generators(id="G_PQ", voltage_level_id="VL2", bus_id="B2",
+                              target_p=5., target_q=3., target_v=0.,
+                              voltage_regulator_on=False, min_p=0., max_p=100.)
+        grid = init_from_pypowsybl(net, gen_slack_id=0, sort_index=False)
+    grid.change_algorithm(AlgorithmType.NR_KLU)
+    n_bus = grid.total_bus()
+    assert grid.ac_pf(np.ones(n_bus, dtype=complex), 30, 1e-10).shape[0] == n_bus
+    names = [g.name for g in grid.get_generators()]
+    return grid, names.index("B2-G"), names.index("G_PQ")
+
+
+def test_gen_v_bus_skips_non_writers():
+    from gpusim2grid._ls2g_utils import extract_injection_elements
+    grid, g_reg, g_pq = _ieee14_with_colocated_pq_gen()
+    n_bus = grid.get_Ybus_solver().shape[0]
+    el = extract_injection_elements(grid, n_bus)
+    assert el.gen_bus[g_pq] == el.gen_bus[g_reg] >= 0
+    assert el.gen_v_bus[g_reg] == el.gen_bus[g_reg]
+    assert el.gen_v_bus[g_pq] == -1
+    # a zero-P, non-slack generator is treated as off (writes no voltage) only
+    # when turned-off generators are not PV
+    zero_p = [g for g, e in enumerate(grid.get_generators())
+              if e.target_p_mw == 0. and not e.is_slack and e.voltage_regulator_on]
+    assert zero_p and all(el.gen_v_bus[g] == el.gen_bus[g] >= 0 for g in zero_p)
+    grid.turnedoff_no_pv()
+    el = extract_injection_elements(grid, n_bus)
+    assert all(el.gen_v_bus[g] == -1 for g in zero_p)
+    assert el.gen_v_bus[g_reg] >= 0
+
+
+class TestNonRegulatingColocatedGenerator:
+    def _inputs(self, grid, n):
+        load_p, load_q = grid.get_loads_res_full()[:2]
+        gen_p = np.asarray(grid.get_gen_target_p())
+        rep = lambda a: np.repeat(np.asarray(a)[None, :], n, axis=0)   # noqa: E731
+        return rep(load_p), rep(load_q), rep(gen_p)
+
+    def test_scenario_sweep_ignores_it(self, solver_atol):
+        """Its gen_v neither conflicts nor applies: every generator's own
+        target_vm (the validation-script pattern) reproduces lightsim2grid."""
+        from gpusim2grid import ScenarioSweepGPU
+        grid, g_reg, g_pq = _ieee14_with_colocated_pq_gen()
+        n_bus = grid.get_Ybus_solver().shape[0]
+        gens = grid.get_generators()
+        n = 3
+        gen_v = np.full((n, len(gens)), np.nan)
+        gen_v[:2, g_reg] = 1.04
+        gen_v[1, g_pq] = 0.0
+        gen_v[2] = [g.target_vm_pu for g in gens]
+        assert gen_v[2, g_pq] == 0.0
+
+        sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=1e-10)
+        sw.set_injections_from_elements(*self._inputs(grid, n))
+        sw.set_gen_v(gen_v)
+        sw.compute(batch_size=n)
+        V = sw.solver.V_results.to_numpy().reshape(n, n_bus)
+        assert sw.get_disconnected().tolist() == [0, 0, 0]
+        bus = int(sw._elements.gen_bus[g_reg])
+        np.testing.assert_allclose(np.abs(V[0, bus]), 1.04, atol=solver_atol)
+        np.testing.assert_allclose(V[1], V[0], atol=solver_atol, rtol=0)
+        np.testing.assert_allclose(V[2], np.asarray(grid.get_V_solver()),
+                                   atol=solver_atol, rtol=0)
+
+    def test_injection_sweep_does_not_raise(self):
+        from gpusim2grid import InjectionSweepGPU
+        grid, g_reg, g_pq = _ieee14_with_colocated_pq_gen()
+        gen_v = np.full((1, len(grid.get_generators())), np.nan)
+        gen_v[0, g_reg] = 1.04
+        gen_v[0, g_pq] = 0.0
+        isw = InjectionSweepGPU(grid, nb_iter=8, tol_base=1e-10)
+        isw.set_gen_v(gen_v)
+
+
+# ---------------------------------------------------------------------------
 # Two connected generators on one bus with different set-points: |V| at a
 # bus is unique, so no solution satisfies both. lightsim2grid's set_vm lets
 # the last one silently win; gpusim2grid refuses the row instead.

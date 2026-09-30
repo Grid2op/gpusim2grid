@@ -610,18 +610,21 @@ AcPfNrState::AcPfNrState(
             lf1_all=to_real(ledger->hvdc_lf1), lf2_all=to_real(ledger->hvdc_lf2),
             rr_all=to_real(ledger->hvdc_r), pm12_all=to_real(ledger->hvdc_pmax12),
             pm21_all=to_real(ledger->hvdc_pmax21);
-        std::vector<int> bus1(n_hvdc), bus2(n_hvdc), status(n_hvdc);
+        std::vector<int> bus1(n_hvdc), bus2(n_hvdc), status(n_hvdc), hid(n_hvdc);
+        const bool have_ids = static_cast<int>(ledger->hvdc_id.size()) == nh_raw;
         std::vector<cuda_real_type> p0(n_hvdc), kk(n_hvdc), lf1(n_hvdc), lf2(n_hvdc),
             rr(n_hvdc), pm12(n_hvdc), pm21(n_hvdc);
         for (int i = 0; i < n_hvdc; ++i) {
             const int e = keep[i];
             bus1[i] = ledger->hvdc_bus1[e]; bus2[i] = ledger->hvdc_bus2[e]; status[i] = ledger->hvdc_status[e];
+            hid[i]  = have_ids ? ledger->hvdc_id[e] : e;
             p0[i] = p0_all[e]; kk[i] = kk_all[e]; lf1[i] = lf1_all[e]; lf2[i] = lf2_all[e];
             rr[i] = rr_all[e]; pm12[i] = pm12_all[e]; pm21[i] = pm21_all[e];
         }
         upload_h2d(d_hvdc_bus1,   bus1.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
+        upload_h2d(d_hvdc_id,     hid.data(),    n_hvdc, cs);
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
@@ -734,18 +737,21 @@ AcPfNrState::AcPfNrState(
             push_feat(find_J_pos(qrow[j], qcol[j]), static_cast<cuda_real_type>(-1.));  // (q_row, q_col)
             if (ledger->vc_kind[j] == 1)  // SVC slope coupling (v_row, q_col)
                 push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]), slope[j]);
-            else if (ledger->vc_grp_count[ledger->vc_group[j]] == 1)
-                // lone GEN controller: the (v_row, q_col) slot exists only when
-                // the ledger reserved it (reserve_stranded_controller_slots);
-                // stamp its normal value 0 every fill so the per-slot stranded
-                // override (value 1) always starts from a known state.
-                // push_feat skips a missing slot.
+            else if (j == ledger->vc_grp_start[ledger->vc_group[j]])
+                // first (non-SVC) controller of its group: the (v_row, q_col)
+                // slot exists only when the ledger reserved it
+                // (reserve_stranded_controller_slots); stamp its normal value 0
+                // every fill so the per-slot stranded override (value 1) always
+                // starts from a known state. push_feat skips a missing slot.
                 push_feat(find_J_pos(vrow[ledger->vc_group[j]], qcol[j]),
                           static_cast<cuda_real_type>(0.));
         }
         h_vc_vrow = vrow;
         h_vc_vrow_qcol_pos.assign(n_vc_grp, -1);
         h_vc_vrow_vmcol_pos.assign(n_vc_grp, -1);
+        h_vc_ctrl_vrow_qcol_pos.assign(n_vc_ctrl, -1);
+        for (int j = 0; j < n_vc_ctrl; ++j)
+            h_vc_ctrl_vrow_qcol_pos[j] = find_J_pos(vrow[ledger->vc_group[j]], qcol[j]);
         for (int g = 0; g < n_vc_grp; ++g) {
             const int vmcol = ledger->vm_col_of_bus[ledger->vc_reg_bus[g]];
             h_vc_vrow_vmcol_pos[g] = find_J_pos(vrow[g], vmcol);

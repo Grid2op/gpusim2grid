@@ -44,6 +44,8 @@
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType, Contingency
 #include "gen_contingency_data.hpp"          // GenContingencyData
+#include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -198,13 +200,25 @@ struct ScenarioSweepSession {
     // =========================================================================
     bool     compute_limit_violations_ = false;
     double   violation_tol_            = 1e-6;   // dedicated; independent of tol_base
-    int      violation_capacity_       = 16;     // K; bounds memory at n_scenarios*K
+    double   violation_rel_tol_        = 1e-9;   // relative margin past a limit (lightsim2grid's violation_rel_tol)
+    int      violation_capacity_       = 16;     // K per type; bounds memory at n_scenarios*3*K
     bool     has_limits_               = false;
     bool     has_violations_result_    = false;
     int      n_lines_                  = 0;      // branch ordering split (lines-then-trafos)
 
     RealVect h_bus_vmin_kv_, h_bus_vmax_kv_;               // [n_bus], solver numbering
     RealVect h_branch_limit_a1_ka_, h_branch_limit_a2_ka_; // [n_branches], lines-then-trafos
+
+    // post-solve physical checks (see physical_checks() above)
+    PhysicalChecksConfig phys_;
+    // per-row set-points of the active-power check (set_gen_p_targets); empty
+    // = the plan's base ones for every row
+    RealMatRM gen_p_targets_;
+    bool      gen_p_targets_dirty_ = false;
+    // per-row targets of the release check (set_gen_pv_release_targets); empty
+    // = the grid's own for every row
+    RealMatRM gen_pv_release_targets_;
+    bool      gen_pv_release_targets_dirty_ = false;
 
     // =========================================================================
     // Host injection data (set_injections()) — (n_scenarios × n_bus)
@@ -216,10 +230,14 @@ struct ScenarioSweepSession {
     bool   has_injections_ = false;
 
     // =========================================================================
-    // Vm-fixed bus mask (pv ∪ slack_ids, built once at construction) --
+    // Vm-fixed bus mask (pv ∪ slack_ids without a ledger Vm unknown, built
+    // once at construction, see build_gen_v_bus_maps) --
     // consulted by set_gen_v() below. See that method's own doc.
     // =========================================================================
     std::vector<char> h_is_vm_fixed_bus_;
+    // VoltageControl group regulating each bus (-1: none) -- a gen_v column
+    // whose generator regulates such a bus drives that group's per-row v_set.
+    std::vector<int>  h_vc_group_of_bus_;
 
     // =========================================================================
     // Host generator target-voltage override (set_gen_v()) -- optional; see
@@ -275,6 +293,29 @@ struct ScenarioSweepSession {
     // start value there, so its gen_v gradient is 0 on that row.
     std::vector<std::vector<int>> row_pv_to_pq_;
 
+    // =========================================================================
+    // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
+    // the OLF-style pre-pass of what each row loses, recomputed every run().
+    // slack_rd_ is the participants snapshot (bridge, or array mode);
+    // gen_p_rows_ the per-row generator set-points (set_gen_p_rows, MW, (n_rows
+    // x n_gen); empty = the grid's own); slack_rows_ the last run's per-row
+    // result (the report and the physical checks read it). rd_applied_ says
+    // the live source carries pre-pass data (so that turning the flag off on a
+    // hot run puts the plain weights back).
+    // =========================================================================
+    bool                    redistribute_slack_ = false;
+    SlackRedistributionData slack_rd_;
+    bool                    has_slack_rd_ = false;
+    RealMatRM               gen_p_rows_;
+    std::vector<slack_redistribution::RowResult> slack_rows_;
+    bool                    rd_applied_ = false;
+    // The saturated units of every row, handed in by a caller that ran the
+    // pre-pass itself (BatchPowerFlow, whose Sbus already carries the
+    // correction): only the row weights are rebuilt from them.
+    std::vector<std::vector<int>> ext_sat_units_;
+    bool                    has_ext_sat_ = false;
+    bool                    rd_gp_last_ = false;   // the gen-P check got pre-pass targets last run
+
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
     CplxVect        Vinit_, Sbus_;
     Eigen::VectorXi slack_ids_, pv_, pq_;
@@ -284,6 +325,19 @@ struct ScenarioSweepSession {
     bool   presolved_v_     = false;
     bool   debug_base_case_ = false;
     std::unique_ptr<LedgerData> base_ledger_;   // null in array/tuple mode
+
+    // Automatic reference slack (lightsim2grid's _select_ref_slack_and_masks,
+    // see choose_reference_bus): with handle_disconnected_grid, the angle
+    // reference is the participant stranded by the fewest rows, moved into the
+    // ledger (move_reference) and the base state rebuilt when it changes.
+    // grid_ref_bus_ is the grid's own, ref_bus_ the one base_state_ was built
+    // with; the choice is cached until the topology changes.
+    bool auto_reference_slack_ = false;
+    int  forced_ref_bus_       = -1;   // solver bus a caller pinned (-1: none)
+    int  grid_ref_bus_         = -1;
+    int  ref_bus_              = -1;
+    int  auto_ref_choice_      = -1;
+    bool auto_ref_valid_       = false;
 
     // Host-side flow result storage (filled by compute_flows()).
     RealVect h_or_amps_;
@@ -416,6 +470,61 @@ struct ScenarioSweepSession {
     void set_gen_contingency_data(const GenContingencyData& data);
 
     // =========================================================================
+    // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
+    // share what each row loses -- the generators it disconnects, the island
+    // it cuts off in handle_disconnected_grid mode -- on the remaining slack
+    // units BEFORE the solve, OLF-style (bounded by [min_p, max_p], never
+    // crossing 0 MW), the saturated units leaving that row's distributed
+    // slack. Off by default; a flag change takes effect on the next run()
+    // without any rebuild. Needs set_slack_redistribution_data (the bridge
+    // factory sets it), the distributed slack, host injections
+    // (set_injections), and a strategy other than direct_base_case_factors.
+    // set_gen_p_rows: the per-row generator set-points the pre-pass reads
+    // (MW, (n_scenarios x n_gen); an empty matrix = the grid's own).
+    // =========================================================================
+    void set_redistribute_slack(bool v) { redistribute_slack_ = v; }
+    bool get_redistribute_slack() const { return redistribute_slack_; }
+
+    // =========================================================================
+    // Automatic reference slack (lightsim2grid PR #216's batch rule): with
+    // handle_disconnected_grid and the distributed slack, the angle reference
+    // becomes the slack participant stranded by the fewest rows (ties: higher
+    // weight, then lower bus) -- fewer rows skipped for stranding it. A change
+    // moves the reference in the ledger and rebuilds the base state (the next
+    // run is cold); the solution is the same, the angles shift by a constant.
+    // forced_reference_bus (solver id, -1 none) is kept whatever the counts
+    // (lightsim2grid's LSGrid::set_reference_slack_bus; the bridge sets it).
+    // reference_bus: the one the current base state uses.
+    // =========================================================================
+    void set_auto_reference_slack(bool v) { auto_reference_slack_ = v; auto_ref_valid_ = false; }
+    bool get_auto_reference_slack() const { return auto_reference_slack_; }
+    void set_forced_reference_bus(int b) { forced_ref_bus_ = b; auto_ref_valid_ = false; }
+    int  get_forced_reference_bus() const { return forced_ref_bus_; }
+    int  reference_bus() const { return ref_bus_; }
+    void set_slack_redistribution_data(const SlackRedistributionData& data);
+    bool has_slack_redistribution_data() const { return has_slack_rd_; }
+    void set_gen_p_rows(Eigen::Ref<const RealMatRM> gen_p);
+    SlackRedistributionReport get_slack_redistribution_report() const;
+
+    // The same pre-pass run by the CALLER (BatchPowerFlow: it needs the
+    // correction inside its autograd graph, so it adds it to the Sbus it hands
+    // in through set_injections_dlpack): per row (ORIGINAL order), the units
+    // (indices into the slack participants of set_slack_redistribution_data)
+    // its pre-pass saturated -- they leave that row's distributed slack. Takes
+    // the place of redistribute_slack's own pre-pass (which must be off);
+    // clear_external_slack_saturation drops it.
+    void set_external_slack_saturation(const std::vector<std::vector<int>>& sat_units_per_row);
+    void clear_external_slack_saturation() { ext_sat_units_.clear(); has_ext_sat_ = false; }
+
+    // The masked (stranded) solver buses and the "not simulated" flag each row
+    // of `branch_ids_per_row` would get, computed on a copy (host only, the
+    // session untouched) with the session's handle_disconnected_grid mode --
+    // what a caller running the pre-pass itself needs BEFORE handing in its
+    // injections. Returns (disconnected [n_rows], masked buses per row).
+    std::pair<std::vector<int>, std::vector<std::vector<int>>>
+    preview_row_masks(const std::vector<std::vector<int>>& branch_ids_per_row) const;
+
+    // =========================================================================
     // set_contingency_gens — (n_scenarios × n_gen) bool mask, row-aligned with
     // set_injections()/set_topology(): True disconnects that generator for
     // that row. Mirrors lightsim2grid's ScenarioSweep::set_contingency_gens:
@@ -440,6 +549,18 @@ struct ScenarioSweepSession {
     int              dim_J() const;
     std::vector<int> get_reserved_buses() const { return reserved_buses_; }
     std::vector<std::vector<int>> get_row_pv_to_pq() const { return row_pv_to_pq_; }
+
+    // VoltageControl structure a gen_v gradient needs: the group regulating
+    // each bus (-1: none), each group's bordered voltage row in J, its base
+    // set-point, whether it holds a member no gen_v column can move (SVC /
+    // hvdc station: its v_set is pinned), and per row of the last run() the
+    // groups handle_disconnected_grid stranded (their voltage row no longer
+    // depends on v_set).
+    std::vector<int>    vc_group_of_bus() const;
+    std::vector<int>    vc_v_row_of_group() const;
+    std::vector<double> vc_v_set() const;
+    std::vector<int>    vc_group_has_fixed_member() const;
+    std::vector<std::vector<int>> get_row_stranded_vc_groups() const;
     bool             has_gen_contingency() const { return has_gen_off_; }
 
     // =========================================================================
@@ -574,6 +695,52 @@ struct ScenarioSweepSession {
     Eigen::VectorXi get_violation_count_high_voltage() const;
     Eigen::VectorXi get_violation_count_current()      const;
 
+    // =========================================================================
+    // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
+    // .hpp): the per-bus reactive capability (compute_physical_violations,
+    // lightsim2grid PR #206 parity) and the droop hvdc P-saturation
+    // (compute_physical_violations). Flags / tolerances / capacities live on
+    // physical_checks(); mutable, taken into account at the next run().
+    // set_bus_q_capability() hands in the plan the reactive check needs (built
+    // by lightsim2grid's own build_bus_q_plan through the bridge, or by the
+    // caller in array mode). The get_* accessors are synchronous D->H copies
+    // and throw unless the last run() had the corresponding flag on.
+    // =========================================================================
+    PhysicalChecksConfig&       physical_checks()       { return phys_; }
+    const PhysicalChecksConfig& physical_checks() const { return phys_; }
+    void set_bus_q_capability(const BusQPlanData& plan);
+    BusQViolationsResult  get_bus_q_violations()    const;
+    BusQViolationsResult  get_bus_q_violations_n()  const;
+    HvdcPViolationsResult get_hvdc_p_violations()   const;
+    HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
+    // The PQ -> PV release check of the generators a caller flagged as pinned at
+    // a reactive limit (lightsim2grid's GenPvReleaseCheck.hpp, PR #216:
+    // LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR). The plan is
+    // OPTIONAL (unset = nothing flagged = nothing to report).
+    void set_gen_pv_release_capability(const GenPvReleasePlanData& plan);
+    GenPvReleaseViolationsResult get_gen_pv_release_violations()   const;
+    GenPvReleaseViolationsResult get_gen_pv_release_violations_n() const;
+    // Per-row active set-points of the machines of that plan (MW, GENERATOR
+    // convention, NaN = keep the grid's own), (n_rows x n_entries) with one
+    // column per entry of the plan in its order, row-aligned with
+    // set_injections: what a row's generator produces is ITS target plus its
+    // share of the slack, and only the caller knows that target (the facades
+    // fill it from set_injections_from_elements' gen_p). Left unset, every row
+    // is checked against the base set-points. An empty matrix drops them.
+    void set_gen_p_targets(Eigen::Ref<const RealMatRM> targets);
+    // Per-row voltage targets of the machines of that plan (pu, NaN = keep the
+    // grid's own), (n_rows x n_entries), one column per entry of the plan in
+    // its order, row-aligned with set_injections: the target a flagged machine
+    // would hold if released (the facades fill it from set_gen_v). An empty
+    // matrix drops them.
+    void set_gen_pv_release_targets(Eigen::Ref<const RealMatRM> targets);
+
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ScenarioSweepSession(const ScenarioSweepSession&)            = delete;
     ScenarioSweepSession& operator=(const ScenarioSweepSession&) = delete;
@@ -606,6 +773,14 @@ private:
     // state's participant order; empty when no row re-weights the slack.
     std::vector<cuda_real_type> _row_slack_weights(
         const std::vector<std::vector<int>>& row_slack_off) const;
+
+    // redistribute_slack: the angle reference (the whole share when a row has
+    // no participant left), the preconditions run() refuses without, and the
+    // pre-pass of every row on the live source's masks.
+    int  _reference_bus() const;
+    int  _wanted_reference_bus();
+    void _check_redistribute_slack() const;
+    std::vector<slack_redistribution::RowResult> _slack_prepass() const;
 };
 
 #endif // SCENARIO_SWEEP_SESSION_HPP

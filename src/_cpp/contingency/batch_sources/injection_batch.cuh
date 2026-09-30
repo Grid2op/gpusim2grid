@@ -45,6 +45,7 @@
 #include "../../acpf_nr_kernels.cuh"       // apply_gen_v_kernel
 #include "../../nr_iter_step.cuh"          // BS
 #include "../gen_v_override.hpp"          // GenVOverride
+#include "gen_vset_slots.cuh"             // GenVsetSlots
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
 
 struct BatchPfDriverContext;
@@ -88,6 +89,7 @@ struct InjectionBatch {
     GenVOverride gen_v_override_;
     thrust::device_vector<int>            d_gv_active_bus;
     thrust::device_vector<cuda_real_type> d_gv_all;
+    GenVsetSlots                          gv_vset_;          // VoltageControl set-point columns
 
     // -------------------------------------------------------------------------
     // Constructor (host-only).
@@ -167,6 +169,10 @@ struct InjectionBatch {
     // BatchSource concept: the injection sweep has no generator contingencies,
     // so every slot keeps the shared base-case slack weights.
     void fill_slack_w_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
+
+    // BatchSource concept: per-slot VoltageControl set-points driven by a
+    // gen_v column (see GenVsetSlots); base's shared array otherwise.
+    void fill_vc_vset_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const { gv_vset_.fill(buf); }
 
     // BatchSource concept: the injection sweep never trips branches (topology
     // is fixed) — compute_limit_violations is scoped to contingency analysis

@@ -637,9 +637,9 @@ void compute_component_masks(
         if (ctg.masked_buses.empty()) continue;   // graph untouched / still connected
 
         // Every bus outside the main component is masked. Stranding the angle
-        // reference or a hard controller bus (HVDC end, regulated bus) has no
-        // value-only fallback on the fixed batch structure → skip the
-        // contingency (NaN), reusing the `disconnected` compaction path.
+        // reference or a hard controller bus (HVDC end) has no value-only
+        // fallback on the fixed batch structure → skip the contingency (NaN),
+        // reusing the `disconnected` compaction path.
         bool skip = false;
         std::fill(is_masked.begin(), is_masked.end(), 0);
         for (int b : ctg.masked_buses) {
@@ -652,10 +652,14 @@ void compute_component_masks(
         }
 
         // VoltageControl groups: count the masked controllers of each group.
-        //   count == 1, lone controller  → repurpose its voltage row (stranded)
-        //   every controller masked      → skip (nobody left to hold the row)
-        //   some of several masked       → nothing to do (sharing rows keep
-        //                                  the masked column coupled)
+        //   every controller masked         → repurpose its voltage row into
+        //                                     Q_first == 0 (stranded), whether
+        //                                     the regulated bus is masked or not
+        //   regulated bus masked, a live one → skip (the frozen magnitude of a
+        //                                     masked bus cannot reach v_set)
+        //   some of several masked          → nothing to do (the live ones hold
+        //                                     the bus, the sharing rows keep
+        //                                     the masked columns coupled)
         if (!skip && n_grp > 0) {
             std::fill(n_masked_ctrl.begin(), n_masked_ctrl.end(), 0);
             for (int j = 0; j < n_ctrl; ++j) {
@@ -664,19 +668,20 @@ void compute_component_masks(
                     ++n_masked_ctrl[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])];
             }
             for (int g = 0; g < n_grp && !skip; ++g) {
-                const int nm = n_masked_ctrl[static_cast<size_t>(g)];
-                if (nm == 0) continue;
+                const int nm  = n_masked_ctrl[static_cast<size_t>(g)];
                 const int cnt = cfg.vc_grp_count[static_cast<size_t>(g)];
-                if (cnt == 1) {
-                    // Needs the reserved (v_row, q_col) slot; without it the
-                    // column would be structurally singular → skip (defensive:
-                    // the CA/SS factories always reserve it).
+                const int reg = cfg.vc_reg_bus.empty() ? -1 : cfg.vc_reg_bus[static_cast<size_t>(g)];
+                const bool reg_masked = reg >= 0 && reg < n_bus && is_masked[static_cast<size_t>(reg)];
+                if (cnt > 0 && nm >= cnt) {
+                    // Needs the reserved (v_row, q_col_first) slot; without it
+                    // the column would be structurally singular → skip
+                    // (defensive: the CA/SS factories always reserve it).
                     if (cfg.vc_vrow_qcol_pos.empty() ||
                         cfg.vc_vrow_qcol_pos[static_cast<size_t>(g)] < 0)
                         skip = true;
                     else
                         ctg.stranded_groups.push_back(g);
-                } else if (nm >= cnt) {
+                } else if (reg_masked) {
                     skip = true;
                 }
             }
@@ -687,6 +692,60 @@ void compute_component_masks(
             ctg.stranded_groups.clear();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// choose_reference_bus
+// ---------------------------------------------------------------------------
+int choose_reference_bus(
+    const std::vector<Contingency>&                               contingencies,
+    const int*                                                    Ybus_rm_outer,
+    const int*                                                    Ybus_rm_inner,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
+    const std::vector<int>&                                       cand_bus,
+    const std::vector<double>&                                    cand_w,
+    int                                                           forced)
+{
+    std::vector<int> cands;
+    for (size_t k = 0; k < cand_bus.size(); ++k)
+        if (k < cand_w.size() && cand_w[k] > 0.) cands.push_back(static_cast<int>(k));
+    if (cands.empty())
+        for (size_t k = 0; k < cand_bus.size(); ++k) cands.push_back(static_cast<int>(k));
+    if (cands.empty()) return -1;
+    if (forced >= 0)
+        for (int k : cands)
+            if (cand_bus[static_cast<size_t>(k)] == forced) return forced;
+
+    // the plain split of every row: no reference / controller / skip rule
+    std::vector<Contingency> ctgs;
+    ctgs.reserve(contingencies.size());
+    for (const auto& c : contingencies) {
+        Contingency x;
+        x.triplets = c.triplets;
+        ctgs.push_back(std::move(x));
+    }
+    resolve_indices(ctgs, Ybus_rm_outer, Ybus_rm_inner);
+    const MaskConfig plain;
+    compute_component_masks(ctgs, Ybus_rm, plain);
+
+    const int n_bus = static_cast<int>(Ybus_rm.rows());
+    std::vector<int> strand(static_cast<size_t>(n_bus), 0);
+    for (const auto& c : ctgs)
+        for (int b : c.masked_buses)
+            if (b >= 0 && b < n_bus) ++strand[static_cast<size_t>(b)];
+
+    int best = -1, best_strand = -1;
+    double best_w = -1.;
+    for (int k : cands) {
+        const int b = cand_bus[static_cast<size_t>(k)];
+        const int s = (b >= 0 && b < n_bus) ? strand[static_cast<size_t>(b)] : 0;
+        const double w = cand_w[static_cast<size_t>(k)];
+        const bool better = best < 0 || s < best_strand ||
+                            (s == best_strand && w > best_w) ||
+                            (s == best_strand && w == best_w && b < best);
+        if (better) { best = b; best_strand = s; best_w = w; }
+    }
+    return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -744,7 +803,13 @@ void build_mask_entries(
                     out.diag.push_back(row_info.q_diag_pos[static_cast<size_t>(bus)]);
                 }
             }
-            // Stranded lone controllers: repurpose the voltage row by value.
+            // Stranded groups: repurpose the voltage row by value into
+            // "Q_first == 0" -- 1 on the first controller's column, 0 on the
+            // regulated magnitude and on the other controllers' slope slots
+            // (an SVC's; a generator has none -- and lightsim2grid v1 refuses an
+            // SVC sharing its regulated bus, so that last loop mirrors upstream's
+            // generic rule without a case that reaches it today). The sharing
+            // rows are untouched.
             for (int g : ctg.stranded_groups) {
                 const int pq = cfg.vc_vrow_qcol_pos[static_cast<size_t>(g)];
                 const int pv = cfg.vc_vrow_vmcol_pos[static_cast<size_t>(g)];
@@ -757,6 +822,17 @@ void build_mask_entries(
                     out.jov_slot.push_back(local_c);
                     out.jov_pos.push_back(pv);
                     out.jov_val.push_back(static_cast<cuda_real_type>(0.));
+                }
+                if (!cfg.vc_grp_start.empty() && !cfg.vc_ctrl_vrow_qcol_pos.empty()) {
+                    const int first = cfg.vc_grp_start[static_cast<size_t>(g)];
+                    const int cnt   = cfg.vc_grp_count[static_cast<size_t>(g)];
+                    for (int j = first + 1; j < first + cnt; ++j) {
+                        const int ps = cfg.vc_ctrl_vrow_qcol_pos[static_cast<size_t>(j)];
+                        if (ps < 0) continue;
+                        out.jov_slot.push_back(local_c);
+                        out.jov_pos.push_back(ps);
+                        out.jov_val.push_back(static_cast<cuda_real_type>(0.));
+                    }
                 }
                 out.str_slot.push_back(local_c);
                 out.str_grp.push_back(g);

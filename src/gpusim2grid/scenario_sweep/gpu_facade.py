@@ -28,6 +28,8 @@ PV→PQ relabelling without changing the Jacobian pattern).
 import numpy as np
 
 from . import (
+    PhysicalChecksFacadeMixin,
+    SlackRedistributionFacadeMixin,
     _ScenarioSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -52,7 +54,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class ScenarioSweepGPU:
+class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -136,7 +138,9 @@ class ScenarioSweepGPU:
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
-                 use_distributed_slack=True):
+                 use_distributed_slack=True,
+                 compute_physical_violations=False, redistribute_slack=False,
+                 reference_slack="auto"):
         _validate_precision(precision)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
@@ -249,6 +253,9 @@ class ScenarioSweepGPU:
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
 
+        # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        self._apply_physical_checks_kwargs(compute_physical_violations)
+
         # set_injections_from_elements() inputs, kept so a later
         # set_contingency_gens() (or vice versa) can re-assemble Sbus with the
         # disconnected generators taken out, whatever the call order.
@@ -257,6 +264,13 @@ class ScenarioSweepGPU:
         # set_gen_v() input, kept so a later set_contingency_gens() (or vice
         # versa) can re-derive which rows ask one bus for two different |V|.
         self._gen_v = None
+
+        # OLF-style bounded slack redistribution of what a row loses, and the
+        # reference slack the fewest rows strand -- see
+        # SlackRedistributionFacadeMixin.
+        if redistribute_slack:
+            self.redistribute_slack = True
+        self.reference_slack = reference_slack
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
@@ -288,6 +302,12 @@ class ScenarioSweepGPU:
         """
         self._pending_elements = None
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
+        # per-bus injections carry no per-generator set-point: the slack
+        # active-power check and the redistribute_slack pre-pass fall back to
+        # the grid's own targets
+        self._gen_p_rows = None
+        self._push_gen_p_targets()
+        self._inner._s.set_gen_p_rows(np.zeros((0, 0), dtype=np.float64))
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
         """Store per-element injections, mirroring lightsim2grid's own batch API.
@@ -322,6 +342,13 @@ class ScenarioSweepGPU:
                                             load_p, load_q, gen_p,
                                             gen_off=gen_off)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+        # the slack active-power check needs each row's own generator
+        # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
+        self._gen_p_rows = gen_p
+        self._push_gen_p_targets()
+        # ... and so does the redistribute_slack pre-pass (what a row
+        # disconnects, where a participant starts from)
+        self._inner._s.set_gen_p_rows(np.ascontiguousarray(gen_p, dtype=np.float64))
 
     def set_contingency_gens(self, mask):
         """Per-row generator contingency mask, shape ``(n_scenarios, n_gen)``,
@@ -393,29 +420,33 @@ class ScenarioSweepGPU:
 
         Mirrors lightsim2grid's ``modify_gen_v``: unlike
         :meth:`set_injections_from_elements`, this does NOT feed Sbus at
-        all -- a PV/slack bus's magnitude is never part of Newton-Raphson's
-        unknown vector, so it never moves during a solve once seeded. This
-        only re-seeds ``|V|`` at each generator's own AC-solver bus,
-        immediately before that scenario's solve, keeping whatever angle is
-        already seeded there.
+        all. A column acts on the bus its generator REGULATES
+        (``regulated_bus_id``): a PV/slack bus's magnitude is never part of
+        Newton-Raphson's unknown vector, so there ``|V|`` is re-seeded right
+        before that scenario's solve (keeping the angle) and stays put; a bus
+        regulated by a VoltageControl group (a remote regulator) keeps its
+        ``|V|`` unknown, and the value becomes that group's set-point in its
+        bordered voltage equation for the row.
 
         Parameters
         ----------
         gen_v : (n_scenarios, n_gens) — target vm_pu per generator,
             row-aligned with :meth:`set_injections_from_elements` /
             :meth:`set_injections` / :meth:`set_topology`. NaN leaves that
-            (scenario, generator) untouched. Only applied to generators
-            whose OWN bus is voltage-fixed (PV or slack) in this session's
-            base case -- a disconnected, reactive-only ("PQ"), or remotely
-            voltage-regulating (SVC / VoltageControl) generator's column is
-            silently ignored, mirroring lightsim2grid's own
-            ``voltage_regulator_on_``-gated behavior. Left unset entirely
+            (scenario, generator) untouched. A disconnected, non-regulating
+            (``voltage_regulator_on`` False, even when co-located with a
+            regulating one) or treated-as-off generator's column is ignored,
+            mirroring lightsim2grid's own ``set_vm`` skips
+            (``InjectionElements.gen_v_bus``). Left unset entirely
             (the default), every scenario keeps the grid's own base-case
             voltage.
 
         A row asking one bus for two different magnitudes (two connected
-        generators on that bus, both applied, set-points further apart than
-        ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``) is infeasible -- |V|
+        generators regulating that bus, both applied, set-points further
+        apart than
+        ``gpusim2grid._ls2g_utils.GEN_V_CONFLICT_TOL``, or one differing from
+        the set-point of an SVC / hvdc station in the same control group) is
+        infeasible -- |V|
         at a bus is unique -- and is reported as NOT SIMULATED (NaN voltage /
         residual, :meth:`get_disconnected` = 1, a ``GRID``/``NOT_SIMULATED``
         violation) rather than letting the last column silently win the way
@@ -436,6 +467,7 @@ class ScenarioSweepGPU:
         self._gen_v = gen_v
         self._push_gen_v()
         self._update_skipped_rows()
+        self._push_gen_pv_release_targets()
 
     def _push_gen_v(self):
         """Hand set_gen_v()'s input to the session with the generators that
@@ -448,7 +480,7 @@ class ScenarioSweepGPU:
         gen_off = self._gen_off
         if gen_off is not None and gen_off.shape == gen_v.shape and gen_off.any():
             gen_v = np.where(gen_off, np.nan, gen_v)
-        self._inner.set_gen_v(gen_v, self._elements.gen_bus)
+        self._inner.set_gen_v(gen_v, self._elements.gen_v_bus)
 
     def _update_skipped_rows(self):
         """Re-derive the not-simulable rows from set_gen_v() (and the
@@ -458,8 +490,10 @@ class ScenarioSweepGPU:
         gen_off = self._gen_off
         if gen_off is not None and gen_off.shape[0] != self._gen_v.shape[0]:
             gen_off = None
-        bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_bus,
-                                     self._inner.is_vm_fixed_bus, gen_off=gen_off)
+        bad = conflicting_gen_v_rows(self._gen_v, self._elements.gen_v_bus,
+                                     self._inner.is_vm_fixed_bus, gen_off=gen_off,
+                                     vc_group_of_bus=self._inner.vc_group_of_bus,
+                                     vc_pinned_v_set=self._inner.vc_pinned_v_set)
         if bad.any():
             self._inner.set_skipped_rows(bad)
         else:
@@ -579,6 +613,26 @@ class ScenarioSweepGPU:
     def compute_limit_violations(self, value):
         self._inner.compute_limit_violations = value
 
+    @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by :attr:`compute_limit_violations` -- lightsim2grid's
+        ``violation_rel_tol``, same default (``1e-9``) and semantics:
+        CURRENT when ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when
+        ``v > vmax * (1 + tol)``, LOW_VOLTAGE when ``v < vmin * (1 - tol)``.
+        It keeps a value that sits ON its limit by construction (a bus a
+        regulator holds exactly at its vmax) from being reported or not
+        depending on the last bit of the solve -- which made the GPU, the
+        lightsim2grid batch and its one-off solve disagree. ``0`` gives the
+        bare strict comparisons. Also applies to :meth:`get_violations_n`.
+        In [0, 1[; takes effect on the next compute(). An FP32 build cannot
+        resolve 1e-9 (use ~1e-6 there)."""
+        return self._inner.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        self._inner.violation_rel_tol = value
+
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per scenario (row order
         matches set_injections()/set_topology()'s input rows). Requires
@@ -636,7 +690,8 @@ class ScenarioSweepGPU:
         return compute_violations_n(
             V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
             branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
-            limit_a1_ka, limit_a2_ka, sn_mva, n_lines)
+            limit_a1_ka, limit_a2_ka, sn_mva, n_lines,
+            rel_tol=self._inner.violation_rel_tol)
 
     # ----------------------------------------------------------- pass-through
     @property

@@ -102,18 +102,21 @@ struct Contingency {
     //                  of the patched graph (empty when the grid stays connected).
     //                  Those buses are frozen; the largest component is solved.
     //   In this mode `disconnected` is reused to mean "still skipped": it is set
-    //   only when the contingency strands the angle reference, an HVDC end, a
-    //   regulated bus, or EVERY controller of a VoltageControl group (an island
-    //   we cannot solve), so it is compacted out → NaN, exactly like a
-    //   fully-disconnecting contingency in the legacy path.
+    //   only when the contingency strands the angle reference, an HVDC end, or
+    //   the regulated bus of a VoltageControl group some of whose controllers
+    //   stay live (an island we cannot solve), so it is compacted out → NaN,
+    //   exactly like a fully-disconnecting contingency in the legacy path.
     std::vector<int> masked_buses;
 
-    // handle_disconnected_grid mode: VoltageControl groups with exactly ONE
-    // controller whose own bus is in masked_buses while the regulated bus is
-    // still live. Their bordered voltage row is repurposed by value into
-    // "Q_c == 0" (J[v_row, q_col] = 1, J[v_row, vm_col(reg)] = 0, F[v_row] =
-    // -Q_c), letting the regulated bus float as an ordinary PQ bus -- the GPU
-    // counterpart of lightsim2grid's VoltageControl::set_masked_buses.
+    // handle_disconnected_grid mode: VoltageControl groups EVERY controller of
+    // which sits on a bus in masked_buses (whatever the group's size, its
+    // regulated bus masked or not). Their bordered voltage row is repurposed by
+    // value into "Q_first == 0" (J[v_row, q_col_first] = 1, J[v_row,
+    // vm_col(reg)] = 0, the other controllers' slope entries on that row 0,
+    // F[v_row] = -Q_first); their sharing rows are kept and pin the other
+    // controllers to 0 too, letting the regulated bus float as an ordinary PQ
+    // bus -- the GPU counterpart of lightsim2grid's
+    // VoltageControl::set_masked_buses.
     std::vector<int> stranded_groups;
 
     // ScenarioSweep generator contingencies: buses whose Q equation is
@@ -309,17 +312,26 @@ struct MaskRowInfo {
 // ---------------------------------------------------------------------------
 struct MaskConfig {
     std::vector<char> is_reference_bus;        // size n_bus: angle reference
-    // HVDC converter ends + every VoltageControl REGULATED bus: stranding one
-    // has no value-only fallback on the fixed structure → skip.
+    // HVDC converter ends: stranding one has no value-only fallback on the
+    // fixed structure → skip. (A VoltageControl REGULATED bus is classified
+    // per group below, not here.)
     std::vector<char> is_hard_controller_bus;  // size n_bus
 
     // VoltageControl group topology (all empty when the ledger has no VC):
     // which bus each controller sits on and which group it belongs to, so a
-    // masked set can be classified per group (lone controller stranded →
-    // repurpose; every controller of a group stranded → skip; some of several
-    // stranded → left alone, the sharing rows keep the column coupled).
+    // masked set can be classified per group (lightsim2grid PR #216 parity):
+    //   every controller of the group masked → stranded, whatever the group's
+    //       size and whether its regulated bus is masked too: the voltage row
+    //       is repurposed into "Q_first == 0", the sharing rows pin the others;
+    //   regulated bus masked, some controller live → skip (the masked, frozen
+    //       magnitude cannot reach v_set);
+    //   some of several controllers masked → left alone (the live ones hold
+    //       the bus, the sharing rows keep the masked columns coupled).
     std::vector<int> vc_bus;             // per controller
     std::vector<int> vc_group;           // per controller
+    std::vector<int> vc_ctrl_vrow_qcol_pos;  // per controller: nnz pos of (v_row, own q_col), -1 if none
+    std::vector<int> vc_reg_bus;         // per group: the regulated bus
+    std::vector<int> vc_grp_start;       // per group: its first controller
     std::vector<int> vc_grp_count;       // per group
     std::vector<int> vc_vrow;            // per group: the bordered voltage row
     std::vector<int> vc_vrow_qcol_pos;   // per group: nnz pos of (v_row, q_col_first), -1 if none
@@ -363,19 +375,38 @@ struct MaskEntries {
 // graph (same removed-edge logic as check_connectivity), keeps the largest by
 // bus count, and records every other bus in Contingency::masked_buses. A
 // contingency is marked `disconnected` (→ skipped/NaN) when its masked set
-// contains the angle reference, a hard controller bus (HVDC end / regulated
-// bus), or EVERY controller of a VoltageControl group — those islands cannot
-// be solved on the GPU's fixed structure. A masked LONE controller (a group
-// of exactly one) whose regulated bus stays live is recorded in
-// Contingency::stranded_groups instead (its voltage row is repurposed by
-// value into Q_c == 0, lightsim2grid PR #192 parity); a masked member of a
-// multi-controller group is left as is. Connected contingencies get
-// masked_buses == empty.
+// contains the angle reference, an HVDC end, or the regulated bus of a
+// VoltageControl group one of whose controllers stays live — those islands
+// cannot be solved on the GPU's fixed structure. A group EVERY controller of
+// which is masked is recorded in Contingency::stranded_groups instead (its
+// voltage row is repurposed by value into Q_first == 0, lightsim2grid PR
+// #192 / #216 parity); a masked member of a group with a live controller is
+// left as is. Connected contingencies get masked_buses == empty.
 // ---------------------------------------------------------------------------
 void compute_component_masks(
     std::vector<Contingency>&                                     contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
     const MaskConfig&                                             cfg);
+
+// ---------------------------------------------------------------------------
+// choose_reference_bus  (handle_disconnected_grid, automatic reference slack)
+//
+// lightsim2grid's BaseBatchSweep::_select_ref_slack_and_masks: among the
+// candidate buses (the distributed-slack participants with a positive weight
+// `cand_w`; all of them when none has one), the one stranded by the FEWEST
+// contingencies -- counted on the plain largest-component split of each row,
+// before any skip decision --, ties to the higher weight, then the lower bus.
+// `forced` (>= 0, a bus a caller pinned as reference) wins when it is a
+// candidate. `contingencies` is copied (its own flags / triplets untouched).
+// ---------------------------------------------------------------------------
+int choose_reference_bus(
+    const std::vector<Contingency>&                               contingencies,
+    const int*                                                    Ybus_rm_outer,
+    const int*                                                    Ybus_rm_inner,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
+    const std::vector<int>&                                       cand_bus,
+    const std::vector<double>&                                    cand_w,
+    int                                                           forced);
 
 // ---------------------------------------------------------------------------
 // build_mask_entries  (handle_disconnected_grid mode + PV pins)

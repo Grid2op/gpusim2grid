@@ -35,6 +35,9 @@
 #include "dtypes.hpp"
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"
+#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "ledger_data.hpp"                      // LedgerData (the stored base ledger)
+#include "slack_redistribution.hpp"              // SlackRedistributionData, slack_redistribution::RowResult
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -103,6 +106,26 @@ struct ContingencyAnalysisSession {
     bool       handle_disconnected_grid_ = false;
     MaskConfig mask_cfg_;
 
+    // Automatic reference slack (see set_auto_reference_slack): the stored ctor
+    // inputs the base state is rebuilt from when the reference moves, the
+    // unextended ledger copy, the grid's own reference and the current one,
+    // and the cached choice for the current contingency list.
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
+    CplxVect        Vinit_;
+    Eigen::VectorXi pv_, pq_;
+    int    max_iter_base_   = 10;
+    double tol_base_        = 1e-6;
+    int    device_          = -1;
+    bool   presolved_v_     = false;
+    bool   debug_base_case_ = false;
+    std::unique_ptr<LedgerData> base_ledger_;   // null in array/tuple mode
+    bool auto_reference_slack_ = false;
+    int  forced_ref_bus_       = -1;
+    int  grid_ref_bus_         = -1;
+    int  ref_bus_              = -1;
+    int  auto_ref_choice_      = -1;
+    bool auto_ref_valid_       = false;
+
     // =========================================================================
     // Host branch data (stored for compute_flows() and build_contingencies())
     // =========================================================================
@@ -123,7 +146,8 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     bool     compute_limit_violations_ = false;
     double   violation_tol_            = 1e-6;   // dedicated; independent of tol_base
-    int      violation_capacity_       = 16;     // K; bounds memory at n_ctg*K regardless
+    double   violation_rel_tol_        = 1e-9;   // relative margin past a limit (lightsim2grid's violation_rel_tol)
+    int      violation_capacity_       = 16;     // K per type; bounds memory at n_ctg*3*K regardless
                                                   // of n_bus/n_branches -- see set_limits()
     bool     has_limits_               = false;
     bool     has_violations_result_    = false;
@@ -131,6 +155,18 @@ struct ContingencyAnalysisSession {
 
     RealVect h_bus_vmin_kv_, h_bus_vmax_kv_;               // [n_bus], solver numbering
     RealVect h_branch_limit_a1_ka_, h_branch_limit_a2_ka_; // [n_branches], lines-then-trafos
+
+    // post-solve physical checks (see physical_checks() above)
+    PhysicalChecksConfig phys_;
+
+    // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
+    // the participants snapshot, the base injections the pre-pass reads a
+    // row's island off (every row has them), and the last run's per-row result.
+    bool                    redistribute_slack_ = false;
+    SlackRedistributionData slack_rd_;
+    bool                    has_slack_rd_ = false;
+    CplxVect                h_Sbus_base_;
+    std::vector<slack_redistribution::RowResult> slack_rows_;
 
     // =========================================================================
     // Contingency data (populated by build_contingencies())
@@ -303,11 +339,75 @@ struct ContingencyAnalysisSession {
     Eigen::VectorXi get_violation_count_high_voltage() const;
     Eigen::VectorXi get_violation_count_current()      const;
 
+    // =========================================================================
+    // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
+    // .hpp): the per-bus reactive capability (compute_physical_violations,
+    // lightsim2grid PR #206 parity) and the droop hvdc P-saturation
+    // (compute_physical_violations). Flags / tolerances / capacities live on
+    // physical_checks(); mutable, taken into account at the next run().
+    // set_bus_q_capability() hands in the plan the reactive check needs (built
+    // by lightsim2grid's own build_bus_q_plan through the bridge, or by the
+    // caller in array mode). The get_* accessors are synchronous D->H copies
+    // and throw unless the last run() had the corresponding flag on.
+    // =========================================================================
+    PhysicalChecksConfig&       physical_checks()       { return phys_; }
+    const PhysicalChecksConfig& physical_checks() const { return phys_; }
+    void set_bus_q_capability(const BusQPlanData& plan);
+    BusQViolationsResult  get_bus_q_violations()    const;
+    BusQViolationsResult  get_bus_q_violations_n()  const;
+    HvdcPViolationsResult get_hvdc_p_violations()   const;
+    HvdcPViolationsResult get_hvdc_p_violations_n() const;
+    // The per-machine active-power check of the distributed slack (lightsim2grid's
+    // GenPCheck.hpp: generators AND storage units, LOW_P / HIGH_P). The plan is
+    // OPTIONAL (unset = nothing was given active limits = nothing to report).
+    void set_gen_p_capability(const GenPPlanData& plan);
+    GenPViolationsResult  get_gen_p_violations()    const;
+    GenPViolationsResult  get_gen_p_violations_n()  const;
+
+    // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
+    // the power the island a contingency cuts off (handle_disconnected_grid)
+    // took out is shared on the remaining slack units BEFORE the solve,
+    // OLF-style (bounded by [min_p, max_p], never crossing 0 MW), the saturated
+    // units leaving that contingency's distributed slack. Off by default; needs
+    // set_slack_redistribution_data (the bridge factory sets it) and the
+    // distributed slack.
+    void set_redistribute_slack(bool v) { redistribute_slack_ = v; }
+    bool get_redistribute_slack() const { return redistribute_slack_; }
+
+    // Automatic reference slack (lightsim2grid PR #216's batch rule, see
+    // ScenarioSweepSession's identical API): with handle_disconnected_grid and
+    // the distributed slack, the reference becomes the participant stranded by
+    // the fewest contingencies; a change moves it in the ledger and rebuilds
+    // the base state. forced_reference_bus (solver id, -1 none) is kept.
+    void set_auto_reference_slack(bool v) { auto_reference_slack_ = v; auto_ref_valid_ = false; }
+    bool get_auto_reference_slack() const { return auto_reference_slack_; }
+    void set_forced_reference_bus(int b) { forced_ref_bus_ = b; auto_ref_valid_ = false; }
+    int  get_forced_reference_bus() const { return forced_ref_bus_; }
+    int  reference_bus() const { return ref_bus_; }
+    void set_slack_redistribution_data(const SlackRedistributionData& data);
+    bool has_slack_redistribution_data() const { return has_slack_rd_; }
+    SlackRedistributionReport get_slack_redistribution_report() const;
+    // The PQ -> PV release check of the generators a caller flagged as pinned at
+    // a reactive limit (lightsim2grid's GenPvReleaseCheck.hpp, PR #216:
+    // LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q on a GENERATOR). The plan is
+    // OPTIONAL (unset = nothing flagged = nothing to report).
+    void set_gen_pv_release_capability(const GenPvReleasePlanData& plan);
+    GenPvReleaseViolationsResult get_gen_pv_release_violations()   const;
+    GenPvReleaseViolationsResult get_gen_pv_release_violations_n() const;
+
     // Non-copyable, non-movable (owns CUDA resources via unique_ptr)
     ContingencyAnalysisSession(const ContingencyAnalysisSession&)            = delete;
     ContingencyAnalysisSession& operator=(const ContingencyAnalysisSession&) = delete;
     ContingencyAnalysisSession(ContingencyAnalysisSession&&)                 = delete;
     ContingencyAnalysisSession& operator=(ContingencyAnalysisSession&&)      = delete;
+
+private:
+    // redistribute_slack's preconditions (run() refuses without them)
+    void _check_redistribute_slack() const;
+    // (Re)build base_state_ / mask_cfg_ on the stored inputs, the ledger's
+    // reference moved to ref_bus_; and the reference run() wants.
+    void _build_base_state();
+    int  _wanted_reference_bus();
 };
 
 #endif // CONTINGENCY_ANALYSIS_SESSION_HPP

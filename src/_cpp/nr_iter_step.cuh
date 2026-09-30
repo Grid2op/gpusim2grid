@@ -155,7 +155,7 @@ struct NrIterBuffers {
     const int*             d_vc_vrow      = nullptr;
     const int*             d_vc_grp_start = nullptr;
     const int*             d_vc_grp_count = nullptr;
-    const cuda_real_type*  d_vc_vset      = nullptr;
+    const cuda_real_type*  d_vc_vset      = nullptr;   // [n_vc_grp], or per slot (vc_vset_stride)
     const int*             d_vc_sh_row    = nullptr;
     const int*             d_vc_sh_first  = nullptr;
     const int*             d_vc_sh_other  = nullptr;
@@ -179,13 +179,14 @@ struct NrIterBuffers {
     const int*             d_maskv_bus    = nullptr;   // [n_mask_v]
     int                    n_mask_v       = 0;
 
-    // ---- stranded lone VoltageControl controllers (per-chunk slice) --------
+    // ---- stranded VoltageControl groups (per-chunk slice) ------------------
     // Per-slot J value overrides (slot, nnz pos, value) written AFTER every
     // feature stamp and BEFORE the bus mask, and stranded rows (slot, group)
-    // whose F[v_row] is rewritten to -Q_c after the VC mismatch kernels. Both
-    // repurpose a lone controller's bordered voltage row into "Q_c == 0" when
-    // handle_disconnected_grid masks that controller's own bus (lightsim2grid
-    // PR #192 parity). All null / 0 when unused → launches skipped.
+    // whose F[v_row] is rewritten to -Q_first after the VC mismatch kernels.
+    // Both repurpose a group's bordered voltage row into "Q_first == 0" when
+    // handle_disconnected_grid masks the own bus of EVERY controller of that
+    // group (lightsim2grid PR #192 / #216 parity; the sharing rows then pin the
+    // other controllers to 0). All null / 0 when unused → launches skipped.
     const int*             d_jov_slot     = nullptr;   // [n_jov]
     const int*             d_jov_pos      = nullptr;   // [n_jov]
     const cuda_real_type*  d_jov_val      = nullptr;   // [n_jov]
@@ -200,6 +201,12 @@ struct NrIterBuffers {
     // d_slack_w[b * n_slack + k] -- a ScenarioSweep row that disconnected a
     // slack participant re-weights the survivors (lightsim2grid PR #193).
     int                    slack_w_stride = 0;
+
+    // ---- per-slot VoltageControl set-points ---------------------------------
+    // 0 (default): d_vc_vset is the shared [n_vc_grp] base array. n_vc_grp:
+    // d_vc_vset is per slot, [actual_batch * n_vc_grp] -- a batch row whose
+    // gen_v moves a controller's set-point (see GenVOverride).
+    int                    vc_vset_stride = 0;
 
     // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
     // launched) unless enabled. Mirrors lightsim2grid's own
@@ -263,7 +270,7 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
             buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
         vc_vrow_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
-            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset,
+            buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset, buf.vc_vset_stride,
             buf.n_vc_grp, buf.n_vc_ctrl, n_bus, dim_J, batch);
         if (buf.n_vc_share > 0)
             vc_share_kernel<<<nr_grid_size((long long)batch * buf.n_vc_share, BS), BS, 0, cs>>>(
@@ -290,7 +297,7 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
     if (buf.n_hvdc > 0)
         hvdc_fill_feature_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2,
+            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
             buf.n_hvdc, n_bus, nnz_J, batch);
     if (buf.n_vc_feat > 0)
@@ -335,7 +342,7 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 }
 
 // -----------------------------------------------------------------------------
-// Stranded lone-controller helpers (no-ops when n_jov / n_str == 0).
+// Stranded-group helpers (no-ops when n_jov / n_str == 0).
 //   nr_apply_J_overrides   : per-slot J value overrides. Must run AFTER every
 //                            feature stamp (they assign the normal values) and
 //                            BEFORE nr_apply_bus_mask (the masked rows win).

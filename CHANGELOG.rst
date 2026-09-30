@@ -1,0 +1,39 @@
+Change Log
+===========
+
+[0.2.0] 2026-xx-yy
+--------------------
+- [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
+  ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
+  lightsim2grid PR #216.
+- [IMPROVED] ``redistribute_slack`` on a scenario sweep (``ScenarioSweepGPU``, ``BatchPowerFlow``)
+  also shares the active imbalance each row's injections create against the grid's set-points
+  (``SlackRedistributionData.base_p_mw``), as lightsim2grid.
+- [ADDED] ``reference_slack="auto"`` (default with ``handle_disconnected_grid``): the angle
+  reference is the slack unit stranded by the fewest rows.
+- [ADDED] PQ -> PV release check (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``) and
+  ``physical_violation_tol_vm_pu``.
+- [ADDED] ``violation_rel_tol`` (default ``1e-9``): a value on its operational limit up to
+  rounding is not reported, as lightsim2grid.
+- [IMPROVED] ``handle_disconnected_grid`` solves a row stranding every controller of a
+  voltage-control group of any size, and skips one stranding a regulated bus whose controllers
+  stay live.
+- [FIXED] ``ScenarioSweepGPU``: a hot re-run lost the row masks, so ``BatchPowerFlow`` gave a
+  stranded voltage-control group a ``gen_v`` gradient.
+- [ADDED] Physical check of the idle SVCs under a standby automaton (lightsim2grid's
+  ``SvcStandbyCheck``, ``LSGrid.set_svc_standby``): a regulated bus outside the automaton's
+  thresholds is reported as ``LOW_VOLTAGE_SVC_STANDBY`` / ``HIGH_VOLTAGE_SVC_STANDBY`` on the new
+  ``ViolationElementType.SVC``. Routed through the PQ -> PV release plan.
+- [ADDED] The PQ -> PV release check for the SVCs lightsim2grid flags as frozen at a reactive limit
+  (``LSGrid.set_svc_can_be_pv``): reported as ``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``
+  on the SVC. The records of the release plan carry their element type (``el_type``), the standby
+  entries are marked by ``GenPvReleasePlanData.standby``.
+- [ADDED] ``redistribute_slack`` shares on the units lightsim2grid flags "can participate in the
+  slack" (``LSGrid.set_gen_can_participate_slack``) too, in the pre-pass only
+  (``SlackRedistributionData.in_slack``).
+- [FIXED] The PQ -> PV release plan (lightsim2grid's ``build_gen_pv_release_plan``) pins a flagged
+  generator at the nearer of its reactive limits, not only within ``physical_violation_tol_mva`` of
+  one: the facades no longer rebuild it when that tolerance changes.
+- [ADDED] The PQ -> PV release of the VSC converter stations lightsim2grid flags as frozen at a
+  reactive limit (``LSGrid.set_hvdc_can_be_pv``): reported on the HVDC line with ``side`` the
+  station's end (``GenPvReleasePlanData.side``, ``GenPvReleaseViolationsResult.side``).

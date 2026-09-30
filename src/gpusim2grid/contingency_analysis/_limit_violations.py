@@ -15,8 +15,14 @@ below).
 __all__ = [
     "ViolationElementType",
     "LimitViolationType",
+    "ViolationCategory",
+    "violation_category",
     "LimitViolation",
     "compute_violations_n",
+    "bus_q_violations_from_result",
+    "hvdc_p_violations_from_result",
+    "gen_p_violations_from_result",
+    "gen_pv_release_violations_from_result",
 ]
 
 from dataclasses import dataclass
@@ -27,11 +33,31 @@ import numpy as np
 
 class ViolationElementType(IntEnum):
     """Mirrors lightsim2grid's ls2g::ViolationElementType exactly (including
-    GRID, added on lightsim2grid's improve_const_ref branch)."""
+    GRID, NOT_SIMULATED's element, and HVDC / GENERATOR / STORAGE / SVC, the
+    elements the PHYSICAL checks of ``compute_physical_violations`` report on)."""
     BUS = 0
     LINE = 1
     TRAFO = 2
     GRID = 3  # the whole grid/contingency, not a specific element
+    HVDC = 4  # an hvdc line (compute_physical_violations)
+    #: A generator / a storage unit, by its own container id: its ACTIVE power
+    #: (LOW_P / HIGH_P, the distributed slack asked it for more than it has)
+    #: and, for a PQ generator flagged as pinned at a reactive limit, the
+    #: voltage of the bus it would regulate (LOW_VOLTAGE_AT_MIN_Q /
+    #: HIGH_VOLTAGE_AT_MAX_Q). A REGULATING machine's reactive violation is
+    #: reported on the BUS instead, because how a bus' reactive power is
+    #: divided between its machines is a convention, while the active one is
+    #: divided by the participation factors the caller chose. A STORAGE record's value/limit are in the GENERATOR convention
+    #: (positive = injected), like its min_q/max_q and unlike the LOAD-convention
+    #: target_p_mw lightsim2grid stores for it.
+    GENERATOR = 5
+    STORAGE = 6
+    #: A static var compensator, by its own id: an idle SVC flagged as carrying
+    #: a standby automaton, which the voltage of the bus it regulates would
+    #: switch on (LOW_VOLTAGE_SVC_STANDBY / HIGH_VOLTAGE_SVC_STANDBY), or a
+    #: fixed-Q SVC flagged as frozen at a reactive limit that would regulate
+    #: again (LOW_VOLTAGE_AT_MIN_Q / HIGH_VOLTAGE_AT_MAX_Q).
+    SVC = 7
 
 
 class LimitViolationType(IntEnum):
@@ -58,6 +84,78 @@ class LimitViolationType(IntEnum):
     CURRENT = 2
     NOT_SIMULATED = 3
     DIVERGENCE = 4
+    #: The reactive power the machines holding ONE BUS' voltage had to produce
+    #: went BELOW / ABOVE the SUM of what they own (lightsim2grid PR #206,
+    #: ``compute_physical_violations``). Category PHYSICAL: a machine cannot
+    #: produce reactive power it does not have, so the converged solution is
+    #: not a state the grid can reach. Reported, never enforced.
+    LOW_Q = 5
+    HIGH_Q = 6
+    #: A droop ("AC emulation") hvdc line in linear regime whose flow exceeds
+    #: pmax in the direction it flows -- OpenLoadFlow's HvdcAcEmulationLimits
+    #: outer loop would saturate it (``compute_physical_violations``). Category
+    #: PHYSICAL. On a GENERATOR / STORAGE: the distributed slack -- solved
+    #: inside the Jacobian by participation factors that know nothing about
+    #: limits -- asked the machine for more than its max_p_mw (lightsim2grid's
+    #: GenPCheck.hpp; OpenLoadFlow's DistributedSlack outer loop).
+    HIGH_P = 7               # lightsim2grid's name for it (LimitViolation.hpp)
+    HVDC_P_SATURATION = 7    # alias: the name it was introduced under here
+    #: ... and the other way: a slack GENERATOR / STORAGE below its min_p_mw
+    #: (an hvdc line's two directions are two HIGH_P with a different side).
+    LOW_P = 8
+    #: A PQ GENERATOR flagged as pinned at its MINIMUM reactive power by an
+    #: outer loop (lightsim2grid's ``can_be_pv``) whose regulated bus sits BELOW
+    #: the target it would hold: it absorbs too much for that target, and
+    #: OpenLoadFlow's ReactiveLimits loop would switch it back to PV (the PQ ->
+    #: PV direction, the mirror of LOW_Q / HIGH_Q; lightsim2grid PR #216).
+    #: Category PHYSICAL. value the regulated voltage, limit the target, kV.
+    LOW_VOLTAGE_AT_MIN_Q = 9
+    #: ... and the mirror: pinned at its MAXIMUM, regulated bus ABOVE the target.
+    HIGH_VOLTAGE_AT_MAX_Q = 10
+    #: A non-regulating SVC flagged as left idle under its standby automaton
+    #: (lightsim2grid's ``LSGrid.set_svc_standby``) whose regulated bus sits
+    #: BELOW the automaton's low threshold: OpenLoadFlow's
+    #: MonitoringVoltageOuterLoop would switch it to voltage control. Category
+    #: PHYSICAL. value the regulated voltage, limit the threshold, kV.
+    LOW_VOLTAGE_SVC_STANDBY = 11
+    #: ... and the mirror: regulated bus ABOVE the high threshold.
+    HIGH_VOLTAGE_SVC_STANDBY = 12
+
+
+class ViolationCategory(IntEnum):
+    """What KIND of statement a violation is (mirrors lightsim2grid's
+    ``ViolationCategory`` exactly) -- a pure function of its type, see
+    :func:`violation_category` / :attr:`LimitViolation.category`.
+
+    OPERATIONAL : a limit an operator chose and the grid CAN leave (a bus
+        outside its voltage band, a branch above its rating): a reachable
+        state nobody wants to sit in. LOW_VOLTAGE, HIGH_VOLTAGE, CURRENT.
+    PHYSICAL : a limit of the equipment itself, which nothing can leave: the
+        converged solution is NOT physically realizable, the control it assumes
+        cannot happen. LOW_Q, HIGH_Q, HIGH_P (= HVDC_P_SATURATION), LOW_P,
+        LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
+        HIGH_VOLTAGE_SVC_STANDBY.
+    SOLVER : not a limit at all, what the solver did. NOT_SIMULATED, DIVERGENCE.
+    """
+    OPERATIONAL = 0
+    PHYSICAL = 1
+    SOLVER = 2
+
+
+def violation_category(violation_type):
+    """The :class:`ViolationCategory` of a :class:`LimitViolationType`."""
+    t = LimitViolationType(int(violation_type))
+    if t in (LimitViolationType.LOW_VOLTAGE, LimitViolationType.HIGH_VOLTAGE,
+             LimitViolationType.CURRENT):
+        return ViolationCategory.OPERATIONAL
+    if t in (LimitViolationType.LOW_Q, LimitViolationType.HIGH_Q,
+             LimitViolationType.HVDC_P_SATURATION, LimitViolationType.LOW_P,
+             LimitViolationType.LOW_VOLTAGE_AT_MIN_Q,
+             LimitViolationType.HIGH_VOLTAGE_AT_MAX_Q,
+             LimitViolationType.LOW_VOLTAGE_SVC_STANDBY,
+             LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY):
+        return ViolationCategory.PHYSICAL
+    return ViolationCategory.SOLVER
 
 
 @dataclass(frozen=True)
@@ -77,6 +175,24 @@ class LimitViolation:
         GRID (NOT_SIMULATED / DIVERGENCE), gpusim2grid populates
         residual/tol (lightsim2grid's own convention leaves these NaN/unused
         for GRID).
+
+    The two PHYSICAL checks add (see :class:`ViolationCategory`):
+
+    LOW_Q / HIGH_Q (``compute_physical_violations``) : element_type BUS,
+        element_id the SOLVER bus id (unlike lightsim2grid, which reports the
+        grid-model id -- gpusim2grid's own voltage records use solver
+        numbering, and so does its V array), side 0, value the reactive
+        power the machines holding that bus had to produce (MVAr), limit
+        their SUMMED capability (MVAr).
+    HVDC_P_SATURATION (``compute_physical_violations``) : element_type HVDC,
+        element_id the grid hvdc id, side 1 (would saturate 1->2: the flow
+        leaving bus 1 exceeds pmax_1to2) or 2 (2->1), value that flow (MW),
+        limit pmax (MW).
+    LOW_P / HIGH_P on a GENERATOR / STORAGE (``compute_physical_violations``) :
+        element_id the container id of that family, side 0, value the
+        machine's converged active power -- its target plus its share of the
+        distributed slack (MW, GENERATOR convention for both families), limit
+        its min_p_mw / max_p_mw.
     """
     element_type: ViolationElementType
     element_id: int
@@ -85,11 +201,71 @@ class LimitViolation:
     value: float
     limit: float
 
+    @property
+    def category(self):
+        """:class:`ViolationCategory` of this violation (derived from its type)."""
+        return violation_category(self.violation_type)
+
+
+def _rows_from_flat(count, stride, make):
+    """Split a flat per-row record buffer into one list per row: row r owns
+    slots [r*stride, r*stride + count[r]); a negative count (the row was
+    never simulated) and a zero one (simulated, nothing to report -- or not
+    converged: upstream reports an EMPTY entry there, never a sentinel) both
+    give an empty list."""
+    out = []
+    for r, cnt in enumerate(count):
+        cnt = int(cnt)
+        base = r * stride
+        out.append([make(base + i) for i in range(max(cnt, 0))])
+    return out
+
+
+def bus_q_violations_from_result(res):
+    """list[list[LimitViolation]] from a ``BusQViolationsResult`` (the raw
+    output of ``get_bus_q_violations[_n]()`` on a batch session)."""
+    bus_id, vtype, value, limit = res.bus_id, res.type, res.value, res.limit
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
+        ViolationElementType.BUS, int(bus_id[i]), 0, LimitViolationType(int(vtype[i])),
+        float(value[i]), float(limit[i])))
+
+
+def hvdc_p_violations_from_result(res):
+    """list[list[LimitViolation]] from an ``HvdcPViolationsResult`` (the raw
+    output of ``get_hvdc_p_violations[_n]()`` on a batch session)."""
+    hvdc_id, side, value, limit = res.hvdc_id, res.side, res.value, res.limit
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
+        ViolationElementType.HVDC, int(hvdc_id[i]), int(side[i]),
+        LimitViolationType.HVDC_P_SATURATION, float(value[i]), float(limit[i])))
+
+
+def gen_p_violations_from_result(res):
+    """list[list[LimitViolation]] from a ``GenPViolationsResult`` (the raw
+    output of ``get_gen_p_violations[_n]()`` on a batch session)."""
+    etype, eid, vtype, value, limit = res.element_type, res.element_id, res.type, res.value, res.limit
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
+        ViolationElementType(int(etype[i])), int(eid[i]), 0, LimitViolationType(int(vtype[i])),
+        float(value[i]), float(limit[i])))
+
+
+def gen_pv_release_violations_from_result(res):
+    """list[list[LimitViolation]] from a ``GenPvReleaseViolationsResult`` (the
+    raw output of ``get_gen_pv_release_violations[_n]()`` on a batch session):
+    the PQ -> PV release of the flagged generators and SVCs, and the switch on
+    of the flagged standby SVCs routed through the same plan -- ``el_type``
+    says which element ``gen_id`` names (an HVDC one: the hvdc line of a frozen VSC
+    station, ``side`` the station's end)."""
+    gen_id, el_type, vtype, value, limit = res.gen_id, res.el_type, res.type, res.value, res.limit
+    side = res.side
+    return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
+        ViolationElementType(int(el_type[i])), int(gen_id[i]), int(side[i]), LimitViolationType(int(vtype[i])),
+        float(value[i]), float(limit[i])))
+
 
 def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
                           branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                           branch_limit_a1_ka, branch_limit_a2_ka, sn_mva,
-                          n_lines, residual=None, tol=None):
+                          n_lines, residual=None, tol=None, rel_tol=1e-9):
     """Pre-contingency ("n") limit-violation check: a single voltage vector,
     not a batch, so this is pure numpy -- no GPU, no memory/transfer concern.
 
@@ -119,6 +295,11 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
         case. There is no NOT_SIMULATED equivalent here -- unlike the batch
         (contingency) case, the pre-contingency "n" power flow this helper
         checks is always actually run, never pre-check-dropped.
+    rel_tol : float
+        Relative margin a value must clear past its limit to be reported
+        (``violation_rel_tol``, the kernel's and lightsim2grid's rule):
+        ``v < vmin * (1 - rel_tol)``, ``v > vmax * (1 + rel_tol)``,
+        ``ka > limit * (1 + rel_tol)``.
 
     Returns
     -------
@@ -137,8 +318,8 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
     if bus_vmin_kv is not None and bus_vmax_kv is not None:
         vm_kv = np.abs(V) * bus_vn_kv
         with np.errstate(invalid="ignore"):
-            low = ~np.isnan(bus_vmin_kv) & (vm_kv < bus_vmin_kv)
-            high = ~np.isnan(bus_vmax_kv) & (vm_kv > bus_vmax_kv)
+            low = ~np.isnan(bus_vmin_kv) & (vm_kv < bus_vmin_kv * (1. - rel_tol))
+            high = ~np.isnan(bus_vmax_kv) & (vm_kv > bus_vmax_kv * (1. + rel_tol))
         for b in np.nonzero(low)[0]:
             out.append(LimitViolation(ViolationElementType.BUS, int(b), 0,
                                        LimitViolationType.LOW_VOLTAGE,
@@ -156,10 +337,10 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
             etype = ViolationElementType.LINE if l < n_lines else ViolationElementType.TRAFO
             eid = l if l < n_lines else l - n_lines
             lim1, lim2 = branch_limit_a1_ka[l], branch_limit_a2_ka[l]
-            if not np.isnan(lim1) and or_ka[l] > lim1:
+            if not np.isnan(lim1) and or_ka[l] > lim1 * (1. + rel_tol):
                 out.append(LimitViolation(etype, eid, 1, LimitViolationType.CURRENT,
                                            float(or_ka[l]), float(lim1)))
-            if not np.isnan(lim2) and ex_ka[l] > lim2:
+            if not np.isnan(lim2) and ex_ka[l] > lim2 * (1. + rel_tol):
                 out.append(LimitViolation(etype, eid, 2, LimitViolationType.CURRENT,
                                            float(ex_ka[l]), float(lim2)))
 
