@@ -348,6 +348,45 @@ class TestAdjointPrimitives:
             np.testing.assert_allclose(lam[r], expected, atol=1e-8, rtol=1e-8)
         assert np.all(lam[2] == 0.0)                     # dropped row
 
+    def test_solve_JT_batch_refuses_a_multi_chunk_forward(self, ieee14_base_case):
+        # The adjoint buffers hold one chunk: a snapshot J passes the shape
+        # check (it IS one chunk's worth), but gathering the n_active rows of
+        # a two-chunk forward into them would write out of bounds.
+        from gpusim2grid import ScenarioSweepGPU
+        grid = ieee14_base_case["grid"]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        n = 4
+        load_p, load_q = (np.asarray(a) for a in grid.get_loads_res_full()[:2])
+        gen_p = np.asarray(grid.get_gen_target_p())
+        rep = lambda a: np.repeat(a[None, :], n, axis=0)   # noqa: E731
+        sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+        sw.compute(batch_size=2)
+        sol = sw.solver
+        assert sol.capacity == 2 and sol.n_active == 4
+        J = torch.from_dlpack(sol.j_values_dlpack()).clone()
+        rhs = torch.zeros(n, sol.dim_J, dtype=RDT, device="cuda")
+        with pytest.raises(RuntimeError, match="one chunk"):
+            sol.solve_JT_batch_dlpack(rhs.__dlpack__(), J.__dlpack__())
+
+    def test_failed_forward_invalidates_a_pending_alias_backward(self, ieee14_base_case):
+        # A forward that throws after the session already replaced its driver
+        # (here: keep_final_jacobian on a batch forced into two chunks) must
+        # still bump run_counter, or the pending backward would read the new
+        # driver's buffers as if they were its own.
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        lp = load_p.clone().requires_grad_(True)
+        V = pf(load_p=lp, load_q=load_q, gen_p=gen_p)
+
+        pf.sweep.solver.batch_size = 1                  # cold rebuild, 3 chunks
+        lp2 = load_p.clone().requires_grad_(True)
+        with pytest.raises(RuntimeError, match="keep_final_jacobian"):
+            pf(load_p=lp2, load_q=load_q, gen_p=gen_p)
+        with pytest.raises(RuntimeError, match="another forward"):
+            V.real.sum().backward()
+
 
 # ---------------------------------------------------------------------------
 # Gradients vs finite differences
@@ -651,6 +690,65 @@ class TestCallToCallState:
         pf(load_p=lp5, load_q=lq5, gen_p=gp5, gen_status=gs5)
         V6 = pf(load_p=load_p, load_q=load_q, gen_p=gen_p).clone()
         torch.testing.assert_close(V6, V0, atol=solver_atol, rtol=0)
+
+    def test_failed_call_does_not_desync_topology(self, ieee14_base_case, solver_atol):
+        # A call that raises after the topology was decided (here: a bad
+        # gen_status shape, validated after line_status) must not leave the
+        # cached mask claiming a topology the session never received --
+        # otherwise the next call with that line_status looks "unchanged" and
+        # silently solves on the old trips.
+        grid = ieee14_base_case["grid"]
+        pf, ref = _pf(grid), _pf(grid)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.05, 0.95])
+        ls, ts = _all_connected(pf, n)
+        ls[1, 3] = False
+        pf(load_p=load_p, load_q=load_q, gen_p=gen_p, line_status=ls, trafo_status=ts)
+        assert pf.sweep.source_build_counter == 1
+
+        ls2 = ls.clone()
+        ls2[2, 0] = False
+        bad_gs = torch.ones(n, pf.n_gen + 1, dtype=torch.bool, device="cuda")
+        with pytest.raises(ValueError, match="gen_status"):
+            pf(load_p=load_p, load_q=load_q, gen_p=gen_p,
+               line_status=ls2, trafo_status=ts, gen_status=bad_gs)
+
+        V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p,
+               line_status=ls2, trafo_status=ts).clone()
+        assert pf.sweep.source_build_counter == 2          # new topology: warm
+        V_ref = ref(load_p=load_p, load_q=load_q, gen_p=gen_p,
+                    line_status=ls2, trafo_status=ts)
+        torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
+
+    def test_failed_call_with_a_new_row_count_does_not_stick(self, ieee14_base_case,
+                                                             solver_atol, monkeypatch):
+        # The session holds an (all-empty) trip list for 3 rows. A 5-row call
+        # fails inside the op after the injections were handed over; the next
+        # 5-row call without status must still replace that 3-row list rather
+        # than trust a row count the session never received (it would refuse
+        # every such call with "row count no longer matches").
+        grid = ieee14_base_case["grid"]
+        pf, ref = _pf(grid), _pf(grid)
+        lp3, lq3, gp3 = _base_inputs(pf, 3)
+        ls3, ts3 = _all_connected(pf, 3)
+        ls3[1, 3] = False
+        pf(load_p=lp3, load_q=lq3, gen_p=gp3, line_status=ls3, trafo_status=ts3)
+        pf(load_p=lp3, load_q=lq3, gen_p=gp3)              # trips cleared, 3 rows
+
+        lp5, lq5, gp5 = _base_inputs(pf, 5, [1.0, 1.02, 0.98, 1.05, 0.95])
+        ls5, ts5 = _all_connected(pf, 5)
+        ls5[4, 6] = False
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("injected failure")
+        with monkeypatch.context() as m:
+            m.setattr(pf.sweep, "set_topology", boom)
+            with pytest.raises(RuntimeError, match="injected failure"):
+                pf(load_p=lp5, load_q=lq5, gen_p=gp5, line_status=ls5, trafo_status=ts5)
+
+        V = pf(load_p=lp5, load_q=lq5, gen_p=gp5).clone()
+        V_ref = ref(load_p=lp5, load_q=lq5, gen_p=gp5)
+        torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
 
 
 # ---------------------------------------------------------------------------

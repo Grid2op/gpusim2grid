@@ -75,10 +75,8 @@ class AcPfGPU:
         ``"max_diag_sum"``, ``"max_diag_product"``, ``"auto"``.
         Construction-time only, same reason as ``reordering_alg``.
         WARNING: ``"max_diag_product"``/``"auto"`` have been observed to
-        silently produce NaN voltages on real power-flow Jacobians while
-        ``timings.converged`` still reports True (the residual check does
-        not catch NaN) — verify ``np.isnan(V).any()`` yourself if you use
-        them. ``"none"``/``"max_diag_count"``/``"max_min_diag"``/
+        produce NaN voltages on real power-flow Jacobians (reported as
+        ``timings.converged == False``) — do not rely on them. ``"none"``/``"max_diag_count"``/``"max_min_diag"``/
         ``"max_min_diag_alt"``/``"max_diag_sum"`` have been verified to
         reproduce the reference solution.
     pivot_epsilon_alg : str, default "default"
