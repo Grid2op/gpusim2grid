@@ -5,6 +5,9 @@
 # `requires_gpu` (conftest.py) is skipped, but all test modules are still
 # imported and any pure-Python test still runs.
 #
+# The GPU tests themselves run in the opt-in `gpu-tests` job at the end, on
+# Modal (ci/modal/gpu_tests.py).
+#
 # CMAKE_CUDA_ARCHITECTURES is not pinned by the project, so CMake falls back
 # to nvcc's default architecture and needs no device to detect one.
 
@@ -43,6 +46,8 @@ jobs:
   lightsim2grid:
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    outputs:
+      sha: ${{ steps.ls2g.outputs.sha }}
     steps:
       - name: Install system packages
         run: |
@@ -178,3 +183,46 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$CUDSS_WHEEL_ROOT/lib:${LD_LIBRARY_PATH:-}"
           pytest tests/python -m "not slow" -q -p no:cacheprovider
+
+  # ---------------------------------------------------------------------------
+  # Run the real GPU test suite on Modal (one leg: CUDA 13, FP64, T4), see
+  # ci/modal/gpu_tests.py. Opt-in, since it costs money: manual dispatch,
+  # pushes to main, and PRs labelled `gpu-ci` (the label is read on the next
+  # push to the PR). Needs the MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets,
+  # which GitHub does not expose to PRs from forks.
+  # ---------------------------------------------------------------------------
+  gpu-tests:
+    name: gpu tests (Modal, CUDA 13.4.2, fp64, T4)
+    needs: [lightsim2grid, build]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      contains(github.event.pull_request.labels.*.name, 'gpu-ci')
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      G2G_CUDA: "13.4.2"
+      G2G_PRECISION: fp64
+      G2G_GPU: T4
+      # Same lightsim2grid commit the build jobs compiled against.
+      LS2G_SHA: ${{ needs.lightsim2grid.outputs.sha }}
+    steps:
+      - name: Check Modal credentials
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets are not set"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal
+        run: pip install -q modal
+
+      - name: Run GPU tests on Modal
+        run: modal run ci/modal/gpu_tests.py
