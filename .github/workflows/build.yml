@@ -5,8 +5,11 @@
 # `requires_gpu` (conftest.py) is skipped, but all test modules are still
 # imported and any pure-Python test still runs.
 #
-# CMAKE_CUDA_ARCHITECTURES is not pinned by the project, so CMake falls back
-# to nvcc's default architecture and needs no device to detect one.
+# The GPU tests themselves run in the opt-in `gpu-tests` job at the end, on
+# Modal (ci/modal/gpu_tests.py), from the CUDA 13 / FP64 leg's wheel.
+#
+# CMAKE_CUDA_ARCHITECTURES is not pinned by the project; CI sets it to 75
+# (the T4 of the gpu-tests job), so no device is needed to detect one.
 
 name: build
 
@@ -154,11 +157,24 @@ jobs:
         env:
           # The cuDSS wheel ships no CMake config; ci/cmake/cudss provides one.
           cudss_DIR: ${{ github.workspace }}/ci/cmake/cudss
-          CMAKE_ARGS: -DGPUSIM2GRID_SUITESPARSE_DIR=/opt/ls2g-dist/SuiteSparse
+          # sm_75 = the T4 the gpu-tests job runs this leg's wheel on (a valid
+          # target for both CUDA 12 and 13).
+          CMAKE_ARGS: >-
+            -DGPUSIM2GRID_SUITESPARSE_DIR=/opt/ls2g-dist/SuiteSparse
+            -DCMAKE_CUDA_ARCHITECTURES=75
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
         run: |
           export ${{ matrix.precision_env }}=1
-          pip install -v --no-build-isolation .
+          pip wheel -v --no-build-isolation --no-deps -w dist .
+          pip install dist/gpusim2grid-*.whl
+
+      - name: Upload the wheel for the GPU tests
+        if: matrix.cuda == '13.4.2' && matrix.precision == 'fp64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpusim2grid-wheel-cu13-fp64
+          path: dist/gpusim2grid-*.whl
+          retention-days: 1
 
       - name: Check the installed extension
         run: |
@@ -178,3 +194,65 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$CUDSS_WHEEL_ROOT/lib:${LD_LIBRARY_PATH:-}"
           pytest tests/python -m "not slow" -q -p no:cacheprovider
+
+  # ---------------------------------------------------------------------------
+  # Run the real GPU test suite on Modal (one leg: CUDA 13, FP64, T4), see
+  # ci/modal/gpu_tests.py. Nothing is compiled there: the wheels built above
+  # are installed into a cached image and only pytest runs on the GPU.
+  # Opt-in, since it costs money: manual dispatch, pushes to main, and PRs
+  # labelled `gpu-ci` (the label is read on the next push to the PR). Needs
+  # the MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets, which GitHub does not
+  # expose to PRs from forks.
+  # ---------------------------------------------------------------------------
+  gpu-tests:
+    name: gpu tests (Modal, CUDA 13.4.2, fp64, T4)
+    needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      contains(github.event.pull_request.labels.*.name, 'gpu-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      G2G_CUDA: "13.4.2"
+      G2G_PRECISION: fp64
+      G2G_GPU: T4
+      G2G_WHEELS: ${{ github.workspace }}/wheels
+    steps:
+      - name: Check Modal credentials
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets are not set"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Download the gpusim2grid wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: gpusim2grid-wheel-cu13-fp64
+          path: wheels
+
+      - name: Download the lightsim2grid build
+        uses: actions/download-artifact@v4
+        with:
+          name: lightsim2grid-dist
+          path: ls2g-dist
+
+      - name: Collect the wheels
+        run: |
+          mv ls2g-dist/wheels/lightsim2grid-*.whl wheels/
+          ls -l wheels
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal
+        run: pip install -q modal
+
+      - name: Run GPU tests on Modal
+        run: modal run ci/modal/gpu_tests.py
