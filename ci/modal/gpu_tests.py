@@ -38,9 +38,6 @@ CUDA_MAJOR = CUDA.split(".")[0]
 # Must match the Python the wheels were built with (ubuntu22.04's python3.10).
 PY = "3.10"
 
-REPO = Path(__file__).resolve().parents[2]
-WHEELS = os.environ.get("G2G_WHEELS", str(REPO / "ci" / "modal" / "wheels"))
-
 image = (
     # The runtime image ships cuSPARSE/cuBLAS/cuSOLVER, no compiler needed.
     modal.Image.from_registry(f"nvidia/cuda:{CUDA}-runtime-ubuntu22.04", add_python=PY)
@@ -50,12 +47,19 @@ image = (
     .pip_install("torch", index_url="https://download.pytorch.org/whl/"
                  + {"12": "cu126", "13": "cu130"}[CUDA_MAJOR])
     .env({"G2G_CUDA": CUDA, "G2G_PRECISION": PRECISION, "G2G_GPU": GPU})
+)
+# Local paths only exist on the machine calling `modal run`: inside the
+# container this file is /root/gpu_tests.py, where parents[2] does not exist.
+if modal.is_local():
+    REPO = Path(__file__).resolve().parents[2]
+    WHEELS = os.environ.get("G2G_WHEELS", str(REPO / "ci" / "modal" / "wheels"))
     # Mounted at container start (no copy=True): changing them never rebuilds
     # the image above.
-    .add_local_dir(WHEELS, "/wheels")
-    .add_local_dir(REPO / "tests" / "python", "/root/tests/python",
-                   ignore=["**/__pycache__"])
-)
+    image = (
+        image.add_local_dir(WHEELS, "/wheels")
+        .add_local_dir(REPO / "tests" / "python", "/root/tests/python",
+                       ignore=["**/__pycache__"])
+    )
 
 app = modal.App("gpusim2grid-gpu-tests")
 
