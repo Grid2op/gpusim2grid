@@ -1,24 +1,26 @@
 """Run the GPU test suite on a real GPU, via Modal (https://modal.com).
 
 The build CI (.github/workflows/build.yml) compiles on GPU-less runners, so
-every `requires_gpu` test skips there. This script builds the same stack in
-an image on Modal and runs pytest on an actual GPU:
+every `requires_gpu` test skips there. This script runs that suite on a GPU,
+and *only* runs it: nothing is compiled on Modal. It installs the wheels the
+build jobs already produced (lightsim2grid + gpusim2grid, CUDA 13, FP64,
+sm_75) into a prebuilt image and calls pytest:
 
-    pip install modal && modal token new      # once
-    modal run ci/modal/gpu_tests.py           # CUDA 13, FP64, T4, full suite
-    modal run ci/modal/gpu_tests.py --pytest-args "-m 'not slow' -x"
+    G2G_WHEELS=path/to/wheels modal run ci/modal/gpu_tests.py
+    G2G_WHEELS=... modal run ci/modal/gpu_tests.py --pytest-args "-x -k contingency"
 
-The configuration is read from environment variables at *image definition*
-time and baked into the image with `.env()`, so the module re-imported inside
-the container sees the same values:
+G2G_WHEELS is a directory holding one lightsim2grid and one gpusim2grid
+wheel (the `lightsim2grid-dist` and `gpusim2grid-wheel-cu13-fp64` artifacts
+of a build run). The image below never changes with the code, so Modal
+builds it once and every later run goes straight to the tests; the wheels
+and tests/python are mounted into the container when it starts.
 
-    G2G_CUDA       nvidia/cuda image tag version       (default 13.4.2)
-    G2G_PRECISION  fp64 | fp32                         (default fp64)
-    G2G_GPU        Modal GPU type, see GPU_ARCH below  (default T4)
-    LS2G_SHA       lightsim2grid commit or ref         (default master)
+Configuration (read at image-definition time, baked in with `.env()` so the
+module re-imported inside the container sees the same values):
 
-Image layers are cached by Modal: the lightsim2grid layer is rebuilt only
-when LS2G_SHA changes; a change to this repository only redoes the last one.
+    G2G_CUDA       nvidia/cuda runtime image version   (default 13.4.2)
+    G2G_PRECISION  fp64 | fp32, checked against the wheel (default fp64)
+    G2G_GPU        Modal GPU type                      (default T4)
 """
 
 import os
@@ -32,88 +34,62 @@ import modal
 CUDA = os.environ.get("G2G_CUDA", "13.4.2")
 PRECISION = os.environ.get("G2G_PRECISION", "fp64")
 GPU = os.environ.get("G2G_GPU", "T4")
-LS2G_SHA = os.environ.get("LS2G_SHA", "master")
-
-# The project leaves CMAKE_CUDA_ARCHITECTURES unset (nvcc's default arch plus
-# PTX JIT); pin native SASS for the GPU the tests actually run on.
-GPU_ARCH = {"T4": "75", "A10G": "86", "L4": "89", "L40S": "89",
-            "A100": "80", "A100-80GB": "80", "H100": "90"}
-ARCH = GPU_ARCH[GPU]
 CUDA_MAJOR = CUDA.split(".")[0]
-PREC_ENV = {"fp64": "CUDA_REAL_DOUBLE", "fp32": "CUDA_REAL_FLOAT"}[PRECISION]
+# Must match the Python the wheels were built with (ubuntu22.04's python3.10).
+PY = "3.10"
 
-PY = "3.12"
-SITE = f"/usr/local/lib/python{PY}/site-packages"
-# nvidia-cudss-cuXX installs under <site-packages>/nvidia/cuXX; it ships no
-# CMake config, ci/cmake/cudss is the shim the build CI uses too.
-CUDSS_ROOT = f"{SITE}/nvidia/cu{CUDA_MAJOR}"
-SRC = "/root/gpusim2grid"
 REPO = Path(__file__).resolve().parents[2]
+WHEELS = os.environ.get("G2G_WHEELS", str(REPO / "ci" / "modal" / "wheels"))
 
 image = (
-    modal.Image.from_registry(f"nvidia/cuda:{CUDA}-devel-ubuntu22.04", add_python=PY)
-    # The Modal base environment exports CXX=clang++, which the CUDA image does
-    # not ship; build with the image's gcc, as the GitHub build jobs do.
-    .env({"CC": "gcc", "CXX": "g++", "CUDAHOSTCXX": "g++"})
-    .apt_install("git", "cmake", "build-essential")
-    .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8", "scikit-build-core", "pybind11",
-                 "numpy", "scipy", "pytest", "pandapower", "pypowsybl",
-                 "setuptools", "wheel")
+    # The runtime image ships cuSPARSE/cuBLAS/cuSOLVER, no compiler needed.
+    modal.Image.from_registry(f"nvidia/cuda:{CUDA}-runtime-ubuntu22.04", add_python=PY)
+    .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8", "numpy", "scipy", "pytest",
+                 "pytest-timeout", "pandapower", "pypowsybl")
     # Enables the DLPack / differentiable tests (importorskip("torch") otherwise).
     .pip_install("torch", index_url="https://download.pytorch.org/whl/"
                  + {"12": "cu126", "13": "cu130"}[CUDA_MAJOR])
-    # lightsim2grid from source: gpusim2grid's C++ bridge builds against it.
-    .run_commands(
-        "git init -q /opt/ls2g && cd /opt/ls2g"
-        " && git remote add origin https://github.com/Grid2op/lightsim2grid"
-        f" && git fetch -q --depth 1 origin {LS2G_SHA} && git checkout -q FETCH_HEAD"
-        " && git submodule update --init --depth 1 SuiteSparse eigen"
-        " && CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) pip install --no-build-isolation ."
-    )
-    .env({
-        "G2G_CUDA": CUDA, "G2G_PRECISION": PRECISION, "G2G_GPU": GPU,
-        "LS2G_SHA": LS2G_SHA,
-        PREC_ENV: "1",
-        "CUDSS_WHEEL_ROOT": CUDSS_ROOT,
-        "cudss_DIR": f"{SRC}/ci/cmake/cudss",
-        "CMAKE_ARGS": f"-DCMAKE_CUDA_ARCHITECTURES={ARCH}"
-                      " -DGPUSIM2GRID_SUITESPARSE_DIR=/opt/ls2g/SuiteSparse",
-        # Keep the nvidia/cuda image's own entries (driver library path).
-        "LD_LIBRARY_PATH": f"{CUDSS_ROOT}/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
-    })
-    # Repository last, so a code change only rebuilds this layer.
-    .add_local_dir(REPO, SRC, copy=True,
-                   ignore=[".git", "build", "dist", "_skbuild", "**/__pycache__",
-                           "**/*.egg-info", "**/*.so"])
-    .run_commands(f"cd {SRC} && CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"
-                  " pip install -v --no-build-isolation .")
+    .env({"G2G_CUDA": CUDA, "G2G_PRECISION": PRECISION, "G2G_GPU": GPU})
+    # Mounted at container start (no copy=True): changing them never rebuilds
+    # the image above.
+    .add_local_dir(WHEELS, "/wheels")
+    .add_local_dir(REPO / "tests" / "python", "/root/tests/python",
+                   ignore=["**/__pycache__"])
 )
 
 app = modal.App("gpusim2grid-gpu-tests")
 
 
-@app.function(image=image, gpu=GPU, timeout=3600)
+@app.function(image=image, gpu=GPU, timeout=20 * 60)
 def run_tests(pytest_args: str) -> int:
     subprocess.run(["nvidia-smi"], check=True)
+    wheels = sorted(str(p) for p in Path("/wheels").glob("*.whl"))
+    print("installing", *wheels, sep="\n  ", flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", *wheels],
+                   check=True)
 
-    # Guard against a green run where every requires_gpu test just skipped.
-    sys.path.insert(0, f"{SRC}/tests/python")
-    from conftest import _cuda_device_count
-    if _cuda_device_count() == 0:
-        raise RuntimeError("no CUDA device visible (driver too old for "
-                           f"CUDA {CUDA}?) -- see nvidia-smi output above")
+    import importlib
+    cudss = list(importlib.import_module(f"nvidia.cu{CUDA_MAJOR}").__path__)[0]
+    env = dict(os.environ,
+               LD_LIBRARY_PATH=f"{cudss}/lib:" + os.environ.get("LD_LIBRARY_PATH", ""))
 
-    from gpusim2grid import _gpusim2grid as m
-    print(f"gpusim2grid: CUDA {CUDA}, {PRECISION}, sm_{ARCH} on {GPU}, "
-          f"is_fp32={m.is_fp32}", flush=True)
-    if bool(m.is_fp32) != (PRECISION == "fp32"):
-        raise RuntimeError("extension compiled with the wrong precision")
+    # Refuse a green run where every requires_gpu test just skipped, or a
+    # wheel of the wrong precision.
+    check = (
+        "import sys; sys.path.insert(0, 'tests/python')\n"
+        "from conftest import _cuda_device_count\n"
+        "assert _cuda_device_count() > 0, 'no CUDA device visible (driver too old?)'\n"
+        "from gpusim2grid import _gpusim2grid as m\n"
+        f"assert bool(m.is_fp32) == {PRECISION == 'fp32'}, 'wrong precision'\n"
+        "print('gpusim2grid is_fp32 =', m.is_fp32)\n"
+    )
+    subprocess.run([sys.executable, "-c", check], cwd="/root", env=env, check=True)
 
-    # From the source tree so conftest.py/pytest.ini apply; the installed
-    # package still wins (src/ layout, the tree has no importable gpusim2grid).
+    # --timeout turns a hang into a failure; --durations shows where time goes.
     cmd = [sys.executable, "-m", "pytest", "tests/python", "-rs",
-           "-p", "no:cacheprovider", *shlex.split(pytest_args)]
-    return subprocess.run(cmd, cwd=SRC).returncode
+           "-p", "no:cacheprovider", "--timeout=300", "--durations=25",
+           *shlex.split(pytest_args)]
+    return subprocess.run(cmd, cwd="/root", env=env).returncode
 
 
 @app.local_entrypoint()
