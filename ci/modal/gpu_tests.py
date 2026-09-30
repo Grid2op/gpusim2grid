@@ -52,6 +52,9 @@ REPO = Path(__file__).resolve().parents[2]
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{CUDA}-devel-ubuntu22.04", add_python=PY)
+    # The Modal base environment exports CXX=clang++, which the CUDA image does
+    # not ship; build with the image's gcc, as the GitHub build jobs do.
+    .env({"CC": "gcc", "CXX": "g++", "CUDAHOSTCXX": "g++"})
     .apt_install("git", "cmake", "build-essential")
     .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8", "scikit-build-core", "pybind11",
                  "numpy", "scipy", "pytest", "pandapower", "pypowsybl",
