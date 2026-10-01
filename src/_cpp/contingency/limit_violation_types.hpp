@@ -88,7 +88,17 @@ enum class LimitViolationType  : int {
     // check_gen_pv_release_violations_kernel (the SVC entries of its plan).
     LOW_VOLTAGE_SVC_STANDBY = 11,
     // ... and the mirror: regulated bus ABOVE the high threshold.
-    HIGH_VOLTAGE_SVC_STANDBY = 12
+    HIGH_VOLTAGE_SVC_STANDBY = 12,
+    // A generator regulating a REMOTE bus whose OWN bus sits BELOW the
+    // realistic range the caller set (lightsim2grid's
+    // LSGrid::set_remote_voltage_control_vm_range): OpenLoadFlow's robust
+    // remote voltage control would switch it to PQ. element_type GENERATOR,
+    // value its own bus' voltage and limit the bound, both in kV. Written by
+    // check_gen_pv_release_violations_kernel (the remote control entries of
+    // its plan).
+    LOW_VOLTAGE_REMOTE_CONTROL = 13,
+    // ... and the mirror: own bus ABOVE the range.
+    HIGH_VOLTAGE_REMOTE_CONTROL = 14
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -98,7 +108,8 @@ enum class LimitViolationType  : int {
 //                 converged solution is not physically realizable (LOW_Q,
 //                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
 //                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
-//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY).
+//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
+//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
 enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
 
@@ -117,6 +128,8 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::HIGH_VOLTAGE_AT_MAX_Q:
         case LimitViolationType::LOW_VOLTAGE_SVC_STANDBY:
         case LimitViolationType::HIGH_VOLTAGE_SVC_STANDBY:
+        case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
+        case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
             return ViolationCategory::PHYSICAL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;
@@ -134,7 +147,8 @@ constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
 constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
 constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
 // LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q (generators), then
-// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan)
-constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 4;
+// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan),
+// then LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL (its remote control entries)
+constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 6;
 
 #endif  // LIMIT_VIOLATION_TYPES_HPP

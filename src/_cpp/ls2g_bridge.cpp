@@ -20,6 +20,10 @@
 #include <batch_algorithm/SvcStandbyCheck.hpp>   // ls2g::svc_standby_check (LSGrid::set_svc_standby)
 #define GPUSIM2GRID_HAVE_LS2G_SVC_STANDBY 1
 #endif
+#if __has_include(<batch_algorithm/RemoteVoltageControlCheck.hpp>)
+#include <batch_algorithm/RemoteVoltageControlCheck.hpp>   // ls2g::remote_voltage_control_check (LSGrid::set_remote_voltage_control_vm_range)
+#define GPUSIM2GRID_HAVE_LS2G_REMOTE_VOLTAGE_CONTROL 1
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -1181,8 +1185,39 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
             target.push_back(static_cast<double>(low ? e.low_vm_pu : e.high_vm_pu));
             vn.push_back(static_cast<double>(e.vn_kv));
             el_type.push_back(GenPvReleasePlanData::EL_SVC);
-            standby.push_back(1);
+            standby.push_back(GenPvReleasePlanData::CHECK_SVC_STANDBY);
             side.push_back(0);
+        }
+    }
+#endif
+#ifdef GPUSIM2GRID_HAVE_LS2G_REMOTE_VOLTAGE_CONTROL
+    // the generators holding a remote bus, when the caller set a realistic range
+    // (LSGrid::set_remote_voltage_control_vm_range), lightsim2grid's own selection on the
+    // voltage-control plan of this labelling: one entry per finite bound, on the
+    // generator's OWN bus (see gen_pv_release_check_data.hpp)
+    {
+        ls2g::VoltageControlSolverData vc;
+        grid.fill_voltage_control_solver_data(vc, /*ac=*/true);
+        ls2g::remote_voltage_control_check::RemoteVoltageControlPlan rc_plan;
+        ls2g::remote_voltage_control_check::build_remote_voltage_control_plan(
+            grid, grid.id_me_to_ac_solver(), vc, rc_plan);
+        for (const ls2g::remote_voltage_control_check::RemoteVoltageControlEntry& e : rc_plan.gens) {
+            if (e.gen_bus_solver < 0 || e.gen_bus_solver >= n_bus_solver) continue;
+            if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;
+            for (int bound = 0; bound < 2; ++bound) {
+                const bool low = (bound == 0);
+                const double vm_bound = static_cast<double>(low ? rc_plan.min_vm_pu : rc_plan.max_vm_pu);
+                if (!std::isfinite(vm_bound)) continue;
+                gen_id.push_back(e.gen_id);
+                reg_bus.push_back(e.gen_bus_solver);   // the bus checked: its own
+                gen_bus.push_back(e.reg_bus_solver);   // the remote one, for its mask
+                at_min.push_back(low ? 1 : 0);
+                target.push_back(vm_bound);
+                vn.push_back(static_cast<double>(e.vn_kv));
+                el_type.push_back(GenPvReleasePlanData::EL_GENERATOR);
+                standby.push_back(GenPvReleasePlanData::CHECK_REMOTE_CONTROL);
+                side.push_back(0);
+            }
         }
     }
 #endif

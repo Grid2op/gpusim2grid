@@ -221,7 +221,12 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "carrying a standby automaton (LSGrid.set_svc_standby) is two entries with "
         "standby = 1 (optional, empty = none): at_min = 1 with target_vm_pu its low "
         "threshold, at_min = 0 with its high one, reported as LOW_VOLTAGE_SVC_STANDBY / "
-        "HIGH_VOLTAGE_SVC_STANDBY.")
+        "HIGH_VOLTAGE_SVC_STANDBY. A generator holding a remote bus, when a realistic range "
+        "is set (LSGrid.set_remote_voltage_control_vm_range), is up to two GENERATOR entries "
+        "with standby = 2: reg_bus_solver its OWN bus (the one checked), gen_bus_solver the "
+        "remote bus (only its mask matters), at_min = 1 with target_vm_pu the low bound and "
+        "at_min = 0 with the high one, reported as LOW_VOLTAGE_REMOTE_CONTROL / "
+        "HIGH_VOLTAGE_REMOTE_CONTROL.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> gen_id,
                                Eigen::Ref<const Eigen::VectorXi> reg_bus_solver,
@@ -526,12 +531,14 @@ static void bind_physical_checks_types(pybind11::module_& m)
     pybind11::class_<GenPvReleaseViolationsResult>(m, "GenPvReleaseViolationsResult",
         "Flat per-row records of the PQ -> PV release check, same layout as "
         "BusQViolationsResult (groups LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, "
-        "LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY, each ranked by |value / limit "
+        "LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL, "
+        "HIGH_VOLTAGE_REMOTE_CONTROL, each ranked by |value / limit "
         "- 1|): gen_id the element id, of element type el_type (5 GENERATOR, or 7 SVC for "
         "a frozen SVC's release or a standby SVC's switch on), type 9 "
         "(LOW_VOLTAGE_AT_MIN_Q) / 10 (HIGH_VOLTAGE_AT_MAX_Q) / 11 / 12 (the standby "
-        "ones), value the voltage of the bus it would regulate and limit the target it "
-        "would hold (the threshold for a standby SVC), both in kV.")
+        "ones) / 13 / 14 (a remote controller's own bus), value the voltage of the bus it "
+        "would regulate (its own bus for 13 / 14) and limit the target it would hold (the "
+        "threshold for a standby SVC, the realistic bound for 13 / 14), both in kV.")
         .def_readonly("gen_id",    &GenPvReleaseViolationsResult::gen_id)
         .def_readonly("type",      &GenPvReleaseViolationsResult::type)
         .def_readonly("el_type",   &GenPvReleaseViolationsResult::el_type)

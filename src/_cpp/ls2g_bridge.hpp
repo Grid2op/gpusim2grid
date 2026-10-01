@@ -262,7 +262,11 @@ GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
 // (solver bus numbering), followed by the idle standby SVCs the caller flagged
 // with LSGrid::set_svc_standby (lightsim2grid's own build_svc_standby_plan, two
 // entries each, el_type SVC; only when the lightsim2grid built against has
-// SvcStandbyCheck.hpp). Empty when nothing is flagged. Throws when the
+// SvcStandbyCheck.hpp), then the generators holding a remote bus when the
+// caller set a realistic range (LSGrid::set_remote_voltage_control_vm_range,
+// lightsim2grid's own build_remote_voltage_control_plan, one entry per bound,
+// standby = 2; only when the lightsim2grid built against has
+// RemoteVoltageControlCheck.hpp). Empty when nothing is flagged. Throws when the
 // lightsim2grid built against predates PR #216.
 GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid& grid,
                                                              int n_bus_solver, double tol_mva);

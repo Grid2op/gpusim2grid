@@ -208,8 +208,10 @@ def build_context(grid, sweep):
     ctx.bq = _plan_arrays_bq(sess.physical_checks.bus_q_plan)
     ctx.gr = _plan_arrays_gr(sess.physical_checks.gen_pv_release_plan)
     ctx.bq_entry_of_bus = {int(b): k for k, b in enumerate(ctx.bq["bus_solver"])}
-    ctx.gr_entry_of_gen = {int(g): k for k, (g, e) in enumerate(zip(ctx.gr["gen_id"], ctx.gr["el_type"]))
-                           if int(e) == _EL_GEN}
+    # the releases only: a remote voltage control entry (standby 2) names a generator too
+    ctx.gr_entry_of_gen = {int(g): k for k, (g, e, c) in enumerate(zip(ctx.gr["gen_id"], ctx.gr["el_type"],
+                                                                       ctx.gr["standby"]))
+                           if int(e) == _EL_GEN and int(c) == 0}
     ctx.vc_ctrl_bus = np.asarray(sess.vc_ctrl_bus, dtype=np.int64)
     ctx.vc_ctrl_kind = np.asarray(sess.vc_ctrl_kind, dtype=np.int64)
     ctx.vc_ctrl_group = np.asarray(sess.vc_ctrl_group, dtype=np.int64)

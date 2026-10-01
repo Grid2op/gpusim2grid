@@ -50,6 +50,12 @@ constexpr int VIOL_HIGH_VOLTAGE_AT_MAX_Q = 10;
 // the standby SVC check, on the SVC entries of the same plan (see limit_violation_types.hpp)
 constexpr int VIOL_LOW_VOLTAGE_SVC_STANDBY  = 11;
 constexpr int VIOL_HIGH_VOLTAGE_SVC_STANDBY = 12;
+// the remote voltage control check, on the remote control entries of the same plan
+constexpr int VIOL_LOW_VOLTAGE_REMOTE_CONTROL  = 13;
+constexpr int VIOL_HIGH_VOLTAGE_REMOTE_CONTROL = 14;
+// the `standby` column of the release plan (GenPvReleasePlanData::CHECK_*)
+constexpr int CHECK_SVC_STANDBY    = 1;
+constexpr int CHECK_REMOTE_CONTROL = 2;
 
 // check_limit_violations_kernel's record groups, in output order (one per
 // type; see N_OPERATIONAL_VIOLATION_GROUPS)
@@ -601,7 +607,8 @@ __global__ void check_gen_pv_release_violations_kernel(
     const unsigned char* skip = d_row_skip ? d_row_skip + static_cast<ptrdiff_t>(out_c) * skip_stride : nullptr;
     // groups: LOW_VOLTAGE_AT_MIN_Q (0), HIGH_VOLTAGE_AT_MAX_Q (1) on the generators and
     // the frozen SVCs, LOW_VOLTAGE_SVC_STANDBY (2), HIGH_VOLTAGE_SVC_STANDBY (3) on the
-    // standby SVCs
+    // standby SVCs, LOW_VOLTAGE_REMOTE_CONTROL (4), HIGH_VOLTAGE_REMOTE_CONTROL (5) on the
+    // remote controllers
     auto topk = make_topk<N_GEN_PV_RELEASE_VIOLATION_GROUPS>(
         base, K, d_out_value, d_out_limit, SevRatio{},
         [&](ptrdiff_t dst, ptrdiff_t src) {
@@ -628,7 +635,11 @@ __global__ void check_gen_pv_release_violations_kernel(
         // station): no row disconnects it nor moves its target / thresholds
         const int el = (d_el_type != nullptr) ? d_el_type[k] : ELEM_GENERATOR;
         const bool is_gen = (el == ELEM_GENERATOR);
-        const bool is_standby = (el == ELEM_SVC) && (d_standby != nullptr) && (d_standby[k] != 0);
+        const int check = (d_standby != nullptr) ? d_standby[k] : 0;
+        const bool is_standby = (el == ELEM_SVC) && (check == CHECK_SVC_STANDBY);
+        // a generator holding a remote bus: its own bus (d_reg_bus) against a fixed bound,
+        // the remote one (d_gen_bus) only for its mask
+        const bool is_remote = is_gen && (check == CHECK_REMOTE_CONTROL);
         const int side = (d_side != nullptr) ? d_side[k] : 0;
         if (is_gen && off != nullptr && gid < n_gen && off[gid]) continue;   // disconnected by the row
         const cudaComplexType Vr = V[d_reg_bus[k]];
@@ -636,7 +647,7 @@ __global__ void check_gen_pv_release_violations_kernel(
         // masked (stranded) regulated bus or own bus: nothing to release
         if (!isfinite(Vr.x) || !isfinite(Vr.y) || !isfinite(Vg.x) || !isfinite(Vg.y)) continue;
         cuda_real_type target = d_target_base[k];
-        if (is_gen && tgt != nullptr) {
+        if (is_gen && !is_remote && tgt != nullptr) {
             const cuda_real_type t_row = tgt[k];
             if (!isnan(t_row)) target = t_row;
         }
@@ -647,12 +658,14 @@ __global__ void check_gen_pv_release_violations_kernel(
             // a generator absorbing all it can, still below the target: absorbs too
             // much; an idle SVC below its low threshold: its automaton switches it on
             if (vm < target - tol_vm_pu) {
-                if (is_standby) push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
-                else            push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, el, side, vm * vn, target * vn);
+                if (is_standby)     push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
+                else if (is_remote) push(4, gid, VIOL_LOW_VOLTAGE_REMOTE_CONTROL, el, side, vm * vn, target * vn);
+                else                push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, el, side, vm * vn, target * vn);
             }
         } else if (vm > target + tol_vm_pu) {
-            if (is_standby) push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
-            else            push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, el, side, vm * vn, target * vn);
+            if (is_standby)     push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
+            else if (is_remote) push(5, gid, VIOL_HIGH_VOLTAGE_REMOTE_CONTROL, el, side, vm * vn, target * vn);
+            else                push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, el, side, vm * vn, target * vn);
         }
     }
 

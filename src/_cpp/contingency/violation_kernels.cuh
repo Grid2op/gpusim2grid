@@ -350,12 +350,18 @@ __global__ void check_hvdc_p_violations_kernel(
 // is on (5 GENERATOR / 7 SVC / 4 HVDC), d_out_gen_id its id and d_out_side its
 // side (the station's end for an HVDC one, 0 otherwise). An HVDC entry (a VSC
 // station frozen at a reactive limit) runs the generators' test, never masked
-// by d_gen_off nor moved by d_targets.
+// by d_gen_off nor moved by d_targets. A GENERATOR entry whose d_standby is 2
+// is a generator holding a remote bus (lightsim2grid's
+// RemoteVoltageControlCheck.hpp): its own bus -- d_reg_bus for that entry, the
+// remote one in d_gen_bus only for its mask -- against the low (at_min) / high
+// realistic bound, masked by d_gen_off but never moved by d_targets, reported
+// as LOW_VOLTAGE_REMOTE_CONTROL (13) / HIGH_VOLTAGE_REMOTE_CONTROL (14).
 // d_row_skip[out_c * skip_stride + k] != 0 (nullptr = none) leaves entry k
 // unchecked on that row (a machine the reactive-limit outer loop released
-// there, or an entry the pass added for a bus it did not switch). Four groups
+// there, or an entry the pass added for a bus it did not switch). Six groups
 // (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
-// HIGH_VOLTAGE_SVC_STANDBY), each keeping the K largest |value / limit - 1|
+// HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL,
+// HIGH_VOLTAGE_REMOTE_CONTROL), each keeping the K largest |value / limit - 1|
 // (a relative measure, like every voltage check), most severe first. Same row gate / result map / capacity / sentinel
 // conventions as check_bus_q_violations_kernel above.
 // -----------------------------------------------------------------------------
@@ -371,7 +377,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cuda_real_type*  __restrict__ d_target_base,
     const cuda_real_type*  __restrict__ d_vn_kv,
     const int*             __restrict__ d_el_type,      // [n_entries] 5 / 7, or nullptr = all generators
-    const int*             __restrict__ d_standby,      // [n_entries] 1 = standby SVC entry, or nullptr = none
+    const int*             __restrict__ d_standby,      // [n_entries] CHECK_* code (1 standby SVC, 2 remote control), or nullptr = all releases
     const int*             __restrict__ d_side,         // [n_entries] 1 / 2 for an HVDC entry, or nullptr = all 0
     const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
     int                                 n_gen,

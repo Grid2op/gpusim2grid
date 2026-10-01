@@ -3,6 +3,9 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] Report a generator holding a remote bus from an unrealistic own-bus voltage
+  (``LOW_VOLTAGE_REMOTE_CONTROL`` / ``HIGH_VOLTAGE_REMOTE_CONTROL``), lightsim2grid's
+  ``set_remote_voltage_control_vm_range``, as OpenLoadFlow's robust remote voltage control does.
 - [ADDED] ``ContingencyAnalysisGPU(reactive_limits_outer_loop=True)`` (opt-in): one pass of
   OpenLoadFlow's ``ReactiveLimits`` loop, re-solving the contingencies a PV bus or a local release
   flags (``get_outer_loop_status``).
