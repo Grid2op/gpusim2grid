@@ -128,6 +128,12 @@ class LimitViolationType(IntEnum):
     LOW_VOLTAGE_REMOTE_CONTROL = 13
     #: ... and the mirror: own bus ABOVE the range.
     HIGH_VOLTAGE_REMOTE_CONTROL = 14
+    #: An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
+    #: ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop, from the row's angles,
+    #: asks for less than that limit: OpenLoadFlow would have left it in AC
+    #: emulation. Category PHYSICAL. side the frozen direction, value that flow,
+    #: limit the pmax, MW.
+    HVDC_AC_EMULATION_RELEASE = 15
 
 
 class ViolationCategory(IntEnum):
@@ -143,7 +149,7 @@ class ViolationCategory(IntEnum):
         cannot happen. LOW_Q, HIGH_Q, HIGH_P (= HVDC_P_SATURATION), LOW_P,
         LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
         HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL,
-        HIGH_VOLTAGE_REMOTE_CONTROL.
+        HIGH_VOLTAGE_REMOTE_CONTROL, HVDC_AC_EMULATION_RELEASE.
     SOLVER : not a limit at all, what the solver did. NOT_SIMULATED, DIVERGENCE.
     """
     OPERATIONAL = 0
@@ -164,7 +170,8 @@ def violation_category(violation_type):
              LimitViolationType.LOW_VOLTAGE_SVC_STANDBY,
              LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY,
              LimitViolationType.LOW_VOLTAGE_REMOTE_CONTROL,
-             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL):
+             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL,
+             LimitViolationType.HVDC_AC_EMULATION_RELEASE):
         return ViolationCategory.PHYSICAL
     return ViolationCategory.SOLVER
 
@@ -199,6 +206,9 @@ class LimitViolation:
         element_id the grid hvdc id, side 1 (would saturate 1->2: the flow
         leaving bus 1 exceeds pmax_1to2) or 2 (2->1), value that flow (MW),
         limit pmax (MW).
+    HVDC_AC_EMULATION_RELEASE (``compute_physical_violations``) : element_type
+        HVDC, a line frozen at its AC-emulation limit whose droop asks for less:
+        side its frozen direction, value that flow (MW), limit pmax (MW).
     LOW_P / HIGH_P on a GENERATOR / STORAGE (``compute_physical_violations``) :
         element_id the container id of that family, side 0, value the
         machine's converged active power -- its target plus its share of the
@@ -244,10 +254,10 @@ def bus_q_violations_from_result(res):
 def hvdc_p_violations_from_result(res):
     """list[list[LimitViolation]] from an ``HvdcPViolationsResult`` (the raw
     output of ``get_hvdc_p_violations[_n]()`` on a batch session)."""
-    hvdc_id, side, value, limit = res.hvdc_id, res.side, res.value, res.limit
+    hvdc_id, side, vtype, value, limit = res.hvdc_id, res.side, res.type, res.value, res.limit
     return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
         ViolationElementType.HVDC, int(hvdc_id[i]), int(side[i]),
-        LimitViolationType.HVDC_P_SATURATION, float(value[i]), float(limit[i])))
+        LimitViolationType(int(vtype[i])), float(value[i]), float(limit[i])))
 
 
 def gen_p_violations_from_result(res):

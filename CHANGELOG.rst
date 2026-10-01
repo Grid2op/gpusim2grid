@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] Report an hvdc line frozen at its AC-emulation limit whose droop asks for less
+  (``HVDC_AC_EMULATION_RELEASE``, lightsim2grid's ``set_hvdc_ac_emulation_frozen``).
 - [FIXED] ``redistribute_slack``: a unit capped well beyond its active limit stays there until the
   shift has used that up (lightsim2grid's ``set_gen_can_participate_slack_overshoot``).
 - [ADDED] Report a generator holding a remote bus from an unrealistic own-bus voltage

@@ -88,6 +88,14 @@ struct LedgerData {
     // (array/tuple mode, where there is no other numbering).
     std::vector<int>    hvdc_id;
 
+    // HVDC lines an outer loop froze at their AC-emulation limit (droop off, set-point at
+    // the limit; lightsim2grid's LSGrid::set_hvdc_ac_emulation_frozen). Not part of the
+    // solve: only checked for their release (HVDC_AC_EMULATION_RELEASE). Solver bus
+    // numbering, per-unit; dir +1 frozen 1->2, -1 frozen 2->1, limit the pmax of that
+    // direction; id the grid hvdc id. Empty when none.
+    std::vector<int>    hvdc_frz_bus1, hvdc_frz_bus2, hvdc_frz_dir, hvdc_frz_id;
+    std::vector<double> hvdc_frz_p0, hvdc_frz_k, hvdc_frz_limit;
+
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }
 

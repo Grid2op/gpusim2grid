@@ -719,12 +719,14 @@ void BatchPfDriver<BatchSource>::set_hvdc_p_check(double tol_mw, double sn_mva, 
     const size_t n_out = static_cast<size_t>(n_contingencies) * row_p;
     d_hp_out_hvdc_id.assign(n_out, 0);
     d_hp_out_side.assign(n_out, 0);
+    d_hp_out_type.assign(n_out, 0);
     d_hp_out_value.assign(n_out, cuda_real_type(0));
     d_hp_out_limit.assign(n_out, cuda_real_type(0));
     d_hp_count.assign(static_cast<size_t>(n_contingencies), -1);   // see set_bus_q_check
     d_hp_truncated.assign(static_cast<size_t>(n_contingencies), 0);
     d_hp_n_hvdc_id.assign(row_p, 0);
     d_hp_n_side.assign(row_p, 0);
+    d_hp_n_type.assign(row_p, 0);
     d_hp_n_value.assign(row_p, cuda_real_type(0));
     d_hp_n_limit.assign(row_p, cuda_real_type(0));
     d_hp_n_count.assign(1, 0);
@@ -756,12 +758,21 @@ void BatchPfDriver<BatchSource>::run_hvdc_p_check_n()
         thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
         thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
         thrust::raw_pointer_cast(base.d_hvdc_id.data()),
+        base.n_hvdc_frz,
+        thrust::raw_pointer_cast(base.d_hvdc_frz_bus1.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_frz_bus2.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_frz_dir.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_frz_id.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_frz_p0.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_frz_k.data()),
+        thrust::raw_pointer_cast(base.d_hvdc_frz_limit.data()),
         hvdc_p_sn_mva_, hvdc_p_tol_pu_,
         base.n_bus,
         /*c_start=*/0, /*actual_batch=*/1, hvdc_p_capacity_,
         /*d_result_map=*/nullptr,
         thrust::raw_pointer_cast(d_hp_n_hvdc_id.data()),
         thrust::raw_pointer_cast(d_hp_n_side.data()),
+        thrust::raw_pointer_cast(d_hp_n_type.data()),
         thrust::raw_pointer_cast(d_hp_n_value.data()),
         thrust::raw_pointer_cast(d_hp_n_limit.data()),
         thrust::raw_pointer_cast(d_hp_n_count.data()),
@@ -1649,12 +1660,21 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(base.d_hvdc_pmax12.data()),
             thrust::raw_pointer_cast(base.d_hvdc_pmax21.data()),
             thrust::raw_pointer_cast(base.d_hvdc_id.data()),
+            base.n_hvdc_frz,
+            thrust::raw_pointer_cast(base.d_hvdc_frz_bus1.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_frz_bus2.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_frz_dir.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_frz_id.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_frz_p0.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_frz_k.data()),
+            thrust::raw_pointer_cast(base.d_hvdc_frz_limit.data()),
             hvdc_p_sn_mva_, hvdc_p_tol_pu_,
             n_bus,
             c_start, actual_batch, hvdc_p_capacity_,
             d_result_map,
             thrust::raw_pointer_cast(d_hp_out_hvdc_id.data()),
             thrust::raw_pointer_cast(d_hp_out_side.data()),
+            thrust::raw_pointer_cast(d_hp_out_type.data()),
             thrust::raw_pointer_cast(d_hp_out_value.data()),
             thrust::raw_pointer_cast(d_hp_out_limit.data()),
             thrust::raw_pointer_cast(d_hp_count.data()),

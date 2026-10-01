@@ -64,12 +64,13 @@ struct BusQViolationsResult {
     int             stride   = 0;   // slots per row in the flat arrays
 };
 
-// Same layout for the droop P-saturation check (one type, so stride ==
-// capacity): hvdc_id is the GRID hvdc id, side 1 (saturates 1->2) or 2
-// (saturates 2->1), value/limit MW. Every record is element type HVDC (4),
-// violation type HVDC_P_SATURATION (7).
+// Same layout for the droop P-saturation check: hvdc_id is the GRID hvdc id, side 1
+// (saturates 1->2) or 2 (saturates 2->1), value/limit MW. Every record is element
+// type HVDC (4); type HVDC_P_SATURATION (7) or, for a line frozen at its
+// AC-emulation limit, HVDC_AC_EMULATION_RELEASE (15, side its frozen direction).
+// Groups: HVDC_P_SATURATION, then HVDC_AC_EMULATION_RELEASE.
 struct HvdcPViolationsResult {
-    Eigen::VectorXi hvdc_id, side;
+    Eigen::VectorXi hvdc_id, side, type;
     RealVect        value, limit;
     Eigen::VectorXi count, truncated;
     int             capacity = 0;

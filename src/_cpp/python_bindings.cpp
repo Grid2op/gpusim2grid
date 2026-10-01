@@ -506,10 +506,12 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "Flat per-row records of the droop hvdc P-saturation check, same layout as "
         "BusQViolationsResult: hvdc_id the GRID hvdc id, side 1 (would saturate 1->2: "
         "p1 > pmax_1to2) or 2 (2->1), value the flow leaving the AC bus into the hvdc "
-        "(MW), limit pmax (MW). Every record is element type HVDC (4), violation type "
-        "HVDC_P_SATURATION (7).")
+        "(MW), limit pmax (MW). Every record is element type HVDC (4); type "
+        "HVDC_P_SATURATION (7) or, for a line frozen at its AC-emulation limit whose droop "
+        "asks for less, HVDC_AC_EMULATION_RELEASE (15, side its frozen direction).")
         .def_readonly("hvdc_id",   &HvdcPViolationsResult::hvdc_id)
         .def_readonly("side",      &HvdcPViolationsResult::side)
+        .def_readonly("type",      &HvdcPViolationsResult::type)
         .def_readonly("value",     &HvdcPViolationsResult::value)
         .def_readonly("limit",     &HvdcPViolationsResult::limit)
         .def_readonly("count",     &HvdcPViolationsResult::count)

@@ -568,6 +568,21 @@ AcPfNrState::AcPfNrState(
     // HVDC angle-droop: per-line raw data + the end P rows / theta-col feature J
     // positions derived from the ledger maps + skeleton. (mirrors Hvdc::register_in
     // / declare_feature_entries; an end at a slack drops the missing row/col.)
+    n_hvdc_frz = ledger != nullptr ? static_cast<int>(ledger->hvdc_frz_bus1.size()) : 0;
+    if (n_hvdc_frz > 0) {
+        auto to_real = [](const std::vector<double>& v) {
+            return std::vector<cuda_real_type>(v.begin(), v.end());
+        };
+        const std::vector<cuda_real_type> p0 = to_real(ledger->hvdc_frz_p0), kk = to_real(ledger->hvdc_frz_k),
+                                          lim = to_real(ledger->hvdc_frz_limit);
+        upload_h2d(d_hvdc_frz_bus1,  ledger->hvdc_frz_bus1.data(), n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_bus2,  ledger->hvdc_frz_bus2.data(), n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_dir,   ledger->hvdc_frz_dir.data(),  n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_id,    ledger->hvdc_frz_id.data(),   n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_p0,    p0.data(),  n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_k,     kk.data(),  n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_limit, lim.data(), n_hvdc_frz, cs);
+    }
     if (ledger != nullptr && ledger->has_hvdc()) {
         // Defensive filter: a droop line should NEVER reach here with either
         // side individually open -- lightsim2grid's own

@@ -37,9 +37,9 @@ constexpr int VIOL_DIVERGENCE   = 4;
 // compute_physical_violations (check_bus_q_violations_kernel)
 constexpr int VIOL_LOW_Q        = 5;
 constexpr int VIOL_HIGH_Q       = 6;
-// compute_physical_violations (check_hvdc_p_violations_kernel) writes no type
-// code at all: every record it emits is element type HVDC (=4), violation type
-// HVDC_P_SATURATION (=7), stamped by the Python session layer.
+// compute_physical_violations (check_hvdc_p_violations_kernel): element type HVDC
+// (=4), violation type HVDC_P_SATURATION (=7, VIOL_HIGH_P below) or, for a line
+// frozen at its limit, VIOL_HVDC_AC_EMULATION_RELEASE.
 // compute_physical_violations (check_gen_p_violations_kernel): HIGH_P is the
 // same code as HVDC_P_SATURATION (lightsim2grid's one name for both).
 constexpr int VIOL_HIGH_P       = 7;
@@ -53,6 +53,7 @@ constexpr int VIOL_HIGH_VOLTAGE_SVC_STANDBY = 12;
 // the remote voltage control check, on the remote control entries of the same plan
 constexpr int VIOL_LOW_VOLTAGE_REMOTE_CONTROL  = 13;
 constexpr int VIOL_HIGH_VOLTAGE_REMOTE_CONTROL = 14;
+constexpr int VIOL_HVDC_AC_EMULATION_RELEASE = 15;
 // the `standby` column of the release plan (GenPvReleasePlanData::CHECK_*)
 constexpr int CHECK_SVC_STANDBY    = 1;
 constexpr int CHECK_REMOTE_CONTROL = 2;
@@ -484,6 +485,14 @@ __global__ void check_hvdc_p_violations_kernel(
     const cuda_real_type*  __restrict__ d_pmax12,
     const cuda_real_type*  __restrict__ d_pmax21,
     const int*             __restrict__ d_hvdc_id,
+    int                                 n_frz,
+    const int*             __restrict__ d_frz_bus1,
+    const int*             __restrict__ d_frz_bus2,
+    const int*             __restrict__ d_frz_dir,
+    const int*             __restrict__ d_frz_id,
+    const cuda_real_type*  __restrict__ d_frz_p0,
+    const cuda_real_type*  __restrict__ d_frz_k,
+    const cuda_real_type*  __restrict__ d_frz_limit,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_pu,
     int n_bus,
@@ -491,6 +500,7 @@ __global__ void check_hvdc_p_violations_kernel(
     const int* __restrict__ d_result_map,
           int*             __restrict__ d_out_hvdc_id,
           int*             __restrict__ d_out_side,
+          int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,
@@ -510,18 +520,20 @@ __global__ void check_hvdc_p_violations_kernel(
     }
 
     const cudaComplexType* V = d_V + local_c * n_bus;
-    // the K largest excesses (one type: HIGH_P, either side)
+    // the K largest excesses per type: HIGH_P (either side), then the releases
     auto topk = make_topk<N_HVDC_P_VIOLATION_GROUPS>(
         base, K, d_out_value, d_out_limit, SevAbs{},
         [&](ptrdiff_t dst, ptrdiff_t src) {
             d_out_hvdc_id[dst] = d_out_hvdc_id[src];
             d_out_side[dst]    = d_out_side[src];
+            d_out_type[dst]    = d_out_type[src];
         });
-    auto push = [&](int hid, int side, cuda_real_type value, cuda_real_type limit) {
-        const ptrdiff_t at = topk.reserve(0, SevAbs{}(value, limit));
+    auto push = [&](int hid, int side, cuda_real_type value, cuda_real_type limit, int grp = 0) {
+        const ptrdiff_t at = topk.reserve(grp, SevAbs{}(value, limit));
         if (at < 0) return;
         d_out_hvdc_id[at] = hid;
         d_out_side[at]    = side;
+        d_out_type[at]    = grp == 0 ? VIOL_HIGH_P : VIOL_HVDC_AC_EMULATION_RELEASE;
         d_out_value[at]   = value;
         d_out_limit[at]   = limit;
     };
@@ -545,6 +557,21 @@ __global__ void check_hvdc_p_violations_kernel(
             if (isfinite(pmax) && p2_flow > pmax + tol_pu)
                 push(d_hvdc_id[e], 2, p2_flow * sn_mva, pmax * sn_mva);
         }
+    }
+
+    // the lines frozen at their limit: released when their droop asks for less
+    for (int e = 0; e < n_frz; ++e) {
+        const cudaComplexType V1 = V[d_frz_bus1[e]];
+        const cudaComplexType V2 = V[d_frz_bus2[e]];
+        if (!isfinite(V1.x) || !isfinite(V1.y) || !isfinite(V2.x) || !isfinite(V2.y)) continue;
+        const cuda_real_type th1 = CudaFunHelper::my_atan2(CudaFunHelper::my_cuCimag(V1), CudaFunHelper::my_cuCreal(V1));
+        const cuda_real_type th2 = CudaFunHelper::my_atan2(CudaFunHelper::my_cuCimag(V2), CudaFunHelper::my_cuCreal(V2));
+        const cuda_real_type raw = d_frz_p0[e] + d_frz_k[e] * (th1 - th2);
+        const int dir = d_frz_dir[e];
+        const cuda_real_type flow  = dir > 0 ? raw : -raw;
+        const cuda_real_type limit = d_frz_limit[e];
+        if (isfinite(flow) && isfinite(limit) && flow < limit - tol_pu)
+            push(d_frz_id[e], dir > 0 ? 1 : 2, flow * sn_mva, limit * sn_mva, 1);
     }
 
     d_out_count[out_c]     = topk.finish();

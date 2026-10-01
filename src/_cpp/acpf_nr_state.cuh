@@ -251,6 +251,11 @@ struct AcPfNrState {
                                           d_hvdc_r, d_hvdc_pmax12, d_hvdc_pmax21;
     thrust::device_vector<int>            d_hvdc_prow1, d_hvdc_prow2;          // end P rows
     thrust::device_vector<int>            d_hvdc_h11, d_hvdc_h12, d_hvdc_h21, d_hvdc_h22;  // feature J pos
+    // the lines frozen at their AC-emulation limit (LedgerData::hvdc_frz_*): checked for
+    // their release only, never solved
+    int n_hvdc_frz = 0;
+    thrust::device_vector<int>            d_hvdc_frz_bus1, d_hvdc_frz_bus2, d_hvdc_frz_dir, d_hvdc_frz_id;
+    thrust::device_vector<cuda_real_type> d_hvdc_frz_p0, d_hvdc_frz_k, d_hvdc_frz_limit;
 
     // -------------------------------------------------------------------------
     // VoltageControl (remote gen + SVC) — n_vc_ctrl == 0 when inactive.

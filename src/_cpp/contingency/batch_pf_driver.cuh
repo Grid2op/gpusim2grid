@@ -335,11 +335,11 @@ struct BatchPfDriver {
     cuda_real_type hvdc_p_residual_tol_ = 0;
     double         t_hvdc_p_setup_ms_   = 0.;
 
-    thrust::device_vector<int>            d_hp_out_hvdc_id, d_hp_out_side;    // [n_contingencies * K_p]
+    thrust::device_vector<int>            d_hp_out_hvdc_id, d_hp_out_side, d_hp_out_type;  // [n_contingencies * 2 * K_p]
     thrust::device_vector<cuda_real_type> d_hp_out_value, d_hp_out_limit;
     thrust::device_vector<int>            d_hp_count;        // [n_contingencies]; -1 = never simulated, else 0..K_p
     thrust::device_vector<int>            d_hp_truncated;    // [n_contingencies]; 0/1
-    thrust::device_vector<int>            d_hp_n_hvdc_id, d_hp_n_side;        // [K_p]
+    thrust::device_vector<int>            d_hp_n_hvdc_id, d_hp_n_side, d_hp_n_type;        // [2 * K_p]
     thrust::device_vector<cuda_real_type> d_hp_n_value, d_hp_n_limit;
     thrust::device_vector<int>            d_hp_n_count, d_hp_n_truncated;     // [1]
 

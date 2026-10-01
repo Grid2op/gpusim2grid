@@ -25,6 +25,10 @@
 #define GPUSIM2GRID_HAVE_LS2G_REMOTE_VOLTAGE_CONTROL 1
 #endif
 
+#if __has_include(<batch_algorithm/HvdcPCheck.hpp>)
+#include <batch_algorithm/HvdcPCheck.hpp>   // ls2g::hvdc_p_check (LSGrid::set_hvdc_ac_emulation_frozen)
+#endif
+
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -721,6 +725,27 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             }
         }
     }
+
+#ifdef LS2G_HAS_HVDC_AC_EMULATION_FROZEN
+    // the lines an outer loop froze at their AC-emulation limit (droop off, so not in the
+    // list above): nothing in the solve reads them, only the check of their release
+    {
+        ls2g::hvdc_p_check::HvdcPPlan plan;
+        ls2g::hvdc_p_check::build_hvdc_p_plan(grid, grid.id_me_to_ac_solver(), plan);
+        const double sn = static_cast<double>(grid.get_sn_mva());
+        for (const ls2g::hvdc_p_check::HvdcPEntry& e : plan.lines) {
+            if (e.frozen_dir == 0) continue;
+            ld.hvdc_frz_bus1.push_back(e.bus1_solver);
+            ld.hvdc_frz_bus2.push_back(e.bus2_solver);
+            ld.hvdc_frz_dir.push_back(e.frozen_dir);
+            ld.hvdc_frz_id.push_back(e.hvdc_id);
+            ld.hvdc_frz_p0.push_back(static_cast<double>(e.p0_mw) / sn);
+            ld.hvdc_frz_k.push_back(static_cast<double>(e.k_mw_per_rad) / sn);
+            ld.hvdc_frz_limit.push_back(static_cast<double>(e.frozen_dir > 0 ? e.pmax_1to2_mw
+                                                                               : e.pmax_2to1_mw) / sn);
+        }
+    }
+#endif
 
     // VoltageControl (remote-regulating generators + voltage-mode SVCs): pull the
     // bordered-block physics (solver numbering, pu). Empty when none active.

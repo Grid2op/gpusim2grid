@@ -98,7 +98,13 @@ enum class LimitViolationType  : int {
     // its plan).
     LOW_VOLTAGE_REMOTE_CONTROL = 13,
     // ... and the mirror: own bus ABOVE the range.
-    HIGH_VOLTAGE_REMOTE_CONTROL = 14
+    HIGH_VOLTAGE_REMOTE_CONTROL = 14,
+    // An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
+    // LSGrid::set_hvdc_ac_emulation_frozen) whose droop, from this row's angles, asks for
+    // less than that limit: OpenLoadFlow would have left it in AC emulation. element_type
+    // HVDC, side the direction it is frozen in, value that flow, limit the pmax, MW.
+    // Written by check_hvdc_p_violations_kernel.
+    HVDC_AC_EMULATION_RELEASE = 15
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -109,7 +115,8 @@ enum class LimitViolationType  : int {
 //                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
 //                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
 //                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
-//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL).
+//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL,
+//                 HVDC_AC_EMULATION_RELEASE).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
 enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
 
@@ -130,6 +137,7 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::HIGH_VOLTAGE_SVC_STANDBY:
         case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
         case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
+        case LimitViolationType::HVDC_AC_EMULATION_RELEASE:
             return ViolationCategory::PHYSICAL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;
@@ -144,7 +152,7 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
 // replacing everything else) needs no group of its own.
 constexpr int N_OPERATIONAL_VIOLATION_GROUPS = 3;   // CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE
 constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
-constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
+constexpr int N_HVDC_P_VIOLATION_GROUPS      = 2;   // HIGH_P (either side), HVDC_AC_EMULATION_RELEASE
 constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
 // LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q (generators), then
 // LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan),

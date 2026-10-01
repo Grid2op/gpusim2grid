@@ -296,6 +296,12 @@ __global__ void check_bus_q_violations_kernel(
 // the K largest |value - limit| (MW), either side, most severe first. Same
 // row gate / result map / capacity / sentinel conventions as
 // check_bus_q_violations_kernel above.
+//
+// The n_frz lines an outer loop froze at their AC-emulation limit (droop off, see
+// LedgerData::hvdc_frz_*) are checked for the other half of that loop, in a second
+// group: raw = p0 + k . (theta1 - theta2) (as lightsim2grid's HvdcPCheck.hpp, no
+// losses), and raw in the frozen direction below the limit by more than tol_pu ->
+// HVDC_AC_EMULATION_RELEASE, side the frozen direction. d_out_type says which.
 // -----------------------------------------------------------------------------
 __global__ void check_hvdc_p_violations_kernel(
     const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order
@@ -313,6 +319,14 @@ __global__ void check_hvdc_p_violations_kernel(
     const cuda_real_type*  __restrict__ d_pmax12,
     const cuda_real_type*  __restrict__ d_pmax21,
     const int*             __restrict__ d_hvdc_id,
+    int                                 n_frz,
+    const int*             __restrict__ d_frz_bus1,
+    const int*             __restrict__ d_frz_bus2,
+    const int*             __restrict__ d_frz_dir,
+    const int*             __restrict__ d_frz_id,
+    const cuda_real_type*  __restrict__ d_frz_p0,
+    const cuda_real_type*  __restrict__ d_frz_k,
+    const cuda_real_type*  __restrict__ d_frz_limit,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_pu,
     int n_bus,
@@ -320,6 +334,7 @@ __global__ void check_hvdc_p_violations_kernel(
     const int* __restrict__ d_result_map,
           int*             __restrict__ d_out_hvdc_id,
           int*             __restrict__ d_out_side,
+          int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,

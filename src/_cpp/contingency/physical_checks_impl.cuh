@@ -187,6 +187,7 @@ HvdcPViolationsResult fetch_hvdc_p(const PhysicalChecksConfig& cfg, const Driver
     r.stride    = N_HVDC_P_VIOLATION_GROUPS * drv.hvdc_p_capacity_;
     r.hvdc_id   = detail::to_int (n_case ? drv.d_hp_n_hvdc_id   : drv.d_hp_out_hvdc_id);
     r.side      = detail::to_int (n_case ? drv.d_hp_n_side      : drv.d_hp_out_side);
+    r.type      = detail::to_int (n_case ? drv.d_hp_n_type      : drv.d_hp_out_type);
     r.value     = detail::to_real(n_case ? drv.d_hp_n_value     : drv.d_hp_out_value);
     r.limit     = detail::to_real(n_case ? drv.d_hp_n_limit     : drv.d_hp_out_limit);
     r.count     = detail::to_int (n_case ? drv.d_hp_n_count     : drv.d_hp_count);
