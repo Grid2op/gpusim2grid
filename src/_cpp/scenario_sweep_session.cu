@@ -45,6 +45,7 @@ static constexpr int SESSION_BS = 256;
 // =============================================================================
 struct ScenarioSweepDeviceData {
     thrust::device_vector<cudaComplexType> d_Sbus_orig;    // n_scenarios × n_bus, per-unit
+    thrust::device_vector<cudaComplexType> d_V_init_orig;  // n_scenarios × n_bus (set_v_init_from_ptr)
     thrust::device_vector<cuda_real_type>  d_gen_v_orig;   // n_scenarios × n_gen (device path only)
     int              gen_v_n_gen = 0;
     // (n_scenarios × n_gen) uint8 copy of gen_off_ (ORIGINAL row order), read
@@ -263,6 +264,304 @@ void ScenarioSweepSession::set_contingency_gens(Eigen::Ref<const BoolMat> mask)
     gen_off_       = mask;
     has_gen_off_   = true;
     gen_off_dirty_ = true;
+}
+
+// =============================================================================
+// set_pv_pq_switches / set_*_row_skip -- the reactive-limit outer loop
+// =============================================================================
+void ScenarioSweepSession::set_pv_pq_switches(
+    const std::vector<std::vector<int>>& to_pq,
+    const std::vector<std::vector<std::pair<int, double>>>& to_pv)
+{
+    if (to_pq.size() != to_pv.size())
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_pv_pq_switches: to_pq and to_pv must have one entry "
+            "per row each");
+    if (to_pq.empty())
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_pv_pq_switches: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(to_pq.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_pv_pq_switches: row count must match "
+            "set_injections()'s n_scenarios");
+    const int n_bus = base_state_->n_bus;
+    const std::vector<int>& q_row = base_state_->h_q_row_of_bus;
+    const std::vector<int>& vm_col = base_state_->h_vm_col_of_bus;
+    for (size_t r = 0; r < to_pq.size(); ++r) {
+        for (int b : to_pq[r]) {
+            if (b < 0 || b >= n_bus)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: bus " + std::to_string(b) +
+                    " out of range");
+            if (!base_ledger_)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: switching a bus to PQ needs the "
+                    "lightsim2grid ledger (a session built from a grid through the bridge)");
+            if (!h_is_vm_fixed_bus_[static_cast<size_t>(b)] ||
+                h_vc_group_of_bus_[static_cast<size_t>(b)] >= 0)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: bus " + std::to_string(b) +
+                    " (row " + std::to_string(r) + ") is not a Vm-fixed bus its own machines hold "
+                    "(a PV / slack bus outside any VoltageControl group): only those can be "
+                    "switched to PQ.");
+        }
+        for (const auto& bv : to_pv[r]) {
+            const int b = bv.first;
+            if (b < 0 || b >= n_bus)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: bus " + std::to_string(b) +
+                    " out of range");
+            if (h_is_vm_fixed_bus_[static_cast<size_t>(b)] ||
+                h_vc_group_of_bus_[static_cast<size_t>(b)] >= 0 ||
+                q_row[static_cast<size_t>(b)] < 0 || vm_col[static_cast<size_t>(b)] < 0)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: bus " + std::to_string(b) +
+                    " (row " + std::to_string(r) + ") is not a PQ bus outside any "
+                    "VoltageControl group: only those can be held PV again.");
+            if (!std::isfinite(bv.second) || !(bv.second > 0.))
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: the |V| of bus " +
+                    std::to_string(b) + " must be finite and > 0");
+            if (std::find(to_pq[r].begin(), to_pq[r].end(), b) != to_pq[r].end())
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_pv_pq_switches: bus " + std::to_string(b) +
+                    " is both switched to PQ and held PV on row " + std::to_string(r));
+        }
+    }
+    sw_to_pq_ = to_pq;
+    sw_to_pv_ = to_pv;
+    has_switches_ = true;
+    switches_dirty_ = true;
+}
+
+void ScenarioSweepSession::set_vc_controller_pins(
+    const std::vector<std::vector<std::pair<int, double>>>& pins)
+{
+    if (pins.empty())
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_vc_controller_pins: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(pins.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_vc_controller_pins: row count must match "
+            "set_injections()'s n_scenarios");
+    const int n_ctrl = base_ledger_ ? base_ledger_->vc_n_controllers() : 0;
+    for (size_t r = 0; r < pins.size(); ++r) {
+        if (pins[r].empty()) continue;
+        if (n_ctrl == 0)
+            throw std::runtime_error(
+                "ScenarioSweepSession::set_vc_controller_pins: this session has no "
+                "VoltageControl controller");
+        std::set<int> seen;
+        for (const auto& pc : pins[r]) {
+            const int j = pc.first;
+            if (j < 0 || j >= n_ctrl)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_vc_controller_pins: controller " +
+                    std::to_string(j) + " out of range");
+            if (!seen.insert(j).second)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_vc_controller_pins: controller " +
+                    std::to_string(j) + " listed twice on row " + std::to_string(r));
+            if (!std::isfinite(pc.second))
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_vc_controller_pins: non-finite target");
+            if (base_ledger_->vc_kind[static_cast<size_t>(j)] != 0)
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_vc_controller_pins: controller " + std::to_string(j) +
+                    " is not a generator (an SVC / hvdc station): not supported.");
+        }
+    }
+    sw_vc_pins_ = pins;
+    has_vc_pins_ = true;
+    switches_dirty_ = true;
+}
+
+void ScenarioSweepSession::set_vc_controller_releases(const std::vector<std::vector<int>>& releases)
+{
+    if (releases.empty())
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_vc_controller_releases: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(releases.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_vc_controller_releases: row count must match "
+            "set_injections()'s n_scenarios");
+    const std::vector<int>& held = base_state_->h_vc_held;
+    for (size_t r = 0; r < releases.size(); ++r)
+        for (int j : releases[r])
+            if (j < 0 || j >= static_cast<int>(held.size()) || !held[static_cast<size_t>(j)])
+                throw std::runtime_error(
+                    "ScenarioSweepSession::set_vc_controller_releases: controller " +
+                    std::to_string(j) + " (row " + std::to_string(r) + ") is not a held "
+                    "controller (lightsim2grid's set_hold_frozen_regulators).");
+    sw_vc_release_ = releases;
+    for (auto& v : sw_vc_release_) std::sort(v.begin(), v.end());
+    has_vc_release_ = true;
+    switches_dirty_ = true;
+}
+
+void ScenarioSweepSession::clear_vc_controller_releases()
+{
+    if (!has_vc_release_) return;
+    sw_vc_release_.clear();
+    has_vc_release_ = false;
+    switches_dirty_ = true;
+}
+
+std::vector<int> ScenarioSweepSession::vc_ctrl_held() const { return base_state_->h_vc_held; }
+std::vector<double> ScenarioSweepSession::vc_ctrl_q_held() const { return base_state_->h_vc_q_held; }
+
+void ScenarioSweepSession::clear_vc_controller_pins()
+{
+    if (!has_vc_pins_) return;
+    sw_vc_pins_.clear();
+    has_vc_pins_ = false;
+    switches_dirty_ = true;
+}
+
+#define SS_LEDGER_VEC(name, field) \
+    std::vector<int> ScenarioSweepSession::name() const \
+    { return base_ledger_ ? base_ledger_->field : std::vector<int>{}; }
+SS_LEDGER_VEC(vc_ctrl_bus,     vc_bus)
+SS_LEDGER_VEC(vc_ctrl_kind,    vc_kind)
+SS_LEDGER_VEC(vc_ctrl_group,   vc_group)
+SS_LEDGER_VEC(vc_ctrl_elem_id, vc_elem_id)
+SS_LEDGER_VEC(vc_grp_start,    vc_grp_start)
+SS_LEDGER_VEC(vc_grp_count,    vc_grp_count)
+SS_LEDGER_VEC(vc_reg_bus,      vc_reg_bus)
+#undef SS_LEDGER_VEC
+
+void ScenarioSweepSession::clear_pv_pq_switches()
+{
+    if (!has_switches_) return;
+    sw_to_pq_.clear();
+    sw_to_pv_.clear();
+    has_switches_ = false;
+    switches_dirty_ = true;
+}
+
+namespace {
+void _store_row_skip(Eigen::Ref<const ScenarioSweepSession::BoolMat> mask,
+                     std::vector<unsigned char>& out, int& cols, bool& dirty)
+{
+    out.clear();
+    cols = 0;
+    if (mask.size() > 0) {
+        cols = static_cast<int>(mask.cols());
+        out.resize(static_cast<size_t>(mask.rows()) * static_cast<size_t>(cols));
+        for (Eigen::Index r = 0; r < mask.rows(); ++r)
+            for (Eigen::Index c = 0; c < mask.cols(); ++c)
+                out[static_cast<size_t>(r) * cols + static_cast<size_t>(c)] = mask(r, c) ? 1 : 0;
+    }
+    dirty = true;
+}
+}  // namespace
+
+void ScenarioSweepSession::set_bus_q_row_skip(Eigen::Ref<const BoolMat> mask)
+{
+    _store_row_skip(mask, bus_q_row_skip_, bus_q_row_skip_cols_, bus_q_row_skip_dirty_);
+}
+
+void ScenarioSweepSession::set_gen_pv_release_row_skip(Eigen::Ref<const BoolMat> mask)
+{
+    _store_row_skip(mask, gen_pv_release_row_skip_, gen_pv_release_row_skip_cols_,
+                    gen_pv_release_row_skip_dirty_);
+}
+
+std::uintptr_t ScenarioSweepSession::v_results_ptr() const
+{
+    return solver_ ? reinterpret_cast<std::uintptr_t>(solver_->d_V_results_ptr()) : 0;
+}
+
+void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows)
+{
+    if (d_V_src == 0)
+        throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: null source buffer");
+    if (src_rows.empty())
+        throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(src_rows.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_v_init_from_ptr: row count must match set_injections()'s n_scenarios");
+    for (int r : src_rows)
+        if (r < 0)
+            throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: negative source row");
+    const int n = static_cast<int>(src_rows.size());
+    const int n_bus = base_state_->n_bus;
+    const cudaStream_t cs = static_cast<cudaStream_t>(base_state_->cs);
+    dev_->d_V_init_orig.resize(static_cast<size_t>(n) * n_bus);
+    std::vector<int> dst_rows(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) dst_rows[static_cast<size_t>(i)] = i;
+    thrust::device_vector<int> d_dst, d_src;
+    upload_h2d(d_dst, dst_rows.data(), dst_rows.size(), cs);
+    upload_h2d(d_src, src_rows.data(), src_rows.size(), cs);
+    launch_copy_rows(thrust::raw_pointer_cast(dev_->d_V_init_orig.data()),
+                     reinterpret_cast<const cudaComplexType*>(d_V_src),
+                     thrust::raw_pointer_cast(d_dst.data()), thrust::raw_pointer_cast(d_src.data()),
+                     n_bus, n, cs);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ScenarioSweepSession::set_v_init_from_ptr: ") +
+                                 cudaGetErrorString(e));
+    base_state_->cs.synchronize();
+    has_v_init_ = true;
+    v_init_rows_ = n;
+}
+
+void ScenarioSweepSession::clear_v_init()
+{
+    has_v_init_ = false;
+    v_init_rows_ = 0;
+}
+
+std::uintptr_t ScenarioSweepSession::residuals_ptr() const
+{
+    return solver_ ? reinterpret_cast<std::uintptr_t>(
+                         thrust::raw_pointer_cast(solver_->d_residuals.data()))
+                   : 0;
+}
+
+// =============================================================================
+// _row_vc_pins -- the VoltageControl controllers row r holds at a fixed Q
+// =============================================================================
+std::vector<std::pair<int, double>> ScenarioSweepSession::_row_vc_pins(int r) const
+{
+    std::vector<std::pair<int, double>> pins;
+    std::set<int> listed;
+    if (has_vc_pins_)
+        for (const auto& pc : sw_vc_pins_[static_cast<size_t>(r)]) {
+            pins.push_back(pc);
+            listed.insert(pc.first);
+        }
+    const std::vector<int>& held = base_state_->h_vc_held;
+    const std::vector<int>* rel = has_vc_release_ ? &sw_vc_release_[static_cast<size_t>(r)] : nullptr;
+    for (size_t j = 0; j < held.size(); ++j) {
+        if (!held[j] || listed.count(static_cast<int>(j))) continue;
+        if (rel != nullptr && std::binary_search(rel->begin(), rel->end(), static_cast<int>(j))) continue;
+        pins.emplace_back(static_cast<int>(j), base_state_->h_vc_q_held[j]);
+    }
+    if (pins.empty() || !base_ledger_) return pins;
+    // a group's first controller is held through the voltage row: every other
+    // controller of the group must then be held too (their sharing rows refer to it)
+    std::set<int> pinned;
+    for (const auto& pc : pins) pinned.insert(pc.first);
+    for (const auto& pc : pins) {
+        const int g = base_ledger_->vc_group[static_cast<size_t>(pc.first)];
+        const int first = base_ledger_->vc_grp_start[static_cast<size_t>(g)];
+        if (pc.first != first) continue;
+        const int cnt = base_ledger_->vc_grp_count[static_cast<size_t>(g)];
+        for (int k = first; k < first + cnt; ++k)
+            if (!pinned.count(k))
+                throw std::runtime_error(
+                    "ScenarioSweepSession: row " + std::to_string(r) + " holds the first controller "
+                    "of group " + std::to_string(g) + " at a fixed reactive injection but not its "
+                    "controller " + std::to_string(k) + ": the group's sharing rows refer to the "
+                    "first one, so either all of them are held or the first one is free.");
+        if (mask_cfg_.vc_vrow_qcol_pos.size() <= static_cast<size_t>(g) ||
+            mask_cfg_.vc_vrow_qcol_pos[static_cast<size_t>(g)] < 0)
+            throw std::runtime_error(
+                "ScenarioSweepSession: group " + std::to_string(g) + " has no reserved (voltage row, "
+                "first controller) slot to hold its first controller.");
+    }
+    return pins;
 }
 
 int ScenarioSweepSession::dim_J() const
@@ -841,6 +1140,51 @@ void ScenarioSweepSession::run()
     std::vector<int>              required;
     std::vector<std::vector<int>> row_pv_to_pq, row_slack_off;
     _prepare_gen_contingency(required, row_pv_to_pq, row_slack_off);
+    // Reactive-limit outer loop: the Vm-fixed buses a row solves as PQ join
+    // the reserved switchable set, exactly like a generator contingency's.
+    bool any_switch = false;
+    if (has_switches_) {
+        if (static_cast<int>(sw_to_pq_.size()) != n_scenarios_ ||
+            static_cast<int>(sw_to_pv_.size()) != n_scenarios_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_pv_pq_switches()'s row count no longer matches "
+                "set_injections()'s n_scenarios -- call set_pv_pq_switches() again after "
+                "changing set_injections()");
+        std::set<int> req(required.begin(), required.end());
+        for (int r = 0; r < n_scenarios_; ++r) {
+            std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
+            for (int b : sw_to_pq_[static_cast<size_t>(r)]) {
+                to_pq.push_back(b);
+                if (base_ledger_->vm_col_of_bus[static_cast<size_t>(b)] < 0 &&
+                    base_ledger_->q_row_of_bus[static_cast<size_t>(b)] < 0)
+                    req.insert(b);
+            }
+            std::sort(to_pq.begin(), to_pq.end());
+            to_pq.erase(std::unique(to_pq.begin(), to_pq.end()), to_pq.end());
+            if (!sw_to_pq_[static_cast<size_t>(r)].empty() || !sw_to_pv_[static_cast<size_t>(r)].empty())
+                any_switch = true;
+        }
+        required.assign(req.begin(), req.end());
+    }
+    if (has_vc_pins_) {
+        if (static_cast<int>(sw_vc_pins_.size()) != n_scenarios_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_vc_controller_pins()'s row count no longer matches "
+                "set_injections()'s n_scenarios -- call set_vc_controller_pins() again after "
+                "changing set_injections()");
+        for (const auto& v : sw_vc_pins_) if (!v.empty()) { any_switch = true; break; }
+    }
+    if (has_v_init_ && v_init_rows_ != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_v_init_from_ptr()'s row count no longer matches "
+            "set_injections()'s n_scenarios -- call it again after changing set_injections()");
+    if (has_vc_release_) {
+        if (static_cast<int>(sw_vc_release_.size()) != n_scenarios_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_vc_controller_releases()'s row count no longer matches "
+                "set_injections()'s n_scenarios -- call it again after changing set_injections()");
+        for (const auto& v : sw_vc_release_) if (!v.empty()) { any_switch = true; break; }
+    }
     const int want_ref = _wanted_reference_bus();
     if (required != reserved_buses_ || want_ref != ref_bus_) {
         ref_bus_ = want_ref;
@@ -848,6 +1192,12 @@ void ScenarioSweepSession::run()
     }
     row_pv_to_pq_ = row_pv_to_pq;
 
+    if (any_switch && strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_pv_pq_switches / set_vc_controller_pins are "
+            "incompatible with the 'direct_base_case_factors' strategy (it reuses the base-case factors, which "
+            "cannot switch a bus between PV and PQ per row). Use 'direct_refactor_every' "
+            "(default), 'direct_iter0_only', or 'direct_refactor_every_n'.");
     if (has_gen_off_ &&
         strategy_type_ == ContingencySolverType::DirectBaseCaseFactors) {
         bool any_effect = !reserved_buses_.empty();
@@ -871,7 +1221,7 @@ void ScenarioSweepSession::run()
     // -------------------------------------------------------------------------
     const ScenarioSweepDriverConfig cfg = _current_config();
     const bool cold = !solver_ || cfg != driver_cfg_;
-    const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_);
+    const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_ || switches_dirty_);
 
     if (cold || warm) {
         if (!has_topology_) {
@@ -889,6 +1239,10 @@ void ScenarioSweepSession::run()
             ctg.masked_buses.clear();
             ctg.stranded_groups.clear();
             ctg.pinned_buses.clear();
+            ctg.vm_reseed.clear();
+            ctg.vc_pinned_ctrl.clear();
+            ctg.vc_released.clear();
+            if (has_vc_release_) ctg.vc_released = sw_vc_release_[r];
             ctg.skip = has_skip_ && skip_rows_[r] != 0;
         }
 
@@ -902,6 +1256,23 @@ void ScenarioSweepSession::run()
                     if (!std::binary_search(to_pq.begin(), to_pq.end(), b)) pinned.push_back(b);
             }
         }
+
+        // Reactive-limit outer loop: a PQ bus a row holds PV again -- its Q
+        // row pinned, |V| re-seeded to the value the machine regulates.
+        if (has_switches_) {
+            for (int r = 0; r < n_scenarios_; ++r) {
+                Contingency& ctg = contingencies_[static_cast<size_t>(r)];
+                for (const auto& bv : sw_to_pv_[static_cast<size_t>(r)]) {
+                    ctg.pinned_buses.push_back(bv.first);
+                    ctg.vm_reseed.push_back(bv);
+                }
+            }
+        }
+        // ... and the VoltageControl controllers held at a fixed Q: lightsim2grid's held
+        // ones on every row that does not release them, then the caller's
+        if (has_vc_pins_ || base_state_->has_vc_held)
+            for (int r = 0; r < n_scenarios_; ++r)
+                contingencies_[static_cast<size_t>(r)].vc_pinned_ctrl = _row_vc_pins(r);
     }
 
     const int n_bus = base_state_->n_bus;
@@ -999,6 +1370,13 @@ void ScenarioSweepSession::run()
     const cudaStream_t scs = static_cast<cudaStream_t>(solver_->cs);
     solver_->source_.set_sbus_from_orig(
         thrust::raw_pointer_cast(dev_->d_Sbus_orig.data()), scs);
+    // ... and so are the rows' own starting voltages, when given
+    if (has_v_init_)
+        solver_->source_.set_v_init_from_orig(
+            thrust::raw_pointer_cast(dev_->d_V_init_orig.data()),
+            thrust::raw_pointer_cast(base_state_->d_V_base.data()), scs);
+    else
+        solver_->source_.clear_v_init();
 
     // gen_v override: (re)applied whenever the source is new or gen_v changed.
     if (cold || warm || gen_v_dirty_) {
@@ -1131,12 +1509,18 @@ void ScenarioSweepSession::run()
         phys_, *solver_, "ScenarioSweepSession", violation_tol_, sn_mva_,
         base_state_->timings.converged, d_gen_off_ptr, n_gen_off,
         physical_checks::RowTargets{gp_targets, gen_p_targets_dirty_ || rd_gp || rd_gp_last_,
-                                    &gen_pv_release_targets_, gen_pv_release_targets_dirty_});
+                                    &gen_pv_release_targets_, gen_pv_release_targets_dirty_,
+                                    &bus_q_row_skip_, bus_q_row_skip_cols_,
+                                    bus_q_row_skip_dirty_ || cold,
+                                    &gen_pv_release_row_skip_, gen_pv_release_row_skip_cols_,
+                                    gen_pv_release_row_skip_dirty_ || cold});
     if (phys_.compute_physical_violations)
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
     rd_gp_last_ = rd_gp;
     gen_p_targets_dirty_ = false;
     gen_pv_release_targets_dirty_ = false;
+    bus_q_row_skip_dirty_ = false;
+    gen_pv_release_row_skip_dirty_ = false;
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms = t_base_case_ms_;
@@ -1170,6 +1554,7 @@ void ScenarioSweepSession::run()
 
     injections_dirty_ = topology_dirty_ = gen_v_dirty_ = gen_off_dirty_ = false;
     skip_dirty_ = false;
+    switches_dirty_ = false;
     last_run_kept_jacobian_ = keep_final_jacobian_;
     ++run_counter_;
 

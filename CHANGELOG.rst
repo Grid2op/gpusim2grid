@@ -3,6 +3,17 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``ContingencyAnalysisGPU(reactive_limits_outer_loop=True)`` (opt-in): one pass of
+  OpenLoadFlow's ``ReactiveLimits`` loop, re-solving the contingencies a PV bus or a local release
+  flags (``get_outer_loop_status``).
+- [IMPROVED] ``reactive_limits_outer_loop`` also re-solves a voltage-control group of generators
+  whose every controller saturated: each held at its limit, the regulated bus floating.
+- [IMPROVED] ``reactive_limits_outer_loop`` also releases a frozen remote regulator, through
+  lightsim2grid's held controllers (``set_hold_frozen_regulators``, lightsim2grid PR #220),
+  pinned on every other row.
+- [IMPROVED] ``reactive_limits_outer_loop``: the second pass starts each contingency from its
+  first-pass voltages (``outer_loop_warm_start``, default on); ``outer_loop_nb_iter`` sets its
+  Newton iterations.
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.

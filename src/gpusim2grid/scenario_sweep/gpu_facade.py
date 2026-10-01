@@ -261,6 +261,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # disconnected generators taken out, whatever the call order.
         self._pending_elements = None
         self._gen_off = None
+        # per-row (rows, buses, MVAr) reactive changes added on top of the
+        # assembled injections -- private, set by ContingencyAnalysisGPU's
+        # reactive_limits_outer_loop second pass (None = none)
+        self._q_delta = None
         # set_gen_v() input, kept so a later set_contingency_gens() (or vice
         # versa) can re-derive which rows ask one bus for two different |V|.
         self._gen_v = None
@@ -341,6 +345,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p,
                                             gen_off=gen_off)
+        if self._q_delta is not None:
+            # ContingencyAnalysisGPU's reactive_limits_outer_loop second pass:
+            # (row, bus, MVAr) changes of the switched / released machines
+            rows, buses, dq = self._q_delta
+            np.add.at(q_mvar, (rows, buses), dq)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
         # the slack active-power check needs each row's own generator
         # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)

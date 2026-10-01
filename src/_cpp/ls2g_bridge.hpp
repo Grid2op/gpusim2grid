@@ -269,6 +269,8 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
 // Whether the lightsim2grid built against has the release check (PR #216):
 // extract_gen_pv_release_plan_from_lsgrid throws otherwise.
 bool bridge_has_gen_pv_release();
+// lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators, PR #220)
+bool bridge_has_hold_frozen();
 
 // Build an InjectionSweepSession from a solved LSGrid (branch data set when
 // with_branch_data=true so compute_flows() works without extra setup).

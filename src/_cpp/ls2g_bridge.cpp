@@ -312,6 +312,25 @@ bool gen_remote_vreg(const C& gens, int g)
     else                                           return gens.gen_is_voltage_controller(g);
 }
 
+// The held controllers of lightsim2grid's set_hold_frozen_regulators
+// (VoltageControlSolverData::held), when the installed headers have them;
+// empty otherwise (no controller is ever held).
+template <class D, class = void>
+struct has_vc_held : std::false_type {};
+template <class D>
+struct has_vc_held<D, std::void_t<decltype(std::declval<const D&>().held)>> : std::true_type {};
+
+template <class D>
+std::vector<int> vc_held_flags(const D& v, int)
+{
+    if constexpr (has_vc_held<D>::value) {
+        if (v.held.size() != v.bus.size()) return {};
+        return std::vector<int>(v.held.data(), v.held.data() + v.held.size());
+    } else {
+        return {};
+    }
+}
+
 }  // namespace
 
 LedgerData drop_multislack_augmentation(const LedgerData& in,
@@ -706,6 +725,24 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             ld.vc_group     = to_iv(v.group);
             ld.vc_slope     = to_dv(v.slope);
             ld.vc_weight    = to_dv(v.weight);
+            ld.vc_elem_id   = to_iv(v.elem_id);
+            // held controllers (lightsim2grid's set_hold_frozen_regulators), when the
+            // lightsim2grid built against has them: pinned at the generator's target Q
+            ld.vc_held = vc_held_flags(v, 0);
+            bool any_held = false;
+            for (int h : ld.vc_held) any_held = any_held || h != 0;
+            if (any_held) {
+                ld.vc_q_held.assign(ld.vc_held.size(), 0.);
+                const auto& gens = grid.get_generators();
+                for (size_t j = 0; j < ld.vc_held.size(); ++j) {
+                    if (!ld.vc_held[j]) continue;
+                    const int gen_id = ld.vc_elem_id[j];
+                    if (gens.get_status(gen_id))
+                        ld.vc_q_held[j] = gens.get_target_q_mvar(gen_id) / grid.get_sn_mva();
+                }
+            } else {
+                ld.vc_held.clear();
+            }
             ld.vc_reg_bus   = to_iv(v.reg_bus);
             ld.vc_grp_start = to_iv(v.grp_start);
             ld.vc_grp_count = to_iv(v.grp_count);
@@ -1079,6 +1116,11 @@ bool bridge_has_gen_pv_release()
 #else
     return false;
 #endif
+}
+
+bool bridge_has_hold_frozen()
+{
+    return has_vc_held<ls2g::VoltageControlSolverData>::value;
 }
 
 // the station's end of a release entry (an HVDC one: a VSC station frozen at a limit);

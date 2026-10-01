@@ -45,6 +45,7 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -313,6 +314,18 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_contingencies * n_bus,)  complex
     RealVect get_residuals()  const;   // (n_contingencies,)           real
+
+    // Overwrite the voltages and residuals of rows dst_rows[i] with row
+    // src_rows[i] of another session's result buffers (device pointers: a
+    // row-major (* x n_bus) complex voltage buffer and a (*,) residual one,
+    // e.g. ScenarioSweepSession::v_results_ptr / residuals_ptr): the reactive-
+    // limit outer loop's second pass. Requires run().
+    void overwrite_rows(const std::vector<int>& dst_rows, const std::vector<int>& src_rows,
+                        std::uintptr_t d_V_src, std::uintptr_t d_res_src);
+    // Device pointer of the last run's row-major (n_contingencies x n_bus)
+    // complex voltages (0 before run()): the reactive-limit outer loop's second
+    // pass starts each row from it (ScenarioSweepSession::set_v_init_from_ptr).
+    std::uintptr_t v_results_ptr() const;
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real
     BatchTimings get_timings() const { return timings_; }

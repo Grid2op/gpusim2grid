@@ -1528,6 +1528,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_contingencies * n_bus,) complex128.")
     .def("get_residuals",  &ContingencyAnalysisSession::get_residuals,
          "Copy per-contingency ||F||inf residuals to host: (n_contingencies,) float64.")
+    .def("overwrite_rows", &ContingencyAnalysisSession::overwrite_rows,
+         pybind11::arg("dst_rows"), pybind11::arg("src_rows"),
+         pybind11::arg("d_V_src"), pybind11::arg("d_res_src"),
+         "Overwrite the voltages and residuals of rows dst_rows[i] with row "
+         "src_rows[i] of another session's device result buffers (e.g. "
+         "ScenarioSweepSession.v_results_ptr() / residuals_ptr()): the "
+         "reactive-limit outer loop's second pass. Requires run().")
+    .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
+         "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
          "Copy origin-terminal ampere flows to host: (n_contingencies * n_branches,). "
          "Requires compute_flows().")
@@ -2066,6 +2075,101 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "whenever that set changes. Raises for a generator regulating a "
          "remote bus or standing on a bus a control group holds, and in "
          "explicit-array (tuple) mode (no generator data).")
+    .def("set_pv_pq_switches", &ScenarioSweepSession::set_pv_pq_switches,
+         pybind11::arg("to_pq"), pybind11::arg("to_pv"),
+         "Labelling side of one reactive-limit outer-loop pass, row-aligned with "
+         "set_injections(): to_pq[r] the Vm-fixed buses (a local PV / slack bus "
+         "outside any VoltageControl group) row r solves as PQ -- reserved like a "
+         "generator contingency's, every other row keeping them PV --, to_pv[r] "
+         "the (bus, |V| pu) pairs of PQ buses (outside any VoltageControl group) "
+         "row r holds PV (Q row pinned, |V| re-seeded). The injection side is "
+         "the caller's. A change is a warm source rebuild (plus a base-state "
+         "rebuild when the reserved set changes).")
+    .def("clear_pv_pq_switches", &ScenarioSweepSession::clear_pv_pq_switches,
+         "Drop any set_pv_pq_switches() labelling.")
+    .def("set_vc_controller_pins", &ScenarioSweepSession::set_vc_controller_pins,
+         pybind11::arg("pins"),
+         "The VoltageControl side of a reactive-limit outer-loop pass, row-aligned "
+         "with set_injections(): pins[r] = [(controller index, Q pu, generator "
+         "convention), ...] of the controllers row r holds at a fixed reactive "
+         "injection (generators only): a controller's sharing row -- the group's "
+         "voltage row for its first one -- is rewritten by value. A row holding a "
+         "group's first controller must hold all of them (checked at run(), with "
+         "the held controllers). A change is a warm source rebuild.")
+    .def("clear_vc_controller_pins", &ScenarioSweepSession::clear_vc_controller_pins,
+         "Drop any set_vc_controller_pins() data.")
+    .def("set_vc_controller_releases", &ScenarioSweepSession::set_vc_controller_releases,
+         pybind11::arg("releases"),
+         "lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned at "
+         "their frozen output on every row; releases[r] lists the controller indices "
+         "row r releases. A change is a warm source rebuild.")
+    .def("clear_vc_controller_releases", &ScenarioSweepSession::clear_vc_controller_releases,
+         "Drop any set_vc_controller_releases() data.")
+    .def_property_readonly("vc_ctrl_held", &ScenarioSweepSession::vc_ctrl_held,
+         "Per controller: 1 for a held one (lightsim2grid's set_hold_frozen_regulators).")
+    .def_property_readonly("vc_ctrl_q_held", &ScenarioSweepSession::vc_ctrl_q_held,
+         "Per controller: the frozen reactive output (pu, generator convention) a held one is pinned at.")
+    .def_property_readonly("vc_ctrl_bus", &ScenarioSweepSession::vc_ctrl_bus,
+         "Per VoltageControl controller: its solver bus.")
+    .def_property_readonly("vc_ctrl_kind", &ScenarioSweepSession::vc_ctrl_kind,
+         "Per controller: 0 GEN, 1 SVC, 2 / 3 hvdc station (side 1 / 2).")
+    .def_property_readonly("vc_ctrl_group", &ScenarioSweepSession::vc_ctrl_group,
+         "Per controller: its group.")
+    .def_property_readonly("vc_ctrl_elem_id", &ScenarioSweepSession::vc_ctrl_elem_id,
+         "Per controller: its id in its own container (the hvdc line id for a station).")
+    .def_property_readonly("vc_grp_start", &ScenarioSweepSession::vc_grp_start,
+         "Per group: its first controller.")
+    .def_property_readonly("vc_grp_count", &ScenarioSweepSession::vc_grp_count,
+         "Per group: its number of controllers.")
+    .def_property_readonly("vc_reg_bus", &ScenarioSweepSession::vc_reg_bus,
+         "Per group: the solver bus it regulates.")
+    .def_property_readonly("has_pv_pq_switches", &ScenarioSweepSession::has_pv_pq_switches)
+    .def("set_bus_q_row_skip",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_bus_q_row_skip: mask must be 2-D (n_scenarios, n_check)");
+             ScenarioSweepSession::BoolMat m(mask.shape(0), mask.shape(1));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_bus_q_row_skip(m);
+         },
+         pybind11::arg("mask"),
+         "(n_scenarios, n_check) bool: True leaves that entry of the reactive-"
+         "capability plan unchecked on that row (a bus the outer loop switched "
+         "to PQ at its limit there). An empty (0, 0) mask drops it.")
+    .def("set_gen_pv_release_row_skip",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_gen_pv_release_row_skip: mask must be 2-D "
+                     "(n_scenarios, n_entries)");
+             ScenarioSweepSession::BoolMat m(mask.shape(0), mask.shape(1));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_gen_pv_release_row_skip(m);
+         },
+         pybind11::arg("mask"),
+         "(n_scenarios, n_entries) bool: True leaves that entry of the release "
+         "plan unchecked on that row (a machine the outer loop released there). "
+         "An empty (0, 0) mask drops it.")
+    .def("v_results_ptr", &ScenarioSweepSession::v_results_ptr,
+         "Device pointer (int) of the last run's (n_scenarios, n_bus) voltages, 0 before run().")
+    .def("residuals_ptr", &ScenarioSweepSession::residuals_ptr,
+         "Device pointer (int) of the last run's (n_scenarios,) residuals, 0 before run().")
+    .def("set_v_init_from_ptr", &ScenarioSweepSession::set_v_init_from_ptr,
+         pybind11::arg("d_V_src"), pybind11::arg("src_rows"),
+         "Per-row starting voltages, row-aligned with set_injections(): row i starts "
+         "from row src_rows[i] of a row-major (*, n_bus) complex device buffer (e.g. "
+         "ContingencyAnalysisSession.v_results_ptr(), ready on the device), copied at "
+         "once; a non-finite entry starts from the base case. A hot change.")
+    .def("clear_v_init", &ScenarioSweepSession::clear_v_init,
+         "Drop set_v_init_from_ptr(): every row starts from the base-case voltages again.")
+    .def_property_readonly("has_v_init", &ScenarioSweepSession::has_v_init)
     .def_property_readonly("dim_J", &ScenarioSweepSession::dim_J,
          "Augmented Jacobian dimension of the current base state (grows by "
          "one per reserved switchable Vm bus -- see set_contingency_gens).")
@@ -2784,9 +2888,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.attr("have_ls2g_bridge") = true;
     // the PQ -> PV release plan needs lightsim2grid PR #216 (can_be_pv)
     m.attr("have_ls2g_gen_pv_release") = bridge_has_gen_pv_release();
+    // the held controllers need lightsim2grid PR #220 (set_hold_frozen_regulators)
+    m.attr("have_ls2g_hold_frozen") = bridge_has_hold_frozen();
 #else
     m.attr("have_ls2g_bridge") = false;
     m.attr("have_ls2g_gen_pv_release") = false;
+    m.attr("have_ls2g_hold_frozen") = false;
 #endif
 
     m.def("solve_cudss_raw", &solve_cudss_raw,

@@ -362,6 +362,8 @@ __global__ void check_bus_q_violations_kernel(
     const cuda_real_type*  __restrict__ d_gen_qmax,
     const unsigned char*   __restrict__ d_gen_off,
     int                                 n_gen,
+    const unsigned char*   __restrict__ d_row_skip,
+    int                                 skip_stride,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mvar,
     int n_bus, int nnz_Y,
@@ -392,6 +394,7 @@ __global__ void check_bus_q_violations_kernel(
     const cudaComplexType* Yv = d_Yvals + local_c * nnz_Y;
     const cudaComplexType* Sb = d_Sbus  + local_c * sbus_stride;
     const unsigned char*   off = d_gen_off ? d_gen_off + static_cast<ptrdiff_t>(out_c) * n_gen : nullptr;
+    const unsigned char*   skip = d_row_skip ? d_row_skip + static_cast<ptrdiff_t>(out_c) * skip_stride : nullptr;
 
     // the K largest excesses of each type (groups: LOW_Q, then HIGH_Q)
     auto topk = make_topk<N_BUS_Q_VIOLATION_GROUPS>(
@@ -415,6 +418,7 @@ __global__ void check_bus_q_violations_kernel(
     };
 
     for (int kk = 0; kk < n_check; ++kk) {
+        if (skip != nullptr && skip[kk]) continue;   // not held by its machines on this row
         const int b = d_bus_solver[kk];
         const cudaComplexType Vb = V[b];
         if (!isfinite(Vb.x) || !isfinite(Vb.y)) continue;   // masked (stranded) bus
@@ -563,6 +567,8 @@ __global__ void check_gen_pv_release_violations_kernel(
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,
     int                                 target_stride,
+    const unsigned char*   __restrict__ d_row_skip,
+    int                                 skip_stride,
     cuda_real_type                      tol_vm_pu,
     int n_bus,
     int c_start, int actual_batch, int K,
@@ -592,6 +598,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cudaComplexType* V = d_V + local_c * n_bus;
     const unsigned char* off = d_gen_off ? d_gen_off + static_cast<ptrdiff_t>(out_c) * n_gen : nullptr;
     const cuda_real_type* tgt = d_targets ? d_targets + static_cast<ptrdiff_t>(out_c) * target_stride : nullptr;
+    const unsigned char* skip = d_row_skip ? d_row_skip + static_cast<ptrdiff_t>(out_c) * skip_stride : nullptr;
     // groups: LOW_VOLTAGE_AT_MIN_Q (0), HIGH_VOLTAGE_AT_MAX_Q (1) on the generators and
     // the frozen SVCs, LOW_VOLTAGE_SVC_STANDBY (2), HIGH_VOLTAGE_SVC_STANDBY (3) on the
     // standby SVCs
@@ -615,6 +622,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     };
 
     for (int k = 0; k < n_entries; ++k) {
+        if (skip != nullptr && skip[k]) continue;   // not pinned at a limit on this row
         const int gid = d_gen_id[k];
         // an SVC entry (frozen at a limit, or standby) or an HVDC one (a frozen VSC
         // station): no row disconnects it nor moves its target / thresholds

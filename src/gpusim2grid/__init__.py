@@ -13,7 +13,7 @@ try:  # pragma: no cover - environment dependent
 except ImportError:
     pass
 
-from .contingency_analysis import ContingencyAnalysisGPU, optimize_reference_slack
+from .contingency_analysis import ContingencyAnalysisGPU, optimize_reference_slack, ReactiveLimitsStatus
 from .injection_sweep import InjectionSweepGPU
 from .scenario_sweep import ScenarioSweepGPU
 from .acpf_nr import AcPfGPU
@@ -22,6 +22,7 @@ from ._gpusim2grid import warmup
 __all__ = [
     "ContingencyAnalysisGPU",
     "optimize_reference_slack",
+    "ReactiveLimitsStatus",
     "InjectionSweepGPU",
     "ScenarioSweepGPU",
     "AcPfGPU",

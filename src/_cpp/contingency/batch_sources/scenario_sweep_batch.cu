@@ -46,6 +46,13 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     // (only when any exist).
     mask_.upload(cs);
 
+    // per-slot |V| reseeds of the reactive-limit outer loop (only when any exist)
+    if (!h_vr_slot_.empty()) {
+        upload_h2d(d_vr_slot, h_vr_slot_.data(), h_vr_slot_.size(), cs);
+        upload_h2d(d_vr_bus,  h_vr_bus_.data(),  h_vr_bus_.size(),  cs);
+        upload_h2d(d_vr_vm,   h_vr_vm_.data(),   h_vr_vm_.size(),   cs);
+    }
+
     // compute_limit_violations tripped-branch table (see the ctor's
     // build_tripped_branch_table call). h_trip_start_/h_trip_count_ are
     // always sized n_active (possibly all-zero counts); h_trip_branch_flat_
@@ -92,6 +99,25 @@ void ScenarioSweepBatch::set_sbus_from_orig(const cudaComplexType* d_Sbus_orig,
                        d_active_to_orig_ptr(), n_bus_, n_act,
                        /*zero_nonfinite=*/false, cs);
     _chk_cuda(cudaGetLastError(), "Sbus row gather");
+}
+
+// =============================================================================
+// set_v_init_from_orig — one gather kernel, original row order → active slots.
+// =============================================================================
+void ScenarioSweepBatch::set_v_init_from_orig(const cudaComplexType* d_V_orig,
+                                              const cudaComplexType* d_V_fallback,
+                                              cudaStream_t cs)
+{
+    const int n_act = n_active();
+    has_v_init_ = false;
+    if (n_act <= 0 || d_V_orig == nullptr) return;
+    d_V_init_all.resize(static_cast<size_t>(n_act) * n_bus_);
+    const long long total = static_cast<long long>(n_act) * n_bus_;
+    gather_v_rows_kernel<<<static_cast<unsigned>((total + BS - 1) / BS), BS, 0, cs>>>(
+        thrust::raw_pointer_cast(d_V_init_all.data()), d_V_orig, d_active_to_orig_ptr(),
+        d_V_fallback, n_bus_, n_act);
+    _chk_cuda(cudaGetLastError(), "V init row gather");
+    has_v_init_ = true;
 }
 
 // =============================================================================
@@ -151,6 +177,15 @@ void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
                 thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
                 ctx.n_bus, ctx.batch_size, cs);
     _chk_cuda(cudaGetLastError(), "tile V");
+    // ... or each row's own starting point (set_v_init_from_orig) over it
+    if (has_v_init_ && actual_batch > 0) {
+        const size_t row0 = static_cast<size_t>(chunk_idx) * ctx.batch_size;
+        _chk_cuda(cudaMemcpyAsync(ctx.d_V_batch,
+                                  thrust::raw_pointer_cast(d_V_init_all.data()) + row0 * ctx.n_bus,
+                                  static_cast<size_t>(actual_batch) * ctx.n_bus * sizeof(cudaComplexType),
+                                  cudaMemcpyDeviceToDevice, cs),
+                  "V init copy");
+    }
     t.t_tile_V += timer.stop_ms();
 
     // ②  Tile Ybus values
@@ -193,6 +228,21 @@ void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
                          ctx.base.n_vc_grp,
                          thrust::raw_pointer_cast(d_gv_all.data()), k,
                          row_offset, actual_batch, ctx.batch_size, cs);
+    }
+
+    // ⑥  |V| of the buses the reactive-limit outer loop holds PV again on a
+    //     row (their Q row is pinned, so this value stays put).
+    if (chunk_idx < static_cast<int>(vr_ranges_.size())) {
+        const ChunkPatchRange& vr = vr_ranges_[static_cast<size_t>(chunk_idx)];
+        if (vr.count > 0) {
+            apply_vm_reseed_kernel<<<(vr.count + BS - 1) / BS, BS, 0, cs>>>(
+                ctx.d_V_batch,
+                thrust::raw_pointer_cast(d_vr_slot.data()) + vr.start,
+                thrust::raw_pointer_cast(d_vr_bus.data())  + vr.start,
+                thrust::raw_pointer_cast(d_vr_vm.data())   + vr.start,
+                vr.count, ctx.n_bus);
+            _chk_cuda(cudaGetLastError(), "vm reseed");
+        }
     }
 }
 

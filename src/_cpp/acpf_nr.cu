@@ -738,6 +738,9 @@ AcPfNrState::AcPfNrState(
         h_vc_vrow_qcol_pos.assign(n_vc_grp, -1);
         h_vc_vrow_vmcol_pos.assign(n_vc_grp, -1);
         h_vc_ctrl_vrow_qcol_pos.assign(n_vc_ctrl, -1);
+        h_vc_ctrl_sh_row.assign(n_vc_ctrl, -1);
+        h_vc_ctrl_sh_self_pos.assign(n_vc_ctrl, -1);
+        h_vc_ctrl_sh_first_pos.assign(n_vc_ctrl, -1);
         for (int j = 0; j < n_vc_ctrl; ++j)
             h_vc_ctrl_vrow_qcol_pos[j] = find_J_pos(vrow[ledger->vc_group[j]], qcol[j]);
         for (int g = 0; g < n_vc_grp; ++g) {
@@ -753,6 +756,9 @@ AcPfNrState::AcPfNrState(
                 const int row = share[g][k];
                 sh_row.push_back(row); sh_first.push_back(first); sh_other.push_back(other);
                 sh_wfirst.push_back(w_first); sh_wother.push_back(w_other);
+                h_vc_ctrl_sh_row[other]       = row;
+                h_vc_ctrl_sh_self_pos[other]  = find_J_pos(row, qcol[other]);
+                h_vc_ctrl_sh_first_pos[other] = find_J_pos(row, qcol[first]);
                 push_feat(find_J_pos(row, qcol[other]), w_first);   // (share_row, q_col_{k+1})
                 push_feat(find_J_pos(row, qcol[first]), -w_other);  // (share_row, q_col_1)
             }
@@ -771,6 +777,65 @@ AcPfNrState::AcPfNrState(
         // running reactive injection per controller, reset to 0 each solve
         d_vc_q.resize(n_vc_ctrl);
         zero_d(d_vc_q, cs);
+
+        // lightsim2grid's held controllers (set_hold_frozen_regulators): their frozen
+        // output, offset out of the mismatch, is where they start; this base solve
+        // pins them the way a batch row does (build_mask_entries' vcp / jov rewrite:
+        // a group's first controller through its voltage row -- only when every
+        // controller is held --, any other one through its sharing row)
+        h_vc_held.assign(n_vc_ctrl, 0);
+        h_vc_q_held.assign(n_vc_ctrl, 0.);
+        has_vc_held = false;
+        if (static_cast<int>(ledger->vc_held.size()) == n_vc_ctrl &&
+            static_cast<int>(ledger->vc_q_held.size()) == n_vc_ctrl) {
+            for (int j = 0; j < n_vc_ctrl; ++j) {
+                h_vc_held[j] = ledger->vc_held[j] ? 1 : 0;
+                h_vc_q_held[j] = ledger->vc_held[j] ? ledger->vc_q_held[j] : 0.;
+                has_vc_held = has_vc_held || h_vc_held[j];
+            }
+        }
+        if (has_vc_held) {
+            std::vector<cuda_real_type> qoff(n_vc_ctrl);
+            for (int j = 0; j < n_vc_ctrl; ++j) qoff[j] = static_cast<cuda_real_type>(h_vc_q_held[j]);
+            upload_h2d(d_vc_qoff, qoff.data(), n_vc_ctrl, cs);
+            copy_d2d(d_vc_q, d_vc_qoff, cs);
+            std::vector<int> vs, vr, vc, js, jp;
+            std::vector<cuda_real_type> vt, jv;
+            auto jov = [&](int pos, cuda_real_type val) {
+                if (pos < 0) return;
+                js.push_back(0); jp.push_back(pos); jv.push_back(val);
+            };
+            for (int j = 0; j < n_vc_ctrl; ++j) {
+                if (!h_vc_held[j]) continue;
+                const int g = ledger->vc_group[j];
+                const int first = ledger->vc_grp_start[g];
+                int row;
+                if (j == first) {
+                    row = h_vc_vrow[g];
+                    jov(h_vc_vrow_qcol_pos[g], 1);
+                    jov(h_vc_vrow_vmcol_pos[g], 0);
+                    for (int k = first + 1; k < first + ledger->vc_grp_count[g]; ++k)
+                        jov(h_vc_ctrl_vrow_qcol_pos[k], 0);
+                } else {
+                    row = h_vc_ctrl_sh_row[j];
+                    jov(h_vc_ctrl_sh_self_pos[j], 1);
+                    jov(h_vc_ctrl_sh_first_pos[j], 0);
+                }
+                vs.push_back(0); vr.push_back(row); vc.push_back(j);
+                vt.push_back(static_cast<cuda_real_type>(h_vc_q_held[j]));
+            }
+            n_hold_vcp = static_cast<int>(vs.size());
+            n_hold_jov = static_cast<int>(js.size());
+            upload_h2d(d_hold_vcp_slot, vs.data(), vs.size(), cs);
+            upload_h2d(d_hold_vcp_row, vr.data(), vr.size(), cs);
+            upload_h2d(d_hold_vcp_ctrl, vc.data(), vc.size(), cs);
+            upload_h2d(d_hold_vcp_target, vt.data(), vt.size(), cs);
+            if (n_hold_jov > 0) {
+                upload_h2d(d_hold_jov_slot, js.data(), js.size(), cs);
+                upload_h2d(d_hold_jov_pos, jp.data(), jp.size(), cs);
+                upload_h2d(d_hold_jov_val, jv.data(), jv.size(), cs);
+            }
+        }
     }
 
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)
@@ -1082,6 +1147,21 @@ AcPfNrState::AcPfNrState(
         buf.d_mask_row     = thrust::raw_pointer_cast(d_pin_row.data());
         buf.d_mask_diag    = thrust::raw_pointer_cast(d_pin_diag.data());
         buf.n_mask_rows    = n_pin;
+    }
+    // Held controllers: offset out of the mismatch, pinned in this base solve.
+    if (has_vc_held) {
+        buf.d_vc_qoff    = thrust::raw_pointer_cast(d_vc_qoff.data());
+        buf.d_vcp_slot   = thrust::raw_pointer_cast(d_hold_vcp_slot.data());
+        buf.d_vcp_row    = thrust::raw_pointer_cast(d_hold_vcp_row.data());
+        buf.d_vcp_ctrl   = thrust::raw_pointer_cast(d_hold_vcp_ctrl.data());
+        buf.d_vcp_target = thrust::raw_pointer_cast(d_hold_vcp_target.data());
+        buf.n_vcp        = n_hold_vcp;
+        if (n_hold_jov > 0) {
+            buf.d_jov_slot = thrust::raw_pointer_cast(d_hold_jov_slot.data());
+            buf.d_jov_pos  = thrust::raw_pointer_cast(d_hold_jov_pos.data());
+            buf.d_jov_val  = thrust::raw_pointer_cast(d_hold_jov_val.data());
+            buf.n_jov      = n_hold_jov;
+        }
     }
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs

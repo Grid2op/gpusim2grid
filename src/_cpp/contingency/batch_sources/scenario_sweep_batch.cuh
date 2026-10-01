@@ -60,6 +60,7 @@
 // =============================================================================
 
 #include <algorithm>
+#include <stdexcept>
 #include <chrono>
 #include <thrust/device_vector.h>
 #include <vector>
@@ -134,6 +135,18 @@ struct ScenarioSweepBatch {
     MaskStreams mask_;
 
     // -------------------------------------------------------------------------
+    // Per-slot |V| reseeds (Contingency::vm_reseed: the buses the reactive-
+    // limit outer loop holds PV again on a row), flat over chunks with one
+    // ChunkPatchRange per chunk, chunk-relative slot ids -- applied right after
+    // the V tile (and set_gen_v's reseed) in prepare_Ybus_batch. Empty = none.
+    // -------------------------------------------------------------------------
+    std::vector<int>             h_vr_slot_, h_vr_bus_;
+    std::vector<cuda_real_type>  h_vr_vm_;
+    std::vector<ChunkPatchRange> vr_ranges_;
+    thrust::device_vector<int>            d_vr_slot, d_vr_bus;
+    thrust::device_vector<cuda_real_type> d_vr_vm;
+
+    // -------------------------------------------------------------------------
     // Per-row distributed slack (see slot_slack_redistribution.cuh): the
     // per-row weights of a generator contingency / the redistribute_slack
     // pre-pass, and that pre-pass' Sbus correction. Empty = every slot keeps
@@ -162,6 +175,10 @@ struct ScenarioSweepBatch {
 
     thrust::device_vector<cudaComplexType> d_Sbus_all;     // n_active × n_bus
     thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus
+    // per-row initial voltages (set_v_init_from_orig), n_active × n_bus; used
+    // instead of the base-case V only while has_v_init_
+    thrust::device_vector<cudaComplexType> d_V_init_all;
+    bool has_v_init_ = false;
 
     // -------------------------------------------------------------------------
     // set_gen_v() override (see ScenarioSweepSession::set_gen_v's doc), in
@@ -245,13 +262,15 @@ struct ScenarioSweepBatch {
         // row pins a switchable bus (generator contingencies).
         bool any_pins = false;
         for (const auto& ctg : contingencies)
-            if (!ctg.pinned_buses.empty()) { any_pins = true; break; }
+            if (!ctg.pinned_buses.empty() || !ctg.vc_pinned_ctrl.empty()) { any_pins = true; break; }
         if (mask_mode_ || any_pins)
             build_mask_entries(contingencies, active_to_orig_, used_batch_size_,
                                mask_cfg, mask_.h);
 
         build_tripped_branch_table(contingencies, active_to_orig_,
                                    h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+
+        _build_vm_reseed(contingencies);
 
         // Permute set_gen_v() rows into active-slot order (host path) — see
         // GenVOverride's own doc. The active-bus column list itself is
@@ -307,6 +326,18 @@ struct ScenarioSweepBatch {
                              const std::vector<int>& active_vc_group,
                              cudaStream_t cs);
     void clear_gen_v() { gen_v_override_ = GenVOverride{}; gv_vset_.clear(); }
+
+    // -------------------------------------------------------------------------
+    // set_v_init_from_orig — gather the session's ORIGINAL-row-order initial
+    //   voltages (n_scenarios × n_bus, device) into active-slot order: every
+    //   chunk then starts from them instead of the base-case V (a non-finite
+    //   entry -- a bus the source solve masked -- takes d_V_fallback's, the
+    //   base case's). The gen_v and |V| reseeds still apply on top.
+    // clear_v_init — back to the base-case V.
+    // -------------------------------------------------------------------------
+    void set_v_init_from_orig(const cudaComplexType* d_V_orig,
+                              const cudaComplexType* d_V_fallback, cudaStream_t cs);
+    void clear_v_init() { has_v_init_ = false; }
 
     // -------------------------------------------------------------------------
     // set_slack_redistribution — per-row slack weights ([n_scenarios * n_slack],
@@ -416,6 +447,36 @@ struct ScenarioSweepBatch {
     double cpu_preprocess_ms() const { return t_preprocess_ms; }
 
 private:
+    // Flatten the rows' Contingency::vm_reseed into the per-chunk h_vr_* streams
+    // (active-slot order, chunk-relative slots).
+    void _build_vm_reseed(const std::vector<Contingency>& contingencies)
+    {
+        h_vr_slot_.clear(); h_vr_bus_.clear(); h_vr_vm_.clear(); vr_ranges_.clear();
+        bool any = false;
+        for (int o : active_to_orig_)
+            if (!contingencies[static_cast<size_t>(o)].vm_reseed.empty()) { any = true; break; }
+        if (!any) return;
+        const int n_act = static_cast<int>(active_to_orig_.size());
+        const int bs = used_batch_size_ > 0 ? used_batch_size_ : 1;
+        const int n_chunks = (n_act + bs - 1) / bs;
+        vr_ranges_.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+        for (int c = 0; c < n_chunks; ++c) {
+            const int start = static_cast<int>(h_vr_slot_.size());
+            for (int a = c * bs; a < std::min(n_act, (c + 1) * bs); ++a) {
+                const Contingency& ctg = contingencies[static_cast<size_t>(active_to_orig_[static_cast<size_t>(a)])];
+                for (const auto& bv : ctg.vm_reseed) {
+                    if (bv.first < 0 || bv.first >= n_bus_)
+                        throw std::runtime_error("[scenario_sweep_batch] vm_reseed: bus out of range");
+                    h_vr_slot_.push_back(a - c * bs);
+                    h_vr_bus_.push_back(bv.first);
+                    h_vr_vm_.push_back(static_cast<cuda_real_type>(bv.second));
+                }
+            }
+            vr_ranges_[static_cast<size_t>(c)] =
+                ChunkPatchRange{start, static_cast<int>(h_vr_slot_.size()) - start};
+        }
+    }
+
     // Host permutation of an original-order override into active-slot order
     // (h_gen_v_all rows follow active_to_orig_; the bus list is row-independent).
     void _permute_gen_v_rows(GenVOverride&& orig)

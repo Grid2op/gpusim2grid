@@ -614,6 +614,8 @@ void compute_component_masks(
     const int n_grp  = static_cast<int>(cfg.vc_grp_count.size());
     const int n_ctrl = static_cast<int>(cfg.vc_bus.size());
     std::vector<int>  n_masked_ctrl(static_cast<size_t>(n_grp), 0);
+    std::vector<int>  n_active_ctrl(static_cast<size_t>(n_grp), 0);
+    std::vector<char> pinned_ctrl(static_cast<size_t>(n_ctrl), 0);
     std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
 
     for (auto& ctg : contingencies) {
@@ -660,16 +662,33 @@ void compute_component_masks(
         //   some of several masked          → nothing to do (the live ones hold
         //                                     the bus, the sharing rows keep
         //                                     the masked columns coupled)
+        // A controller the row holds at a fixed Q (Contingency::vc_pinned_ctrl, and
+        // a held one -- lightsim2grid's set_hold_frozen_regulators -- the row does
+        // not release) holds no bus: only the free ones count, and a group with
+        // none is neither stranded nor a reason to skip.
         if (!skip && n_grp > 0) {
             std::fill(n_masked_ctrl.begin(), n_masked_ctrl.end(), 0);
+            std::fill(n_active_ctrl.begin(), n_active_ctrl.end(), 0);
+            std::fill(pinned_ctrl.begin(), pinned_ctrl.end(), 0);
+            if (!cfg.vc_held.empty()) {
+                for (int j = 0; j < n_ctrl; ++j)
+                    pinned_ctrl[static_cast<size_t>(j)] = cfg.vc_held[static_cast<size_t>(j)] ? 1 : 0;
+                for (int j : ctg.vc_released)
+                    if (j >= 0 && j < n_ctrl) pinned_ctrl[static_cast<size_t>(j)] = 0;
+            }
+            for (const auto& pc : ctg.vc_pinned_ctrl)
+                if (pc.first >= 0 && pc.first < n_ctrl) pinned_ctrl[static_cast<size_t>(pc.first)] = 1;
             for (int j = 0; j < n_ctrl; ++j) {
+                if (pinned_ctrl[static_cast<size_t>(j)]) continue;
+                const int grp = cfg.vc_group[static_cast<size_t>(j)];
+                ++n_active_ctrl[static_cast<size_t>(grp)];
                 const int b = cfg.vc_bus[static_cast<size_t>(j)];
                 if (b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)])
-                    ++n_masked_ctrl[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])];
+                    ++n_masked_ctrl[static_cast<size_t>(grp)];
             }
             for (int g = 0; g < n_grp && !skip; ++g) {
                 const int nm  = n_masked_ctrl[static_cast<size_t>(g)];
-                const int cnt = cfg.vc_grp_count[static_cast<size_t>(g)];
+                const int cnt = n_active_ctrl[static_cast<size_t>(g)];
                 const int reg = cfg.vc_reg_bus.empty() ? -1 : cfg.vc_reg_bus[static_cast<size_t>(g)];
                 const bool reg_masked = reg >= 0 && reg < n_bus && is_masked[static_cast<size_t>(reg)];
                 if (cnt > 0 && nm >= cnt) {
@@ -681,7 +700,7 @@ void compute_component_masks(
                         skip = true;
                     else
                         ctg.stranded_groups.push_back(g);
-                } else if (reg_masked) {
+                } else if (reg_masked && cnt > nm) {
                     skip = true;
                 }
             }
@@ -767,6 +786,7 @@ void build_mask_entries(
     out.v_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
     out.jov_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
     out.str_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    out.vcp_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
 
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
         const int a_start   = chunk * batch_size;
@@ -775,6 +795,7 @@ void build_mask_entries(
         const int v_start   = static_cast<int>(out.v_slot.size());
         const int jov_start = static_cast<int>(out.jov_slot.size());
         const int str_start = static_cast<int>(out.str_slot.size());
+        const int vcp_start = static_cast<int>(out.vcp_slot.size());
 
         for (int local_c = 0; local_c < a_end - a_start; ++local_c) {
             const Contingency& ctg = contingencies[active_to_orig[a_start + local_c]];
@@ -837,6 +858,41 @@ void build_mask_entries(
                 out.str_slot.push_back(local_c);
                 out.str_grp.push_back(g);
             }
+            // Controllers held at a fixed reactive injection (the reactive-limit
+            // outer loop): a group's first controller through its voltage row
+            // ("Q_first = t": 1 on its q_col, 0 on the regulated magnitude and on
+            // the other controllers' slope slots -- the stranded-group rewrite
+            // with a target), any other one through its sharing row ("Q_c = t":
+            // 1 on its own q_col, 0 on the first controller's). The regulated
+            // bus floats once every controller of the group is held.
+            auto jov = [&](int pos, double val) {
+                if (pos < 0) return;
+                out.jov_slot.push_back(local_c);
+                out.jov_pos.push_back(pos);
+                out.jov_val.push_back(static_cast<cuda_real_type>(val));
+            };
+            for (const auto& pc : ctg.vc_pinned_ctrl) {
+                const int j = pc.first;
+                const int g = cfg.vc_group[static_cast<size_t>(j)];
+                const int first = cfg.vc_grp_start[static_cast<size_t>(g)];
+                int row;
+                if (j == first) {
+                    row = cfg.vc_vrow[static_cast<size_t>(g)];
+                    jov(cfg.vc_vrow_qcol_pos[static_cast<size_t>(g)], 1.);
+                    jov(cfg.vc_vrow_vmcol_pos[static_cast<size_t>(g)], 0.);
+                    const int cnt = cfg.vc_grp_count[static_cast<size_t>(g)];
+                    for (int k = first + 1; k < first + cnt; ++k)
+                        jov(cfg.vc_ctrl_vrow_qcol_pos[static_cast<size_t>(k)], 0.);
+                } else {
+                    row = cfg.vc_ctrl_sh_row[static_cast<size_t>(j)];
+                    jov(cfg.vc_ctrl_sh_self_pos[static_cast<size_t>(j)], 1.);
+                    jov(cfg.vc_ctrl_sh_first_pos[static_cast<size_t>(j)], 0.);
+                }
+                out.vcp_slot.push_back(local_c);
+                out.vcp_row.push_back(row);
+                out.vcp_ctrl.push_back(j);
+                out.vcp_target.push_back(static_cast<cuda_real_type>(pc.second));
+            }
         }
 
         out.row_ranges[static_cast<size_t>(chunk)] =
@@ -847,6 +903,8 @@ void build_mask_entries(
             {jov_start, static_cast<int>(out.jov_slot.size()) - jov_start};
         out.str_ranges[static_cast<size_t>(chunk)] =
             {str_start, static_cast<int>(out.str_slot.size()) - str_start};
+        out.vcp_ranges[static_cast<size_t>(chunk)] =
+            {vcp_start, static_cast<int>(out.vcp_slot.size()) - vcp_start};
     }
 }
 

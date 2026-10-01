@@ -617,6 +617,13 @@ void BatchPfDriver<BatchSource>::set_bus_q_check(
     to_dev_r(d_bq_gen_qmin,   plan.gen_qmin_mvar);
     to_dev_r(d_bq_gen_qmax,   plan.gen_qmax_mvar);
 
+    // a skip mask uploaded for another plan no longer lines up
+    if (bus_q_skip_stride_ != 0 && bus_q_skip_stride_ != plan.n_check) {
+        d_bq_row_skip.clear();
+        d_bq_row_skip.shrink_to_fit();
+        bus_q_skip_stride_ = 0;
+    }
+
     bus_q_n_check_      = plan.n_check;
     bus_q_capacity_     = K_q;
     bus_q_n_gen_        = (d_gen_off != nullptr) ? n_gen : 0;
@@ -673,6 +680,7 @@ void BatchPfDriver<BatchSource>::run_bus_q_check_n()
         thrust::raw_pointer_cast(d_bq_gen_qmin.data()),
         thrust::raw_pointer_cast(d_bq_gen_qmax.data()),
         /*d_gen_off=*/nullptr, /*n_gen=*/0,
+        /*d_row_skip=*/nullptr, /*skip_stride=*/0,
         bus_q_sn_mva_, bus_q_tol_mvar_,
         base.n_bus, base.nnz_Y,
         /*c_start=*/0, /*actual_batch=*/1, bus_q_capacity_,
@@ -1056,6 +1064,11 @@ void BatchPfDriver<BatchSource>::set_gen_pv_release_check(
         d_gr_targets.shrink_to_fit();
         gen_pv_release_target_stride_ = 0;
     }
+    if (gen_pv_release_skip_stride_ != 0 && gen_pv_release_skip_stride_ != plan.n_entries) {
+        d_gr_row_skip.clear();
+        d_gr_row_skip.shrink_to_fit();
+        gen_pv_release_skip_stride_ = 0;
+    }
 
     gen_pv_release_n_entries_    = plan.n_entries;
     gen_pv_release_capacity_     = K_r;
@@ -1119,6 +1132,53 @@ void BatchPfDriver<BatchSource>::upload_gen_pv_release_targets(const RealMatRM& 
     t_gen_pv_release_setup_ms_ += bpf_ms_since(t_start);
 }
 
+// Shared by the two per-row skip masks below: validate the (n_contingencies x
+// n_entries) shape, upload, or drop on an empty mask.
+namespace {
+inline void bpf_upload_row_skip(thrust::device_vector<unsigned char>& d, int& stride,
+                                const std::vector<unsigned char>& mask, int n_cols,
+                                int n_entries, int n_rows, cudaStream_t cs, const char* who)
+{
+    if (mask.empty()) {
+        d.clear();
+        d.shrink_to_fit();
+        stride = 0;
+        return;
+    }
+    if (n_cols != n_entries)
+        throw std::runtime_error(std::string(who) + ": the skip mask has " + std::to_string(n_cols) +
+            " columns, but the plan has " + std::to_string(n_entries) + " entries.");
+    if (static_cast<long long>(mask.size()) != static_cast<long long>(n_rows) * n_cols)
+        throw std::runtime_error(std::string(who) + ": the skip mask has " +
+            std::to_string(mask.size()) + " entries, expected n_rows (" + std::to_string(n_rows) +
+            ") x " + std::to_string(n_cols) + ".");
+    upload_h2d(d, mask.data(), mask.size(), cs);
+    stride = n_cols;
+}
+}  // namespace
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::upload_bus_q_row_skip(const std::vector<unsigned char>& mask, int n_cols)
+{
+    if (!_bus_q_enabled)
+        throw std::runtime_error("BatchPfDriver::upload_bus_q_row_skip: call set_bus_q_check first.");
+    bpf_upload_row_skip(d_bq_row_skip, bus_q_skip_stride_, mask, n_cols, bus_q_n_check_,
+                        n_contingencies, cs, "set_bus_q_row_skip");
+    cs.synchronize();
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::upload_gen_pv_release_row_skip(const std::vector<unsigned char>& mask,
+                                                                int n_cols)
+{
+    if (!_gen_pv_release_enabled)
+        throw std::runtime_error("BatchPfDriver::upload_gen_pv_release_row_skip: call set_gen_pv_release_check first.");
+    bpf_upload_row_skip(d_gr_row_skip, gen_pv_release_skip_stride_, mask, n_cols,
+                        gen_pv_release_n_entries_, n_contingencies, cs,
+                        "set_gen_pv_release_row_skip");
+    cs.synchronize();
+}
+
 template <typename BatchSource>
 void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
 {
@@ -1140,6 +1200,7 @@ void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
         d_gr_side.empty() ? nullptr : thrust::raw_pointer_cast(d_gr_side.data()),
         /*d_gen_off=*/nullptr, /*n_gen=*/0,
         /*d_targets=*/nullptr, /*target_stride=*/0,
+        /*d_row_skip=*/nullptr, /*skip_stride=*/0,
         gen_pv_release_tol_vm_pu_,
         base.n_bus,
         /*c_start=*/0, /*actual_batch=*/1, gen_pv_release_capacity_,
@@ -1385,10 +1446,19 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         init_slack_absorbed_kernel<<<(batch_size_ + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
             d_Sbus_for_NR, sbus_stride, n_bus, batch_size_);
-    if (base.n_vc_ctrl > 0)
+    // Held controllers (lightsim2grid's set_hold_frozen_regulators) start at the
+    // output they hold, the others at 0; their frozen output is offset out of the
+    // mismatch (it is in Sbus already).
+    if (base.has_vc_held) {
+        buf.d_vc_qoff = thrust::raw_pointer_cast(base.d_vc_qoff.data());
+        launch_tile(thrust::raw_pointer_cast(d_vc_q_batch.data()),
+                    thrust::raw_pointer_cast(base.d_vc_qoff.data()),
+                    base.n_vc_ctrl, batch_size_, cs);
+    } else if (base.n_vc_ctrl > 0) {
         CHK_CUDA_BPF(cudaMemsetAsync(
             thrust::raw_pointer_cast(d_vc_q_batch.data()), 0,
             d_vc_q_batch.size() * sizeof(cuda_real_type), cs));
+    }
 
     std::visit([&](auto& policy) {
         run_nr_loop(
@@ -1544,6 +1614,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_bq_gen_qmin.data()),
             thrust::raw_pointer_cast(d_bq_gen_qmax.data()),
             d_bq_gen_off_, bus_q_n_gen_,
+            has_bus_q_row_skip() ? thrust::raw_pointer_cast(d_bq_row_skip.data()) : nullptr,
+            bus_q_skip_stride_,
             bus_q_sn_mva_, bus_q_tol_mvar_,
             n_bus, nnz_Y,
             c_start, actual_batch, bus_q_capacity_,
@@ -1671,6 +1743,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             d_gr_gen_off_, gen_pv_release_n_gen_,
             has_gen_pv_release_targets() ? thrust::raw_pointer_cast(d_gr_targets.data()) : nullptr,
             gen_pv_release_target_stride_,
+            has_gen_pv_release_row_skip() ? thrust::raw_pointer_cast(d_gr_row_skip.data()) : nullptr,
+            gen_pv_release_skip_stride_,
             gen_pv_release_tol_vm_pu_,
             n_bus,
             c_start, actual_batch, gen_pv_release_capacity_,

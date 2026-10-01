@@ -19,6 +19,7 @@
 //   v    : masked-voltage NaN entries
 //   jov  : per-slot J value overrides (stranded lone controller)
 //   str  : stranded rows (F[v_row] = -Q_c)
+//   vcp  : controller rows held at a fixed Q (F[row] = -(Q_c - target))
 // =============================================================================
 
 #include <thrust/device_vector.h>
@@ -36,6 +37,8 @@ struct MaskStreams {
     thrust::device_vector<int>            d_jov_slot, d_jov_pos;
     thrust::device_vector<cuda_real_type> d_jov_val;
     thrust::device_vector<int>            d_str_slot, d_str_grp;
+    thrust::device_vector<int>            d_vcp_slot, d_vcp_row, d_vcp_ctrl;
+    thrust::device_vector<cuda_real_type> d_vcp_target;
 
     bool any() const { return h.any(); }
 
@@ -59,6 +62,12 @@ struct MaskStreams {
         if (!h.str_slot.empty()) {
             upload_h2d(d_str_slot, h.str_slot.data(), h.str_slot.size(), cs);
             upload_h2d(d_str_grp,  h.str_grp.data(),  h.str_grp.size(),  cs);
+        }
+        if (!h.vcp_slot.empty()) {
+            upload_h2d(d_vcp_slot,   h.vcp_slot.data(),   h.vcp_slot.size(),   cs);
+            upload_h2d(d_vcp_row,    h.vcp_row.data(),    h.vcp_row.size(),    cs);
+            upload_h2d(d_vcp_ctrl,   h.vcp_ctrl.data(),   h.vcp_ctrl.size(),   cs);
+            upload_h2d(d_vcp_target, h.vcp_target.data(), h.vcp_target.size(), cs);
         }
     }
 
@@ -106,6 +115,16 @@ struct MaskStreams {
                 buf.d_str_slot = thrust::raw_pointer_cast(d_str_slot.data()) + r.start;
                 buf.d_str_grp  = thrust::raw_pointer_cast(d_str_grp.data())  + r.start;
                 buf.n_str      = r.count;
+            }
+        }
+        {
+            const ChunkPatchRange r = slice(h.vcp_ranges);
+            if (r.count > 0) {
+                buf.d_vcp_slot   = thrust::raw_pointer_cast(d_vcp_slot.data())   + r.start;
+                buf.d_vcp_row    = thrust::raw_pointer_cast(d_vcp_row.data())    + r.start;
+                buf.d_vcp_ctrl   = thrust::raw_pointer_cast(d_vcp_ctrl.data())   + r.start;
+                buf.d_vcp_target = thrust::raw_pointer_cast(d_vcp_target.data()) + r.start;
+                buf.n_vcp        = r.count;
             }
         }
     }

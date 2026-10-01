@@ -8,6 +8,7 @@ __all__ = [
     "ViolationCategory",
     "violation_category",
     "LimitViolation",
+    "ReactiveLimitsStatus",
 ]
 
 from .._gpusim2grid import (
@@ -22,6 +23,7 @@ from ._limit_violations import (ViolationElementType, LimitViolationType, Violat
                                 violation_category, LimitViolation)
 from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
+from ._reactive_limits import ReactiveLimitsStatus
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.

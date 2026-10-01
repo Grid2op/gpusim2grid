@@ -140,7 +140,8 @@ struct ContingencyBatch {
                      const int*                Ybus_rm_inner,
                      const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                      int                       max_batch_size,
-                     const MaskConfig*         mask_cfg = nullptr)
+                     const MaskConfig*         mask_cfg = nullptr,
+                     bool                      mask_mode = true)
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
@@ -149,7 +150,9 @@ struct ContingencyBatch {
         // handle_disconnected_grid: largest-component masking (mask the split-off
         // buses, only skip when the reference / a controller is stranded). Legacy
         // path: skip any contingency that disconnects the graph.
-        mask_mode_ = (mask_cfg != nullptr);
+        // mask_cfg without mask_mode: no largest-component masking, only the
+        // per-row pins (lightsim2grid's held controllers) need its positions
+        mask_mode_ = (mask_cfg != nullptr) && mask_mode;
         if (mask_mode_)
             compute_component_masks(contingencies, Ybus_rm, *mask_cfg);
         else
@@ -171,7 +174,10 @@ struct ContingencyBatch {
                            h_flat_delta_re_, h_flat_delta_im_,
                            chunk_ranges_, active_to_orig_);
 
-        if (mask_mode_)
+        bool any_pins = false;
+        for (const auto& ctg : contingencies)
+            if (!ctg.pinned_buses.empty() || !ctg.vc_pinned_ctrl.empty()) { any_pins = true; break; }
+        if (mask_mode_ || (mask_cfg != nullptr && any_pins))
             build_mask_entries(contingencies, active_to_orig_, used_batch_size_,
                                *mask_cfg, mask_.h);
 
@@ -241,7 +247,7 @@ struct ContingencyBatch {
     // -------------------------------------------------------------------------
     void fill_mask_buffers(NrIterBuffers& buf, int chunk_idx, const int* d_J_outer) const
     {
-        if (!mask_mode_) return;
+        if (!mask_.any()) return;
         mask_.fill(buf, chunk_idx, d_J_outer);
     }
 

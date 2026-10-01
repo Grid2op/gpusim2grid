@@ -24,6 +24,7 @@
 #include <thrust/execution_policy.h>
 
 #include <stdexcept>
+#include <string>
 #include <limits>
 #include <utility>   // std::move
 
@@ -227,11 +228,18 @@ void ContingencyAnalysisSession::run()
     // Reset any masking flags set on a previous run() (the contingency list is
     // mutated in place across runs; compute_component_masks / check_connectivity
     // expect to start from a clean state).
+    // lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned on
+    // every contingency, as in the grid's own solve (AcPfNrState pins them too)
+    std::vector<std::pair<int, double>> held_pins;
+    for (size_t j = 0; j < base_state_->h_vc_held.size(); ++j)
+        if (base_state_->h_vc_held[j])
+            held_pins.emplace_back(static_cast<int>(j), base_state_->h_vc_q_held[j]);
     for (auto& ctg : contingencies_) {
         ctg.disconnected = false;
         ctg.masked_buses.clear();
         ctg.stranded_groups.clear();
         ctg.pinned_buses.clear();
+        ctg.vc_pinned_ctrl = held_pins;
     }
 
     // Host preprocessing (resolve_indices + connectivity/masking + build_flat_patches)
@@ -245,7 +253,8 @@ void ContingencyAnalysisSession::run()
         Ybus_rm_.innerIndexPtr(),
         Ybus_rm_,
         batch_size_,
-        handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
+        (handle_disconnected_grid_ || !held_pins.empty()) ? &mask_cfg_ : nullptr,
+        handle_disconnected_grid_);
     used_batch_size_ = source.used_batch_size();
 
     // redistribute_slack: the pre-pass of what each contingency's island took
@@ -721,6 +730,52 @@ RealVect ContingencyAnalysisSession::get_residuals() const
         out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
+}
+
+void ContingencyAnalysisSession::overwrite_rows(const std::vector<int>& dst_rows,
+                                                const std::vector<int>& src_rows,
+                                                std::uintptr_t d_V_src, std::uintptr_t d_res_src)
+{
+    if (!solver_)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: call run() first");
+    if (dst_rows.size() != src_rows.size())
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: dst_rows and src_rows "
+                                 "must have the same length");
+    if (dst_rows.empty()) return;
+    if (d_V_src == 0 || d_res_src == 0)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: null source buffer");
+    const int n_rows = solver_->n_contingencies;
+    for (int r : dst_rows)
+        if (r < 0 || r >= n_rows)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: row " +
+                                     std::to_string(r) + " outside [0, n_contingencies)");
+    for (int r : src_rows)
+        if (r < 0)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: negative source row");
+    const cudaStream_t cs = static_cast<cudaStream_t>(solver_->cs);
+    thrust::device_vector<int> d_dst, d_src;
+    upload_h2d(d_dst, dst_rows.data(), dst_rows.size(), cs);
+    upload_h2d(d_src, src_rows.data(), src_rows.size(), cs);
+    const int n = static_cast<int>(dst_rows.size());
+    launch_copy_rows(thrust::raw_pointer_cast(solver_->d_V_results.data()),
+                     reinterpret_cast<const cudaComplexType*>(d_V_src),
+                     thrust::raw_pointer_cast(d_dst.data()), thrust::raw_pointer_cast(d_src.data()),
+                     base_state_->n_bus, n, cs);
+    launch_copy_rows(thrust::raw_pointer_cast(solver_->d_residuals.data()),
+                     reinterpret_cast<const cuda_real_type*>(d_res_src),
+                     thrust::raw_pointer_cast(d_dst.data()), thrust::raw_pointer_cast(d_src.data()),
+                     1, n, cs);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ContingencyAnalysisSession::overwrite_rows: ") +
+                                 cudaGetErrorString(e));
+    solver_->cs.synchronize();
+}
+
+std::uintptr_t ContingencyAnalysisSession::v_results_ptr() const
+{
+    return solver_ ? reinterpret_cast<std::uintptr_t>(thrust::raw_pointer_cast(solver_->d_V_results.data()))
+                   : 0;
 }
 
 RealVect ContingencyAnalysisSession::get_or_amps() const

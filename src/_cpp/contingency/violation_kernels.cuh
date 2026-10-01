@@ -211,6 +211,11 @@ __global__ void check_limit_violations_kernel(
 //   generator off, no station / storage unit / SVC) => the bus is an ordinary PQ bus in this
 //   row and is not checked (the residual there is nobody's output).
 //
+//   d_row_skip[out_c * skip_stride + kk] != 0 (nullptr = none) leaves entry kk
+//   unchecked on that row: a bus the reactive-limit outer loop switched to PQ
+//   at its limit there (ContingencyAnalysisGPU's second pass), or an entry the
+//   pass added for a machine that row did not release.
+//
 //   violation:  q_bus < q_min - tol_mvar  -> LOW_Q  (value q_bus, limit q_min)
 //         else  q_bus > q_max + tol_mvar  -> HIGH_Q (value q_bus, limit q_max)
 //   a non-finite limit disables that side; a non-finite q_bus skips the bus.
@@ -254,6 +259,8 @@ __global__ void check_bus_q_violations_kernel(
     const cuda_real_type*  __restrict__ d_gen_qmax,
     const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
     int                                 n_gen,
+    const unsigned char*   __restrict__ d_row_skip,     // [n_rows × skip_stride] ORIGINAL order, or nullptr
+    int                                 skip_stride,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mvar,
     int n_bus, int nnz_Y,
@@ -343,7 +350,10 @@ __global__ void check_hvdc_p_violations_kernel(
 // is on (5 GENERATOR / 7 SVC / 4 HVDC), d_out_gen_id its id and d_out_side its
 // side (the station's end for an HVDC one, 0 otherwise). An HVDC entry (a VSC
 // station frozen at a reactive limit) runs the generators' test, never masked
-// by d_gen_off nor moved by d_targets. Four groups
+// by d_gen_off nor moved by d_targets.
+// d_row_skip[out_c * skip_stride + k] != 0 (nullptr = none) leaves entry k
+// unchecked on that row (a machine the reactive-limit outer loop released
+// there, or an entry the pass added for a bus it did not switch). Four groups
 // (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
 // HIGH_VOLTAGE_SVC_STANDBY), each keeping the K largest |value / limit - 1|
 // (a relative measure, like every voltage check), most severe first. Same row gate / result map / capacity / sentinel
@@ -367,6 +377,8 @@ __global__ void check_gen_pv_release_violations_kernel(
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,      // [n_rows × target_stride] ORIGINAL order, or nullptr
     int                                 target_stride,
+    const unsigned char*   __restrict__ d_row_skip,     // [n_rows × skip_stride] ORIGINAL order, or nullptr
+    int                                 skip_stride,
     cuda_real_type                      tol_vm_pu,
     int n_bus,
     int c_start, int actual_batch, int K,

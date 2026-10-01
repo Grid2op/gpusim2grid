@@ -194,6 +194,16 @@ struct NrIterBuffers {
     const int*             d_str_slot     = nullptr;   // [n_str]
     const int*             d_str_grp      = nullptr;   // [n_str]
     int                    n_str          = 0;
+    // controller rows held at a fixed reactive injection (the reactive-limit
+    // outer loop; MaskEntries::vcp): F[row] = -(Q_ctrl - target) per slot
+    const int*             d_vcp_slot     = nullptr;   // [n_vcp]
+    const int*             d_vcp_row      = nullptr;   // [n_vcp]
+    const int*             d_vcp_ctrl     = nullptr;   // [n_vcp]
+    const cuda_real_type*  d_vcp_target   = nullptr;   // [n_vcp]
+    int                    n_vcp          = 0;
+    // per controller, the frozen output a held one (LedgerData::vc_held) holds and
+    // its Sbus entry already carries: offset out of the mismatch; nullptr = none held
+    const cuda_real_type*  d_vc_qoff      = nullptr;   // [n_vc_ctrl]
 
     // ---- per-slot distributed-slack weights ---------------------------------
     // 0 (default): d_slack_w is the shared single-system [n_slack] array.
@@ -267,7 +277,7 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
             buf.n_hvdc, n_bus, dim_J, batch);
     if (buf.n_vc_ctrl > 0) {
         vc_adjust_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_vc_ctrl, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
+            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.d_vc_qoff, buf.n_vc_ctrl, dim_J, batch);
         vc_vrow_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
             buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset, buf.vc_vset_stride,
@@ -346,7 +356,9 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 //   nr_apply_J_overrides   : per-slot J value overrides. Must run AFTER every
 //                            feature stamp (they assign the normal values) and
 //                            BEFORE nr_apply_bus_mask (the masked rows win).
-//   nr_apply_stranded_vrow : F[v_row] = -Q_c for the stranded groups. Must run
+//   nr_apply_stranded_vrow : F[v_row] = -Q_c for the stranded groups (and
+//                            F[row] = -(Q_c - t) for the controllers held at a
+//                            fixed Q, MaskEntries::vcp). Must run
 //                            AFTER nr_feature_mismatch (vc_vrow_kernel assigns
 //                            the voltage-constraint residual it replaces).
 // The two composites below bundle each with the bus mask in the right order;
@@ -366,6 +378,10 @@ inline void nr_apply_stranded_vrow(const NrIterBuffers& buf, int dim_J, cudaStre
         vc_stranded_vrow_kernel<<<(buf.n_str + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_F, buf.d_vc_q, buf.d_vc_vrow, buf.d_vc_grp_start,
             buf.d_str_slot, buf.d_str_grp, buf.n_vc_ctrl, dim_J, buf.n_str);
+    if (buf.n_vcp > 0)
+        vc_pinned_ctrl_rows_kernel<<<(buf.n_vcp + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_vc_q, buf.d_vcp_slot, buf.d_vcp_row, buf.d_vcp_ctrl,
+            buf.d_vcp_target, buf.n_vc_ctrl, dim_J, buf.n_vcp);
 }
 
 // After fill_F + nr_feature_mismatch: stranded rows, then the bus mask.

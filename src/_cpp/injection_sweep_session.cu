@@ -69,6 +69,16 @@ InjectionSweepSession::InjectionSweepSession(
     , max_dVm_(max_dVm)
 {
     (void)slack_weights;
+    // lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned per
+    // row by the mask streams, which an injection sweep does not have
+    if (ledger != nullptr)
+        for (int h : ledger->vc_held)
+            if (h)
+                throw std::runtime_error(
+                    "InjectionSweepSession: this grid holds frozen remote regulators in their "
+                    "voltage-control group (lightsim2grid's set_hold_frozen_regulators), which "
+                    "InjectionSweepGPU does not support: turn the option off on the grid, or "
+                    "use ScenarioSweepGPU.");
 
     auto t_base_start = std::chrono::steady_clock::now();
     base_state_ = std::make_unique<AcPfNrState>(

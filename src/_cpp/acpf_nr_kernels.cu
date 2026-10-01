@@ -339,6 +339,73 @@ __global__ void apply_gen_v_kernel(
 }
 
 // =============================================================================
+// vc_pinned_ctrl_rows_kernel
+// =============================================================================
+__global__ void vc_pinned_ctrl_rows_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,
+    const int*            __restrict__ d_slot,
+    const int*            __restrict__ d_row,
+    const int*            __restrict__ d_ctrl,
+    const cuda_real_type* __restrict__ d_target,
+    int n_ctrl,
+    int dim_J,
+    int n_entries)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_entries) return;
+    const ptrdiff_t slot = d_slot[k];
+    d_F[slot * dim_J + d_row[k]] = -(d_vc_q[slot * n_ctrl + d_ctrl[k]] - d_target[k]);
+}
+
+// =============================================================================
+// apply_vm_reseed_kernel
+// =============================================================================
+__global__ void apply_vm_reseed_kernel(
+          cudaComplexType* __restrict__ d_V_batch,
+    const int*             __restrict__ d_slot,
+    const int*             __restrict__ d_bus,
+    const cuda_real_type*  __restrict__ d_vm,
+    int n_entries,
+    int n_bus)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_entries) return;
+    const ptrdiff_t at = static_cast<ptrdiff_t>(d_slot[k]) * n_bus + d_bus[k];
+    cudaComplexType v = d_V_batch[at];
+    cuda_real_type mag = CudaFunHelper::my_cuCabs(v);
+    if (mag < cuda_real_type(1e-10)) {
+        v   = CudaFunHelper::my_make_cuComplex(cuda_real_type(1), cuda_real_type(0));
+        mag = cuda_real_type(1);
+    }
+    const cuda_real_type scale = d_vm[k] / mag;
+    d_V_batch[at] = CudaFunHelper::my_make_cuComplex(
+        CudaFunHelper::my_cuCreal(v) * scale,
+        CudaFunHelper::my_cuCimag(v) * scale);
+}
+
+// =============================================================================
+// gather_v_rows_kernel
+// =============================================================================
+__global__ void gather_v_rows_kernel(
+          cudaComplexType* __restrict__ d_dst,
+    const cudaComplexType* __restrict__ d_src,
+    const int*             __restrict__ d_map,
+    const cudaComplexType* __restrict__ d_fallback,
+    int n_bus,
+    int n_rows)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / n_bus;
+    const int       b   = static_cast<int>(tid % n_bus);
+    if (r >= n_rows) return;
+    const ptrdiff_t src_r = d_map ? d_map[r] : r;
+    const cudaComplexType v = d_src[src_r * n_bus + b];
+    d_dst[r * n_bus + b] = (isfinite(CudaFunHelper::my_cuCreal(v)) && isfinite(CudaFunHelper::my_cuCimag(v)))
+                         ? v : d_fallback[b];
+}
+
+// =============================================================================
 // tile_vc_vset_kernel / apply_gen_vset_kernel
 // =============================================================================
 __global__ void tile_vc_vset_kernel(
@@ -853,6 +920,7 @@ __global__ void vc_adjust_mismatch_kernel(
           cuda_real_type* __restrict__ d_F,
     const cuda_real_type* __restrict__ d_vc_q,
     const int*            __restrict__ d_vc_qrow,
+    const cuda_real_type* __restrict__ d_vc_qoff,
     int n_ctrl,
     int dim_J,
     int actual_batch)
@@ -862,8 +930,10 @@ __global__ void vc_adjust_mismatch_kernel(
     const ptrdiff_t b   = tid / n_ctrl;
     const int       j   = static_cast<int>(tid % n_ctrl);
     if (b >= actual_batch) return;
-    // mis(c.bus) -= i·Q_c  ⇒  residual d_F[q_row] += Q_c
-    atomic_add_real(&d_F[b * dim_J + d_vc_qrow[j]], d_vc_q[b * n_ctrl + j]);
+    // mis(c.bus) -= i·(Q_c - q_off_c)  ⇒  residual d_F[q_row] += Q_c - q_off_c: a held
+    // controller's frozen output is already in Sbus
+    const cuda_real_type off = d_vc_qoff ? d_vc_qoff[j] : cuda_real_type(0);
+    atomic_add_real(&d_F[b * dim_J + d_vc_qrow[j]], d_vc_q[b * n_ctrl + j] - off);
 }
 
 __global__ void vc_vrow_kernel(
