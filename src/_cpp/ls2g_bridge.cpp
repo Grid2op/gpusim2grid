@@ -460,6 +460,13 @@ int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver)
 #else
 #define GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(info) 0.
 #endif
+// ... and how far beyond its limit such a unit was in the reference solve
+// (LSGrid::set_gen_can_participate_slack_overshoot); 0 against a lightsim2grid that predates it
+#ifdef LS2G_HAS_CAN_PARTICIPATE_SLACK_OVERSHOOT
+#define GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(info) static_cast<double>((info).can_participate_slack_overshoot_mw)
+#else
+#define GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(info) 0.
+#endif
 
 SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
@@ -471,7 +478,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         return (b >= 0 && b < n_bus_solver) ? b : -1;
     };
     std::vector<int>    kind, el_id, bus, in_slack;
-    std::vector<double> weight, min_p, max_p, target;
+    std::vector<double> weight, min_p, max_p, target, overshoot;
 
     // generators by id, then storage units by id (upstream's append_participants
     // order): connected, flagged slack with a nonzero weight -- or flagged "can
@@ -495,6 +502,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         el_id.push_back(g);
         bus.push_back(b);
         in_slack.push_back(g_in_slack ? 1 : 0);
+        overshoot.push_back(g_in_slack ? 0. : GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(gi));
         weight.push_back(g_w);
         min_p.push_back(static_cast<double>(gi.min_p_mw));
         max_p.push_back(static_cast<double>(gi.max_p_mw));
@@ -514,6 +522,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         el_id.push_back(s);
         bus.push_back(b);
         in_slack.push_back(s_in_slack ? 1 : 0);
+        overshoot.push_back(s_in_slack ? 0. : GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(si));
         weight.push_back(s_w);
         min_p.push_back(static_cast<double>(si.min_p_mw));
         max_p.push_back(static_cast<double>(si.max_p_mw));
@@ -534,6 +543,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     d.max_p_mw    = rv(max_p);
     d.target_p_mw = rv(target);
     d.in_slack    = iv(in_slack);
+    d.overshoot_mw = rv(overshoot);
 
     // the shunts' active power at 1 pu per solver bus: not in the AC Sbus
     d.shunt_p_mw = RealVect::Zero(std::max(n_bus_solver, 0));

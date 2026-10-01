@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] ``redistribute_slack``: a unit capped well beyond its active limit stays there until the
+  shift has used that up (lightsim2grid's ``set_gen_can_participate_slack_overshoot``).
 - [ADDED] Report a generator holding a remote bus from an unrealistic own-bus voltage
   (``LOW_VOLTAGE_REMOTE_CONTROL`` / ``HIGH_VOLTAGE_REMOTE_CONTROL``), lightsim2grid's
   ``set_remote_voltage_control_vm_range``, as OpenLoadFlow's robust remote voltage control does.

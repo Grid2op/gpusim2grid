@@ -276,7 +276,10 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "out of the slack only because it sat at an active limit -- which never enters the "
         "solve's slack weights. Optional base_p_mw: the active injection of the grid's own "
         "set-points summed over the solved system (MW), what a scenario row's injection "
-        "change is pre-shared against (NaN = unknown: no such term).")
+        "change is pre-shared against (NaN = unknown: no such term). Optional overshoot_mw (one "
+        "per unit, empty = all 0): for a pre-pass-only unit, how far beyond the limit it sits at "
+        "it was in the reference solve (LSGrid.set_gen_can_participate_slack_overshoot): it only "
+        "leaves that limit once the common shift of the distribution has used that up.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> kind,
                                Eigen::Ref<const Eigen::VectorXi> el_id,
@@ -291,7 +294,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const RealVect> shunt_p_mw,
                                double sn_mva,
                                Eigen::Ref<const Eigen::VectorXi> in_slack,
-                               double base_p_mw) {
+                               double base_p_mw,
+                               Eigen::Ref<const RealVect> overshoot_mw) {
                  SlackRedistributionData d;
                  d.n_units = static_cast<int>(kind.size());
                  d.kind = kind; d.el_id = el_id; d.bus_solver = bus_solver;
@@ -302,6 +306,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  d.n_sto = n_sto; d.shunt_p_mw = shunt_p_mw; d.sn_mva = sn_mva;
                  d.in_slack = in_slack;
                  d.base_p_mw = base_p_mw;
+                 d.overshoot_mw = overshoot_mw;
                  return d;
              }),
              pybind11::arg("kind"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
@@ -310,8 +315,10 @@ static void bind_physical_checks_types(pybind11::module_& m)
              pybind11::arg("gen_target_p_mw"), pybind11::arg("n_sto"),
              pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"),
              pybind11::arg("in_slack") = Eigen::VectorXi(),
-             pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN())
+             pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN(),
+             pybind11::arg("overshoot_mw") = RealVect())
         .def_readonly("n_units",         &SlackRedistributionData::n_units)
+        .def_readonly("overshoot_mw",    &SlackRedistributionData::overshoot_mw)
         .def_readonly("kind",            &SlackRedistributionData::kind)
         .def_readonly("el_id",           &SlackRedistributionData::el_id)
         .def_readonly("bus_solver",      &SlackRedistributionData::bus_solver)

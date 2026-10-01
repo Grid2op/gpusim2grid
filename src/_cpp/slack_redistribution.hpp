@@ -92,6 +92,11 @@ struct SlackRedistributionData {
     // slack only because it sat at an active limit), which never enters the solve's
     // slack weights. Empty: every unit is in the slack.
     Eigen::VectorXi in_slack;
+    // [n_units] for a pre-pass-only unit: how far BEYOND the limit it sits at it was in the
+    // reference solve, MW (lightsim2grid's LSGrid::set_gen_can_participate_slack_overshoot):
+    // it only leaves that limit once the common shift of the distribution has used it up.
+    // Empty: 0 for every unit.
+    RealVect        overshoot_mw;
     // ---- every generator: whether it is in the solved system (its solver bus,
     // -1 otherwise) and its grid set-point -- what a row that disconnects it
     // loses when the row gives no set-point of its own
@@ -131,6 +136,13 @@ struct SlackRedistributionData {
         need(max_p_mw.size(),    n_units, "max_p_mw");
         need(target_p_mw.size(), n_units, "target_p_mw");
         if (in_slack.size() != 0) need(in_slack.size(), n_units, "in_slack");
+        if (overshoot_mw.size() != 0) {
+            need(overshoot_mw.size(), n_units, "overshoot_mw");
+            for (int k = 0; k < n_units; ++k) {
+                if (!std::isfinite(static_cast<double>(overshoot_mw(k))) || static_cast<double>(overshoot_mw(k)) < 0.)
+                    fail("overshoot_mw must be finite and >= 0");
+            }
+        }
         need(gen_bus_solver.size(),  n_gen, "gen_bus_solver");
         need(gen_target_p_mw.size(), n_gen, "gen_target_p_mw");
         need(shunt_p_mw.size(),  n_bus, "shunt_p_mw");
@@ -171,6 +183,7 @@ struct Participant {
     double weight;
     double min_p_mw;   // NaN: unbounded
     double max_p_mw;   // NaN: unbounded
+    double overshoot_mw = 0.;   // beyond the limit it sits at, in the reference solve (see the data)
 };
 
 // What the redistribution did, per row (lightsim2grid's SlackRedistributionReport).
@@ -193,9 +206,18 @@ constexpr double MOVED_EPS_MW     = 1e-7;   // a set-point "moved" (upstream _to
 // never crossing 0 MW; a clamped unit leaves the pool and what it could not
 // take is shared again. When EVERY unit hits its bound, `saturated` is cleared
 // and all_saturated set (they all stay in the slack).
+inline Report distribute_with_overshoot(const std::vector<Participant>& units, double mismatch_mw,
+                                        double eps_mw, std::vector<double>& new_injection_mw,
+                                        std::vector<char>& saturated);
+
 inline Report distribute(const std::vector<Participant>& units, double mismatch_mw, double eps_mw,
                          std::vector<double>& new_injection_mw, std::vector<char>& saturated)
 {
+    // a unit that sat beyond its limit in the reference solve: the exact rule (see
+    // distribute_with_overshoot); without one, this one, which gives the same answer
+    for (const Participant& u : units)
+        if (u.overshoot_mw > 0.)
+            return distribute_with_overshoot(units, mismatch_mw, eps_mw, new_injection_mw, saturated);
     const std::size_t nb = units.size();
     Report report;
     report.mismatch_mw = mismatch_mw;
@@ -255,6 +277,88 @@ inline Report distribute(const std::vector<Participant>& units, double mismatch_
 }
 
 // What the pre-pass decided for ONE row.
+// Port of lightsim2grid's slack_redistribution::distribute_with_overshoot: OpenLoadFlow's
+// rule written as what it is, p_k = clamp(v_k + delta * w_k / W, lo_k, hi_k), ONE common
+// shift delta solved by bisection. v_k is the unit's injection plus its overshoot beyond the
+// limit it sits at, the bounds those of `distribute` (0 MW on the side the unit is not on)
+// widened to its injection when it already sits beyond one.
+inline Report distribute_with_overshoot(const std::vector<Participant>& units, double mismatch_mw,
+                                        double eps_mw, std::vector<double>& new_injection_mw,
+                                        std::vector<char>& saturated)
+{
+    const std::size_t nb = units.size();
+    Report report;
+    report.mismatch_mw = mismatch_mw;
+    report.nb_participants = static_cast<int>(nb);
+    new_injection_mw.resize(nb);
+    saturated.assign(nb, 0);
+    for (std::size_t k = 0; k < nb; ++k) new_injection_mw[k] = units[k].injection_mw;
+    if (nb == 0 || std::abs(mismatch_mw) <= eps_mw) return report;
+
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<double> lo(nb), hi(nb), virt(nb), share(nb);
+    double weight_sum = 0.;
+    for (std::size_t k = 0; k < nb; ++k) weight_sum += units[k].weight;
+    if (weight_sum <= 0.) return report;
+    for (std::size_t k = 0; k < nb; ++k) {
+        const double inj = units[k].injection_mw;
+        double l = std::isfinite(units[k].min_p_mw) ? units[k].min_p_mw : -inf;
+        double h = std::isfinite(units[k].max_p_mw) ? units[k].max_p_mw : inf;
+        if (inj < 0.) h = std::min(h, 0.);
+        else l = std::max(l, 0.);
+        double offset = 0.;
+        if (units[k].overshoot_mw > 0.) {
+            if (std::isfinite(h) && inj >= h - eps_mw) offset = units[k].overshoot_mw;
+            else if (std::isfinite(l) && inj <= l + eps_mw) offset = -units[k].overshoot_mw;
+        }
+        lo[k] = std::min(l, inj);
+        hi[k] = std::max(h, inj);
+        virt[k] = inj + offset;
+        share[k] = units[k].weight / weight_sum;
+    }
+    auto taken = [&](double delta) {
+        double res = 0.;
+        for (std::size_t k = 0; k < nb; ++k)
+            res += std::min(hi[k], std::max(lo[k], virt[k] + delta * share[k])) - units[k].injection_mw;
+        return res;
+    };
+    double capacity = 0.;
+    for (std::size_t k = 0; k < nb; ++k)
+        capacity += (mismatch_mw > 0.) ? hi[k] - units[k].injection_mw : lo[k] - units[k].injection_mw;
+    if (std::isfinite(capacity) && std::abs(capacity) <= std::abs(mismatch_mw) + eps_mw) {
+        for (std::size_t k = 0; k < nb; ++k) new_injection_mw[k] = (mismatch_mw > 0.) ? hi[k] : lo[k];
+        report.not_distributed_mw = mismatch_mw - capacity;
+        report.nb_rounds = 1;
+        report.nb_saturated = static_cast<int>(nb);   // as `distribute`: counted, none leaves the slack
+        report.all_saturated = true;
+        return report;
+    }
+    double a = 0., b = mismatch_mw;
+    int guard = 0;
+    while (std::abs(taken(b)) < std::abs(mismatch_mw) && guard < 200) { a = b; b *= 2.; ++guard; }
+    for (int it = 0; it < 200; ++it) {
+        const double mid = 0.5 * (a + b);
+        const double t = taken(mid);
+        ++report.nb_rounds;
+        if (std::abs(t - mismatch_mw) <= 1e-3 * eps_mw) { a = b = mid; break; }
+        if ((t < mismatch_mw) == (mismatch_mw > 0.)) a = mid; else b = mid;
+    }
+    const double delta = 0.5 * (a + b);
+    double done = 0.;
+    for (std::size_t k = 0; k < nb; ++k) {
+        const double target = virt[k] + delta * share[k];
+        const double p = std::min(hi[k], std::max(lo[k], target));
+        new_injection_mw[k] = p;
+        done += p - units[k].injection_mw;
+        if ((mismatch_mw > 0. && target >= hi[k]) || (mismatch_mw < 0. && target <= lo[k])) {
+            saturated[k] = 1;
+            ++report.nb_saturated;
+        }
+    }
+    report.not_distributed_mw = mismatch_mw - done;
+    return report;
+}
+
 struct RowResult {
     std::vector<std::pair<int, double>> dp_pu;   // (solver bus, dP in pu), one per bus, sorted
     std::vector<std::pair<int, double>> moved;   // (unit index, new set-point MW, gen. convention), sorted
@@ -329,6 +433,7 @@ RowResult redistribute_row(const SlackRedistributionData& d, double lost,
         p.weight       = static_cast<double>(d.weight(k));
         p.min_p_mw     = static_cast<double>(d.min_p_mw(k));
         p.max_p_mw     = static_cast<double>(d.max_p_mw(k));
+        p.overshoot_mw = d.overshoot_mw.size() != 0 ? static_cast<double>(d.overshoot_mw(k)) : 0.;
         units.push_back(p);
     }
     if (units.empty()) return out;   // the row's own fallback stays (see row_slack_weights)

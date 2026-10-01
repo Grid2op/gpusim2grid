@@ -36,7 +36,7 @@ LEAF_LINE = 3       # line 1-4: taking it out islands bus 4
 MAX_IT, TOL = 30, 1e-11
 
 
-def _grid(flagged=True, leaf_gen_mw=0.):
+def _grid(flagged=True, leaf_gen_mw=0., overshoot_mw=0.):
     """lightsim2grid's own test_can_participate_slack grid: buses 0-1-2-3 in a row plus
     a leaf bus 4 off bus 1; 60 MW of load on bus 3, 20 MW on bus 4 (and a `leaf_gen_mw`
     generator there). Gen 0 is the slack; gen 1 sits at its max_p, out of the slack,
@@ -59,14 +59,16 @@ def _grid(flagged=True, leaf_gen_mw=0.):
     if flagged:
         grid.set_gen_can_participate_slack(np.array([False, True] + [False] * (n - 2)),
                                            np.array([0., 0.5] + [0.] * (n - 2)))
+        if overshoot_mw:
+            grid.set_gen_can_participate_slack_overshoot(np.array([0., overshoot_mw] + [0.] * (n - 2)))
     grid.tell_solver_need_reset()
     V = grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, TOL)
     assert V.shape[0] > 0
     return grid
 
 
-def _one_off(flagged, leaf_gen_mw=0.):
-    grid = _grid(flagged, leaf_gen_mw)
+def _one_off(flagged, leaf_gen_mw=0., overshoot_mw=0.):
+    grid = _grid(flagged, leaf_gen_mw, overshoot_mw)
     grid.deactivate_powerline(LEAF_LINE)
     report = grid.consider_only_main_component(True)
     V = grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, TOL)
@@ -111,3 +113,33 @@ def test_island_matches_lightsim2grid(solver_atol, flagged, leaf_gen_mw):
     assert rep["mismatch_mw"][0] == pytest.approx(report.mismatch_mw, abs=1e-9)
     assert rep["nb_participants"][0] == report.nb_participants
     assert rep["nb_participants"][0] == (2 if flagged else 1)
+
+
+def _has_overshoot():
+    try:
+        from lightsim2grid.lightsim2grid_cpp import LSGrid
+    except ImportError:
+        return False
+    return hasattr(LSGrid, "set_gen_can_participate_slack_overshoot")
+
+
+@pytest.mark.skipif(not _has_overshoot(),
+                    reason="needs a lightsim2grid with LSGrid.set_gen_can_participate_slack_overshoot")
+@pytest.mark.parametrize("overshoot_mw", [15., 25.])
+def test_overshoot_matches_lightsim2grid(solver_atol, overshoot_mw):
+    """The capped unit sat beyond its max_p in the reference solve: it only leaves it once
+    the common shift has used that up (15 MW: it gives 2.5 of the 20 MW; 25 MW: nothing) --
+    the data carries the overshoot and the GPU pre-pass gives lightsim2grid's voltages."""
+    from gpusim2grid import _gpusim2grid as _cpp
+    grid = _grid(True, 0., overshoot_mw)
+    d = _cpp._extract_slack_redistribution_data_from_lsgrid(grid, grid.get_Ybus_solver().shape[0])
+    np.testing.assert_allclose(d.overshoot_mw, [0., overshoot_mw])
+    V_ref, report = _one_off(True, 0., overshoot_mw)
+    ca, V = _gpu(_grid(True, 0., overshoot_mw))
+    live = np.arange(4)
+    atol = 10 * solver_atol
+    np.testing.assert_allclose(np.abs(V[live]), np.abs(V_ref[live]), rtol=0., atol=atol)
+    ang = lambda x: np.angle(x[live]) - np.angle(x[0])    # noqa: E731
+    np.testing.assert_allclose(ang(V), ang(V_ref), rtol=0., atol=atol)
+    assert ca.get_slack_redistribution_report()["mismatch_mw"][0] == pytest.approx(report.mismatch_mw, abs=1e-9)
+
