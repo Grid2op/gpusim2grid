@@ -5,6 +5,8 @@
 __all__ = [
     "ViolationElementType",
     "LimitViolationType",
+    "ViolationCategory",
+    "violation_category",
     "LimitViolation",
 ]
 
@@ -16,7 +18,10 @@ from .._gpusim2grid import (
     PivotEpsilonAlg as _PivotEpsilonAlg,
 )
 
-from ._limit_violations import ViolationElementType, LimitViolationType, LimitViolation
+from ._limit_violations import (ViolationElementType, LimitViolationType, ViolationCategory,
+                                violation_category, LimitViolation)
+from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
+from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -159,7 +164,7 @@ class DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _ContingencyAnalysisSolver:
+class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin):
     """Stateful GPU N-k contingency analysis solver.
 
     Parameters
@@ -243,7 +248,10 @@ class _ContingencyAnalysisSolver:
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
       divergence check (see :meth:`set_limits`). Default False.
     - ``violation_tol`` (*float*), ``violation_capacity`` (*int*): DIVERGENCE
-      tolerance and max records kept per contingency (default 16).
+      tolerance and records kept per contingency AND per type -- the most
+      severe ones (default 16).
+    - ``violation_rel_tol`` (*float*): relative margin a value must clear
+      past its limit to be reported (default 1e-9, lightsim2grid's name).
 
     Examples
     --------
@@ -437,9 +445,12 @@ class _ContingencyAnalysisSolver:
     @property
     def handle_disconnected_grid(self):
         """bool: solve the largest connected component of a split grid (masking the
-        rest as NaN) instead of skipping the contingency. Contingencies that strand
-        the angle reference or a controller bus are still skipped. Incompatible with
-        the 'direct_base_case_factors' strategy. Takes effect on the next run()."""
+        rest as NaN) instead of skipping the contingency. A voltage-control group
+        whose controllers are all stranded releases the bus it regulates (their
+        reactive power is pinned to 0). Contingencies that strand the angle
+        reference, an HVDC droop end, or a regulated bus one of whose controllers
+        stays live are still skipped. Incompatible with the
+        'direct_base_case_factors' strategy. Takes effect on the next run()."""
         return self._s.handle_disconnected_grid
 
     @handle_disconnected_grid.setter
@@ -542,10 +553,34 @@ class _ContingencyAnalysisSolver:
         self._s.violation_tol = float(value)
 
     @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by compute_limit_violations (lightsim2grid's
+        ``violation_rel_tol``, default ``1e-9``): CURRENT when
+        ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when ``v > vmax * (1 + tol)``,
+        LOW_VOLTAGE when ``v < vmin * (1 - tol)``. A value on its limit up to
+        rounding -- a bus a regulator holds exactly at its vmax -- is then not
+        reported, whichever side of the limit the last bit of the solve put it
+        on. ``0`` gives the bare strict comparisons. In [0, 1[; takes effect on
+        the next run(). (An FP32 build cannot resolve 1e-9: there, a value
+        needs a tolerance of ~1e-6 to be absorbed.)"""
+        return self._s.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        value = float(value)
+        if not (0. <= value < 1.):
+            raise ValueError(f"violation_rel_tol must be in [0, 1[ (got {value}).")
+        self._s.violation_rel_tol = value
+
+    @property
     def violation_capacity(self):
-        """int: max violation records kept per contingency (K). Bounds the
-        compact output at n_contingencies * K regardless of grid size. Takes
-        effect on the next run(); default 16."""
+        """int: violation records kept per contingency AND per violation type
+        (K): the K most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones,
+        ranked by ``|value / limit - 1|`` (so a LOW_VOLTAGE ranks by how far
+        below its limit it fell). Bounds the compact output at
+        n_contingencies * 3 * K regardless of grid size. Takes effect on the next
+        run(); default 16."""
         return self._s.violation_capacity
 
     @violation_capacity.setter
@@ -559,6 +594,9 @@ class _ContingencyAnalysisSolver:
         NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
         single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        Otherwise the records of a contingency come type after type -- CURRENT,
+        then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
+        violation_capacity) most severe violations, most severe first.
         Both mirror lightsim2grid's own ViolationElementType.GRID /
         LimitViolationType.{NOT_SIMULATED,DIVERGENCE}. Requires run() with
         compute_limit_violations=True."""
@@ -573,7 +611,9 @@ class _ContingencyAnalysisSolver:
         vtype  = self._s.get_violation_type()
         value  = self._s.get_violation_value()
         limit  = self._s.get_violation_limit()
-        K = self.violation_capacity
+        # row c owns slots [c*stride, c*stride + count[c]) -- stride is
+        # 3 * the violation_capacity of the run that produced the buffers
+        stride = len(etype) // max(len(counts), 1)
         out = []
         for c, cnt in enumerate(counts):
             if cnt < 0:
@@ -585,7 +625,7 @@ class _ContingencyAnalysisSolver:
                                             LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
-            base = c * K
+            base = c * stride
             out.append([
                 LimitViolation(ViolationElementType(int(etype[base + i])), int(eid[base + i]),
                                int(side[base + i]), LimitViolationType(int(vtype[base + i])),
@@ -596,9 +636,10 @@ class _ContingencyAnalysisSolver:
 
     def get_violations_truncated(self):
         """(n_contingencies,) bool ndarray: True where more than
-        violation_capacity violations were found for that contingency
-        (clamped -- raise violation_capacity if this matters for your use
-        case). Requires run() with compute_limit_violations=True."""
+        violation_capacity violations of one type were found for that
+        contingency (only the most severe were kept -- raise violation_capacity
+        if this matters for your use case; get_violation_counts() has the
+        exact totals). Requires run() with compute_limit_violations=True."""
         return self._s.get_violation_truncated().astype(bool)
 
     def get_violation_counts(self):

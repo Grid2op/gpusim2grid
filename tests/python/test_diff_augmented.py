@@ -139,6 +139,44 @@ def test_gradcheck_hvdc_droop():
 
 @requires_gpu
 @needs_bridge
+def test_hvdc_droop_resistive_loss_slope_is_exact():
+    """A droop line with a resistive dc loss: the receiving-side slope carries
+    the factor (1 - 2 r line_in). With that factor dropped Newton-Raphson still
+    converges to the same V (so every V-level test passes), but the adjoint is
+    solved on an inexact Jacobian and the active-power gradient is off by
+    ~2 r line_in -- ~1e-4 on a real grid, several 1e-3 here. Central differences
+    on the same batch (one scenario), tolerance 1e-6, catch it."""
+    if _is_fp32():
+        pytest.skip("FP32 build: needs FP64")
+    from gpusim2grid.differentiable import BatchPowerFlow
+
+    grid = _solved_hvdc_droop_grid(p0=60.0, r_ohm=40.0, nominal_v_kv=100.0)
+    pf = BatchPowerFlow.from_lsgrid(grid, nb_iter=10, tol_base=1e-12, max_iter_base=40)
+    dev, rdt = pf.device, torch.float64
+    rng = np.random.default_rng(3)
+    w_re = torch.as_tensor(rng.standard_normal(pf.n_bus), dtype=rdt, device=dev)
+    w_im = torch.as_tensor(rng.standard_normal(pf.n_bus), dtype=rdt, device=dev)
+
+    def loss(V):
+        return (V.real * w_re + V.imag * w_im).sum()
+
+    base = pf._load_p_base.cpu().numpy()
+    lp = torch.tensor(base[None, :], dtype=rdt, device=dev, requires_grad=True)
+    loss(pf(load_p=lp)).backward()
+    g = lp.grad.cpu().numpy()[0]
+    for d in (np.ones(pf.n_load), rng.standard_normal(pf.n_load)):
+        an = float(g @ d)
+        h = 1e-3
+        Ls = []
+        for s in (1.0, -1.0):
+            with torch.no_grad():
+                Ls.append(float(loss(pf(load_p=torch.as_tensor((base + s * h * d)[None, :], dtype=rdt, device=dev)))))
+        fd = (Ls[0] - Ls[1]) / (2 * h)
+        assert abs(an - fd) <= 1e-6 * max(abs(an), abs(fd)), (an, fd)
+
+
+@requires_gpu
+@needs_bridge
 def test_gradcheck_remote_gen_voltage_control():
     """Remote-regulating generator: bordered VoltageControl adds a q-column
     (controller reactive unknown) + a voltage-constraint custom row."""

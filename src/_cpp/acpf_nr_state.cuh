@@ -193,9 +193,14 @@ struct AcPfNrState {
     //                                   ledger reserved no such slot
     //   h_vc_vrow_vmcol_pos           : per group, nnz pos of (v_row,
     //                                   vm_col(reg_bus)), -1 if absent
+    //   h_vc_ctrl_vrow_qcol_pos       : per CONTROLLER, nnz pos of (v_row of
+    //                                   its group, its own q_col), -1 if
+    //                                   absent (only an SVC's slope slot and a
+    //                                   group's reserved first slot exist)
     std::vector<int>            h_slack_bus;
     std::vector<cuda_real_type> h_slack_w;
     std::vector<int>            h_vc_vrow, h_vc_vrow_qcol_pos, h_vc_vrow_vmcol_pos;
+    std::vector<int>            h_vc_ctrl_vrow_qcol_pos;
 
     // Switchable Vm buses (LedgerData::switchable_vm_buses, sorted): their Q
     // rows are identity-PINNED in this single-system base solve (the base
@@ -228,6 +233,7 @@ struct AcPfNrState {
     // -------------------------------------------------------------------------
     int n_hvdc = 0;
     thrust::device_vector<int>            d_hvdc_bus1, d_hvdc_bus2, d_hvdc_status;
+    thrust::device_vector<int>            d_hvdc_id;   // grid hvdc id per entry (reporting only)
     thrust::device_vector<cuda_real_type> d_hvdc_p0, d_hvdc_k, d_hvdc_lf1, d_hvdc_lf2,
                                           d_hvdc_r, d_hvdc_pmax12, d_hvdc_pmax21;
     thrust::device_vector<int>            d_hvdc_prow1, d_hvdc_prow2;          // end P rows

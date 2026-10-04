@@ -37,6 +37,11 @@ struct GenContingencyData {
     std::vector<double> slack_weight;      // [n_gen] raw (un-normalised) slack weight
     std::vector<char>   vreg_on;           // [n_gen] voltage regulator on (its Q is NOT in Sbus)
     std::vector<double> target_q_mvar;     // [n_gen] reactive setpoint of a non-regulating one
+    // [n_bus_solver] raw slack weight of the storage units taking part in the
+    // distributed slack, summed per bus: no row disconnects a storage unit, so
+    // this share survives every row's re-weighting (lightsim2grid's
+    // LSGrid::get_slack_weights_solver_without)
+    std::vector<double> storage_slack_weight_bus;
 
     bool empty() const { return n_gen == 0; }
 };

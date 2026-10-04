@@ -14,6 +14,8 @@ import numpy as np
 
 from . import (
     _ContingencyAnalysisSolver,
+    PhysicalChecksFacadeMixin,
+    SlackRedistributionFacadeMixin,
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
@@ -46,6 +48,12 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
     inherits that reference (read off the solved grid) and skips as few split
     contingencies as possible. Call this **before** building a
     :class:`ContingencyAnalysisGPU` (bridge / multi-slack path).
+
+    The ``*GPU`` facades now make the same choice themselves by default
+    (``reference_slack="auto"``, lightsim2grid PR #216's batch rule), without
+    touching the grid; this function remains for callers that want the grid
+    itself re-solved with that reference, or use ``reference_slack="grid"``.
+    Note that the reference it forces on the grid is then kept by the facades.
 
     Requires a lightsim2grid whose ``ContingencyAnalysisCPP`` exposes
     ``pick_reference_slack`` and whose grid exposes ``set_reference_slack_bus``.
@@ -82,7 +90,7 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
     return ref
 
 
-class ContingencyAnalysisGPU:
+class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -225,7 +233,9 @@ class ContingencyAnalysisGPU:
                  matching_alg=None, pivot_epsilon_alg=None,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
-                 use_distributed_slack=True):
+                 use_distributed_slack=True,
+                 compute_physical_violations=False, redistribute_slack=False,
+                 reference_slack="auto"):
         _validate_precision(precision)
 
         # Single source of truth, resolved once here and applied at
@@ -350,6 +360,18 @@ class ContingencyAnalysisGPU:
         # and the array path (mutable property on the underlying session).
         self._inner.handle_disconnected_grid = bool(handle_disconnected_grid)
 
+        # Post-solve physical checks (compute_physical_violations: bus reactive
+        # capability + hvdc droop saturation): the bus-Q plan is pulled off the
+        # grid here when there is one -- see PhysicalChecksFacadeMixin.
+        self._apply_physical_checks_kwargs(compute_physical_violations)
+
+        # OLF-style bounded slack redistribution of the island a contingency
+        # cuts off, and the reference slack the fewest contingencies strand --
+        # see SlackRedistributionFacadeMixin.
+        if redistribute_slack:
+            self.redistribute_slack = True
+        self.reference_slack = reference_slack
+
         self._nb_iter = int(nb_iter)
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
@@ -472,6 +494,26 @@ class ContingencyAnalysisGPU:
     def compute_limit_violations(self, value):
         self._inner.compute_limit_violations = value
 
+    @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by :attr:`compute_limit_violations` -- lightsim2grid's
+        ``violation_rel_tol``, same default (``1e-9``) and semantics:
+        CURRENT when ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when
+        ``v > vmax * (1 + tol)``, LOW_VOLTAGE when ``v < vmin * (1 - tol)``.
+        It keeps a value that sits ON its limit by construction (a bus a
+        regulator holds exactly at its vmax) from being reported or not
+        depending on the last bit of the solve -- which made the GPU, the
+        lightsim2grid batch and its one-off solve disagree. ``0`` gives the
+        bare strict comparisons. Also applies to :meth:`get_violations_n`.
+        In [0, 1[; takes effect on the next compute(). An FP32 build cannot
+        resolve 1e-9 (use ~1e-6 there)."""
+        return self._inner.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        self._inner.violation_rel_tol = value
+
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per contingency (row order
         matches add_contingencies_by_branch_id). Requires compute() with
@@ -529,7 +571,8 @@ class ContingencyAnalysisGPU:
         return compute_violations_n(
             V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
             branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
-            limit_a1_ka, limit_a2_ka, sn_mva, n_lines)
+            limit_a1_ka, limit_a2_ka, sn_mva, n_lines,
+            rel_tol=self._inner.violation_rel_tol)
 
     # ----------------------------------------------------------- pass-through
     @property
