@@ -57,11 +57,12 @@ The run's ``timings`` add ``n_rounds``, ``occupancy`` (useful row-iterations /
 slots x iterations run) and ``t_schedule`` (the scheduler's host work).
 
 The continuous schedule refuses the ``'direct_iter0_only'`` and
-``'direct_refactor_every_n'`` strategies, cuDSS's non-uniform batch modes and
-the batched adjoint (``keep_final_jacobian``, hence ``BatchPowerFlow``), and a
-``ScenarioSweepGPU`` in that mode rebuilds its batch driver on every
+``'direct_refactor_every_n'`` strategies and cuDSS's non-uniform batch modes,
+and a ``ScenarioSweepGPU`` in that mode rebuilds its batch driver on every
 ``compute()``. With ``reactive_limits_outer_loop`` the second pass runs with
-the analysis' scheduling, and no row is ``LEFT_OUT``.
+the analysis' scheduling, and no row is ``LEFT_OUT``. The batched adjoint
+(``BatchPowerFlow``) works in both schedules; in the continuous one it keeps no
+Jacobian from the forward and rebuilds them in the backward (see below).
 
 .. code-block:: python
 
@@ -373,7 +374,11 @@ a snapshot either way. With ``scheduling="continuous"`` every call is cold.
 For the differentiable layer (:class:`~gpusim2grid.differentiable.BatchPowerFlow`)
 the same table applies to its forward, with one addition when gradients are
 requested: the batched Jacobian is refilled at the converged voltages after
-the iterations (one extra ``fill J``, on every path). Its backward has its own
+the iterations (one extra ``fill J``, on every path; chunked schedule only --
+a continuous forward does nothing extra: its rows leave at different rounds,
+so the backward reloads them ``batch_size`` at a time and refills each one's
+Jacobian at its converged voltages, ``timings.t_adjoint_rebuild_J``, before
+factorizing Jᵀ chunk by chunk). Its backward has its own
 lazily built state: the first ``backward()`` transposes the Jacobian pattern,
 builds the J→Jᵀ position map and buffers and runs one cuDSS ANALYSIS + one
 FACTORIZATION of Jᵀ; every later backward only permutes the values with a

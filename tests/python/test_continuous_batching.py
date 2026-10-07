@@ -513,10 +513,9 @@ def test_refusals(case14, monkeypatch):
     Sbus = grid.get_Sbus_solver()
     sn = grid.get_sn_mva()
     sw.set_injections(np.repeat(Sbus.real[None] * sn, 2, 0), np.repeat(Sbus.imag[None] * sn, 2, 0), sn)
+    # keep_final_jacobian is accepted (and does nothing): the batched adjoint
+    # rebuilds each row's Jacobian (tests/python/test_batch_power_flow.py)
     sw.solver.keep_final_jacobian = True
-    with pytest.raises(ValueError, match="keep_final_jacobian"):
-        sw.compute(batch_size=2)
-    sw.solver.keep_final_jacobian = False
     sw.compute(batch_size=2)
     assert sw.get_row_status().shape == (2,)
     assert n_bus > 0

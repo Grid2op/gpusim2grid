@@ -78,8 +78,8 @@ class SchedulingEngineMixin:
         (``batch_size`` slots; every ``nb_iter_per_round`` iterations a row
         that converged (``residual < tol``), diverged or used its ``nb_iter``
         budget leaves and its slot is refilled at once). Continuous refuses
-        the ``'direct_iter0_only'`` / ``'direct_refactor_every_n'`` strategies
-        and the batched adjoint. Takes effect on the next run()."""
+        the ``'direct_iter0_only'`` / ``'direct_refactor_every_n'`` strategies.
+        Takes effect on the next run()."""
         return _SCHEDULING_NAME[self._s.scheduling]
 
     @scheduling.setter

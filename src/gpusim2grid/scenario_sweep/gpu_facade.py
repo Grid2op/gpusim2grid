@@ -103,7 +103,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     scheduling, nb_iter_per_round, tol
         Batch scheduling (chunked / continuous) and the convergence tolerance
         of a row; see :class:`ContingencyAnalysisGPU`. A continuous run always
-        rebuilds its batch driver and refuses ``keep_final_jacobian``.
+        rebuilds its batch driver; its batched adjoint rebuilds each row's
+        Jacobian from the converged voltages (``keep_final_jacobian`` is not
+        needed there).
 
     Examples
     --------

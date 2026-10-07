@@ -415,6 +415,7 @@ struct BatchTimings {
     TimingEntry t_adjoint_first_factorize; // single FACTORIZATION of Jᵀ (first backward only)
     TimingEntry t_adjoint_refactorize;     // REFACTORIZATION of Jᵀ (every later backward after a new forward)
     TimingEntry t_adjoint_solve;           // SOLVE with Jᵀ (every backward)
+    TimingEntry t_adjoint_rebuild_J;       // continuous runs: reload of the rows + J at their converged V (every backward)
     int adjoint_n_analysis    = 0;         // 0 or 1 per driver life
     int adjoint_n_factorize   = 0;         // 0 or 1 per driver life
     int adjoint_n_refactorize = 0;

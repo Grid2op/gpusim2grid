@@ -158,6 +158,22 @@ source* of its own forward (the active-slot map, the identity-row masks, the
 pinned rows all live there and are read at backward time): another forward
 in between may change the injections / ``gen_v`` (hot path) but not the
 topology or generator mask (``source_build_counter`` guard).
+
+Scheduling: ``scheduling="continuous"`` (``from_lsgrid``) solves the rows in
+``batch_size`` slots (default ``n_scen``), each row leaving as soon as its
+residual is below ``tol`` (``nb_iter`` is then each row's budget; see
+``ScenarioSweepGPU``). Rows leave at different rounds, so no buffer ever
+holds every row's Jacobian, and none is kept: the backward rebuilds them,
+``batch_size`` rows at a time, from the converged ``V`` and the session's
+batch source (a row's Jacobian depends on nothing else -- its patched Ybus,
+its slack weights and its masked / pinned rows all come from the source),
+then solves Jᵀ chunk by chunk. Nothing is copied in the forward and nothing
+but ``V`` is kept until the backward, whatever ``n_scen``; the extra cost is
+one reload + Jacobian fill per ``batch_size`` rows in each backward. With
+``snapshot_jacobian=True`` the snapshot is just ``V``, but every continuous
+forward still rebuilds the batch source today, so a backward must come before
+the next forward in both modes (and ``torch.autograd.gradcheck``, which runs
+several forwards first, cannot be used: check with central differences).
 """
 
 import numpy as np
@@ -181,15 +197,16 @@ class BatchPowerFlow:
     """
 
     def __init__(self, sweep, *, snapshot_jacobian=False,
-                 gen_v_conflict_tol=GEN_V_CONFLICT_TOL):
+                 gen_v_conflict_tol=GEN_V_CONFLICT_TOL, batch_size=None):
         if sweep._elements is None:
             raise ValueError(
                 "BatchPowerFlow needs a ScenarioSweepGPU built from a lightsim2grid "
                 "grid (explicit-array/tuple mode has no loads/generators to map).")
         self._sweep = sweep
         self._solver = sweep.solver                 # _ScenarioSweepSolver
-        self._solver.fixed_batch_capacity = True    # always one chunk (adjoint)
+        self._solver.fixed_batch_capacity = True    # chunked: always one chunk (adjoint)
         self.snapshot_jacobian = bool(snapshot_jacobian)
+        self.batch_size = batch_size
         self.gen_v_conflict_tol = float(gen_v_conflict_tol)
 
         self._dev = torch.device("cuda", _device_index(sweep))
@@ -306,16 +323,18 @@ class BatchPowerFlow:
                     scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                     init_from_n_powerflow=True, max_iter_base=10, tol_base=1e-8,
                     precision=None, gen_v_conflict_tol=GEN_V_CONFLICT_TOL,
-                    redistribute_slack=False):
+                    redistribute_slack=False, scheduling="chunked", batch_size=None,
+                    nb_iter_per_round=1, tol=None):
         """Build from a *solved* lightsim2grid grid (``grid.ac_pf`` done).
 
         The keyword arguments are :class:`gpusim2grid.ScenarioSweepGPU`'s
         (same meaning), plus ``strategy`` (linear-solve strategy string),
-        ``snapshot_jacobian`` and ``gen_v_conflict_tol`` (see the module
-        docstring). ``nb_iter`` is the
-        fixed Newton-Raphson iteration count per row: raise it (and lower
-        ``tol_base``) when gradients must be accurate -- the adjoint is exact
-        only at a converged solution.
+        ``snapshot_jacobian``, ``gen_v_conflict_tol`` and ``batch_size`` (see
+        the module docstring). ``nb_iter`` is the
+        fixed Newton-Raphson iteration count per row (chunked), or each row's
+        budget (``scheduling="continuous"``: a row stops at ``tol``): raise it
+        (and lower ``tol_base``) when gradients must be accurate -- the adjoint
+        is exact only at a converged solution.
         """
         sweep = ScenarioSweepGPU(
             grid, init_from_n_powerflow=init_from_n_powerflow, precision=precision,
@@ -327,10 +346,11 @@ class BatchPowerFlow:
             max_dVa=max_dVa, max_dVm=max_dVm,
             use_distributed_slack=use_distributed_slack,
             # a row's angles must not depend on the other rows' topologies
-            reference_slack="grid")
+            reference_slack="grid",
+            scheduling=scheduling, nb_iter_per_round=nb_iter_per_round, tol=tol)
         sweep.strategy = strategy
         pf = cls(sweep, snapshot_jacobian=snapshot_jacobian,
-                 gen_v_conflict_tol=gen_v_conflict_tol)
+                 gen_v_conflict_tol=gen_v_conflict_tol, batch_size=batch_size)
         pf.redistribute_slack = redistribute_slack
         return pf
 
@@ -407,10 +427,15 @@ class BatchPowerFlow:
         gen_off = self._apply_gen_status(gen_status, n_scen)
         gen_p_in = gen_p   # a disconnected generator's set-point is what the others make up
 
-        if n_scen != self._last_n_scen:
-            # Capacity == n_scen: one chunk, whatever rows get islanded.
-            self._solver.batch_size = n_scen
-            self._last_n_scen = n_scen
+        # Chunked: capacity == n_scen, one chunk whatever rows get islanded (the
+        # adjoint reads its Jacobians). Continuous: batch_size slots (default
+        # n_scen); the adjoint rebuilds the Jacobians batch_size rows at a time.
+        cap = n_scen
+        if self.batch_size is not None and self._sweep.scheduling == "continuous":
+            cap = int(self.batch_size)
+        if self._solver.batch_size != cap:
+            self._solver.batch_size = cap
+        self._last_n_scen = n_scen
 
         # Element -> bus, in plain (differentiable) torch.
         inv_sn = 1.0 / self.sn_mva
@@ -808,7 +833,11 @@ class _BatchPowerFlowOp(torch.autograd.Function):
         ctx.released = pf._released
         ctx.want_gen_v = bool(want_gen_v)
         ctx.J = ctx.Y = None
-        if needs_grad and pf.snapshot_jacobian:
+        # A continuous run keeps no Jacobian anywhere: the backward rebuilds it
+        # from V (saved below) and this run's batch source, so its snapshot is V.
+        ctx.continuous = pf._sweep.scheduling == "continuous"
+        ctx.snapshot = bool(needs_grad and pf.snapshot_jacobian)
+        if ctx.snapshot and not ctx.continuous:
             ctx.J = torch.from_dlpack(solver.j_values_dlpack()).clone()
             if want_gen_v:
                 ctx.Y = torch.from_dlpack(solver.ybus_values_dlpack()).clone()
@@ -824,13 +853,19 @@ class _BatchPowerFlowOp(torch.autograd.Function):
         rdtype = pf._rdtype
         n_scen, n_bus = V.shape
 
-        if ctx.J is None and solver.run_counter != ctx.run_id:
+        if not ctx.snapshot and solver.run_counter != ctx.run_id:
             raise RuntimeError(
                 "BatchPowerFlow.backward: another forward() ran after the one this "
                 "gradient belongs to, overwriting its Jacobians on the GPU. Call "
                 "backward() before the next forward(), or build the model with "
                 "snapshot_jacobian=True to keep a copy per forward.")
-        if ctx.J is not None and solver.source_build_counter != ctx.source_id:
+        if ctx.snapshot and solver.source_build_counter != ctx.source_id:
+            if ctx.continuous:
+                raise RuntimeError(
+                    "BatchPowerFlow.backward: another forward() ran after the one this "
+                    "gradient belongs to. With scheduling='continuous' every forward "
+                    "rebuilds the session's batch source, which the backward needs: "
+                    "call backward() before the next forward().")
             raise RuntimeError(
                 "BatchPowerFlow.backward: another forward() with a different "
                 "topology, generator mask or number of rows ran after the one this "
@@ -863,9 +898,12 @@ class _BatchPowerFlowOp(torch.autograd.Function):
         j_cap = y_cap = v_cap = None
         if ctx.J is not None:
             j_cap = ctx.J.__dlpack__()
-            v_cap = V.detach().contiguous().__dlpack__()
             if ctx.Y is not None:
                 y_cap = ctx.Y.__dlpack__()
+        if ctx.snapshot:
+            # (alias mode: the session's own results are this V -- run_counter
+            # guard -- and a second backward then reuses the Jᵀ factors)
+            v_cap = V.detach().contiguous().__dlpack__()
         lam_cap, gvm_cap = solver.solve_JT_batch_dlpack(
             xbar.__dlpack__(), j_cap, y_cap, v_cap, ctx.want_gen_v, stream)
         lam = torch.from_dlpack(lam_cap).clone()

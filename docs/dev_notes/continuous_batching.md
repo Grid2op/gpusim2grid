@@ -2,8 +2,9 @@
 
 **Design note, not documentation.** Proposal written on 2026-10-07. **Part A is implemented**
 (2026-10-07: `scheduling="continuous"`, see `docs/api.rst` "Batch scheduling" and CLAUDE.md);
-the review that preceded it corrected a few points of the proposal, marked *Review* below. A.6 and
-Part B are not implemented. It is not part of the built documentation (`docs/*.rst`).
+the review that preceded it corrected a few points of the proposal, marked *Review* below. A.6
+item 1 (the batched adjoint) is implemented too, differently from the proposal (see there); A.6
+item 2 and Part B are not. It is not part of the built documentation (`docs/*.rst`).
 
 - **Part A** works on the current code, with no outer loop, and can start now. Its A.6 lists
   what the first version leaves out, to bring back once it is implemented and tested, before
@@ -239,6 +240,7 @@ Both of these come back once the mode is implemented and tested, before Part B (
 
 - `keep_final_jacobian`, and so the batched adjoint behind `BatchPowerFlow`, **raises** in
   continuous mode. It needs a single chunk and each row's final J.
+  *(Implemented since, see A.6 item 1.)*
 - `ScenarioSweepSession`'s **warm and hot reuse paths are not taken**: in continuous mode every
   `run()` takes the cold path (a new `BatchPfDriver`, with its cuDSS ANALYSIS).
 
@@ -337,6 +339,44 @@ back once Part A is implemented and tested, and before starting the outer loops.
    Cost: `n_rows × (nnz_J + 2·nnz_Y + n_bus)` values kept until the backward pass, against one
    chunk's worth today. It should be optional, and refused (or chunked to host memory) above a
    size budget. Gradients are checked against finite differences, as for every adjoint here.
+
+   *Review (implemented, 2026-10-07): nothing is stored; the backward rebuilds J.* A row's J
+   depends on its converged V, its patched Ybus values, its per-slot slack weights and its mask
+   streams (identity rows, `jov` overrides) -- not on Sbus, `slack_absorbed` or the controllers'
+   Q. The run keeps V anyway (`d_V_results`; the caller's V snapshot in snapshot mode) and the
+   batch source holds the rest, so storing J and Ybus would cost `n_rows × (nnz_J + 2·nnz_Y)`
+   for values that can be recomputed exactly. `BatchPfDriver::_solve_JT_rebuilt` (taken when
+   the last `solve()` was continuous) works over adjoint chunks of `S` active rows:
+   - the source's own `load_slots` fills the slots with the chunk's rows (phantom tail = base
+     case): patched Ybus, slack weights, starting V;
+   - the rows' converged V is copied over it, finite entries only: a masked bus is NaN in the
+     results and kept its loaded value through the solve (identity row, `dx = 0`), so the slot
+     holds the row's final state entry for entry -- and no NaN reaches the SpMV;
+   - SpMV + `nr_fill_J_at_current_V` with the rows' mask streams bound (`bind_slots` of that
+     slot table): the forward's own fill sequence;
+   - Jᵀ permuted, refactorized (FACTORIZE once per driver), solved; the identity rows zeroed
+     and λ scattered to original rows; the `gen_v` contraction on the NaN-masked V and the
+     reloaded Ybus.
+
+   Nothing changes in the forward (`keep_final_jacobian` has no effect there) and the extra
+   memory is nil; the backward pays one reload + SpMV + J fill per chunk, small next to the
+   factorization. The Jᵀ factors of a single-chunk backward on the driver's own V survive for a
+   second backward on the same forward, as in the chunked path. Refused after a continuous run:
+   J / Ybus snapshots (`solve_JT_batch`'s `d_J_ext` / `d_Ybus_ext`, `j_values_dlpack()` /
+   `ybus_values_dlpack()`). `BatchPowerFlow.from_lsgrid(scheduling="continuous",
+   batch_size=S)` exposes it; its snapshot is V alone. Pinned in
+   `tests/python/test_batch_power_flow.py::TestContinuousScheduling`: gradients equal to the
+   chunked ones for S = 1, 3, n (trips, `gen_v`, generator contingencies with released and
+   pinned buses), islanded rows masked (`handle_disconnected_grid`) or dropped (non-identity
+   active map), central differences, Jᵀ reuse counters, the guards.
+
+   What this leaves for item 2: the backward needs the forward's batch source, and today every
+   continuous `run()` is cold, so a backward must come before the next forward even with a V
+   snapshot (`source_build_counter` guard; `gradcheck` cannot run there). Once hot runs keep
+   the source, a V snapshot survives an injection-only forward -- **except** for the per-row
+   slack weights under `redistribute_slack`, which `run()` re-sets on the live source on every
+   run (the saturated units follow the injections): the hot path must then either keep the
+   weights of the forward the snapshot belongs to, or the guard must also cover them.
 2. **`ScenarioSweepSession`'s warm and hot reuse paths.**
    - Add the scheduling options (`scheduling`, `nb_iter_per_round`, `max_iter`, `tol`) to the
      `ScenarioSweepDriverConfig` snapshot, so that changing them forces a cold run.

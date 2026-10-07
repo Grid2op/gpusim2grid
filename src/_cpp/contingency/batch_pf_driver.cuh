@@ -170,10 +170,11 @@ struct BatchAdjoint {
     int  factorized_for_solve = -1;   // driver n_solves_ whose own J was last permuted+refactored
 
     // Counters / timings (cumulative over the driver's life; surfaced through
-    // BatchTimings by the sessions).
+    // BatchTimings by the sessions). t_rebuild_J: continuous schedule only,
+    // the reload of each adjoint chunk's rows + J at their converged V.
     int    n_analysis = 0, n_factorize = 0, n_refactorize = 0, n_solve = 0;
     double t_build_ms = 0.;
-    TimingEntry t_first_factorize, t_refactorize, t_solve;
+    TimingEntry t_first_factorize, t_refactorize, t_solve, t_rebuild_J;
 };
 
 // =============================================================================
@@ -495,18 +496,24 @@ struct BatchPfDriver {
     // -------------------------------------------------------------------------
     // Persistence / adjoint state
     //
-    //   keep_final_jacobian_ : after the NR loop of a chunk, refill
-    //                          d_J_values_batch at the CONVERGED V (the loop
-    //                          leaves J(V_{nb_iter-1}) behind). Only one chunk
-    //                          may be solved then (only the last chunk's J
-    //                          survives in the chunk buffer) -- solve() throws
-    //                          otherwise. Set by the differentiable wrapper.
+    //   keep_final_jacobian_ : chunked schedule: after the NR loop of a chunk,
+    //                          refill d_J_values_batch at the CONVERGED V (the
+    //                          loop leaves J(V_{nb_iter-1}) behind). Only one
+    //                          chunk may be solved then (only the last chunk's
+    //                          J survives in the chunk buffer) -- solve()
+    //                          throws otherwise. Set by the differentiable
+    //                          wrapper. No effect on a continuous solve: its
+    //                          adjoint rebuilds each row's J (see
+    //                          solve_JT_batch).
     //   n_solves_            : solve() calls on this driver; the adjoint keys
     //                          its "J already permuted + refactored" cache on it.
+    //   last_continuous_     : the schedule of the last solve() (the adjoint
+    //                          path follows it, whatever scheduling_ says now).
     //   adjoint_             : null until the first solve_JT_batch().
     // -------------------------------------------------------------------------
     bool keep_final_jacobian_ = false;
     int  n_solves_            = 0;
+    bool last_continuous_     = false;
     std::unique_ptr<BatchAdjoint> adjoint_;
 
     // -------------------------------------------------------------------------
@@ -636,20 +643,34 @@ struct BatchPfDriver {
     }
 
     // -------------------------------------------------------------------------
-    // solve_JT_batch — batched adjoint solve Jᵀ λ = x̄ per active slot, in
+    // solve_JT_batch — batched adjoint solve Jᵀ λ = x̄ per active row, in
     // ORIGINAL row order both ways (see BatchAdjoint above; first call builds
-    // everything). Requires solve() to have run with keep_final_jacobian_ so
+    // everything).
+    //
+    // After a chunked solve(): requires keep_final_jacobian_ so
     // d_J_values_batch holds the converged J (alias mode), or a caller-owned
     // [capacity × nnz_J] snapshot of those values (d_J_ext, snapshot mode).
     //
+    // After a continuous solve(): no row's J survives in the chunk buffers
+    // (rows leave at different rounds), and none is stored: J is a function of
+    // the row's converged V, its patched Ybus, its slack weights and its mask
+    // streams -- the run keeps the first (d_V_results, or the caller's
+    // d_V_ext_orig snapshot), the batch source the others. So the rows are
+    // taken S at a time (adjoint chunk c: active rows c*S ..), reloaded into
+    // the slots by the source's own load path, given their converged V, and J
+    // is refilled by the forward's fill sequence (_solve_JT_rebuilt). The
+    // source must be the forward's (the sessions' source_build_counter guard).
+    // d_J_ext / d_Ybus_ext are refused there.
+    //
     //   d_rhs_orig      : [n_contingencies × dim_J]; non-finite entries → 0.
-    //   d_J_ext         : nullptr → use d_J_values_batch.
+    //   d_J_ext         : nullptr → use d_J_values_batch (chunked only).
     //   want_gen_v_grad : also compute the gen_v (Vm-fixed bus) gradient
     //                     contraction into d_gvm_full (see gen_v_adjoint_kernel).
     //   d_Ybus_ext      : snapshot of [capacity × nnz_Y] patched Ybus values
-    //                     (nullptr → d_Ybus_values_batch). gen_v only.
+    //                     (nullptr → d_Ybus_values_batch). gen_v, chunked only.
     //   d_V_ext_orig    : [n_contingencies × n_bus] converged V in original
-    //                     order (nullptr → the chunk's own d_V_batch). gen_v only.
+    //                     order. nullptr → the chunk's own d_V_batch (chunked),
+    //                     d_V_results (continuous). Chunked: gen_v only.
     //   is_vm_fixed_bus : [n_bus] (pv ∪ slack) mask, gen_v only.
     // Results: d_JT_sol_full_ptr() [n_contingencies × dim_J] and, when asked,
     // d_gvm_full_ptr() [n_contingencies × n_bus]; rows of compacted-out
@@ -901,6 +922,12 @@ private:
     // First-call setup of the adjoint: skeleton transpose + position map,
     // buffers, cuDSS ANALYSIS of Jᵀ (with the forward's config).
     void _prepare_adjoint();
+    // Permute the J values of every slot into Jᵀ and (re)factorize it.
+    void _factor_JT(const cuda_real_type* d_J_slots, CudaTimer& timer);
+    // solve_JT_batch after a continuous solve(): J rebuilt per adjoint chunk.
+    void _solve_JT_rebuilt(const cuda_real_type* d_rhs_orig, bool want_gen_v_grad,
+                           const cudaComplexType* d_V_ext_orig,
+                           const std::vector<char>& is_vm_fixed_bus);
     // First-call setup of the gen_v contraction data (Ybus transpose-position
     // map, bus→row maps, Vm-fixed mask).
     void _prepare_gen_v_adjoint(const std::vector<char>& is_vm_fixed_bus);

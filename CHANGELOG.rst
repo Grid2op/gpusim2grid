@@ -7,6 +7,9 @@ Change Log
   converged, diverged or out of its ``nb_iter`` budget, and the slot is refilled at once.
 - [ADDED] ``get_row_status()`` / ``get_row_iterations()`` (``RowStatus``) and ``tol``: each row's
   outcome, in both schedules.
+- [ADDED] ``BatchPowerFlow.from_lsgrid(scheduling="continuous", batch_size=...)``: gradients through a
+  continuous run. The backward rebuilds each row's Jacobian from its converged voltages, so
+  nothing is kept from the forward.
 - [ADDED] Report an hvdc line frozen at its AC-emulation limit whose droop asks for less
   (``HVDC_AC_EMULATION_RELEASE``, lightsim2grid's ``set_hvdc_ac_emulation_frozen``).
 - [FIXED] ``redistribute_slack``: a unit capped well beyond its active limit stays there until the

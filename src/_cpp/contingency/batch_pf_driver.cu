@@ -1281,18 +1281,15 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     BatchTimings t;
     ++n_solves_;
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    last_continuous_ = continuous;
     if (continuous) {
-        if (keep_final_jacobian_)
-            throw std::invalid_argument(
-                "scheduling='continuous' does not support keep_final_jacobian (the "
-                "batched adjoint needs every row's final Jacobian in one chunk)");
         const ContingencySolverType strategy =
             std::holds_alternative<PolicyIter0Only>(policy_)      ? ContingencySolverType::DirectIter0Only
           : std::holds_alternative<PolicyRefactorEveryN>(policy_) ? ContingencySolverType::DirectRefactorEveryN
           : ContingencySolverType::DirectRefactorEvery;
         check_continuous_scheduling(strategy, nb_iter_, nb_iter_per_round_, tol_);
     }
-    if (keep_final_jacobian_ && n_chunks_ > 1)
+    if (keep_final_jacobian_ && !continuous && n_chunks_ > 1)
         throw std::runtime_error(
             "[batch_pf] keep_final_jacobian requires the whole batch to be "
             "solved in ONE chunk (only the last chunk's Jacobian survives in "
@@ -2350,6 +2347,187 @@ void BatchPfDriver<BatchSource>::_prepare_gen_v_adjoint(const std::vector<char>&
 }
 
 // =============================================================================
+// _factor_JT — Jᵀ values of every slot from J's (d_J_slots: [capacity ×
+// nnz_J], slot order), then FACTORIZE on the first call of the driver's life,
+// REFACTORIZE afterwards.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_factor_JT(const cuda_real_type* d_J_slots, CudaTimer& timer)
+{
+    BatchAdjoint& A = *adjoint_;
+    const int nnz_J = base.nnz_J;
+    transpose_gather_values_kernel<<<
+        nr_grid_size((long long)batch_size_ * nnz_J, BS), BS, 0, cs>>>(
+        thrust::raw_pointer_cast(A.d_JT_values.data()), d_J_slots,
+        thrust::raw_pointer_cast(A.d_J_to_JT.data()), nnz_J, batch_size_);
+    CHK_CUDA_BPF(cudaGetLastError());
+    A.solver.set_values(thrust::raw_pointer_cast(A.d_JT_values.data()));
+    A.solver.prepare_factorization();
+    timer.start();
+    if (!A.factorized) {
+        A.solver.factor();
+        A.t_first_factorize += timer.stop_ms();
+        ++A.n_factorize;
+        A.factorized = true;
+    } else {
+        A.solver.refactor();
+        A.t_refactorize += timer.stop_ms();
+        ++A.n_refactorize;
+    }
+}
+
+// dst[s * n_bus + b] = src[r * n_bus + b] for s < n, r = map[c0 + s] (c0 + s
+// when map is null), wherever that source entry is finite; a non-finite one
+// (a bus handle_disconnected_grid masked: NaN in the results) leaves dst
+// alone.
+__global__ void overlay_finite_rows_kernel(
+          cudaComplexType* __restrict__ dst,
+    const cudaComplexType* __restrict__ src,
+    const int*             __restrict__ map,
+    int c0, int n_bus, int n)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t s   = tid / n_bus;
+    const int       b   = static_cast<int>(tid % n_bus);
+    if (s >= n) return;
+    const ptrdiff_t r = map ? map[c0 + s] : c0 + s;
+    const cudaComplexType v = src[r * n_bus + b];
+    if (isfinite(v.x) && isfinite(v.y)) dst[s * n_bus + b] = v;
+}
+
+// =============================================================================
+// _solve_JT_rebuilt — solve_JT_batch after a continuous solve(). The active
+// rows are taken S at a time; for adjoint chunk c (rows c0 = c*S ..):
+//   ① the source's load path fills the slots with the rows (phantom tail =
+//      base case): the patched Ybus values, the per-slot slack weights, and
+//      the starting V -- which a masked bus never left (identity row, dx = 0);
+//   ② the rows' converged V over it, finite entries only, so d_V_batch is the
+//      row's final state, entry for entry;
+//   ③ SpMV + nr_fill_J_at_current_V with the rows' mask streams bound: the
+//      J the forward's last fill would have produced at that V (J reads
+//      neither Sbus nor slack_absorbed / controller Q), then Jᵀ and its
+//      factorization;
+//   ④ rhs gather, solve, identity rows dropped, scatter to original rows;
+//   ⑤ gen_v contraction on the rows' NaN-masked V and the reloaded Ybus.
+// The Jᵀ factors of a single-chunk call on this driver's own V survive for a
+// second backward on the same forward (as in the chunked path).
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rhs_orig,
+                                                   bool                     want_gen_v_grad,
+                                                   const cudaComplexType*   d_V_ext_orig,
+                                                   const std::vector<char>& is_vm_fixed_bus)
+{
+    BatchAdjoint& A = *adjoint_;
+    const int S     = batch_size_;
+    const int n_bus = base.n_bus;
+    const int dim_J = base.dim_J;
+    const int nnz_Y = base.nnz_Y;
+    const int nnz_J = base.nnz_J;
+    const int* d_map = source_.d_result_map();   // nullptr → identity
+    const cudaComplexType* d_V_src =
+        d_V_ext_orig ? d_V_ext_orig : thrust::raw_pointer_cast(d_V_results.data());
+    const int n_adj_chunks = (n_active_ + S - 1) / S;
+    const bool reuse = A.factorized && n_adj_chunks == 1 && d_V_ext_orig == nullptr
+                    && A.factorized_for_solve == n_solves_;
+
+    CudaTimer timer(cs);
+    BatchTimings t_load;   // the reloads belong to no run()'s timings
+    zero_d(A.d_sol_full, cs);
+    if (want_gen_v_grad) {
+        if (!A.gen_v_ready) _prepare_gen_v_adjoint(is_vm_fixed_bus);
+        A.d_V_ext_slots.resize(static_cast<size_t>(S) * n_bus);
+        zero_d(A.d_gvm_full, cs);
+    }
+
+    for (int c = 0; c < n_adj_chunks; ++c) {
+        const int c0 = c * S;
+        const int n  = std::min(S, n_active_ - c0);
+        // rows c0 .. c0+n-1 of an ORIGINAL-order array: through the map, or
+        // the slice starting at row c0 when the map is the identity
+        const int* map_c = d_map ? d_map + c0 : nullptr;
+        auto rows_of = [&](auto* p, int width) {
+            return d_map ? p : p + static_cast<ptrdiff_t>(c0) * width;
+        };
+
+        // ① + ②
+        timer.start();
+        _wait_sched_upload();
+        for (int s = 0; s < S; ++s) {
+            const int row = s < n ? c0 + s : -1;
+            h_load_slot()[s] = s;
+            h_load_row()[s]  = row;
+            h_evict()[s]     = -1;
+            h_slot_row()[s]  = row;
+        }
+        _upload_sched();
+        {
+            BatchPfDriverContext ctx = make_context();
+            CudaTimer load_timer(cs);
+            source_.load_slots(ctx, _load_view(S, -1, n), cs, load_timer, t_load);
+        }
+        overlay_finite_rows_kernel<<<nr_grid_size((long long)n * n_bus, BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()),
+            d_V_src, d_map, c0, n_bus, n);
+        CHK_CUDA_BPF(cudaGetLastError());
+        const NrIterBuffers buf = _bound_nr_buffers(_table_view(-1));
+
+        // ③
+        if (!reuse) {
+            spmv_batch.spmv();
+            nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, S, cs);
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
+        A.t_rebuild_J += timer.stop_ms();
+        if (!reuse) _factor_JT(thrust::raw_pointer_cast(d_J_values_batch.data()), timer);
+
+        // ④
+        zero_d(A.d_rhs, cs);
+        launch_gather_rows(thrust::raw_pointer_cast(A.d_rhs.data()), rows_of(d_rhs_orig, dim_J),
+                           map_c, dim_J, n, /*zero_nonfinite=*/true, cs);
+        CHK_CUDA_BPF(cudaGetLastError());
+        timer.start();
+        A.solver.solve();
+        A.t_solve += timer.stop_ms();
+        ++A.n_solve;
+        if (buf.n_mask_rows > 0) {
+            zero_identity_rows_kernel<<<(buf.n_mask_rows + BS - 1) / BS, BS, 0, cs>>>(
+                thrust::raw_pointer_cast(A.d_sol.data()),
+                buf.d_mask_slot, buf.d_mask_row, dim_J, buf.n_mask_rows);
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
+        launch_scatter_rows(rows_of(thrust::raw_pointer_cast(A.d_sol_full.data()), dim_J),
+                            thrust::raw_pointer_cast(A.d_sol.data()), map_c, dim_J, n, cs);
+        CHK_CUDA_BPF(cudaGetLastError());
+
+        // ⑤
+        if (want_gen_v_grad) {
+            launch_gather_rows(thrust::raw_pointer_cast(A.d_V_ext_slots.data()),
+                               rows_of(d_V_src, n_bus), map_c, n_bus, n,
+                               /*zero_nonfinite=*/false, cs);
+            gen_v_adjoint_kernel<<<nr_grid_size((long long)n * n_bus, BS), BS, 0, cs>>>(
+                thrust::raw_pointer_cast(A.d_gvm.data()),
+                thrust::raw_pointer_cast(A.d_sol.data()),
+                thrust::raw_pointer_cast(A.d_V_ext_slots.data()),
+                thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
+                thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+                thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+                thrust::raw_pointer_cast(A.d_Ybus_T_pos.data()),
+                thrust::raw_pointer_cast(A.d_p_row_of_bus.data()),
+                thrust::raw_pointer_cast(A.d_q_row_of_bus.data()),
+                thrust::raw_pointer_cast(A.d_is_vm_fixed_bus.data()),
+                n_bus, nnz_Y, dim_J, n);
+            CHK_CUDA_BPF(cudaGetLastError());
+            launch_scatter_rows(rows_of(thrust::raw_pointer_cast(A.d_gvm_full.data()), n_bus),
+                                thrust::raw_pointer_cast(A.d_gvm.data()), map_c, n_bus, n, cs);
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
+    }
+    A.factorized_for_solve = (n_adj_chunks == 1 && d_V_ext_orig == nullptr) ? n_solves_ : -1;
+    cs.synchronize();
+}
+
+// =============================================================================
 // solve_JT_batch
 // =============================================================================
 template <typename BatchSource>
@@ -2364,11 +2542,19 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
     if (n_solves_ == 0)
         throw std::runtime_error(
             "[batch_pf] solve_JT_batch: call solve() (a forward run) first");
+    if (last_continuous_ && (d_J_ext != nullptr || d_Ybus_ext != nullptr))
+        throw std::invalid_argument(
+            "[batch_pf] solve_JT_batch: after a continuous run the adjoint rebuilds "
+            "each row's Jacobian from its converged V -- pass the V snapshot, not "
+            "J / Ybus ones");
     if (!adjoint_) _prepare_adjoint();
+    if (last_continuous_) {
+        _solve_JT_rebuilt(d_rhs_orig, want_gen_v_grad, d_V_ext_orig, is_vm_fixed_bus);
+        return;
+    }
     BatchAdjoint& A = *adjoint_;
 
     const int dim_J = base.dim_J;
-    const int nnz_J = base.nnz_J;
     const int n_bus = base.n_bus;
     const int nnz_Y = base.nnz_Y;
     const int* d_map = source_.d_result_map();   // nullptr → identity
@@ -2380,25 +2566,7 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
     const bool own_J = (d_J_ext == nullptr);
     const bool need_refactor = !A.factorized || !own_J || A.factorized_for_solve != n_solves_;
     if (need_refactor) {
-        const cuda_real_type* src = own_J ? thrust::raw_pointer_cast(d_J_values_batch.data()) : d_J_ext;
-        transpose_gather_values_kernel<<<
-            nr_grid_size((long long)batch_size_ * nnz_J, BS), BS, 0, cs>>>(
-            thrust::raw_pointer_cast(A.d_JT_values.data()), src,
-            thrust::raw_pointer_cast(A.d_J_to_JT.data()), nnz_J, batch_size_);
-        CHK_CUDA_BPF(cudaGetLastError());
-        A.solver.set_values(thrust::raw_pointer_cast(A.d_JT_values.data()));
-        A.solver.prepare_factorization();
-        timer.start();
-        if (!A.factorized) {
-            A.solver.factor();
-            A.t_first_factorize += timer.stop_ms();
-            ++A.n_factorize;
-            A.factorized = true;
-        } else {
-            A.solver.refactor();
-            A.t_refactorize += timer.stop_ms();
-            ++A.n_refactorize;
-        }
+        _factor_JT(own_J ? thrust::raw_pointer_cast(d_J_values_batch.data()) : d_J_ext, timer);
         A.factorized_for_solve = own_J ? n_solves_ : -1;
     }
 

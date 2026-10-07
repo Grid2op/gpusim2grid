@@ -910,3 +910,166 @@ class TestConflictingSetpoints:
         assert pf.get_disconnected().tolist() == [0, 0]
         torch.testing.assert_close(V, V_ref, atol=solver_atol, rtol=0)
         assert abs(V[0, int(pf._gen_bus_all[g_reg])]).item() == pytest.approx(1.04, abs=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# scheduling="continuous": no row's Jacobian is kept by the forward; the
+# backward rebuilds them batch_size rows at a time from the converged V and the
+# batch source (docs/dev_notes/continuous_batching.md, A.6 item 1).
+# ---------------------------------------------------------------------------
+
+# rows stop at tol: tight in FP64 so that they match the chunked reference
+CONT = dict(scheduling="continuous", nb_iter=15, tol=None if is_fp32 else 1e-12)
+
+
+def _loss_and_grads(pf, *, load_p, load_q, gen_p, gen_v=None, **kw):
+    """V and the gradients of a loss touching magnitudes and angles."""
+    ins = {"load_p": load_p, "load_q": load_q, "gen_p": gen_p, "gen_v": gen_v}
+    req = {k: v.clone().requires_grad_(True) for k, v in ins.items() if v is not None}
+    V = pf(**{k: req.get(k) for k in ins}, **kw)
+    valid = torch.isfinite(V.real)
+    Vs = torch.where(valid, V, torch.zeros_like(V))
+    w = torch.linspace(0.5, 1.5, pf.n_bus, dtype=RDT, device="cuda")
+    ((Vs.abs() ** 2) * w + Vs.real * w.flip(0)).sum().backward()
+    return V.detach(), {k: t.grad for k, t in req.items()}
+
+
+def _assert_same_gradients(pf_ref, pf, inputs, atol):
+    V_ref, g_ref = _loss_and_grads(pf_ref, **inputs)
+    V, g = _loss_and_grads(pf, **inputs)
+    torch.testing.assert_close(torch.isnan(V.real), torch.isnan(V_ref.real))
+    m = torch.isfinite(V_ref.real)
+    torch.testing.assert_close(V[m], V_ref[m], atol=atol, rtol=0)
+    for k in g_ref:
+        torch.testing.assert_close(g[k], g_ref[k], atol=atol, rtol=1e-6, msg=k)
+    return g
+
+
+class TestContinuousScheduling:
+
+    @fp64_only
+    def test_gradients_match_chunked(self, ieee14_base_case):
+        """Branch trips, gen_v set-points and generator contingencies (a bus
+        released PV -> PQ, reserved buses identity-pinned on the other rows):
+        every gradient is the chunked one, whatever the slots."""
+        grid = ieee14_base_case["grid"]
+        ref = _pf(grid, nb_iter=15)
+        n = 7
+        load_p, load_q, gen_p = _base_inputs(ref, n, [1.0, 1.1, 0.9, 1.05, 0.95, 1.02, 0.98])
+        line_status, trafo_status = _all_connected(ref, n)
+        line_status[1, 3] = line_status[4, 3] = line_status[5, 7] = False
+        gs = torch.ones(n, ref.n_gen, dtype=torch.bool, device="cuda")
+        gs[2, 1] = False
+        gs[6, 3] = False
+        gen_v = torch.full((n, ref.n_gen), float("nan"), dtype=RDT, device="cuda")
+        gen_v[:, 1] = 1.04
+        gen_v[3, 2] = 1.0
+        gen_v[5, 0] = 1.055
+        inputs = dict(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v,
+                      line_status=line_status, trafo_status=trafo_status, gen_status=gs)
+        for S in (1, 3, n):
+            pf = _pf(grid, batch_size=S, **CONT)
+            g = _assert_same_gradients(ref, pf, inputs, atol=1e-8)
+            assert pf.sweep.get_row_status().tolist() == [0] * n
+            t = pf.timings
+            n_chunks = -(-n // S)
+            assert (t.adjoint_n_analysis, t.adjoint_n_factorize,
+                    t.adjoint_n_refactorize, t.adjoint_n_solve) == (1, 1, n_chunks - 1, n_chunks)
+            assert t.t_adjoint_rebuild_J.wall_ms > 0
+        # row 2 released gen 1's bus (its load_q there is live, its gen_v is not)
+        bus1 = int(ref._gen_bus_all[1])
+        l1 = int(ref._load_sel[torch.nonzero(ref._load_bus_sel == bus1).flatten()[0]])
+        assert g["load_q"][2, l1] != 0 and g["load_q"][0, l1] == 0
+        assert g["gen_v"][2, 1] == 0 and g["gen_v"][0, 1] != 0
+
+    @needs_bridge
+    @fp64_only
+    @pytest.mark.parametrize("handle_disconnected_grid", [True, False])
+    def test_islanded_rows_match_chunked(self, handle_disconnected_grid):
+        """A row islanding a distributed-slack participant: solved on its main
+        component (masked buses NaN, P row identity-masked, slack re-weighted)
+        or dropped from the batch (the active -> original map is not the
+        identity): the gradients are the chunked ones, 0 on what is not solved."""
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=True)
+        kw = dict(handle_disconnected_grid=handle_disconnected_grid)
+        ref = _pf(grid, nb_iter=15, **kw)
+        n = 5
+        load_p, load_q, gen_p = _base_inputs(ref, n, [1.0, 1.05, 0.95, 1.1, 0.9])
+        line_status, _ = _all_connected(ref, n)
+        line_status[1, int(spur_line)] = line_status[3, int(spur_line)] = False
+        line_status[4, 3] = False
+        inputs = dict(load_p=load_p, load_q=load_q, gen_p=gen_p, line_status=line_status)
+        for S in (1, 2):
+            pf = _pf(grid, batch_size=S, **kw, **CONT)
+            g = _assert_same_gradients(ref, pf, inputs, atol=1e-8)
+        if handle_disconnected_grid:
+            assert pf.get_disconnected().tolist() == [0] * n
+            spur_load = pf.n_load - 1          # the spur's own load, created last
+            assert g["load_p"][1, spur_load] == 0 and g["load_p"][0, spur_load] != 0
+        else:
+            assert pf.get_disconnected().tolist() == [0, 1, 0, 1, 0]
+            assert torch.all(g["load_p"][[1, 3]] == 0)
+
+    @fp64_only
+    def test_central_differences(self, ieee14_base_case):
+        grid = ieee14_base_case["grid"]
+        pf = _pf(grid, batch_size=2, **CONT)
+        n = 3
+        load_p, load_q, gen_p = _base_inputs(pf, n, [1.0, 1.1, 0.9])
+        line_status, _ = _all_connected(pf, n)
+        line_status[2, 3] = False
+        gen_v = torch.tensor([[1.06, 1.045, 1.01, 1.07, 1.09]] * n, dtype=RDT, device="cuda")
+        gen_v[1, 3] = float("nan")
+        coords = [("load_p", (0, 2)), ("load_p", (2, 5)), ("load_q", (1, 4)),
+                  ("gen_p", (0, 1)), ("gen_p", (2, 3)),
+                  ("gen_v", (0, 0)), ("gen_v", (1, 1)), ("gen_v", (2, 2)), ("gen_v", (2, 4)),
+                  ("gen_v", (1, 3))]
+        grads = _fd_check(pf, load_p, load_q, gen_p, gen_v, line_status, coords)
+        assert grads["gen_v"].grad[1, 3] == 0.0
+
+    def test_reuse_and_guards(self, ieee14_base_case, solver_atol):
+        grid = ieee14_base_case["grid"]
+        n = 3
+        for S, first, second in ((2, (1, 1, 1, 2), (1, 1, 3, 4)),     # 2 adjoint chunks
+                                 (8, (1, 1, 0, 1), (1, 1, 0, 2))):    # 1: factors reused
+            pf = _pf(grid, batch_size=S, **CONT)
+            load_p, _, gen_p = _base_inputs(pf, n, [1.0, 1.1, 0.9])
+            lp = load_p.clone().requires_grad_(True)
+            loss = pf(load_p=lp, gen_p=gen_p).real.sum()
+            assert pf.sweep.solver.capacity == min(S, n)
+            loss.backward(retain_graph=True)
+            t = pf.timings
+            assert (t.adjoint_n_analysis, t.adjoint_n_factorize,
+                    t.adjoint_n_refactorize, t.adjoint_n_solve) == first
+            g1 = lp.grad.clone()
+            lp.grad = None
+            loss.backward()
+            t = pf.timings
+            assert (t.adjoint_n_analysis, t.adjoint_n_factorize,
+                    t.adjoint_n_refactorize, t.adjoint_n_solve) == second
+            torch.testing.assert_close(lp.grad, g1, atol=1e-3 * solver_atol, rtol=0)
+
+        # No chunk buffer holds the rows' Jacobians: no J / Ybus snapshot.
+        with pytest.raises(ValueError, match="continuous"):
+            pf.sweep.solver.j_values_dlpack()
+        with pytest.raises(ValueError, match="continuous"):
+            pf.sweep.solver.ybus_values_dlpack()
+
+        # Every continuous forward rebuilds the batch source: a backward must
+        # come before the next forward, snapshot or not.
+        for snapshot, match in ((False, "snapshot_jacobian"), (True, "continuous")):
+            pf = _pf(grid, batch_size=2, snapshot_jacobian=snapshot, **CONT)
+            lp = load_p.clone().requires_grad_(True)
+            V1 = pf(load_p=lp, gen_p=gen_p)
+            pf(load_p=load_p * 1.01, gen_p=gen_p)
+            with pytest.raises(RuntimeError, match=match):
+                V1.real.sum().backward()
+
+        # ... and with the snapshot, a backward right after its forward works
+        # and is the alias one
+        pf_ref = _pf(grid, batch_size=2, **CONT)
+        lp_ref = load_p.clone().requires_grad_(True)
+        pf_ref(load_p=lp_ref, gen_p=gen_p).abs().sum().backward()
+        lp = load_p.clone().requires_grad_(True)
+        pf(load_p=lp, gen_p=gen_p).abs().sum().backward()
+        torch.testing.assert_close(lp.grad, lp_ref.grad, atol=10 * solver_atol, rtol=1e-6)

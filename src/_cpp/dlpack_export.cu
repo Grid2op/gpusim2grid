@@ -399,6 +399,11 @@ export_j_values_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
     if (!self->solver_)
         throw std::runtime_error(
             "ScenarioSweepSession: run() must be called before j_values_dlpack()");
+    if (self->solver_->last_continuous_)
+        throw std::invalid_argument(
+            "ScenarioSweepSession::j_values_dlpack: after a continuous run no chunk buffer "
+            "holds every row's values; solve_JT_batch_dlpack() rebuilds them from "
+            "the converged voltages (pass v=)");
     self->solver_->synchronize();
     void*   ptr = const_cast<void*>(static_cast<const void*>(self->solver_->j_values_ptr()));
     int     dev = self->solver_->device_id();
@@ -414,6 +419,11 @@ export_ybus_values_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
     if (!self->solver_)
         throw std::runtime_error(
             "ScenarioSweepSession: run() must be called before ybus_values_dlpack()");
+    if (self->solver_->last_continuous_)
+        throw std::invalid_argument(
+            "ScenarioSweepSession::ybus_values_dlpack: after a continuous run no chunk buffer "
+            "holds every row's values; solve_JT_batch_dlpack() rebuilds them from "
+            "the converged voltages (pass v=)");
     self->solver_->synchronize();
     void*   ptr = const_cast<void*>(static_cast<const void*>(self->solver_->ybus_values_ptr()));
     int     dev = self->solver_->device_id();

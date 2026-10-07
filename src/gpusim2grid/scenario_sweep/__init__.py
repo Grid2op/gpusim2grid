@@ -656,7 +656,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     @property
     def keep_final_jacobian(self):
         """bool: refill the batched Jacobian at the converged voltages after
-        each run() so solve_JT_batch_dlpack() can use it. Default False."""
+        each chunked run() so solve_JT_batch_dlpack() can use it (a continuous
+        run needs nothing kept: the adjoint rebuilds the Jacobians from the
+        converged voltages). Default False."""
         return self._s.keep_final_jacobian
 
     @keep_final_jacobian.setter

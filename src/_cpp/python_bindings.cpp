@@ -918,6 +918,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "cuDSS REFACTORIZATION of J^T -- every later backward after a new run() -- total")
         .def_readonly("t_adjoint_solve", &BatchTimings::t_adjoint_solve,
                       "cuDSS SOLVE with J^T -- every backward -- total")
+        .def_readonly("t_adjoint_rebuild_J", &BatchTimings::t_adjoint_rebuild_J,
+                      "Continuous scheduling: reload of the rows into the slots + J at their "
+                      "converged V (no row's J is kept by the run) -- every backward -- total")
         .def_readonly("adjoint_n_analysis", &BatchTimings::adjoint_n_analysis,
                       "Number of J^T ANALYSIS calls over the driver's life (0 or 1)")
         .def_readonly("adjoint_n_factorize", &BatchTimings::adjoint_n_factorize,
@@ -1048,6 +1051,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             adjoint["first_factorize"] = entry_dict(t.t_adjoint_first_factorize);
             adjoint["refactorize"]     = entry_dict(t.t_adjoint_refactorize);
             adjoint["solve"]           = entry_dict(t.t_adjoint_solve);
+            adjoint["rebuild_J"]       = entry_dict(t.t_adjoint_rebuild_J);
             adjoint["n_analysis"]      = t.adjoint_n_analysis;
             adjoint["n_factorize"]     = t.adjoint_n_factorize;
             adjoint["n_refactorize"]   = t.adjoint_n_refactorize;
@@ -2503,10 +2507,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "(keep_final_jacobian). Default False. Takes effect on the "
                    "next run() (rebuilds the driver when changed).")
     .def_readwrite("keep_final_jacobian", &ScenarioSweepSession::keep_final_jacobian_,
-                   "When True, run() refills the batched Jacobian at the CONVERGED "
-                   "voltages after the NR loop (one extra fill_J), so that "
+                   "When True, a chunked run() refills the batched Jacobian at the "
+                   "CONVERGED voltages after the NR loop (one extra fill_J), so that "
                    "solve_JT_batch_dlpack() can use it. Requires the batch to be "
-                   "solved in one chunk (see fixed_batch_capacity). Default False.")
+                   "solved in one chunk (see fixed_batch_capacity). No effect on a "
+                   "continuous run, which needs nothing kept: solve_JT_batch_dlpack() "
+                   "rebuilds each row's Jacobian from its converged V. Default False.")
     .def_readonly("run_counter", &ScenarioSweepSession::run_counter_,
                   "Number of run() calls so far (an autograd backward checks it "
                   "against the forward it belongs to).")
@@ -2589,7 +2595,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "with the Jacobians at the converged voltages of the last run() "
          "(keep_final_jacobian=True) -- or with the j_values / ybus_values / v "
          "snapshots taken right after that run (j_values_dlpack(), "
-         "ybus_values_dlpack(), v_results_dlpack(), cloned). rhs: (n_scenarios, "
+         "ybus_values_dlpack(), v_results_dlpack(), cloned). After a continuous "
+         "run, the Jacobians are rebuilt batch_size rows at a time from the "
+         "converged voltages (v, else the session's own results) and the batch "
+         "source of that run; j_values / ybus_values are refused. rhs: (n_scenarios, "
          "dim_J) real, original row order, non-finite entries treated as 0. "
          "Returns (lambda, gvm): lambda (n_scenarios, dim_J); gvm (n_scenarios, "
          "n_bus) when want_gen_v_grad else None -- the adjoint contraction of "
@@ -2603,10 +2612,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("j_values_dlpack", &export_j_values_dlpack_ss,
          "(capacity, nnz_J) real: the batched Jacobian values of the last chunk "
          "(active-slot order; rows >= n_active are phantom base-case copies). "
-         "Aliases the chunk buffer: clone right after run() for a snapshot.")
+         "Aliases the chunk buffer: clone right after run() for a snapshot. "
+         "Refused after a continuous run (no chunk holds every row's Jacobian).")
     .def("ybus_values_dlpack", &export_ybus_values_dlpack_ss,
          "(capacity, nnz_Y) complex: the per-slot patched Ybus values of the last "
-         "chunk (active-slot order). Aliases the chunk buffer: clone for a snapshot.");
+         "chunk (active-slot order). Aliases the chunk buffer: clone for a snapshot. "
+         "Refused after a continuous run.");
 
     // -----------------------------------------------------------------
     // Zero-copy construction from a solved lightsim2grid LSGrid

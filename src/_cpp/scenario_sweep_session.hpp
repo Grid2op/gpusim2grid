@@ -139,6 +139,8 @@ struct ScenarioSweepSession {
     //                         rebalancing for the plain sweep API.
     //   keep_final_jacobian_ : refill J at the converged V after the NR loop
     //                         (forwarded to the driver; see BatchPfDriver).
+    //                         Chunked runs only: a continuous one needs nothing
+    //                         kept (solve_JT_batch rebuilds J per row).
     //   run_counter_ etc.   : observability for callers/tests (a torch
     //                         autograd backward checks run_counter_ against
     //                         the forward it belongs to).
@@ -172,8 +174,9 @@ struct ScenarioSweepSession {
     // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
     // row runs nb_iter_ iterations) or continuous (nb_iter_ is each row's
     // budget, checked every nb_iter_per_round_ iterations against tol_; every
-    // run() then takes the cold path, fixed_batch_capacity_ is ignored and
-    // keep_final_jacobian_ is refused). Mutable, taken by the next run().
+    // run() then takes the cold path, and fixed_batch_capacity_ and
+    // keep_final_jacobian_ are ignored: the adjoint rebuilds each row's J from
+    // its converged V). Mutable, taken by the next run().
     BatchScheduling scheduling_        = BatchScheduling::Chunked;
     int             nb_iter_per_round_ = 1;
     double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
@@ -716,9 +719,12 @@ struct ScenarioSweepSession {
     // =========================================================================
     // solve_JT_batch — batched adjoint (see BatchPfDriver::solve_JT_batch;
     // pointer arguments are device buffers of the documented shapes, nullptr
-    // where optional). Requires the last run() to have been made with
-    // keep_final_jacobian_ = true (alias mode) or an external J snapshot.
-    // Builds the transposed system lazily on the first call.
+    // where optional). After a chunked run(): requires it to have been made
+    // with keep_final_jacobian_ = true (alias mode) or an external J snapshot.
+    // After a continuous one: J is rebuilt from the converged V (d_V_ext_orig,
+    // else the run's own results) and this run's batch source; J / Ybus
+    // snapshots are refused. Builds the transposed system lazily on the first
+    // call.
     // =========================================================================
     void solve_JT_batch(const void* d_rhs_orig, const void* d_J_ext,
                         bool want_gen_v_grad,

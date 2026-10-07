@@ -1121,14 +1121,8 @@ void ScenarioSweepSession::run()
             "'direct_iter0_only', or 'direct_refactor_every_n'.");
 
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
-    if (continuous) {   // before any allocation / cuDSS ANALYSIS
+    if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
-        if (keep_final_jacobian_)
-            throw std::invalid_argument(
-                "ScenarioSweepSession: scheduling='continuous' does not support "
-                "keep_final_jacobian (the batched adjoint needs every row's final "
-                "Jacobian in one chunk)");
-    }
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
         throw std::runtime_error(
@@ -1592,7 +1586,9 @@ void ScenarioSweepSession::solve_JT_batch(const void* d_rhs_orig, const void* d_
     if (!solver_)
         throw std::runtime_error(
             "ScenarioSweepSession::solve_JT_batch: call run() first");
-    if (d_J_ext == nullptr && !last_run_kept_jacobian_)
+    // A continuous run keeps no Jacobian: the driver rebuilds each row's from
+    // its converged V (see BatchPfDriver::solve_JT_batch).
+    if (d_J_ext == nullptr && !last_run_kept_jacobian_ && !solver_->last_continuous_)
         throw std::runtime_error(
             "ScenarioSweepSession::solve_JT_batch: the last run() did not keep "
             "the converged Jacobian (set keep_final_jacobian = True before run(), "
@@ -1679,6 +1675,7 @@ BatchTimings ScenarioSweepSession::get_timings() const
         t.t_adjoint_first_factorize = A.t_first_factorize;
         t.t_adjoint_refactorize    = A.t_refactorize;
         t.t_adjoint_solve          = A.t_solve;
+        t.t_adjoint_rebuild_J      = A.t_rebuild_J;
         t.adjoint_n_analysis       = A.n_analysis;
         t.adjoint_n_factorize      = A.n_factorize;
         t.adjoint_n_refactorize    = A.n_refactorize;

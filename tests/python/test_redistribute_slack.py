@@ -916,3 +916,37 @@ def test_batch_power_flow_gradient_is_the_finite_difference():
 
     with torch.no_grad():
         assert abs(fd(loss_off, 2, 1, case.clamped_gen, 1e-3)) > 1e-6
+
+
+@pytest.mark.skipif(bool(__import__("gpusim2grid._gpusim2grid", fromlist=["x"]).is_fp32),
+                    reason="compared to 1e-8: needs the FP64 build")
+def test_batch_power_flow_continuous_gradient_is_the_chunked_one():
+    """scheduling='continuous' rebuilds each row's Jacobian in the backward,
+    with that row's slack weights (a disconnected slack generator re-weights
+    the slack, the pre-pass takes its saturated units out): the gradients are
+    the chunked ones, whatever the slots."""
+    _needs_upstream()
+    torch = pytest.importorskip("torch")
+    case, trafo_status, gen_status = _bpf_case()
+    load_p, load_q, gen_p = (torch.as_tensor(a, device="cuda") for a in case.elements(4))
+    ts = torch.as_tensor(trafo_status, device="cuda")
+    gs = torch.as_tensor(gen_status, device="cuda")
+
+    def run(pf):
+        x = [a.clone().requires_grad_(True) for a in (load_p, load_q, gen_p)]
+        V = pf(load_p=x[0], load_q=x[1], gen_p=x[2], trafo_status=ts, gen_status=gs)
+        ok = torch.isfinite(V.real)
+        Vs = torch.where(ok, V, torch.zeros_like(V))
+        w = torch.linspace(0.5, 1.5, pf.n_bus, dtype=torch.float64, device="cuda")
+        ((Vs.abs() ** 2) * w + Vs.imag * w.flip(0)).sum().backward()
+        return V.detach(), [a.grad for a in x]
+
+    V_ref, g_ref = run(_bpf(case, redistribute_slack=True))
+    for S in (1, 3):
+        V, g = run(_bpf(case, redistribute_slack=True, scheduling="continuous",
+                        batch_size=S, tol=1e-12))
+        ok = torch.isfinite(V_ref.real)
+        torch.testing.assert_close(torch.isfinite(V.real), ok)
+        torch.testing.assert_close(V[ok], V_ref[ok], atol=1e-10, rtol=0)
+        for a, b in zip(g, g_ref):
+            torch.testing.assert_close(a, b, atol=1e-8, rtol=1e-6)
