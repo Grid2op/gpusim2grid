@@ -9,6 +9,7 @@ __all__ = [
     "violation_category",
     "LimitViolation",
     "ReactiveLimitsStatus",
+    "RowStatus",
 ]
 
 from .._gpusim2grid import (
@@ -24,6 +25,7 @@ from ._limit_violations import (ViolationElementType, LimitViolationType, Violat
 from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
 from ._reactive_limits import ReactiveLimitsStatus
+from ._scheduling import RowStatus, SchedulingEngineMixin, SchedulingFacadeMixin
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -166,7 +168,8 @@ class DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin):
+class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
+                                 SchedulingEngineMixin):
     """Stateful GPU N-k contingency analysis solver.
 
     Parameters
@@ -224,7 +227,11 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
     :meth:`run` call:
 
     - ``batch_size`` (*int*): Contingencies per GPU chunk.
-    - ``nb_iter`` (*int*): Fixed NR iterations per chunk.
+    - ``nb_iter`` (*int*): NR iterations every contingency runs (chunked), or
+      each contingency's budget (continuous).
+    - ``scheduling`` (*str*), ``nb_iter_per_round`` (*int*), ``tol`` (*float*):
+      chunked / continuous batching and the convergence tolerance of a row
+      (see :class:`~gpusim2grid.contingency_analysis._scheduling.SchedulingEngineMixin`).
     - ``strategy`` (*str*): Linear-solve strategy.  One of
       ``'direct_refactor_every'`` (default), ``'direct_base_case_factors'``,
       ``'direct_iter0_only'``, ``'direct_refactor_every_n'``.
@@ -285,7 +292,8 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
                  device=None, handle_disconnected_grid=False, presolved_v=False,
                  reordering_alg='default', matching_alg='none',
                  pivot_epsilon_alg='default', debug_base_case=False,
-                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
+                 scheduling='chunked', nb_iter_per_round=1, tol=None):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -308,6 +316,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
+        self._init_scheduling(scheduling, nb_iter_per_round, tol)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -509,6 +518,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         Does not return timings — call solver.timings after compute_flows()
         for a complete breakdown including flow computation time.
         """
+        self._warn_tol_above_violation_tol()
         self._s.run()
 
     def compute_flows(self):

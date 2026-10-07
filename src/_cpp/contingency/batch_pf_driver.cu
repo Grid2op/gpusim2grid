@@ -130,7 +130,10 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     PivotEpsilonAlg       pivot_epsilon_alg,
     bool                  scaling_max_voltage_change,
     double                max_dVa,
-    double                max_dVm)
+    double                max_dVm,
+    BatchScheduling       scheduling,
+    int                   nb_iter_per_round,
+    double                tol)
     : base(base_state)
     , source_(std::move(source))
     , n_contingencies(n_contingencies_in)
@@ -146,9 +149,17 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     , reordering_alg_(reordering_alg)
     , matching_alg_(matching_alg)
     , pivot_epsilon_alg_(pivot_epsilon_alg)
+    , scheduling_(scheduling)
+    , nb_iter_per_round_(nb_iter_per_round)
+    , tol_(tol)
 {
     // Pin this driver's stream and allocations to the same device as base.
     CHK_CUDA_BPF(cudaSetDevice(base.device_id_));
+
+    // The continuous schedule's refusals, before any allocation / ANALYSIS.
+    if (scheduling_ == BatchScheduling::Continuous) {
+        check_continuous_scheduling(strategy_type, nb_iter_, nb_iter_per_round_, tol_);
+    }
 
     // Emplace the requested policy alternative.
     if (strategy_type == ContingencySolverType::DirectBaseCaseFactors)
@@ -239,6 +250,13 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
 
         d_V_results.resize(static_cast<size_t>(n_contingencies) * n_bus);
         d_residuals.resize(n_contingencies, cuda_real_type(0));
+
+        // Slot schedule staging (see the members' doc).
+        h_sched_.resize(static_cast<size_t>(4) * batch_size_);
+        d_sched_.resize(static_cast<size_t>(4) * batch_size_);
+        h_slot_res_.resize(static_cast<size_t>(batch_size_));
+        d_slot_res_.resize(static_cast<size_t>(batch_size_));
+        sched_done_.record(cs);
 
         cs.synchronize();
         t_alloc_ms_ = bpf_ms_since(t_alloc_start);
@@ -684,7 +702,7 @@ void BatchPfDriver<BatchSource>::run_bus_q_check_n()
         bus_q_sn_mva_, bus_q_tol_mvar_,
         base.n_bus, base.nnz_Y,
         /*c_start=*/0, /*actual_batch=*/1, bus_q_capacity_,
-        /*d_result_map=*/nullptr,
+        /*d_result_map=*/nullptr, /*d_slot_active=*/nullptr,
         thrust::raw_pointer_cast(d_bq_n_bus_id.data()),
         thrust::raw_pointer_cast(d_bq_n_type.data()),
         thrust::raw_pointer_cast(d_bq_n_value.data()),
@@ -769,7 +787,7 @@ void BatchPfDriver<BatchSource>::run_hvdc_p_check_n()
         hvdc_p_sn_mva_, hvdc_p_tol_pu_,
         base.n_bus,
         /*c_start=*/0, /*actual_batch=*/1, hvdc_p_capacity_,
-        /*d_result_map=*/nullptr,
+        /*d_result_map=*/nullptr, /*d_slot_active=*/nullptr,
         thrust::raw_pointer_cast(d_hp_n_hvdc_id.data()),
         thrust::raw_pointer_cast(d_hp_n_side.data()),
         thrust::raw_pointer_cast(d_hp_n_type.data()),
@@ -1000,7 +1018,7 @@ void BatchPfDriver<BatchSource>::run_gen_p_check_n()
         gen_p_sn_mva_, gen_p_tol_mw_,
         base.n_bus, base.nnz_Y,
         /*c_start=*/0, /*actual_batch=*/1, gen_p_capacity_,
-        /*d_result_map=*/nullptr,
+        /*d_result_map=*/nullptr, /*d_slot_active=*/nullptr,
         thrust::raw_pointer_cast(d_gp_n_element_type.data()),
         thrust::raw_pointer_cast(d_gp_n_element_id.data()),
         thrust::raw_pointer_cast(d_gp_n_type.data()),
@@ -1215,7 +1233,7 @@ void BatchPfDriver<BatchSource>::run_gen_pv_release_check_n()
         gen_pv_release_tol_vm_pu_,
         base.n_bus,
         /*c_start=*/0, /*actual_batch=*/1, gen_pv_release_capacity_,
-        /*d_result_map=*/nullptr,
+        /*d_result_map=*/nullptr, /*d_slot_active=*/nullptr,
         thrust::raw_pointer_cast(d_gr_n_gen_id.data()),
         thrust::raw_pointer_cast(d_gr_n_type.data()),
         thrust::raw_pointer_cast(d_gr_n_el_type.data()),
@@ -1262,6 +1280,18 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
 {
     BatchTimings t;
     ++n_solves_;
+    const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    if (continuous) {
+        if (keep_final_jacobian_)
+            throw std::invalid_argument(
+                "scheduling='continuous' does not support keep_final_jacobian (the "
+                "batched adjoint needs every row's final Jacobian in one chunk)");
+        const ContingencySolverType strategy =
+            std::holds_alternative<PolicyIter0Only>(policy_)      ? ContingencySolverType::DirectIter0Only
+          : std::holds_alternative<PolicyRefactorEveryN>(policy_) ? ContingencySolverType::DirectRefactorEveryN
+          : ContingencySolverType::DirectRefactorEvery;
+        check_continuous_scheduling(strategy, nb_iter_, nb_iter_per_round_, tol_);
+    }
     if (keep_final_jacobian_ && n_chunks_ > 1)
         throw std::runtime_error(
             "[batch_pf] keep_final_jacobian requires the whole batch to be "
@@ -1269,9 +1299,26 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
             "the chunk buffer): raise batch_size to at least the number of "
             "active elements (" + std::to_string(n_active_) + ").");
     t.n_contingencies  = n_contingencies;
-    t.n_chunks         = n_chunks_;
+    t.n_chunks         = continuous ? 0 : n_chunks_;
     t.chunk_size       = batch_size_;
     t.nb_iter          = nb_iter_;
+    t.scheduling        = static_cast<int>(scheduling_);
+    t.nb_iter_per_round = continuous ? nb_iter_per_round_ : 0;
+
+    // Per-row outcome, ORIGINAL row order: rows the pre-check dropped stay
+    // NOT_SIMULATED; the active -> original map is needed on the host.
+    row_iters_.assign(static_cast<size_t>(n_contingencies), 0);
+    row_status_.assign(static_cast<size_t>(n_contingencies),
+                       static_cast<int>(RowStatus::NotSimulated));
+    h_a2o_.clear();
+    if (const int* d_map = source_.d_result_map()) {
+        h_a2o_.resize(static_cast<size_t>(n_active_));
+        if (n_active_ > 0)
+            CHK_CUDA_BPF(cudaMemcpyAsync(h_a2o_.data(), d_map,
+                                         static_cast<size_t>(n_active_) * sizeof(int),
+                                         cudaMemcpyDeviceToHost, cs));
+        cs.synchronize();
+    }
     t.t_preprocess_ms  = t_preprocess_ms_;
     t.t_alloc_ms       = t_alloc_ms_;
     t.t_analysis_ms    = t_analysis_ms_;
@@ -1296,10 +1343,14 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     // space); _solve_chunk scatters each result to its original index.
     // Per-chunk ANALYSIS of the non-uniform cuDSS modes (0 in uniform mode).
     const double t_chunk_analysis_start = linear_solver_.analysis_ms();
-    for (int chunk = 0; chunk < n_chunks_; ++chunk) {
-        const int c_start      = chunk * batch_size_;
-        const int actual_batch = std::min(batch_size_, n_active_ - c_start);
-        _solve_chunk(c_start, actual_batch, t);
+    if (continuous) {
+        _solve_continuous(t);
+    } else {
+        for (int chunk = 0; chunk < n_chunks_; ++chunk) {
+            const int c_start      = chunk * batch_size_;
+            const int actual_batch = std::min(batch_size_, n_active_ - c_start);
+            _solve_chunk(c_start, actual_batch, t);
+        }
     }
     t.t_analysis_ms += linear_solver_.analysis_ms() - t_chunk_analysis_start;
 
@@ -1311,45 +1362,40 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.cudss_mem_host_peak_bytes        = fs.mem_host_peak;
 
     cs.synchronize();
+
+    // Chunked schedule: every simulated row ran nb_iter iterations; its status
+    // follows from its final residual (the continuous schedule recorded both
+    // as each row left).
+    if (!continuous && n_active_ > 0) {
+        std::vector<cuda_real_type> res(static_cast<size_t>(n_contingencies));
+        CHK_CUDA_BPF(cudaMemcpy(res.data(), thrust::raw_pointer_cast(d_residuals.data()),
+                                res.size() * sizeof(cuda_real_type), cudaMemcpyDeviceToHost));
+        for (int a = 0; a < n_active_; ++a) {
+            const int o = _orig_row(a);
+            const double r = static_cast<double>(res[static_cast<size_t>(o)]);
+            row_iters_[static_cast<size_t>(o)] = nb_iter_;
+            row_status_[static_cast<size_t>(o)] = static_cast<int>(
+                !std::isfinite(r) ? RowStatus::Diverged
+              : r < tol_          ? RowStatus::Converged
+                                  : RowStatus::MaxIter);
+        }
+    }
     return t;
 }
 
 // =============================================================================
-// _solve_chunk
+// _make_nr_buffers — the non-owning pointer bundle the NR loop and the
+// post-solve kernels read: the chunk buffers, base's shared single-system
+// data, the source's Sbus, the per-slot feature state and the step-scaling
+// scratch. The source's per-slot mask / weight / v_set slices are attached by
+// the caller (source_.fill_*_buffers).
 // =============================================================================
 template <typename BatchSource>
-void BatchPfDriver<BatchSource>::_solve_chunk(
-    int c_start, int actual_batch, BatchTimings& t)
+NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
 {
-    const int n_bus  = base.n_bus;
-    const int n_pvpq = base.n_pvpq;
-    const int n_pq   = base.n_pq;
-    const int dim_J  = base.dim_J;
-    const int nnz_Y  = base.nnz_Y;
-    const int nnz_J  = base.nnz_J;
-
-    const int chunk = c_start / batch_size_;
-
-    // Active-slot → original-index map (nullptr when no compaction: identity).
-    const int* d_result_map = source_.d_result_map();
-
-    CudaTimer timer(cs);
-
-    // -------------------------------------------------------------------------
-    // ①  BatchSource::prepare_Ybus_batch  — tile V (+ optionally tile Ybus
-    //     and apply patches, depending on the source).
-    // ②  BatchSource::prepare_Sbus_batch  — no-op (contingency) or row-slice
-    //     copy + phantom-pad (injection).
-    // -------------------------------------------------------------------------
     BatchPfDriverContext ctx = make_context();
-    source_.prepare_Ybus_batch(ctx, chunk, actual_batch, cs, timer, t);
-    source_.prepare_Sbus_batch(ctx, chunk, actual_batch, cs, timer, t);
-
-    // -------------------------------------------------------------------------
-    // ③  Fixed NR loop
-    // -------------------------------------------------------------------------
-    const cudaComplexType* d_Sbus_for_NR = source_.d_Sbus_ptr(ctx);
-    const int sbus_stride = source_.sbus_stride(n_bus);   // may depend on the source's own state
+    const cudaComplexType* d_Sbus = source_.d_Sbus_ptr(ctx);
+    const int sbus_stride = source_.sbus_stride(base.n_bus);   // may depend on the source's own state
 
     NrIterBuffers buf {
         thrust::raw_pointer_cast(d_J_values_batch.data()),
@@ -1376,7 +1422,7 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         thrust::raw_pointer_cast(base.d_vm_buses.data()),
         thrust::raw_pointer_cast(base.d_vm_cols.data()),
         base.n_vm,
-        d_Sbus_for_NR,
+        d_Sbus,
         sbus_stride,
         // ---- MultiSlack (shared feature data on base; per-slot state here) ----
         base.slack_col,
@@ -1437,132 +1483,191 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
         buf.d_scale_max_dvm    = thrust::raw_pointer_cast(d_scale_max_dvm_batch.data());
     }
 
-    // handle_disconnected_grid: attach this chunk's mask slice (no-op for the
-    // injection sweep / when the mode is off). d_J_outer is the shared skeleton.
-    source_.fill_mask_buffers(buf, chunk, thrust::raw_pointer_cast(base.d_J_outer.data()));
-
-    // Per-slot distributed-slack weights (ScenarioSweep generator
-    // contingencies only; no-op elsewhere -- buf.d_slack_w stays base's
-    // shared array with slack_w_stride 0).
-    source_.fill_slack_w_buffers(buf, chunk);
-
-    // Per-slot VoltageControl set-points (a gen_v column driving a group's
-    // v_set; no-op otherwise -- base's shared array, stride 0).
-    source_.fill_vc_vset_buffers(buf, chunk);
-
-    // Re-initialise the per-slot feature state for this chunk (slack_absorbed =
-    // Re(Σ Sbus_slot); controller reactive injection = 0). The NR loop runs over
-    // the full padded batch, so initialise batch_size_ slots.
-    if (base.slack_col >= 0)
-        init_slack_absorbed_kernel<<<(batch_size_ + BS - 1) / BS, BS, 0, cs>>>(
-            thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
-            d_Sbus_for_NR, sbus_stride, n_bus, batch_size_);
-    // Held controllers (lightsim2grid's set_hold_frozen_regulators) start at the
-    // output they hold, the others at 0; their frozen output is offset out of the
-    // mismatch (it is in Sbus already).
-    if (base.has_vc_held) {
+    // Held controllers (lightsim2grid's set_hold_frozen_regulators): their
+    // frozen output is offset out of the mismatch (it is in Sbus already).
+    if (base.has_vc_held)
         buf.d_vc_qoff = thrust::raw_pointer_cast(base.d_vc_qoff.data());
-        launch_tile(thrust::raw_pointer_cast(d_vc_q_batch.data()),
-                    thrust::raw_pointer_cast(base.d_vc_qoff.data()),
-                    base.n_vc_ctrl, batch_size_, cs);
+    return buf;
+}
+
+// =============================================================================
+// _init_slot_state — the per-slot Newton unknowns beyond V, for the slots
+// being loaded: slack_absorbed = Re(Σ Sbus_slot) (the slot's Sbus is loaded
+// already); controller reactive injection = 0, or the output a held
+// controller holds. A slot that stays keeps its own: they are part of its
+// Newton iterate.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_init_slot_state(const NrIterBuffers& buf, const SlotLoadView& L)
+{
+    if (L.n <= 0) return;
+    if (base.slack_col >= 0)
+        init_slack_absorbed_slots_kernel<cudaComplexType, cuda_real_type>
+            <<<(L.n + BS - 1) / BS, BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_slack_absorbed_batch.data()),
+            buf.d_Sbus, buf.sbus_stride, base.n_bus, L.d_slot, L.n);
+    if (base.has_vc_held) {
+        launch_gather_rows_to_slots(thrust::raw_pointer_cast(d_vc_q_batch.data()),
+                                    static_cast<const cuda_real_type*>(nullptr),
+                                    thrust::raw_pointer_cast(base.d_vc_qoff.data()),
+                                    L, base.n_vc_ctrl, cs);
     } else if (base.n_vc_ctrl > 0) {
-        CHK_CUDA_BPF(cudaMemsetAsync(
-            thrust::raw_pointer_cast(d_vc_q_batch.data()), 0,
-            d_vc_q_batch.size() * sizeof(cuda_real_type), cs));
+        launch_fill_slots(thrust::raw_pointer_cast(d_vc_q_batch.data()),
+                          static_cast<cuda_real_type>(0), L, base.n_vc_ctrl, cs);
     }
+}
 
-    std::visit([&](auto& policy) {
-        run_nr_loop(
-            policy, linear_solver_, spmv_batch, buf,
-            n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
-            /*batch_size=*/batch_size_,
-            /*nb_iter=*/nb_iter_,
-            cs, timer, t);
-    }, policy_);
+// =============================================================================
+// Slot schedule staging helpers
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_upload_sched()
+{
+    CHK_CUDA_BPF(cudaMemcpyAsync(thrust::raw_pointer_cast(d_sched_.data()), h_sched_.ptr,
+                                 static_cast<size_t>(4) * batch_size_ * sizeof(int),
+                                 cudaMemcpyHostToDevice, cs));
+    sched_done_.record(cs);
+}
 
-    // -------------------------------------------------------------------------
-    // ④  Post-loop: final SpMV + fill_F + per-element ‖F‖∞
-    // -------------------------------------------------------------------------
+template <typename BatchSource>
+SlotLoadView BatchPfDriver<BatchSource>::_load_view(int n_load, int chunk, int n_real)
+{
+    SlotLoadView L;
+    L.n      = n_load;
+    L.d_slot = d_load_slot();
+    L.d_row  = d_load_row();
+    L.h_slot = h_load_slot();
+    L.h_row  = h_load_row();
+    L.chunk  = chunk;
+    L.n_real = n_real;
+    return L;
+}
+
+template <typename BatchSource>
+SlotTableView BatchPfDriver<BatchSource>::_table_view(int chunk)
+{
+    SlotTableView T;
+    T.S          = batch_size_;
+    T.d_slot_row = d_slot_row();
+    T.h_slot_row = h_slot_row();
+    T.chunk      = chunk;
+    return T;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_load(const SlotLoadView& L, CudaTimer& timer, BatchTimings& t)
+{
+    BatchPfDriverContext ctx = make_context();
+    source_.load_slots(ctx, L, cs, timer, t);
+    _init_slot_state(_make_nr_buffers(), L);
+}
+
+template <typename BatchSource>
+NrIterBuffers BatchPfDriver<BatchSource>::_bound_nr_buffers(const SlotTableView& T)
+{
+    NrIterBuffers buf = _make_nr_buffers();
+    // handle_disconnected_grid masks, per-slot distributed-slack weights and
+    // VoltageControl set-points of the slots' rows (no-ops for what the source
+    // does not carry; base's shared arrays, stride 0, otherwise).
+    source_.bind_slots(buf, T, thrust::raw_pointer_cast(base.d_J_outer.data()), cs);
+    return buf;
+}
+
+// =============================================================================
+// _residual_pass — final SpMV + fill_F (+ feature mismatch, + the same row
+// rewrites the NR loop applies, so the frozen component and the pinned rows
+// do not pollute it) + per-slot ‖F‖∞ over the first n_slots slots, written to
+// d_out at d_result_map[a] (a = d_slot_active[s], or c_start + s when null).
+// The SpMV covers the whole padded batch (the converged-J refill reads it).
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_slots,
+                                                cuda_real_type* d_out, int c_start,
+                                                const int* d_result_map,
+                                                const int* d_slot_active,
+                                                CudaTimer& timer, BatchTimings& t)
+{
+    const int n_bus = base.n_bus;
+    const int dim_J = base.dim_J;
+    const int nnz_J = base.nnz_J;
     timer.start();
     {
         spmv_batch.spmv();
 
-        if (actual_batch > 0) {
+        if (n_slots > 0) {
             fill_FP_kernel<<<
-                nr_grid_size((long long)actual_batch * base.n_p, BS), BS, 0, cs>>>(
+                nr_grid_size((long long)n_slots * base.n_p, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
-                d_Sbus_for_NR,
+                buf.d_Sbus,
                 thrust::raw_pointer_cast(base.d_p_buses.data()),
                 thrust::raw_pointer_cast(base.d_p_rows.data()),
-                base.n_p, n_bus, dim_J, actual_batch, sbus_stride);
+                base.n_p, n_bus, dim_J, n_slots, buf.sbus_stride);
             fill_FQ_kernel<<<
-                nr_grid_size((long long)actual_batch * base.n_q, BS), BS, 0, cs>>>(
+                nr_grid_size((long long)n_slots * base.n_q, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_F_batch.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
                 thrust::raw_pointer_cast(d_Ibus_batch.data()),
-                d_Sbus_for_NR,
+                buf.d_Sbus,
                 thrust::raw_pointer_cast(base.d_q_buses.data()),
                 thrust::raw_pointer_cast(base.d_q_rows.data()),
-                base.n_q, n_bus, dim_J, actual_batch, sbus_stride);
+                base.n_q, n_bus, dim_J, n_slots, buf.sbus_stride);
             // Augmented-feature contributions to the final residual (slack /
             // HVDC mismatch + VC bordered custom rows), using the converged state.
-            nr_feature_mismatch(buf, n_bus, dim_J, actual_batch, cs);
+            nr_feature_mismatch(buf, n_bus, dim_J, n_slots, cs);
             // handle_disconnected_grid / PV pins / stranded controllers: the
             // same row rewrites the NR loop applied, so the frozen component
             // and the pinned rows do not pollute the ‖F‖∞ residual.
-            nr_apply_F_masks(buf, nnz_J, dim_J, actual_batch, cs);
+            nr_apply_F_masks(buf, nnz_J, dim_J, n_slots, cs);
 
             compute_residuals_kernel<<<
-                actual_batch, BS,
+                n_slots, BS,
                 static_cast<size_t>(BS) * sizeof(cuda_real_type), cs>>>(
-                thrust::raw_pointer_cast(d_residuals.data()),
+                d_out,
                 thrust::raw_pointer_cast(d_F_batch.data()),
-                dim_J, actual_batch, c_start, d_result_map);
+                dim_J, n_slots, c_start, d_result_map, d_slot_active);
         }
     }
     t.t_residual += timer.stop_ms();
+}
 
-    // -------------------------------------------------------------------------
-    // ④b Converged Jacobian (opt-in, differentiable wrapper): the loop left
-    //     J(V_{nb_iter-1}) in d_J_values_batch; refill it at V_final using the
-    //     SpMV output of step ④ (d_Ibus_batch = Ybus · V_final for the whole
-    //     padded batch). Same fill sequence as the loop -- one definition
-    //     (nr_fill_J_at_current_V). Must run BEFORE step ⑤'s NaN masking of
-    //     d_V_batch. The forward factors are untouched (cuDSS keeps them in
-    //     its own data object); the batched adjoint reads the values later.
-    // -------------------------------------------------------------------------
-    if (keep_final_jacobian_) {
-        timer.start();
-        nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, batch_size_, cs);
-        t.t_fill_J += timer.stop_ms();
-    }
+// =============================================================================
+// _evict — everything done to a finished slot, in this order: its masked
+// buses' voltages to NaN (in place: the slot must be reloaded before it
+// iterates again), the fused limit / physical checks on its converged state,
+// the store of its V and its branch flows. Over the first n_slots slots, each
+// written at its original row (d_slot_active / c_start as in _residual_pass);
+// d_residuals must already hold the rows' residuals (the checks read it).
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, int c_start,
+                                        const int* d_slot_active,
+                                        CudaTimer& timer, BatchTimings& t)
+{
+    const int n_bus = base.n_bus;
+    const int nnz_Y = base.nnz_Y;
+    const int* d_result_map = source_.d_result_map();
 
-    // -------------------------------------------------------------------------
-    // ⑤  Store V results.  Without compaction the active slots map contiguously
-    //     to result indices (single D→D memcpy).  With compaction the original
-    //     indices are non-contiguous, so scatter through d_result_map instead.
-    // -------------------------------------------------------------------------
     timer.start();
-    if (actual_batch > 0) {
+    if (n_slots > 0) {
         // handle_disconnected_grid: report the frozen (masked) buses' voltages as
         // NaN before the result store (no-op when the mode is off).
-        nr_mask_v_nan(buf, n_bus, cs);
+        nr_mask_v_nan(buf, n_bus, cs, d_slot_active);
     }
     t.t_store_V += timer.stop_ms();
 
     // compute_limit_violations: fused per-contingency voltage/current/
     // divergence check, reading d_V_batch (chunk-local, post mask-NaN)
-    // directly -- never touches d_V_results or any O(actual_batch*n_branches)
+    // directly -- never touches d_V_results or any O(n_slots*n_branches)
     // buffer. d_residuals already holds this chunk's just-written residuals
     // (step ④ above). No-op (skipped entirely) unless set_violation_limits()
     // was called -- timed separately into t_violation_check so it isn't
     // folded into t_store_V's "D→D copy" cost.
-    if (actual_batch > 0 && _fused_violations_enabled) {
+    if (n_slots > 0 && _fused_violations_enabled) {
         timer.start();
         const TrippedBranchTable trip = source_.tripped_branch_table();
-        check_limit_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+        check_limit_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_residuals.data()),
             violation_tol_,
@@ -1582,8 +1687,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
             trip.d_start, trip.d_count, trip.d_branch_flat,
             n_bus, n_branches_, n_lines_,
-            c_start, actual_batch, violation_capacity_,
-            d_result_map,
+            c_start, n_slots, violation_capacity_,
+            d_result_map, d_slot_active,
             thrust::raw_pointer_cast(d_viol_element_type.data()),
             thrust::raw_pointer_cast(d_viol_element_id.data()),
             thrust::raw_pointer_cast(d_viol_side.data()),
@@ -1604,14 +1709,14 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // and its Sbus (shared or per slot, see sbus_stride). Launched whenever the
     // check is on -- even with an empty plan -- so every simulated row gets a
     // count (0), distinct from the -1 "never simulated" sentinel.
-    if (actual_batch > 0 && _bus_q_enabled) {
+    if (n_slots > 0 && _bus_q_enabled) {
         timer.start();
-        check_bus_q_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+        check_bus_q_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
             thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
             thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
-            d_Sbus_for_NR, sbus_stride,
+            buf.d_Sbus, buf.sbus_stride,
             thrust::raw_pointer_cast(d_residuals.data()), bus_q_residual_tol_,
             bus_q_n_check_,
             thrust::raw_pointer_cast(d_bq_bus_solver.data()),
@@ -1629,8 +1734,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             bus_q_skip_stride_,
             bus_q_sn_mva_, bus_q_tol_mvar_,
             n_bus, nnz_Y,
-            c_start, actual_batch, bus_q_capacity_,
-            d_result_map,
+            c_start, n_slots, bus_q_capacity_,
+            d_result_map, d_slot_active,
             thrust::raw_pointer_cast(d_bq_out_bus_id.data()),
             thrust::raw_pointer_cast(d_bq_out_type.data()),
             thrust::raw_pointer_cast(d_bq_out_value.data()),
@@ -1643,9 +1748,9 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 
     // compute_physical_violations: droop P-saturation check on the same voltages
     // (the per-line data is the base state's own, shared across slots).
-    if (actual_batch > 0 && _hvdc_p_enabled) {
+    if (n_slots > 0 && _hvdc_p_enabled) {
         timer.start();
-        check_hvdc_p_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+        check_hvdc_p_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_residuals.data()), hvdc_p_residual_tol_,
             base.n_hvdc,
@@ -1670,8 +1775,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(base.d_hvdc_frz_limit.data()),
             hvdc_p_sn_mva_, hvdc_p_tol_pu_,
             n_bus,
-            c_start, actual_batch, hvdc_p_capacity_,
-            d_result_map,
+            c_start, n_slots, hvdc_p_capacity_,
+            d_result_map, d_slot_active,
             thrust::raw_pointer_cast(d_hp_out_hvdc_id.data()),
             thrust::raw_pointer_cast(d_hp_out_side.data()),
             thrust::raw_pointer_cast(d_hp_out_type.data()),
@@ -1686,14 +1791,14 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // compute_physical_violations: the per-machine active power of the
     // distributed slack (generators and storage units), on the same voltages,
     // this chunk's patched Ybus values and its Sbus.
-    if (actual_batch > 0 && _gen_p_enabled) {
+    if (n_slots > 0 && _gen_p_enabled) {
         timer.start();
-        check_gen_p_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+        check_gen_p_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
             thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
             thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
-            d_Sbus_for_NR, sbus_stride,
+            buf.d_Sbus, buf.sbus_stride,
             thrust::raw_pointer_cast(d_residuals.data()), gen_p_residual_tol_,
             base.n_hvdc,
             thrust::raw_pointer_cast(base.d_hvdc_bus1.data()),
@@ -1730,8 +1835,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             gen_p_ns_sto_,
             gen_p_sn_mva_, gen_p_tol_mw_,
             n_bus, nnz_Y,
-            c_start, actual_batch, gen_p_capacity_,
-            d_result_map,
+            c_start, n_slots, gen_p_capacity_,
+            d_result_map, d_slot_active,
             thrust::raw_pointer_cast(d_gp_out_element_type.data()),
             thrust::raw_pointer_cast(d_gp_out_element_id.data()),
             thrust::raw_pointer_cast(d_gp_out_type.data()),
@@ -1745,9 +1850,9 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
 
     // compute_physical_violations: the PQ -> PV release of the generators the
     // caller flagged as pinned at a reactive limit, on the same voltages.
-    if (actual_batch > 0 && _gen_pv_release_enabled) {
+    if (n_slots > 0 && _gen_pv_release_enabled) {
         timer.start();
-        check_gen_pv_release_violations_kernel<<<(actual_batch + BS - 1) / BS, BS, 0, cs>>>(
+        check_gen_pv_release_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_residuals.data()), gen_pv_release_residual_tol_,
             gen_pv_release_n_entries_,
@@ -1767,8 +1872,8 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             gen_pv_release_skip_stride_,
             gen_pv_release_tol_vm_pu_,
             n_bus,
-            c_start, actual_batch, gen_pv_release_capacity_,
-            d_result_map,
+            c_start, n_slots, gen_pv_release_capacity_,
+            d_result_map, d_slot_active,
             thrust::raw_pointer_cast(d_gr_out_gen_id.data()),
             thrust::raw_pointer_cast(d_gr_out_type.data()),
             thrust::raw_pointer_cast(d_gr_out_el_type.data()),
@@ -1782,19 +1887,19 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     }
 
     timer.start();
-    if (actual_batch > 0) {
-        if (d_result_map) {
-            scatter_V_results_kernel<<<nr_grid_size((long long)actual_batch * n_bus, BS), BS, 0, cs>>>(
+    if (n_slots > 0) {
+        if (d_result_map || d_slot_active) {
+            scatter_V_results_kernel<<<nr_grid_size((long long)n_slots * n_bus, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_V_results.data()),
                 thrust::raw_pointer_cast(d_V_batch.data()),
-                d_result_map, c_start, n_bus, actual_batch);
+                d_result_map, c_start, n_bus, n_slots, d_slot_active);
             CHK_CUDA_BPF(cudaGetLastError());
         } else {
             CHK_CUDA_BPF(cudaMemcpyAsync(
                 thrust::raw_pointer_cast(d_V_results.data())
                     + static_cast<ptrdiff_t>(c_start) * n_bus,
                 thrust::raw_pointer_cast(d_V_batch.data()),
-                static_cast<size_t>(actual_batch) * n_bus * sizeof(cudaComplexType),
+                static_cast<size_t>(n_slots) * n_bus * sizeof(cudaComplexType),
                 cudaMemcpyDeviceToDevice, cs));
         }
     }
@@ -1803,9 +1908,9 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     // -------------------------------------------------------------------------
     // ⑥  Optional branch-flow computation
     // -------------------------------------------------------------------------
-    if (_has_branch_data && actual_batch > 0) {
+    if (_has_branch_data && n_slots > 0) {
         timer.start();
-        compute_branch_flows_kernel<<<nr_grid_size((long long)actual_batch * n_branches_, BS), BS, 0, cs>>>(
+        compute_branch_flows_kernel<<<nr_grid_size((long long)n_slots * n_branches_, BS), BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_branch_from.data()),
             thrust::raw_pointer_cast(d_branch_to.data()),
@@ -1817,10 +1922,219 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
             thrust::raw_pointer_cast(d_base_current_ex_A.data()),
             thrust::raw_pointer_cast(d_or_amps_results.data()),
             thrust::raw_pointer_cast(d_ex_amps_results.data()),
-            n_bus, n_branches_, c_start, actual_batch, d_result_map);
+            n_bus, n_branches_, c_start, n_slots, d_result_map, d_slot_active);
         CHK_CUDA_BPF(cudaGetLastError());
         t.t_flow_computation += timer.stop_ms();
     }
+}
+
+// =============================================================================
+// _solve_continuous — the continuous schedule (docs/dev_notes/
+// continuous_batching.md). S = batch_size_ slots, filled from the queue of
+// active rows in order; every round runs k = nb_iter_per_round_ Newton
+// iterations on all of them, then one residual pass and ONE D->H of the S
+// residuals. On the host, each slot holding a row:
+//     residual not finite -> DIVERGED, leaves
+//     residual < tol_     -> CONVERGED, leaves
+//     iterations >= nb_iter_ (the row's budget) -> MAX_ITER, leaves
+//     otherwise stays, with its V and Newton state.
+// A leaving row gets its residual, its NaN mask, its checks, its V and its
+// flows written at its original row (_evict through the eviction map), and
+// its slot is reloaded at once: with the next queued row, else with the base
+// case (required: the slot holds the old row's NaN mask / divergent state).
+// Rows are loaded in active order into the freed slots in increasing slot
+// order, so a row's trajectory depends on that row alone. A loaded row always
+// runs at least k iterations (it is first checked after its first round).
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
+{
+    const int S      = batch_size_;
+    const int k      = nb_iter_per_round_;
+    const int budget = nb_iter_;
+    const int dim_J  = base.dim_J;
+    const int nnz_Y  = base.nnz_Y;
+    const int nnz_J  = base.nnz_J;
+    const int* d_result_map = source_.d_result_map();
+
+    CudaTimer timer(cs);
+    std::vector<int> iters(static_cast<size_t>(S), 0);
+    int       q      = 0;     // next active row of the queue
+    int       rounds = 0;
+    long long useful = 0;     // row-iterations spent on real rows
+
+    // Initial load: every slot (the queue's first rows, phantoms past its end).
+    _wait_sched_upload();
+    int n_live = 0;
+    for (int s = 0; s < S; ++s) {
+        const int row = q < n_active_ ? q++ : -1;
+        h_load_slot()[s] = s;
+        h_load_row()[s]  = row;
+        h_evict()[s]     = -1;
+        h_slot_row()[s]  = row;
+        if (row >= 0) ++n_live;
+    }
+    if (n_live == 0) return;   // nothing to solve
+    _upload_sched();
+    _load(_load_view(S, -1, n_live), timer, t);
+    NrIterBuffers buf = _bound_nr_buffers(_table_view(-1));
+
+    while (n_live > 0) {
+        std::visit([&](auto& policy) {
+            run_nr_loop(
+                policy, linear_solver_, spmv_batch, buf,
+                base.n_bus, base.n_pvpq, base.n_pq, dim_J, nnz_Y, nnz_J,
+                /*batch_size=*/S, /*nb_iter=*/k, cs, timer, t);
+        }, policy_);
+        ++rounds;
+
+        // Per-slot residual at the current V, slot order.
+        _residual_pass(buf, S, thrust::raw_pointer_cast(d_slot_res_.data()), /*c_start=*/0,
+                       /*d_result_map=*/nullptr, /*d_slot_active=*/nullptr, timer, t);
+
+        // ---- host: decisions, eviction map, load list --------------------
+        const auto t_sched0 = std::chrono::steady_clock::now();
+        CHK_CUDA_BPF(cudaMemcpyAsync(h_slot_res_.ptr, thrust::raw_pointer_cast(d_slot_res_.data()),
+                                     static_cast<size_t>(S) * sizeof(cuda_real_type),
+                                     cudaMemcpyDeviceToHost, cs));
+        cs.synchronize();   // also retires the previous H->D of the staging block
+
+        int n_leave = 0;
+        for (int s = 0; s < S; ++s) {
+            h_evict()[s] = -1;
+            const int a = h_slot_row()[s];
+            if (a < 0) continue;
+            iters[static_cast<size_t>(s)] += k;
+            useful += k;
+            const double r = static_cast<double>(h_slot_res_[static_cast<size_t>(s)]);
+            RowStatus st;
+            if (!std::isfinite(r))                          st = RowStatus::Diverged;
+            else if (r < tol_)                              st = RowStatus::Converged;
+            else if (iters[static_cast<size_t>(s)] >= budget) st = RowStatus::MaxIter;
+            else continue;   // stays
+            h_evict()[s] = a;
+            ++n_leave;
+            const size_t o = static_cast<size_t>(_orig_row(a));
+            row_iters_[o]  = iters[static_cast<size_t>(s)];
+            row_status_[o] = static_cast<int>(st);
+        }
+        int n_load = 0, n_load_real = 0;
+        if (n_leave > 0) {
+            for (int s = 0; s < S; ++s) {
+                if (h_evict()[s] < 0) continue;
+                const int row = q < n_active_ ? q++ : -1;
+                h_load_slot()[n_load] = s;
+                h_load_row()[n_load]  = row;
+                ++n_load;
+                h_slot_row()[s] = row;
+                iters[static_cast<size_t>(s)] = 0;
+                if (row >= 0) ++n_load_real;
+            }
+            n_live += n_load_real - n_leave;
+            _upload_sched();
+        }
+        t.t_schedule += TimingEntry{0., std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_sched0).count()};
+        if (n_leave == 0) continue;
+
+        // ---- eviction of the leaving slots -------------------------------
+        // Their residuals into d_residuals at their original rows (d_F is
+        // still this round's: nothing touched it since the residual pass);
+        // the checks read them.
+        timer.start();
+        compute_residuals_kernel<<<S, BS, static_cast<size_t>(BS) * sizeof(cuda_real_type), cs>>>(
+            thrust::raw_pointer_cast(d_residuals.data()),
+            thrust::raw_pointer_cast(d_F_batch.data()),
+            dim_J, S, /*c_start=*/0, d_result_map, d_evict());
+        t.t_residual += timer.stop_ms();
+        _evict(buf, S, /*c_start=*/0, d_evict(), timer, t);
+
+        // ---- refill the freed slots ---------------------------------------
+        if (n_live == 0) break;   // everything left; no round follows
+        _load(_load_view(n_load, -1, n_load_real), timer, t);
+        buf = _bound_nr_buffers(_table_view(-1));
+    }
+
+    t.n_rounds  = rounds;
+    t.occupancy = rounds > 0
+        ? static_cast<double>(useful) / (static_cast<double>(rounds) * k * S) : 0.;
+}
+
+// =============================================================================
+// _solve_chunk — one chunk of the chunked schedule: prepare every slot (rows
+// [c_start, c_start + actual_batch) of the active set, phantom tail = base
+// case), nb_iter fixed NR iterations, then the residual and the eviction of
+// every real slot.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_solve_chunk(
+    int c_start, int actual_batch, BatchTimings& t)
+{
+    const int n_bus  = base.n_bus;
+    const int n_pvpq = base.n_pvpq;
+    const int n_pq   = base.n_pq;
+    const int dim_J  = base.dim_J;
+    const int nnz_Y  = base.nnz_Y;
+    const int nnz_J  = base.nnz_J;
+
+    const int chunk = c_start / batch_size_;
+
+    CudaTimer timer(cs);
+
+    // -------------------------------------------------------------------------
+    // ①②  Load every slot: slot i <- active row c_start + i, the phantom tail
+    //      (i >= actual_batch) <- the base case. The source fills V (+ Ybus
+    //      tile and patches, gen_v, ...) and Sbus; the driver the per-slot
+    //      Newton state. The NR loop runs over the full padded batch.
+    // -------------------------------------------------------------------------
+    _wait_sched_upload();
+    for (int i = 0; i < batch_size_; ++i) {
+        const int row = i < actual_batch ? c_start + i : -1;
+        h_load_slot()[i] = i;
+        h_load_row()[i]  = row;
+        h_evict()[i]     = -1;
+        h_slot_row()[i]  = row;
+    }
+    _upload_sched();
+    _load(_load_view(batch_size_, chunk, actual_batch), timer, t);
+
+    // -------------------------------------------------------------------------
+    // ③  Fixed NR loop
+    // -------------------------------------------------------------------------
+    NrIterBuffers buf = _bound_nr_buffers(_table_view(chunk));
+
+    std::visit([&](auto& policy) {
+        run_nr_loop(
+            policy, linear_solver_, spmv_batch, buf,
+            n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
+            /*batch_size=*/batch_size_,
+            /*nb_iter=*/nb_iter_,
+            cs, timer, t);
+    }, policy_);
+
+    // -------------------------------------------------------------------------
+    // ④  Post-loop: final SpMV + fill_F + per-element ‖F‖∞
+    // -------------------------------------------------------------------------
+    _residual_pass(buf, actual_batch, thrust::raw_pointer_cast(d_residuals.data()),
+                   c_start, source_.d_result_map(), /*d_slot_active=*/nullptr, timer, t);
+
+    // -------------------------------------------------------------------------
+    // ④b Converged Jacobian (opt-in, differentiable wrapper): the loop left
+    //     J(V_{nb_iter-1}) in d_J_values_batch; refill it at V_final using the
+    //     SpMV output of step ④ (d_Ibus_batch = Ybus · V_final for the whole
+    //     padded batch). Same fill sequence as the loop -- one definition
+    //     (nr_fill_J_at_current_V). Must run BEFORE step ⑤'s NaN masking of
+    //     d_V_batch. The forward factors are untouched (cuDSS keeps them in
+    //     its own data object); the batched adjoint reads the values later.
+    // -------------------------------------------------------------------------
+    if (keep_final_jacobian_) {
+        timer.start();
+        nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, batch_size_, cs);
+        t.t_fill_J += timer.stop_ms();
+    }
+
+    // ⑤  NaN mask, limit / physical checks, store V, flows.
+    _evict(buf, actual_batch, c_start, /*d_slot_active=*/nullptr, timer, t);
 }
 
 // =============================================================================
@@ -2097,15 +2411,16 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
 
     // ③ Solve, drop the identity-row components (see zero_identity_rows_kernel;
     //    the driver is one chunk here -- keep_final_jacobian requires it -- so
-    //    the chunk-0 slice is the whole batch) and scatter back to original order.
+    //    the slot table of the forward's chunk 0 is the whole batch) and
+    //    scatter back to original order.
     timer.start();
     A.solver.solve();
     A.t_solve += timer.stop_ms();
     ++A.n_solve;
     {
         NrIterBuffers mb{};
-        source_.fill_mask_buffers(mb, /*chunk_idx=*/0,
-                                  thrust::raw_pointer_cast(base.d_J_outer.data()));
+        source_.bind_slots(mb, _table_view(/*chunk=*/0),
+                           thrust::raw_pointer_cast(base.d_J_outer.data()), cs);
         if (mb.n_mask_rows > 0) {
             zero_identity_rows_kernel<<<(mb.n_mask_rows + BS - 1) / BS, BS, 0, cs>>>(
                 thrust::raw_pointer_cast(A.d_sol.data()),

@@ -342,12 +342,16 @@ inline void nr_apply_bus_mask(const NrIterBuffers& buf,
             buf.d_J_outer_mask, nnz_J, dim_J, buf.n_mask_rows);
 }
 
-inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
+// d_slot_active (optional): only the slots whose entry is >= 0 (the slots
+// leaving a continuous-batching round); nullptr = every slot.
+inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs,
+                          const int* d_slot_active = nullptr)
 {
     if (buf.n_mask_v > 0) {
         const cuda_real_type nan_val = std::numeric_limits<cuda_real_type>::quiet_NaN();
         mask_V_nan_kernel<<<(buf.n_mask_v + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_V, buf.d_maskv_slot, buf.d_maskv_bus, nan_val, n_bus, buf.n_mask_v);
+            buf.d_V, buf.d_maskv_slot, buf.d_maskv_bus, nan_val, n_bus, buf.n_mask_v,
+            d_slot_active);
     }
 }
 

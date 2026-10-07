@@ -188,6 +188,7 @@ __global__ void check_limit_violations_kernel(
     int n_bus, int n_branches, int n_lines,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_side,
@@ -208,7 +209,12 @@ __global__ void check_limit_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);   // GLOBAL active-slot id (tripped-branch table)
+    // GLOBAL active-slot id (tripped-branch table): the slot's own row when
+    // d_slot_active is given (continuous batching; -1 = not leaving), else
+    // the chunk's c_start + local_c.
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     // base widened to ptrdiff_t: out_c * K (this contingency's output slice
     // offset) is the same at-risk product as fill_J_kernel's own J_base once
@@ -376,6 +382,7 @@ __global__ void check_bus_q_violations_kernel(
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_bus_id,
           int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
@@ -387,7 +394,9 @@ __global__ void check_bus_q_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_BUS_Q_VIOLATION_GROUPS * K);
 
@@ -498,6 +507,7 @@ __global__ void check_hvdc_p_violations_kernel(
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_hvdc_id,
           int*             __restrict__ d_out_side,
           int*             __restrict__ d_out_type,
@@ -509,7 +519,9 @@ __global__ void check_hvdc_p_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_HVDC_P_VIOLATION_GROUPS * K);
 
@@ -606,6 +618,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
           int*             __restrict__ d_out_el_type,
@@ -618,7 +631,9 @@ __global__ void check_gen_pv_release_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_GEN_PV_RELEASE_VIOLATION_GROUPS * K);
 
@@ -752,6 +767,7 @@ __global__ void check_gen_p_violations_kernel(
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_type,
@@ -764,7 +780,9 @@ __global__ void check_gen_p_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_GEN_P_VIOLATION_GROUPS * K);
 

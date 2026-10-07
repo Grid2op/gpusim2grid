@@ -20,6 +20,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <utility>
@@ -173,10 +174,16 @@ void InjectionSweepSession::run()
             "again after changing set_injections()");
 
     const int n_bus = base_state_->n_bus;
+    const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    if (continuous)   // before any allocation / cuDSS ANALYSIS
+        check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
 
     // Effective per-chunk batch size: balance the last chunk (same rule as
-    // run_injection_sweep_gpu / run_contingency_analysis_gpu).
-    {
+    // run_injection_sweep_gpu / run_contingency_analysis_gpu). Continuous:
+    // batch_size_ slots, never more than the rows.
+    if (continuous) {
+        used_batch_size_ = std::max(1, std::min(batch_size_, n_scenarios_));
+    } else {
         const size_t n_elem   = static_cast<size_t>(n_scenarios_);
         const size_t max_bs   = static_cast<size_t>(batch_size_);
         const size_t n_chunks = (n_elem + max_bs - 1) / max_bs;
@@ -220,7 +227,10 @@ void InjectionSweepSession::run()
         pivot_epsilon_alg_,
         scaling_max_voltage_change_,
         max_dVa_,
-        max_dVm_);
+        max_dVm_,
+        scheduling_,
+        nb_iter_per_round_,
+        tol_);
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
     // violations); an injection sweep never disconnects a generator (nullptr mask).
@@ -385,6 +395,20 @@ CplxVect InjectionSweepSession::get_V_results() const
             static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
+}
+
+Eigen::VectorXi InjectionSweepSession::get_row_iterations() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_iterations();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+Eigen::VectorXi InjectionSweepSession::get_row_status() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_status();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
 }
 
 RealVect InjectionSweepSession::get_residuals() const

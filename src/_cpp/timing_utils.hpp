@@ -383,6 +383,10 @@ struct BatchTimings {
     TimingEntry t_gen_p_check;       // check_gen_p_violations_kernel, same gate
     TimingEntry t_gen_pv_release_check;   // check_gen_pv_release_violations_kernel, same gate
     TimingEntry t_flow_computation;
+    // continuous batching only: the per-round host work of the scheduler --
+    // the D->H of the slots' residuals, the decisions, the H->D of the
+    // eviction map and the load list (wall time; gpu_ms stays 0).
+    TimingEntry t_schedule;
 
     // --- metadata ---
     //
@@ -395,6 +399,13 @@ struct BatchTimings {
     int nb_iter          = 0;
     int n_refactorize    = 0;   // number of refactorize calls (n_chunks * nb_iter - 1)
     int n_disconnected   = 0;   // contingencies skipped (would disconnect the grid)
+    // scheduling (BatchScheduling: 0 = chunked, 1 = continuous). For the
+    // continuous schedule n_chunks is 0, chunk_size the slot count S, nb_iter
+    // the per-row budget, and these three describe the run:
+    int    scheduling        = 0;
+    int    nb_iter_per_round = 0;   // k
+    int    n_rounds          = 0;   // rounds of k iterations
+    double occupancy         = 0.;  // useful row-iterations / (S * iterations run)
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
@@ -427,7 +438,7 @@ struct BatchTimings {
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
               + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
-              + t_flow_computation).wall_ms;
+              + t_flow_computation + t_schedule).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

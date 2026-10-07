@@ -46,6 +46,7 @@
 #include "gen_contingency_data.hpp"          // GenContingencyData
 #include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -88,6 +89,10 @@ struct ScenarioSweepDriverConfig {
     bool   mask_mode            = false;   // handle_disconnected_grid
     bool   fixed_batch_capacity = false;
     int    base_state_generation = -1;
+    // The schedule: a chunked run after a continuous one must not take the
+    // hot path on a capacity built for the other. (The continuous schedule
+    // always takes the cold path anyway.)
+    BatchScheduling scheduling = BatchScheduling::Chunked;
 
     bool operator==(const ScenarioSweepDriverConfig& o) const {
         return n_scenarios == o.n_scenarios && batch_size == o.batch_size
@@ -97,7 +102,8 @@ struct ScenarioSweepDriverConfig {
             && scaling_max_voltage_change == o.scaling_max_voltage_change
             && max_dVa == o.max_dVa && max_dVm == o.max_dVm
             && mask_mode == o.mask_mode && fixed_batch_capacity == o.fixed_batch_capacity
-            && base_state_generation == o.base_state_generation;
+            && base_state_generation == o.base_state_generation
+            && scheduling == o.scheduling;
     }
     bool operator!=(const ScenarioSweepDriverConfig& o) const { return !(*this == o); }
 };
@@ -163,6 +169,14 @@ struct ScenarioSweepSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // row runs nb_iter_ iterations) or continuous (nb_iter_ is each row's
+    // budget, checked every nb_iter_per_round_ iterations against tol_; every
+    // run() then takes the cold path, fixed_batch_capacity_ is ignored and
+    // keep_final_jacobian_ is refused). Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
@@ -777,6 +791,10 @@ struct ScenarioSweepSession {
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_scenarios * n_bus,)      complex
     RealVect get_residuals()  const;   // (n_scenarios,)               real
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_scenarios,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const;  // run() timings + cumulative adjoint counters

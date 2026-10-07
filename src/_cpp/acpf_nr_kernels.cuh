@@ -655,7 +655,8 @@ __global__ void mask_V_nan_kernel(
     const int*             __restrict__ d_maskv_bus,
     cuda_real_type nan_val,
     int n_bus,
-    int n_entries);
+    int n_entries,
+    const int*             __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // compute_residuals_kernel
@@ -680,6 +681,10 @@ __global__ void mask_V_nan_kernel(
 // c_start     : active-slot offset for indexing into d_result_map
 // d_result_map: [n_active] active-slot → original-index map, or nullptr for
 //               identity (write residual at c_start + b directly)
+// d_slot_active: [actual_batch] active row held by each slot, -1 = skip the
+//               slot, or nullptr for c_start + b (continuous batching passes
+//               the rows leaving this round). Same meaning in the two kernels
+//               below and in mask_V_nan_kernel.
 // ---------------------------------------------------------------------------
 __global__ void compute_residuals_kernel(
           cuda_real_type* __restrict__ d_residuals,
@@ -687,7 +692,8 @@ __global__ void compute_residuals_kernel(
     int dim_J,
     int actual_batch,
     int c_start,
-    const int* __restrict__ d_result_map);
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // scatter_V_results_kernel
@@ -701,7 +707,7 @@ __global__ void compute_residuals_kernel(
 // ----------
 // d_V_results  : [n_contingencies * n_bus] complex — full-size output
 // d_V_batch    : [actual_batch * n_bus]    complex — this chunk's converged V
-// d_result_map : [n_active] active-slot → original-index map (must be non-null)
+// d_result_map : [n_active] active-slot → original-index map, or nullptr
 // c_start      : active-slot offset for this chunk
 // n_bus        : buses per system
 // actual_batch : number of active systems in this chunk
@@ -712,7 +718,8 @@ __global__ void scatter_V_results_kernel(
     const int*             __restrict__ d_result_map,
     int c_start,
     int n_bus,
-    int actual_batch);
+    int actual_batch,
+    const int*             __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // compute_branch_flows_kernel
@@ -768,7 +775,8 @@ __global__ void compute_branch_flows_kernel(
     int n_branches,
     int c_start,
     int actual_batch,
-    const int* __restrict__ d_result_map);
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // zero_branch_flows_kernel

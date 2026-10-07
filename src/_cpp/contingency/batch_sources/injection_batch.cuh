@@ -15,17 +15,13 @@
 //                Built upstream from (p_mw, q_mvar, sn_mva) by the Python entry
 //                point.  Uploaded to d_Sbus_all in initialize().
 //
-// Per-chunk behaviour
-// -------------------
-//   prepare_Ybus_batch :
-//     ① tile base d_V into d_V_batch                  (one tile_kernel launch)
+// Load path (load_slots, for the slots being (re)filled)
+// -------------------------------------------------------
+//     ① base d_V into each loaded slot, then the row's set_gen_v() reseed
+//        (and the VoltageControl set-points its columns drive).
 //     (no Ybus mutation — base Ybus has already been tiled into
 //      d_Ybus_values_batch once during initialize().)
-//
-//   prepare_Sbus_batch :
-//     ② cudaMemcpyAsync the (actual_batch × n_bus) row-slice of d_Sbus_all
-//        into d_Sbus_batch.
-//     ③ Phantom-pad remaining slots (batch_size - actual_batch) with
+//     ② the row's Sbus into each loaded slot; a phantom slot (row -1) gets
 //        base.d_Sbus, so phantom NR is a converged no-op.
 //
 // sbus_stride = n_bus → fill_FP/FQ kernels read d_Sbus[b * n_bus + bus],
@@ -47,6 +43,7 @@
 #include "../gen_v_override.hpp"          // GenVOverride
 #include "gen_vset_slots.cuh"             // GenVsetSlots
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
+#include "../slot_schedule.cuh"           // SlotLoadView, SlotTableView
 
 struct BatchPfDriverContext;
 struct NrIterBuffers;
@@ -89,6 +86,7 @@ struct InjectionBatch {
     GenVOverride gen_v_override_;
     thrust::device_vector<int>            d_gv_active_bus;
     thrust::device_vector<cuda_real_type> d_gv_all;
+    thrust::device_vector<cuda_real_type> d_gv_slots;        // [S * k] the loaded slots' rows, NaN elsewhere
     GenVsetSlots                          gv_vset_;          // VoltageControl set-point columns
 
     // -------------------------------------------------------------------------
@@ -125,25 +123,25 @@ struct InjectionBatch {
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
 
     // -------------------------------------------------------------------------
-    // prepare_Ybus_batch — tile V, then apply this chunk's set_gen_v()
-    // overrides (if any).  Ybus itself is permanent.
+    // load_slots — fill the listed slots with their rows (see the file doc):
+    // V + set_gen_v() reseed, then Sbus. Ybus itself is permanent.
     // -------------------------------------------------------------------------
-    void prepare_Ybus_batch(BatchPfDriverContext& ctx,
-                            int                  chunk_idx,
-                            int                  actual_batch,
-                            cudaStream_t         cs,
-                            CudaTimer&           timer,
-                            BatchTimings&  t);
+    void load_slots(BatchPfDriverContext& ctx,
+                    const SlotLoadView&   L,
+                    cudaStream_t          cs,
+                    CudaTimer&            timer,
+                    BatchTimings&         t);
 
     // -------------------------------------------------------------------------
-    // prepare_Sbus_batch — copy the row-slice + phantom-pad with base.d_Sbus.
+    // bind_slots — point the NrIterBuffers at this batch's per-slot data: the
+    // VoltageControl set-points a gen_v column drives (base's shared array
+    // otherwise). No masks, no per-slot slack weights in this sweep.
     // -------------------------------------------------------------------------
-    void prepare_Sbus_batch(BatchPfDriverContext& ctx,
-                            int                  chunk_idx,
-                            int                  actual_batch,
-                            cudaStream_t         cs,
-                            CudaTimer&           timer,
-                            BatchTimings&  t);
+    void bind_slots(NrIterBuffers& buf, const SlotTableView& /*T*/,
+                    const int* /*d_J_outer*/, cudaStream_t /*cs*/) const
+    {
+        gv_vset_.fill(buf);
+    }
 
     // -------------------------------------------------------------------------
     // d_Sbus_ptr  — returns the per-batch Sbus pointer.
@@ -159,20 +157,6 @@ struct InjectionBatch {
     // -------------------------------------------------------------------------
     int        n_active()     const { return n_scenarios_; }
     const int* d_result_map() const { return nullptr; }
-
-    // BatchSource concept: the injection sweep never masks buses (topology is
-    // fixed), so this is a no-op that leaves the NrIterBuffers mask fields at
-    // their off defaults.
-    void fill_mask_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/,
-                           const int* /*d_J_outer*/) const {}
-
-    // BatchSource concept: the injection sweep has no generator contingencies,
-    // so every slot keeps the shared base-case slack weights.
-    void fill_slack_w_buffers(NrIterBuffers& /*buf*/, int /*chunk_idx*/) const {}
-
-    // BatchSource concept: per-slot VoltageControl set-points driven by a
-    // gen_v column (see GenVsetSlots); base's shared array otherwise.
-    void fill_vc_vset_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const { gv_vset_.fill(buf); }
 
     // BatchSource concept: the injection sweep never trips branches (topology
     // is fixed) — compute_limit_violations is scoped to contingency analysis

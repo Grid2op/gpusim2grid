@@ -30,6 +30,7 @@ import numpy as np
 from . import (
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
+    SchedulingFacadeMixin,
     _ScenarioSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -54,7 +55,8 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
+class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
+                       SchedulingFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -98,6 +100,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     use_distributed_slack : bool, default True
         Selects which of the two slack formulations the GPU solves; see
         :class:`InjectionSweepGPU`.
+    scheduling, nb_iter_per_round, tol
+        Batch scheduling (chunked / continuous) and the convergence tolerance
+        of a row; see :class:`ContingencyAnalysisGPU`. A continuous run always
+        rebuilds its batch driver and refuses ``keep_final_jacobian``.
 
     Examples
     --------
@@ -140,7 +146,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
-                 reference_slack="auto"):
+                 reference_slack="auto", scheduling="chunked", nb_iter_per_round=1,
+                 tol=None):
         _validate_precision(precision)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
@@ -254,6 +261,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         self._last_residuals = None
 
         # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
         # set_injections_from_elements() inputs, kept so a later

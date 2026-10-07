@@ -10,6 +10,7 @@
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "scenario_sweep_session.hpp"        // ScenarioSweepSession
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
 #include "warmup.hpp"                        // warmup
@@ -885,6 +886,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "compute_physical_violations) — total across all chunks; zero unless enabled")
         .def_readonly("t_flow_computation", &BatchTimings::t_flow_computation,
                       "compute_branch_flows_kernel — total across all chunks (0 if no branch data)")
+        .def_readonly("t_schedule", &BatchTimings::t_schedule,
+                      "Continuous scheduling only: the scheduler's per-round host work (D->H of "
+                      "the slots' residuals, decisions, H->D of the eviction map / load list), wall")
+        .def_readonly("scheduling", &BatchTimings::scheduling,
+                      "BatchScheduling of the run: 0 = chunked, 1 = continuous")
+        .def_readonly("nb_iter_per_round", &BatchTimings::nb_iter_per_round,
+                      "Continuous scheduling: Newton iterations between two convergence checks (k)")
+        .def_readonly("n_rounds", &BatchTimings::n_rounds,
+                      "Continuous scheduling: rounds of nb_iter_per_round iterations run")
+        .def_readonly("occupancy", &BatchTimings::occupancy,
+                      "Continuous scheduling: useful row-iterations / (slots x iterations run)")
         // --- metadata ---
         .def_readonly("n_contingencies", &BatchTimings::n_contingencies,
                       "Total number of contingencies")
@@ -1020,6 +1032,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["gen_p_check"]       = entry_dict(t.t_gen_p_check);
             gpu_compute["gen_pv_release_check"] = entry_dict(t.t_gen_pv_release_check);
             gpu_compute["flow_computation"]  = entry_dict(t.t_flow_computation);
+            gpu_compute["schedule"]          = entry_dict(t.t_schedule);
 
             py::dict d2h;
             d2h["total"]                      = t.t_device_to_host_ms();
@@ -1341,6 +1354,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // Registered BEFORE bindings that use it as a default argument
   // (e.g. acpf_nr_gpu_injection's strategy_type kwarg).
   // -----------------------------------------------------------------
+  // BatchScheduling / RowStatus (contingency/row_status.hpp): the batch
+  // sessions' scheduling knob and the per-row outcome of a run.
+  pybind11::enum_<BatchScheduling>(m, "BatchScheduling")
+      .value("Chunked", BatchScheduling::Chunked,
+             "ceil(n_rows / batch_size) chunks, every row runs exactly nb_iter iterations.")
+      .value("Continuous", BatchScheduling::Continuous,
+             "batch_size slots; a row leaves as soon as it converged (residual < tol), "
+             "diverged or used its nb_iter budget, and its slot is refilled at once.");
+  pybind11::enum_<RowStatus>(m, "RowStatus")
+      .value("Converged",    RowStatus::Converged,    "||F||inf < tol")
+      .value("MaxIter",      RowStatus::MaxIter,      "nb_iter budget used, residual >= tol")
+      .value("Diverged",     RowStatus::Diverged,     "residual not finite")
+      .value("NotSimulated", RowStatus::NotSimulated, "dropped by the pre-check, never solved");
+
   pybind11::enum_<ContingencySolverType>(m, "ContingencySolverType")
       .value("DirectRefactorEvery",   ContingencySolverType::DirectRefactorEvery,
              "Fill J every iteration; FACTORIZE once globally, REFACTORIZE for all "
@@ -1544,6 +1571,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_contingencies * n_bus,) complex128.")
     .def("get_residuals",  &ContingencyAnalysisSession::get_residuals,
          "Copy per-contingency ||F||inf residuals to host: (n_contingencies,) float64.")
+    .def("get_row_iterations", &ContingencyAnalysisSession::get_row_iterations,
+         "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def("get_row_status", &ContingencyAnalysisSession::get_row_status,
+         "(n_rows,) int: RowStatus of each row in the last run().")
+    .def("overwrite_row_outcomes", &ContingencyAnalysisSession::overwrite_row_outcomes,
+         pybind11::arg("rows"), pybind11::arg("iterations"), pybind11::arg("status"),
+         "Overwrite the per-row outcome (iterations, RowStatus) of the given rows "
+         "(the reactive-limit outer loop's second pass). Requires run().")
     .def("overwrite_rows", &ContingencyAnalysisSession::overwrite_rows,
          pybind11::arg("dst_rows"), pybind11::arg("src_rows"),
          pybind11::arg("d_V_src"), pybind11::arg("d_res_src"),
@@ -1572,7 +1607,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readonly("used_batch_size", &ContingencyAnalysisSession::used_batch_size_,
                    "Batch size effectively used during the last run()")
     .def_readwrite("nb_iter",    &ContingencyAnalysisSession::nb_iter_,
-                   "Fixed NR iterations per chunk (takes effect on the next run())")
+                   "Chunked: NR iterations every row runs. Continuous: each row's iteration "
+                   "budget (takes effect on the next run())")
+    .def_readwrite("scheduling", &ContingencyAnalysisSession::scheduling_,
+                   "BatchScheduling (takes effect on the next run())")
+    .def_readwrite("nb_iter_per_round", &ContingencyAnalysisSession::nb_iter_per_round_,
+                   "Continuous scheduling: NR iterations between two convergence checks "
+                   "(takes effect on the next run())")
+    .def_readwrite("tol", &ContingencyAnalysisSession::tol_,
+                   "A row has converged when ||F||inf < tol: decides when it leaves "
+                   "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
     .def_readwrite("refactor_period", &ContingencyAnalysisSession::refactor_period_,
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &ContingencyAnalysisSession::strategy_type_,
@@ -1860,6 +1904,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_scenarios * n_bus,) complex128.")
     .def("get_residuals",  &InjectionSweepSession::get_residuals,
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
+    .def("get_row_iterations", &InjectionSweepSession::get_row_iterations,
+         "(n_scenarios,) int: Newton iterations each row ran in the last run().")
+    .def("get_row_status", &InjectionSweepSession::get_row_status,
+         "(n_scenarios,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &InjectionSweepSession::get_or_amps,
          "Copy origin-terminal ampere flows to host: (n_scenarios * n_branches,). "
          "Requires compute_flows().")
@@ -1879,7 +1927,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readonly("used_batch_size", &InjectionSweepSession::used_batch_size_,
                    "Batch size effectively used during the last run()")
     .def_readwrite("nb_iter",    &InjectionSweepSession::nb_iter_,
-                   "Fixed NR iterations per chunk (takes effect on the next run())")
+                   "Chunked: NR iterations every row runs. Continuous: each row's iteration "
+                   "budget (takes effect on the next run())")
+    .def_readwrite("scheduling", &InjectionSweepSession::scheduling_,
+                   "BatchScheduling (takes effect on the next run())")
+    .def_readwrite("nb_iter_per_round", &InjectionSweepSession::nb_iter_per_round_,
+                   "Continuous scheduling: NR iterations between two convergence checks "
+                   "(takes effect on the next run())")
+    .def_readwrite("tol", &InjectionSweepSession::tol_,
+                   "A row has converged when ||F||inf < tol: decides when it leaves "
+                   "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
     .def_readwrite("refactor_period", &InjectionSweepSession::refactor_period_,
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &InjectionSweepSession::strategy_type_,
@@ -2212,6 +2269,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_scenarios * n_bus,) complex128.")
     .def("get_residuals",  &ScenarioSweepSession::get_residuals,
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
+    .def("get_row_iterations", &ScenarioSweepSession::get_row_iterations,
+         "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def("get_row_status", &ScenarioSweepSession::get_row_status,
+         "(n_rows,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,
          "Copy origin-terminal ampere flows to host: (n_scenarios * n_branches,). "
          "Requires compute_flows().")
@@ -2235,7 +2296,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readonly("used_batch_size", &ScenarioSweepSession::used_batch_size_,
                    "Batch size effectively used during the last run()")
     .def_readwrite("nb_iter",    &ScenarioSweepSession::nb_iter_,
-                   "Fixed NR iterations per chunk (takes effect on the next run())")
+                   "Chunked: NR iterations every row runs. Continuous: each row's iteration "
+                   "budget (takes effect on the next run())")
+    .def_readwrite("scheduling", &ScenarioSweepSession::scheduling_,
+                   "BatchScheduling (takes effect on the next run())")
+    .def_readwrite("nb_iter_per_round", &ScenarioSweepSession::nb_iter_per_round_,
+                   "Continuous scheduling: NR iterations between two convergence checks "
+                   "(takes effect on the next run())")
+    .def_readwrite("tol", &ScenarioSweepSession::tol_,
+                   "A row has converged when ||F||inf < tol: decides when it leaves "
+                   "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
     .def_readwrite("refactor_period", &ScenarioSweepSession::refactor_period_,
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &ScenarioSweepSession::strategy_type_,

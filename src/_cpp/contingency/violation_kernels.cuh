@@ -130,6 +130,11 @@
 //                    per type (3K output slots per contingency)
 // d_result_map     : [n_active] active-slot -> original-index map, or nullptr
 //                    for identity (c_start + local_c directly)
+// d_slot_active    : [actual_batch] the active row each batch slot holds, -1 =
+//                    skip that slot (continuous batching: only the slots that
+//                    leave this round are checked), or nullptr for the chunk's
+//                    own c_start + local_c. Same meaning in the four physical
+//                    checks below.
 // d_out_*          : [n_contingencies * 3K] compact SoA output (see
 //                    ContingencyAnalysisSession::get_violation_*())
 // d_out_count      : [n_contingencies]; -1 = not simulated, else 0..3K
@@ -164,6 +169,7 @@ __global__ void check_limit_violations_kernel(
     int n_bus, int n_branches, int n_lines,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_side,
@@ -266,6 +272,7 @@ __global__ void check_bus_q_violations_kernel(
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_bus_id,
           int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
@@ -332,6 +339,7 @@ __global__ void check_hvdc_p_violations_kernel(
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_hvdc_id,
           int*             __restrict__ d_out_side,
           int*             __restrict__ d_out_type,
@@ -404,6 +412,7 @@ __global__ void check_gen_pv_release_violations_kernel(
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
           int*             __restrict__ d_out_el_type,
@@ -490,6 +499,7 @@ __global__ void check_gen_p_violations_kernel(
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_type,

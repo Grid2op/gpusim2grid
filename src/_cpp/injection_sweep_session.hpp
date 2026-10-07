@@ -43,7 +43,8 @@
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
-#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/physical_checks_data.hpp"
+#include "contingency/row_status.hpp"   // BatchScheduling, RowStatus  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 
 #include <memory>
 #include <vector>
@@ -77,6 +78,13 @@ struct InjectionSweepSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // row runs nb_iter_ iterations) or continuous (nb_iter_ is each row's
+    // budget, checked every nb_iter_per_round_ iterations against tol_).
+    // Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
@@ -292,6 +300,10 @@ struct InjectionSweepSession {
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_scenarios,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
 
     // =========================================================================
     // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data

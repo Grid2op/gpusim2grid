@@ -9,6 +9,7 @@
 #include "scenario_sweep_batch.cuh"
 #include "../batch_pf_driver.cuh"   // BatchPfDriverContext (complete type)
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -31,7 +32,6 @@ inline void _chk_cuda(cudaError_t e, const char* what) {
 // =============================================================================
 void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
 {
-    upload_h2d(d_flat_ctg_id,   h_flat_ctg_id_.data(),   h_flat_ctg_id_.size(),   cs);
     upload_h2d(d_flat_k,         h_flat_k_.data(),         h_flat_k_.size(),         cs);
     upload_h2d(d_flat_delta_re,  h_flat_delta_re_.data(),  h_flat_delta_re_.size(),  cs);
     upload_h2d(d_flat_delta_im,  h_flat_delta_im_.data(),  h_flat_delta_im_.size(),  cs);
@@ -47,8 +47,7 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     mask_.upload(cs);
 
     // per-slot |V| reseeds of the reactive-limit outer loop (only when any exist)
-    if (!h_vr_slot_.empty()) {
-        upload_h2d(d_vr_slot, h_vr_slot_.data(), h_vr_slot_.size(), cs);
+    if (!h_vr_bus_.empty()) {
         upload_h2d(d_vr_bus,  h_vr_bus_.data(),  h_vr_bus_.size(),  cs);
         upload_h2d(d_vr_vm,   h_vr_vm_.data(),   h_vr_vm_.size(),   cs);
     }
@@ -162,141 +161,98 @@ void ScenarioSweepBatch::set_gen_v_from_orig(const cuda_real_type* d_gen_v_orig,
 }
 
 // =============================================================================
-// prepare_Ybus_batch — verbatim ContingencyBatch::prepare_Ybus_batch.
+// load_slots — fill the listed slots with their rows (see the header's doc),
+// in the order the per-chunk preparation always used: V (+ warm start), Ybus,
+// patches, gen_v reseed + v_set, |V| reseeds, then Sbus, its correction and
+// the slack weights.
 // =============================================================================
-void ScenarioSweepBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
-                                            int                  chunk_idx,
-                                            int                  actual_batch,
-                                            cudaStream_t         cs,
-                                            CudaTimer&           timer,
-                                            BatchTimings&  t)
+void ScenarioSweepBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadView& L,
+                                    cudaStream_t cs, CudaTimer& timer, BatchTimings& t)
 {
-    // ①  Tile V
+    const int n_bus = ctx.n_bus;
+    const int S     = ctx.batch_size;
+
+    // ①  V: the row's own starting point (set_v_init_from_orig) when given,
+    //     else the base-case V; a phantom slot always the base case.
     timer.start();
-    launch_tile(ctx.d_V_batch,
-                thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
-                ctx.n_bus, ctx.batch_size, cs);
-    _chk_cuda(cudaGetLastError(), "tile V");
-    // ... or each row's own starting point (set_v_init_from_orig) over it
-    if (has_v_init_ && actual_batch > 0) {
-        const size_t row0 = static_cast<size_t>(chunk_idx) * ctx.batch_size;
-        _chk_cuda(cudaMemcpyAsync(ctx.d_V_batch,
-                                  thrust::raw_pointer_cast(d_V_init_all.data()) + row0 * ctx.n_bus,
-                                  static_cast<size_t>(actual_batch) * ctx.n_bus * sizeof(cudaComplexType),
-                                  cudaMemcpyDeviceToDevice, cs),
-                  "V init copy");
-    }
+    launch_gather_rows_to_slots(ctx.d_V_batch,
+                                has_v_init_ ? thrust::raw_pointer_cast(d_V_init_all.data())
+                                            : static_cast<const cudaComplexType*>(nullptr),
+                                thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
+                                L, n_bus, cs);
+    _chk_cuda(cudaGetLastError(), "V rows");
     t.t_tile_V += timer.stop_ms();
 
-    // ②  Tile Ybus values
+    // ②  base Ybus values
     timer.start();
-    launch_tile(ctx.d_Ybus_values_batch,
-                thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data()),
-                ctx.nnz_Y, ctx.batch_size, cs);
+    launch_gather_rows_to_slots(ctx.d_Ybus_values_batch, static_cast<const cudaComplexType*>(nullptr),
+                                thrust::raw_pointer_cast(ctx.base.d_Ybus_values.data()),
+                                L, ctx.nnz_Y, cs);
     _chk_cuda(cudaGetLastError(), "tile Ybus");
     t.t_tile_Ybus += timer.stop_ms();
 
-    // ③  Apply this chunk's contingency (branch-trip) patches
+    // ③  the loaded rows' contingency (branch-trip) patches
     timer.start();
-    {
-        const ChunkPatchRange& pr = chunk_ranges_[static_cast<size_t>(chunk_idx)];
-        if (pr.count > 0) {
-            apply_contingencies_kernel<<<(pr.count + BS - 1) / BS, BS, 0, cs>>>(
-                ctx.d_Ybus_values_batch,
-                thrust::raw_pointer_cast(d_flat_ctg_id.data())  + pr.start,
-                thrust::raw_pointer_cast(d_flat_k.data())        + pr.start,
-                thrust::raw_pointer_cast(d_flat_delta_re.data()) + pr.start,
-                thrust::raw_pointer_cast(d_flat_delta_im.data()) + pr.start,
-                ctx.nnz_Y, pr.count);
-        }
+    patch_gather_.plan(patch_seg_, L.h_slot, L.h_row, L.n, cs);
+    if (patch_gather_.total > 0) {
+        patch_gather_.gather(b_flat_k, d_flat_k, cs);
+        patch_gather_.gather(b_flat_delta_re, d_flat_delta_re, cs);
+        patch_gather_.gather(b_flat_delta_im, d_flat_delta_im, cs);
+        apply_contingencies_kernel<<<(patch_gather_.total + BS - 1) / BS, BS, 0, cs>>>(
+            ctx.d_Ybus_values_batch,
+            patch_gather_.out_slot(),
+            thrust::raw_pointer_cast(b_flat_k.data()),
+            thrust::raw_pointer_cast(b_flat_delta_re.data()),
+            thrust::raw_pointer_cast(b_flat_delta_im.data()),
+            ctx.nnz_Y, patch_gather_.total);
     }
     t.t_patch_Ybus += timer.stop_ms();
 
-    // ④  Re-seed generator target voltages (set_gen_v()), if configured.
-    //     Rows here are already in active-slot order (see the ctor), so the
-    //     row offset is a plain chunk*batch_size slice, same as ③ above.
+    // ④  Re-seed generator target voltages (set_gen_v()), if configured: the
+    //     loaded rows' columns (active-slot order already, see the ctor) into
+    //     a per-slot scratch that is NaN on every other slot, so the reseed
+    //     (NaN = leave alone) touches the loaded slots only.
     if (gen_v_override_.k_active() > 0) {
         const int k = gen_v_override_.k_active();
-        const int row_offset = chunk_idx * ctx.batch_size;
-        apply_gen_v_kernel<<<nr_grid_size((long long)actual_batch * k, BS), BS, 0, cs>>>(
-            ctx.d_V_batch,
-            thrust::raw_pointer_cast(d_gv_all.data()),
+        if (d_gv_slots.size() < static_cast<size_t>(S) * k)
+            d_gv_slots.resize(static_cast<size_t>(S) * k);
+        cuda_real_type* d_gv = thrust::raw_pointer_cast(d_gv_slots.data());
+        launch_fill_value(d_gv, std::numeric_limits<cuda_real_type>::quiet_NaN(),
+                          static_cast<ptrdiff_t>(S) * k, cs);
+        launch_gather_rows_to_slots(d_gv, thrust::raw_pointer_cast(d_gv_all.data()),
+                                    static_cast<const cuda_real_type*>(nullptr), L, k, cs);
+        apply_gen_v_kernel<<<nr_grid_size((long long)S * k, BS), BS, 0, cs>>>(
+            ctx.d_V_batch, d_gv,
             thrust::raw_pointer_cast(d_gv_active_bus.data()),
-            row_offset, k, actual_batch, ctx.n_bus);
+            /*row_offset=*/0, k, S, n_bus);
         // ⑤  ... and the VoltageControl set-points those columns drive.
-        gv_vset_.prepare(thrust::raw_pointer_cast(ctx.base.d_vc_vset.data()),
-                         ctx.base.n_vc_grp,
-                         thrust::raw_pointer_cast(d_gv_all.data()), k,
-                         row_offset, actual_batch, ctx.batch_size, cs);
+        gv_vset_.size_for(S, ctx.base.n_vc_grp);
+        gv_vset_.load(thrust::raw_pointer_cast(ctx.base.d_vc_vset.data()), d_gv, k, L, S, cs);
     }
 
     // ⑥  |V| of the buses the reactive-limit outer loop holds PV again on a
     //     row (their Q row is pinned, so this value stays put).
-    if (chunk_idx < static_cast<int>(vr_ranges_.size())) {
-        const ChunkPatchRange& vr = vr_ranges_[static_cast<size_t>(chunk_idx)];
-        if (vr.count > 0) {
-            apply_vm_reseed_kernel<<<(vr.count + BS - 1) / BS, BS, 0, cs>>>(
-                ctx.d_V_batch,
-                thrust::raw_pointer_cast(d_vr_slot.data()) + vr.start,
-                thrust::raw_pointer_cast(d_vr_bus.data())  + vr.start,
-                thrust::raw_pointer_cast(d_vr_vm.data())   + vr.start,
-                vr.count, ctx.n_bus);
-            _chk_cuda(cudaGetLastError(), "vm reseed");
-        }
+    vr_gather_.plan(vr_seg_, L.h_slot, L.h_row, L.n, cs);
+    if (vr_gather_.total > 0) {
+        vr_gather_.gather(b_vr_bus, d_vr_bus, cs);
+        vr_gather_.gather(b_vr_vm, d_vr_vm, cs);
+        apply_vm_reseed_kernel<<<(vr_gather_.total + BS - 1) / BS, BS, 0, cs>>>(
+            ctx.d_V_batch, vr_gather_.out_slot(),
+            thrust::raw_pointer_cast(b_vr_bus.data()),
+            thrust::raw_pointer_cast(b_vr_vm.data()),
+            vr_gather_.total, n_bus);
+        _chk_cuda(cudaGetLastError(), "vm reseed");
     }
-}
 
-// =============================================================================
-// prepare_Sbus_batch — verbatim InjectionBatch::prepare_Sbus_batch, operating
-// on d_Sbus_all in whatever row order it holds (active-slot order here).
-// =============================================================================
-void ScenarioSweepBatch::prepare_Sbus_batch(BatchPfDriverContext& ctx,
-                                            int                  chunk_idx,
-                                            int                  actual_batch,
-                                            cudaStream_t         cs,
-                                            CudaTimer&           timer,
-                                            BatchTimings&        t)
-{
-    const int n_bus     = ctx.n_bus;
-    const int c_start   = chunk_idx * ctx.batch_size;
-
+    // ⑦  Sbus rows (base for a phantom slot), the redistribute_slack
+    //     correction on top, and the per-row slack weights.
     timer.start();
-
-    if (actual_batch > 0) {
-        const cudaComplexType* const src =
-            thrust::raw_pointer_cast(d_Sbus_all.data())
-            + static_cast<ptrdiff_t>(c_start) * n_bus;
-        cudaComplexType* const dst =
-            thrust::raw_pointer_cast(d_Sbus_batch.data());
-        const size_t nbytes =
-            static_cast<size_t>(actual_batch) * n_bus * sizeof(cudaComplexType);
-        _chk_cuda(cudaMemcpyAsync(dst, src, nbytes,
-                                   cudaMemcpyDeviceToDevice, cs),
-                  "Sbus row-slice copy");
-    }
-
-    if (actual_batch < ctx.batch_size) {
-        const cudaComplexType* const src_base =
-            thrust::raw_pointer_cast(ctx.base.d_Sbus.data());
-        const size_t row_bytes =
-            static_cast<size_t>(n_bus) * sizeof(cudaComplexType);
-        for (int b = actual_batch; b < ctx.batch_size; ++b) {
-            cudaComplexType* const dst =
-                thrust::raw_pointer_cast(d_Sbus_batch.data())
-                + static_cast<ptrdiff_t>(b) * n_bus;
-            _chk_cuda(cudaMemcpyAsync(dst, src_base, row_bytes,
-                                       cudaMemcpyDeviceToDevice, cs),
-                      "Sbus phantom pad");
-        }
-    }
-
-    // The redistribute_slack Sbus correction of this chunk's rows, on top.
-    slack_.apply_dp(thrust::raw_pointer_cast(d_Sbus_batch.data()), chunk_idx, n_bus, cs);
-
-    // Per-row slack weights: same row-slice + phantom-pad as Sbus above, the
-    // phantom slots taking base's shared weights.
-    slack_.prepare_weights(chunk_idx, actual_batch, ctx.batch_size,
-                           thrust::raw_pointer_cast(ctx.base.d_slack_w.data()), cs);
-
+    launch_gather_rows_to_slots(thrust::raw_pointer_cast(d_Sbus_batch.data()),
+                                thrust::raw_pointer_cast(d_Sbus_all.data()),
+                                thrust::raw_pointer_cast(ctx.base.d_Sbus.data()),
+                                L, n_bus, cs);
+    _chk_cuda(cudaGetLastError(), "Sbus rows");
+    slack_.apply_dp(thrust::raw_pointer_cast(d_Sbus_batch.data()), L, n_bus, cs);
+    slack_.load_weights(L, thrust::raw_pointer_cast(ctx.base.d_slack_w.data()), cs);
     t.t_tile_Sbus += timer.stop_ms();
 }

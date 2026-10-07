@@ -100,7 +100,8 @@ __global__ void compute_branch_flows_kernel(
     int n_branches,
     int c_start,
     int actual_batch,
-    const int* __restrict__ d_result_map)
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active)
 {
     // tid/b widened to ptrdiff_t: see fill_J_kernel's own note. Here
     // actual_batch * n_branches (this launch's thread count) and b * n_bus /
@@ -109,6 +110,8 @@ __global__ void compute_branch_flows_kernel(
     const ptrdiff_t b   = tid / n_branches;   // contingency index in batch
     const int        l  = static_cast<int>(tid % n_branches);   // branch index
     if (b >= actual_batch) return;
+    const int a = d_slot_active ? d_slot_active[b] : static_cast<int>(c_start + b);
+    if (a < 0) return;
 
     // branch_from/branch_to are in AC-solver bus numbering (see
     // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
@@ -137,7 +140,7 @@ __global__ void compute_branch_flows_kernel(
     // d_result_map is null, e.g. the full-batch session call or injection).
     // out_c itself (a contingency index < n_contingencies) fits int32; only
     // out_c * n_branches (the flat offset) needs the 64-bit product.
-    const int out_c   = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
+    const int out_c   = d_result_map ? d_result_map[a] : a;
     const ptrdiff_t out_idx = static_cast<ptrdiff_t>(out_c) * n_branches + l;
     d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
     d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
@@ -157,7 +160,8 @@ __global__ void scatter_V_results_kernel(
     const int*             __restrict__ d_result_map,
     int c_start,
     int n_bus,
-    int actual_batch)
+    int actual_batch,
+    const int*             __restrict__ d_slot_active)
 {
     // tid/total/local_c widened to ptrdiff_t -- actual_batch * n_bus (this
     // launch's thread count) and local_c/out_c * n_bus (the offsets below)
@@ -168,7 +172,9 @@ __global__ void scatter_V_results_kernel(
 
     const ptrdiff_t local_c = tid / n_bus;   // active-slot index in this chunk
     const int       bus     = static_cast<int>(tid % n_bus);
-    const int out_c   = d_result_map[c_start + local_c];   // original index
+    const int a = d_slot_active ? d_slot_active[local_c] : static_cast<int>(c_start + local_c);
+    if (a < 0) return;
+    const int out_c = d_result_map ? d_result_map[a] : a;   // original index
     d_V_results[static_cast<ptrdiff_t>(out_c) * n_bus + bus] = d_V_batch[local_c * n_bus + bus];
 }
 
@@ -251,11 +257,15 @@ __global__ void mask_V_nan_kernel(
     const int*             __restrict__ d_maskv_bus,
     cuda_real_type nan_val,
     int n_bus,
-    int n_entries)
+    int n_entries,
+    const int*             __restrict__ d_slot_active)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_entries) return;
     const int slot = d_maskv_slot[tid];
+    // continuous batching: only the slots leaving this round (a slot that
+    // stays keeps iterating on its masked buses' finite values)
+    if (d_slot_active && d_slot_active[slot] < 0) return;
     const int bus  = d_maskv_bus[tid];
     d_V[static_cast<ptrdiff_t>(slot) * n_bus + bus] =
         CudaFunHelper::my_make_cuComplex(nan_val, nan_val);
@@ -1024,7 +1034,8 @@ __global__ void compute_residuals_kernel(
     int dim_J,
     int actual_batch,
     int c_start,
-    const int* __restrict__ d_result_map)
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active)
 {
     // One block handles one contingency. b widened to ptrdiff_t: blockIdx.x
     // itself is a valid small block index, but b * dim_J below is the same
@@ -1032,6 +1043,10 @@ __global__ void compute_residuals_kernel(
     // dim_J grows large.
     const ptrdiff_t b = blockIdx.x;
     if (b >= actual_batch) return;
+    // The slot's active row (d_slot_active, -1 = skip: the whole block returns)
+    // or the chunk's c_start + b.
+    const int a = d_slot_active ? d_slot_active[b] : static_cast<int>(c_start + b);
+    if (a < 0) return;
 
     extern __shared__ cuda_real_type sdata[];
 
@@ -1063,7 +1078,7 @@ __global__ void compute_residuals_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const int out = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
+        const int out = d_result_map ? d_result_map[a] : a;
         d_residuals[out] = sdata[0];
     }
 }

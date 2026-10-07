@@ -95,6 +95,7 @@ ScenarioSweepDriverConfig ScenarioSweepSession::_current_config() const
     c.mask_mode                  = handle_disconnected_grid_;
     c.fixed_batch_capacity       = fixed_batch_capacity_;
     c.base_state_generation      = base_state_generation_;
+    c.scheduling                 = scheduling_;
     return c;
 }
 
@@ -1119,6 +1120,16 @@ void ScenarioSweepSession::run()
             "base-case factors). Use 'direct_refactor_every' (default), "
             "'direct_iter0_only', or 'direct_refactor_every_n'.");
 
+    const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    if (continuous) {   // before any allocation / cuDSS ANALYSIS
+        check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+        if (keep_final_jacobian_)
+            throw std::invalid_argument(
+                "ScenarioSweepSession: scheduling='continuous' does not support "
+                "keep_final_jacobian (the batched adjoint needs every row's final "
+                "Jacobian in one chunk)");
+    }
+
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
         throw std::runtime_error(
             "ScenarioSweepSession: set_contingency_gens()'s row count no longer "
@@ -1220,7 +1231,9 @@ void ScenarioSweepSession::run()
     // (get_disconnected(), n_disconnected, get_row_stranded_vc_groups()).
     // -------------------------------------------------------------------------
     const ScenarioSweepDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_;
+    // The continuous schedule always rebuilds its driver (its warm / hot reuse
+    // is a later step, docs/dev_notes/continuous_batching.md A.6).
+    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
     const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_ || switches_dirty_);
 
     if (cold || warm) {
@@ -1323,7 +1336,9 @@ void ScenarioSweepSession::run()
             handle_disconnected_grid_,
             GenVOverride{},
             /*forced_batch_size=*/fixed_batch_capacity_ ? batch_size_ : 0);
-        used_batch_size_ = source.used_batch_size();
+        // Continuous: batch_size_ slots, never more than the simulated rows.
+        used_batch_size_ = continuous ? std::max(1, std::min(batch_size_, source.n_active()))
+                                      : source.used_batch_size();
 
         // New driver: allocation, block-diagonal structure, cuDSS ANALYSIS.
         solver_ = std::make_unique<ScenarioSweepSolver>(
@@ -1339,7 +1354,10 @@ void ScenarioSweepSession::run()
             pivot_epsilon_alg_,
             scaling_max_voltage_change_,
             max_dVa_,
-            max_dVm_);
+            max_dVm_,
+            scheduling_,
+            nb_iter_per_round_,
+            tol_);
         driver_cfg_ = cfg;
         ++driver_build_counter_;
         ++source_build_counter_;
@@ -1443,6 +1461,8 @@ void ScenarioSweepSession::run()
     // Per-run knobs that need no rebuild.
     solver_->nb_iter_             = nb_iter_;
     solver_->keep_final_jacobian_ = keep_final_jacobian_;
+    solver_->nb_iter_per_round_   = nb_iter_per_round_;
+    solver_->tol_                 = tol_;
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop
@@ -1785,6 +1805,20 @@ CplxVect ScenarioSweepSession::get_V_results() const
             static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_row_iterations() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_iterations();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+Eigen::VectorXi ScenarioSweepSession::get_row_status() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_status();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
 }
 
 RealVect ScenarioSweepSession::get_residuals() const

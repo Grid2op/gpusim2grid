@@ -30,6 +30,52 @@ callers without a lightsim2grid grid.
 
 .. autofunction:: gpusim2grid.optimize_reference_slack
 
+Batch scheduling
+~~~~~~~~~~~~~~~~
+
+The three batch facades (``ContingencyAnalysisGPU``, ``InjectionSweepGPU``,
+``ScenarioSweepGPU``) take ``scheduling="chunked"`` (the default) or
+``"continuous"``, a mutable setting like ``nb_iter``:
+
+- **chunked**: the rows go through the GPU in ``ceil(n_rows / batch_size)``
+  chunks, and every row runs exactly ``nb_iter`` Newton iterations. ``nb_iter``
+  must cover the hardest row, and the others pay for it.
+- **continuous**: ``batch_size`` slots. Every ``nb_iter_per_round``
+  iterations (default 1: a check is cheap next to a refactorization) each
+  row is checked, and one that converged
+  (``||F||inf < tol``), diverged or used its ``nb_iter`` budget leaves at
+  once -- its voltages, residual and violation records written -- and its slot
+  is refilled from the queue. A row pays the iterations it needs; it runs a
+  multiple of ``nb_iter_per_round``, at least one round.
+
+``tol`` (default 1e-8, 1e-3 in an FP32 build) is per unit, like
+``last_residuals()``; lightsim2grid takes its ``tol`` in MVA
+(``||F||inf < tol / sn_mva``). Both schedules report each row's outcome:
+``get_row_status()`` (:class:`gpusim2grid.RowStatus`: ``CONVERGED``,
+``MAX_ITER``, ``DIVERGED``, ``NOT_SIMULATED``) and ``get_row_iterations()``.
+The run's ``timings`` add ``n_rounds``, ``occupancy`` (useful row-iterations /
+slots x iterations run) and ``t_schedule`` (the scheduler's host work).
+
+The continuous schedule refuses the ``'direct_iter0_only'`` and
+``'direct_refactor_every_n'`` strategies, cuDSS's non-uniform batch modes and
+the batched adjoint (``keep_final_jacobian``, hence ``BatchPowerFlow``), and a
+``ScenarioSweepGPU`` in that mode rebuilds its batch driver on every
+``compute()``. With ``reactive_limits_outer_loop`` the second pass runs with
+the analysis' scheduling, and no row is ``LEFT_OUT``.
+
+.. code-block:: python
+
+    ca = ContingencyAnalysisGPU(grid, nb_iter=8, scheduling="continuous",
+                                nb_iter_per_round=1)
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_branches)])
+    ca.compute(batch_size=512)
+    ca.get_row_status()        # RowStatus per contingency
+    ca.get_row_iterations()    # Newton iterations each one ran
+    ca.timings.occupancy
+
+.. autoclass:: gpusim2grid.RowStatus
+   :members:
+
 Contingency analysis
 --------------------
 
@@ -322,7 +368,7 @@ paths:
 
 The result buffer behind ``v_results_dlpack()`` is overwritten in place by a
 warm or hot call and freed (reallocated) by a cold one — clone the tensor for
-a snapshot either way.
+a snapshot either way. With ``scheduling="continuous"`` every call is cold.
 
 For the differentiable layer (:class:`~gpusim2grid.differentiable.BatchPowerFlow`)
 the same table applies to its forward, with one addition when gradients are

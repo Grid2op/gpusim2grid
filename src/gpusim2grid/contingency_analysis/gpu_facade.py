@@ -16,6 +16,7 @@ from . import (
     _ContingencyAnalysisSolver,
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
+    SchedulingFacadeMixin,
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
@@ -91,7 +92,8 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
     return ref
 
 
-class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
+class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
+                             SchedulingFacadeMixin):
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -242,6 +244,29 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         Newton iterations of the second pass; None = :attr:`nb_iter`. With
         the warm start, fewer usually suffice; a row that does not converge
         is ``DIVERGED`` and keeps its first pass. Mutable.
+    scheduling : {"chunked", "continuous"}, default "chunked"
+        How the rows go through the batch. ``"chunked"``: ``ceil(n_rows /
+        batch_size)`` chunks, every row runs exactly ``nb_iter`` Newton
+        iterations. ``"continuous"``: ``batch_size`` slots; every
+        ``nb_iter_per_round`` iterations each row is checked, and one that
+        converged (``||F||inf < tol``), diverged or used its ``nb_iter``
+        budget leaves at once, its slot refilled from the queue -- a row pays
+        the iterations it needs, not the hardest row's. ``nb_iter`` is then
+        each row's budget (a row runs a multiple of ``nb_iter_per_round``, at
+        least one round). Continuous refuses the ``'direct_iter0_only'`` /
+        ``'direct_refactor_every_n'`` strategies. Mutable.
+    nb_iter_per_round : int, default 1
+        Continuous scheduling: iterations between two convergence checks. A
+        check (one SpMV + mismatch) is cheap next to a refactorization, so 1
+        is usually fastest: on case6515rte N-1, 1 / 2 / 4 took 6.7 / 8.6 /
+        9.2 s. Mutable.
+    tol : float or None, default None
+        A row has converged when ``||F||inf < tol``, per unit like
+        :meth:`last_residuals`: when it leaves (continuous) and its
+        :class:`RowStatus` (both schedules, :meth:`get_row_status`).
+        lightsim2grid compares the same way but takes its ``tol`` in MVA
+        (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
+        build). Mutable.
 
     Examples
     --------
@@ -272,7 +297,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                  compute_physical_violations=False, redistribute_slack=False,
                  reference_slack="auto", reactive_limits_outer_loop=False,
                  outer_loop_min_last_chunk=250, outer_loop_warm_start=True,
-                 outer_loop_nb_iter=None):
+                 outer_loop_nb_iter=None, scheduling="chunked", nb_iter_per_round=1,
+                 tol=None):
         _validate_precision(precision)
         # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
         # built (lazily) from the same grid with the same construction options
@@ -418,6 +444,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         # Post-solve physical checks (compute_physical_violations: bus reactive
         # capability + hvdc droop saturation): the bus-Q plan is pulled off the
         # grid here when there is one -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
         # OLF-style bounded slack redistribution of the island a contingency
@@ -633,6 +662,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         dst.nb_iter = src.nb_iter if self._outer_loop_nb_iter is None else self._outer_loop_nb_iter
         dst.strategy = src.strategy
         dst.refactor_period = src.refactor_period
+        dst.nb_iter_per_round = src.nb_iter_per_round
+        dst.tol = src.tol
+        dst.scheduling = src.scheduling
         dst.handle_disconnected_grid = src.handle_disconnected_grid
         if src.compute_limit_violations and not dst.compute_limit_violations:
             sweep.set_limits_from_grid()
@@ -667,7 +699,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         status, switches = plan_switches(ctx, sess.get_bus_q_violations(),
                                          sess.get_gen_pv_release_violations(), conv)
         cand = [r for r, sw in enumerate(switches) if sw is not None]
-        run_rows, left = batch_rule(cand, batch_size, self._outer_loop_min_last_chunk)
+        if self.scheduling == "continuous":
+            # no chunk, so no last partial chunk to leave out: every row re-solved
+            run_rows, left = cand, []
+        else:
+            run_rows, left = batch_rule(cand, batch_size, self._outer_loop_min_last_chunk)
         status[left] = int(ReactiveLimitsStatus.LEFT_OUT)
         out = {"status": status, "n_rows": len(run_rows), "timings": None, "switches": switches,
                "viol": {}, "viol_trunc": {}, "viol_counts": {}, "phys": {}, "phys_trunc": {}}
@@ -685,6 +721,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             status[dst] = int(ReactiveLimitsStatus.RECOMPUTED)
             s2 = sweep.solver._s
             sess.overwrite_rows(dst, [int(i) for i in ok], s2.v_results_ptr(), s2.residuals_ptr())
+            # ... and their outcome: the second pass' iterations and status
+            sess.overwrite_row_outcomes(dst, [int(v) for v in np.asarray(s2.get_row_iterations())[ok]],
+                                        [int(v) for v in np.asarray(s2.get_row_status())[ok]])
             phys = sweep.get_physical_violations()
             phys_tr = sweep.get_physical_violations_truncated()
             viol = sweep.get_violations() if sweep.solver.compute_limit_violations else None
