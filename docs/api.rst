@@ -176,7 +176,7 @@ bounded per-row record buffer, and keep their records apart from
 ``get_violations()``. A row that was never simulated or did not converge has
 an **empty** entry (no sentinel), exactly as lightsim2grid reports it.
 
-Today the category holds two checks:
+Today the category holds five checks:
 
 - **Per-bus reactive capability** (lightsim2grid's own): for every bus whose
   voltage is held by a machine (a voltage-regulating generator, an HVDC
@@ -189,6 +189,23 @@ Today the category holds two checks:
   else is needed; in explicit-array mode hand it in with
   :meth:`~gpusim2grid.ContingencyAnalysisGPU.set_bus_q_capability`. Note that
   ``element_id`` is the *solver* bus id, like every other gpusim2grid record.
+- **PQ → PV release** (lightsim2grid's ``GenPvReleaseCheck``): a generator an
+  outer loop left pinned at a reactive limit (flagged with lightsim2grid's
+  ``LSGrid.set_gen_can_be_pv``, ``init_from_pypowsybl``'s ``can_be_pv``) whose
+  regulated bus is still below (at its minimum Q) or above (at its maximum Q)
+  the target it would hold would regulate again —
+  ``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q`` on the ``GENERATOR``,
+  ``value`` the regulated voltage and ``limit`` the target, in kV. The same
+  for an SVC or a VSC station frozen at a reactive limit
+  (``LSGrid.set_svc_can_be_pv``), reported on its own element. In
+  explicit-array mode, hand the candidates in with
+  :meth:`~gpusim2grid.ContingencyAnalysisGPU.set_gen_pv_release_capability`.
+- **SVC standby automaton** (lightsim2grid's ``SvcStandbyCheck``,
+  OpenLoadFlow's ``MonitoringVoltageOuterLoop``): an idle SVC flagged as
+  carrying a standby automaton (``LSGrid.set_svc_standby``) whose regulated
+  bus left the automaton's thresholds would be switched to voltage control —
+  ``LOW_VOLTAGE_SVC_STANDBY`` / ``HIGH_VOLTAGE_SVC_STANDBY`` on the ``SVC``,
+  ``value`` / ``limit`` in kV.
 - **HVDC droop ("AC emulation") P saturation** (OpenLoadFlow's
   ``HvdcAcEmulationLimits``): a droop line in linear regime whose angle-driven
   flow leaves the AC bus above ``pmax`` in the direction it flows —
@@ -196,8 +213,21 @@ Today the category holds two checks:
   1→2) or 2 (2→1), ``value`` / ``limit`` in MW. A line already saturated is
   pinned at ``pmax`` by construction and is not checked.
 
+- **Active power of the distributed slack** (lightsim2grid's ``GenPCheck``,
+  OpenLoadFlow's ``DistributedSlack`` outer loop): the slack is solved inside
+  the Jacobian by participation factors that know nothing about limits, so a
+  participating generator's or storage unit's converged active power (its
+  target plus its share of the imbalance) can leave ``[min_p_mw, max_p_mw]`` —
+  ``LOW_P`` / ``HIGH_P`` on the ``GENERATOR`` or ``STORAGE``, ``value`` /
+  ``limit`` in MW (generator convention for both families). Generators and
+  storage units are checked together, since a machine's share is a fraction of
+  its whole bus' participation. In explicit-array mode, hand the limits in with
+  :meth:`~gpusim2grid.ContingencyAnalysisGPU.set_gen_p_capability` (unset:
+  nothing is checked).
+
 ``physical_violation_tol_mva`` (1e-4 by default) is the slack on every
-comparison, MVAr or MW.
+MVAr / MW comparison, ``physical_violation_tol_vm_pu`` on the voltage ones
+(the release and standby checks).
 
 .. code-block:: python
 

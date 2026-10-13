@@ -442,6 +442,22 @@ int choose_reference_bus(
     int                                                           forced);
 
 // ---------------------------------------------------------------------------
+// choose_reference_bus_from_ledger
+//
+// The automatic reference slack of the CA / SS sessions: choose_reference_bus
+// over the ledger's distributed-slack participants (a non-zero weight and a P
+// row), `fallback` (the grid's own reference) when it picks none. The single
+// definition of the candidate rule, so both sessions always agree.
+// ---------------------------------------------------------------------------
+struct LedgerData;
+int choose_reference_bus_from_ledger(
+    const std::vector<Contingency>&                               contingencies,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
+    const LedgerData&                                             ledger,
+    int                                                           forced,
+    int                                                           fallback);
+
+// ---------------------------------------------------------------------------
 // build_mask_entries  (handle_disconnected_grid mode + PV pins)
 //
 // Converts the per-contingency masked_buses / stranded_groups / pinned_buses

@@ -126,6 +126,7 @@ void InjectionSweepSession::set_gen_v(
     gen_v_     = gen_v;
     gen_bus_   = gen_bus;
     has_gen_v_ = true;
+    gen_v_dirty_ = true;
 }
 
 // =============================================================================
@@ -156,6 +157,24 @@ void InjectionSweepSession::set_injections(
     sn_mva_        = sn_mva;
     n_scenarios_   = static_cast<int>(p_mw.rows());
     has_injections_ = true;
+    injections_dirty_ = true;
+}
+
+BatchDriverConfig InjectionSweepSession::_current_config() const
+{
+    BatchDriverConfig c;
+    c.n_scenarios                = n_scenarios_;
+    c.batch_size                 = batch_size_;
+    c.refactor_period            = refactor_period_;
+    c.strategy                   = strategy_type_;
+    c.reordering_alg             = reordering_alg_;
+    c.matching_alg               = matching_alg_;
+    c.pivot_epsilon_alg          = pivot_epsilon_alg_;
+    c.scaling_max_voltage_change = scaling_max_voltage_change_;
+    c.max_dVa                    = max_dVa_;
+    c.max_dVm                    = max_dVm_;
+    c.scheduling                 = scheduling_;
+    return c;
 }
 
 // =============================================================================
@@ -178,59 +197,93 @@ void InjectionSweepSession::run()
     if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
 
-    // Effective per-chunk batch size: balance the last chunk (same rule as
-    // run_injection_sweep_gpu / run_contingency_analysis_gpu). Continuous:
-    // batch_size_ slots, never more than the rows.
-    if (continuous) {
-        used_batch_size_ = std::max(1, std::min(batch_size_, n_scenarios_));
-    } else {
-        const size_t n_elem   = static_cast<size_t>(n_scenarios_);
-        const size_t max_bs   = static_cast<size_t>(batch_size_);
-        const size_t n_chunks = (n_elem + max_bs - 1) / max_bs;
-        used_batch_size_ = static_cast<int>(
-            n_chunks > 0 ? (n_elem + n_chunks - 1) / n_chunks : n_elem);
+    // Hot run: same settings and row count as the live driver -- keep it
+    // (allocations, cuDSS ANALYSIS, the policy's factorization state); new
+    // injections / gen_v, if any, go into its live source. Otherwise build a
+    // new one, as the first run() does. The continuous schedule always
+    // rebuilds (its reuse is a later step, docs/dev_notes/continuous_batching.md
+    // A.6).
+    const BatchDriverConfig cfg = _current_config();
+    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
+    const bool new_rows = cold || injections_dirty_ || gen_v_dirty_;
+
+    std::vector<cudaComplexType> h_Sbus_all;
+    GenVOverride gen_v_override;
+    t_sbus_build_ms_ = 0.;
+    if (new_rows) {
+        // Host-side per-unit complex Sbus_all ((n_scenarios × n_bus) row-major).
+        auto t_sbus_start = std::chrono::steady_clock::now();
+        h_Sbus_all.resize(static_cast<size_t>(n_scenarios_) * static_cast<size_t>(n_bus));
+        const double inv_sn = 1.0 / sn_mva_;
+        for (int s = 0; s < n_scenarios_; ++s) {
+            for (int b = 0; b < n_bus; ++b) {
+                h_Sbus_all[static_cast<size_t>(s) * n_bus + b] =
+                    CudaFunHelper::my_make_cuComplex(
+                        static_cast<cuda_real_type>(p_mw_(s, b)   * inv_sn),
+                        static_cast<cuda_real_type>(q_mvar_(s, b) * inv_sn));
+            }
+        }
+        if (has_gen_v_)
+            gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+        t_sbus_build_ms_ = ms_since(t_sbus_start);
     }
 
-    // Build host-side per-unit complex Sbus_all ((n_scenarios × n_bus) row-major).
-    auto t_sbus_start = std::chrono::steady_clock::now();
-    std::vector<cudaComplexType> h_Sbus_all(
-        static_cast<size_t>(n_scenarios_) * static_cast<size_t>(n_bus));
-    const double inv_sn = 1.0 / sn_mva_;
-    for (int s = 0; s < n_scenarios_; ++s) {
-        for (int b = 0; b < n_bus; ++b) {
-            h_Sbus_all[static_cast<size_t>(s) * n_bus + b] =
-                CudaFunHelper::my_make_cuComplex(
-                    static_cast<cuda_real_type>(p_mw_(s, b)   * inv_sn),
-                    static_cast<cuda_real_type>(q_mvar_(s, b) * inv_sn));
+    double t_rows_upload_ms = 0.;
+    if (cold) {
+        // Effective per-chunk batch size: balance the last chunk (same rule as
+        // run_injection_sweep_gpu / run_contingency_analysis_gpu). Continuous:
+        // batch_size_ slots, never more than the rows.
+        if (continuous) {
+            used_batch_size_ = std::max(1, std::min(batch_size_, n_scenarios_));
+        } else {
+            const size_t n_elem   = static_cast<size_t>(n_scenarios_);
+            const size_t max_bs   = static_cast<size_t>(batch_size_);
+            const size_t n_chunks = (n_elem + max_bs - 1) / max_bs;
+            used_batch_size_ = static_cast<int>(
+                n_chunks > 0 ? (n_elem + n_chunks - 1) / n_chunks : n_elem);
+        }
+
+        InjectionBatch source(std::move(h_Sbus_all), n_scenarios_, t_sbus_build_ms_,
+                              std::move(gen_v_override));
+
+        // New driver: allocation, cuDSS ANALYSIS. Free the old one first so
+        // the two never coexist on the device.
+        solver_.reset();
+        solver_ = std::make_unique<InjectionSweepSolver>(
+            *base_state_,
+            std::move(source),
+            n_scenarios_,
+            used_batch_size_,
+            nb_iter_,
+            strategy_type_,
+            refactor_period_,
+            reordering_alg_,
+            matching_alg_,
+            pivot_epsilon_alg_,
+            scaling_max_voltage_change_,
+            max_dVa_,
+            max_dVm_,
+            scheduling_,
+            nb_iter_per_round_,
+            tol_);
+        driver_cfg_ = cfg;
+        ++driver_build_counter_;
+    } else {
+        solver_->mark_reused(/*hot=*/true);
+        if (new_rows) {
+            auto t_up = std::chrono::steady_clock::now();
+            solver_->source_.set_rows(std::move(h_Sbus_all), std::move(gen_v_override),
+                                      static_cast<cudaStream_t>(solver_->cs));
+            solver_->cs.synchronize();
+            t_rows_upload_ms = ms_since(t_up);
         }
     }
-    t_sbus_build_ms_ = ms_since(t_sbus_start);
-
-    GenVOverride gen_v_override;
-    if (has_gen_v_)
-        gen_v_override = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
-
-    InjectionBatch source(std::move(h_Sbus_all), n_scenarios_, t_sbus_build_ms_,
-                          std::move(gen_v_override));
-
-    // (Re-)construct the solver — allows run() to be called multiple times.
-    solver_ = std::make_unique<InjectionSweepSolver>(
-        *base_state_,
-        std::move(source),
-        n_scenarios_,
-        used_batch_size_,
-        nb_iter_,
-        strategy_type_,
-        refactor_period_,
-        reordering_alg_,
-        matching_alg_,
-        pivot_epsilon_alg_,
-        scaling_max_voltage_change_,
-        max_dVa_,
-        max_dVm_,
-        scheduling_,
-        nb_iter_per_round_,
-        tol_);
+    injections_dirty_ = false;
+    gen_v_dirty_      = false;
+    // per-run knobs, no rebuild needed
+    solver_->nb_iter_           = nb_iter_;
+    solver_->nb_iter_per_round_ = nb_iter_per_round_;
+    solver_->tol_               = tol_;
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
     // violations); an injection sweep never disconnects a generator (nullptr mask).
@@ -239,10 +292,21 @@ void InjectionSweepSession::run()
         base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0,
         physical_checks::RowTargets{&gen_p_targets_, gen_p_targets_dirty_,
                                     &gen_pv_release_targets_, gen_pv_release_targets_dirty_});
-    gen_p_targets_dirty_ = false;
-    gen_pv_release_targets_dirty_ = false;
+    // The targets reached the driver only if the checks ran their setup: with
+    // them off, keep the flags so turning them back on on this same driver
+    // uploads what changed meanwhile.
+    if (phys_.compute_physical_violations) {
+        gen_p_targets_dirty_ = false;
+        gen_pv_release_targets_dirty_ = false;
+    }
 
     timings_ = solver_->solve();
+    if (!cold) {
+        // mark_reused zeroed the source's own costs; a hot run that loaded
+        // new rows still paid for building and uploading them.
+        timings_.t_preprocess_ms += t_sbus_build_ms_;
+        timings_.t_alloc_ms      += t_rows_upload_ms;
+    }
     timings_.t_base_case_ms  = t_base_case_ms_;
     timings_.t_preprocess_ms += base_state_->timings.t_build_J_ms;
     timings_.t_alloc_ms      += base_state_->timings.t_upload_ms;
@@ -346,14 +410,11 @@ void InjectionSweepSession::compute_flows()
     const int n = n_scen * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
-        thrust::host_vector<cuda_real_type> h_or = solver_->d_or_amps_results;
-        thrust::host_vector<cuda_real_type> h_ex = solver_->d_ex_amps_results;
+        // Through the driver's pinned staging buffer (download_into).
         h_or_amps_.resize(n);
         h_ex_amps_.resize(n);
-        for (int i = 0; i < n; ++i) {
-            h_or_amps_(i) = static_cast<eigen_real_type>(h_or[static_cast<size_t>(i)]);
-            h_ex_amps_(i) = static_cast<eigen_real_type>(h_ex[static_cast<size_t>(i)]);
-        }
+        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
+        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
     }
     timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
 }
@@ -387,12 +448,8 @@ CplxVect InjectionSweepSession::get_V_results() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
-    thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = eigen_cplx_type(
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
@@ -418,10 +475,8 @@ RealVect InjectionSweepSession::get_residuals() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
-    thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_residuals);   // pinned, pipelined
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }

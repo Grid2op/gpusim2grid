@@ -656,6 +656,44 @@ struct CudaTimer {
 };
 
 // ---------------------------------------------------------------------------
+// PinnedHostBuffer — page-locked host memory (cudaMallocHost), grown on
+// demand and reused. A D→H copy into pageable memory goes through the
+// driver's own bounce buffer at a fraction of the bus bandwidth, and the
+// first write to a freshly allocated host buffer faults every page; staging
+// result downloads here avoids both. Not shrunk: a session keeps the largest
+// size it ever needed until it dies.
+// ---------------------------------------------------------------------------
+struct PinnedHostBuffer {
+    void*       ptr  = nullptr;
+    std::size_t size = 0;
+
+    PinnedHostBuffer() = default;
+    PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
+    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+    ~PinnedHostBuffer() { release(); }
+
+    void* reserve(std::size_t bytes) {
+        if (bytes > size) {
+            release();
+            cudaError_t err = cudaMallocHost(&ptr, bytes);
+            if (err != cudaSuccess) {
+                ptr = nullptr;
+                throw std::runtime_error(
+                    std::string("PinnedHostBuffer: cudaMallocHost failed: ")
+                    + cudaGetErrorString(err));
+            }
+            size = bytes;
+        }
+        return ptr;
+    }
+    void release() {
+        if (ptr) cudaFreeHost(ptr);
+        ptr  = nullptr;
+        size = 0;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // CudaStream
 // ---------------------------------------------------------------------------
 struct CudaStream {

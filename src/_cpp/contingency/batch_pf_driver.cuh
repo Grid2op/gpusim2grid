@@ -50,6 +50,9 @@
 // =============================================================================
 
 #include <thrust/device_vector.h>
+#include <algorithm>
+#include <cstring>        // std::memcpy (download_into)
+#include <type_traits>
 
 #include "../dtypes.hpp"
 #include "../cuda_utils.h"
@@ -60,6 +63,7 @@
 #include "bus_q_check_data.hpp"                   // BusQPlanData
 #include "gen_p_check_data.hpp"                   // GenPPlanData
 #include "gen_pv_release_check_data.hpp"          // GenPvReleasePlanData
+#include "physical_checks_data.hpp"               // PhysicalSetupKey
 #include "row_status.hpp"                         // BatchScheduling, RowStatus
 #include "slot_schedule.cuh"                      // SlotLoadView, SlotTableView, PinnedBuffer
 #include "strategies/cudss_batch_solver.cuh"
@@ -268,6 +272,61 @@ struct BatchPfDriver {
     // -------------------------------------------------------------------------
     thrust::device_vector<cudaComplexType> d_V_results;
     thrust::device_vector<cuda_real_type>  d_residuals;
+
+    // -------------------------------------------------------------------------
+    // download_into — D→H copy of the first n entries of a device vector into
+    // the caller's host array (the sessions' get_*() results), converting to
+    // the Eigen-side type. Pipelined through a pinned staging buffer (reused
+    // across calls and runs): ~2 MB chunks alternate between its two halves,
+    // so the DMA of chunk k+1 runs while the host moves chunk k into dst. A
+    // pageable copy would go through the driver's own bounce buffer at a
+    // fraction of the bus bandwidth, and fault every page of dst on the way.
+    // Stream-ordered after everything already queued on cs.
+    // -------------------------------------------------------------------------
+    mutable PinnedHostBuffer h_staging_;
+    mutable CudaEvent        download_ev_[2];
+    template <typename D, typename T>
+    void download_into(D* dst, std::size_t n, const thrust::device_vector<T>& d_src) const
+    {
+        if (n > d_src.size())
+            throw std::runtime_error("[batch_pf] download_into: more entries asked than stored");
+        if (n == 0) return;
+        const std::size_t chunk   = std::max<std::size_t>(1, (std::size_t(2) << 20) / sizeof(T));
+        const std::size_t n_chunk = (n + chunk - 1) / chunk;
+        T* stage = static_cast<T*>(h_staging_.reserve(2 * chunk * sizeof(T)));
+        const T* src = thrust::raw_pointer_cast(d_src.data());
+        auto issue = [&](std::size_t k) {
+            const std::size_t off = k * chunk, cnt = std::min(chunk, n - off);
+            cudaError_t err = cudaMemcpyAsync(
+                stage + (k % 2) * chunk, src + off, cnt * sizeof(T),
+                cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(cs));
+            if (err != cudaSuccess)
+                throw std::runtime_error(
+                    std::string("[batch_pf] download_into: ") + cudaGetErrorString(err));
+            download_ev_[k % 2].record(static_cast<cudaStream_t>(cs));
+        };
+        issue(0);
+        if (n_chunk > 1) issue(1);
+        for (std::size_t k = 0; k < n_chunk; ++k) {
+            download_ev_[k % 2].synchronize();
+            const std::size_t off = k * chunk, cnt = std::min(chunk, n - off);
+            const T* h = stage + (k % 2) * chunk;
+            // Same layout (FP64: double / std::complex<double> vs double /
+            // double2): a plain copy. FP32: widened element by element.
+            if (sizeof(D) == sizeof(T) && std::is_same<eigen_real_type, cuda_real_type>::value) {
+                std::memcpy(static_cast<void*>(dst + off), h, cnt * sizeof(T));
+            } else {
+                for (std::size_t i = 0; i < cnt; ++i) dst[off + i] = to_host_value<D>(h[i]);
+            }
+            if (k + 2 < n_chunk) issue(k + 2);   // that half is free again
+        }
+    }
+    template <typename D>
+    static D to_host_value(cuda_real_type v) { return static_cast<D>(v); }
+    template <typename D>
+    static D to_host_value(const cudaComplexType& v) {
+        return D(static_cast<eigen_real_type>(v.x), static_cast<eigen_real_type>(v.y));
+    }
 
     // -------------------------------------------------------------------------
     // Optional branch-flow outputs (only meaningful for contingency-style
@@ -830,6 +889,17 @@ struct BatchPfDriver {
     void upload_gen_pv_release_row_skip(const std::vector<unsigned char>& mask, int n_cols);
     bool has_gen_pv_release_row_skip() const { return gen_pv_release_skip_stride_ > 0; }
     void run_gen_pv_release_check_n();
+
+    // physical_checks::before_solve's bookkeeping: the key of the last full
+    // setup (valid while phys_setup_valid_). reset_physical_outputs() re-seeds
+    // the per-row counts / truncation flags of the enabled checks (the -1
+    // "never simulated" sentinel), asynchronously on cs, for a run whose key
+    // is unchanged; disable_physical_checks() stops the per-chunk checks of a
+    // live driver whose session turned them off.
+    PhysicalSetupKey phys_setup_key_;
+    bool             phys_setup_valid_ = false;
+    void reset_physical_outputs();
+    void disable_physical_checks();
 
     double bus_q_setup_ms()  const { return t_bus_q_setup_ms_; }
     double hvdc_p_setup_ms() const { return t_hvdc_p_setup_ms_; }

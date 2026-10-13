@@ -371,3 +371,199 @@ class TestDevicePath:
         wrong_dtype = torch.zeros(3, sw.n_bus, dtype=torch.float64, device="cuda")
         with pytest.raises(RuntimeError, match="dtype"):
             sw.solver.set_injections_dlpack(wrong_dtype.__dlpack__())
+
+
+class TestStateKeptAcrossRuns:
+    """Session state that must survive (or be refreshed by) a reused driver."""
+
+    @needs_bridge
+    @pytest.mark.parametrize("change", ["injections", "gen_v"])
+    def test_disconnected_flags_survive_a_hot_run(self, change):
+        # Only a new batch source recomputes which rows are islanded; a hot
+        # run keeps the live source, so it must keep those flags too.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        scales = [1.0, 1.05, 0.95]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.set_topology([[], [int(spur_line)], []])        # row 1 islands the spur bus
+        V1 = _np(sw.compute(batch_size=3))
+        assert list(sw.get_disconnected()) == [0, 1, 0]
+        assert sw.timings.n_disconnected == 1
+        assert np.all(np.isnan(V1[1]))
+
+        if change == "injections":
+            sw.set_injections_from_elements(*_rows(grid, [0.9, 1.1, 1.02]))
+        else:
+            gen_v = np.full((3, len(grid.get_gen_target_p())), np.nan)
+            gen_v[:, 0] = 1.02
+            sw.set_gen_v(gen_v)
+        V2 = _np(sw.compute(batch_size=3))
+        assert sw.driver_build_counter == 1 and sw.source_build_counter == 1   # hot
+        assert np.all(np.isnan(V2[1]))
+        assert list(sw.get_disconnected()) == [0, 1, 0]
+        assert sw.timings.n_disconnected == 1
+
+    def test_set_branch_data_after_a_run_reaches_the_driver(self, ieee14_base_case, solver_atol):
+        # The driver uploads the branch admittances once and survives across
+        # runs: a later set_branch_data() must still reach it.
+        from gpusim2grid import ScenarioSweepGPU
+        from gpusim2grid._ls2g_utils import extract_branch_data
+        grid = ieee14_base_case["grid"]
+        scales = [1.0, 1.1]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.compute(batch_size=2)
+        sw.compute_flows()
+        or1 = sw.or_amps.to_numpy().copy()
+        ex1 = sw.ex_amps.to_numpy().copy()
+        assert np.all(np.isfinite(or1)) and np.any(or1 > 0.0)
+
+        # Branch currents are linear in the admittances; Ybus (hence V) is
+        # untouched by set_branch_data, so doubling them doubles the currents.
+        (b_from, b_to, yff, yft, ytf, ytt, vn_kv, sn_mva), _, _ = extract_branch_data(grid)
+        sw.set_branch_data(b_from, b_to, 2 * np.asarray(yff), 2 * np.asarray(yft),
+                           2 * np.asarray(ytf), 2 * np.asarray(ytt), vn_kv, sn_mva)
+        sw.compute(batch_size=2)
+        assert sw.driver_build_counter == 1                 # same driver
+        sw.compute_flows()
+        np.testing.assert_allclose(sw.or_amps.to_numpy(), 2 * or1, rtol=solver_atol, atol=solver_atol)
+        np.testing.assert_allclose(sw.ex_amps.to_numpy(), 2 * ex1, rtol=solver_atol, atol=solver_atol)
+
+    @needs_bridge
+    def test_warm_run_outgrowing_the_cold_capacity_rebuilds_the_driver(self, solver_atol):
+        # The cold run sizes the chunk capacity for ITS active rows. A warm
+        # run with far more active rows must not be split into one-row chunks.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        spur = int(spur_line)
+        scales = [1.0, 1.05, 0.95, 1.1, 0.9, 1.02]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(*_rows(grid, scales))
+
+        sw.set_topology([[spur]] * 5 + [[]])               # 1 active row of 6
+        sw.compute(batch_size=6)
+        assert sw.solver.n_active == 1 and sw.solver.capacity == 1
+        assert sw.driver_build_counter == 1
+
+        # mild growth (1 -> 2 active): one extra chunk, no new analysis
+        topo_mild = [[spur]] * 4 + [[], []]
+        sw.set_topology(topo_mild)
+        V_mild = _np(sw.compute(batch_size=6))
+        assert sw.driver_build_counter == 1 and sw.source_build_counter == 2
+        assert sw.solver.capacity == 1
+
+        # all 6 active: 6 chunks at the live capacity vs 1 fresh -> rebuild
+        topo_all = [[]] * 6
+        sw.set_topology(topo_all)
+        V_all = _np(sw.compute(batch_size=6))
+        assert sw.driver_build_counter == 2
+        assert sw.solver.n_active == 6 and sw.solver.capacity == 6
+        assert list(sw.get_disconnected()) == [0] * 6
+
+        ref_mild = _fresh(grid, scales, topology=topo_mild)[0]
+        ref_all = _fresh(grid, scales, topology=topo_all)[0]
+        np.testing.assert_allclose(V_mild[4:], ref_mild[4:], atol=solver_atol)
+        np.testing.assert_allclose(V_all, ref_all, atol=solver_atol)
+
+    @needs_bridge
+    def test_turning_limit_violations_off_disarms_the_reused_driver(self, ieee14_base_case):
+        from gpusim2grid import ScenarioSweepGPU
+        grid = ieee14_base_case["grid"]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL,
+                              compute_limit_violations=True)
+        sw.set_injections_from_elements(*_rows(grid, [1.0, 1.1]))
+        sw.compute(batch_size=2)
+        t_on = sw.timings.t_violation_check
+        assert t_on.wall_ms > 0.0 or t_on.gpu_ms > 0.0
+
+        sw.compute_limit_violations = False
+        sw.compute(batch_size=2)
+        assert sw.driver_build_counter == 1                 # same driver
+        t_off = sw.timings.t_violation_check
+        assert t_off.wall_ms == 0.0 and t_off.gpu_ms == 0.0
+        with pytest.raises(RuntimeError, match="compute_limit_violations"):
+            sw.get_violations()
+
+    def test_set_branch_data_refuses_ids_the_topology_still_trips(self, ieee14_base_case,
+                                                                  solver_atol):
+        from gpusim2grid import ScenarioSweepGPU
+        from gpusim2grid._ls2g_utils import extract_branch_data
+        grid = ieee14_base_case["grid"]
+        scales = [1.0, 1.1]
+        topo = [[3], []]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.set_topology(topo)
+        V1 = _np(sw.compute(batch_size=2))
+
+        args, _, _ = extract_branch_data(grid)
+        short = tuple(np.asarray(a)[:3] for a in args[:6]) + tuple(args[6:])
+        with pytest.raises(RuntimeError, match="out of range"):
+            sw.set_branch_data(*short)
+
+        # refused before anything was replaced: same topology, same answer
+        V2 = _np(sw.compute(batch_size=2))
+        np.testing.assert_allclose(V2, V1, atol=solver_atol)
+        np.testing.assert_allclose(V2, _fresh(grid, scales, topology=topo)[0],
+                                   atol=solver_atol)
+
+    @needs_bridge
+    def test_set_branch_data_with_more_branches(self, ieee14_base_case, solver_atol):
+        # One extra (zero-admittance) branch: the flow buffers are resized,
+        # the old per-branch limits are dropped (set_limits() is asked for
+        # again instead of reading past their end), the topology still holds.
+        from gpusim2grid import ScenarioSweepGPU
+        from gpusim2grid._ls2g_utils import extract_branch_data
+        grid = ieee14_base_case["grid"]
+        topo = [[3], []]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL,
+                              compute_limit_violations=True)
+        sw.set_injections_from_elements(*_rows(grid, [1.0, 1.1]))
+        sw.set_topology(topo)
+        V1 = _np(sw.compute(batch_size=2))
+        sw.compute_flows()
+        or1 = sw.or_amps.to_numpy().reshape(2, -1).copy()
+        n_bra = or1.shape[1]
+
+        (b_from, b_to, yff, yft, ytf, ytt, vn_kv, sn_mva), _, _ = extract_branch_data(grid)
+        z = np.zeros(1, dtype=np.asarray(yff).dtype)
+        sw.set_branch_data(np.append(b_from, 0), np.append(b_to, 1),
+                           np.append(yff, z), np.append(yft, z),
+                           np.append(ytf, z), np.append(ytt, z), vn_kv, sn_mva)
+        with pytest.raises(RuntimeError, match="set_limits"):
+            sw.compute(batch_size=2)
+
+        sw.compute_limit_violations = False
+        V2 = _np(sw.compute(batch_size=2))
+        np.testing.assert_allclose(V2, V1, atol=solver_atol)
+        sw.compute_flows()
+        or2 = sw.or_amps.to_numpy().reshape(2, -1)
+        assert or2.shape == (2, n_bra + 1)
+        np.testing.assert_allclose(or2[:, :n_bra], or1, rtol=solver_atol, atol=solver_atol)
+        assert np.all(or2[:, n_bra] == 0.0)
+        assert or2[0, 3] == 0.0                             # still tripped in row 0
+
+    @needs_bridge
+    def test_keep_final_jacobian_rebuilds_when_one_chunk_is_possible(self, solver_atol):
+        # keep_final_jacobian needs one chunk. The cold run's capacity (2: two
+        # of four rows islanded) would split a later all-active topology in two
+        # chunks, which is under the "twice as many chunks" rebuild threshold;
+        # the forward must still get the one chunk batch_size allows.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        spur = int(spur_line)
+        scales = [1.0, 1.05, 0.95, 1.1]
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        sw.solver.keep_final_jacobian = True
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        sw.set_topology([[spur], [spur], [], []])
+        sw.compute(batch_size=4)
+        assert sw.solver.capacity == 2
+
+        topo = [[]] * 4
+        sw.set_topology(topo)
+        V = _np(sw.compute(batch_size=4))                # used to raise
+        assert sw.driver_build_counter == 2 and sw.solver.capacity == 4
+        np.testing.assert_allclose(V, _fresh(grid, scales, topology=topo)[0],
+                                   atol=solver_atol)

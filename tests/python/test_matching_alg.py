@@ -21,8 +21,8 @@ assumed):
 - Single-system (AcPfGPU): 'none', 'max_diag_count', 'max_min_diag',
   'max_min_diag_alt', 'max_diag_sum' all reproduce the reference solution.
   'max_diag_product' and 'auto' silently produce NaN voltages (all non-slack
-  buses) while ``timings.converged`` still reports True -- the ||F||_inf
-  residual check does not catch NaN (NaN comparisons are always False). This
+  buses). ``timings.converged`` now reports False for them (the ||F||_inf
+  reduction propagates NaN; it used to drop it and report True). This
   is a cuDSS/matching-scaling interaction with gpusim2grid's power-flow
   Jacobians, not a gpusim2grid plumbing bug -- see
   test_single_system_max_diag_product_and_auto_produce_nan below. Do not
@@ -73,11 +73,12 @@ class TestAcPfGpuMatchingAlg:
     def test_single_system_max_diag_product_and_auto_produce_nan(
             self, ieee14_base_case, alg):
         """Documents a real (non-plumbing) finding: cuDSS's MaxDiagProduct/Auto
-        matching silently produces NaN voltages for gpusim2grid's power-flow
-        Jacobians, and the existing ||F||_inf convergence check does not catch
-        it (NaN comparisons are always False). This is not something to
-        silently work around here -- callers must be warned (see docstrings)
-        rather than have gpusim2grid quietly "fix" or hide it."""
+        matching produces NaN voltages for gpusim2grid's power-flow
+        Jacobians. This is not something to silently work around here --
+        callers must be warned (see docstrings) rather than have gpusim2grid
+        quietly "fix" or hide it -- but it must not be reported as converged
+        either: the ||F||_inf reduction propagates NaN (it used to drop it,
+        so an all-NaN F read as 0 and ``timings.converged`` was True)."""
         from gpusim2grid import AcPfGPU
 
         d = ieee14_base_case
@@ -90,6 +91,7 @@ class TestAcPfGpuMatchingAlg:
             f"matching_alg={alg!r} was expected to reproduce the known NaN "
             "issue; if this now passes, cuDSS behavior may have changed -- "
             "update _SINGLE_SYSTEM_SAFE_ALGS / the docstrings accordingly.")
+        assert not ac.timings.converged
 
     def test_enum_passthrough(self, ieee14_base_case, solver_atol):
         from gpusim2grid import AcPfGPU

@@ -88,6 +88,10 @@ struct InjectionBatch {
     thrust::device_vector<cuda_real_type> d_gv_all;
     thrust::device_vector<cuda_real_type> d_gv_slots;        // [S * k] the loaded slots' rows, NaN elsewhere
     GenVsetSlots                          gv_vset_;          // VoltageControl set-point columns
+    // what initialize() saw, for set_rows()'s re-upload (_upload_gen_v)
+    int capacity_ = 0;
+    int n_vc_grp_ = 0;
+    void _upload_gen_v(cudaStream_t cs);
 
     // -------------------------------------------------------------------------
     // Constructor (host-only).
@@ -121,6 +125,17 @@ struct InjectionBatch {
     //     identical base values from every batch slot.
     // -------------------------------------------------------------------------
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
+
+    // -------------------------------------------------------------------------
+    // set_rows — new injections (and gen_v override) for the SAME row count
+    // on a live source: re-uploads d_Sbus_all and the gen_v arrays only (the
+    // chunk buffers and the tiled Ybus stay). Lets a session keep its driver
+    // -- no allocation, no cuDSS ANALYSIS -- across runs that only change the
+    // scenarios' injections. Stream-ordered on cs.
+    // -------------------------------------------------------------------------
+    void set_rows(std::vector<cudaComplexType>&& h_Sbus_all,
+                  GenVOverride&&                 gen_v_override,
+                  cudaStream_t                   cs);
 
     // -------------------------------------------------------------------------
     // load_slots — fill the listed slots with their rows (see the file doc):

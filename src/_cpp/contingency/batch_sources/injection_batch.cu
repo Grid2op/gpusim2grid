@@ -48,15 +48,39 @@ void InjectionBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     _chk_cuda(cudaGetLastError(), "tile base Ybus");
 
     // set_gen_v() overrides, if any -- see GenVOverride's own doc.
+    capacity_ = ctx.batch_size;
+    n_vc_grp_ = ctx.base.n_vc_grp;
+    _upload_gen_v(cs);
+}
+
+void InjectionBatch::_upload_gen_v(cudaStream_t cs)
+{
+    // A previous override's VoltageControl columns must not outlive it (a
+    // set_rows() whose gen_v drives no group, or none at all).
+    gv_vset_.clear();
     if (gen_v_override_.k_active() > 0) {
         upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
                    gen_v_override_.h_active_bus.size(), cs);
         upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
                    gen_v_override_.h_gen_v_all.size(), cs);
         gv_vset_.upload(gen_v_override_.h_active_vc_group, cs);
-        gv_vset_.size_for(ctx.batch_size, ctx.base.n_vc_grp);
-        d_gv_slots.resize(static_cast<size_t>(ctx.batch_size) * gen_v_override_.k_active());
+        gv_vset_.size_for(capacity_, n_vc_grp_);
+        d_gv_slots.resize(static_cast<size_t>(capacity_) * gen_v_override_.k_active());
     }
+}
+
+void InjectionBatch::set_rows(std::vector<cudaComplexType>&& h_Sbus_all,
+                              GenVOverride&&                 gen_v_override,
+                              cudaStream_t                   cs)
+{
+    if (h_Sbus_all.size() != h_Sbus_all_.size())
+        throw std::runtime_error(
+            "[injection_batch] set_rows: the row count / bus count changed "
+            "(a new driver is needed)");
+    h_Sbus_all_     = std::move(h_Sbus_all);
+    gen_v_override_ = std::move(gen_v_override);
+    upload_h2d(d_Sbus_all, h_Sbus_all_.data(), h_Sbus_all_.size(), cs);
+    _upload_gen_v(cs);
 }
 
 void InjectionBatch::load_slots(BatchPfDriverContext& ctx,

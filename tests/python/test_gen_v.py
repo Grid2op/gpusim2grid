@@ -404,6 +404,78 @@ class TestConflictingSetpoints:
         V3 = sw.solver.V_results.to_numpy().reshape(n, n_bus)
         np.testing.assert_allclose(np.abs(V3[1, b5]), 1.02, atol=solver_atol)
 
+    def test_gen_v_may_change_row_count_before_the_injections(self):
+        # set_gen_v() for a new row count, THEN the matching injections: the
+        # skip mask is derived again at compute(), not refused on the way
+        from gpusim2grid import ScenarioSweepGPU
+        grid, (g_a, g_b), _ = _two_gen_case14()
+        load_p, load_q = grid.get_loads_res_full()[:2]
+        gen_p = np.asarray(grid.get_gen_target_p())
+        n_gen = len(grid.get_generators())
+        rep = lambda a, n: np.repeat(np.asarray(a)[None, :], n, axis=0)   # noqa: E731
+
+        sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=1e-10)
+        sw.set_injections_from_elements(rep(load_p, 2), rep(load_q, 2), rep(gen_p, 2))
+        sw.compute(batch_size=4)
+
+        gen_v = np.full((4, n_gen), np.nan)
+        gen_v[:, [g_a, g_b]] = 1.02
+        gen_v[2, g_b] = 1.03                  # row 2: infeasible
+        sw.set_gen_v(gen_v)                   # 4 rows while the session holds 2
+        sw.set_injections_from_elements(rep(load_p, 4), rep(load_q, 4), rep(gen_p, 4))
+        sw.compute(batch_size=4)
+        assert sw.get_disconnected().tolist() == [0, 0, 1, 0]
+
+        # and back to fewer rows, the conflict moving with them
+        gen_v = gen_v[:3].copy()
+        gen_v[2, g_b] = 1.02
+        gen_v[0, g_b] = 1.03
+        sw.set_gen_v(gen_v)
+        sw.set_injections_from_elements(rep(load_p, 3), rep(load_q, 3), rep(gen_p, 3))
+        sw.compute(batch_size=4)
+        assert sw.get_disconnected().tolist() == [1, 0, 0]
+
+    @pytest.mark.parametrize("mask_first", [False, True])
+    def test_disconnected_generator_does_not_impose_its_setpoint(self, solver_atol,
+                                                                 mask_first):
+        # A generator taken out by set_contingency_gens must not write its
+        # gen_v onto a bus another connected generator keeps PV -- whichever
+        # of the two columns the kernel happens to write last, and whichever
+        # of set_gen_v / set_contingency_gens comes first.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, (g_a, g_b), b5 = _two_gen_case14()
+        n_bus = grid.get_Ybus_solver().shape[0]
+        load_p, load_q = grid.get_loads_res_full()[:2]
+        gen_p = np.asarray(grid.get_gen_target_p())
+        n = 3
+        rep = lambda a: np.repeat(np.asarray(a)[None, :], n, axis=0)   # noqa: E731
+        n_gen = len(grid.get_generators())
+        gen_v = np.full((n, n_gen), np.nan)
+        gen_v[:, [g_a, g_b]] = 1.02
+        gen_v[1, g_a] = 1.05                  # row 1: g_a off, g_b on at 1.02
+        gen_v[2, g_b] = 1.05                  # row 2: g_b off, g_a on at 1.02
+        mask = np.zeros((n, n_gen), dtype=bool)
+        mask[1, g_a] = True
+        mask[2, g_b] = True
+
+        sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=1e-10)
+        sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+        if mask_first:
+            sw.set_contingency_gens(mask)
+            sw.set_gen_v(gen_v)
+        else:
+            sw.set_gen_v(gen_v)
+            sw.set_contingency_gens(mask)
+        sw.compute(batch_size=n)
+        assert sw.get_disconnected().tolist() == [0, 0, 0]
+        V = sw.solver.V_results.to_numpy().reshape(n, n_bus)
+        np.testing.assert_allclose(np.abs(V[:, b5]), [1.02] * n, atol=solver_atol)
+
+        # the mask lifted: both generators are connected again and disagree
+        sw.set_contingency_gens(np.zeros((n, n_gen), dtype=bool))
+        sw.compute(batch_size=n)
+        assert sw.get_disconnected().tolist() == [0, 1, 1]
+
     def test_injection_sweep_raises(self):
         from gpusim2grid import InjectionSweepGPU
         grid, (g_a, g_b), _ = _two_gen_case14()

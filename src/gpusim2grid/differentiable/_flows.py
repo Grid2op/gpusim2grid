@@ -19,6 +19,9 @@ Each terminal current is converted to amperes with the nominal voltage of
 its own bus (as lightsim2grid and the CUDA kernels do): the two bases differ
 on a transformer or on any branch joining two voltage levels.
 
+(a side at bus -1 -- Kron-reduced half-open end -- counts as V = 0 with no
+terminal current, and its base falls back to the other end's vn_kv).
+
 All operations are natively differentiable via PyTorch autograd. ``V`` may
 carry any number of leading batch dimensions (``(..., n_bus)``, e.g. the
 ``(n_scen, n_bus)`` output of ``BatchPowerFlow``): the branch indexing is
@@ -55,17 +58,32 @@ def compute_flows(
     All values are real tensors of shape [..., n_branches] (the leading
     dimensions of ``V``).
     """
-    Vi = V[..., branch_from]  # complex [..., n_branches]
-    Vj = V[..., branch_to]    # complex [..., n_branches]
+    # A side lightsim2grid Kron-reduced away (half-open line, isolated bus)
+    # is relabeled to bus -1: it has no voltage (V = 0) and no terminal, so no
+    # current or power on that side, and the base current uses the live
+    # endpoint's nominal voltage -- exactly compute_branch_flows_kernel.
+    # (Plain V[..., -1] would silently read the last bus instead.)
+    live_f = branch_from >= 0
+    live_t = branch_to >= 0
+    bf = branch_from.clamp(min=0)
+    bt = branch_to.clamp(min=0)
+    zero = torch.zeros((), dtype=V.dtype, device=V.device)
 
-    I_or = yff_eff * Vi + yft_eff * Vj  # origin terminal current
-    I_ex = ytf_eff * Vi + ytt_eff * Vj  # extremity terminal current
+    Vi = torch.where(live_f, V[..., bf], zero)  # complex [..., n_branches]
+    Vj = torch.where(live_t, V[..., bt], zero)  # complex [..., n_branches]
+
+    I_or = torch.where(live_f, yff_eff * Vi + yft_eff * Vj, zero)  # origin terminal current
+    I_ex = torch.where(live_t, ytf_eff * Vi + ytt_eff * Vj, zero)  # extremity terminal current
 
     S_or = Vi * I_or.conj()     # complex apparent power (pu), origin
     S_ex = Vj * I_ex.conj()     # complex apparent power (pu), extremity
 
-    base_or_A = sn_mva * 1e6 / (math.sqrt(3.0) * bus_vn_kv[branch_from] * 1e3)
-    base_ex_A = sn_mva * 1e6 / (math.sqrt(3.0) * bus_vn_kv[branch_to] * 1e3)
+    # Each terminal's base uses its own bus' nominal voltage; a -1 side (no
+    # current anyway) falls back to the live end's, like set_branch_data.
+    vn_or = bus_vn_kv[torch.where(live_f, bf, bt)]
+    vn_ex = bus_vn_kv[torch.where(live_t, bt, bf)]
+    base_or_A = sn_mva * 1e6 / (math.sqrt(3.0) * vn_or * 1e3)
+    base_ex_A = sn_mva * 1e6 / (math.sqrt(3.0) * vn_ex * 1e3)
 
     return {
         "p_or_mw":   S_or.real * sn_mva,
