@@ -1017,6 +1017,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Number of buses in the grid.")
     .def_property_readonly("n_branches",      &ContingencyAnalysisSession::n_branches,
          "Number of branches (lines + trafos); available after set_branch_data().")
+    .def_readonly("driver_build_counter", &ContingencyAnalysisSession::driver_build_counter_,
+        "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
+        "ANALYSIS, factorization state) while the settings it was built with "
+        "and the contingency list are unchanged, so this only grows when one of them changed.")
     .def_readwrite("batch_size", &ContingencyAnalysisSession::batch_size_,
                    "Contingencies per GPU chunk (takes effect on the next run())")
     .def_readonly("used_batch_size", &ContingencyAnalysisSession::used_batch_size_,
@@ -1259,6 +1263,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Number of buses in the grid.")
     .def_property_readonly("n_branches",  &InjectionSweepSession::n_branches,
          "Number of branches (lines + trafos); available after set_branch_data().")
+    .def_readonly("driver_build_counter", &InjectionSweepSession::driver_build_counter_,
+        "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
+        "ANALYSIS, factorization state) while the settings it was built with "
+        "and the scenario count are unchanged, so this only grows when one of them changed.")
     .def_readwrite("batch_size", &InjectionSweepSession::batch_size_,
                    "Scenarios per GPU chunk (takes effect on the next run())")
     .def_readonly("used_batch_size", &InjectionSweepSession::used_batch_size_,

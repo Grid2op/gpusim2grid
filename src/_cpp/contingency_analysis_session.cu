@@ -140,6 +140,25 @@ void ContingencyAnalysisSession::build_contingencies(
         disconnected_per_ctg_.push_back(branch_ids_per_ctg[c]);
     }
     has_contingencies_ = true;
+    ++contingencies_generation_;   // the live driver's source is stale now
+}
+
+BatchDriverConfig ContingencyAnalysisSession::_current_config() const
+{
+    BatchDriverConfig c;
+    c.n_scenarios                = static_cast<int>(contingencies_.size());
+    c.batch_size                 = batch_size_;
+    c.refactor_period            = refactor_period_;
+    c.strategy                   = strategy_type_;
+    c.reordering_alg             = reordering_alg_;
+    c.matching_alg               = matching_alg_;
+    c.pivot_epsilon_alg          = pivot_epsilon_alg_;
+    c.scaling_max_voltage_change = scaling_max_voltage_change_;
+    c.max_dVa                    = max_dVa_;
+    c.max_dVm                    = max_dVm_;
+    c.mask_mode                  = handle_disconnected_grid_;
+    c.rows_generation            = contingencies_generation_;
+    return c;
 }
 
 // =============================================================================
@@ -159,45 +178,66 @@ void ContingencyAnalysisSession::run()
             "base-case factors). Use 'direct_refactor_every' (default), "
             "'direct_iter0_only', or 'direct_refactor_every_n'.");
 
-    // Reset any masking flags set on a previous run() (the contingency list is
-    // mutated in place across runs; compute_component_masks / check_connectivity
-    // expect to start from a clean state).
-    for (auto& ctg : contingencies_) {
-        ctg.disconnected = false;
-        ctg.masked_buses.clear();
-        ctg.stranded_groups.clear();
-        ctg.pinned_buses.clear();
+    // Hot run: same settings, same contingency list as the live driver --
+    // keep it (allocations, block-diagonal structure, cuDSS ANALYSIS, the
+    // policy's factorization state) and its source (connectivity, masks,
+    // patches already on the device); only solve() runs again. Otherwise
+    // build both, as the first run() does.
+    const BatchDriverConfig cfg = _current_config();
+    const bool cold = !solver_ || cfg != driver_cfg_;
+
+    if (cold) {
+        // Reset any masking flags set on a previous run() (the contingency
+        // list is mutated in place across runs; compute_component_masks /
+        // check_connectivity expect to start from a clean state). A hot run
+        // keeps them: they describe the live source.
+        for (auto& ctg : contingencies_) {
+            ctg.disconnected = false;
+            ctg.masked_buses.clear();
+            ctg.stranded_groups.clear();
+            ctg.pinned_buses.clear();
+        }
+
+        // Host preprocessing (resolve_indices + connectivity/masking +
+        // build_flat_patches) captured by the BatchSource; mutates
+        // contingencies_ in-place so that disconnected flags are observable
+        // below for the disconnected count. The source rebalances the chunk
+        // size over the ACTIVE (simulated) count; we read it back so the
+        // driver chunks consistently with the source.
+        ContingencyBatch source(
+            contingencies_,
+            Ybus_rm_.outerIndexPtr(),
+            Ybus_rm_.innerIndexPtr(),
+            Ybus_rm_,
+            batch_size_,
+            handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
+        used_batch_size_ = source.used_batch_size();
+
+        // New driver: allocation, block-diagonal structure, cuDSS ANALYSIS.
+        // Free the old one first so the two never coexist on the device.
+        solver_.reset();
+        solver_ = std::make_unique<ContingencyAnalysisSolver>(
+            *base_state_,
+            std::move(source),
+            static_cast<int>(contingencies_.size()),
+            used_batch_size_,
+            nb_iter_,
+            strategy_type_,
+            refactor_period_,
+            reordering_alg_,
+            matching_alg_,
+            pivot_epsilon_alg_,
+            scaling_max_voltage_change_,
+            max_dVa_,
+            max_dVm_);
+        driver_cfg_ = cfg;
+        ++driver_build_counter_;
+    } else {
+        // One-time costs (allocation, ANALYSIS, source preprocessing) are
+        // not paid again: report them as 0 for this run.
+        solver_->mark_reused(/*hot=*/true);
     }
-
-    // Host preprocessing (resolve_indices + connectivity/masking + build_flat_patches)
-    // captured by the BatchSource; mutates contingencies_ in-place so that
-    // disconnected flags are observable below for the disconnected count.
-    // The source rebalances the chunk size over the ACTIVE (simulated) count;
-    // we read it back so the driver chunks consistently with the source.
-    ContingencyBatch source(
-        contingencies_,
-        Ybus_rm_.outerIndexPtr(),
-        Ybus_rm_.innerIndexPtr(),
-        Ybus_rm_,
-        batch_size_,
-        handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
-    used_batch_size_ = source.used_batch_size();
-
-    // (Re-)construct the solver — allows run() to be called multiple times.
-    solver_ = std::make_unique<ContingencyAnalysisSolver>(
-        *base_state_,
-        std::move(source),
-        static_cast<int>(contingencies_.size()),
-        used_batch_size_,
-        nb_iter_,
-        strategy_type_,
-        refactor_period_,
-        reordering_alg_,
-        matching_alg_,
-        pivot_epsilon_alg_,
-        scaling_max_voltage_change_,
-        max_dVa_,
-        max_dVm_);
+    solver_->nb_iter_ = nb_iter_;   // per-run knob, no rebuild needed
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop
@@ -354,14 +394,11 @@ void ContingencyAnalysisSession::compute_flows()
     const int n = n_ctg * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
-        thrust::host_vector<cuda_real_type> h_or = solver_->d_or_amps_results;
-        thrust::host_vector<cuda_real_type> h_ex = solver_->d_ex_amps_results;
+        // Through the driver's pinned staging buffer (download_into).
         h_or_amps_.resize(n);
         h_ex_amps_.resize(n);
-        for (int i = 0; i < n; ++i) {
-            h_or_amps_(i) = static_cast<eigen_real_type>(h_or[static_cast<size_t>(i)]);
-            h_ex_amps_(i) = static_cast<eigen_real_type>(h_ex[static_cast<size_t>(i)]);
-        }
+        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
+        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
     }
     timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
 }
@@ -585,12 +622,8 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
-    thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = eigen_cplx_type(
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
@@ -602,10 +635,8 @@ RealVect ContingencyAnalysisSession::get_residuals() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
-    thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_residuals);   // pinned, pipelined
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }

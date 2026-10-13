@@ -55,6 +55,25 @@ void InjectionBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
     }
 }
 
+void InjectionBatch::set_rows(std::vector<cudaComplexType>&& h_Sbus_all,
+                              GenVOverride&&                 gen_v_override,
+                              cudaStream_t                   cs)
+{
+    if (h_Sbus_all.size() != h_Sbus_all_.size())
+        throw std::runtime_error(
+            "[injection_batch] set_rows: the row count / bus count changed "
+            "(a new driver is needed)");
+    h_Sbus_all_     = std::move(h_Sbus_all);
+    gen_v_override_ = std::move(gen_v_override);
+    upload_h2d(d_Sbus_all, h_Sbus_all_.data(), h_Sbus_all_.size(), cs);
+    if (gen_v_override_.k_active() > 0) {
+        upload_h2d(d_gv_active_bus, gen_v_override_.h_active_bus.data(),
+                   gen_v_override_.h_active_bus.size(), cs);
+        upload_h2d(d_gv_all, gen_v_override_.h_gen_v_all.data(),
+                   gen_v_override_.h_gen_v_all.size(), cs);
+    }
+}
+
 void InjectionBatch::prepare_Ybus_batch(BatchPfDriverContext& ctx,
                                         int                  chunk_idx,
                                         int                  actual_batch,

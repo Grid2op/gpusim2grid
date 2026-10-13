@@ -55,7 +55,7 @@ def _rhs(session):
 # Lazy adjoint
 # ---------------------------------------------------------------------------
 
-def test_adjoint_is_built_by_the_first_solve_JT(ieee14_base_case):
+def test_adjoint_is_built_by_the_first_solve_JT(ieee14_base_case, solver_atol):
     d = ieee14_base_case
     sess = _bare_session(d, d["Sbus"])
     assert sess.timings.t_prepare_jt_ms == 0.0   # forward only: nothing paid
@@ -67,7 +67,9 @@ def test_adjoint_is_built_by_the_first_solve_JT(ieee14_base_case):
 
     lam2 = _solve_JT(sess, rhs)                  # factors reused as they are
     assert sess.timings.t_prepare_jt_ms == t_first
-    np.testing.assert_array_equal(lam1, lam2)
+    # cuDSS's SOLVE is not bit-reproducible (the first solve on fresh factors
+    # differs from the next ones in the last bits): compare to rounding
+    np.testing.assert_allclose(lam1, lam2, rtol=0, atol=1e-3 * solver_atol)
 
 
 def test_lazy_adjoint_is_the_transpose_solve(ieee14_base_case, solver_atol):

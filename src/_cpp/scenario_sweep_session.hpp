@@ -47,6 +47,7 @@
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
+#include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -64,41 +65,9 @@ struct ScenarioSweepDeviceData;   // session-owned device buffers (defined in th
 template <typename BatchSource> struct BatchPfDriver;
 using ScenarioSweepSolver = BatchPfDriver<ScenarioSweepBatch>;
 
-// =============================================================================
-// ScenarioSweepDriverConfig — the construction-time shape of the live batch
-// driver. run() compares the current settings against the snapshot taken when
-// solver_ was built: any difference means the driver cannot be reused (a
-// "cold" run rebuilds it, with a new cuDSS ANALYSIS); otherwise run() only
-// swaps the source (new topology, "warm") or the injections ("hot"). The
-// config members are plain read/write attributes on the Python side, so a
-// snapshot comparison is the only robust way to notice a change.
-// =============================================================================
-struct ScenarioSweepDriverConfig {
-    int    n_scenarios     = -1;
-    int    batch_size      = 0;
-    int    refactor_period = 1;
-    ContingencySolverType strategy = ContingencySolverType::DirectRefactorEvery;
-    ReorderingAlg   reordering_alg    = ReorderingAlg::Default;
-    MatchingAlg     matching_alg      = MatchingAlg::None;
-    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default;
-    bool   scaling_max_voltage_change = false;
-    double max_dVa = 0.5, max_dVm = 0.1;
-    bool   mask_mode            = false;   // handle_disconnected_grid
-    bool   fixed_batch_capacity = false;
-    int    base_state_generation = -1;
-
-    bool operator==(const ScenarioSweepDriverConfig& o) const {
-        return n_scenarios == o.n_scenarios && batch_size == o.batch_size
-            && refactor_period == o.refactor_period && strategy == o.strategy
-            && reordering_alg == o.reordering_alg && matching_alg == o.matching_alg
-            && pivot_epsilon_alg == o.pivot_epsilon_alg
-            && scaling_max_voltage_change == o.scaling_max_voltage_change
-            && max_dVa == o.max_dVa && max_dVm == o.max_dVm
-            && mask_mode == o.mask_mode && fixed_batch_capacity == o.fixed_batch_capacity
-            && base_state_generation == o.base_state_generation;
-    }
-    bool operator!=(const ScenarioSweepDriverConfig& o) const { return !(*this == o); }
-};
+// ScenarioSweepDriverConfig — the live driver's construction-time shape; see
+// BatchDriverConfig (shared with the contingency / injection sessions).
+using ScenarioSweepDriverConfig = BatchDriverConfig;
 
 struct ScenarioSweepSession {
 
