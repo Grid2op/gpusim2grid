@@ -12,10 +12,15 @@ compute_flows — differentiable branch-flow computation in pure PyTorch.
     S_or = V[from] * conj(I_or)      (complex apparent power, per-unit)
     S_ex = V[to]   * conj(I_ex)
 
-    base_A = sn_mva * 1e6 / (sqrt(3) * vn_kv[from] * 1e3)
+    base_or_A = sn_mva * 1e6 / (sqrt(3) * vn_kv[from] * 1e3)
+    base_ex_A = sn_mva * 1e6 / (sqrt(3) * vn_kv[to]   * 1e3)
+
+Each terminal current is converted to amperes with the nominal voltage of
+its own bus (as lightsim2grid and the CUDA kernels do): the two bases differ
+on a transformer or on any branch joining two voltage levels.
 
 (a side at bus -1 -- Kron-reduced half-open end -- counts as V = 0 with no
-terminal current, and base_A then uses vn_kv[to]).
+terminal current, and its base falls back to the other end's vn_kv).
 
 All operations are natively differentiable via PyTorch autograd. ``V`` may
 carry any number of leading batch dimensions (``(..., n_bus)``, e.g. the
@@ -73,14 +78,18 @@ def compute_flows(
     S_or = Vi * I_or.conj()     # complex apparent power (pu), origin
     S_ex = Vj * I_ex.conj()     # complex apparent power (pu), extremity
 
-    vn_kv = bus_vn_kv[torch.where(live_f, bf, bt)]
-    base_A = sn_mva * 1e6 / (math.sqrt(3.0) * vn_kv * 1e3)
+    # Each terminal's base uses its own bus' nominal voltage; a -1 side (no
+    # current anyway) falls back to the live end's, like set_branch_data.
+    vn_or = bus_vn_kv[torch.where(live_f, bf, bt)]
+    vn_ex = bus_vn_kv[torch.where(live_t, bt, bf)]
+    base_or_A = sn_mva * 1e6 / (math.sqrt(3.0) * vn_or * 1e3)
+    base_ex_A = sn_mva * 1e6 / (math.sqrt(3.0) * vn_ex * 1e3)
 
     return {
         "p_or_mw":   S_or.real * sn_mva,
         "q_or_mvar": S_or.imag * sn_mva,
         "p_ex_mw":   S_ex.real * sn_mva,
         "q_ex_mvar": S_ex.imag * sn_mva,
-        "i_or_a":    I_or.abs() * base_A,
-        "i_ex_a":    I_ex.abs() * base_A,
+        "i_or_a":    I_or.abs() * base_or_A,
+        "i_ex_a":    I_ex.abs() * base_ex_A,
     }

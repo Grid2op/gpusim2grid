@@ -87,8 +87,9 @@ def main(case="case14"):
 
     converged = ca.converged()
     violations = ca.get_violations()
-    # get_violations()' per-contingency records are capped at
-    # violation_capacity; get_violation_counts() reports the TRUE, uncapped
+    # get_violations() keeps, per contingency and per type, the
+    # violation_capacity most severe records (by |value / limit - 1|, most
+    # severe first); get_violation_counts() reports the TRUE, uncapped
     # count of each type per contingency, so totals stay exact even for a
     # contingency that hit get_violations_truncated().
     counts = ca.get_violation_counts()

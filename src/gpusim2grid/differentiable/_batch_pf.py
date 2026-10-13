@@ -91,10 +91,50 @@ depending on ``gen_v`` through ``G``. Hence
 
 where ``∂S_calc/∂Vm_k`` is the dS/dVm column ``fill_J`` never stores for a
 Vm-fixed bus, evaluated on the row's own patched Ybus. The minus sign is the
-implicit-function sign: ``dx/dVm_k = -J⁻¹ ∂S_calc/∂Vm_k``. Only generators
-whose own bus is Vm-fixed (pv or slack) get a non-zero gradient -- exactly
-the ones ``set_gen_v`` acts on; a NaN entry (= "keep the base-case voltage")
-gets 0.
+implicit-function sign: ``dx/dVm_k = -J⁻¹ ∂S_calc/∂Vm_k``.
+
+A generator regulating a bus a VoltageControl group holds (a remote
+regulator: ``regulated_bus_id`` differs from its own bus) does not fix any
+``|V|``: its set-point is the group's ``v_set`` in the bordered equation
+``F_v = |V_reg| + Σ s·Q_c − v_set = 0``. ``∂F_v/∂v_set = −1``, the same sign an
+injection has in its P/Q row, so its gradient is ``λ`` at that group's
+voltage row (0 on a row where ``handle_disconnected_grid`` stranded every
+controller of the group: its row then no longer contains ``v_set``; 0 for a
+group holding an SVC or an
+hvdc station, whose set-point no batch moves).
+
+Tied set-points: generators regulating the same bus must agree on a row (a
+bus has one magnitude, a group one ``v_set``; rows that don't are NOT
+SIMULATED), so only the derivative ALONG the tie exists. It is split equally
+between the columns that actually apply on that row (non-NaN, not taken out by
+``gen_status``) -- they sum to it, as ``lightsim2grid``'s ``get_gen_v_share``.
+
+Only generators whose ``gen_v`` reaches the solve get a non-zero gradient
+(``InjectionElements.gen_v_bus``: connected, voltage regulation on, not
+treated as off, keyed on the REGULATED bus); a non-regulating generator
+co-located with a regulating one gets 0 and never conflicts; a NaN entry (=
+"keep the base-case set-point") gets 0.
+
+``redistribute_slack`` (lightsim2grid PR #216, ``ScenarioSweepGPU``'s option
+of the same name): what a row loses -- the generators ``gen_status`` takes out,
+the island ``handle_disconnected_grid`` masks, and the imbalance its own
+``load_p`` / ``gen_p`` create against the grid's set-points -- is shared on the remaining
+slack units BEFORE the solve, OpenLoadFlow-style (clamped to ``[min_p,
+max_p]``, a clamped unit leaving that row's slack). Here the pre-pass runs in
+the forward itself, so that its correction is part of the autograd graph: the
+lost power and the units' set-points are torch expressions of ``load_p`` /
+``gen_p``, the OLF loop runs on the host to decide which units end up clamped,
+and the correction is rebuilt in torch with that set fixed -- exact values
+from the host, and the exact derivative of the (piecewise-linear) pre-pass: a
+free unit moves by ``w_k / W_free · (lost − Σ_clamped ΔP_j)``, a unit clamped
+to a bound sits there whatever its set-point. With the clamped set fixed, the
+free units absorb what was lost in proportion to their weights -- what the
+Newton slack, which has the same free units and weights, would do anyway -- so
+the lost power itself (a disconnected generator's ``gen_p``, a masked island's
+injections) has a zero local derivative, and a clamped unit's own ``gen_p``
+moves nothing at all (with a constant correction it would move the state as
+any participant does). The derivative is one-sided where a small change would
+make a unit reach or leave a bound.
 
 Row bookkeeping: the session works in *active-slot* order (rows the
 connectivity pre-check drops are compacted out); all of that stays in C++
@@ -125,7 +165,7 @@ import torch
 from torch import Tensor
 
 from .. import _gpusim2grid as _cpp
-from .._ls2g_utils import extract_branch_data, GEN_V_CONFLICT_TOL
+from .._ls2g_utils import extract_branch_data, gen_v_driven_columns, GEN_V_CONFLICT_TOL
 from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
 from ._flows import compute_flows as _compute_flows_torch
 
@@ -177,8 +217,19 @@ class BatchPowerFlow:
         self._load_sel = torch.as_tensor(np.asarray(el.load_sel, dtype=np.int64), device=dev)
         self._load_bus_sel = torch.as_tensor(np.asarray(el.load_bus[el.load_sel], dtype=np.int64), device=dev)
         self._gen_bus_all = torch.as_tensor(np.asarray(el.gen_bus, dtype=np.int64), device=dev)
-        self._gen_bus_np = np.ascontiguousarray(el.gen_bus, dtype=np.int32)
+        # bus each gen_v set-point writes (-1: none; see InjectionElements.gen_v_bus)
+        self._gen_v_bus_all = torch.as_tensor(np.asarray(el.gen_v_bus, dtype=np.int64), device=dev)
+        self._gen_v_bus_np = np.ascontiguousarray(el.gen_v_bus, dtype=np.int32)
         self._is_vm_fixed = torch.as_tensor(self._solver.is_vm_fixed_bus, device=dev)
+        # VoltageControl: group regulating each bus (-1: none), each group's
+        # bordered voltage row, and the groups whose v_set is pinned by a member
+        # without a gen_v column (SVC / hvdc station)
+        self._vc_group_np = np.asarray(self._solver.vc_group_of_bus, dtype=np.int64)
+        self._vc_group = torch.as_tensor(self._vc_group_np, device=dev)
+        self._vc_v_row = torch.as_tensor(np.asarray(self._solver.vc_v_row_of_group, dtype=np.int64),
+                                         device=dev)
+        self._vc_pinned_np = np.asarray(self._solver.vc_pinned_v_set, dtype=np.float64)
+        self._vc_pinned = torch.as_tensor(np.isfinite(self._vc_pinned_np), device=dev)
         # Generator contingencies (build_bus_injections' gen_off correction):
         # the target Q of a NON-regulating generator sits inside const_mw and
         # leaves with it. Older snapshots (no reactive data) cannot do this.
@@ -204,6 +255,13 @@ class BatchPowerFlow:
         self._ytt = torch.as_tensor(np.asarray(ytt), dtype=self._cdtype, device=dev)
         self._bus_vn_kv = torch.as_tensor(np.asarray(vn_kv), dtype=rdt, device=dev)
 
+        # redistribute_slack (see the module docstring): off until asked for.
+        self._redistribute_slack = False
+        self._rd = None                 # the slack participants, as tensors
+        self._rd_masks = None           # (masked, dropped, topology mask they were built from)
+        self._pending_ext_sat = None    # per-row saturated units for the session, or "clear"
+        self._ext_sat_in_session = False
+
         # Call-to-call state.
         self._last_n_scen = None
         # The *_mask attributes describe what the session actually holds: they
@@ -224,17 +282,28 @@ class BatchPowerFlow:
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
         self._skip_in_session = False
         self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
-        # Columns that can conflict: connected generators on a Vm-fixed bus
-        # sharing that bus with another such generator.
-        gb = np.asarray(el.gen_bus, dtype=np.int64)
-        fixed = np.asarray(self._solver.is_vm_fixed_bus, dtype=bool)
-        ok = gb >= 0
-        ok[ok] = fixed[gb[ok]]
-        _, inv, cnt = np.unique(gb[ok], return_inverse=True, return_counts=True)
-        cols = np.flatnonzero(ok)[cnt[inv] > 1]
+        # Columns the session drives (their regulated bus is Vm-fixed, or held by
+        # a VoltageControl group), and among them the ones that can conflict:
+        # sharing their regulated bus with another driven column, or regulating
+        # a bus whose group set-point is pinned.
+        gb = np.asarray(el.gen_v_bus, dtype=np.int64)
+        driven = gen_v_driven_columns(gb, self._solver.is_vm_fixed_bus, self._vc_group_np)
+        self._driven = torch.as_tensor(driven, device=dev)
+        _, inv, cnt = np.unique(gb[driven], return_inverse=True, return_counts=True)
+        shared = np.zeros(driven.size, dtype=bool)
+        shared[np.flatnonzero(driven)[cnt[inv] > 1]] = True
+        ref = np.full(self.n_bus, np.nan)
+        grp_of_col = np.where(driven, self._vc_group_np[np.clip(gb, 0, None)], -1)
+        if self._vc_pinned_np.size:
+            pinned_col = (grp_of_col >= 0) & np.isfinite(
+                self._vc_pinned_np[np.clip(grp_of_col, 0, None)])
+            shared |= pinned_col
+            ref[gb[pinned_col]] = self._vc_pinned_np[grp_of_col[pinned_col]]
+        cols = np.flatnonzero(shared)
         self._shared_cols = torch.as_tensor(cols, device=dev) if cols.size else None
         if self._shared_cols is not None:
             self._shared_bus = torch.as_tensor(gb[cols], device=dev)
+            self._pinned_ref = torch.as_tensor(ref, dtype=rdt, device=dev)
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -244,7 +313,8 @@ class BatchPowerFlow:
                     pivot_epsilon_alg=None, use_distributed_slack=True,
                     scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                     init_from_n_powerflow=True, max_iter_base=10, tol_base=1e-8,
-                    precision=None, gen_v_conflict_tol=GEN_V_CONFLICT_TOL):
+                    precision=None, gen_v_conflict_tol=GEN_V_CONFLICT_TOL,
+                    redistribute_slack=False):
         """Build from a *solved* lightsim2grid grid (``grid.ac_pf`` done).
 
         The keyword arguments are :class:`gpusim2grid.ScenarioSweepGPU`'s
@@ -263,10 +333,53 @@ class BatchPowerFlow:
             pivot_epsilon_alg=pivot_epsilon_alg,
             scaling_max_voltage_change=scaling_max_voltage_change,
             max_dVa=max_dVa, max_dVm=max_dVm,
-            use_distributed_slack=use_distributed_slack)
+            use_distributed_slack=use_distributed_slack,
+            # a row's angles must not depend on the other rows' topologies
+            reference_slack="grid")
         sweep.strategy = strategy
-        return cls(sweep, snapshot_jacobian=snapshot_jacobian,
-                   gen_v_conflict_tol=gen_v_conflict_tol)
+        pf = cls(sweep, snapshot_jacobian=snapshot_jacobian,
+                 gen_v_conflict_tol=gen_v_conflict_tol)
+        pf.redistribute_slack = redistribute_slack
+        return pf
+
+    # ------------------------------------------------------ redistribute_slack
+    @property
+    def redistribute_slack(self):
+        """bool: run lightsim2grid's ``redistribute_slack`` pre-pass in every
+        forward, differentiably (see the module docstring). Needs the
+        distributed slack and the grid's ``set_gen_p_limits`` /
+        ``set_storage_p_limits`` to clamp anything (turning it on reads them
+        off the grid). Default False."""
+        return self._redistribute_slack
+
+    @redistribute_slack.setter
+    def redistribute_slack(self, value):
+        if bool(value) != value:
+            raise ValueError("The `redistribute_slack` attribute must be a boolean.")
+        value = bool(value)
+        if value:
+            grid = self._sweep._grid
+            data = _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self.n_bus)
+            self._solver._s.set_slack_redistribution_data(data)
+            dev, rdt = self._dev, self._rdtype
+            kind = np.asarray(data.kind, dtype=np.int64)
+            self._rd = {
+                "n": int(data.n_units),
+                "is_gen": torch.as_tensor(kind == 5, device=dev),
+                "el_id": torch.as_tensor(np.asarray(data.el_id, dtype=np.int64), device=dev),
+                "bus": torch.as_tensor(np.asarray(data.bus_solver, dtype=np.int64), device=dev),
+                "weight": torch.as_tensor(np.asarray(data.weight), dtype=rdt, device=dev),
+                "target": torch.as_tensor(np.asarray(data.target_p_mw), dtype=rdt, device=dev),
+                "weight_np": np.ascontiguousarray(data.weight, dtype=np.float64),
+                "min_np": np.ascontiguousarray(data.min_p_mw, dtype=np.float64),
+                "max_np": np.ascontiguousarray(data.max_p_mw, dtype=np.float64),
+                "gen_in_grid": torch.as_tensor(np.asarray(data.gen_bus_solver) >= 0, device=dev),
+                "shunt": torch.as_tensor(np.asarray(data.shunt_p_mw), dtype=rdt, device=dev),
+                "base_p_mw": float(data.base_p_mw),
+            }
+        elif self._ext_sat_in_session:
+            self._pending_ext_sat = "clear"
+        self._redistribute_slack = value
 
     # --------------------------------------------------------------- forward
     def __call__(self, *args, **kwargs):
@@ -300,6 +413,7 @@ class BatchPowerFlow:
 
         self._apply_topology(line_status, trafo_status, n_scen)
         gen_off = self._apply_gen_status(gen_status, n_scen)
+        gen_p_in = gen_p   # a disconnected generator's set-point is what the others make up
 
         if n_scen != self._last_n_scen:
             # Capacity == n_scen: one chunk, whatever rows get islanded.
@@ -328,8 +442,106 @@ class BatchPowerFlow:
         if self._load_sel.numel():
             P = P.index_add(1, self._load_bus_sel, -load_p[:, self._load_sel] * inv_sn)
             Q = Q.index_add(1, self._load_bus_sel, -load_q[:, self._load_sel] * inv_sn)
+        if self._redistribute_slack:
+            P = self._slack_prepass(P, gen_p_in, gen_off, n_scen)
 
         return _BatchPowerFlowOp.apply(P, Q, gen_v, self)
+
+    def _row_masks(self, n_scen):
+        """(n_scen, n_bus) bool: the buses each row's topology masks (none
+        without handle_disconnected_grid), and (n_scen,) bool: the rows it
+        drops. Cached until the topology changes.
+
+        Runs before the op hands the pending topology to the session, so it
+        reads the topology this call will solve -- the queued one, else the
+        one the session holds -- and keys the cache on that very tensor (a
+        call that raised before the session took a queued topology cannot
+        leave its masks behind)."""
+        topo = (self._pending_topology_mask if self._pending_topology is not None
+                else self._topology_mask)
+        if (self._rd_masks is not None and self._rd_masks[2] is topo
+                and self._rd_masks[0].shape[0] == n_scen):
+            return self._rd_masks[0], self._rd_masks[1]
+        masked = torch.zeros(n_scen, self.n_bus, dtype=torch.bool, device=self._dev)
+        dropped = torch.zeros(n_scen, dtype=torch.bool, device=self._dev)
+        if topo is not None:
+            nz = topo.nonzero().cpu().numpy()
+            ragged = [[] for _ in range(n_scen)]
+            for r, c in nz:
+                ragged[int(r)].append(int(c))
+            disc, buses = self._solver._s.preview_row_masks(ragged)
+            dropped = torch.as_tensor(np.asarray(disc, dtype=bool), device=self._dev)
+            rows = [r for r, b in enumerate(buses) for _ in b]
+            cols = [x for b in buses for x in b]
+            if cols:
+                masked[torch.as_tensor(rows, device=self._dev),
+                       torch.as_tensor(cols, device=self._dev)] = True
+        self._rd_masks = (masked, dropped, topo)
+        return masked, dropped
+
+    def _slack_prepass(self, P, gen_p_in, gen_off, n_scen):
+        """lightsim2grid's redistribute_slack pre-pass, differentiable (see the
+        module docstring): returns P with each row's correction added, and
+        queues the units it saturated for the session's row weights."""
+        rd = self._rd
+        sn = self.sn_mva
+        masked, dropped = self._row_masks(n_scen)
+        Mf = masked.to(P.dtype)
+        # what each row loses: its island's net injection (minus the shunts the
+        # AC Sbus does not carry), the generators it disconnects and what its
+        # injections take out of the balance of the grid's set-points (P left
+        # the disconnected generators out: put back, the line above counts them)
+        lost = (P * Mf).sum(1) * sn - Mf @ rd["shunt"]
+        if gen_off is not None:
+            off = gen_off & rd["gen_in_grid"].unsqueeze(0)
+            lost = lost + (gen_p_in * off.to(P.dtype)).sum(1)
+        if np.isfinite(rd["base_p_mw"]):
+            lost = lost + rd["base_p_mw"] - P.sum(1) * sn
+            if gen_off is not None:
+                lost = lost - (gen_p_in * off.to(P.dtype)).sum(1)
+        lost = torch.where(dropped, torch.zeros_like(lost), lost)
+        if rd["n"] == 0:
+            self._queue_ext_sat([[] for _ in range(n_scen)])
+            return P
+
+        # the units that stay, at their row set-point (generator convention)
+        is_gen = rd["is_gen"].unsqueeze(0)
+        el = rd["el_id"].clamp(max=max(self.n_gen - 1, 0))
+        target = rd["target"].unsqueeze(0).expand(n_scen, -1)
+        inj = torch.where(is_gen, gen_p_in[:, el], target) if self.n_gen > 0 else target
+        pool = (rd["weight"] > 1e-7).unsqueeze(0) & ~masked[:, rd["bus"]]
+        if gen_off is not None:
+            pool = pool & ~(is_gen & gen_off[:, el])
+
+        new_np, clamped_np, sat_np, _ = _cpp._slack_distribute_rows(
+            np.ascontiguousarray(inj.detach().cpu().numpy(), dtype=np.float64),
+            np.ascontiguousarray(pool.cpu().numpy(), dtype=np.int32),
+            rd["weight_np"], rd["min_np"], rd["max_np"],
+            np.ascontiguousarray(lost.detach().cpu().numpy(), dtype=np.float64))
+        new = torch.as_tensor(new_np, dtype=P.dtype, device=self._dev)
+        clamped = torch.as_tensor(clamped_np, device=self._dev).bool() & pool
+        # the exact values of the host loop, the derivative of the linear map
+        # the loop is for this clamped set
+        kept_old = clamped & (new == inj.detach())
+        dp_clamped = torch.where(clamped & ~kept_old, new - inj, torch.zeros_like(inj))
+        free = pool & ~clamped
+        w = rd["weight"].unsqueeze(0).expand(n_scen, -1)
+        w_free = (w * free.to(P.dtype)).sum(1, keepdim=True)
+        rest = (lost - dp_clamped.sum(1)).unsqueeze(1)
+        dp_free = torch.where(free & (w_free > 0), w * rest / torch.where(w_free > 0, w_free, torch.ones_like(w_free)),
+                              torch.zeros_like(inj))
+        shares = (lost.detach().abs() > 1e-6).unsqueeze(1)
+        dp_lin = torch.where(shares & pool, dp_clamped + dp_free, torch.zeros_like(inj))
+        dp_host = torch.where(pool, new - inj.detach(), torch.zeros_like(inj))
+        dp = dp_host + (dp_lin - dp_lin.detach())
+        P = P.index_add(1, rd["bus"], dp / sn)
+
+        sat = [np.flatnonzero(row).tolist() for row in np.asarray(sat_np, dtype=bool)]
+        self._queue_ext_sat(sat)
+        return P
+
+    def _queue_ext_sat(self, sat):
+        self._pending_ext_sat = sat
 
     # --------------------------------------------------------------- results
     def get_disconnected(self):
@@ -473,6 +685,11 @@ class BatchPowerFlow:
             lo = lo.scatter_reduce(1, idx, torch.where(finite, v, torch.full_like(v, big)),
                                    reduce="amin")
             both = (hi > small) & (lo < big)
+            # a pinned group set-point takes part as one more (fixed) value
+            ref = self._pinned_ref.unsqueeze(0).expand(n_scen, -1)
+            has_ref = torch.isfinite(ref) & both
+            hi = torch.where(has_ref, torch.maximum(hi, ref), hi)
+            lo = torch.where(has_ref, torch.minimum(lo, ref), lo)
             conflict = both & ((hi - lo) > self.gen_v_conflict_tol)
             rows = conflict.any(dim=1)
             if bool(rows.any()):
@@ -558,11 +775,21 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             pf._pending_gen_off = None
             pf._pending_gen_off_mask = None
         if gen_v is not None:
-            solver.set_gen_v_dlpack(gen_v.detach().contiguous().__dlpack__(), pf._gen_bus_np, stream)
+            solver.set_gen_v_dlpack(gen_v.detach().contiguous().__dlpack__(), pf._gen_v_bus_np, stream)
             pf._gen_v_in_session = True
         elif pf._gen_v_in_session:
             solver.clear_gen_v()
             pf._gen_v_in_session = False
+
+        if pf._pending_ext_sat is not None:
+            # after the injections (the session checks the row count against them)
+            if isinstance(pf._pending_ext_sat, str):
+                solver._s.clear_external_slack_saturation()
+                pf._ext_sat_in_session = False
+            else:
+                solver._s.set_external_slack_saturation(pf._pending_ext_sat)
+                pf._ext_sat_in_session = True
+            pf._pending_ext_sat = None
 
         want_gen_v = gen_v is not None and ctx.needs_input_grad[2]
         needs_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or want_gen_v
@@ -582,6 +809,18 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                     if buses:
                         m[r, torch.as_tensor(buses, device=dev)] = True
                 pf._released = m
+
+        # Rows where handle_disconnected_grid stranded a VoltageControl group:
+        # its voltage row became Q_c == 0 and no longer holds v_set.
+        ctx.stranded = None
+        if want_gen_v and pf._vc_v_row.numel():
+            st = solver.get_row_stranded_vc_groups()
+            if any(st):
+                m = torch.zeros(V.shape[0], pf._vc_v_row.numel(), dtype=torch.bool, device=dev)
+                for r, groups in enumerate(st):
+                    if groups:
+                        m[r, torch.as_tensor(groups, device=dev)] = True
+                ctx.stranded = m
 
         ctx.pf = pf
         ctx.run_id = solver.run_counter
@@ -663,15 +902,29 @@ class _BatchPowerFlowOp(torch.autograd.Function):
         if ctx.want_gen_v:
             gvm = torch.from_dlpack(gvm_cap).clone()          # indirect term (sign included)
             g_bus = proj_vm + gvm                              # + direct term
-            gen_bus = pf._gen_bus_all
+            gen_bus = pf._gen_v_bus_all
             safe_bus = gen_bus.clamp(min=0)
-            ok = (gen_bus >= 0) & pf._is_vm_fixed[safe_bus]
-            g = g_bus[:, safe_bus]
-            g = torch.where(ok.unsqueeze(0), g, torch.zeros_like(g))
+            g = torch.where(pf._is_vm_fixed[safe_bus].unsqueeze(0), g_bus[:, safe_bus],
+                            torch.zeros_like(g_bus[:, safe_bus]))
+            if pf._vc_v_row.numel():
+                # a set-point driving a VoltageControl group: lambda at its
+                # voltage row (dF_v/dv_set = -1, the injection sign)
+                g_grp = lam[:, pf._vc_v_row]
+                if ctx.stranded is not None:
+                    g_grp = torch.where(ctx.stranded, torch.zeros_like(g_grp), g_grp)
+                g_grp = torch.where(pf._vc_pinned.unsqueeze(0), torch.zeros_like(g_grp), g_grp)
+                grp = pf._vc_group[safe_bus]
+                is_vc = grp >= 0
+                g = torch.where(is_vc.unsqueeze(0), g_grp[:, grp.clamp(min=0)], g)
             if ctx.released is not None:
                 rel = ctx.released[:, safe_bus]
                 g = torch.where(rel, torch.zeros_like(g), g)
-            g = torch.where(torch.isnan(gen_v), torch.zeros_like(g), g)
-            grad_gen_v = g
+            # tied set-points: the one derivative that exists is split between
+            # the columns that actually applied on that row
+            applied = pf._driven.unsqueeze(0) & ~torch.isnan(gen_v)
+            count = torch.zeros(n_scen, n_bus, dtype=rdtype, device=dev).scatter_add_(
+                1, safe_bus.unsqueeze(0).expand(n_scen, -1), applied.to(rdtype))
+            share = 1.0 / count.gather(1, safe_bus.unsqueeze(0).expand(n_scen, -1)).clamp(min=1.0)
+            grad_gen_v = torch.where(applied, g * share, torch.zeros_like(g))
 
         return grad_P, grad_Q, grad_gen_v, None

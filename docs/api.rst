@@ -62,6 +62,21 @@ a ``GRID``/``DIVERGENCE`` entry instead of needing a separate convergence
 check; one the pre-check dropped before it was ever solved gets a ``GRID``/
 ``NOT_SIMULATED`` entry instead.
 
+A value is reported only when it is past its limit by more than a relative
+margin, ``violation_rel_tol`` (default ``1e-9``, lightsim2grid's name and
+rule): ``CURRENT`` when ``ka > limit * (1 + tol)``, ``HIGH_VOLTAGE`` when
+``v > vmax * (1 + tol)``, ``LOW_VOLTAGE`` when ``v < vmin * (1 - tol)``. A bus
+a regulator holds exactly at its ``vmax`` comes out of the solve a few ulps on
+either side of it; without the margin the last bit of rounding would decide
+whether it is reported, and the GPU and lightsim2grid would disagree. Set it
+to ``0`` for the bare strict comparisons (an FP32 build cannot resolve
+``1e-9``; use about ``1e-6`` there):
+
+.. code-block:: python
+
+    ca = ContingencyAnalysisGPU(grid, compute_limit_violations=True)
+    ca.violation_rel_tol = 1e-6       # takes effect on the next compute()
+
 Per contingency, branch current is checked **before** bus voltage (thermal
 violations are generally a first-order operational concern, voltage a
 second-order one), so :meth:`~gpusim2grid.ContingencyAnalysisGPU.get_violations`
@@ -91,6 +106,91 @@ batch) :meth:`~gpusim2grid.ContingencyAnalysisGPU.get_violations_n` /
 
 .. autoclass:: gpusim2grid.contingency_analysis.LimitViolation
    :members:
+
+.. autoclass:: gpusim2grid.contingency_analysis.ViolationCategory
+   :members:
+
+Physical checks (outer-loop detection)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A further opt-in, post-solve check, ``compute_physical_violations``, is
+available on **all three** batch facades (:class:`~gpusim2grid.ContingencyAnalysisGPU`,
+:class:`~gpusim2grid.ScenarioSweepGPU`, :class:`~gpusim2grid.InjectionSweepGPU`),
+with lightsim2grid's names and contract. Unlike the operational limits above,
+its records say that the converged solution is **not a state the grid can
+reach at all** — the control it assumes cannot be held by the equipment: every
+entry of :meth:`~gpusim2grid.ContingencyAnalysisGPU.get_physical_violations`
+has ``category ==`` :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.PHYSICAL`.
+One flag for the whole category, so the next physical limit needs no new one.
+Each check is the first pass of a PowSyBl OpenLoadFlow *outer loop*, as a
+detection: nothing is switched or re-solved, the row is only reported. They
+run fused into each chunk on the device like the operational check, write a
+bounded per-row record buffer, and keep their records apart from
+``get_violations()``. A row that was never simulated or did not converge has
+an **empty** entry (no sentinel), exactly as lightsim2grid reports it.
+
+Today the category holds five checks:
+
+- **Per-bus reactive capability** (lightsim2grid's own): for every bus whose
+  voltage is held by a machine (a voltage-regulating generator, an HVDC
+  converter station, a voltage-mode SVC), the reactive power those machines
+  had to produce is compared with the **sum** of what they own — ``LOW_Q`` /
+  ``HIGH_Q`` on the ``BUS``, ``value`` / ``limit`` in MVAr. Per bus, not per
+  machine: the split between machines of one bus is a convention, what the
+  bus as a whole can produce is not. The routing (which machine holds which
+  bus) is built by lightsim2grid itself off the grid, so in grid mode nothing
+  else is needed; in explicit-array mode hand it in with
+  :meth:`~gpusim2grid.ContingencyAnalysisGPU.set_bus_q_capability`. Note that
+  ``element_id`` is the *solver* bus id, like every other gpusim2grid record.
+- **PQ → PV release** (lightsim2grid's ``GenPvReleaseCheck``): a generator an
+  outer loop left pinned at a reactive limit (flagged with lightsim2grid's
+  ``LSGrid.set_gen_can_be_pv``, ``init_from_pypowsybl``'s ``can_be_pv``) whose
+  regulated bus is still below (at its minimum Q) or above (at its maximum Q)
+  the target it would hold would regulate again —
+  ``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q`` on the ``GENERATOR``,
+  ``value`` the regulated voltage and ``limit`` the target, in kV. The same
+  for an SVC or a VSC station frozen at a reactive limit
+  (``LSGrid.set_svc_can_be_pv``), reported on its own element. In
+  explicit-array mode, hand the candidates in with
+  :meth:`~gpusim2grid.ContingencyAnalysisGPU.set_gen_pv_release_capability`.
+- **SVC standby automaton** (lightsim2grid's ``SvcStandbyCheck``,
+  OpenLoadFlow's ``MonitoringVoltageOuterLoop``): an idle SVC flagged as
+  carrying a standby automaton (``LSGrid.set_svc_standby``) whose regulated
+  bus left the automaton's thresholds would be switched to voltage control —
+  ``LOW_VOLTAGE_SVC_STANDBY`` / ``HIGH_VOLTAGE_SVC_STANDBY`` on the ``SVC``,
+  ``value`` / ``limit`` in kV.
+- **HVDC droop ("AC emulation") P saturation** (OpenLoadFlow's
+  ``HvdcAcEmulationLimits``): a droop line in linear regime whose angle-driven
+  flow leaves the AC bus above ``pmax`` in the direction it flows —
+  ``HVDC_P_SATURATION`` on the ``HVDC`` element, ``side`` 1 (would saturate
+  1→2) or 2 (2→1), ``value`` / ``limit`` in MW. A line already saturated is
+  pinned at ``pmax`` by construction and is not checked.
+
+- **Active power of the distributed slack** (lightsim2grid's ``GenPCheck``,
+  OpenLoadFlow's ``DistributedSlack`` outer loop): the slack is solved inside
+  the Jacobian by participation factors that know nothing about limits, so a
+  participating generator's or storage unit's converged active power (its
+  target plus its share of the imbalance) can leave ``[min_p_mw, max_p_mw]`` —
+  ``LOW_P`` / ``HIGH_P`` on the ``GENERATOR`` or ``STORAGE``, ``value`` /
+  ``limit`` in MW (generator convention for both families). Generators and
+  storage units are checked together, since a machine's share is a fraction of
+  its whole bus' participation. In explicit-array mode, hand the limits in with
+  :meth:`~gpusim2grid.ContingencyAnalysisGPU.set_gen_p_capability` (unset:
+  nothing is checked).
+
+``physical_violation_tol_mva`` (1e-4 by default) is the slack on every
+MVAr / MW comparison, ``physical_violation_tol_vm_pu`` on the voltage ones
+(the release and standby checks).
+
+.. code-block:: python
+
+    ca = ContingencyAnalysisGPU(grid, compute_physical_violations=True)
+    ca.add_contingencies_by_branch_id([[12], [40]])
+    ca.compute()
+    ca.get_physical_violations()      # list[list[LimitViolation]], one per contingency
+    ca.get_physical_violations_n()    # the base ("n") case
+    [v for v in ca.get_physical_violations()[0]
+     if v.element_type == ViolationElementType.HVDC]   # the hvdc part alone
 
 Injection sweep
 ---------------

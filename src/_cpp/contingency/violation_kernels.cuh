@@ -20,14 +20,16 @@
 
 #include "../dtypes.hpp"
 #include "../cu_complex_utils.h"
+#include "../acpf_nr_kernels.cuh"   // hvdc_flows_pu (shared with the NR loop)
 #include "tripped_branch_table.hpp"
+#include "limit_violation_types.hpp"   // N_*_VIOLATION_GROUPS
 
 // -----------------------------------------------------------------------------
 // check_limit_violations_kernel
 //
 // One thread PER CONTINGENCY (active slot) in the current chunk -- not per
 // bus, not per (contingency, branch). Each thread owns output slice
-// [out_c*K, out_c*K+K) exclusively (out_c = original contingency index), so
+// [out_c*3K, out_c*3K+3K) exclusively (out_c = original contingency index), so
 // there is no cross-thread write hazard and no atomics anywhere in this
 // kernel. n_contingencies is typically large enough on its own to saturate
 // the GPU at one-thread-per-contingency; total FLOPs are identical to a
@@ -68,11 +70,12 @@
 //        GLOBAL active-slot id c_start+local_c -- typically 0-4 entries,
 //        linear scan).
 //        I_or = yff_eff[l]*V[from] + yft_eff[l]*V[to];  ka_or = |I_or|*base_current_A[l]*0.001
-//        I_ex = ytf_eff[l]*V[from] + ytt_eff[l]*V[to];  ka_ex = |I_ex|*base_current_A[l]*0.001
+//        I_ex = ytf_eff[l]*V[from] + ytt_eff[l]*V[to];  ka_ex = |I_ex|*base_current_ex_A[l]*0.001
 //        (the /1000 converts gpusim2grid's existing Amps-basis
-//        d_base_current_A into kA, matching branch_limit_a1_ka/a2_ka's units;
-//        base_current_A itself is untouched, this kernel is the only place
-//        that rescales it.)
+//        d_base_current_A / d_base_current_ex_A (origin / extremity bus
+//        nominal voltage, see compute_branch_flows_kernel) into kA, matching
+//        branch_limit_a1_ka/a2_ka's units; the bases themselves are
+//        untouched, this kernel is the only place that rescales them.)
 //        if !isnan(limit1[l]) && ka_or > limit1[l] -> CURRENT, side=1 (d_out_count_current++)
 //        if !isnan(limit2[l]) && ka_ex > limit2[l] -> CURRENT, side=2 (d_out_count_current++)
 //
@@ -85,13 +88,16 @@
 //        if !isnan(vmin[b]) && vm_kv < vmin[b]  -> LOW_VOLTAGE (d_out_count_low_voltage++)
 //        else if !isnan(vmax[b]) && vm_kv > vmax[b] -> HIGH_VOLTAGE (d_out_count_high_voltage++)
 //
-// Detail-record capacity: on the (K+1)-th write attempt for a contingency,
-// stop writing further detail records (clamp) and set d_out_truncated[out_c]
-// = 1 -- but keep SCANNING every bus/branch regardless, so the three
-// per-type totals (d_out_count_low_voltage/high_voltage/current) are always
-// the TRUE, uncapped violation counts for that contingency, independent of
-// violation_capacity (K). This is the reason these loops do not stop early
-// on truncation like the detail-record buffer does.
+// Records kept: for EACH violation type (CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE)
+// the K most severe, severity = |value/limit - 1| (relative, so a large bus
+// or line does not outrank a small one by its size alone), sorted most
+// severe first; ties keep scan order. Each type fills its own K-slot range of
+// the row's slice while the row is scanned, and the kept records are then
+// packed to the front of the slice in that type order (d_out_count of them).
+// A type with more than K violations sets d_out_truncated[out_c] = 1. Every
+// bus/branch is scanned whatever is already kept, so the three per-type
+// totals (d_out_count_low_voltage/high_voltage/current) are always the TRUE,
+// uncapped violation counts, independent of violation_capacity (K).
 //
 // element_id de-concatenation (lines-then-trafos -> lightsim2grid's own-type
 // local id, per LimitViolation.hpp's documented convention):
@@ -110,7 +116,8 @@
 // d_bus_vmin_kv/d_bus_vmax_kv : [n_bus] real, kV, NaN = unconfigured
 // d_branch_from/to : [n_branches] int, terminal bus indices
 // d_yff_eff/yft_eff/ytf_eff/ytt_eff: [n_branches] complex, pi-model admittances
-// d_base_current_A : [n_branches] real, Amps-basis (kernel /1000 for kA)
+// d_base_current_A : [n_branches] real, Amps-basis, origin side (kernel /1000 for kA)
+// d_base_current_ex_A : [n_branches] real, same, extremity side
 // d_branch_limit_a1_ka/a2_ka : [n_branches] real, kA, NaN = unconfigured
 // d_trip_start/d_trip_count/d_trip_branch_flat : tripped-branch lookup table,
 //                    indexed by GLOBAL active-slot id (c_start + local_c), or
@@ -119,14 +126,15 @@
 //                    from that path, but the parameters stay generic)
 // n_bus, n_branches, n_lines : dimensions
 // c_start, actual_batch : this chunk's active-slot offset / size
-// K                : violation_capacity, output slots per contingency
+// K                : violation_capacity, records kept per contingency AND
+//                    per type (3K output slots per contingency)
 // d_result_map     : [n_active] active-slot -> original-index map, or nullptr
 //                    for identity (c_start + local_c directly)
-// d_out_*          : [n_contingencies * K] compact SoA output (see
+// d_out_*          : [n_contingencies * 3K] compact SoA output (see
 //                    ContingencyAnalysisSession::get_violation_*())
-// d_out_count      : [n_contingencies]; -1 = not simulated, else 0..K
-//                    (number of DETAIL records written, capped at K)
-// d_out_truncated  : [n_contingencies]; 0/1
+// d_out_count      : [n_contingencies]; -1 = not simulated, else 0..3K
+//                    (number of DETAIL records kept, at most K per type)
+// d_out_truncated  : [n_contingencies]; 0/1 (a type had more than K)
 // d_out_count_low_voltage/high_voltage/current : [n_contingencies]; -1 = not
 //                    simulated, else the TRUE, UNCAPPED count of violations
 //                    of that type (independent of K / violation_capacity --
@@ -136,6 +144,7 @@ __global__ void check_limit_violations_kernel(
     const cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_residuals,
     cuda_real_type          tol,
+    cuda_real_type          rel_tol,
     const cuda_real_type*  __restrict__ d_bus_vn_kv,
     const cuda_real_type*  __restrict__ d_bus_vmin_kv,
     const cuda_real_type*  __restrict__ d_bus_vmax_kv,
@@ -146,6 +155,7 @@ __global__ void check_limit_violations_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
     const cuda_real_type*  __restrict__ d_branch_limit_a1_ka,
     const cuda_real_type*  __restrict__ d_branch_limit_a2_ka,
     const int*             __restrict__ d_trip_start,
@@ -165,5 +175,294 @@ __global__ void check_limit_violations_kernel(
           int*             __restrict__ d_out_count_low_voltage,
           int*             __restrict__ d_out_count_high_voltage,
           int*             __restrict__ d_out_count_current);
+
+// -----------------------------------------------------------------------------
+// check_bus_q_violations_kernel  (compute_physical_violations, lightsim2grid
+// PR #206 parity -- see BusQCheck.hpp there and bus_q_check_data.hpp here)
+//
+// One thread PER active slot, same ownership / no-atomics layout as
+// check_limit_violations_kernel above: records land in this row's exclusive
+// slice [out_c*2K, out_c*2K+2K), LOW_Q ones then HIGH_Q ones, each type
+// holding its K largest |value - limit| (MVAr), most severe first; ties keep
+// PLAN order (the order build_bus_q_plan lists the buses, ascending grid bus
+// id), so the output is deterministic.
+//
+// For each checked bus k (solver id b = d_bus_solver[k]):
+//
+//   what the machines holding b had to produce (MVAr):
+//       q_bus = ( imag( V_b . conj( sum_j Y_bj V_j ) ) - imag(Sbus_b) ) . sn_mva
+//   i.e. the RAW reactive residual of the converged state. This is exactly
+//   lightsim2grid's `imag(mis_bus) + sum Q_c`: its mis_bus is the raw residual
+//   with each VoltageControl controller's -i.Q_c folded in, and the check adds
+//   the Q_c back. Nothing else touches the imaginary part of the residual (the
+//   distributed slack and the HVDC droop act on P rows only), and a regulating
+//   machine's Q is never in Sbus -- so the raw residual IS its output, whether
+//   it pins its own bus (classical PV) or belongs to a bordered control group.
+//   A NaN neighbour voltage (a bus this row masked) counts as 0, exactly like
+//   gen_v_adjoint_kernel: its coupling entries were patched out of Ybus by the
+//   islanding trip, so the value is immaterial, but 0 * NaN would poison the
+//   sum. A checked bus whose OWN V is NaN (masked) is skipped.
+//
+//   what they can produce, THIS row (MVAr):
+//       q_min = sum over LIVE generators of gen_qmin + qmin_fixed
+//             + bmin_sum . |V_b|^2 . sn_mva          (idem q_max)
+//   a generator is live unless d_gen_off[out_c * n_gen + gen_id] (a
+//   ScenarioSweep generator contingency; nullptr = none). nb_live == 0 (every
+//   generator off, no station / storage unit / SVC) => the bus is an ordinary PQ bus in this
+//   row and is not checked (the residual there is nobody's output).
+//
+//   violation:  q_bus < q_min - tol_mvar  -> LOW_Q  (value q_bus, limit q_min)
+//         else  q_bus > q_max + tol_mvar  -> HIGH_Q (value q_bus, limit q_max)
+//   a non-finite limit disables that side; a non-finite q_bus skips the bus.
+//
+// Row gate: when d_residuals != nullptr and the row's residual is NaN or
+// exceeds residual_tol, the row gets count = 0 and NOTHING else -- upstream
+// reports an EMPTY entry for a non-converged row (never a DIVERGENCE record,
+// which stays in get_violations()). d_residuals == nullptr disables the gate
+// (the base-case "n" report, gated by the caller on the base solve's own
+// convergence flag).
+//
+// Sbus indexing follows fill_FQ_kernel: d_Sbus[local_c * sbus_stride + b],
+// stride 0 for a source whose Sbus is shared (ContingencyBatch), n_bus for a
+// per-slot dense row (InjectionBatch / ScenarioSweepBatch). Launched even when
+// n_check == 0 so every simulated row gets count 0 (distinct from the -1
+// "never simulated" sentinel seeded by BatchPfDriver::set_bus_q_check).
+//
+// Capacity: a type with more than K violations sets d_out_truncated[out_c]
+// = 1, its least severe records dropped (upstream has no cap; ours is
+// physical_violation_capacity, per type).
+// -----------------------------------------------------------------------------
+__global__ void check_bus_q_violations_kernel(
+    const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order, post mask-NaN
+    const cudaComplexType* __restrict__ d_Yvals,        // [actual_batch × nnz_Y], slot order, patched
+    const int*             __restrict__ d_Y_outer,      // [n_bus + 1] shared skeleton
+    const int*             __restrict__ d_Y_inner,      // [nnz_Y]
+    const cudaComplexType* __restrict__ d_Sbus,         // see sbus_stride
+    int                                 sbus_stride,
+    const cuda_real_type*  __restrict__ d_residuals,    // [n_rows] ORIGINAL order, or nullptr
+    cuda_real_type                      residual_tol,
+    int                                 n_check,
+    const int*             __restrict__ d_bus_solver,
+    const cuda_real_type*  __restrict__ d_qmin_fixed,
+    const cuda_real_type*  __restrict__ d_qmax_fixed,
+    const int*             __restrict__ d_n_fixed,
+    const cuda_real_type*  __restrict__ d_bmin_sum,
+    const cuda_real_type*  __restrict__ d_bmax_sum,
+    const int*             __restrict__ d_gen_start,
+    const int*             __restrict__ d_gen_id,
+    const cuda_real_type*  __restrict__ d_gen_qmin,
+    const cuda_real_type*  __restrict__ d_gen_qmax,
+    const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
+    int                                 n_gen,
+    cuda_real_type                      sn_mva,
+    cuda_real_type                      tol_mvar,
+    int n_bus, int nnz_Y,
+    int c_start, int actual_batch, int K,
+    const int* __restrict__ d_result_map,
+          int*             __restrict__ d_out_bus_id,
+          int*             __restrict__ d_out_type,
+          cuda_real_type*  __restrict__ d_out_value,
+          cuda_real_type*  __restrict__ d_out_limit,
+          int*             __restrict__ d_out_count,
+          int*             __restrict__ d_out_truncated);
+
+// -----------------------------------------------------------------------------
+// check_hvdc_p_violations_kernel  (compute_physical_violations)
+//
+// OpenLoadFlow's HvdcAcEmulationLimits outer loop, first pass, as a post-solve
+// detection: a droop ("AC emulation") HVDC line in LINEAR regime (status == 0)
+// whose theta-driven flow leaves the AC bus above pmax in the direction it
+// flows would be saturated by that loop (and the row re-solved with the flow
+// pinned at pmax). Nothing is enforced here; it only reports.
+//
+// One thread per active slot, looping over the n_hvdc droop lines of the
+// session (shared single-system arrays, see AcPfNrState). Per line e:
+//     raw = p0 + k . (theta1 - theta2)                 (pu)
+//     (p1, p2) = hvdc_flows_pu(status=0, raw, ...)     the flows LEAVING the AC
+//                                                      buses into the hvdc
+//     raw >= 0 and p1 > pmax12 + tol_pu -> side 1 (saturates 1->2), value p1, limit pmax12
+//     raw <  0 and p2 > pmax21 + tol_pu -> side 2 (saturates 2->1), value p2, limit pmax21
+// value / limit are reported in MW (x sn_mva); element_id is the GRID hvdc id
+// (d_hvdc_id); element_type HVDC. A saturated line (status != 0) is pinned at
+// pmax by construction and is not checked; a line with a NaN end voltage
+// (masked) is skipped. One type, so the row's slice is [out_c*K, out_c*K+K):
+// the K largest |value - limit| (MW), either side, most severe first. Same
+// row gate / result map / capacity / sentinel conventions as
+// check_bus_q_violations_kernel above.
+// -----------------------------------------------------------------------------
+__global__ void check_hvdc_p_violations_kernel(
+    const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order
+    const cuda_real_type*  __restrict__ d_residuals,    // [n_rows] ORIGINAL order, or nullptr
+    cuda_real_type                      residual_tol,
+    int                                 n_hvdc,
+    const int*             __restrict__ d_bus1,
+    const int*             __restrict__ d_bus2,
+    const int*             __restrict__ d_status,
+    const cuda_real_type*  __restrict__ d_p0,
+    const cuda_real_type*  __restrict__ d_k,
+    const cuda_real_type*  __restrict__ d_lf1,
+    const cuda_real_type*  __restrict__ d_lf2,
+    const cuda_real_type*  __restrict__ d_r,
+    const cuda_real_type*  __restrict__ d_pmax12,
+    const cuda_real_type*  __restrict__ d_pmax21,
+    const int*             __restrict__ d_hvdc_id,
+    cuda_real_type                      sn_mva,
+    cuda_real_type                      tol_pu,
+    int n_bus,
+    int c_start, int actual_batch, int K,
+    const int* __restrict__ d_result_map,
+          int*             __restrict__ d_out_hvdc_id,
+          int*             __restrict__ d_out_side,
+          cuda_real_type*  __restrict__ d_out_value,
+          cuda_real_type*  __restrict__ d_out_limit,
+          int*             __restrict__ d_out_count,
+          int*             __restrict__ d_out_truncated);
+
+// -----------------------------------------------------------------------------
+// check_gen_pv_release_violations_kernel  (compute_physical_violations,
+// lightsim2grid's GenPvReleaseCheck.hpp parity, PR #216)
+//
+// The PQ -> PV direction of OpenLoadFlow's ReactiveLimits loop, as a post-solve
+// detection: for every PQ generator of the plan (gen_pv_release_check_data.hpp,
+// flagged by the caller as pinned at a reactive limit), with Vm = |V| of the
+// bus it would regulate and `target` this row's own target (d_targets[out_c *
+// target_stride + k] when non-NaN, the plan's base target otherwise):
+//     at min_q and Vm < target - tol_vm_pu -> LOW_VOLTAGE_AT_MIN_Q  (9)
+//     at max_q and Vm > target + tol_vm_pu -> HIGH_VOLTAGE_AT_MAX_Q (10)
+// value Vm and limit target, both x vn_kv (kV); element_id the generator id.
+// Skipped: a machine whose regulated bus OR own bus is masked (NaN V -- a
+// stranded machine releases nothing, like a disconnected one) and a generator
+// the row disconnects (d_gen_off, ORIGINAL row order, nullptr = none).
+// An entry whose d_el_type is SVC (7; nullptr = every entry a generator) is an
+// SVC, never masked by d_gen_off nor moved by d_targets: an SVC frozen at a
+// reactive limit (the generators' test, reported as LOW_VOLTAGE_AT_MIN_Q /
+// HIGH_VOLTAGE_AT_MAX_Q), or, when d_standby says so (nullptr = none), an idle
+// standby SVC (lightsim2grid's SvcStandbyCheck.hpp): the same test against its
+// low (at_min) / high threshold, reported as LOW_VOLTAGE_SVC_STANDBY (11) /
+// HIGH_VOLTAGE_SVC_STANDBY (12). d_out_el_type says which element each record
+// is on (5 GENERATOR / 7 SVC / 4 HVDC), d_out_gen_id its id and d_out_side its
+// side (the station's end for an HVDC one, 0 otherwise). An HVDC entry (a VSC
+// station frozen at a reactive limit) runs the generators' test, never masked
+// by d_gen_off nor moved by d_targets. Four groups
+// (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
+// HIGH_VOLTAGE_SVC_STANDBY), each keeping the K largest |value / limit - 1|
+// (a relative measure, like every voltage check), most severe first. Same row gate / result map / capacity / sentinel
+// conventions as check_bus_q_violations_kernel above.
+// -----------------------------------------------------------------------------
+__global__ void check_gen_pv_release_violations_kernel(
+    const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order
+    const cuda_real_type*  __restrict__ d_residuals,    // [n_rows] ORIGINAL order, or nullptr
+    cuda_real_type                      residual_tol,
+    int                                 n_entries,
+    const int*             __restrict__ d_gen_id,
+    const int*             __restrict__ d_reg_bus,
+    const int*             __restrict__ d_gen_bus,
+    const int*             __restrict__ d_at_min,
+    const cuda_real_type*  __restrict__ d_target_base,
+    const cuda_real_type*  __restrict__ d_vn_kv,
+    const int*             __restrict__ d_el_type,      // [n_entries] 5 / 7, or nullptr = all generators
+    const int*             __restrict__ d_standby,      // [n_entries] 1 = standby SVC entry, or nullptr = none
+    const int*             __restrict__ d_side,         // [n_entries] 1 / 2 for an HVDC entry, or nullptr = all 0
+    const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
+    int                                 n_gen,
+    const cuda_real_type*  __restrict__ d_targets,      // [n_rows × target_stride] ORIGINAL order, or nullptr
+    int                                 target_stride,
+    cuda_real_type                      tol_vm_pu,
+    int n_bus,
+    int c_start, int actual_batch, int K,
+    const int* __restrict__ d_result_map,
+          int*             __restrict__ d_out_gen_id,
+          int*             __restrict__ d_out_type,
+          int*             __restrict__ d_out_el_type,
+          int*             __restrict__ d_out_side,
+          cuda_real_type*  __restrict__ d_out_value,
+          cuda_real_type*  __restrict__ d_out_limit,
+          int*             __restrict__ d_out_count,
+          int*             __restrict__ d_out_truncated);
+
+// -----------------------------------------------------------------------------
+// check_gen_p_violations_kernel  (compute_physical_violations, lightsim2grid's
+// GenPCheck.hpp parity -- generators AND storage units)
+//
+// One thread per row, like the two above. For every machine of the plan
+// (gen_p_check_data.hpp) that the row leaves participating -- its bus not
+// masked, and not a generator the row disconnected (d_gen_off, ORIGINAL row
+// order, nullptr = none) -- its converged active power is
+//
+//   p = target + node_mismatch(bus) * sn_mva * w / bus_raw_w
+//
+// with `target` this row's own set-point (d_targets[out_c * target_stride + k],
+// NaN = the plan's base one; nullptr = base for every row), `w` the machine's
+// raw participation factor, `bus_raw_w` the sum of the factors of the LIVE
+// participants standing on its bus (upstream's `w_norm(bus) * total_raw_w`)
+// and node_mismatch the raw active residual real(V . conj(Ybus . V) - Sbus)
+// plus the angle-droop hvdc flows leaving the bus (see gen_p_check_data.hpp).
+// A unit the row's redistribute_slack pre-pass saturated (d_no_share_gen /
+// d_no_share_sto, per container id, ORIGINAL row order, nullptr = none) sits
+// at its (clamped) target and takes no share: it is left out of bus_raw_w and
+// gets no share itself (upstream's takes_no_share). A row whose live sharing
+// participants sum to (nearly) nothing checks every unit at its target
+// (upstream's anything_shared). Records: element_type 5 /
+// 6, element_id the container id, type HIGH_P (7) above max_p + tol, LOW_P
+// (8) below min_p - tol, value / limit in MW, generator convention. Same row
+// gate, output layout (LOW_P then HIGH_P, K largest |value - limit| each,
+// generators and storage units ranked together), capacity and result-map
+// conventions as check_bus_q_violations_kernel.
+// -----------------------------------------------------------------------------
+__global__ void check_gen_p_violations_kernel(
+    const cudaComplexType* __restrict__ d_V,
+    const cudaComplexType* __restrict__ d_Yvals,
+    const int*             __restrict__ d_Y_outer,
+    const int*             __restrict__ d_Y_inner,
+    const cudaComplexType* __restrict__ d_Sbus,
+    int                                 sbus_stride,
+    const cuda_real_type*  __restrict__ d_residuals,
+    cuda_real_type                      residual_tol,
+    int                                 n_hvdc,
+    const int*             __restrict__ d_hvdc_bus1,
+    const int*             __restrict__ d_hvdc_bus2,
+    const int*             __restrict__ d_hvdc_status,
+    const cuda_real_type*  __restrict__ d_hvdc_p0,
+    const cuda_real_type*  __restrict__ d_hvdc_k,
+    const cuda_real_type*  __restrict__ d_hvdc_lf1,
+    const cuda_real_type*  __restrict__ d_hvdc_lf2,
+    const cuda_real_type*  __restrict__ d_hvdc_r,
+    const cuda_real_type*  __restrict__ d_hvdc_pmax12,
+    const cuda_real_type*  __restrict__ d_hvdc_pmax21,
+    int                                 n_entries,
+    const int*             __restrict__ d_el_type,
+    const int*             __restrict__ d_el_id,
+    const int*             __restrict__ d_bus_solver,
+    const int*             __restrict__ d_bus_slot,
+    const cuda_real_type*  __restrict__ d_weight,
+    const cuda_real_type*  __restrict__ d_min_p,
+    const cuda_real_type*  __restrict__ d_max_p,
+    const cuda_real_type*  __restrict__ d_target_base,
+    int                                 n_part_bus,
+    const int*             __restrict__ d_part_bus,
+    const int*             __restrict__ d_part_start,
+    const int*             __restrict__ d_part_el_type,
+    const int*             __restrict__ d_part_el_id,
+    const cuda_real_type*  __restrict__ d_part_weight,
+    const unsigned char*   __restrict__ d_gen_off,
+    int                                 n_gen,
+    const cuda_real_type*  __restrict__ d_targets,
+    int                                 target_stride,
+    const unsigned char*   __restrict__ d_no_share_gen,   // [n_rows × n_ns_gen] ORIGINAL order, or nullptr
+    int                                 n_ns_gen,
+    const unsigned char*   __restrict__ d_no_share_sto,   // [n_rows × n_ns_sto] ORIGINAL order, or nullptr
+    int                                 n_ns_sto,
+    cuda_real_type                      sn_mva,
+    cuda_real_type                      tol_mw,
+    int n_bus, int nnz_Y,
+    int c_start, int actual_batch, int K,
+    const int* __restrict__ d_result_map,
+          int*             __restrict__ d_out_element_type,
+          int*             __restrict__ d_out_element_id,
+          int*             __restrict__ d_out_type,
+          cuda_real_type*  __restrict__ d_out_value,
+          cuda_real_type*  __restrict__ d_out_limit,
+          int*             __restrict__ d_out_count,
+          int*             __restrict__ d_out_truncated);
 
 #endif  // VIOLATION_KERNELS_CUH

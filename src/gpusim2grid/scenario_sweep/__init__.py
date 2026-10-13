@@ -46,7 +46,19 @@ from ..contingency_analysis import (
 from ..contingency_analysis._limit_violations import (
     ViolationElementType,
     LimitViolationType,
+    ViolationCategory,
+    violation_category,
     LimitViolation,
+    LimitViolationsEngineMixin,
+    LimitViolationsFacadeMixin,
+)
+from ..contingency_analysis._physical_checks import (
+    PhysicalChecksEngineMixin,
+    PhysicalChecksFacadeMixin,
+)
+from ..contingency_analysis._slack_redistribution import (
+    SlackRedistributionEngineMixin,
+    SlackRedistributionFacadeMixin,
 )
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
@@ -76,7 +88,8 @@ def _resolve_strategy(strategy):
     )
 
 
-class _ScenarioSweepSolver:
+class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
+                           LimitViolationsEngineMixin):
     """Stateful GPU row-aligned combined topology + injection sweep.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -265,10 +278,13 @@ class _ScenarioSweepSolver:
     @property
     def handle_disconnected_grid(self):
         """bool: solve the largest connected component of a scenario's split
-        grid (masking the rest as NaN) instead of skipping it. Scenarios that
-        strand the angle reference or a controller bus are still skipped.
-        Incompatible with the 'direct_base_case_factors' strategy. Takes
-        effect on the next run()."""
+        grid (masking the rest as NaN) instead of skipping it. A
+        voltage-control group whose controllers are all stranded releases the
+        bus it regulates (their reactive power is pinned to 0). Scenarios that
+        strand the angle reference, an HVDC droop end, or a regulated bus one
+        of whose controllers stays live are still skipped. Incompatible with
+        the 'direct_base_case_factors' strategy. Takes effect on the next
+        run()."""
         return self._s.handle_disconnected_grid
 
     @handle_disconnected_grid.setter
@@ -305,6 +321,21 @@ class _ScenarioSweepSolver:
         p = np.ascontiguousarray(p_mw, dtype=np.float64)
         q = np.ascontiguousarray(q_mvar, dtype=np.float64)
         self._s.set_injections(p, q, float(sn_mva))
+
+    def set_gen_p_targets(self, targets):
+        """Per-row active set-points of the machines of the slack active-power
+        plan (``set_gen_p_capability``): ``(n_scenarios, n_entries)`` MW in the
+        GENERATOR convention, one column per entry of the plan in its order,
+        NaN = keep the grid's own set-point; row-aligned with
+        :meth:`set_injections`. A row's generator produces ITS target plus its
+        share of the slack, and only the caller knows that target -- the
+        facade fills this from ``set_injections_from_elements``' ``gen_p``.
+        Left unset (or given an empty array), every row is checked against the
+        base set-points. Takes effect on the next run()."""
+        t = np.ascontiguousarray(targets, dtype=np.float64)
+        if t.size == 0:
+            t = np.zeros((0, 0), dtype=np.float64)
+        self._s.set_gen_p_targets(t)
 
     def set_gen_v(self, gen_v, gen_bus):
         """Per-scenario generator target voltage magnitude (vm_pu, NOT kV),
@@ -411,27 +442,6 @@ class _ScenarioSweepSolver:
         self._s.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
                            branch_limit_a2_ka, int(n_lines))
 
-    @property
-    def violation_tol(self):
-        """float: residual tolerance for the DIVERGENCE check, independent of
-        tol_base. Takes effect on the next run()."""
-        return self._s.violation_tol
-
-    @violation_tol.setter
-    def violation_tol(self, value):
-        self._s.violation_tol = float(value)
-
-    @property
-    def violation_capacity(self):
-        """int: max violation records kept per scenario (K). Bounds the
-        compact output at n_scenarios * K regardless of grid size. Takes
-        effect on the next run(); default 16."""
-        return self._s.violation_capacity
-
-    @violation_capacity.setter
-    def violation_capacity(self, value):
-        self._s.violation_capacity = int(value)
-
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per scenario (row order
         matches set_injections()/set_topology()'s input rows). A
@@ -439,6 +449,9 @@ class _ScenarioSweepSolver:
         GRID/NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
         single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        Otherwise the records of a scenario come type after type -- CURRENT,
+        then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
+        violation_capacity) most severe violations, most severe first.
         Requires run() with compute_limit_violations=True."""
         if not self.compute_limit_violations:
             raise RuntimeError(
@@ -451,7 +464,9 @@ class _ScenarioSweepSolver:
         vtype  = self._s.get_violation_type()
         value  = self._s.get_violation_value()
         limit  = self._s.get_violation_limit()
-        K = self.violation_capacity
+        # row c owns slots [c*stride, c*stride + count[c]) -- stride is
+        # 3 * the violation_capacity of the run that produced the buffers
+        stride = len(etype) // max(len(counts), 1)
         out = []
         for c, cnt in enumerate(counts):
             if cnt < 0:
@@ -463,7 +478,7 @@ class _ScenarioSweepSolver:
                                             LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
-            base = c * K
+            base = c * stride
             out.append([
                 LimitViolation(ViolationElementType(int(etype[base + i])), int(eid[base + i]),
                                int(side[base + i]), LimitViolationType(int(vtype[base + i])),
@@ -474,9 +489,10 @@ class _ScenarioSweepSolver:
 
     def get_violations_truncated(self):
         """(n_scenarios,) bool ndarray: True where more than
-        violation_capacity violations were found for that scenario
-        (clamped -- raise violation_capacity if this matters for your use
-        case). Requires run() with compute_limit_violations=True."""
+        violation_capacity violations of one type were found for that
+        scenario (only the most severe were kept -- raise violation_capacity
+        if this matters for your use case; get_violation_counts() has the
+        exact totals). Requires run() with compute_limit_violations=True."""
         return self._s.get_violation_truncated().astype(bool)
 
     def get_violation_counts(self):
@@ -561,8 +577,11 @@ class _ScenarioSweepSolver:
         """Zero-copy DLPack capsule of base-case voltages, shape [n_bus].
 
         Pass to ``torch.from_dlpack()`` or ``jax.dlpack.from_dlpack()`` for a
-        zero-copy GPU tensor.  The solver must remain alive while the tensor
-        is in use.
+        zero-copy GPU tensor.  The tensor co-owns the base state it views: a
+        ``run()`` that rebuilds the base state (a generator contingency mask
+        changing the reserved buses, the automatic reference slack moving)
+        leaves it showing the *previous* base case -- take a new capsule
+        then.
         """
         return self._s.v_base_dlpack()
 
@@ -658,8 +677,30 @@ class _ScenarioSweepSolver:
 
     @property
     def is_vm_fixed_bus(self):
-        """(n_bus,) bool: |V| fixed at that bus (pv or slack)."""
+        """(n_bus,) bool: |V| fixed at that bus (pv or slack without a |V| unknown)."""
         return np.asarray(self._s.is_vm_fixed_bus, dtype=bool)
+
+    @property
+    def vc_group_of_bus(self):
+        """(n_bus,) int64: VoltageControl group regulating the bus, -1 for none."""
+        return np.asarray(self._s.vc_group_of_bus, dtype=np.int64)
+
+    @property
+    def vc_v_row_of_group(self):
+        """(n_groups,) int64: J row of each group's bordered voltage equation."""
+        return np.asarray(self._s.vc_v_row_of_group, dtype=np.int64)
+
+    @property
+    def vc_pinned_v_set(self):
+        """(n_groups,) float: base v_set of a group holding a member no gen_v
+        column can move (SVC / hvdc station), NaN for a free group."""
+        vset = np.asarray(self._s.vc_v_set, dtype=np.float64)
+        fixed = np.asarray(self._s.vc_group_has_fixed_member, dtype=bool)
+        return np.where(fixed, vset, np.nan) if vset.size else vset
+
+    def get_row_stranded_vc_groups(self):
+        """list[list[int]]: per row of the last run(), the stranded VoltageControl groups."""
+        return self._s.get_row_stranded_vc_groups()
 
     def get_active_to_orig(self):
         """(n_active,) int64: original scenario index of each active slot."""

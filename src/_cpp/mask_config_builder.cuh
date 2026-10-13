@@ -16,12 +16,12 @@
 //
 //   is_reference_bus       : the bus(es) with no theta column anchor the angle
 //                            and cannot be frozen → skip when stranded.
-//   is_hard_controller_bus : HVDC converter ends and every VoltageControl
-//                            REGULATED bus -- their feature equations
+//   is_hard_controller_bus : HVDC converter ends -- their droop equations
 //                            reference the live block with no value-only
 //                            fallback → skip when stranded.
-//   vc_*                   : group topology, so a masked CONTROLLER bus can be
-//                            classified per group (see compute_component_masks).
+//   vc_*                   : group topology, so a masked controller or
+//                            regulated bus can be classified per group (see
+//                            compute_component_masks).
 // =============================================================================
 
 #include <vector>
@@ -51,10 +51,12 @@ inline MaskConfig build_mask_config(const AcPfNrState& base, const LedgerData* l
         };
         for (int b : ledger->hvdc_bus1)  mark(b);
         for (int b : ledger->hvdc_bus2)  mark(b);
-        for (int b : ledger->vc_reg_bus) mark(b);
 
         cfg.vc_bus            = ledger->vc_bus;
         cfg.vc_group          = ledger->vc_group;
+        cfg.vc_ctrl_vrow_qcol_pos = base.h_vc_ctrl_vrow_qcol_pos;
+        cfg.vc_reg_bus        = ledger->vc_reg_bus;
+        cfg.vc_grp_start      = ledger->vc_grp_start;
         cfg.vc_grp_count      = ledger->vc_grp_count;
         cfg.vc_vrow           = base.h_vc_vrow;
         cfg.vc_vrow_qcol_pos  = base.h_vc_vrow_qcol_pos;

@@ -73,8 +73,10 @@
 #include "../../contingency_analysis_helper.hpp"
 #include "../../nr_iter_step.cuh"         // BS
 #include "../gen_v_override.hpp"          // GenVOverride
+#include "gen_vset_slots.cuh"             // GenVsetSlots
 #include "../tripped_branch_table.hpp"    // TrippedBranchTable
 #include "../mask_streams.cuh"            // MaskStreams
+#include "slot_slack_redistribution.cuh"  // SlotSlackRedistribution
 
 struct BatchPfDriverContext;
 
@@ -132,16 +134,13 @@ struct ScenarioSweepBatch {
     MaskStreams mask_;
 
     // -------------------------------------------------------------------------
-    // Per-row distributed-slack weights (generator contingencies, see
-    // ScenarioSweepSession::set_contingency_gens). h_slack_w_all_ is
-    // [n_active * n_slack], ALREADY PERMUTED into active-slot order; empty when
-    // no row re-weights the slack (every slot then keeps base's shared
-    // weights, slack_w_stride 0 -- bit-identical).
+    // Per-row distributed slack (see slot_slack_redistribution.cuh): the
+    // per-row weights of a generator contingency / the redistribute_slack
+    // pre-pass, and that pre-pass' Sbus correction. Empty = every slot keeps
+    // base's shared weights and its own Sbus row (bit-identical). Set on the
+    // LIVE source by set_slack_redistribution (every run() path).
     // -------------------------------------------------------------------------
-    std::vector<cuda_real_type>            h_slack_w_all_;
-    int                                    n_slack_ = 0;
-    thrust::device_vector<cuda_real_type>  d_slack_w_all;     // n_active × n_slack
-    thrust::device_vector<cuda_real_type>  d_slack_w_batch;   // batch_size × n_slack
+    SlotSlackRedistribution slack_;
 
     // -------------------------------------------------------------------------
     // compute_limit_violations: per-active-slot (global, not per-chunk)
@@ -176,6 +175,7 @@ struct ScenarioSweepBatch {
     thrust::device_vector<int>            d_gv_active_bus;
     thrust::device_vector<int>            d_gv_active_col;   // device path only
     thrust::device_vector<cuda_real_type> d_gv_all;
+    GenVsetSlots                          gv_vset_;          // VoltageControl set-point columns
 
     // Preprocess timing captured at construction (CPU work only).
     double t_preprocess_ms = 0.0;
@@ -199,9 +199,6 @@ struct ScenarioSweepBatch {
     //   gen_v_override_orig : optional set_gen_v() data, ORIGINAL (pre-
     //                     compaction) row order — permuted into active-slot
     //                     order below.
-    //   h_slack_w_orig  : optional per-row slack weights, [n_scenarios *
-    //                     n_slack] in ORIGINAL row order (empty: every row
-    //                     keeps the base weights) -- permuted below too.
     //   forced_batch_size : 0 → rebalance used_batch_size_ over the active
     //                     count (cold path); > 0 → use exactly this chunk
     //                     size (a live driver's capacity, warm path; also the
@@ -215,8 +212,6 @@ struct ScenarioSweepBatch {
                        const MaskConfig&         mask_cfg,
                        bool                      mask_mode,
                        GenVOverride&&            gen_v_override_orig = GenVOverride{},
-                       std::vector<cuda_real_type>&& h_slack_w_orig = std::vector<cuda_real_type>{},
-                       int                       n_slack = 0,
                        int                       forced_batch_size = 0)
     {
         auto t_start = std::chrono::steady_clock::now();
@@ -264,23 +259,6 @@ struct ScenarioSweepBatch {
         if (gen_v_override_orig.k_active() > 0)
             _permute_gen_v_rows(std::move(gen_v_override_orig));
 
-        // Permute the per-row slack weights into active-slot order too.
-        n_slack_ = n_slack;
-        if (!h_slack_w_orig.empty() && n_slack > 0) {
-            if (static_cast<int>(h_slack_w_orig.size()) != n_total_ * n_slack)
-                throw std::runtime_error(
-                    "[scenario_sweep_batch] per-row slack weights must be "
-                    "(n_scenarios x n_slack)");
-            h_slack_w_all_.resize(active_to_orig_.size() * static_cast<size_t>(n_slack));
-            for (size_t slot = 0; slot < active_to_orig_.size(); ++slot) {
-                const int orig = active_to_orig_[slot];
-                std::copy(
-                    h_slack_w_orig.begin() + static_cast<ptrdiff_t>(orig) * n_slack,
-                    h_slack_w_orig.begin() + static_cast<ptrdiff_t>(orig + 1) * n_slack,
-                    h_slack_w_all_.begin() + static_cast<ptrdiff_t>(slot) * n_slack);
-            }
-        }
-
         t_preprocess_ms = ssb_ms_since(t_start);
     }
 
@@ -317,16 +295,38 @@ struct ScenarioSweepBatch {
     // into active-slot order and upload (replaces whatever was configured).
     // set_gen_v_from_orig — device path: gather the selected generator columns
     //   of the session's original-order (n_scenarios × n_gen) device matrix
-    //   into active-slot order with one kernel. active_cols/active_bus are the
-    //   Vm-fixed generator columns and their buses (GenVOverride's filter).
+    //   into active-slot order with one kernel. active_cols/active_bus/
+    //   active_vc_group are the driven generator columns, the bus each
+    //   regulates and the VoltageControl group it drives (gen_v_active_columns).
     // clear_gen_v — drop any override (rows keep the base-case voltage).
     // -------------------------------------------------------------------------
     void set_gen_v(GenVOverride&& gen_v_override_orig, cudaStream_t cs);
     void set_gen_v_from_orig(const cuda_real_type* d_gen_v_orig, int n_gen,
                              const std::vector<int>& active_cols,
                              const std::vector<int>& active_bus,
+                             const std::vector<int>& active_vc_group,
                              cudaStream_t cs);
-    void clear_gen_v() { gen_v_override_ = GenVOverride{}; }
+    void clear_gen_v() { gen_v_override_ = GenVOverride{}; gv_vset_.clear(); }
+
+    // -------------------------------------------------------------------------
+    // set_slack_redistribution — per-row slack weights ([n_scenarios * n_slack],
+    // ORIGINAL row order; empty = base weights) and the redistribute_slack Sbus
+    // correction (per ORIGINAL row, sorted (bus, dP pu); empty = none),
+    // permuted into active-slot order and uploaded on the live source. Requires
+    // initialize(); batch_capacity is the driver's chunk capacity.
+    // -------------------------------------------------------------------------
+    void set_slack_redistribution(const std::vector<cuda_real_type>& w_orig, int n_slack,
+                                  const std::vector<std::vector<std::pair<int, double>>>& dp_orig,
+                                  int base_n_slack, int batch_capacity, cudaStream_t cs)
+    {
+        if (!w_orig.empty() && n_slack != base_n_slack)
+            throw std::runtime_error(
+                "[scenario_sweep_batch] per-row slack weight count does not match the "
+                "base case's participant count");
+        slack_.set_weights_host(w_orig, n_slack, active_to_orig_, n_total_);
+        slack_.set_dp_host(dp_orig, active_to_orig_, batch_capacity);
+        slack_.upload(batch_capacity, cs);
+    }
 
     // -------------------------------------------------------------------------
     // fill_mask_buffers — write this chunk's handle_disconnected_grid mask
@@ -345,11 +345,19 @@ struct ScenarioSweepBatch {
     // weights (sliced by prepare_Sbus_batch) when some row re-weighted the
     // slack; otherwise leave base's shared array (stride 0, bit-identical).
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // fill_vc_vset_buffers — point buf.d_vc_vset at this chunk's per-slot
+    // VoltageControl set-points (built by prepare_Ybus_batch) when a gen_v
+    // column drives a group; otherwise base's shared array (stride 0).
+    // -------------------------------------------------------------------------
+    void fill_vc_vset_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const
+    {
+        gv_vset_.fill(buf);
+    }
+
     void fill_slack_w_buffers(NrIterBuffers& buf, int /*chunk_idx*/) const
     {
-        if (h_slack_w_all_.empty() || n_slack_ <= 0) return;
-        buf.d_slack_w      = thrust::raw_pointer_cast(d_slack_w_batch.data());
-        buf.slack_w_stride = n_slack_;
+        slack_.fill(buf);
     }
 
     // -------------------------------------------------------------------------
@@ -414,6 +422,7 @@ private:
     {
         const ptrdiff_t k = orig.k_active();
         gen_v_override_.h_active_bus = std::move(orig.h_active_bus);
+        gen_v_override_.h_active_vc_group = std::move(orig.h_active_vc_group);
         gen_v_override_.h_gen_v_all.resize(active_to_orig_.size() * static_cast<size_t>(k));
         for (size_t slot = 0; slot < active_to_orig_.size(); ++slot) {
             const int o = active_to_orig_[slot];

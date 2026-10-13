@@ -232,6 +232,28 @@ class TestWarmPath:
         np.testing.assert_allclose(Vb[1:], Vref_b[1:], atol=solver_atol)
 
     @needs_bridge
+    def test_hot_run_keeps_the_topology_flags(self, solver_atol):
+        """The per-row disconnected flags are an output of the source build: a
+        hot run (new injections, same topology) keeps the source, and must keep
+        reporting them -- they used to be wiped by every run."""
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL)
+        topo = [[], [int(spur_line)]]                   # row 1 islands the spur bus
+        sw.set_injections_from_elements(*_rows(grid, [1.0, 1.05]))
+        sw.set_topology(topo)
+        sw.compute(batch_size=2)
+        assert list(sw.get_disconnected()) == [0, 1]
+        sw.set_injections_from_elements(*_rows(grid, [1.1, 0.95]))
+        V = _np(sw.compute(batch_size=2))
+        assert sw.driver_build_counter == 1 and sw.source_build_counter == 1   # hot
+        assert list(sw.get_disconnected()) == [0, 1]
+        assert sw.timings.n_disconnected == 1
+        assert np.all(np.isnan(V[1]))
+        Vref = _fresh(grid, [1.1, 0.95], topology=topo)[0]
+        np.testing.assert_allclose(V[0], Vref[0], atol=solver_atol)
+
+    @needs_bridge
     def test_handle_disconnected_grid_warm_path(self, solver_atol):
         from gpusim2grid import ScenarioSweepGPU
         grid, _, spur_line, spur_bus = _solved_spur_grid(distributed_slack=False)

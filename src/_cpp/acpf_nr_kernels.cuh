@@ -106,6 +106,33 @@ __global__ void apply_gen_v_kernel(
     int n_bus);
 
 // ---------------------------------------------------------------------------
+// tile_vc_vset_kernel / apply_gen_vset_kernel
+//
+// Per-slot VoltageControl set-points: tile the base per-group v_set into
+// [batch_size * n_grp] (phantom slots included), then overwrite
+// d_vset_batch[r * n_grp + group[j]] with each non-NaN gen_v column j that
+// drives a group (d_active_group[j] >= 0; -1 columns are plain reseeds and
+// are skipped). Rows agreeing within a group is the caller's contract
+// (conflicting rows are skipped before they get here), so the write order
+// within a group does not matter. Consumed by vc_vrow_kernel with
+// vset_stride = n_grp.
+// ---------------------------------------------------------------------------
+__global__ void tile_vc_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_vset_base,
+    int n_grp,
+    int batch_size);
+
+__global__ void apply_gen_vset_kernel(
+          cuda_real_type* __restrict__ d_vset_batch,
+    const cuda_real_type* __restrict__ d_gen_v_all,
+    const int*            __restrict__ d_active_group,
+    int row_offset,
+    int k_active,
+    int actual_batch,
+    int n_grp);
+
+// ---------------------------------------------------------------------------
 // fill_FP_kernel
 //
 // Stores −ΔP at the ledger P-equation row of each P bus.
@@ -334,8 +361,14 @@ __global__ void update_slack_absorbed_kernel(
 // GPU (mirroring lightsim2grid's Hvdc extension):
 //   • hvdc_adjust_mismatch_kernel : the theta-dependent droop flows leaving each
 //       end bus into the HVDC  ⇒  d_F[p_row(end)] -= p_flow
-//   • hvdc_fill_feature_kernel    : the (piecewise-constant) dP/dtheta slopes
-//       ADDED onto the four (p_row(end), theta_col(end)) J positions.
+//   • hvdc_fill_feature_kernel    : the dP/dtheta slopes ADDED onto the four
+//       (p_row(end), theta_col(end)) J positions -- the exact derivative of the
+//       flows above: k on the controller side, k·(1-lf1)(1-lf2)·(1 - 2·r·line_in)
+//       on the receiving side (the resistive loss is quadratic in the line
+//       current, so its slope is not constant). lightsim2grid's own stamp
+//       (NRSystem.hpp, Hvdc::fill_feature_values) drops that last factor; NR
+//       converges either way, but an adjoint solved on the inexact Jacobian
+//       inherits the error (~1e-4 relative on the P gradients of a real grid).
 //
 // Two lines may share an end bus / J position, so both kernels use atomicAdd.
 // Because the feature slopes ACCUMULATE onto (and some HVDC-only positions are
@@ -346,6 +379,41 @@ __global__ void update_slack_absorbed_kernel(
 // frozen (0 linear, +1 sat 1→2, -1 sat 2→1). h11/h12/h21/h22 and prow1/prow2 are
 // -1 when the corresponding row/column does not exist (a slack end).
 // ===========================================================================
+// Active power received by the non-controller side (HvdcDroopSolverData::recv_pu)
+__device__ __forceinline__ cuda_real_type hvdc_recv_pu(
+    cuda_real_type p_ctrl_abs, bool side1_ctrl,
+    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r)
+{
+    const cuda_real_type lf_ctrl = side1_ctrl ? lf1 : lf2;
+    const cuda_real_type lf_recv = side1_ctrl ? lf2 : lf1;
+    const cuda_real_type line_in = (static_cast<cuda_real_type>(1.) - lf_ctrl) * p_ctrl_abs;
+    return (static_cast<cuda_real_type>(1.) - lf_recv) * (line_in - r * line_in * line_in);
+}
+
+// The two active flows leaving the AC buses into the HVDC (HvdcDroopSolverData::flows_pu)
+__device__ __forceinline__ void hvdc_flows_pu(
+    int st, cuda_real_type raw,
+    cuda_real_type lf1, cuda_real_type lf2, cuda_real_type r,
+    cuda_real_type pmax12, cuda_real_type pmax21,
+    cuda_real_type& p1_flow, cuda_real_type& p2_flow)
+{
+    if (st == 0) {
+        if (raw >= static_cast<cuda_real_type>(0.)) {
+            p1_flow =  raw;
+            p2_flow = -hvdc_recv_pu(raw, true, lf1, lf2, r);
+        } else {
+            p1_flow = -hvdc_recv_pu(-raw, false, lf1, lf2, r);
+            p2_flow = -raw;
+        }
+    } else if (st > 0) {
+        p1_flow =  pmax12;
+        p2_flow = -hvdc_recv_pu(pmax12, true, lf1, lf2, r);
+    } else {
+        p1_flow = -hvdc_recv_pu(pmax21, false, lf1, lf2, r);
+        p2_flow =  pmax21;
+    }
+}
+
 __global__ void hvdc_adjust_mismatch_kernel(
           cuda_real_type*  __restrict__ d_F,
     const cudaComplexType* __restrict__ d_V,
@@ -376,6 +444,7 @@ __global__ void hvdc_fill_feature_kernel(
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
     const cuda_real_type*  __restrict__ lf2,
+    const cuda_real_type*  __restrict__ r,
     const int*             __restrict__ h11,
     const int*             __restrict__ h12,
     const int*             __restrict__ h21,
@@ -418,7 +487,8 @@ __global__ void vc_vrow_kernel(
     const int*             __restrict__ d_vc_vrow,     // [n_grp]
     const int*             __restrict__ d_vc_grp_start,// [n_grp]
     const int*             __restrict__ d_vc_grp_count,// [n_grp]
-    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp]
+    const cuda_real_type*  __restrict__ d_vc_vset,     // [n_grp] or [actual_batch * n_grp]
+    int vset_stride,                                   // 0: shared, n_grp: per slot
     int n_grp,
     int n_ctrl,
     int n_bus,
@@ -479,12 +549,13 @@ __global__ void apply_bus_mask_kernel(
     int n_entries);
 
 // ---------------------------------------------------------------------------
-// apply_J_overrides_kernel  (stranded lone VoltageControl controller)
+// apply_J_overrides_kernel  (stranded VoltageControl group)
 //
 // Per-slot J value overrides: d_J_values[slot * nnz_J + pos] = val, one thread
-// per entry. Used to repurpose a stranded lone controller's bordered voltage
-// row into "Q_c == 0" -- (v_row, q_col) = 1 and (v_row, vm_col(reg)) = 0 --
-// on the slots whose contingency masks that controller's own bus. Must run
+// per entry. Used to repurpose a stranded group's bordered voltage row into
+// "Q_first == 0" -- (v_row, q_col_first) = 1, (v_row, vm_col(reg)) = 0 and 0
+// on the other controllers' slope slots -- on the slots whose contingency
+// masks the own bus of every controller of that group. Must run
 // AFTER every feature stamp (which assign the normal values on every slot)
 // and BEFORE apply_bus_mask_kernel. No-op when n_entries == 0.
 // ---------------------------------------------------------------------------
@@ -497,7 +568,7 @@ __global__ void apply_J_overrides_kernel(
     int n_entries);
 
 // ---------------------------------------------------------------------------
-// vc_stranded_vrow_kernel  (stranded lone VoltageControl controller)
+// vc_stranded_vrow_kernel  (stranded VoltageControl group)
 //
 // For each (slot, group) entry: d_F[slot * dim_J + v_row(g)] = -Q_c(slot,
 // first controller of g), replacing the voltage-constraint residual
@@ -597,9 +668,13 @@ __global__ void scatter_V_results_kernel(
 //   I_or = yff_eff * V[from] + yft_eff * V[to]   (origin / from-bus terminal)
 //   I_ex = ytf_eff * V[from] + ytt_eff * V[to]   (extremity / to-bus terminal)
 //
-// The per-unit magnitude is multiplied by d_base_current_A[l] to give A:
-//   d_base_current_A[l] = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[from[l]] * 1e3)
-// (pre-computed on the host in set_branch_data and uploaded once).
+// The per-unit magnitude is multiplied by the terminal's own current base
+// to give A (each side uses the nominal voltage of ITS bus, as lightsim2grid
+// does -- they differ on a transformer or any branch joining two voltage levels):
+//   d_base_current_A[l]    = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[from[l]] * 1e3)
+//   d_base_current_ex_A[l] = sn_mva * 1e6 / (sqrt(3) * bus_vn_kv[to[l]]   * 1e3)
+// (pre-computed on the host in set_branch_data and uploaded once; a -1
+// endpoint falls back to the other end's nominal voltage).
 //
 // Thread layout: one thread per (b, l) pair.
 //   b = tid / n_branches  — contingency index in batch [0, actual_batch)
@@ -614,7 +689,8 @@ __global__ void scatter_V_results_kernel(
 // d_V              : [actual_batch * n_bus] complex — converged voltages
 // d_branch_from/to : [n_branches] int — terminal bus indices
 // d_yff_eff/yft_eff/ytf_eff/ytt_eff: [n_branches] complex — π-model admittances
-// d_base_current_A : [n_branches] real — pre-computed I_base in A per branch
+// d_base_current_A : [n_branches] real — pre-computed I_base in A per branch, origin side
+// d_base_current_ex_A : [n_branches] real — same, extremity side
 // d_or_amps        : [n_contingencies * n_branches] real — output origin amps
 // d_ex_amps        : [n_contingencies * n_branches] real — output extremity amps
 // n_bus, n_branches, c_start, actual_batch : dimensions / offsets
@@ -630,6 +706,7 @@ __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_ytf_eff,
     const cudaComplexType* __restrict__ d_ytt_eff,
     const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
     int n_bus,

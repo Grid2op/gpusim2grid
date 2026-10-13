@@ -325,6 +325,67 @@ def test_truncation(ieee14_grid, ieee14_base_case):
 
 
 @requires_gpu
+def test_truncation_keeps_most_severe_per_type(ieee14_grid, ieee14_base_case):
+    """violation_capacity is per TYPE: with several violations of each type,
+    the kept records are, for CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE each, the
+    violation_capacity of largest |value / limit - 1|, most severe first, the
+    types one after the other in that order -- checked against an uncapped
+    run of the same batch."""
+    from gpusim2grid.contingency_analysis import LimitViolationType
+    cont_branch_ids = [[0], [3], [5]]
+    baseline, n_lines, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids)
+    n_branches = baseline._s.n_branches
+    baseline.run()
+    n_bus = ieee14_base_case["n_bus"]
+    V0 = baseline.V_results.to_numpy().reshape(len(cont_branch_ids), n_bus)[0]
+    assert np.all(np.isfinite(V0))
+    vm_kv0 = np.abs(V0) * ieee14_grid.get_bus_vn_kv()
+
+    # even buses: vmax below the solved voltage, odd ones: vmin above it, each
+    # by a different margin (so every row has several of both, no tie)
+    rng = np.random.default_rng(0)
+    bus_vmin_kv = np.full(n_bus, np.nan)
+    bus_vmax_kv = np.full(n_bus, np.nan)
+    even, odd = np.arange(0, n_bus, 2), np.arange(1, n_bus, 2)
+    bus_vmax_kv[even] = vm_kv0[even] * (1. - rng.uniform(0.01, 0.2, even.size))
+    bus_vmin_kv[odd] = vm_kv0[odd] * (1. + rng.uniform(0.01, 0.2, odd.size))
+    # tiny, varied current limits: most branch ends violate
+    limit_a1_ka = rng.uniform(1e-3, 5e-2, n_branches)
+    limit_a2_ka = rng.uniform(1e-3, 5e-2, n_branches)
+
+    def run(capacity):
+        solver, _, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids,
+                                     violation_capacity=capacity)
+        solver.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        solver.compute_limit_violations = True
+        solver.run()
+        return solver
+
+    full = run(n_bus + 2 * n_branches)   # nothing dropped
+    assert not full.get_violations_truncated().any()
+    K = 2
+    capped = run(K)
+    trunc = capped.get_violations_truncated()
+    order = [LimitViolationType.CURRENT, LimitViolationType.LOW_VOLTAGE,
+             LimitViolationType.HIGH_VOLTAGE]
+    sev = lambda v: abs(v.value / v.limit - 1.)
+    key = lambda v: (int(v.element_type), v.element_id, v.side, int(v.violation_type))
+    for r, (all_rows, kept) in enumerate(zip(full.get_violations(), capped.get_violations())):
+        expected, n_of = [], []
+        for t in order:
+            of_type = [v for v in all_rows if v.violation_type == t]
+            n_of.append(len(of_type))
+            expected += sorted(of_type, key=sev, reverse=True)[:K]
+        assert min(n_of) > K, f"row {r}: the test needs more than K violations of each type"
+        assert [key(v) for v in kept] == [key(v) for v in expected], f"row {r}"
+        np.testing.assert_allclose([v.value for v in kept], [v.value for v in expected], rtol=1e-9)
+        assert trunc[r]
+    # the exact per-type totals do not depend on the capacity
+    for name, got in capped.get_violation_counts().items():
+        np.testing.assert_array_equal(got, full.get_violation_counts()[name])
+
+
+@requires_gpu
 def test_compute_limit_violations_clear_on_change(ieee14_grid, ieee14_base_case):
     """Mirrors lightsim2grid's set_compute_limit_violations: no-op if
     unchanged, else clears previous results; get_violation_*() raises after
@@ -465,3 +526,133 @@ def test_set_limits_from_grid_without_configured_limits(ieee14_base_case):
     # the constructor-time path (bridge factory) must accept it too
     ca = ContingencyAnalysisGPU(grid, nb_iter=6, tol_base=1e-10, compute_limit_violations=True)
     assert ca is not None
+
+
+# ---------------------------------------------------------------------------
+# violation_rel_tol: a value ON its limit up to rounding is not a violation
+# ---------------------------------------------------------------------------
+
+def _is_fp32() -> bool:
+    try:
+        from gpusim2grid._gpusim2grid import is_fp32 as _fp32
+        return bool(_fp32)
+    except ImportError:
+        return False
+
+
+def test_compute_violations_n_rel_tol():
+    """the numpy "n" check applies the same relative margin as the kernel and
+    lightsim2grid: v > vmax*(1+tol), v < vmin*(1-tol), ka > limit*(1+tol)."""
+    from gpusim2grid.contingency_analysis._limit_violations import compute_violations_n
+
+    V = np.array([1.0 + 0j, 1.0 + 0j])
+    vn = np.array([100.0, 100.0])
+    z = np.array([0.0 + 0j])
+    yff = np.array([1.0 + 0j])
+    # the current the check computes on side 1, harvested with a limit it exceeds
+    ka = compute_violations_n(V, vn, None, None, np.array([0]), np.array([1]),
+                              yff, z, z, z, np.array([1e-9]), np.array([np.nan]),
+                              100.0, 1)[0].value
+    # bus 0 is 5e-10 above its vmax, bus 1 5e-10 below its vmin, the branch
+    # 5e-10 above its limit: all within the default 1e-9
+    vmax = np.array([100.0 / (1. + 5e-10), np.nan])
+    vmin = np.array([np.nan, 100.0 / (1. - 5e-10)])
+    lim1 = np.array([ka / (1. + 5e-10)])
+    args = (V, vn, vmin, vmax, np.array([0]), np.array([1]), yff, z, z, z,
+            lim1, np.array([np.nan]), 100.0, 1)
+    assert compute_violations_n(*args) == []
+    strict = compute_violations_n(*args, rel_tol=0.)
+    assert sorted(v.violation_type.name for v in strict) == ["CURRENT", "HIGH_VOLTAGE", "LOW_VOLTAGE"]
+    assert len(compute_violations_n(*args, rel_tol=1e-10)) == 3
+
+
+@requires_gpu
+def test_violation_rel_tol_on_the_limit(ieee14_grid, ieee14_base_case):
+    """the fused kernel: a LOW_VOLTAGE, a HIGH_VOLTAGE and a CURRENT placed
+    5e-10 (relative) past their limits are not reported with the default
+    violation_rel_tol (1e-9) and are with 0 (bare strict comparison) or a
+    smaller tolerance. The values are harvested from the kernel itself, so
+    they are exactly what it compares."""
+    from gpusim2grid.contingency_analysis._limit_violations import LimitViolationType
+    if _is_fp32():
+        pytest.skip("an FP32 build cannot resolve a 5e-10 relative margin")
+
+    cont = [[0]]
+    n_bus = ieee14_base_case["n_bus"]
+    bus_low, bus_high = 0, 1
+
+    def run(vmin, vmax, lim1, rel_tol=None):
+        solver, n_lines, _ = _build_solver(ieee14_grid, ieee14_base_case, cont)
+        n_br = solver._s.n_branches
+        if rel_tol is not None:
+            solver.violation_rel_tol = rel_tol
+        solver.set_limits(vmin, vmax, lim1, np.full(n_br, np.nan), n_lines)
+        solver.compute_limit_violations = True
+        solver.run()
+        return solver.get_violations()[0], n_br
+
+    # harvest: limits every value clearly violates
+    solver, _, _ = _build_solver(ieee14_grid, ieee14_base_case, cont)
+    n_br = solver._s.n_branches
+    branch_l = next(l for l in range(n_br) if l not in cont[0])
+    vmin = np.full(n_bus, np.nan)
+    vmax = np.full(n_bus, np.nan)
+    vmin[bus_low] = 1e6
+    vmax[bus_high] = 1e-6
+    lim1 = np.full(n_br, np.nan)
+    lim1[branch_l] = 1e-9
+    viol, _ = run(vmin, vmax, lim1)
+    got = {(v.violation_type, v.element_id): v.value for v in viol}
+    v_low = got[(LimitViolationType.LOW_VOLTAGE, bus_low)]
+    v_high = got[(LimitViolationType.HIGH_VOLTAGE, bus_high)]
+    ka = next(v.value for v in viol if v.violation_type == LimitViolationType.CURRENT
+              and v.side == 1)
+
+    # 5e-10 past each limit
+    vmin[bus_low] = v_low / (1. - 5e-10)
+    vmax[bus_high] = v_high / (1. + 5e-10)
+    lim1[branch_l] = ka / (1. + 5e-10)
+    kinds = lambda viol: sorted(v.violation_type.name for v in viol)  # noqa: E731
+    assert run(vmin, vmax, lim1)[0] == [], "within the default 1e-9"
+    assert kinds(run(vmin, vmax, lim1, rel_tol=0.)[0]) == ["CURRENT", "HIGH_VOLTAGE", "LOW_VOLTAGE"]
+    assert kinds(run(vmin, vmax, lim1, rel_tol=1e-10)[0]) == ["CURRENT", "HIGH_VOLTAGE", "LOW_VOLTAGE"]
+    # on the limit as harvested: two sessions agree only to ~1e-15 (batched
+    # reductions), so a bare strict comparison may flip either way -- exactly
+    # the flip the default tolerance absorbs
+    vmin[bus_low], vmax[bus_high], lim1[branch_l] = v_low, v_high, ka
+    assert run(vmin, vmax, lim1)[0] == []
+
+
+@requires_gpu
+def test_violation_rel_tol_property():
+    """default 1e-9 (lightsim2grid's), validated to [0, 1[ on the engine and
+    the facade, and the facade forwards it (also to get_violations_n)."""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from gpusim2grid import ContingencyAnalysisGPU, ScenarioSweepGPU
+
+    grid = init_from_pandapower(pn.case14())
+    V = grid.ac_pf(np.ones(len(grid.get_bus_vn_kv()), dtype=complex), 10, 1e-8)
+    assert V.shape[0] > 0
+    for cls in (ContingencyAnalysisGPU, ScenarioSweepGPU):
+        obj = cls(grid, compute_limit_violations=True)
+        assert obj.violation_rel_tol == 1e-9
+        assert obj.solver.violation_rel_tol == 1e-9
+        for bad in (-1e-9, 1., 2.):
+            with pytest.raises(ValueError):
+                obj.violation_rel_tol = bad
+        obj.violation_rel_tol = 0.
+        assert obj.solver.violation_rel_tol == 0.
+        assert obj.solver._s.violation_rel_tol == 0.
+
+    # get_violations_n uses it: put bus 0's vmax 5e-10 below its voltage
+    vn = grid.get_bus_vn_kv()
+    vm_kv = np.abs(grid.get_V()) * vn
+    vmax = np.full(vn.shape, np.nan)
+    vmax[0] = vm_kv[0] / (1. + 5e-10)
+    grid.set_bus_voltage_limits(np.full(vn.shape, np.nan), vmax)
+    ca = ContingencyAnalysisGPU(grid, compute_limit_violations=True)
+    assert [v for v in ca.get_violations_n() if v.element_type.name == "BUS"] == []
+    ca.violation_rel_tol = 0.
+    assert [v.violation_type.name for v in ca.get_violations_n()
+            if v.element_type.name == "BUS"] == ["HIGH_VOLTAGE"]

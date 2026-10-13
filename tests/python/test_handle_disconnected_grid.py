@@ -158,7 +158,9 @@ def test_optimize_reference_slack_reduces_skips():
     cont = [[c] for c in range(n_ctg)]
 
     def n_skips():
-        g = ContingencyAnalysisGPU(grid, handle_disconnected_grid=True,
+        # the grid's own reference (the facades pick one themselves by default,
+        # see test_automatic_reference_slack below)
+        g = ContingencyAnalysisGPU(grid, handle_disconnected_grid=True, reference_slack="grid",
                                    precision=None, nb_iter=12, tol_base=1e-10)
         g.add_contingencies_by_branch_id(cont)
         g.compute(batch_size=64)
@@ -170,6 +172,128 @@ def test_optimize_reference_slack_reduces_skips():
 
     assert ref is not None and ref >= 0
     assert skips_optimized < skips_default
+
+
+def _gpu_ca_spur(grid, cont, **kw):
+    from gpusim2grid import ContingencyAnalysisGPU
+    g = ContingencyAnalysisGPU(grid, handle_disconnected_grid=True, precision=None,
+                               nb_iter=12, tol_base=1e-10, **kw)
+    g.add_contingencies_by_branch_id(cont)
+    g.compute(batch_size=64)
+    n_bus = grid.get_Ybus_solver().shape[0]
+    return g, g.V_results.to_numpy().reshape(len(cont), n_bus)
+
+
+@requires_gpu
+@needs_bridge
+@pytest.mark.parametrize("path", ["contingency_analysis", "scenario_sweep"])
+def test_automatic_reference_slack(solver_atol, path):
+    """reference_slack="auto" (the default, lightsim2grid PR #216's batch rule):
+    the reference becomes the slack participant the fewest contingencies strand
+    -- the central one here --, so the spur trip is solved instead of skipped;
+    the other rows are the same state as with the grid's reference, up to a
+    constant angle shift, and the whole batch equals lightsim2grid's own."""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    grid, n_bus, n_ctg, spur_line = _solved_spur_primary_slack_grid()
+    cont = [[c] for c in range(n_ctg)]
+    V0 = grid.get_V_solver() if hasattr(grid, "get_V_solver") else None
+
+    if path == "contingency_analysis":
+        g_auto, V_auto = _gpu_ca_spur(grid, cont)
+        g_grid, V_grid = _gpu_ca_spur(grid, cont, reference_slack="grid")
+        res_auto, res_grid = g_auto.last_residuals(), g_grid.last_residuals()
+    else:
+        from gpusim2grid import ScenarioSweepGPU
+
+        def ss(**kw):
+            sw = ScenarioSweepGPU(grid, handle_disconnected_grid=True, nb_iter=12,
+                                  tol_base=1e-10, precision=None, **kw)
+            S = grid.get_Sbus_solver()
+            sn = grid.get_sn_mva()
+            sw.set_injections(np.repeat((S.real * sn)[None, :], n_ctg, axis=0),
+                              np.repeat((S.imag * sn)[None, :], n_ctg, axis=0), sn)
+            sw.set_topology(cont)
+            sw.compute(batch_size=64)
+            return sw, sw.solver.V_results.to_numpy().reshape(n_ctg, n_bus)
+        g_auto, V_auto = ss()
+        g_grid, V_grid = ss(reference_slack="grid")
+        res_auto, res_grid = g_auto.last_residuals(), g_grid.last_residuals()
+
+    assert g_auto.reference_bus != g_grid.reference_bus
+    assert np.isnan(res_grid[spur_line]) and np.isfinite(res_auto[spur_line])
+    assert int(np.isnan(res_auto).sum()) < int(np.isnan(res_grid).sum())
+    # the rows both solve: same magnitudes, and within a row every angle
+    # shifted by the same constant (each row pins another bus at its base-case
+    # angle, so the constant is the row's own)
+    for r in np.flatnonzero(np.isfinite(res_auto) & np.isfinite(res_grid)):
+        live = np.isfinite(V_auto[r]) & np.isfinite(V_grid[r])
+        np.testing.assert_allclose(np.abs(V_auto[r][live]), np.abs(V_grid[r][live]),
+                                   atol=10 * solver_atol)
+        shift = np.angle(V_auto[r][live]) - np.angle(V_grid[r][live])
+        shift = np.angle(np.exp(1j * (shift - shift[0])))
+        np.testing.assert_allclose(shift, 0., atol=10 * solver_atol)
+
+    # lightsim2grid's own batch picks the same reference: same voltages
+    ls = ContingencyAnalysisCPP(grid)
+    ls.handle_disconnected_grid = True
+    for c in cont:
+        ls.add_n1(int(c[0]))
+    n_bus_grid = grid.get_bus_vn_kv().shape[0]
+    ls.compute(np.asarray(grid.get_V()) if hasattr(grid, "get_V") else np.ones(n_bus_grid, dtype=complex),
+               30, 1e-10)
+    rows = {int(list(c)[0]): i for i, c in enumerate(ls.my_defaults())}
+    V_ls = np.asarray(ls.get_voltages())
+    conv = np.asarray(ls.converged_mask(), dtype=bool)
+    s2me = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    for c in range(n_ctg):
+        i = rows[c]
+        assert conv[i] == bool(np.isfinite(res_auto[c])), c
+        if not conv[i]:
+            continue
+        ok = np.isfinite(V_auto[c])
+        np.testing.assert_allclose(V_auto[c][ok], V_ls[i][s2me][ok], atol=10 * solver_atol)
+
+
+@requires_gpu
+@needs_bridge
+def test_moved_reference_is_lightsim2grids_own_ledger():
+    """move_reference (what the automatic reference slack builds) gives exactly
+    the augmented-J skeleton, maps and registrations lightsim2grid itself poses
+    once the reference is forced there and the grid re-solved."""
+    from gpusim2grid._gpusim2grid import _ledger_skeleton
+    grid, n_bus, n_ctg, spur_line = _solved_spur_primary_slack_grid()
+    # the grid's reference is the spur slack; the other participant is bus 4
+    target = int(np.asarray(grid.id_me_to_ac_solver())[4])
+    assert _ledger_skeleton(grid)["reference_bus"] != target
+    ref_grid = grid.copy()
+    ref_grid.set_reference_slack_bus(4)
+    ref_grid.ac_pf(np.ones(grid.get_bus_vn_kv().shape[0], dtype=complex), 30, 1e-10)
+    native = _ledger_skeleton(ref_grid)
+    moved = _ledger_skeleton(grid, target)
+    assert native["reference_bus"] == moved["reference_bus"] == target
+    for key in native:
+        a, b = moved[key], native[key]
+        if isinstance(a, int):
+            assert a == b, key
+        else:
+            assert list(a) == list(b), key
+
+
+@requires_gpu
+@needs_bridge
+def test_forced_reference_slack_is_kept():
+    """A reference forced on the grid (LSGrid.set_reference_slack_bus) is kept
+    by the automatic choice, like lightsim2grid's batch keeps it."""
+    grid, n_bus, n_ctg, spur_line = _solved_spur_primary_slack_grid()
+    cont = [[c] for c in range(n_ctg)]
+    g_auto, _ = _gpu_ca_spur(grid, cont)
+    g_grid, _ = _gpu_ca_spur(grid, cont, reference_slack="grid")
+    s2me = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    grid.set_reference_slack_bus(int(s2me[g_grid.reference_bus]))
+    grid.ac_pf(np.ones(grid.get_bus_vn_kv().shape[0], dtype=complex), 30, 1e-10)
+    g_forced, _ = _gpu_ca_spur(grid, cont)
+    assert g_forced.reference_bus == g_grid.reference_bus != g_auto.reference_bus
+    assert np.isnan(g_forced.last_residuals()[spur_line])
 
 
 @requires_gpu

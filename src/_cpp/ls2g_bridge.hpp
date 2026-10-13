@@ -37,6 +37,8 @@
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
 #include "gen_contingency_data.hpp"  // GenContingencyData
+#include "contingency/bus_q_check_data.hpp"  // BusQPlanData
+#include "contingency/gen_p_check_data.hpp"  // GenPPlanData
 
 // Build a LedgerData (augmented-J description) from a solved LSGrid: the J
 // sparsity skeleton (get_J_solver), the NRLedger row/col maps, and the
@@ -91,6 +93,17 @@ LedgerData drop_multislack_augmentation(const LedgerData& in,
 // membership, slack participation + raw weight, reactive setpoint). See
 // gen_contingency_data.hpp.
 GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// The distributed-slack participants of the redistribute_slack pre-pass
+// (generators then storage units, by id: connected, flagged slack, nonzero
+// weight, with their [min_p, max_p] and set-point in GENERATOR convention),
+// every generator's solver bus and set-point, and the shunts' active power per
+// solver bus. See slack_redistribution.hpp.
+SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// The reference slack bus the caller forced on the grid
+// (LSGrid::set_reference_slack_bus), in solver numbering; -1 when none.
+int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver);
 
 // Build a single-system AcPfNrSession from a solved LSGrid, solving the same
 // augmented system lightsim2grid does (distributed slack / future extensions).
@@ -217,6 +230,45 @@ make_ca_session_from_lsgrid(
 // Returns (bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka).
 std::tuple<RealVect, RealVect, RealVect, RealVect>
 extract_limits_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// The plan of the per-bus reactive-capability check (compute_physical_violations,
+// lightsim2grid PR #206) off a solved LSGrid, built by lightsim2grid's OWN
+// bus_q_check::build_bus_q_plan -- the same routing its batch classes use:
+// which buses a voltage-regulating machine holds (a local PV generator or a
+// VoltageControl controller, a voltage-regulating storage unit, an hvdc
+// converter station, a voltage-mode SVC), and what each can produce -- and
+// flattened into BusQPlanData (solver bus numbering, MVAr for generators /
+// storage units / stations, pu susceptance for SVCs, plus
+// sn_mva). n_bus_solver is the session's n_bus. Empty when no machine
+// regulates any voltage.
+BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// The plan of the per-machine active-power check of the distributed slack
+// (compute_physical_violations, lightsim2grid's GenPCheck.hpp) off a solved
+// LSGrid, built by lightsim2grid's OWN gen_p_check::build_gen_p_plan -- the
+// generators and storage units that take a share of the slack (connected,
+// flagged slack, nonzero weight), those of them given at least one finite
+// active limit being the reportable entries -- and flattened into
+// GenPPlanData (solver bus numbering, MW in the GENERATOR convention: a storage
+// unit's load-convention target is negated, like upstream). n_bus_solver is the
+// session's n_bus. Empty when no participating machine has a limit.
+GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// The plan of the PQ -> PV release check (compute_physical_violations,
+// lightsim2grid's GenPvReleaseCheck.hpp, PR #216) off a solved LSGrid, built by
+// lightsim2grid's OWN build_gen_pv_release_plan -- the PQ generators the caller
+// flagged with LSGrid::set_gen_can_be_pv, pinned at the nearer of their reactive
+// limits (`tol_mva` is ignored, kept for the callers) -- and flattened into GenPvReleasePlanData
+// (solver bus numbering), followed by the idle standby SVCs the caller flagged
+// with LSGrid::set_svc_standby (lightsim2grid's own build_svc_standby_plan, two
+// entries each, el_type SVC; only when the lightsim2grid built against has
+// SvcStandbyCheck.hpp). Empty when nothing is flagged. Throws when the
+// lightsim2grid built against predates PR #216.
+GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid& grid,
+                                                             int n_bus_solver, double tol_mva);
+// Whether the lightsim2grid built against has the release check (PR #216):
+// extract_gen_pv_release_plan_from_lsgrid throws otherwise.
+bool bridge_has_gen_pv_release();
 
 // Build an InjectionSweepSession from a solved LSGrid (branch data set when
 // with_branch_data=true so compute_flows() works without extra setup).
