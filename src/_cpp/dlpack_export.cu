@@ -91,7 +91,10 @@ export_jt_solve_dlpack(std::shared_ptr<AcPfNrSession> self,
         static_cast<const cuda_real_type*>(rhs_mt->dl_tensor.data);
 
     // Sync stream, solve, sync again so the result is visible to the caller.
+    // ensure_JT() first: Jᵀ (and d_JT_sol, whose pointer is taken below) is
+    // only built by the first adjoint solve.
     self->state_->cs.synchronize();
+    self->state_->ensure_JT();
     self->state_->solve_JT(
         rhs_ptr,
         thrust::raw_pointer_cast(self->state_->d_JT_sol.data()));

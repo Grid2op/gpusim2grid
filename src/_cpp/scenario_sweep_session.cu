@@ -1437,14 +1437,11 @@ void ScenarioSweepSession::compute_flows()
     const int n = n_scen * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
-        thrust::host_vector<cuda_real_type> h_or = solver_->d_or_amps_results;
-        thrust::host_vector<cuda_real_type> h_ex = solver_->d_ex_amps_results;
+        // Through the driver's pinned staging buffer (download_into).
         h_or_amps_.resize(n);
         h_ex_amps_.resize(n);
-        for (int i = 0; i < n; ++i) {
-            h_or_amps_(i) = static_cast<eigen_real_type>(h_or[static_cast<size_t>(i)]);
-            h_ex_amps_(i) = static_cast<eigen_real_type>(h_ex[static_cast<size_t>(i)]);
-        }
+        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
+        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
     }
     timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
 }
@@ -1478,12 +1475,8 @@ CplxVect ScenarioSweepSession::get_V_results() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
-    thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = eigen_cplx_type(
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
@@ -1495,10 +1488,8 @@ RealVect ScenarioSweepSession::get_residuals() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
-    thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_residuals);   // pinned, pipelined
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }

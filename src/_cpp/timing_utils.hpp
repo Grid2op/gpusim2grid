@@ -81,13 +81,15 @@ struct TimingEntry {
 //                     call gpusim2grid.warmup() before timing anything to
 //                     move it out of the measured region entirely.
 //   t_analyze_ms  — wall-clock: cuDSS symbolic analysis / reordering (done once).
-//   t_prepare_jt_ms — wall-clock: prepare_JT() -- builds Jᵀ via cusparseCsr2cscEx2
-//                     and factorizes it with a dedicated cuDSS context, for the
-//                     adjoint (backward-pass) solve. Called unconditionally at
-//                     the end of construction; comparable in cost to
+//   t_prepare_jt_ms — wall-clock: ensure_JT() -- builds Jᵀ (host transpose of
+//                     the J skeleton) and factorizes it with a dedicated cuDSS
+//                     context, for the adjoint (backward-pass) solve. Paid by
+//                     the FIRST solve_JT(), not at construction (0 for a
+//                     forward-only session); comparable in cost to
 //                     t_analyze_ms + t_first_factorize since it repeats
 //                     equivalent symbolic-analysis + factorization work on the
-//                     transposed system.
+//                     transposed system. Accumulates (a refactorization after
+//                     resolve() adds to it).
 //
 // Per-iteration accumulated totals (TimingEntry: gpu + wall):
 //   t_spmv        — cuSPARSE SpMV: Ibus = Ybus·V
@@ -177,8 +179,8 @@ struct AcPfTimings {
 
     // Note: t_total() intentionally excludes t_prepare_jt_ms (adjoint setup is
     // not part of the forward-solve "total"); t_gpu_compute_ms()/
-    // t_grand_total_ms() below include it since it's real one-time GPU work
-    // performed during construction.
+    // t_grand_total_ms() below include it since it's real GPU work, paid by
+    // the first adjoint solve.
 
     // --- coarse aggregation (read-only; see note above) ---
     // t_build_J_ms + t_ground_truth_check_ms: the latter is CPU work that
