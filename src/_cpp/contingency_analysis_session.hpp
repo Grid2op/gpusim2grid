@@ -17,8 +17,9 @@
 //   2. set_branch_data() → store host copies of π-model admittances.
 //   3. build_contingencies(list[list[int]]) → convert branch IDs to Ybus
 //      triplets; record which branches are tripped per contingency.
-//   4. run() → ContingencyAnalysisSolver constructed + solve() called;
-//      d_V_results / d_residuals filled on device.
+//   4. run() → solve() on the ContingencyAnalysisSolver; d_V_results /
+//      d_residuals filled on device. The solver is built by the first run()
+//      and KEPT while nothing that shapes it changes (see driver_cfg_).
 //   5. compute_flows() → flows computed for ALL contingencies at once from
 //      d_V_results; disconnected entries zeroed device-side.
 //
@@ -38,6 +39,7 @@
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
+#include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -68,7 +70,21 @@ struct ContingencyAnalysisSession {
     // Owned GPU state
     // =========================================================================
     std::unique_ptr<AcPfNrState>               base_state_;
-    std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run()
+    std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run(); then kept
+
+    // =========================================================================
+    // Driver persistence (see BatchDriverConfig): run() keeps solver_ -- its
+    // allocations, block-diagonal structure, cuDSS ANALYSIS and factorization
+    // state -- while the settings snapshot it was built with and the
+    // contingency list are unchanged ("hot" run: only solve()). Any change
+    // (a setting, build_contingencies()) builds a new one, as before.
+    //   contingencies_generation_ : bumped by build_contingencies().
+    //   driver_build_counter_     : drivers built so far (observability).
+    // =========================================================================
+    BatchDriverConfig driver_cfg_;
+    int contingencies_generation_ = 0;
+    int driver_build_counter_     = 0;
+    BatchDriverConfig _current_config() const;
 
     // RowMajor Ybus copy — needed by resolve_indices in run()
     Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm_;

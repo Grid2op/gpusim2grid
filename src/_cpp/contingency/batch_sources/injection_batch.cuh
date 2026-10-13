@@ -123,6 +123,17 @@ struct InjectionBatch {
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
 
     // -------------------------------------------------------------------------
+    // set_rows — new injections (and gen_v override) for the SAME row count
+    // on a live source: re-uploads d_Sbus_all and the gen_v arrays only (the
+    // chunk buffers and the tiled Ybus stay). Lets a session keep its driver
+    // -- no allocation, no cuDSS ANALYSIS -- across runs that only change the
+    // scenarios' injections. Stream-ordered on cs.
+    // -------------------------------------------------------------------------
+    void set_rows(std::vector<cudaComplexType>&& h_Sbus_all,
+                  GenVOverride&&                 gen_v_override,
+                  cudaStream_t                   cs);
+
+    // -------------------------------------------------------------------------
     // prepare_Ybus_batch — tile V, then apply this chunk's set_gen_v()
     // overrides (if any).  Ybus itself is permanent.
     // -------------------------------------------------------------------------

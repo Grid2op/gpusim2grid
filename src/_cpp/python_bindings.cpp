@@ -23,6 +23,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/eigen.h>
 
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -126,10 +127,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall-clock: cuDSS symbolic analysis — done once, "
                       "sparsity pattern of J never changes (ms)")
         .def_readonly("t_prepare_jt_ms", &AcPfTimings::t_prepare_jt_ms,
-                      "Wall-clock: prepare_JT() -- builds and factorizes Jᵀ for the "
-                      "adjoint (backward-pass) solve, called once at the end of "
-                      "construction. Comparable in cost to t_analyze_ms + "
-                      "t_first_factorize combined (ms)")
+                      "Wall-clock: ensure_JT() -- builds (first call: structure + "
+                      "cuDSS ANALYSIS) and factorizes Jᵀ for the adjoint "
+                      "(backward-pass) solve. Paid by the first solve_JT_dlpack(), "
+                      "not at construction, so 0 for a forward-only session (ms)")
         .def_readonly("t_ground_truth_check_ms", &AcPfTimings::t_ground_truth_check_ms,
                       "Wall-clock: LSGrid::check_solution() precondition, measured "
                       "BEFORE this object existed (inside extract_ledger_data(), "
@@ -690,6 +691,30 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "solution (e.g. a flat/DC start).")
     .def_property_readonly("timings", &AcPfNrSession::timings,
          "AcPfTimings struct with per-phase timing breakdowns.")
+    .def("resolve",
+         [](AcPfNrSession& self, Eigen::Ref<const CplxVect> Vinit,
+            std::optional<CplxVect> Sbus, int max_iter, eigen_real_type tol) {
+             return self.resolve(Vinit, Sbus ? &*Sbus : nullptr, max_iter, tol);
+         },
+         pybind11::arg("Vinit"),
+         pybind11::arg("Sbus") = pybind11::none(),
+         pybind11::arg("max_iter") = -1,
+         pybind11::arg("tol") = -1.,
+         "Solve again on this session, from Vinit (n_bus complex), reusing "
+         "everything construction built: Ybus, the ledger / Jacobian "
+         "structure, the cuSPARSE descriptor and the cuDSS handle with its "
+         "ANALYSIS -- only the Newton-Raphson iterations run (FACTORIZATION "
+         "at the first, REFACTORIZATION after).\n\n"
+         "Sbus (n_bus complex, optional): new injections; None keeps the "
+         "current ones. pv/pq labelling and Ybus cannot change.\n"
+         "max_iter / tol: < 0 (default) uses the constructor's.\n\n"
+         "Always iterates (never the presolved_v shortcut). The distributed "
+         "slack / voltage-control running state restarts as at construction, "
+         "so the result is that of a fresh presolved_v=False session on the "
+         "same inputs. get_v(), v_dlpack() memory (overwritten in place) and "
+         "solve_JT_dlpack() (Jᵀ refactorized on its next call) follow the new "
+         "solution. Returns the AcPfTimings of this solve, which also becomes "
+         "``timings`` (one-time fields 0); check ``converged``.")
     .def("get_v", &AcPfNrSession::get_v,
          "Copy the voltage vector from device to a NumPy array (one D→H transfer).")
     .def("get_F", &AcPfNrSession::get_F,
@@ -729,6 +754,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("solve_JT_dlpack", &export_jt_solve_dlpack,
          pybind11::arg("rhs"),
          "Solve Jᵀλ = rhs using the converged LU factorization of Jᵀ.\n"
+         "Jᵀ is built (structure + cuDSS ANALYSIS + FACTORIZATION) by the "
+         "first call, not at construction, and refactorized by the first call "
+         "after a resolve(); its cost lands in timings.t_prepare_jt_ms.\n"
          "rhs: DLPack capsule, shape [dim_J], real float, on the same device.\n"
          "Returns a DLPack capsule for λ (shape [dim_J], real float).\n"
          "WARNING: the result aliases an internal buffer — clone the tensor\n"
@@ -989,6 +1017,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Number of buses in the grid.")
     .def_property_readonly("n_branches",      &ContingencyAnalysisSession::n_branches,
          "Number of branches (lines + trafos); available after set_branch_data().")
+    .def_readonly("driver_build_counter", &ContingencyAnalysisSession::driver_build_counter_,
+        "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
+        "ANALYSIS, factorization state) while the settings it was built with "
+        "and the contingency list are unchanged, so this only grows when one of them changed.")
     .def_readwrite("batch_size", &ContingencyAnalysisSession::batch_size_,
                    "Contingencies per GPU chunk (takes effect on the next run())")
     .def_readonly("used_batch_size", &ContingencyAnalysisSession::used_batch_size_,
@@ -1231,6 +1263,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Number of buses in the grid.")
     .def_property_readonly("n_branches",  &InjectionSweepSession::n_branches,
          "Number of branches (lines + trafos); available after set_branch_data().")
+    .def_readonly("driver_build_counter", &InjectionSweepSession::driver_build_counter_,
+        "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
+        "ANALYSIS, factorization state) while the settings it was built with "
+        "and the scenario count are unchanged, so this only grows when one of them changed.")
     .def_readwrite("batch_size", &InjectionSweepSession::batch_size_,
                    "Scenarios per GPU chunk (takes effect on the next run())")
     .def_readonly("used_batch_size", &InjectionSweepSession::used_batch_size_,

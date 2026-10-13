@@ -92,7 +92,7 @@ struct AcPfNrState {
     // -------------------------------------------------------------------------
     // cuDSS CUDSS_CONFIG_REORDERING_ALG choice, set once at construction and
     // applied to BOTH dss (forward J, in the ctor) and dss_T (transpose Jᵀ,
-    // in prepare_JT()) -- they are independent CudssContexts, each running
+    // in ensure_JT()) -- they are independent CudssContexts, each running
     // its own CUDSS_PHASE_ANALYSIS, so neither inherits the other's setting.
     // -------------------------------------------------------------------------
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
@@ -123,7 +123,7 @@ struct AcPfNrState {
     // InjectionSweepSession's internal base_state_ (set via their own
     // constructors) -- never for AcPfNrSession, which IS the production
     // solver and must always keep a valid cuDSS context alive for its own
-    // run()/prepare_JT(). When true AND the presolved_v ground-truth path
+    // resolve()/solve_JT(). When true AND the presolved_v ground-truth path
     // applies (no debug override, extension state available from the
     // ledger), this instance skips its cuDSS context (handle/config/data/
     // ANALYSIS/FACTORIZATION) entirely -- see need_cudss in acpf_nr.cu.
@@ -321,15 +321,18 @@ struct AcPfNrState {
     CudssDescriptor dss_x;  // dense dx descriptor (solution)
 
     // -------------------------------------------------------------------------
-    // Jᵀ CSR and cuDSS context for the adjoint solve  (built at end of ctor)
+    // Jᵀ CSR and cuDSS context for the adjoint solve  (built LAZILY, by the
+    // first solve_JT() -- see ensure_JT())
     //
     // cuDSS 0.7 exposes CUDSS_CONFIG_SOLVE_MODE for a future transpose mode,
     // but only value 0 (forward solve) is currently supported.  We build Jᵀ
-    // via cusparseCsr2cscEx2 (CSC of J == CSR of Jᵀ for a square matrix) and
-    // factor it with a separate CudssContext reused across all backward calls.
+    // explicitly (host counting sort of the J skeleton, once; its values are
+    // J's permuted through d_J_to_JT, like BatchAdjoint) and factor it with a
+    // separate CudssContext reused across all backward calls.
     // -------------------------------------------------------------------------
     thrust::device_vector<int>            d_JT_outer;   // size dim_J+1
     thrust::device_vector<int>            d_JT_inner;   // size nnz_J
+    thrust::device_vector<int>            d_J_to_JT;    // size nnz_J: JT_values[map[p]] = J_values[p]
     thrust::device_vector<cuda_real_type> d_JT_values;  // size nnz_J
     thrust::device_vector<cuda_real_type> d_JT_rhs;     // work RHS, size dim_J
     thrust::device_vector<cuda_real_type> d_JT_sol;     // solution, size dim_J
@@ -338,6 +341,23 @@ struct AcPfNrState {
     CudssDescriptor dss_AT;  // sparse Jᵀ descriptor
     CudssDescriptor dss_bT;  // dense RHS descriptor
     CudssDescriptor dss_xT;  // dense solution descriptor
+
+    // jt_analyzed_ : Jᵀ structure uploaded, dss_T created and ANALYZED (once).
+    // jt_factored_ : dss_T holds the factors of the CURRENT d_J_values_base;
+    //                cleared by resolve(), which moves the converged J.
+    bool jt_analyzed_ = false;
+    bool jt_factored_ = false;
+
+    // -------------------------------------------------------------------------
+    // Solve settings kept for resolve(): the ctor's own max_iter/tol (its
+    // defaults) and NR step-scaling choice, and the MultiSlack start value of
+    // slack_absorbed (Re(Σ Sbus), recomputed when resolve() gets a new Sbus).
+    // -------------------------------------------------------------------------
+    int             max_iter_ = 0;
+    eigen_real_type tol_      = 0.;
+    bool            scaling_max_voltage_change_ = false;
+    double          max_dVa_ = 0.5, max_dVm_ = 0.1;
+    cuda_real_type  slack_absorbed0_ = 0.;
 
     // -------------------------------------------------------------------------
     // Timings captured during construction.  Mutable so the const
@@ -448,12 +468,33 @@ struct AcPfNrState {
     }
 
     // =========================================================================
-    // Jᵀ adjoint helpers
-    //   prepare_JT() — called once at the end of the constructor.
-    //   solve_JT()   — called each backward pass; reuses the factored Jᵀ.
-    //   Both pointers are device pointers of size dim_J.
+    // resolve — run the NR loop again on this state: same Ybus, same ledger /
+    //   J structure, same cuSPARSE descriptor and cuDSS handle + ANALYSIS,
+    //   from a new Vinit (and, when Sbus != nullptr, a new Sbus; otherwise the
+    //   current one). The extension running state (slack_absorbed, vc_q)
+    //   restarts exactly as the ctor starts it, so the result is the one a
+    //   fresh presolved_v=false state built on the same inputs gives.
+    //   max_iter < 0 / tol < 0 → the ctor's own. Replaces `timings` with this
+    //   solve's (one-time fields 0: nothing one-time is paid) and returns it.
+    //   Throws on a state without a cuDSS context (base_case_only_).
     // =========================================================================
-    void prepare_JT();
+    AcPfTimings resolve(Eigen::Ref<const CplxVect> Vinit,
+                        const CplxVect*            Sbus,
+                        int                        max_iter = -1,
+                        eigen_real_type            tol      = -1.);
+
+    // =========================================================================
+    // Jᵀ adjoint helpers
+    //   ensure_JT() — makes dss_T hold the factors of Jᵀ at the converged J
+    //                 (d_J_values_base): structure + ANALYSIS on its first
+    //                 call, FACTORIZATION again after a resolve(), nothing
+    //                 otherwise. Never called by the ctor: a forward-only
+    //                 caller never pays for the adjoint.
+    //   solve_JT()  — called each backward pass (calls ensure_JT() itself).
+    //   Both pointers are device pointers of size dim_J; d_sol may be
+    //   d_JT_sol itself, once ensure_JT() has allocated it.
+    // =========================================================================
+    void ensure_JT();
     void solve_JT(const cuda_real_type* d_rhs, cuda_real_type* d_sol);
 
     // =========================================================================
