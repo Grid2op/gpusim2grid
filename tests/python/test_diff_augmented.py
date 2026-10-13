@@ -48,8 +48,15 @@ def _is_fp32() -> bool:
 
 
 def _gradcheck_grid(grid, max_iter=40, tol=1e-10, eps=1e-5, atol=1e-3, rtol=1e-2,
-                    nondet_tol=0.0):
-    """gradcheck driver: Sbus (seeded from the grid's own solved state) -> V.real.sum()."""
+                    nondet_tol=1e-6):
+    """gradcheck driver: Sbus (seeded from the grid's own solved state) -> V.real.sum().
+
+    nondet_tol is not 0: gradcheck back-propagates twice through the same
+    session and compares bit for bit, but cuDSS's SOLVE is not
+    bit-reproducible (the first solve on fresh Jᵀ factors can differ from
+    the next one in the last bits). That is the case on the CI's T4 since
+    Jᵀ is factorized by the first backward instead of the constructor.
+    """
     from gpusim2grid.differentiable import solve_power_flow
 
     Sbus0 = grid.get_Sbus_solver()
