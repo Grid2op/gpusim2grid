@@ -87,6 +87,17 @@ struct AcPfNrSession {
 
     AcPfTimings timings() const;
 
+    // Solve again on this session -- same Ybus, ledger / J structure, cuSPARSE
+    // descriptor and cuDSS handle + ANALYSIS -- from Vinit, with a new Sbus
+    // (nullptr: keep the current one). Always iterates (never the presolved_v
+    // shortcut); max_iter / tol < 0 → the constructor's. The voltage, the
+    // DLPack view and the adjoint (Jᵀ refactorized on the next solve_JT) all
+    // follow. Returns, and becomes, this solve's timings.
+    AcPfTimings resolve(Eigen::Ref<const CplxVect> Vinit,
+                        const CplxVect*            Sbus = nullptr,
+                        int                        max_iter = -1,
+                        eigen_real_type            tol = -1.);
+
     // Copy d_V from device to a host Eigen vector (one D→H transfer).
     CplxVect get_v() const;
 
