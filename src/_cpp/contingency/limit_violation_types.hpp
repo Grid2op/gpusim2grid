@@ -88,7 +88,17 @@ enum class LimitViolationType  : int {
     // check_gen_pv_release_violations_kernel (the SVC entries of its plan).
     LOW_VOLTAGE_SVC_STANDBY = 11,
     // ... and the mirror: regulated bus ABOVE the high threshold.
-    HIGH_VOLTAGE_SVC_STANDBY = 12
+    HIGH_VOLTAGE_SVC_STANDBY = 12,
+    // lightsim2grid 1.2's remote voltage control and HVDC AC-emulation release
+    // checks (LimitViolation.hpp). Mirrored so the codes stay in sync; no
+    // gpusim2grid kernel writes them yet.
+    // A GENERATOR regulating a REMOTE bus whose own bus leaves the realistic
+    // range (LSGrid::set_remote_voltage_control_vm_range), value/limit in kV.
+    LOW_VOLTAGE_REMOTE_CONTROL = 13,
+    HIGH_VOLTAGE_REMOTE_CONTROL = 14,
+    // A droop HVDC line frozen at its active power limit whose droop would now
+    // ask for less (LSGrid::set_hvdc_ac_emulation_frozen), value/limit in MW.
+    HVDC_AC_EMULATION_RELEASE = 15
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -98,7 +108,9 @@ enum class LimitViolationType  : int {
 //                 converged solution is not physically realizable (LOW_Q,
 //                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
 //                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
-//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY).
+//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
+//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL,
+//                 HVDC_AC_EMULATION_RELEASE).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
 enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
 
@@ -117,6 +129,9 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::HIGH_VOLTAGE_AT_MAX_Q:
         case LimitViolationType::LOW_VOLTAGE_SVC_STANDBY:
         case LimitViolationType::HIGH_VOLTAGE_SVC_STANDBY:
+        case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
+        case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
+        case LimitViolationType::HVDC_AC_EMULATION_RELEASE:
             return ViolationCategory::PHYSICAL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;

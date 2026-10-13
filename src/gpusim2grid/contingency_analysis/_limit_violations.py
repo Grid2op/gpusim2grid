@@ -122,6 +122,22 @@ class LimitViolationType(IntEnum):
     LOW_VOLTAGE_SVC_STANDBY = 11
     #: ... and the mirror: regulated bus ABOVE the high threshold.
     HIGH_VOLTAGE_SVC_STANDBY = 12
+    #: A GENERATOR regulating a REMOTE bus whose own bus sits BELOW the
+    #: realistic range (lightsim2grid's
+    #: ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's
+    #: ReactiveLimits loop, in its robust remote voltage control mode, would
+    #: switch it to PQ. Category PHYSICAL. value the generator's own bus
+    #: voltage, limit the bound, kV. Mirrored for parity, not computed here.
+    LOW_VOLTAGE_REMOTE_CONTROL = 13
+    #: ... and the mirror: own bus ABOVE the realistic range.
+    HIGH_VOLTAGE_REMOTE_CONTROL = 14
+    #: An angle-droop HVDC line an outer loop froze at its active power limit
+    #: (lightsim2grid's ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop
+    #: would now ask for LESS than that limit: OpenLoadFlow's
+    #: AcHvdcAcEmulationLimits loop would leave it in AC emulation. Category
+    #: PHYSICAL. side the direction it is frozen in, value/limit in MW.
+    #: Mirrored for parity, not computed here.
+    HVDC_AC_EMULATION_RELEASE = 15
 
 
 class ViolationCategory(IntEnum):
@@ -136,7 +152,8 @@ class ViolationCategory(IntEnum):
         converged solution is NOT physically realizable, the control it assumes
         cannot happen. LOW_Q, HIGH_Q, HIGH_P (= HVDC_P_SATURATION), LOW_P,
         LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
-        HIGH_VOLTAGE_SVC_STANDBY.
+        HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL,
+        HIGH_VOLTAGE_REMOTE_CONTROL, HVDC_AC_EMULATION_RELEASE.
     SOLVER : not a limit at all, what the solver did. NOT_SIMULATED, DIVERGENCE.
     """
     OPERATIONAL = 0
@@ -155,7 +172,10 @@ def violation_category(violation_type):
              LimitViolationType.LOW_VOLTAGE_AT_MIN_Q,
              LimitViolationType.HIGH_VOLTAGE_AT_MAX_Q,
              LimitViolationType.LOW_VOLTAGE_SVC_STANDBY,
-             LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY):
+             LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY,
+             LimitViolationType.LOW_VOLTAGE_REMOTE_CONTROL,
+             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL,
+             LimitViolationType.HVDC_AC_EMULATION_RELEASE):
         return ViolationCategory.PHYSICAL
     return ViolationCategory.SOLVER
 

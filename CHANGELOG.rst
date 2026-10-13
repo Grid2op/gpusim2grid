@@ -11,6 +11,8 @@ Change Log
   (``SlackRedistributionData.base_p_mw``), as lightsim2grid.
 - [ADDED] ``reference_slack="auto"`` (default with ``handle_disconnected_grid``): the angle
   reference is the slack unit stranded by the fewest rows.
+- [ADDED] ``LimitViolationType`` mirrors lightsim2grid 1.2's ``LOW_VOLTAGE_REMOTE_CONTROL`` /
+  ``HIGH_VOLTAGE_REMOTE_CONTROL`` / ``HVDC_AC_EMULATION_RELEASE`` (category PHYSICAL, not computed yet).
 - [ADDED] PQ -> PV release check (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``) and
   ``physical_violation_tol_vm_pu``.
 - [ADDED] ``violation_rel_tol`` (default ``1e-9``): a value on its operational limit up to
