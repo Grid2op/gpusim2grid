@@ -2076,6 +2076,32 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
 // =============================================================================
 // Explicit template instantiations
 // =============================================================================
+// =============================================================================
+// reset_physical_outputs / disable_physical_checks  (physical_checks::before_solve)
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::reset_physical_outputs()
+{
+    auto reseed = [&](thrust::device_vector<int>& count, thrust::device_vector<int>& truncated) {
+        thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)), count.begin(), count.end(), -1);
+        thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)), truncated.begin(), truncated.end(), 0);
+    };
+    if (_bus_q_enabled)          reseed(d_bq_count, d_bq_truncated);
+    if (_hvdc_p_enabled)         reseed(d_hp_count, d_hp_truncated);
+    if (_gen_p_enabled)          reseed(d_gp_count, d_gp_truncated);
+    if (_gen_pv_release_enabled) reseed(d_gr_count, d_gr_truncated);
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::disable_physical_checks()
+{
+    _bus_q_enabled          = false;
+    _hvdc_p_enabled         = false;
+    _gen_p_enabled          = false;
+    _gen_pv_release_enabled = false;
+    phys_setup_valid_       = false;
+}
+
 template struct BatchPfDriver<ContingencyBatch>;
 template struct BatchPfDriver<InjectionBatch>;
 template struct BatchPfDriver<ScenarioSweepBatch>;

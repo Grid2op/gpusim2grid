@@ -418,18 +418,8 @@ int ScenarioSweepSession::_wanted_reference_bus()
     if (grid_ref_bus_ < 0 || !auto_reference_slack_ || !handle_disconnected_grid_ || !has_topology_)
         return grid_ref_bus_;
     if (!auto_ref_valid_) {
-        std::vector<int>    cand_bus;
-        std::vector<double> cand_w;
-        const LedgerData& ld = *base_ledger_;
-        for (int b = 0; b < ld.n_bus && b < static_cast<int>(ld.slack_weights.size()); ++b)
-            if (ld.p_row_of_bus[static_cast<size_t>(b)] >= 0 && ld.slack_weights[static_cast<size_t>(b)] != 0.) {
-                cand_bus.push_back(b);
-                cand_w.push_back(ld.slack_weights[static_cast<size_t>(b)]);
-            }
-        auto_ref_choice_ = choose_reference_bus(contingencies_, Ybus_rm_.outerIndexPtr(),
-                                                Ybus_rm_.innerIndexPtr(), Ybus_rm_,
-                                                cand_bus, cand_w, forced_ref_bus_);
-        if (auto_ref_choice_ < 0) auto_ref_choice_ = grid_ref_bus_;
+        auto_ref_choice_ = choose_reference_bus_from_ledger(contingencies_, Ybus_rm_, *base_ledger_,
+                                                            forced_ref_bus_, grid_ref_bus_);
         auto_ref_valid_ = true;
     }
     return auto_ref_choice_;
@@ -1219,11 +1209,15 @@ void ScenarioSweepSession::run()
         base_state_->timings.converged, d_gen_off_ptr, n_gen_off,
         physical_checks::RowTargets{gp_targets, gen_p_targets_dirty_ || rd_gp || rd_gp_last_,
                                     &gen_pv_release_targets_, gen_pv_release_targets_dirty_});
-    if (phys_.compute_physical_violations)
+    // The targets reached the driver only if the checks ran their setup: with
+    // them off, keep the flags so turning them back on on this same driver
+    // uploads what changed meanwhile.
+    if (phys_.compute_physical_violations) {
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
-    rd_gp_last_ = rd_gp;
-    gen_p_targets_dirty_ = false;
-    gen_pv_release_targets_dirty_ = false;
+        rd_gp_last_ = rd_gp;
+        gen_p_targets_dirty_ = false;
+        gen_pv_release_targets_dirty_ = false;
+    }
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms = t_base_case_ms_;

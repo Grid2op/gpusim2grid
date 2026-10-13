@@ -19,7 +19,8 @@ from .._gpusim2grid import (
 )
 
 from ._limit_violations import (ViolationElementType, LimitViolationType, ViolationCategory,
-                                violation_category, LimitViolation)
+                                violation_category, LimitViolation,
+                                LimitViolationsEngineMixin, LimitViolationsFacadeMixin)
 from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
 
@@ -164,7 +165,8 @@ class DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin):
+class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
+                                 LimitViolationsEngineMixin):
     """Stateful GPU N-k contingency analysis solver.
 
     Parameters
@@ -542,51 +544,6 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         self._s.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
                            branch_limit_a2_ka, int(n_lines))
 
-    @property
-    def violation_tol(self):
-        """float: residual tolerance for the DIVERGENCE check, independent of
-        tol_base. Takes effect on the next run()."""
-        return self._s.violation_tol
-
-    @violation_tol.setter
-    def violation_tol(self, value):
-        self._s.violation_tol = float(value)
-
-    @property
-    def violation_rel_tol(self):
-        """float: relative margin a value must clear past its limit to be
-        reported by compute_limit_violations (lightsim2grid's
-        ``violation_rel_tol``, default ``1e-9``): CURRENT when
-        ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when ``v > vmax * (1 + tol)``,
-        LOW_VOLTAGE when ``v < vmin * (1 - tol)``. A value on its limit up to
-        rounding -- a bus a regulator holds exactly at its vmax -- is then not
-        reported, whichever side of the limit the last bit of the solve put it
-        on. ``0`` gives the bare strict comparisons. In [0, 1[; takes effect on
-        the next run(). (An FP32 build cannot resolve 1e-9: there, a value
-        needs a tolerance of ~1e-6 to be absorbed.)"""
-        return self._s.violation_rel_tol
-
-    @violation_rel_tol.setter
-    def violation_rel_tol(self, value):
-        value = float(value)
-        if not (0. <= value < 1.):
-            raise ValueError(f"violation_rel_tol must be in [0, 1[ (got {value}).")
-        self._s.violation_rel_tol = value
-
-    @property
-    def violation_capacity(self):
-        """int: violation records kept per contingency AND per violation type
-        (K): the K most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones,
-        ranked by ``|value / limit - 1|`` (so a LOW_VOLTAGE ranks by how far
-        below its limit it fell). Bounds the compact output at
-        n_contingencies * 3 * K regardless of grid size. Takes effect on the next
-        run(); default 16."""
-        return self._s.violation_capacity
-
-    @violation_capacity.setter
-    def violation_capacity(self, value):
-        self._s.violation_capacity = int(value)
-
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per contingency (row order
         matches build_contingencies()'s input list). A not-simulated
@@ -705,10 +662,11 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
     def v_base_dlpack(self):
         """Zero-copy DLPack capsule of base-case voltages, shape [n_bus].
 
-        The capsule aliases live GPU memory owned by this solver.  Pass to
-        ``torch.from_dlpack()`` or ``jax.dlpack.from_dlpack()`` for a
-        zero-copy GPU tensor.  The solver must remain alive while the tensor
-        is in use.
+        Pass to ``torch.from_dlpack()`` or ``jax.dlpack.from_dlpack()`` for a
+        zero-copy GPU tensor.  The tensor co-owns the base state it views: a
+        ``run()`` that rebuilds the base state (the automatic reference slack
+        moving, ``reference_slack='auto'``) leaves it showing the *previous*
+        base case -- take a new capsule then.
         """
         return self._s.v_base_dlpack()
 

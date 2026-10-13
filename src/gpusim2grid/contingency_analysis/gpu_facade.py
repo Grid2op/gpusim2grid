@@ -13,6 +13,7 @@ It is a thin, batch-oriented facade over :class:`_ContingencyAnalysisSolver`.
 import numpy as np
 
 from . import (
+    LimitViolationsFacadeMixin,
     _ContingencyAnalysisSolver,
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
@@ -90,7 +91,8 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
     return ref
 
 
-class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
+class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
+                             LimitViolationsFacadeMixin):
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -493,26 +495,6 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     @compute_limit_violations.setter
     def compute_limit_violations(self, value):
         self._inner.compute_limit_violations = value
-
-    @property
-    def violation_rel_tol(self):
-        """float: relative margin a value must clear past its limit to be
-        reported by :attr:`compute_limit_violations` -- lightsim2grid's
-        ``violation_rel_tol``, same default (``1e-9``) and semantics:
-        CURRENT when ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when
-        ``v > vmax * (1 + tol)``, LOW_VOLTAGE when ``v < vmin * (1 - tol)``.
-        It keeps a value that sits ON its limit by construction (a bus a
-        regulator holds exactly at its vmax) from being reported or not
-        depending on the last bit of the solve -- which made the GPU, the
-        lightsim2grid batch and its one-off solve disagree. ``0`` gives the
-        bare strict comparisons. Also applies to :meth:`get_violations_n`.
-        In [0, 1[; takes effect on the next compute(). An FP32 build cannot
-        resolve 1e-9 (use ~1e-6 there)."""
-        return self._inner.violation_rel_tol
-
-    @violation_rel_tol.setter
-    def violation_rel_tol(self, value):
-        self._inner.violation_rel_tol = value
 
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per contingency (row order

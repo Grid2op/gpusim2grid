@@ -124,7 +124,10 @@ export_v_base_dlpack(std::shared_ptr<ContingencyAnalysisSession> self)
         static_cast<const void*>(self->base_state_->d_V_ptr()));
     int64_t n   = static_cast<int64_t>(self->base_state_->n_bus);
     int     dev = self->base_state_->device_id_;
-    auto    owner = std::static_pointer_cast<void>(self);
+    // The base state, not the session, owns the buffer: run() replaces it
+    // when the reference slack (or a generator contingency's reserved set)
+    // changes, and a view taken before must not dangle.
+    auto    owner = std::static_pointer_cast<void>(self->base_state_);
     auto*   mt  = make_dl_tensor(ptr, dev, n, 0, std::move(owner));
     return pybind11::capsule(mt, "dltensor", capsule_destructor);
 }
@@ -194,7 +197,10 @@ export_v_base_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
         static_cast<const void*>(self->base_state_->d_V_ptr()));
     int64_t n   = static_cast<int64_t>(self->base_state_->n_bus);
     int     dev = self->base_state_->device_id_;
-    auto    owner = std::static_pointer_cast<void>(self);
+    // The base state, not the session, owns the buffer: run() replaces it
+    // when the reference slack (or a generator contingency's reserved set)
+    // changes, and a view taken before must not dangle.
+    auto    owner = std::static_pointer_cast<void>(self->base_state_);
     auto*   mt  = make_dl_tensor(ptr, dev, n, 0, std::move(owner));
     return pybind11::capsule(mt, "dltensor", capsule_destructor);
 }

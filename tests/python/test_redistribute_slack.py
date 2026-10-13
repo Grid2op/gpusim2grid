@@ -338,6 +338,48 @@ def test_refusals():
         ca.compute(batch_size=8)
 
 
+def test_ca_toggling_on_a_live_object_matches_a_fresh_one(solver_atol):
+    """the pre-pass lives in the contingency analysis' batch source: turning
+    it on or off on a live object builds a new driver, never reuses the one
+    the other mode built"""
+    _needs_upstream()
+    case = Case14(lambda c: c.two_clamped())
+    branches = [case.leaf_branch, 0]
+    _, V_on = _gpu_ca(case, branches)
+    ca, V_off = _gpu_ca(case, branches, redistribute=False)
+    assert not np.allclose(V_on[0], V_off[0], equal_nan=True)
+    ca.redistribute_slack = True
+    ca.compute(batch_size=8)
+    np.testing.assert_allclose(ca.V_results.to_numpy().reshape(len(branches), case.n_bus),
+                               V_on, rtol=0., atol=solver_atol)
+    ca.redistribute_slack = False
+    ca.compute(batch_size=8)
+    np.testing.assert_allclose(ca.V_results.to_numpy().reshape(len(branches), case.n_bus),
+                               V_off, rtol=0., atol=solver_atol)
+
+
+def test_ca_refuses_participants_on_another_sn_mva():
+    """the pre-pass reads an island off the per-unit base Sbus with the
+    participants' sn_mva: another base than the branch data's would mis-scale
+    every lost MW without a word"""
+    _needs_upstream()
+    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid import _gpusim2grid as _cpp
+    case = Case14(lambda c: c.two_clamped())
+    ca = ContingencyAnalysisGPU(case.grid, nb_iter=10, handle_disconnected_grid=True,
+                                redistribute_slack=True)
+    ca.add_contingencies_by_branch_id([[case.leaf_branch]])
+    data = _cpp._extract_slack_redistribution_data_from_lsgrid(case.grid, ca._inner._s.n_bus)
+    ca.set_slack_redistribution_data((
+        data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
+        data.target_p_mw, data.gen_bus_solver, data.gen_target_p_mw, data.n_sto,
+        data.shunt_p_mw, 1.0, data.in_slack))
+    with pytest.raises(RuntimeError, match="another sn_mva"):
+        ca.compute(batch_size=8)
+    ca.set_slack_redistribution_data(data)   # the grid's own base: accepted
+    ca.compute(batch_size=8)
+
+
 # ---------------------------------------------------------------- scenario sweep
 class SweepCase(Case14):
     """lightsim2grid's TestScenarioSweepRedistributeSlack grid: a non-slack

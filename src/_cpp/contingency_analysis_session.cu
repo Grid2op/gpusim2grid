@@ -23,6 +23,8 @@
 #include <thrust/fill.h>
 #include <thrust/execution_policy.h>
 
+#include <algorithm>   // std::max
+#include <cmath>       // std::abs
 #include <stdexcept>
 #include <limits>
 #include <utility>   // std::move
@@ -131,18 +133,8 @@ int ContingencyAnalysisSession::_wanted_reference_bus()
     if (grid_ref_bus_ < 0 || !auto_reference_slack_ || !handle_disconnected_grid_ || !has_contingencies_)
         return grid_ref_bus_;
     if (!auto_ref_valid_) {
-        std::vector<int>    cand_bus;
-        std::vector<double> cand_w;
-        const LedgerData& ld = *base_ledger_;
-        for (int b = 0; b < ld.n_bus && b < static_cast<int>(ld.slack_weights.size()); ++b)
-            if (ld.p_row_of_bus[static_cast<size_t>(b)] >= 0 && ld.slack_weights[static_cast<size_t>(b)] != 0.) {
-                cand_bus.push_back(b);
-                cand_w.push_back(ld.slack_weights[static_cast<size_t>(b)]);
-            }
-        auto_ref_choice_ = choose_reference_bus(contingencies_, Ybus_rm_.outerIndexPtr(),
-                                                Ybus_rm_.innerIndexPtr(), Ybus_rm_,
-                                                cand_bus, cand_w, forced_ref_bus_);
-        if (auto_ref_choice_ < 0) auto_ref_choice_ = grid_ref_bus_;
+        auto_ref_choice_ = choose_reference_bus_from_ledger(contingencies_, Ybus_rm_, *base_ledger_,
+                                                            forced_ref_bus_, grid_ref_bus_);
         auto_ref_valid_ = true;
     }
     return auto_ref_choice_;
@@ -838,6 +830,12 @@ void ContingencyAnalysisSession::_check_redistribute_slack() const
             "ContingencyAnalysisSession: redistribute_slack is incompatible with the "
             "'direct_base_case_factors' strategy (it reuses the base-case factors, which cannot "
             "take a saturated unit out of a contingency's slack).");
+    // the pre-pass reads a row's island off the per-unit base Sbus with
+    // slack_rd_.sn_mva: another base would mis-scale every lost MW
+    if (std::abs(slack_rd_.sn_mva - sn_mva_) > 1e-9 * std::max(1.0, std::abs(sn_mva_)))
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: the slack participants were given with another sn_mva "
+            "than the branch data's (set_branch_data).");
 }
 
 void ContingencyAnalysisSession::set_gen_p_capability(const GenPPlanData& plan)

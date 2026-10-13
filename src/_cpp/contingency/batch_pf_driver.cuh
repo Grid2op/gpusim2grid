@@ -56,6 +56,7 @@
 #include "bus_q_check_data.hpp"                   // BusQPlanData
 #include "gen_p_check_data.hpp"                   // GenPPlanData
 #include "gen_pv_release_check_data.hpp"          // GenPvReleasePlanData
+#include "physical_checks_data.hpp"               // PhysicalSetupKey
 #include "strategies/cudss_batch_solver.cuh"
 #include "strategies/policy_refactor_every.cuh"
 #include "strategies/policy_base_case_factors.cuh"
@@ -768,6 +769,17 @@ struct BatchPfDriver {
     void upload_gen_pv_release_targets(const RealMatRM& targets);
     bool has_gen_pv_release_targets() const { return gen_pv_release_target_stride_ > 0; }
     void run_gen_pv_release_check_n();
+
+    // physical_checks::before_solve's bookkeeping: the key of the last full
+    // setup (valid while phys_setup_valid_). reset_physical_outputs() re-seeds
+    // the per-row counts / truncation flags of the enabled checks (the -1
+    // "never simulated" sentinel), asynchronously on cs, for a run whose key
+    // is unchanged; disable_physical_checks() stops the per-chunk checks of a
+    // live driver whose session turned them off.
+    PhysicalSetupKey phys_setup_key_;
+    bool             phys_setup_valid_ = false;
+    void reset_physical_outputs();
+    void disable_physical_checks();
 
     double bus_q_setup_ms()  const { return t_bus_q_setup_ms_; }
     double hvdc_p_setup_ms() const { return t_hvdc_p_setup_ms_; }

@@ -80,7 +80,7 @@ struct ScenarioSweepSession {
     // =========================================================================
     // Owned GPU state
     // =========================================================================
-    std::unique_ptr<AcPfNrState>          base_state_;
+    std::shared_ptr<AcPfNrState>          base_state_;   // shared: a v_base_dlpack() capsule co-owns it
     std::unique_ptr<ScenarioSweepSolver>  solver_;   // null until the first run(); then PERSISTENT
     std::unique_ptr<ScenarioSweepDeviceData> dev_;   // canonical original-order Sbus / gen_v device buffers
 

@@ -266,8 +266,13 @@ void InjectionSweepSession::run()
         base_state_->timings.converged, /*d_gen_off=*/nullptr, /*n_gen=*/0,
         physical_checks::RowTargets{&gen_p_targets_, gen_p_targets_dirty_,
                                     &gen_pv_release_targets_, gen_pv_release_targets_dirty_});
-    gen_p_targets_dirty_ = false;
-    gen_pv_release_targets_dirty_ = false;
+    // The targets reached the driver only if the checks ran their setup: with
+    // them off, keep the flags so turning them back on on this same driver
+    // uploads what changed meanwhile.
+    if (phys_.compute_physical_violations) {
+        gen_p_targets_dirty_ = false;
+        gen_pv_release_targets_dirty_ = false;
+    }
 
     timings_ = solver_->solve();
     if (!cold) {

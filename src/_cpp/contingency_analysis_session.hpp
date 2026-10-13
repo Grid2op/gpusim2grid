@@ -72,7 +72,7 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     // Owned GPU state
     // =========================================================================
-    std::unique_ptr<AcPfNrState>               base_state_;
+    std::shared_ptr<AcPfNrState>               base_state_;   // shared: a v_base_dlpack() capsule co-owns it
     std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run(); then kept
 
     // =========================================================================

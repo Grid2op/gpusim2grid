@@ -49,8 +49,11 @@ void sync_targets(const RealMatRM* targets, bool dirty, bool driver_has, Upload 
 
 // Before solve(): hand the driver what the four checks need and (re)seed
 // their outputs, then produce the base ("n") case's own report when the base
-// solve converged. Re-callable on a live driver (ScenarioSweep's persistent
-// one): that is what resets the -1 "never simulated" sentinels between runs.
+// solve converged. Re-callable on a live driver (the persistent drivers of
+// the three sessions): a run whose PhysicalSetupKey matches the driver's last
+// setup -- same plans, tolerances, capacity, generator mask -- only resets the
+// -1 "never simulated" sentinels; anything else redoes the whole setup. With
+// the checks off, a live driver stops running them.
 template <class Driver>
 SetupTimes before_solve(PhysicalChecksConfig& cfg, Driver& drv, const char* who,
                         double residual_tol, double sn_mva, bool base_converged,
@@ -58,37 +61,67 @@ SetupTimes before_solve(PhysicalChecksConfig& cfg, Driver& drv, const char* who,
                         const RowTargets& targets = RowTargets())
 {
     SetupTimes t;
-    if (!cfg.compute_physical_violations) return t;
+    if (!cfg.compute_physical_violations) {
+        drv.disable_physical_checks();
+        return t;
+    }
     if (!cfg.has_bus_q_plan)
         throw std::runtime_error(std::string(who) +
             ": compute_physical_violations requires the per-bus reactive capability -- call "
             "set_bus_q_capability() first (the *GPU facades do it from a lightsim2grid grid "
             "through set_bus_q_capability_from_grid(); an EMPTY plan is accepted when no "
             "machine regulates a voltage).");
-    drv.set_bus_q_check(cfg.bus_q_plan, cfg.physical_violation_tol_mva,
-                        cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
-    if (base_converged) drv.run_bus_q_check_n();
-    t.bus_q_ms = drv.bus_q_setup_ms();
-    drv.set_hvdc_p_check(cfg.physical_violation_tol_mva, sn_mva,
-                         cfg.physical_violation_capacity, residual_tol);
-    if (base_converged) drv.run_hvdc_p_check_n();
-    t.hvdc_p_ms = drv.hvdc_p_setup_ms();
-    // the active check: an unset plan is an empty one (nothing was given
-    // limits), see PhysicalChecksConfig::gen_p_plan
-    drv.set_gen_p_check(cfg.gen_p_plan, cfg.physical_violation_tol_mva,
-                        cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
+    PhysicalSetupKey key;
+    key.plan_generation = cfg.plan_generation;
+    key.tol_mva         = cfg.physical_violation_tol_mva;
+    key.tol_vm_pu       = cfg.physical_violation_tol_vm_pu;
+    key.capacity        = cfg.physical_violation_capacity;
+    key.residual_tol    = residual_tol;
+    key.sn_mva          = sn_mva;
+    key.d_gen_off       = d_gen_off;
+    key.n_gen           = n_gen;
+    key.base_converged  = base_converged;
+    const bool same_setup = drv.phys_setup_valid_ && drv.phys_setup_key_ == key;
+
+    if (same_setup) {
+        drv.reset_physical_outputs();
+    } else {
+        drv.set_bus_q_check(cfg.bus_q_plan, cfg.physical_violation_tol_mva,
+                            cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
+        if (base_converged) drv.run_bus_q_check_n();
+        t.bus_q_ms = drv.bus_q_setup_ms();
+        drv.set_hvdc_p_check(cfg.physical_violation_tol_mva, sn_mva,
+                             cfg.physical_violation_capacity, residual_tol);
+        if (base_converged) drv.run_hvdc_p_check_n();
+        t.hvdc_p_ms = drv.hvdc_p_setup_ms();
+        // the active check: an unset plan is an empty one (nothing was given
+        // limits), see PhysicalChecksConfig::gen_p_plan
+        drv.set_gen_p_check(cfg.gen_p_plan, cfg.physical_violation_tol_mva,
+                            cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
+        // the release check: an unset plan is an empty one (nothing was flagged)
+        drv.set_gen_pv_release_check(cfg.gen_pv_release_plan, cfg.physical_violation_tol_vm_pu,
+                                     cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
+    }
+    // per-row targets: uploaded only when they changed (or the driver has none)
+    auto t_targets = std::chrono::steady_clock::now();
     detail::sync_targets(targets.gen_p, targets.gen_p_dirty, drv.has_gen_p_targets(),
                          [&](const RealMatRM& m) { drv.upload_gen_p_targets(m); });
-    if (base_converged) drv.run_gen_p_check_n();
-    t.gen_p_ms = drv.gen_p_setup_ms();
-    // the release check: an unset plan is an empty one (nothing was flagged)
-    drv.set_gen_pv_release_check(cfg.gen_pv_release_plan, cfg.physical_violation_tol_vm_pu,
-                                 cfg.physical_violation_capacity, residual_tol, d_gen_off, n_gen);
     detail::sync_targets(targets.gen_pv_release, targets.gen_pv_release_dirty,
                          drv.has_gen_pv_release_targets(),
                          [&](const RealMatRM& m) { drv.upload_gen_pv_release_targets(m); });
-    if (base_converged) drv.run_gen_pv_release_check_n();
-    t.gen_pv_release_ms = drv.gen_pv_release_setup_ms();
+    const double targets_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_targets).count();
+    if (same_setup) {
+        t.gen_p_ms = targets_ms;
+    } else {
+        // (the driver's setup times already include the target uploads)
+        if (base_converged) drv.run_gen_p_check_n();
+        t.gen_p_ms = drv.gen_p_setup_ms();
+        if (base_converged) drv.run_gen_pv_release_check_n();
+        t.gen_pv_release_ms = drv.gen_pv_release_setup_ms();
+        drv.phys_setup_key_   = key;
+        drv.phys_setup_valid_ = true;
+    }
     return t;
 }
 

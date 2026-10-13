@@ -28,6 +28,7 @@ PV→PQ relabelling without changing the Jacobian pattern).
 import numpy as np
 
 from . import (
+    LimitViolationsFacadeMixin,
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
     _ScenarioSweepSolver,
@@ -54,7 +55,8 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin):
+class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
+                       LimitViolationsFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -264,6 +266,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # set_gen_v() input, kept so a later set_contingency_gens() (or vice
         # versa) can re-derive which rows ask one bus for two different |V|.
         self._gen_v = None
+        # The skip mask those rows give could not be pushed yet (its row count
+        # differed from the injections'): compute() re-derives it. The row
+        # count of the last set_injections*() (None: none yet) -- the
+        # session's own n_scenarios is the live driver's until the next run.
+        self._skip_rows_stale = False
+        self._n_injection_rows = None
 
         # OLF-style bounded slack redistribution of what a row loses, and the
         # reference slack the fewest rows strand -- see
@@ -302,6 +310,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         """
         self._pending_elements = None
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
+        self._n_injection_rows = int(np.shape(p_mw)[0])
+        self._skip_rows_stale = self._gen_v is not None
         # per-bus injections carry no per-generator set-point: the slack
         # active-power check and the redistribute_slack pre-pass fall back to
         # the grid's own targets
@@ -342,6 +352,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                                             load_p, load_q, gen_p,
                                             gen_off=gen_off)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
+        self._n_injection_rows = int(p_mw.shape[0])
+        self._skip_rows_stale = self._gen_v is not None
         # the slack active-power check needs each row's own generator
         # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
         self._gen_p_rows = gen_p
@@ -466,8 +478,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         gen_v = np.ascontiguousarray(gen_v, dtype=np.float64)
         self._gen_v = gen_v
         self._push_gen_v()
-        self._update_skipped_rows()
         self._push_gen_pv_release_targets()
+        self._update_skipped_rows()
 
     def _push_gen_v(self):
         """Hand set_gen_v()'s input to the session with the generators that
@@ -484,8 +496,17 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
 
     def _update_skipped_rows(self):
         """Re-derive the not-simulable rows from set_gen_v() (and the
-        generator mask); a row-count mismatch is left to the C++ session."""
+        generator mask). While set_gen_v()'s row count differs from the
+        injections' the mask is dropped and re-derived by compute(), so the
+        setters may come in any order; a mismatch still there at compute()
+        is reported by the C++ session's own set_gen_v() check."""
+        self._skip_rows_stale = False
         if self._gen_v is None:
+            return
+        n_rows = self._n_injection_rows
+        if n_rows is not None and self._gen_v.shape[0] != n_rows:
+            self._inner.clear_skipped_rows()
+            self._skip_rows_stale = True
             return
         gen_off = self._gen_off
         if gen_off is not None and gen_off.shape[0] != self._gen_v.shape[0]:
@@ -527,6 +548,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         for a snapshot.  Residuals are cached for :meth:`last_residuals`.
         """
         self._inner.batch_size = int(batch_size)
+        if self._skip_rows_stale:
+            self._update_skipped_rows()
         self._inner.run()
         self._last_residuals = self._inner.residuals
         return self._inner.v_results_dlpack()
@@ -612,26 +635,6 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     @compute_limit_violations.setter
     def compute_limit_violations(self, value):
         self._inner.compute_limit_violations = value
-
-    @property
-    def violation_rel_tol(self):
-        """float: relative margin a value must clear past its limit to be
-        reported by :attr:`compute_limit_violations` -- lightsim2grid's
-        ``violation_rel_tol``, same default (``1e-9``) and semantics:
-        CURRENT when ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when
-        ``v > vmax * (1 + tol)``, LOW_VOLTAGE when ``v < vmin * (1 - tol)``.
-        It keeps a value that sits ON its limit by construction (a bus a
-        regulator holds exactly at its vmax) from being reported or not
-        depending on the last bit of the solve -- which made the GPU, the
-        lightsim2grid batch and its one-off solve disagree. ``0`` gives the
-        bare strict comparisons. Also applies to :meth:`get_violations_n`.
-        In [0, 1[; takes effect on the next compute(). An FP32 build cannot
-        resolve 1e-9 (use ~1e-6 there)."""
-        return self._inner.violation_rel_tol
-
-    @violation_rel_tol.setter
-    def violation_rel_tol(self, value):
-        self._inner.violation_rel_tol = value
 
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per scenario (row order
