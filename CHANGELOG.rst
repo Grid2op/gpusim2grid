@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
+  remote regulators added or changed since it was built.
 - [ADDED] ``scheduling="continuous"`` on the three batch facades: a row leaves its slot once
   converged, diverged or out of its ``nb_iter`` budget, and the slot is refilled at once.
 - [ADDED] ``get_row_status()`` / ``get_row_iterations()`` (``RowStatus``) and ``tol``: each row's

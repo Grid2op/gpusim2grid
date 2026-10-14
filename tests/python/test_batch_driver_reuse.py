@@ -204,6 +204,64 @@ def test_is_new_gen_v_keeps_the_driver(ieee14_base_case, solver_atol):
     _assert_same(sw.V_results.to_numpy(), _is_V(grid, F1, gen_v=gen_v), 1e-3 * solver_atol)
 
 
+def test_is_hot_gen_v_drives_remote_regulators(solver_atol):
+    """gen_v columns that drive a VoltageControl group (a remote regulator), brought
+    in, changed or dropped on a reused driver: the group set-points follow them, as
+    on a fresh session. The live source used to keep the group map of its first
+    build: a hot run ignored a remote column it did not have then, and applied the
+    old map to a new set of columns."""
+    from gpusim2grid import InjectionSweepGPU
+    from gpusim2grid._gpusim2grid import have_ls2g_bridge
+    if not have_ls2g_bridge:
+        pytest.skip("VoltageControl needs the lightsim2grid C++ bridge")
+    from test_gen_v_regulated_bus import _remote_case14, GEN_REMOTE, REG_BUS, NB_ITER, TOL
+    model, _ = _remote_case14()
+    sn = model.get_sn_mva()
+    S = np.asarray(model.get_Sbus_solver())
+    n, n_bus, n_gen = 2, S.shape[0], len(model.get_generators())
+    p, q = np.tile(S.real * sn, (n, 1)), np.tile(S.imag * sn, (n, 1))
+    reg = int(np.asarray(model.id_me_to_ac_solver())[REG_BUS])
+    LOCAL = 0                                   # gen 0 holds its own (PV) bus
+    remote_v, local_v = np.array([1.03, 1.055]), np.array([1.03, 1.05])
+
+    def gv(remote=False, local=False):
+        g = np.full((n, n_gen), np.nan)
+        if remote:
+            g[:, GEN_REMOTE] = remote_v
+        if local:
+            g[:, LOCAL] = local_v
+        return g
+
+    def build(gen_v=None):
+        sw = InjectionSweepGPU(model, nb_iter=NB_ITER, tol_base=TOL)
+        sw.set_injections(p, q, sn)
+        if gen_v is not None:
+            sw.set_gen_v(gen_v)
+        sw.compute(batch_size=4)
+        return sw
+
+    def V(sw):
+        return sw.solver.V_results.to_numpy().reshape(n, n_bus)
+
+    def hot(sw, gen_v):
+        sw.set_gen_v(gen_v)
+        sw.compute(batch_size=4)
+        assert _session(sw).driver_build_counter == 1   # the reused driver is what is tested
+        _assert_same(V(sw), V(build(gen_v)), solver_atol)
+        return V(sw)
+
+    # the first build had no gen_v at all
+    sw = build()
+    Vh = hot(sw, gv(remote=True))
+    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v, atol=10 * solver_atol)
+
+    # the first build had the remote column only: more columns, then none of the group's
+    sw = build(gv(remote=True))
+    Vh = hot(sw, gv(remote=True, local=True))
+    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v, atol=10 * solver_atol)
+    hot(sw, gv(local=True))
+
+
 def test_is_row_count_change_rebuilds(ieee14_base_case, solver_atol):
     grid = ieee14_base_case["grid"]
     sw = _is(grid, F1)
