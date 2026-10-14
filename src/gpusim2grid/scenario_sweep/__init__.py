@@ -60,6 +60,7 @@ from ..contingency_analysis._slack_redistribution import (
     SlackRedistributionEngineMixin,
     SlackRedistributionFacadeMixin,
 )
+from ..contingency_analysis._scheduling import SchedulingEngineMixin, SchedulingFacadeMixin
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
 
@@ -89,7 +90,7 @@ def _resolve_strategy(strategy):
 
 
 class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
-                           LimitViolationsEngineMixin):
+                           SchedulingEngineMixin, LimitViolationsEngineMixin):
     """Stateful GPU row-aligned combined topology + injection sweep.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -136,7 +137,8 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
                  reordering_alg='default',
                  matching_alg='none', pivot_epsilon_alg='default',
                  debug_base_case=False,
-                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
+                 scheduling='chunked', nb_iter_per_round=1, tol=None):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -154,6 +156,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
+        self._init_scheduling(scheduling, nb_iter_per_round, tol)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -407,6 +410,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
 
     def run(self):
         """Run all scenarios; fills V_results and residuals on device."""
+        self._warn_tol_above_violation_tol()
         self._s.run()
 
     def compute_flows(self):
@@ -612,7 +616,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     @property
     def keep_final_jacobian(self):
         """bool: refill the batched Jacobian at the converged voltages after
-        each run() so solve_JT_batch_dlpack() can use it. Default False."""
+        each chunked run() so solve_JT_batch_dlpack() can use it (a continuous
+        run needs nothing kept: the adjoint rebuilds the Jacobians from the
+        converged voltages). Default False."""
         return self._s.keep_final_jacobian
 
     @keep_final_jacobian.setter

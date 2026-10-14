@@ -88,6 +88,14 @@ struct LedgerData {
     // (array/tuple mode, where there is no other numbering).
     std::vector<int>    hvdc_id;
 
+    // HVDC lines an outer loop froze at their AC-emulation limit (droop off, set-point at
+    // the limit; lightsim2grid's LSGrid::set_hvdc_ac_emulation_frozen). Not part of the
+    // solve: only checked for their release (HVDC_AC_EMULATION_RELEASE). Solver bus
+    // numbering, per-unit; dir +1 frozen 1->2, -1 frozen 2->1, limit the pmax of that
+    // direction; id the grid hvdc id. Empty when none.
+    std::vector<int>    hvdc_frz_bus1, hvdc_frz_bus2, hvdc_frz_dir, hvdc_frz_id;
+    std::vector<double> hvdc_frz_p0, hvdc_frz_k, hvdc_frz_limit;
+
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }
 
@@ -101,6 +109,15 @@ struct LedgerData {
     // J positions. kind: 0 = GEN, 1 = SVC (sloped).
     std::vector<int>    vc_bus, vc_kind, vc_group;       // per controller
     std::vector<double> vc_slope, vc_weight;             // per controller
+    // id of each controller in its own container (generator / svc id, the hvdc
+    // LINE id for a station); empty in array mode
+    std::vector<int>    vc_elem_id;                      // per controller
+    // lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators): 1 for a
+    // generator frozen at a reactive limit kept in its group, its reactive injection
+    // pinned at vc_q_held (pu, generator convention) -- which its Sbus entry already
+    // carries, so the mismatch only sees what it moves away from it. Empty = none.
+    std::vector<int>    vc_held;                         // per controller
+    std::vector<double> vc_q_held;                       // per controller, 0 unless held
     // J column of each controller's own Q unknown (controller-registration
     // order, from LSGrid::get_controller_q_col_solver() -- NOT the bus-keyed
     // q_col_of_bus map: that map collides whenever two controllers regulate

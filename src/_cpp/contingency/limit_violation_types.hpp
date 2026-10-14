@@ -89,15 +89,21 @@ enum class LimitViolationType  : int {
     LOW_VOLTAGE_SVC_STANDBY = 11,
     // ... and the mirror: regulated bus ABOVE the high threshold.
     HIGH_VOLTAGE_SVC_STANDBY = 12,
-    // lightsim2grid 1.2's remote voltage control and HVDC AC-emulation release
-    // checks (LimitViolation.hpp). Mirrored so the codes stay in sync; no
-    // gpusim2grid kernel writes them yet.
-    // A GENERATOR regulating a REMOTE bus whose own bus leaves the realistic
-    // range (LSGrid::set_remote_voltage_control_vm_range), value/limit in kV.
+    // A generator regulating a REMOTE bus whose OWN bus sits BELOW the
+    // realistic range the caller set (lightsim2grid's
+    // LSGrid::set_remote_voltage_control_vm_range): OpenLoadFlow's robust
+    // remote voltage control would switch it to PQ. element_type GENERATOR,
+    // value its own bus' voltage and limit the bound, both in kV. Written by
+    // check_gen_pv_release_violations_kernel (the remote control entries of
+    // its plan).
     LOW_VOLTAGE_REMOTE_CONTROL = 13,
+    // ... and the mirror: own bus ABOVE the range.
     HIGH_VOLTAGE_REMOTE_CONTROL = 14,
-    // A droop HVDC line frozen at its active power limit whose droop would now
-    // ask for less (LSGrid::set_hvdc_ac_emulation_frozen), value/limit in MW.
+    // An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
+    // LSGrid::set_hvdc_ac_emulation_frozen) whose droop, from this row's angles, asks for
+    // less than that limit: OpenLoadFlow would have left it in AC emulation. element_type
+    // HVDC, side the direction it is frozen in, value that flow, limit the pmax, MW.
+    // Written by check_hvdc_p_violations_kernel.
     HVDC_AC_EMULATION_RELEASE = 15
 };
 
@@ -146,10 +152,11 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
 // replacing everything else) needs no group of its own.
 constexpr int N_OPERATIONAL_VIOLATION_GROUPS = 3;   // CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE
 constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
-constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
+constexpr int N_HVDC_P_VIOLATION_GROUPS      = 2;   // HIGH_P (either side), HVDC_AC_EMULATION_RELEASE
 constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
 // LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q (generators), then
-// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan)
-constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 4;
+// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan),
+// then LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL (its remote control entries)
+constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 6;
 
 #endif  // LIMIT_VIOLATION_TYPES_HPP

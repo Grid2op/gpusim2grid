@@ -122,21 +122,19 @@ class LimitViolationType(IntEnum):
     LOW_VOLTAGE_SVC_STANDBY = 11
     #: ... and the mirror: regulated bus ABOVE the high threshold.
     HIGH_VOLTAGE_SVC_STANDBY = 12
-    #: A GENERATOR regulating a REMOTE bus whose own bus sits BELOW the
-    #: realistic range (lightsim2grid's
-    #: ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's
-    #: ReactiveLimits loop, in its robust remote voltage control mode, would
-    #: switch it to PQ. Category PHYSICAL. value the generator's own bus
-    #: voltage, limit the bound, kV. Mirrored for parity, not computed here.
+    #: A GENERATOR regulating a REMOTE bus whose OWN bus sits BELOW the
+    #: realistic range the caller set (lightsim2grid's
+    #: ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's robust
+    #: remote voltage control would switch it to PQ. Category PHYSICAL. value
+    #: its own bus' voltage, limit the bound, kV.
     LOW_VOLTAGE_REMOTE_CONTROL = 13
-    #: ... and the mirror: own bus ABOVE the realistic range.
+    #: ... and the mirror: own bus ABOVE the range.
     HIGH_VOLTAGE_REMOTE_CONTROL = 14
-    #: An angle-droop HVDC line an outer loop froze at its active power limit
-    #: (lightsim2grid's ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop
-    #: would now ask for LESS than that limit: OpenLoadFlow's
-    #: AcHvdcAcEmulationLimits loop would leave it in AC emulation. Category
-    #: PHYSICAL. side the direction it is frozen in, value/limit in MW.
-    #: Mirrored for parity, not computed here.
+    #: An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
+    #: ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop, from the row's angles,
+    #: asks for less than that limit: OpenLoadFlow would have left it in AC
+    #: emulation. Category PHYSICAL. side the frozen direction, value that flow,
+    #: limit the pmax, MW.
     HVDC_AC_EMULATION_RELEASE = 15
 
 
@@ -210,6 +208,9 @@ class LimitViolation:
         element_id the grid hvdc id, side 1 (would saturate 1->2: the flow
         leaving bus 1 exceeds pmax_1to2) or 2 (2->1), value that flow (MW),
         limit pmax (MW).
+    HVDC_AC_EMULATION_RELEASE (``compute_physical_violations``) : element_type
+        HVDC, a line frozen at its AC-emulation limit whose droop asks for less:
+        side its frozen direction, value that flow (MW), limit pmax (MW).
     LOW_P / HIGH_P on a GENERATOR / STORAGE (``compute_physical_violations``) :
         element_id the container id of that family, side 0, value the
         machine's converged active power -- its target plus its share of the
@@ -255,10 +256,10 @@ def bus_q_violations_from_result(res):
 def hvdc_p_violations_from_result(res):
     """list[list[LimitViolation]] from an ``HvdcPViolationsResult`` (the raw
     output of ``get_hvdc_p_violations[_n]()`` on a batch session)."""
-    hvdc_id, side, value, limit = res.hvdc_id, res.side, res.value, res.limit
+    hvdc_id, side, vtype, value, limit = res.hvdc_id, res.side, res.type, res.value, res.limit
     return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
         ViolationElementType.HVDC, int(hvdc_id[i]), int(side[i]),
-        LimitViolationType.HVDC_P_SATURATION, float(value[i]), float(limit[i])))
+        LimitViolationType(int(vtype[i])), float(value[i]), float(limit[i])))
 
 
 def gen_p_violations_from_result(res):
@@ -273,8 +274,9 @@ def gen_p_violations_from_result(res):
 def gen_pv_release_violations_from_result(res):
     """list[list[LimitViolation]] from a ``GenPvReleaseViolationsResult`` (the
     raw output of ``get_gen_pv_release_violations[_n]()`` on a batch session):
-    the PQ -> PV release of the flagged generators and SVCs, and the switch on
-    of the flagged standby SVCs routed through the same plan -- ``el_type``
+    the PQ -> PV release of the flagged generators and SVCs, the switch on of
+    the flagged standby SVCs and the generators holding a remote bus from an
+    unrealistic voltage, routed through the same plan -- ``el_type``
     says which element ``gen_id`` names (an HVDC one: the hvdc line of a frozen VSC
     station, ``side`` the station's end)."""
     gen_id, el_type, vtype, value, limit = res.gen_id, res.el_type, res.type, res.value, res.limit

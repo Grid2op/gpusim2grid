@@ -20,6 +20,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <utility>
@@ -69,6 +70,16 @@ InjectionSweepSession::InjectionSweepSession(
     , max_dVm_(max_dVm)
 {
     (void)slack_weights;
+    // lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned per
+    // row by the mask streams, which an injection sweep does not have
+    if (ledger != nullptr)
+        for (int h : ledger->vc_held)
+            if (h)
+                throw std::runtime_error(
+                    "InjectionSweepSession: this grid holds frozen remote regulators in their "
+                    "voltage-control group (lightsim2grid's set_hold_frozen_regulators), which "
+                    "InjectionSweepGPU does not support: turn the option off on the grid, or "
+                    "use ScenarioSweepGPU.");
 
     auto t_base_start = std::chrono::steady_clock::now();
     base_state_ = std::make_unique<AcPfNrState>(
@@ -162,6 +173,7 @@ BatchDriverConfig InjectionSweepSession::_current_config() const
     c.scaling_max_voltage_change = scaling_max_voltage_change_;
     c.max_dVa                    = max_dVa_;
     c.max_dVm                    = max_dVm_;
+    c.scheduling                 = scheduling_;
     return c;
 }
 
@@ -181,13 +193,18 @@ void InjectionSweepSession::run()
             "again after changing set_injections()");
 
     const int n_bus = base_state_->n_bus;
+    const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    if (continuous)   // before any allocation / cuDSS ANALYSIS
+        check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
 
     // Hot run: same settings and row count as the live driver -- keep it
     // (allocations, cuDSS ANALYSIS, the policy's factorization state); new
     // injections / gen_v, if any, go into its live source. Otherwise build a
-    // new one, as the first run() does.
+    // new one, as the first run() does. The continuous schedule always
+    // rebuilds its driver (its reuse is docs/dev_notes/continuous_batching.md
+    // A.6 item 2), as in ScenarioSweepSession.
     const BatchDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_;
+    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
     const bool new_rows = cold || injections_dirty_ || gen_v_dirty_;
 
     std::vector<cudaComplexType> h_Sbus_all;
@@ -214,8 +231,11 @@ void InjectionSweepSession::run()
     double t_rows_upload_ms = 0.;
     if (cold) {
         // Effective per-chunk batch size: balance the last chunk (same rule as
-        // run_injection_sweep_gpu / run_contingency_analysis_gpu).
-        {
+        // run_injection_sweep_gpu / run_contingency_analysis_gpu). Continuous:
+        // batch_size_ slots, never more than the rows.
+        if (continuous) {
+            used_batch_size_ = std::max(1, std::min(batch_size_, n_scenarios_));
+        } else {
             const size_t n_elem   = static_cast<size_t>(n_scenarios_);
             const size_t max_bs   = static_cast<size_t>(batch_size_);
             const size_t n_chunks = (n_elem + max_bs - 1) / max_bs;
@@ -242,7 +262,10 @@ void InjectionSweepSession::run()
             pivot_epsilon_alg_,
             scaling_max_voltage_change_,
             max_dVa_,
-            max_dVm_);
+            max_dVm_,
+            scheduling_,
+            nb_iter_per_round_,
+            tol_);
         driver_cfg_ = cfg;
         ++driver_build_counter_;
     } else {
@@ -257,7 +280,9 @@ void InjectionSweepSession::run()
     }
     injections_dirty_ = false;
     gen_v_dirty_      = false;
-    solver_->nb_iter_ = nb_iter_;   // per-run knob, no rebuild needed
+    solver_->nb_iter_           = nb_iter_;   // per-run knobs, no rebuild needed
+    solver_->nb_iter_per_round_ = nb_iter_per_round_;
+    solver_->tol_               = tol_;
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
     // violations); an injection sweep never disconnects a generator (nullptr mask).
@@ -426,6 +451,20 @@ CplxVect InjectionSweepSession::get_V_results() const
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
+}
+
+Eigen::VectorXi InjectionSweepSession::get_row_iterations() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_iterations();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+Eigen::VectorXi InjectionSweepSession::get_row_status() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_status();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
 }
 
 RealVect InjectionSweepSession::get_residuals() const

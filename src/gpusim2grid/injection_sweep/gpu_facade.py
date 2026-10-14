@@ -13,6 +13,7 @@ import numpy as np
 
 from . import (
     PhysicalChecksFacadeMixin,
+    SchedulingFacadeMixin,
     _InjectionSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -37,7 +38,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class InjectionSweepGPU(PhysicalChecksFacadeMixin):
+class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
     """Batch injection sweep on the GPU, seeded from a CPU base-case solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -139,6 +140,27 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         Only meaningful on the lightsim2grid-bridge path; the explicit-array
         and Python-fallback paths have no ledger and always solve the bare
         system.
+    scheduling : {"chunked", "continuous"}, default "chunked"
+        How the rows go through the batch. ``"chunked"``: ``ceil(n_rows /
+        batch_size)`` chunks, every row runs exactly ``nb_iter`` Newton
+        iterations. ``"continuous"``: ``batch_size`` slots; every
+        ``nb_iter_per_round`` iterations each row is checked, and one that
+        converged (``||F||inf < tol``), diverged or used its ``nb_iter``
+        budget leaves at once, its slot refilled from the queue -- a row pays
+        the iterations it needs, not the hardest row's. ``nb_iter`` is then
+        each row's budget (a row runs a multiple of ``nb_iter_per_round``, at
+        least one round). Continuous refuses the ``'direct_iter0_only'`` /
+        ``'direct_refactor_every_n'`` strategies. Mutable.
+    nb_iter_per_round : int, default 1
+        Continuous scheduling: iterations between two convergence checks; see
+        :class:`ContingencyAnalysisGPU`. Mutable.
+    tol : float or None, default None
+        A row has converged when ``||F||inf < tol``, per unit like
+        :meth:`last_residuals`: when it leaves (continuous) and its
+        :class:`RowStatus` (both schedules, :meth:`get_row_status`).
+        lightsim2grid compares the same way but takes its ``tol`` in MVA
+        (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
+        build). Mutable.
 
     Examples
     --------
@@ -170,7 +192,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
-                 compute_physical_violations=False):
+                 compute_physical_violations=False, scheduling="chunked",
+                 nb_iter_per_round=1, tol=None):
         _validate_precision(precision)
 
         # Single source of truth, resolved once here and applied at
@@ -269,6 +292,9 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         self._last_residuals = None
 
         # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
     # ------------------------------------------------------------------ spec

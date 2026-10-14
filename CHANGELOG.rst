@@ -3,6 +3,33 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
+  remote regulators added or changed since it was built.
+- [ADDED] ``scheduling="continuous"`` on the three batch facades: a row leaves its slot once
+  converged, diverged or out of its ``nb_iter`` budget, and the slot is refilled at once.
+- [ADDED] ``get_row_status()`` / ``get_row_iterations()`` (``RowStatus``) and ``tol``: each row's
+  outcome, in both schedules.
+- [ADDED] ``BatchPowerFlow.from_lsgrid(scheduling="continuous", batch_size=...)``: gradients through a
+  continuous run. The backward rebuilds each row's Jacobian from its converged voltages, so
+  nothing is kept from the forward.
+- [ADDED] Report an hvdc line frozen at its AC-emulation limit whose droop asks for less
+  (``HVDC_AC_EMULATION_RELEASE``, lightsim2grid's ``set_hvdc_ac_emulation_frozen``).
+- [FIXED] ``redistribute_slack``: a unit capped well beyond its active limit stays there until the
+  shift has used that up (lightsim2grid's ``set_gen_can_participate_slack_overshoot``).
+- [ADDED] Report a generator holding a remote bus from an unrealistic own-bus voltage
+  (``LOW_VOLTAGE_REMOTE_CONTROL`` / ``HIGH_VOLTAGE_REMOTE_CONTROL``), lightsim2grid's
+  ``set_remote_voltage_control_vm_range``, as OpenLoadFlow's robust remote voltage control does.
+- [ADDED] ``ContingencyAnalysisGPU(reactive_limits_outer_loop=True)`` (opt-in): one pass of
+  OpenLoadFlow's ``ReactiveLimits`` loop, re-solving the contingencies a PV bus or a local release
+  flags (``get_outer_loop_status``).
+- [IMPROVED] ``reactive_limits_outer_loop`` also re-solves a voltage-control group of generators
+  whose every controller saturated: each held at its limit, the regulated bus floating.
+- [IMPROVED] ``reactive_limits_outer_loop`` also releases a frozen remote regulator, through
+  lightsim2grid's held controllers (``set_hold_frozen_regulators``, lightsim2grid PR #220),
+  pinned on every other row.
+- [IMPROVED] ``reactive_limits_outer_loop``: the second pass starts each contingency from its
+  first-pass voltages (``outer_loop_warm_start``, default on); ``outer_loop_nb_iter`` sets its
+  Newton iterations.
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.
@@ -12,7 +39,7 @@ Change Log
 - [ADDED] ``reference_slack="auto"`` (default with ``handle_disconnected_grid``): the angle
   reference is the slack unit stranded by the fewest rows.
 - [ADDED] ``LimitViolationType`` mirrors lightsim2grid 1.2's ``LOW_VOLTAGE_REMOTE_CONTROL`` /
-  ``HIGH_VOLTAGE_REMOTE_CONTROL`` / ``HVDC_AC_EMULATION_RELEASE`` (category PHYSICAL, not computed yet).
+  ``HIGH_VOLTAGE_REMOTE_CONTROL`` / ``HVDC_AC_EMULATION_RELEASE`` (category PHYSICAL).
 - [ADDED] PQ -> PV release check (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``) and
   ``physical_violation_tol_vm_pu``.
 - [ADDED] ``violation_rel_tol`` (default ``1e-9``): a value on its operational limit up to

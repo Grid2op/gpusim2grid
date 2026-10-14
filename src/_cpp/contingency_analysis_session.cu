@@ -26,6 +26,7 @@
 #include <algorithm>   // std::max
 #include <cmath>       // std::abs
 #include <stdexcept>
+#include <string>
 #include <limits>
 #include <utility>   // std::move
 
@@ -209,6 +210,7 @@ BatchDriverConfig ContingencyAnalysisSession::_current_config() const
     c.mask_mode                  = handle_disconnected_grid_;
     c.base_state_generation      = base_state_generation_;
     c.rows_generation            = contingencies_generation_;
+    c.scheduling                 = scheduling_;
     return c;
 }
 
@@ -228,6 +230,9 @@ void ContingencyAnalysisSession::run()
             "with the 'direct_base_case_factors' strategy (it reuses the unmasked "
             "base-case factors). Use 'direct_refactor_every' (default), "
             "'direct_iter0_only', or 'direct_refactor_every_n'.");
+    const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    if (continuous)   // before any allocation / cuDSS ANALYSIS
+        check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
 
     // Automatic reference slack: the participant the fewest contingencies
     // strand; a change moves it in the ledger and rebuilds the base state.
@@ -241,20 +246,30 @@ void ContingencyAnalysisSession::run()
     // keep it (allocations, block-diagonal structure, cuDSS ANALYSIS, the
     // policy's factorization state) and its source (connectivity, masks,
     // patches already on the device); only solve() runs again. Otherwise
-    // build both, as the first run() does.
+    // build both, as the first run() does. The continuous schedule always
+    // rebuilds its driver (its reuse is docs/dev_notes/continuous_batching.md
+    // A.6 item 2), as in ScenarioSweepSession.
     const BatchDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_;
+    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
 
     if (cold) {
         // Reset any masking flags set on a previous run() (the contingency
         // list is mutated in place across runs; compute_component_masks /
         // check_connectivity expect to start from a clean state). A hot run
         // keeps them: they describe the live source.
+        // lightsim2grid's held controllers (set_hold_frozen_regulators) are
+        // pinned on every contingency, as in the grid's own solve (AcPfNrState
+        // pins them too)
+        std::vector<std::pair<int, double>> held_pins;
+        for (size_t j = 0; j < base_state_->h_vc_held.size(); ++j)
+            if (base_state_->h_vc_held[j])
+                held_pins.emplace_back(static_cast<int>(j), base_state_->h_vc_q_held[j]);
         for (auto& ctg : contingencies_) {
             ctg.disconnected = false;
             ctg.masked_buses.clear();
             ctg.stranded_groups.clear();
             ctg.pinned_buses.clear();
+            ctg.vc_pinned_ctrl = held_pins;
         }
 
         // Host preprocessing (resolve_indices + connectivity/masking +
@@ -269,8 +284,11 @@ void ContingencyAnalysisSession::run()
             Ybus_rm_.innerIndexPtr(),
             Ybus_rm_,
             batch_size_,
-            handle_disconnected_grid_ ? &mask_cfg_ : nullptr);
-        used_batch_size_ = source.used_batch_size();
+            (handle_disconnected_grid_ || !held_pins.empty()) ? &mask_cfg_ : nullptr,
+            handle_disconnected_grid_);
+        // Continuous: batch_size_ slots, never more than the simulated rows.
+        used_batch_size_ = continuous ? std::max(1, std::min(batch_size_, source.n_active()))
+                                      : source.used_batch_size();
 
         // redistribute_slack: the pre-pass of what each contingency's island took
         // out, on the masks the source just computed -- handed to the source
@@ -316,7 +334,10 @@ void ContingencyAnalysisSession::run()
             pivot_epsilon_alg_,
             scaling_max_voltage_change_,
             max_dVa_,
-            max_dVm_);
+            max_dVm_,
+            scheduling_,
+            nb_iter_per_round_,
+            tol_);
         driver_cfg_ = cfg;
         ++driver_build_counter_;
     } else {
@@ -324,7 +345,9 @@ void ContingencyAnalysisSession::run()
         // not paid again: report them as 0 for this run.
         solver_->mark_reused(/*hot=*/true);
     }
-    solver_->nb_iter_ = nb_iter_;   // per-run knob, no rebuild needed
+    solver_->nb_iter_           = nb_iter_;   // per-run knobs, no rebuild needed
+    solver_->nb_iter_per_round_ = nb_iter_per_round_;
+    solver_->tol_               = tol_;
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop
@@ -746,6 +769,86 @@ RealVect ContingencyAnalysisSession::get_residuals() const
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_residuals);   // pinned, pipelined
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
+}
+
+void ContingencyAnalysisSession::overwrite_rows(const std::vector<int>& dst_rows,
+                                                const std::vector<int>& src_rows,
+                                                std::uintptr_t d_V_src, std::uintptr_t d_res_src)
+{
+    if (!solver_)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: call run() first");
+    if (dst_rows.size() != src_rows.size())
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: dst_rows and src_rows "
+                                 "must have the same length");
+    if (dst_rows.empty()) return;
+    if (d_V_src == 0 || d_res_src == 0)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: null source buffer");
+    const int n_rows = solver_->n_contingencies;
+    for (int r : dst_rows)
+        if (r < 0 || r >= n_rows)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: row " +
+                                     std::to_string(r) + " outside [0, n_contingencies)");
+    for (int r : src_rows)
+        if (r < 0)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: negative source row");
+    const cudaStream_t cs = static_cast<cudaStream_t>(solver_->cs);
+    thrust::device_vector<int> d_dst, d_src;
+    upload_h2d(d_dst, dst_rows.data(), dst_rows.size(), cs);
+    upload_h2d(d_src, src_rows.data(), src_rows.size(), cs);
+    const int n = static_cast<int>(dst_rows.size());
+    launch_copy_rows(thrust::raw_pointer_cast(solver_->d_V_results.data()),
+                     reinterpret_cast<const cudaComplexType*>(d_V_src),
+                     thrust::raw_pointer_cast(d_dst.data()), thrust::raw_pointer_cast(d_src.data()),
+                     base_state_->n_bus, n, cs);
+    launch_copy_rows(thrust::raw_pointer_cast(solver_->d_residuals.data()),
+                     reinterpret_cast<const cuda_real_type*>(d_res_src),
+                     thrust::raw_pointer_cast(d_dst.data()), thrust::raw_pointer_cast(d_src.data()),
+                     1, n, cs);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ContingencyAnalysisSession::overwrite_rows: ") +
+                                 cudaGetErrorString(e));
+    solver_->cs.synchronize();
+}
+
+void ContingencyAnalysisSession::overwrite_row_outcomes(const std::vector<int>& rows,
+                                                        const std::vector<int>& iterations,
+                                                        const std::vector<int>& status)
+{
+    if (!solver_)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_row_outcomes: call run() first");
+    if (rows.size() != iterations.size() || rows.size() != status.size())
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_row_outcomes: rows, "
+                                 "iterations and status must have the same length");
+    const int n_rows = static_cast<int>(solver_->row_iters_.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const int r = rows[i];
+        if (r < 0 || r >= n_rows)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_row_outcomes: row " +
+                                     std::to_string(r) + " outside [0, n_contingencies)");
+        solver_->row_iters_[static_cast<size_t>(r)]  = iterations[i];
+        solver_->row_status_[static_cast<size_t>(r)] = status[i];
+    }
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_row_iterations() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_iterations();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+Eigen::VectorXi ContingencyAnalysisSession::get_row_status() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_status();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+std::uintptr_t ContingencyAnalysisSession::v_results_ptr() const
+{
+    return solver_ ? reinterpret_cast<std::uintptr_t>(thrust::raw_pointer_cast(solver_->d_V_results.data()))
+                   : 0;
 }
 
 RealVect ContingencyAnalysisSession::get_or_amps() const

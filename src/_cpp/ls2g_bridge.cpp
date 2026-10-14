@@ -20,6 +20,14 @@
 #include <batch_algorithm/SvcStandbyCheck.hpp>   // ls2g::svc_standby_check (LSGrid::set_svc_standby)
 #define GPUSIM2GRID_HAVE_LS2G_SVC_STANDBY 1
 #endif
+#if __has_include(<batch_algorithm/RemoteVoltageControlCheck.hpp>)
+#include <batch_algorithm/RemoteVoltageControlCheck.hpp>   // ls2g::remote_voltage_control_check (LSGrid::set_remote_voltage_control_vm_range)
+#define GPUSIM2GRID_HAVE_LS2G_REMOTE_VOLTAGE_CONTROL 1
+#endif
+
+#if __has_include(<batch_algorithm/HvdcPCheck.hpp>)
+#include <batch_algorithm/HvdcPCheck.hpp>   // ls2g::hvdc_p_check (LSGrid::set_hvdc_ac_emulation_frozen)
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -312,6 +320,25 @@ bool gen_remote_vreg(const C& gens, int g)
     else                                           return gens.gen_is_voltage_controller(g);
 }
 
+// The held controllers of lightsim2grid's set_hold_frozen_regulators
+// (VoltageControlSolverData::held), when the installed headers have them;
+// empty otherwise (no controller is ever held).
+template <class D, class = void>
+struct has_vc_held : std::false_type {};
+template <class D>
+struct has_vc_held<D, std::void_t<decltype(std::declval<const D&>().held)>> : std::true_type {};
+
+template <class D>
+std::vector<int> vc_held_flags(const D& v, int)
+{
+    if constexpr (has_vc_held<D>::value) {
+        if (v.held.size() != v.bus.size()) return {};
+        return std::vector<int>(v.held.data(), v.held.data() + v.held.size());
+    } else {
+        return {};
+    }
+}
+
 }  // namespace
 
 LedgerData drop_multislack_augmentation(const LedgerData& in,
@@ -437,6 +464,13 @@ int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver)
 #else
 #define GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(info) 0.
 #endif
+// ... and how far beyond its limit such a unit was in the reference solve
+// (LSGrid::set_gen_can_participate_slack_overshoot); 0 against a lightsim2grid that predates it
+#ifdef LS2G_HAS_CAN_PARTICIPATE_SLACK_OVERSHOOT
+#define GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(info) static_cast<double>((info).can_participate_slack_overshoot_mw)
+#else
+#define GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(info) 0.
+#endif
 
 SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
@@ -448,7 +482,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         return (b >= 0 && b < n_bus_solver) ? b : -1;
     };
     std::vector<int>    kind, el_id, bus, in_slack;
-    std::vector<double> weight, min_p, max_p, target;
+    std::vector<double> weight, min_p, max_p, target, overshoot;
 
     // generators by id, then storage units by id (upstream's append_participants
     // order): connected, flagged slack with a nonzero weight -- or flagged "can
@@ -472,6 +506,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         el_id.push_back(g);
         bus.push_back(b);
         in_slack.push_back(g_in_slack ? 1 : 0);
+        overshoot.push_back(g_in_slack ? 0. : GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(gi));
         weight.push_back(g_w);
         min_p.push_back(static_cast<double>(gi.min_p_mw));
         max_p.push_back(static_cast<double>(gi.max_p_mw));
@@ -491,6 +526,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         el_id.push_back(s);
         bus.push_back(b);
         in_slack.push_back(s_in_slack ? 1 : 0);
+        overshoot.push_back(s_in_slack ? 0. : GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(si));
         weight.push_back(s_w);
         min_p.push_back(static_cast<double>(si.min_p_mw));
         max_p.push_back(static_cast<double>(si.max_p_mw));
@@ -511,6 +547,7 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     d.max_p_mw    = rv(max_p);
     d.target_p_mw = rv(target);
     d.in_slack    = iv(in_slack);
+    d.overshoot_mw = rv(overshoot);
 
     // the shunts' active power at 1 pu per solver bus: not in the AC Sbus
     d.shunt_p_mw = RealVect::Zero(std::max(n_bus_solver, 0));
@@ -689,6 +726,27 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
         }
     }
 
+#ifdef LS2G_HAS_HVDC_AC_EMULATION_FROZEN
+    // the lines an outer loop froze at their AC-emulation limit (droop off, so not in the
+    // list above): nothing in the solve reads them, only the check of their release
+    {
+        ls2g::hvdc_p_check::HvdcPPlan plan;
+        ls2g::hvdc_p_check::build_hvdc_p_plan(grid, grid.id_me_to_ac_solver(), plan);
+        const double sn = static_cast<double>(grid.get_sn_mva());
+        for (const ls2g::hvdc_p_check::HvdcPEntry& e : plan.lines) {
+            if (e.frozen_dir == 0) continue;
+            ld.hvdc_frz_bus1.push_back(e.bus1_solver);
+            ld.hvdc_frz_bus2.push_back(e.bus2_solver);
+            ld.hvdc_frz_dir.push_back(e.frozen_dir);
+            ld.hvdc_frz_id.push_back(e.hvdc_id);
+            ld.hvdc_frz_p0.push_back(static_cast<double>(e.p0_mw) / sn);
+            ld.hvdc_frz_k.push_back(static_cast<double>(e.k_mw_per_rad) / sn);
+            ld.hvdc_frz_limit.push_back(static_cast<double>(e.frozen_dir > 0 ? e.pmax_1to2_mw
+                                                                               : e.pmax_2to1_mw) / sn);
+        }
+    }
+#endif
+
     // VoltageControl (remote-regulating generators + voltage-mode SVCs): pull the
     // bordered-block physics (solver numbering, pu). Empty when none active.
     {
@@ -706,6 +764,24 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             ld.vc_group     = to_iv(v.group);
             ld.vc_slope     = to_dv(v.slope);
             ld.vc_weight    = to_dv(v.weight);
+            ld.vc_elem_id   = to_iv(v.elem_id);
+            // held controllers (lightsim2grid's set_hold_frozen_regulators), when the
+            // lightsim2grid built against has them: pinned at the generator's target Q
+            ld.vc_held = vc_held_flags(v, 0);
+            bool any_held = false;
+            for (int h : ld.vc_held) any_held = any_held || h != 0;
+            if (any_held) {
+                ld.vc_q_held.assign(ld.vc_held.size(), 0.);
+                const auto& gens = grid.get_generators();
+                for (size_t j = 0; j < ld.vc_held.size(); ++j) {
+                    if (!ld.vc_held[j]) continue;
+                    const int gen_id = ld.vc_elem_id[j];
+                    if (gens.get_status(gen_id))
+                        ld.vc_q_held[j] = gens.get_target_q_mvar(gen_id) / grid.get_sn_mva();
+                }
+            } else {
+                ld.vc_held.clear();
+            }
             ld.vc_reg_bus   = to_iv(v.reg_bus);
             ld.vc_grp_start = to_iv(v.grp_start);
             ld.vc_grp_count = to_iv(v.grp_count);
@@ -1081,6 +1157,11 @@ bool bridge_has_gen_pv_release()
 #endif
 }
 
+bool bridge_has_hold_frozen()
+{
+    return has_vc_held<ls2g::VoltageControlSolverData>::value;
+}
+
 // the station's end of a release entry (an HVDC one: a VSC station frozen at a limit);
 // 0 against a lightsim2grid whose entries have no side yet
 #ifdef LS2G_HAS_RELEASE_ENTRY_SIDE
@@ -1139,8 +1220,39 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
             target.push_back(static_cast<double>(low ? e.low_vm_pu : e.high_vm_pu));
             vn.push_back(static_cast<double>(e.vn_kv));
             el_type.push_back(GenPvReleasePlanData::EL_SVC);
-            standby.push_back(1);
+            standby.push_back(GenPvReleasePlanData::CHECK_SVC_STANDBY);
             side.push_back(0);
+        }
+    }
+#endif
+#ifdef GPUSIM2GRID_HAVE_LS2G_REMOTE_VOLTAGE_CONTROL
+    // the generators holding a remote bus, when the caller set a realistic range
+    // (LSGrid::set_remote_voltage_control_vm_range), lightsim2grid's own selection on the
+    // voltage-control plan of this labelling: one entry per finite bound, on the
+    // generator's OWN bus (see gen_pv_release_check_data.hpp)
+    {
+        ls2g::VoltageControlSolverData vc;
+        grid.fill_voltage_control_solver_data(vc, /*ac=*/true);
+        ls2g::remote_voltage_control_check::RemoteVoltageControlPlan rc_plan;
+        ls2g::remote_voltage_control_check::build_remote_voltage_control_plan(
+            grid, grid.id_me_to_ac_solver(), vc, rc_plan);
+        for (const ls2g::remote_voltage_control_check::RemoteVoltageControlEntry& e : rc_plan.gens) {
+            if (e.gen_bus_solver < 0 || e.gen_bus_solver >= n_bus_solver) continue;
+            if (e.reg_bus_solver < 0 || e.reg_bus_solver >= n_bus_solver) continue;
+            for (int bound = 0; bound < 2; ++bound) {
+                const bool low = (bound == 0);
+                const double vm_bound = static_cast<double>(low ? rc_plan.min_vm_pu : rc_plan.max_vm_pu);
+                if (!std::isfinite(vm_bound)) continue;
+                gen_id.push_back(e.gen_id);
+                reg_bus.push_back(e.gen_bus_solver);   // the bus checked: its own
+                gen_bus.push_back(e.reg_bus_solver);   // the remote one, for its mask
+                at_min.push_back(low ? 1 : 0);
+                target.push_back(vm_bound);
+                vn.push_back(static_cast<double>(e.vn_kv));
+                el_type.push_back(GenPvReleasePlanData::EL_GENERATOR);
+                standby.push_back(GenPvReleasePlanData::CHECK_REMOTE_CONTROL);
+                side.push_back(0);
+            }
         }
     }
 #endif

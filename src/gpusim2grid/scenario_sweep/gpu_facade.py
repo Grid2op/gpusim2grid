@@ -31,6 +31,7 @@ from . import (
     LimitViolationsFacadeMixin,
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
+    SchedulingFacadeMixin,
     _ScenarioSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
@@ -56,7 +57,7 @@ def _have_bridge():
 
 
 class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
-                       LimitViolationsFacadeMixin):
+                       SchedulingFacadeMixin, LimitViolationsFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -100,6 +101,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     use_distributed_slack : bool, default True
         Selects which of the two slack formulations the GPU solves; see
         :class:`InjectionSweepGPU`.
+    scheduling, nb_iter_per_round, tol
+        Batch scheduling (chunked / continuous) and the convergence tolerance
+        of a row; see :class:`ContingencyAnalysisGPU`. A continuous run always
+        rebuilds its batch driver; its batched adjoint rebuilds each row's
+        Jacobian from the converged voltages (``keep_final_jacobian`` is not
+        needed there).
 
     Examples
     --------
@@ -142,7 +149,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
-                 reference_slack="auto"):
+                 reference_slack="auto", scheduling="chunked", nb_iter_per_round=1,
+                 tol=None):
         _validate_precision(precision)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
@@ -256,6 +264,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         self._last_residuals = None
 
         # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
         # set_injections_from_elements() inputs, kept so a later
@@ -263,6 +274,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # disconnected generators taken out, whatever the call order.
         self._pending_elements = None
         self._gen_off = None
+        # per-row (rows, buses, MVAr) reactive changes added on top of the
+        # assembled injections -- private, set by ContingencyAnalysisGPU's
+        # reactive_limits_outer_loop second pass (None = none)
+        self._q_delta = None
         # set_gen_v() input, kept so a later set_contingency_gens() (or vice
         # versa) can re-derive which rows ask one bus for two different |V|.
         self._gen_v = None
@@ -351,6 +366,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p,
                                             gen_off=gen_off)
+        if self._q_delta is not None:
+            # ContingencyAnalysisGPU's reactive_limits_outer_loop second pass:
+            # (row, bus, MVAr) changes of the switched / released machines
+            rows, buses, dq = self._q_delta
+            np.add.at(q_mvar, (rows, buses), dq)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
         self._n_injection_rows = int(p_mw.shape[0])
         self._skip_rows_stale = self._gen_v is not None

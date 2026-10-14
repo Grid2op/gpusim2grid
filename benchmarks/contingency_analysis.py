@@ -32,6 +32,11 @@ def get_parser():
                         help="linear-solve strategy (default: direct_refactor_every)")
     parser.add_argument("--refactor_period", type=int, default=1,
                         help="refactor period N for direct_refactor_every_n (default: 1)")
+    parser.add_argument("--scheduling", default="chunked", choices=["chunked", "continuous"],
+                        help="batch scheduling; with 'continuous', nb_iter is each row's "
+                             "budget (default: chunked)")
+    parser.add_argument("--nb_iter_per_round", type=int, default=1,
+                        help="continuous scheduling: iterations between two checks (default: 1)")
     return parser
 
 
@@ -56,11 +61,14 @@ def main(args):
         prng = np.random.default_rng(0)
         cont_ids_both = prng.choice(list(range(n_branches)), size=nb_max_cont_cpu, replace=False)
         cont_ids_both = sorted(cont_ids_both)
-        if ac_Ybus.shape[0] > nb_max_cont_gpu - nb_max_cont_cpu:
-            cont_ids_gpu_only = prng.choice(list(range(n_branches)), size=(nb_max_cont_gpu - nb_max_cont_cpu), replace=False)
+        # the GPU-only contingencies: the branches the CPU does not simulate, all of
+        # them when they fit in the GPU budget, a random subset otherwise
+        others = np.setdiff1d(np.arange(n_branches), cont_ids_both)
+        if others.size > nb_max_cont_gpu - nb_max_cont_cpu:
+            cont_ids_gpu_only = prng.choice(others, size=(nb_max_cont_gpu - nb_max_cont_cpu), replace=False)
             max_ = max_cont
         else:
-            cont_ids_gpu_only = np.asarray([el for el in list(range(n_branches)) if not el in cont_ids_both], dtype=int)
+            cont_ids_gpu_only = others
             max_ = n_branches
     else:
         cont_ids_both = None
@@ -122,7 +130,8 @@ def main(args):
 
     print(f"\nRunning contingency analysis on GPU (strategy={args.strategy}, batch_size={batch_size}, nb_iter={nb_iter}, n cont = {n_conts_simul}) ...")
     ca = ContingencyAnalysisGPU(
-        grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6)
+        grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6,
+        scheduling=args.scheduling, nb_iter_per_round=args.nb_iter_per_round)
     # branch data (needed for compute_flows) is extracted automatically from
     # `grid` -- call ca.set_branch_data(...) only in explicit-array mode.
 

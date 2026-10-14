@@ -36,6 +36,12 @@ no row is re-solved):
   ``can_be_pv``); routed through the release plan (two entries per SVC, see
   ``GenPvReleasePlanData``), value / limit in kV, compared with
   ``physical_violation_tol_vm_pu``;
+- the own bus of the generators holding a remote bus, when the grid carries a
+  realistic range (``LOW_VOLTAGE_REMOTE_CONTROL`` / ``HIGH_VOLTAGE_REMOTE_CONTROL``
+  on a ``GENERATOR``, lightsim2grid's ``RemoteVoltageControlCheck``, range set
+  with ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's robust
+  remote voltage control switches such a controller to PQ. Routed through the
+  release plan too (one entry per bound), value / limit in kV;
 - droop hvdc P-saturation (``HVDC_P_SATURATION`` on an ``HVDC``):
   OpenLoadFlow's ``HvdcAcEmulationLimits`` outer loop;
 - per-machine active power of the distributed slack (``LOW_P`` / ``HIGH_P``
@@ -178,7 +184,11 @@ class PhysicalChecksEngineMixin:
         its end in the optional ``side``) and, with the optional ``standby`` (1
         for such an entry), the idle
         standby SVCs, two entries each (the low threshold with at_min 1, the
-        high one with at_min 0). OPTIONAL: left unset, nothing is flagged and
+        high one with at_min 0); with ``standby`` 2 on a GENERATOR entry, a
+        generator holding a remote bus (``LSGrid.set_remote_voltage_control_vm_range``):
+        its OWN bus as ``reg_bus_solver``, the remote one as ``gen_bus_solver``, one
+        entry per realistic bound, reported as ``LOW_VOLTAGE_REMOTE_CONTROL`` /
+        ``HIGH_VOLTAGE_REMOTE_CONTROL``. OPTIONAL: left unset, nothing is flagged and
         nothing is reported. Validated against n_bus; drops any previous
         report.
 

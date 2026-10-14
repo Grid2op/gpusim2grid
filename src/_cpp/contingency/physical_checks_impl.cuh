@@ -16,6 +16,7 @@
 #include <string>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
+#include <vector>
 
 #include "physical_checks_data.hpp"
 #include "../timing_utils.hpp"
@@ -33,6 +34,15 @@ struct RowTargets {
     bool             gen_p_dirty = false;
     const RealMatRM* gen_pv_release = nullptr;   // release check, pu
     bool             gen_pv_release_dirty = false;
+    // per-row skip masks of the reactive and release plans' entries (uint8,
+    // (n_rows x n_entries) row-major, ORIGINAL row order; nullptr / empty =
+    // none): the reactive-limit outer loop's second pass
+    const std::vector<unsigned char>* bus_q_skip = nullptr;
+    int              bus_q_skip_cols = 0;
+    bool             bus_q_skip_dirty = false;
+    const std::vector<unsigned char>* gen_pv_release_skip = nullptr;
+    int              gen_pv_release_skip_cols = 0;
+    bool             gen_pv_release_skip_dirty = false;
 };
 
 namespace detail {
@@ -44,6 +54,15 @@ void sync_targets(const RealMatRM* targets, bool dirty, bool driver_has, Upload 
     const bool has = (targets != nullptr) && targets->size() > 0;
     if (has && (dirty || !driver_has)) upload(*targets);
     else if (!has && driver_has)        upload(RealMatRM());
+}
+// the same for a skip mask
+template <class Upload>
+void sync_skip(const std::vector<unsigned char>* mask, int n_cols, bool dirty, bool driver_has,
+               Upload upload)
+{
+    const bool has = (mask != nullptr) && !mask->empty();
+    if (has && (dirty || !driver_has)) upload(*mask, n_cols);
+    else if (!has && driver_has)        upload(std::vector<unsigned char>(), 0);
 }
 }  // namespace detail
 
@@ -109,6 +128,15 @@ SetupTimes before_solve(PhysicalChecksConfig& cfg, Driver& drv, const char* who,
     detail::sync_targets(targets.gen_pv_release, targets.gen_pv_release_dirty,
                          drv.has_gen_pv_release_targets(),
                          [&](const RealMatRM& m) { drv.upload_gen_pv_release_targets(m); });
+    // per-row skip masks (the reactive-limit outer loop's second pass): a
+    // setup above drops the driver's, so they go up again then too
+    detail::sync_skip(targets.bus_q_skip, targets.bus_q_skip_cols, targets.bus_q_skip_dirty,
+                      drv.has_bus_q_row_skip(),
+                      [&](const std::vector<unsigned char>& m, int c) { drv.upload_bus_q_row_skip(m, c); });
+    detail::sync_skip(targets.gen_pv_release_skip, targets.gen_pv_release_skip_cols,
+                      targets.gen_pv_release_skip_dirty, drv.has_gen_pv_release_row_skip(),
+                      [&](const std::vector<unsigned char>& m, int c) {
+                          drv.upload_gen_pv_release_row_skip(m, c); });
     const double targets_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_targets).count();
     if (same_setup) {
@@ -194,6 +222,7 @@ HvdcPViolationsResult fetch_hvdc_p(const PhysicalChecksConfig& cfg, const Driver
     r.stride    = N_HVDC_P_VIOLATION_GROUPS * drv.hvdc_p_capacity_;
     r.hvdc_id   = detail::to_int (n_case ? drv.d_hp_n_hvdc_id   : drv.d_hp_out_hvdc_id);
     r.side      = detail::to_int (n_case ? drv.d_hp_n_side      : drv.d_hp_out_side);
+    r.type      = detail::to_int (n_case ? drv.d_hp_n_type      : drv.d_hp_out_type);
     r.value     = detail::to_real(n_case ? drv.d_hp_n_value     : drv.d_hp_out_value);
     r.limit     = detail::to_real(n_case ? drv.d_hp_n_limit     : drv.d_hp_out_limit);
     r.count     = detail::to_int (n_case ? drv.d_hp_n_count     : drv.d_hp_count);

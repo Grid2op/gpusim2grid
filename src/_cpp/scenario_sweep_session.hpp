@@ -46,6 +46,7 @@
 #include "gen_contingency_data.hpp"          // GenContingencyData
 #include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -102,6 +103,8 @@ struct ScenarioSweepSession {
     //                         rebalancing for the plain sweep API.
     //   keep_final_jacobian_ : refill J at the converged V after the NR loop
     //                         (forwarded to the driver; see BatchPfDriver).
+    //                         Chunked runs only: a continuous one needs nothing
+    //                         kept (solve_JT_batch rebuilds J per row).
     //   run_counter_ etc.   : observability for callers/tests (a torch
     //                         autograd backward checks run_counter_ against
     //                         the forward it belongs to).
@@ -132,6 +135,15 @@ struct ScenarioSweepSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // row runs nb_iter_ iterations) or continuous (nb_iter_ is each row's
+    // budget, checked every nb_iter_per_round_ iterations against tol_; every
+    // run() then takes the cold path, and fixed_batch_capacity_ and
+    // keep_final_jacobian_ are ignored: the adjoint rebuilds each row's J from
+    // its converged V). Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
@@ -261,6 +273,39 @@ struct ScenarioSweepSession {
     // differentiable wrapper: a released bus' voltage set-point is only an NR
     // start value there, so its gen_v gradient is 0 on that row.
     std::vector<std::vector<int>> row_pv_to_pq_;
+
+    // =========================================================================
+    // Reactive-limit outer loop (the second pass ContingencyAnalysisGPU runs
+    // with reactive_limits_outer_loop): per row, ORIGINAL order, the Vm-fixed
+    // buses it solves as PQ (sw_to_pq_: they join the reserved switchable set
+    // exactly like a generator contingency's) and the PQ buses it holds PV at
+    // a given |V| (sw_to_pv_: Q row pinned, |V| re-seeded). The injection side
+    // (the limit a switched bus' machines produce, the frozen Q a released
+    // machine no longer injects) is the caller's, through set_injections.
+    // =========================================================================
+    std::vector<std::vector<int>>                    sw_to_pq_;
+    std::vector<std::vector<std::pair<int, double>>> sw_to_pv_;
+    // per row, (controller, Q pu) of the VoltageControl controllers held at a
+    // fixed reactive injection (set_vc_controller_pins); empty = none
+    std::vector<std::vector<std::pair<int, double>>> sw_vc_pins_;
+    // the final pins of row r: the held controllers it does not release, then the
+    // caller's (set_vc_controller_pins); validated (see there)
+    std::vector<std::pair<int, double>> _row_vc_pins(int r) const;
+    // per row, the held controllers (lightsim2grid's set_hold_frozen_regulators)
+    // released there: every other row pins them at their frozen output
+    std::vector<std::vector<int>>                    sw_vc_release_;
+    bool has_switches_   = false;
+    bool has_vc_pins_    = false;
+    bool has_vc_release_ = false;
+    // set_v_init_from_ptr: rows held in ScenarioSweepDeviceData::d_V_init_orig
+    bool has_v_init_ = false;
+    int  v_init_rows_ = 0;
+    bool switches_dirty_ = false;
+    // per-row skip masks of the reactive / release plans' entries (uint8,
+    // (n_rows x n_entries) row-major; empty = none), see set_bus_q_row_skip
+    std::vector<unsigned char> bus_q_row_skip_, gen_pv_release_row_skip_;
+    int  bus_q_row_skip_cols_ = 0, gen_pv_release_row_skip_cols_ = 0;
+    bool bus_q_row_skip_dirty_ = false, gen_pv_release_row_skip_dirty_ = false;
 
     // =========================================================================
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
@@ -512,6 +557,86 @@ struct ScenarioSweepSession {
     // =========================================================================
     void set_contingency_gens(Eigen::Ref<const BoolMat> mask);
 
+    // =========================================================================
+    // set_pv_pq_switches — the labelling side of one reactive-limit outer-loop
+    // pass, row-aligned with set_injections() (n_scenarios entries each, in
+    // ORIGINAL row order):
+    //   to_pq[r] : Vm-fixed buses (a local PV / slack bus, not one a
+    //              VoltageControl group holds) that row r solves as PQ -- they
+    //              get a reserved Vm column + Q equation like a generator
+    //              contingency's (one base-state rebuild when the union
+    //              changes), every other row keeping them PV;
+    //   to_pv[r] : (bus, |V| pu) of PQ buses (a Vm unknown and a Q equation in
+    //              the base ledger, no VoltageControl group) that row r holds
+    //              PV: its Q row is identity-pinned and |V| re-seeded to the
+    //              value before the solve.
+    // The injections are the caller's (the Q the switched machines produce at
+    // their limit, the frozen Q a released one no longer injects). A change is
+    // a warm source rebuild. clear_pv_pq_switches drops them.
+    // =========================================================================
+    void set_pv_pq_switches(const std::vector<std::vector<int>>& to_pq,
+                            const std::vector<std::vector<std::pair<int, double>>>& to_pv);
+    void clear_pv_pq_switches();
+    bool has_pv_pq_switches() const { return has_switches_; }
+
+    // The VoltageControl side of the same pass, row-aligned with set_injections():
+    // pins[r] lists (controller index, reactive injection pu, generator
+    // convention) of the generator controllers row r holds at a fixed Q -- a
+    // group whose controllers reached a reactive limit (each other controller's
+    // sharing row, and the group's voltage row for its first one, are rewritten
+    // by value; the structure is unchanged). With lightsim2grid's held
+    // controllers pinned too (below), a row whose pins reach a group's first
+    // controller must pin every controller of that group (checked at run()).
+    // A change is a warm source rebuild. clear_vc_controller_pins drops them.
+    void set_vc_controller_pins(const std::vector<std::vector<std::pair<int, double>>>& pins);
+    void clear_vc_controller_pins();
+    // lightsim2grid's held controllers (LedgerData::vc_held) are pinned at their
+    // frozen output on every row; releases[r] lists the ones row r releases (they
+    // then take part in their group like any controller). Only held controllers
+    // can be listed. A change is a warm source rebuild.
+    void set_vc_controller_releases(const std::vector<std::vector<int>>& releases);
+    void clear_vc_controller_releases();
+    std::vector<int>    vc_ctrl_held() const;
+    std::vector<double> vc_ctrl_q_held() const;
+
+    // The VoltageControl groups of the base ledger, per controller (bus, kind:
+    // 0 GEN / 1 SVC / 2-3 HVDC station, group, element id) and per group
+    // (first controller, count, regulated bus, v_set pu); all empty without a
+    // ledger.
+    std::vector<int>    vc_ctrl_bus() const;
+    std::vector<int>    vc_ctrl_kind() const;
+    std::vector<int>    vc_ctrl_group() const;
+    std::vector<int>    vc_ctrl_elem_id() const;
+    std::vector<int>    vc_grp_start() const;
+    std::vector<int>    vc_grp_count() const;
+    std::vector<int>    vc_reg_bus() const;
+
+    // Per-row skip masks of the reactive-capability / release plans' entries
+    // ((n_scenarios x n_entries) bool, True = that entry is not checked on
+    // that row; an empty matrix drops the mask): the outer loop's second pass
+    // does not check a bus it switched to PQ at its limit for LOW_Q / HIGH_Q,
+    // nor a machine it released for its release. Validated against the plan
+    // at run().
+    void set_bus_q_row_skip(Eigen::Ref<const BoolMat> mask);
+    void set_gen_pv_release_row_skip(Eigen::Ref<const BoolMat> mask);
+
+    // Device pointers of the last run's results (row-major (n_scenarios x
+    // n_bus) complex voltages / (n_scenarios,) residuals, ORIGINAL row order),
+    // for a caller copying rows into another session (0 before run()).
+    std::uintptr_t v_results_ptr() const;
+    std::uintptr_t residuals_ptr() const;
+
+    // Per-row starting voltages, row-aligned with set_injections(): row i
+    // starts from row src_rows[i] of a row-major (* x n_bus) complex device
+    // buffer (e.g. ContingencyAnalysisSession::v_results_ptr), copied at once;
+    // a non-finite entry (a bus that solve masked) starts from the base case.
+    // The reactive-limit outer loop's second pass continues each contingency
+    // from its first-pass solution this way. A hot change (no source rebuild).
+    // clear_v_init: back to the base-case V.
+    void set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows);
+    void clear_v_init();
+    bool has_v_init() const { return has_v_init_; }
+
     // Current augmented Jacobian dimension of the base state (grows by one per
     // reserved switchable bus) and the reserved buses themselves -- lets a
     // caller observe when run() rebuilt the base state.
@@ -558,9 +683,12 @@ struct ScenarioSweepSession {
     // =========================================================================
     // solve_JT_batch — batched adjoint (see BatchPfDriver::solve_JT_batch;
     // pointer arguments are device buffers of the documented shapes, nullptr
-    // where optional). Requires the last run() to have been made with
-    // keep_final_jacobian_ = true (alias mode) or an external J snapshot.
-    // Builds the transposed system lazily on the first call.
+    // where optional). After a chunked run(): requires it to have been made
+    // with keep_final_jacobian_ = true (alias mode) or an external J snapshot.
+    // After a continuous one: J is rebuilt from the converged V (d_V_ext_orig,
+    // else the run's own results) and this run's batch source; J / Ybus
+    // snapshots are refused. Builds the transposed system lazily on the first
+    // call.
     // =========================================================================
     void solve_JT_batch(const void* d_rhs_orig, const void* d_J_ext,
                         bool want_gen_v_grad,
@@ -633,6 +761,10 @@ struct ScenarioSweepSession {
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_scenarios * n_bus,)      complex
     RealVect get_residuals()  const;   // (n_scenarios,)               real
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_scenarios,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const;  // run() timings + cumulative adjoint counters

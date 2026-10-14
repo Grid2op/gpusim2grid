@@ -56,6 +56,7 @@ from ..contingency_analysis._physical_checks import (
     PhysicalChecksEngineMixin,
     PhysicalChecksFacadeMixin,
 )
+from ..contingency_analysis._scheduling import SchedulingEngineMixin, SchedulingFacadeMixin
 
 
 _STRATEGY_MAP = {
@@ -172,7 +173,7 @@ class _DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _InjectionSweepSolver(PhysicalChecksEngineMixin):
+class _InjectionSweepSolver(PhysicalChecksEngineMixin, SchedulingEngineMixin):
     """Stateful GPU batched-injection power flow solver.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -221,7 +222,8 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
                  device=None, presolved_v=False, reordering_alg='default',
                  matching_alg='none', pivot_epsilon_alg='default',
                  debug_base_case=False,
-                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
+                 scheduling='chunked', nb_iter_per_round=1, tol=None):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -241,6 +243,7 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
             debug_base_case=bool(debug_base_case),
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
+        self._init_scheduling(scheduling, nb_iter_per_round, tol)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -433,6 +436,7 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
 
     def run(self):
         """Run all scenarios; fills V_results and residuals on device."""
+        self._warn_tol_above_violation_tol()
         self._s.run()
 
     def compute_flows(self):

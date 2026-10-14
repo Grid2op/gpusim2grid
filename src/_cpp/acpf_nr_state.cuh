@@ -201,6 +201,19 @@ struct AcPfNrState {
     std::vector<cuda_real_type> h_slack_w;
     std::vector<int>            h_vc_vrow, h_vc_vrow_qcol_pos, h_vc_vrow_vmcol_pos;
     std::vector<int>            h_vc_ctrl_vrow_qcol_pos;
+    //   h_vc_ctrl_sh_row / _sh_self_pos / _sh_first_pos : per CONTROLLER, the
+    //                                   sharing row tying it to its group's
+    //                                   first controller and the nnz pos of
+    //                                   its (own q_col) / (first's q_col)
+    //                                   entries; -1 for a first controller
+    std::vector<int>            h_vc_ctrl_sh_row, h_vc_ctrl_sh_self_pos, h_vc_ctrl_sh_first_pos;
+    //   h_vc_held / h_vc_q_held       : per CONTROLLER, lightsim2grid's held ones
+    //                                   (LedgerData::vc_held) and the output they
+    //                                   hold (pu); all 0 when none is held. Every
+    //                                   batch row pins them unless it releases one.
+    std::vector<int>            h_vc_held;
+    std::vector<double>         h_vc_q_held;
+    bool                        has_vc_held = false;
 
     // Switchable Vm buses (LedgerData::switchable_vm_buses, sorted): their Q
     // rows are identity-PINNED in this single-system base solve (the base
@@ -238,6 +251,11 @@ struct AcPfNrState {
                                           d_hvdc_r, d_hvdc_pmax12, d_hvdc_pmax21;
     thrust::device_vector<int>            d_hvdc_prow1, d_hvdc_prow2;          // end P rows
     thrust::device_vector<int>            d_hvdc_h11, d_hvdc_h12, d_hvdc_h21, d_hvdc_h22;  // feature J pos
+    // the lines frozen at their AC-emulation limit (LedgerData::hvdc_frz_*): checked for
+    // their release only, never solved
+    int n_hvdc_frz = 0;
+    thrust::device_vector<int>            d_hvdc_frz_bus1, d_hvdc_frz_bus2, d_hvdc_frz_dir, d_hvdc_frz_id;
+    thrust::device_vector<cuda_real_type> d_hvdc_frz_p0, d_hvdc_frz_k, d_hvdc_frz_limit;
 
     // -------------------------------------------------------------------------
     // VoltageControl (remote gen + SVC) — n_vc_ctrl == 0 when inactive.
@@ -256,6 +274,15 @@ struct AcPfNrState {
     thrust::device_vector<int>            d_vc_feat_pos;                        // flat feature J pos
     thrust::device_vector<cuda_real_type> d_vc_feat_val;                       // flat feature value
     thrust::device_vector<cuda_real_type> d_vc_q;                              // [n_vc_ctrl] running state
+    // held controllers: the frozen output offset out of the mismatch (empty = none
+    // held) and their pins in this base solve (the vcp / jov streams of the batch
+    // rows, slot 0)
+    thrust::device_vector<cuda_real_type> d_vc_qoff;                           // [n_vc_ctrl]
+    thrust::device_vector<int>            d_hold_vcp_slot, d_hold_vcp_row, d_hold_vcp_ctrl;
+    thrust::device_vector<cuda_real_type> d_hold_vcp_target;
+    thrust::device_vector<int>            d_hold_jov_slot, d_hold_jov_pos;
+    thrust::device_vector<cuda_real_type> d_hold_jov_val;
+    int                                   n_hold_vcp = 0, n_hold_jov = 0;
 
     // -------------------------------------------------------------------------
     // Ybus CSR (device, complex cuda_real_type)

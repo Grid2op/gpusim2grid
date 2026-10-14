@@ -106,6 +106,60 @@ __global__ void apply_gen_v_kernel(
     int n_bus);
 
 // ---------------------------------------------------------------------------
+// vc_pinned_ctrl_rows_kernel  (reactive-limit outer loop)
+//
+// F[slot * dim_J + row] = -(Q[slot, ctrl] - target) for every controller held
+// at a fixed reactive injection on a row (MaskEntries::vcp): the custom row
+// (group voltage row or sharing row) build_mask_entries rewrote into
+// "Q_ctrl = target" by value. Assigns, so it must run after the feature
+// mismatch kernels that assign those rows' normal residual.
+// ---------------------------------------------------------------------------
+__global__ void vc_pinned_ctrl_rows_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,
+    const int*            __restrict__ d_slot,
+    const int*            __restrict__ d_row,
+    const int*            __restrict__ d_ctrl,
+    const cuda_real_type* __restrict__ d_target,
+    int n_ctrl,
+    int dim_J,
+    int n_entries);
+
+// ---------------------------------------------------------------------------
+// apply_vm_reseed_kernel
+//
+// Per-slot magnitude reseed, keeping the tiled angle: d_V_batch[slot * n_bus +
+// bus] gets |V| = vm for each (slot, bus, vm) entry of this chunk's slice (the
+// reactive-limit outer loop's released buses, whose Q row the same row pins).
+// A collapsed magnitude is forced to 1 first, like apply_gen_v_kernel. One
+// thread per entry.
+// ---------------------------------------------------------------------------
+__global__ void apply_vm_reseed_kernel(
+          cudaComplexType* __restrict__ d_V_batch,
+    const int*             __restrict__ d_slot,
+    const int*             __restrict__ d_bus,
+    const cuda_real_type*  __restrict__ d_vm,
+    int n_entries,
+    int n_bus);
+
+// ---------------------------------------------------------------------------
+// gather_v_rows_kernel
+//
+// Per-row initial voltages into active-slot order: d_dst[r * n_bus + b] =
+// d_src[map[r] * n_bus + b], or d_fallback[b] where that entry is not finite
+// (a bus the row's source solve masked). The reactive-limit outer loop's
+// second pass starts each row from its first-pass solution this way. One
+// thread per entry.
+// ---------------------------------------------------------------------------
+__global__ void gather_v_rows_kernel(
+          cudaComplexType* __restrict__ d_dst,
+    const cudaComplexType* __restrict__ d_src,
+    const int*             __restrict__ d_map,
+    const cudaComplexType* __restrict__ d_fallback,
+    int n_bus,
+    int n_rows);
+
+// ---------------------------------------------------------------------------
 // tile_vc_vset_kernel / apply_gen_vset_kernel
 //
 // Per-slot VoltageControl set-points: tile the base per-group v_set into
@@ -474,6 +528,7 @@ __global__ void vc_adjust_mismatch_kernel(
           cuda_real_type* __restrict__ d_F,
     const cuda_real_type* __restrict__ d_vc_q,     // [actual_batch * n_ctrl]
     const int*            __restrict__ d_vc_qrow,  // [n_ctrl]
+    const cuda_real_type* __restrict__ d_vc_qoff,  // [n_ctrl] held controllers' frozen output, or nullptr
     int n_ctrl,
     int dim_J,
     int actual_batch);
@@ -600,7 +655,8 @@ __global__ void mask_V_nan_kernel(
     const int*             __restrict__ d_maskv_bus,
     cuda_real_type nan_val,
     int n_bus,
-    int n_entries);
+    int n_entries,
+    const int*             __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // compute_residuals_kernel
@@ -625,6 +681,10 @@ __global__ void mask_V_nan_kernel(
 // c_start     : active-slot offset for indexing into d_result_map
 // d_result_map: [n_active] active-slot → original-index map, or nullptr for
 //               identity (write residual at c_start + b directly)
+// d_slot_active: [actual_batch] active row held by each slot, -1 = skip the
+//               slot, or nullptr for c_start + b (continuous batching passes
+//               the rows leaving this round). Same meaning in the two kernels
+//               below and in mask_V_nan_kernel.
 // ---------------------------------------------------------------------------
 __global__ void compute_residuals_kernel(
           cuda_real_type* __restrict__ d_residuals,
@@ -632,7 +692,8 @@ __global__ void compute_residuals_kernel(
     int dim_J,
     int actual_batch,
     int c_start,
-    const int* __restrict__ d_result_map);
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // scatter_V_results_kernel
@@ -646,7 +707,7 @@ __global__ void compute_residuals_kernel(
 // ----------
 // d_V_results  : [n_contingencies * n_bus] complex — full-size output
 // d_V_batch    : [actual_batch * n_bus]    complex — this chunk's converged V
-// d_result_map : [n_active] active-slot → original-index map (must be non-null)
+// d_result_map : [n_active] active-slot → original-index map, or nullptr
 // c_start      : active-slot offset for this chunk
 // n_bus        : buses per system
 // actual_batch : number of active systems in this chunk
@@ -657,7 +718,8 @@ __global__ void scatter_V_results_kernel(
     const int*             __restrict__ d_result_map,
     int c_start,
     int n_bus,
-    int actual_batch);
+    int actual_batch,
+    const int*             __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // compute_branch_flows_kernel
@@ -713,7 +775,8 @@ __global__ void compute_branch_flows_kernel(
     int n_branches,
     int c_start,
     int actual_batch,
-    const int* __restrict__ d_result_map);
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active = nullptr);
 
 // ---------------------------------------------------------------------------
 // zero_branch_flows_kernel
@@ -831,6 +894,36 @@ inline void launch_scatter_rows(T* dst, const T* src, const int* map,
     const long long total = static_cast<long long>(n_cols) * n_rows;
     scatter_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
         dst, src, map, n_cols, n_rows);
+}
+
+// =============================================================================
+// copy_rows_kernel / launch_copy_rows
+//   dst[dst_rows[i] * n_cols + c] = src[src_rows[i] * n_cols + c]   for i in
+//   [0, n): moves rows between two sessions' result buffers (the reactive-limit
+//   outer loop's second pass into ContingencyAnalysisSession's).
+// =============================================================================
+template <typename T>
+__global__ void copy_rows_kernel(T* __restrict__ dst, const T* __restrict__ src,
+                                 const int* __restrict__ dst_rows,
+                                 const int* __restrict__ src_rows, int n_cols, int n)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t i   = tid / n_cols;
+    const int       c   = static_cast<int>(tid % n_cols);
+    if (i >= n) return;
+    dst[static_cast<ptrdiff_t>(dst_rows[i]) * n_cols + c] =
+        src[static_cast<ptrdiff_t>(src_rows[i]) * n_cols + c];
+}
+
+template <typename T>
+inline void launch_copy_rows(T* dst, const T* src, const int* dst_rows, const int* src_rows,
+                             int n_cols, int n, cudaStream_t cs)
+{
+    if (n_cols <= 0 || n <= 0) return;
+    constexpr int block = 256;
+    const long long total = static_cast<long long>(n_cols) * n;
+    copy_rows_kernel<T><<<static_cast<unsigned>((total + block - 1) / block), block, 0, cs>>>(
+        dst, src, dst_rows, src_rows, n_cols, n);
 }
 
 // =============================================================================

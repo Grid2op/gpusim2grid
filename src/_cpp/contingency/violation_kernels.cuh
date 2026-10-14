@@ -130,6 +130,11 @@
 //                    per type (3K output slots per contingency)
 // d_result_map     : [n_active] active-slot -> original-index map, or nullptr
 //                    for identity (c_start + local_c directly)
+// d_slot_active    : [actual_batch] the active row each batch slot holds, -1 =
+//                    skip that slot (continuous batching: only the slots that
+//                    leave this round are checked), or nullptr for the chunk's
+//                    own c_start + local_c. Same meaning in the four physical
+//                    checks below.
 // d_out_*          : [n_contingencies * 3K] compact SoA output (see
 //                    ContingencyAnalysisSession::get_violation_*())
 // d_out_count      : [n_contingencies]; -1 = not simulated, else 0..3K
@@ -164,6 +169,7 @@ __global__ void check_limit_violations_kernel(
     int n_bus, int n_branches, int n_lines,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_side,
@@ -211,6 +217,11 @@ __global__ void check_limit_violations_kernel(
 //   generator off, no station / storage unit / SVC) => the bus is an ordinary PQ bus in this
 //   row and is not checked (the residual there is nobody's output).
 //
+//   d_row_skip[out_c * skip_stride + kk] != 0 (nullptr = none) leaves entry kk
+//   unchecked on that row: a bus the reactive-limit outer loop switched to PQ
+//   at its limit there (ContingencyAnalysisGPU's second pass), or an entry the
+//   pass added for a machine that row did not release.
+//
 //   violation:  q_bus < q_min - tol_mvar  -> LOW_Q  (value q_bus, limit q_min)
 //         else  q_bus > q_max + tol_mvar  -> HIGH_Q (value q_bus, limit q_max)
 //   a non-finite limit disables that side; a non-finite q_bus skips the bus.
@@ -254,11 +265,14 @@ __global__ void check_bus_q_violations_kernel(
     const cuda_real_type*  __restrict__ d_gen_qmax,
     const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
     int                                 n_gen,
+    const unsigned char*   __restrict__ d_row_skip,     // [n_rows × skip_stride] ORIGINAL order, or nullptr
+    int                                 skip_stride,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mvar,
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_bus_id,
           int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
@@ -289,6 +303,12 @@ __global__ void check_bus_q_violations_kernel(
 // the K largest |value - limit| (MW), either side, most severe first. Same
 // row gate / result map / capacity / sentinel conventions as
 // check_bus_q_violations_kernel above.
+//
+// The n_frz lines an outer loop froze at their AC-emulation limit (droop off, see
+// LedgerData::hvdc_frz_*) are checked for the other half of that loop, in a second
+// group: raw = p0 + k . (theta1 - theta2) (as lightsim2grid's HvdcPCheck.hpp, no
+// losses), and raw in the frozen direction below the limit by more than tol_pu ->
+// HVDC_AC_EMULATION_RELEASE, side the frozen direction. d_out_type says which.
 // -----------------------------------------------------------------------------
 __global__ void check_hvdc_p_violations_kernel(
     const cudaComplexType* __restrict__ d_V,            // [actual_batch × n_bus], slot order
@@ -306,13 +326,23 @@ __global__ void check_hvdc_p_violations_kernel(
     const cuda_real_type*  __restrict__ d_pmax12,
     const cuda_real_type*  __restrict__ d_pmax21,
     const int*             __restrict__ d_hvdc_id,
+    int                                 n_frz,
+    const int*             __restrict__ d_frz_bus1,
+    const int*             __restrict__ d_frz_bus2,
+    const int*             __restrict__ d_frz_dir,
+    const int*             __restrict__ d_frz_id,
+    const cuda_real_type*  __restrict__ d_frz_p0,
+    const cuda_real_type*  __restrict__ d_frz_k,
+    const cuda_real_type*  __restrict__ d_frz_limit,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_pu,
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_hvdc_id,
           int*             __restrict__ d_out_side,
+          int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,
@@ -343,9 +373,18 @@ __global__ void check_hvdc_p_violations_kernel(
 // is on (5 GENERATOR / 7 SVC / 4 HVDC), d_out_gen_id its id and d_out_side its
 // side (the station's end for an HVDC one, 0 otherwise). An HVDC entry (a VSC
 // station frozen at a reactive limit) runs the generators' test, never masked
-// by d_gen_off nor moved by d_targets. Four groups
+// by d_gen_off nor moved by d_targets. A GENERATOR entry whose d_standby is 2
+// is a generator holding a remote bus (lightsim2grid's
+// RemoteVoltageControlCheck.hpp): its own bus -- d_reg_bus for that entry, the
+// remote one in d_gen_bus only for its mask -- against the low (at_min) / high
+// realistic bound, masked by d_gen_off but never moved by d_targets, reported
+// as LOW_VOLTAGE_REMOTE_CONTROL (13) / HIGH_VOLTAGE_REMOTE_CONTROL (14).
+// d_row_skip[out_c * skip_stride + k] != 0 (nullptr = none) leaves entry k
+// unchecked on that row (a machine the reactive-limit outer loop released
+// there, or an entry the pass added for a bus it did not switch). Six groups
 // (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
-// HIGH_VOLTAGE_SVC_STANDBY), each keeping the K largest |value / limit - 1|
+// HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL,
+// HIGH_VOLTAGE_REMOTE_CONTROL), each keeping the K largest |value / limit - 1|
 // (a relative measure, like every voltage check), most severe first. Same row gate / result map / capacity / sentinel
 // conventions as check_bus_q_violations_kernel above.
 // -----------------------------------------------------------------------------
@@ -361,16 +400,19 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cuda_real_type*  __restrict__ d_target_base,
     const cuda_real_type*  __restrict__ d_vn_kv,
     const int*             __restrict__ d_el_type,      // [n_entries] 5 / 7, or nullptr = all generators
-    const int*             __restrict__ d_standby,      // [n_entries] 1 = standby SVC entry, or nullptr = none
+    const int*             __restrict__ d_standby,      // [n_entries] CHECK_* code (1 standby SVC, 2 remote control), or nullptr = all releases
     const int*             __restrict__ d_side,         // [n_entries] 1 / 2 for an HVDC entry, or nullptr = all 0
     const unsigned char*   __restrict__ d_gen_off,      // [n_rows × n_gen] ORIGINAL order, or nullptr
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,      // [n_rows × target_stride] ORIGINAL order, or nullptr
     int                                 target_stride,
+    const unsigned char*   __restrict__ d_row_skip,     // [n_rows × skip_stride] ORIGINAL order, or nullptr
+    int                                 skip_stride,
     cuda_real_type                      tol_vm_pu,
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
           int*             __restrict__ d_out_el_type,
@@ -457,6 +499,7 @@ __global__ void check_gen_p_violations_kernel(
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_type,

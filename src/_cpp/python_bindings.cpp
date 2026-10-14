@@ -10,6 +10,7 @@
 #include "injection_sweep_session.hpp"       // InjectionSweepSession
 #include "scenario_sweep_session.hpp"        // ScenarioSweepSession
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
 #include "warmup.hpp"                        // warmup
@@ -222,7 +223,12 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "carrying a standby automaton (LSGrid.set_svc_standby) is two entries with "
         "standby = 1 (optional, empty = none): at_min = 1 with target_vm_pu its low "
         "threshold, at_min = 0 with its high one, reported as LOW_VOLTAGE_SVC_STANDBY / "
-        "HIGH_VOLTAGE_SVC_STANDBY.")
+        "HIGH_VOLTAGE_SVC_STANDBY. A generator holding a remote bus, when a realistic range "
+        "is set (LSGrid.set_remote_voltage_control_vm_range), is up to two GENERATOR entries "
+        "with standby = 2: reg_bus_solver its OWN bus (the one checked), gen_bus_solver the "
+        "remote bus (only its mask matters), at_min = 1 with target_vm_pu the low bound and "
+        "at_min = 0 with the high one, reported as LOW_VOLTAGE_REMOTE_CONTROL / "
+        "HIGH_VOLTAGE_REMOTE_CONTROL.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> gen_id,
                                Eigen::Ref<const Eigen::VectorXi> reg_bus_solver,
@@ -272,7 +278,10 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "out of the slack only because it sat at an active limit -- which never enters the "
         "solve's slack weights. Optional base_p_mw: the active injection of the grid's own "
         "set-points summed over the solved system (MW), what a scenario row's injection "
-        "change is pre-shared against (NaN = unknown: no such term).")
+        "change is pre-shared against (NaN = unknown: no such term). Optional overshoot_mw (one "
+        "per unit, empty = all 0): for a pre-pass-only unit, how far beyond the limit it sits at "
+        "it was in the reference solve (LSGrid.set_gen_can_participate_slack_overshoot): it only "
+        "leaves that limit once the common shift of the distribution has used that up.")
         .def(pybind11::init<>())
         .def(pybind11::init([](Eigen::Ref<const Eigen::VectorXi> kind,
                                Eigen::Ref<const Eigen::VectorXi> el_id,
@@ -287,7 +296,8 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const RealVect> shunt_p_mw,
                                double sn_mva,
                                Eigen::Ref<const Eigen::VectorXi> in_slack,
-                               double base_p_mw) {
+                               double base_p_mw,
+                               Eigen::Ref<const RealVect> overshoot_mw) {
                  SlackRedistributionData d;
                  d.n_units = static_cast<int>(kind.size());
                  d.kind = kind; d.el_id = el_id; d.bus_solver = bus_solver;
@@ -298,6 +308,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  d.n_sto = n_sto; d.shunt_p_mw = shunt_p_mw; d.sn_mva = sn_mva;
                  d.in_slack = in_slack;
                  d.base_p_mw = base_p_mw;
+                 d.overshoot_mw = overshoot_mw;
                  return d;
              }),
              pybind11::arg("kind"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
@@ -306,8 +317,10 @@ static void bind_physical_checks_types(pybind11::module_& m)
              pybind11::arg("gen_target_p_mw"), pybind11::arg("n_sto"),
              pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"),
              pybind11::arg("in_slack") = Eigen::VectorXi(),
-             pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN())
+             pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN(),
+             pybind11::arg("overshoot_mw") = RealVect())
         .def_readonly("n_units",         &SlackRedistributionData::n_units)
+        .def_readonly("overshoot_mw",    &SlackRedistributionData::overshoot_mw)
         .def_readonly("kind",            &SlackRedistributionData::kind)
         .def_readonly("el_id",           &SlackRedistributionData::el_id)
         .def_readonly("bus_solver",      &SlackRedistributionData::bus_solver)
@@ -495,10 +508,12 @@ static void bind_physical_checks_types(pybind11::module_& m)
         "Flat per-row records of the droop hvdc P-saturation check, same layout as "
         "BusQViolationsResult: hvdc_id the GRID hvdc id, side 1 (would saturate 1->2: "
         "p1 > pmax_1to2) or 2 (2->1), value the flow leaving the AC bus into the hvdc "
-        "(MW), limit pmax (MW). Every record is element type HVDC (4), violation type "
-        "HVDC_P_SATURATION (7).")
+        "(MW), limit pmax (MW). Every record is element type HVDC (4); type "
+        "HVDC_P_SATURATION (7) or, for a line frozen at its AC-emulation limit whose droop "
+        "asks for less, HVDC_AC_EMULATION_RELEASE (15, side its frozen direction).")
         .def_readonly("hvdc_id",   &HvdcPViolationsResult::hvdc_id)
         .def_readonly("side",      &HvdcPViolationsResult::side)
+        .def_readonly("type",      &HvdcPViolationsResult::type)
         .def_readonly("value",     &HvdcPViolationsResult::value)
         .def_readonly("limit",     &HvdcPViolationsResult::limit)
         .def_readonly("count",     &HvdcPViolationsResult::count)
@@ -527,12 +542,14 @@ static void bind_physical_checks_types(pybind11::module_& m)
     pybind11::class_<GenPvReleaseViolationsResult>(m, "GenPvReleaseViolationsResult",
         "Flat per-row records of the PQ -> PV release check, same layout as "
         "BusQViolationsResult (groups LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, "
-        "LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY, each ranked by |value / limit "
+        "LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL, "
+        "HIGH_VOLTAGE_REMOTE_CONTROL, each ranked by |value / limit "
         "- 1|): gen_id the element id, of element type el_type (5 GENERATOR, or 7 SVC for "
         "a frozen SVC's release or a standby SVC's switch on), type 9 "
         "(LOW_VOLTAGE_AT_MIN_Q) / 10 (HIGH_VOLTAGE_AT_MAX_Q) / 11 / 12 (the standby "
-        "ones), value the voltage of the bus it would regulate and limit the target it "
-        "would hold (the threshold for a standby SVC), both in kV.")
+        "ones) / 13 / 14 (a remote controller's own bus), value the voltage of the bus it "
+        "would regulate (its own bus for 13 / 14) and limit the target it would hold (the "
+        "threshold for a standby SVC, the realistic bound for 13 / 14), both in kV.")
         .def_readonly("gen_id",    &GenPvReleaseViolationsResult::gen_id)
         .def_readonly("type",      &GenPvReleaseViolationsResult::type)
         .def_readonly("el_type",   &GenPvReleaseViolationsResult::el_type)
@@ -870,6 +887,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "compute_physical_violations) — total across all chunks; zero unless enabled")
         .def_readonly("t_flow_computation", &BatchTimings::t_flow_computation,
                       "compute_branch_flows_kernel — total across all chunks (0 if no branch data)")
+        .def_readonly("t_schedule", &BatchTimings::t_schedule,
+                      "Continuous scheduling only: the scheduler's per-round host work (D->H of "
+                      "the slots' residuals, decisions, H->D of the eviction map / load list), wall")
+        .def_readonly("scheduling", &BatchTimings::scheduling,
+                      "BatchScheduling of the run: 0 = chunked, 1 = continuous")
+        .def_readonly("nb_iter_per_round", &BatchTimings::nb_iter_per_round,
+                      "Continuous scheduling: Newton iterations between two convergence checks (k)")
+        .def_readonly("n_rounds", &BatchTimings::n_rounds,
+                      "Continuous scheduling: rounds of nb_iter_per_round iterations run")
+        .def_readonly("occupancy", &BatchTimings::occupancy,
+                      "Continuous scheduling: useful row-iterations / (slots x iterations run)")
         // --- metadata ---
         .def_readonly("n_contingencies", &BatchTimings::n_contingencies,
                       "Total number of contingencies")
@@ -891,6 +919,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "cuDSS REFACTORIZATION of J^T -- every later backward after a new run() -- total")
         .def_readonly("t_adjoint_solve", &BatchTimings::t_adjoint_solve,
                       "cuDSS SOLVE with J^T -- every backward -- total")
+        .def_readonly("t_adjoint_rebuild_J", &BatchTimings::t_adjoint_rebuild_J,
+                      "Continuous scheduling: reload of the rows into the slots + J at their "
+                      "converged V (no row's J is kept by the run) -- every backward -- total")
         .def_readonly("adjoint_n_analysis", &BatchTimings::adjoint_n_analysis,
                       "Number of J^T ANALYSIS calls over the driver's life (0 or 1)")
         .def_readonly("adjoint_n_factorize", &BatchTimings::adjoint_n_factorize,
@@ -1005,6 +1036,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["gen_p_check"]       = entry_dict(t.t_gen_p_check);
             gpu_compute["gen_pv_release_check"] = entry_dict(t.t_gen_pv_release_check);
             gpu_compute["flow_computation"]  = entry_dict(t.t_flow_computation);
+            gpu_compute["schedule"]          = entry_dict(t.t_schedule);
 
             py::dict d2h;
             d2h["total"]                      = t.t_device_to_host_ms();
@@ -1020,6 +1052,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             adjoint["first_factorize"] = entry_dict(t.t_adjoint_first_factorize);
             adjoint["refactorize"]     = entry_dict(t.t_adjoint_refactorize);
             adjoint["solve"]           = entry_dict(t.t_adjoint_solve);
+            adjoint["rebuild_J"]       = entry_dict(t.t_adjoint_rebuild_J);
             adjoint["n_analysis"]      = t.adjoint_n_analysis;
             adjoint["n_factorize"]     = t.adjoint_n_factorize;
             adjoint["n_refactorize"]   = t.adjoint_n_refactorize;
@@ -1352,6 +1385,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // Registered BEFORE bindings that use it as a default argument
   // (e.g. acpf_nr_gpu_injection's strategy_type kwarg).
   // -----------------------------------------------------------------
+  // BatchScheduling / RowStatus (contingency/row_status.hpp): the batch
+  // sessions' scheduling knob and the per-row outcome of a run.
+  pybind11::enum_<BatchScheduling>(m, "BatchScheduling")
+      .value("Chunked", BatchScheduling::Chunked,
+             "ceil(n_rows / batch_size) chunks, every row runs exactly nb_iter iterations.")
+      .value("Continuous", BatchScheduling::Continuous,
+             "batch_size slots; a row leaves as soon as it converged (residual < tol), "
+             "diverged or used its nb_iter budget, and its slot is refilled at once.");
+  pybind11::enum_<RowStatus>(m, "RowStatus")
+      .value("Converged",    RowStatus::Converged,    "||F||inf < tol")
+      .value("MaxIter",      RowStatus::MaxIter,      "nb_iter budget used, residual >= tol")
+      .value("Diverged",     RowStatus::Diverged,     "residual not finite")
+      .value("NotSimulated", RowStatus::NotSimulated, "dropped by the pre-check, never solved");
+
   pybind11::enum_<ContingencySolverType>(m, "ContingencySolverType")
       .value("DirectRefactorEvery",   ContingencySolverType::DirectRefactorEvery,
              "Fill J every iteration; FACTORIZE once globally, REFACTORIZE for all "
@@ -1555,6 +1602,23 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_contingencies * n_bus,) complex128.")
     .def("get_residuals",  &ContingencyAnalysisSession::get_residuals,
          "Copy per-contingency ||F||inf residuals to host: (n_contingencies,) float64.")
+    .def("get_row_iterations", &ContingencyAnalysisSession::get_row_iterations,
+         "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def("get_row_status", &ContingencyAnalysisSession::get_row_status,
+         "(n_rows,) int: RowStatus of each row in the last run().")
+    .def("overwrite_row_outcomes", &ContingencyAnalysisSession::overwrite_row_outcomes,
+         pybind11::arg("rows"), pybind11::arg("iterations"), pybind11::arg("status"),
+         "Overwrite the per-row outcome (iterations, RowStatus) of the given rows "
+         "(the reactive-limit outer loop's second pass). Requires run().")
+    .def("overwrite_rows", &ContingencyAnalysisSession::overwrite_rows,
+         pybind11::arg("dst_rows"), pybind11::arg("src_rows"),
+         pybind11::arg("d_V_src"), pybind11::arg("d_res_src"),
+         "Overwrite the voltages and residuals of rows dst_rows[i] with row "
+         "src_rows[i] of another session's device result buffers (e.g. "
+         "ScenarioSweepSession.v_results_ptr() / residuals_ptr()): the "
+         "reactive-limit outer loop's second pass. Requires run().")
+    .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
+         "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
          "Copy origin-terminal ampere flows to host: (n_contingencies * n_branches,). "
          "Requires compute_flows().")
@@ -1578,7 +1642,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readonly("used_batch_size", &ContingencyAnalysisSession::used_batch_size_,
                    "Batch size effectively used during the last run()")
     .def_readwrite("nb_iter",    &ContingencyAnalysisSession::nb_iter_,
-                   "Fixed NR iterations per chunk (takes effect on the next run())")
+                   "Chunked: NR iterations every row runs. Continuous: each row's iteration "
+                   "budget (takes effect on the next run())")
+    .def_readwrite("scheduling", &ContingencyAnalysisSession::scheduling_,
+                   "BatchScheduling (takes effect on the next run())")
+    .def_readwrite("nb_iter_per_round", &ContingencyAnalysisSession::nb_iter_per_round_,
+                   "Continuous scheduling: NR iterations between two convergence checks "
+                   "(takes effect on the next run())")
+    .def_readwrite("tol", &ContingencyAnalysisSession::tol_,
+                   "A row has converged when ||F||inf < tol: decides when it leaves "
+                   "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
     .def_readwrite("refactor_period", &ContingencyAnalysisSession::refactor_period_,
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &ContingencyAnalysisSession::strategy_type_,
@@ -1866,6 +1939,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_scenarios * n_bus,) complex128.")
     .def("get_residuals",  &InjectionSweepSession::get_residuals,
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
+    .def("get_row_iterations", &InjectionSweepSession::get_row_iterations,
+         "(n_scenarios,) int: Newton iterations each row ran in the last run().")
+    .def("get_row_status", &InjectionSweepSession::get_row_status,
+         "(n_scenarios,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &InjectionSweepSession::get_or_amps,
          "Copy origin-terminal ampere flows to host: (n_scenarios * n_branches,). "
          "Requires compute_flows().")
@@ -1889,7 +1966,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readonly("used_batch_size", &InjectionSweepSession::used_batch_size_,
                    "Batch size effectively used during the last run()")
     .def_readwrite("nb_iter",    &InjectionSweepSession::nb_iter_,
-                   "Fixed NR iterations per chunk (takes effect on the next run())")
+                   "Chunked: NR iterations every row runs. Continuous: each row's iteration "
+                   "budget (takes effect on the next run())")
+    .def_readwrite("scheduling", &InjectionSweepSession::scheduling_,
+                   "BatchScheduling (takes effect on the next run())")
+    .def_readwrite("nb_iter_per_round", &InjectionSweepSession::nb_iter_per_round_,
+                   "Continuous scheduling: NR iterations between two convergence checks "
+                   "(takes effect on the next run())")
+    .def_readwrite("tol", &InjectionSweepSession::tol_,
+                   "A row has converged when ||F||inf < tol: decides when it leaves "
+                   "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
     .def_readwrite("refactor_period", &InjectionSweepSession::refactor_period_,
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &InjectionSweepSession::strategy_type_,
@@ -2101,6 +2187,101 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "whenever that set changes. Raises for a generator regulating a "
          "remote bus or standing on a bus a control group holds, and in "
          "explicit-array (tuple) mode (no generator data).")
+    .def("set_pv_pq_switches", &ScenarioSweepSession::set_pv_pq_switches,
+         pybind11::arg("to_pq"), pybind11::arg("to_pv"),
+         "Labelling side of one reactive-limit outer-loop pass, row-aligned with "
+         "set_injections(): to_pq[r] the Vm-fixed buses (a local PV / slack bus "
+         "outside any VoltageControl group) row r solves as PQ -- reserved like a "
+         "generator contingency's, every other row keeping them PV --, to_pv[r] "
+         "the (bus, |V| pu) pairs of PQ buses (outside any VoltageControl group) "
+         "row r holds PV (Q row pinned, |V| re-seeded). The injection side is "
+         "the caller's. A change is a warm source rebuild (plus a base-state "
+         "rebuild when the reserved set changes).")
+    .def("clear_pv_pq_switches", &ScenarioSweepSession::clear_pv_pq_switches,
+         "Drop any set_pv_pq_switches() labelling.")
+    .def("set_vc_controller_pins", &ScenarioSweepSession::set_vc_controller_pins,
+         pybind11::arg("pins"),
+         "The VoltageControl side of a reactive-limit outer-loop pass, row-aligned "
+         "with set_injections(): pins[r] = [(controller index, Q pu, generator "
+         "convention), ...] of the controllers row r holds at a fixed reactive "
+         "injection (generators only): a controller's sharing row -- the group's "
+         "voltage row for its first one -- is rewritten by value. A row holding a "
+         "group's first controller must hold all of them (checked at run(), with "
+         "the held controllers). A change is a warm source rebuild.")
+    .def("clear_vc_controller_pins", &ScenarioSweepSession::clear_vc_controller_pins,
+         "Drop any set_vc_controller_pins() data.")
+    .def("set_vc_controller_releases", &ScenarioSweepSession::set_vc_controller_releases,
+         pybind11::arg("releases"),
+         "lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned at "
+         "their frozen output on every row; releases[r] lists the controller indices "
+         "row r releases. A change is a warm source rebuild.")
+    .def("clear_vc_controller_releases", &ScenarioSweepSession::clear_vc_controller_releases,
+         "Drop any set_vc_controller_releases() data.")
+    .def_property_readonly("vc_ctrl_held", &ScenarioSweepSession::vc_ctrl_held,
+         "Per controller: 1 for a held one (lightsim2grid's set_hold_frozen_regulators).")
+    .def_property_readonly("vc_ctrl_q_held", &ScenarioSweepSession::vc_ctrl_q_held,
+         "Per controller: the frozen reactive output (pu, generator convention) a held one is pinned at.")
+    .def_property_readonly("vc_ctrl_bus", &ScenarioSweepSession::vc_ctrl_bus,
+         "Per VoltageControl controller: its solver bus.")
+    .def_property_readonly("vc_ctrl_kind", &ScenarioSweepSession::vc_ctrl_kind,
+         "Per controller: 0 GEN, 1 SVC, 2 / 3 hvdc station (side 1 / 2).")
+    .def_property_readonly("vc_ctrl_group", &ScenarioSweepSession::vc_ctrl_group,
+         "Per controller: its group.")
+    .def_property_readonly("vc_ctrl_elem_id", &ScenarioSweepSession::vc_ctrl_elem_id,
+         "Per controller: its id in its own container (the hvdc line id for a station).")
+    .def_property_readonly("vc_grp_start", &ScenarioSweepSession::vc_grp_start,
+         "Per group: its first controller.")
+    .def_property_readonly("vc_grp_count", &ScenarioSweepSession::vc_grp_count,
+         "Per group: its number of controllers.")
+    .def_property_readonly("vc_reg_bus", &ScenarioSweepSession::vc_reg_bus,
+         "Per group: the solver bus it regulates.")
+    .def_property_readonly("has_pv_pq_switches", &ScenarioSweepSession::has_pv_pq_switches)
+    .def("set_bus_q_row_skip",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_bus_q_row_skip: mask must be 2-D (n_scenarios, n_check)");
+             ScenarioSweepSession::BoolMat m(mask.shape(0), mask.shape(1));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_bus_q_row_skip(m);
+         },
+         pybind11::arg("mask"),
+         "(n_scenarios, n_check) bool: True leaves that entry of the reactive-"
+         "capability plan unchecked on that row (a bus the outer loop switched "
+         "to PQ at its limit there). An empty (0, 0) mask drops it.")
+    .def("set_gen_pv_release_row_skip",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error(
+                     "ScenarioSweepSession::set_gen_pv_release_row_skip: mask must be 2-D "
+                     "(n_scenarios, n_entries)");
+             ScenarioSweepSession::BoolMat m(mask.shape(0), mask.shape(1));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_gen_pv_release_row_skip(m);
+         },
+         pybind11::arg("mask"),
+         "(n_scenarios, n_entries) bool: True leaves that entry of the release "
+         "plan unchecked on that row (a machine the outer loop released there). "
+         "An empty (0, 0) mask drops it.")
+    .def("v_results_ptr", &ScenarioSweepSession::v_results_ptr,
+         "Device pointer (int) of the last run's (n_scenarios, n_bus) voltages, 0 before run().")
+    .def("residuals_ptr", &ScenarioSweepSession::residuals_ptr,
+         "Device pointer (int) of the last run's (n_scenarios,) residuals, 0 before run().")
+    .def("set_v_init_from_ptr", &ScenarioSweepSession::set_v_init_from_ptr,
+         pybind11::arg("d_V_src"), pybind11::arg("src_rows"),
+         "Per-row starting voltages, row-aligned with set_injections(): row i starts "
+         "from row src_rows[i] of a row-major (*, n_bus) complex device buffer (e.g. "
+         "ContingencyAnalysisSession.v_results_ptr(), ready on the device), copied at "
+         "once; a non-finite entry starts from the base case. A hot change.")
+    .def("clear_v_init", &ScenarioSweepSession::clear_v_init,
+         "Drop set_v_init_from_ptr(): every row starts from the base-case voltages again.")
+    .def_property_readonly("has_v_init", &ScenarioSweepSession::has_v_init)
     .def_property_readonly("dim_J", &ScenarioSweepSession::dim_J,
          "Augmented Jacobian dimension of the current base state (grows by "
          "one per reserved switchable Vm bus -- see set_contingency_gens).")
@@ -2127,6 +2308,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy batch voltages to host: (n_scenarios * n_bus,) complex128.")
     .def("get_residuals",  &ScenarioSweepSession::get_residuals,
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
+    .def("get_row_iterations", &ScenarioSweepSession::get_row_iterations,
+         "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def("get_row_status", &ScenarioSweepSession::get_row_status,
+         "(n_rows,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,
          "Copy origin-terminal ampere flows to host: (n_scenarios * n_branches,). "
          "Requires compute_flows().")
@@ -2150,7 +2335,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readonly("used_batch_size", &ScenarioSweepSession::used_batch_size_,
                    "Batch size effectively used during the last run()")
     .def_readwrite("nb_iter",    &ScenarioSweepSession::nb_iter_,
-                   "Fixed NR iterations per chunk (takes effect on the next run())")
+                   "Chunked: NR iterations every row runs. Continuous: each row's iteration "
+                   "budget (takes effect on the next run())")
+    .def_readwrite("scheduling", &ScenarioSweepSession::scheduling_,
+                   "BatchScheduling (takes effect on the next run())")
+    .def_readwrite("nb_iter_per_round", &ScenarioSweepSession::nb_iter_per_round_,
+                   "Continuous scheduling: NR iterations between two convergence checks "
+                   "(takes effect on the next run())")
+    .def_readwrite("tol", &ScenarioSweepSession::tol_,
+                   "A row has converged when ||F||inf < tol: decides when it leaves "
+                   "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
     .def_readwrite("refactor_period", &ScenarioSweepSession::refactor_period_,
                    "Refactor period N for DirectRefactorEveryN strategy (takes effect on the next run())")
     .def_readwrite("strategy_type", &ScenarioSweepSession::strategy_type_,
@@ -2348,10 +2542,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "(keep_final_jacobian). Default False. Takes effect on the "
                    "next run() (rebuilds the driver when changed).")
     .def_readwrite("keep_final_jacobian", &ScenarioSweepSession::keep_final_jacobian_,
-                   "When True, run() refills the batched Jacobian at the CONVERGED "
-                   "voltages after the NR loop (one extra fill_J), so that "
+                   "When True, a chunked run() refills the batched Jacobian at the "
+                   "CONVERGED voltages after the NR loop (one extra fill_J), so that "
                    "solve_JT_batch_dlpack() can use it. Requires the batch to be "
-                   "solved in one chunk (see fixed_batch_capacity). Default False.")
+                   "solved in one chunk (see fixed_batch_capacity). No effect on a "
+                   "continuous run, which needs nothing kept: solve_JT_batch_dlpack() "
+                   "rebuilds each row's Jacobian from its converged V. Default False.")
     .def_readonly("run_counter", &ScenarioSweepSession::run_counter_,
                   "Number of run() calls so far (an autograd backward checks it "
                   "against the forward it belongs to).")
@@ -2434,7 +2630,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "with the Jacobians at the converged voltages of the last run() "
          "(keep_final_jacobian=True) -- or with the j_values / ybus_values / v "
          "snapshots taken right after that run (j_values_dlpack(), "
-         "ybus_values_dlpack(), v_results_dlpack(), cloned). rhs: (n_scenarios, "
+         "ybus_values_dlpack(), v_results_dlpack(), cloned). After a continuous "
+         "run, the Jacobians are rebuilt batch_size rows at a time from the "
+         "converged voltages (v, else the session's own results) and the batch "
+         "source of that run; j_values / ybus_values are refused. rhs: (n_scenarios, "
          "dim_J) real, original row order, non-finite entries treated as 0. "
          "Returns (lambda, gvm): lambda (n_scenarios, dim_J); gvm (n_scenarios, "
          "n_bus) when want_gen_v_grad else None -- the adjoint contraction of "
@@ -2448,10 +2647,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("j_values_dlpack", &export_j_values_dlpack_ss,
          "(capacity, nnz_J) real: the batched Jacobian values of the last chunk "
          "(active-slot order; rows >= n_active are phantom base-case copies). "
-         "Aliases the chunk buffer: clone right after run() for a snapshot.")
+         "Aliases the chunk buffer: clone right after run() for a snapshot. "
+         "Refused after a continuous run (no chunk holds every row's Jacobian).")
     .def("ybus_values_dlpack", &export_ybus_values_dlpack_ss,
          "(capacity, nnz_Y) complex: the per-slot patched Ybus values of the last "
-         "chunk (active-slot order). Aliases the chunk buffer: clone for a snapshot.");
+         "chunk (active-slot order). Aliases the chunk buffer: clone for a snapshot. "
+         "Refused after a continuous run.");
 
     // -----------------------------------------------------------------
     // Zero-copy construction from a solved lightsim2grid LSGrid
@@ -2819,9 +3020,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.attr("have_ls2g_bridge") = true;
     // the PQ -> PV release plan needs lightsim2grid PR #216 (can_be_pv)
     m.attr("have_ls2g_gen_pv_release") = bridge_has_gen_pv_release();
+    // the held controllers need lightsim2grid PR #220 (set_hold_frozen_regulators)
+    m.attr("have_ls2g_hold_frozen") = bridge_has_hold_frozen();
 #else
     m.attr("have_ls2g_bridge") = false;
     m.attr("have_ls2g_gen_pv_release") = false;
+    m.attr("have_ls2g_hold_frozen") = false;
 #endif
 
     m.def("solve_cudss_raw", &solve_cudss_raw,

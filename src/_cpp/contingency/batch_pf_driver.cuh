@@ -31,12 +31,19 @@
 //   7.  std::visit policy.initialize_from_base
 //   8.  source.initialize(ctx, cs)   — source-specific one-time work
 //
-// Per-chunk loop (in _solve_chunk):
-//   a.  source.prepare_Ybus_batch(ctx, chunk_idx, actual_batch, …)
-//   b.  source.prepare_Sbus_batch(ctx, chunk_idx, actual_batch, …)
-//   c.  NrIterBuffers built with source.d_Sbus_ptr() + source.sbus_stride()
-//   d.  std::visit policy → run_nr_loop<Policy>
-//   e.  final SpMV + fill_F + per-element ‖F‖∞ + store-V (+ optional flows)
+// Two schedules (BatchScheduling, see row_status.hpp):
+//   chunked (_solve_chunk, per chunk):
+//     a.  source.load_slots(ctx, every slot of the chunk, …) + per-slot
+//         Newton state (slack_absorbed, controller Q)
+//     b.  NrIterBuffers built with source.d_Sbus_ptr() + source.sbus_stride(),
+//         source.bind_slots() attaching the per-slot masks / weights / v_set
+//     c.  std::visit policy → run_nr_loop<Policy> (nb_iter)
+//     d.  _residual_pass (final SpMV + fill_F + per-element ‖F‖∞), then
+//         _evict (NaN mask, checks, store V, optional flows)
+//   continuous (_solve_continuous): S slots, rounds of nb_iter_per_round
+//     iterations; after each, the residual pass, one D→H, the host's
+//     decisions, then _evict of the leaving slots and load_slots of the
+//     freed ones (next queued rows, else the base case).
 //
 // Member declaration order is the same as the historic
 // ContingencyAnalysisSolver: cs FIRST so it is destroyed LAST.
@@ -56,6 +63,8 @@
 #include "bus_q_check_data.hpp"                   // BusQPlanData
 #include "gen_p_check_data.hpp"                   // GenPPlanData
 #include "gen_pv_release_check_data.hpp"          // GenPvReleasePlanData
+#include "row_status.hpp"                         // BatchScheduling, RowStatus
+#include "slot_schedule.cuh"                      // SlotLoadView, SlotTableView, PinnedBuffer
 #include "physical_checks_data.hpp"               // PhysicalSetupKey
 #include "strategies/cudss_batch_solver.cuh"
 #include "strategies/policy_refactor_every.cuh"
@@ -64,6 +73,7 @@
 #include "strategies/policy_refactor_every_n.cuh"
 
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -86,6 +96,43 @@ struct BatchPfDriverContext {
     int              n_bus;
     int              nnz_Y;
 };
+
+// -----------------------------------------------------------------------------
+// check_continuous_scheduling — what the continuous schedule refuses, checked
+// by the sessions BEFORE they build a driver (no cuDSS ANALYSIS is paid for a
+// configuration that then throws) and again by the driver itself:
+//   • direct_iter0_only: it factorizes J at the first iteration of a chunk and
+//     reuses it for the whole solve, which assumes every slot starts together
+//     (run_nr_loop's begin_chunk() runs on every round);
+//   • direct_refactor_every_n: its period counts the batch's iterations, not a
+//     row's, so a row's trajectory would depend on the other slots;
+//   • a non-uniform cuDSS mode (GPUSIM2GRID_USE_BLOCKDIAG / _BATCH_MODE): they
+//     re-analyse per chunk in CudssBatchSolver::begin_chunk();
+//   • nb_iter_per_round < 1, nb_iter < 1, a non-positive / non-finite tol.
+// Throws std::invalid_argument (ValueError in Python).
+// -----------------------------------------------------------------------------
+inline void check_continuous_scheduling(ContingencySolverType strategy,
+                                        int nb_iter, int nb_iter_per_round, double tol)
+{
+    if (strategy == ContingencySolverType::DirectIter0Only)
+        throw std::invalid_argument(
+            "scheduling='continuous' does not support strategy 'direct_iter0_only' (it "
+            "factorizes J once per chunk, assuming every slot starts together)");
+    if (strategy == ContingencySolverType::DirectRefactorEveryN)
+        throw std::invalid_argument(
+            "scheduling='continuous' does not support strategy 'direct_refactor_every_n' "
+            "(its period counts the batch's iterations, not a row's)");
+    if (cudss_batch_mode_from_env() != CudssBatchMode::Uniform)
+        throw std::invalid_argument(
+            "scheduling='continuous' needs cuDSS's uniform batch mode (unset "
+            "GPUSIM2GRID_USE_BLOCKDIAG / GPUSIM2GRID_USE_BATCH_MODE)");
+    if (nb_iter < 1)
+        throw std::invalid_argument("scheduling='continuous': nb_iter (the per-row budget) must be >= 1");
+    if (nb_iter_per_round < 1)
+        throw std::invalid_argument("scheduling='continuous': nb_iter_per_round must be >= 1");
+    if (!(tol > 0.) || !std::isfinite(tol))
+        throw std::invalid_argument("scheduling='continuous': tol must be a positive finite number");
+}
 
 // -----------------------------------------------------------------------------
 // BatchAdjoint — the batched transposed system Jᵀ λ = x̄ (one per batch slot),
@@ -127,10 +174,11 @@ struct BatchAdjoint {
     int  factorized_for_solve = -1;   // driver n_solves_ whose own J was last permuted+refactored
 
     // Counters / timings (cumulative over the driver's life; surfaced through
-    // BatchTimings by the sessions).
+    // BatchTimings by the sessions). t_rebuild_J: continuous schedule only,
+    // the reload of each adjoint chunk's rows + J at their converged V.
     int    n_analysis = 0, n_factorize = 0, n_refactorize = 0, n_solve = 0;
     double t_build_ms = 0.;
-    TimingEntry t_first_factorize, t_refactorize, t_solve;
+    TimingEntry t_first_factorize, t_refactorize, t_solve, t_rebuild_J;
 };
 
 // =============================================================================
@@ -365,6 +413,10 @@ struct BatchPfDriver {
     // ORIGINAL row order (ScenarioSweep generator contingencies); nullptr = none.
     const unsigned char* d_bq_gen_off_ = nullptr;
     double         t_bus_q_setup_ms_  = 0.;
+    // entries a row does not check (upload_bus_q_row_skip), ORIGINAL row
+    // order, [n_contingencies * n_check]; empty = every entry on every row
+    thrust::device_vector<unsigned char>  d_bq_row_skip;
+    int            bus_q_skip_stride_ = 0;
 
     thrust::device_vector<int>            d_bq_bus_solver, d_bq_n_fixed, d_bq_gen_start, d_bq_gen_id;
     thrust::device_vector<cuda_real_type> d_bq_qmin_fixed, d_bq_qmax_fixed, d_bq_bmin_sum, d_bq_bmax_sum,
@@ -390,11 +442,11 @@ struct BatchPfDriver {
     cuda_real_type hvdc_p_residual_tol_ = 0;
     double         t_hvdc_p_setup_ms_   = 0.;
 
-    thrust::device_vector<int>            d_hp_out_hvdc_id, d_hp_out_side;    // [n_contingencies * K_p]
+    thrust::device_vector<int>            d_hp_out_hvdc_id, d_hp_out_side, d_hp_out_type;  // [n_contingencies * 2 * K_p]
     thrust::device_vector<cuda_real_type> d_hp_out_value, d_hp_out_limit;
     thrust::device_vector<int>            d_hp_count;        // [n_contingencies]; -1 = never simulated, else 0..K_p
     thrust::device_vector<int>            d_hp_truncated;    // [n_contingencies]; 0/1
-    thrust::device_vector<int>            d_hp_n_hvdc_id, d_hp_n_side;        // [K_p]
+    thrust::device_vector<int>            d_hp_n_hvdc_id, d_hp_n_side, d_hp_n_type;        // [2 * K_p]
     thrust::device_vector<cuda_real_type> d_hp_n_value, d_hp_n_limit;
     thrust::device_vector<int>            d_hp_n_count, d_hp_n_truncated;     // [1]
 
@@ -465,6 +517,10 @@ struct BatchPfDriver {
     // per-row targets of the plan's entries (upload_gen_pv_release_targets),
     // ORIGINAL row order, [n_contingencies * n_entries]; empty = base targets
     thrust::device_vector<cuda_real_type> d_gr_targets;
+    // entries a row does not check (upload_gen_pv_release_row_skip), same
+    // layout; empty = every entry on every row
+    thrust::device_vector<unsigned char>  d_gr_row_skip;
+    int            gen_pv_release_skip_stride_ = 0;
     thrust::device_vector<int>            d_gr_out_gen_id, d_gr_out_type;     // [n_contingencies * K_r]
     thrust::device_vector<int>            d_gr_out_el_type, d_gr_out_side;    // [n_contingencies * K_r]
     thrust::device_vector<cuda_real_type> d_gr_out_value, d_gr_out_limit;
@@ -499,19 +555,49 @@ struct BatchPfDriver {
     // -------------------------------------------------------------------------
     // Persistence / adjoint state
     //
-    //   keep_final_jacobian_ : after the NR loop of a chunk, refill
-    //                          d_J_values_batch at the CONVERGED V (the loop
-    //                          leaves J(V_{nb_iter-1}) behind). Only one chunk
-    //                          may be solved then (only the last chunk's J
-    //                          survives in the chunk buffer) -- solve() throws
-    //                          otherwise. Set by the differentiable wrapper.
+    //   keep_final_jacobian_ : chunked schedule: after the NR loop of a chunk,
+    //                          refill d_J_values_batch at the CONVERGED V (the
+    //                          loop leaves J(V_{nb_iter-1}) behind). Only one
+    //                          chunk may be solved then (only the last chunk's
+    //                          J survives in the chunk buffer) -- solve()
+    //                          throws otherwise. Set by the differentiable
+    //                          wrapper. No effect on a continuous solve: its
+    //                          adjoint rebuilds each row's J (see
+    //                          solve_JT_batch).
     //   n_solves_            : solve() calls on this driver; the adjoint keys
     //                          its "J already permuted + refactored" cache on it.
+    //   last_continuous_     : the schedule of the last solve() (the adjoint
+    //                          path follows it, whatever scheduling_ says now).
     //   adjoint_             : null until the first solve_JT_batch().
     // -------------------------------------------------------------------------
     bool keep_final_jacobian_ = false;
     int  n_solves_            = 0;
+    bool last_continuous_     = false;
     std::unique_ptr<BatchAdjoint> adjoint_;
+
+    // -------------------------------------------------------------------------
+    // Scheduling (see row_status.hpp and docs/dev_notes/continuous_batching.md)
+    //
+    //   scheduling_         : Chunked (default) or Continuous.
+    //   nb_iter_per_round_  : k, the Newton iterations every slot runs between
+    //                         two convergence checks (Continuous only).
+    //   tol_                : a row has converged when ||F||inf < tol_. In
+    //                         Continuous mode it decides when a row leaves; in
+    //                         both it decides the reported RowStatus.
+    //   nb_iter_            : Chunked: the iterations every row runs.
+    //                         Continuous: the per-row budget -- a row leaves at
+    //                         the first check with iterations >= nb_iter_, so
+    //                         it runs up to ceil(nb_iter_/k)*k of them.
+    // Public and set per run like nb_iter_ (the sessions patch them).
+    // -------------------------------------------------------------------------
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = 1e-8;
+
+    // Per-row outcome of the last solve(), ORIGINAL row order, sized
+    // n_contingencies: iterations run (Chunked: nb_iter_) and RowStatus.
+    std::vector<int> row_iters_;
+    std::vector<int> row_status_;
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -543,7 +629,11 @@ struct BatchPfDriver {
         // by default; see AcPfNrState's own doc for what this fixes.
         bool                      scaling_max_voltage_change = false,
         double                    max_dVa = 0.5,
-        double                    max_dVm = 0.1);
+        double                    max_dVm = 0.1,
+        // Scheduling -- see the members' own doc. Chunked by default.
+        BatchScheduling           scheduling = BatchScheduling::Chunked,
+        int                       nb_iter_per_round = 1,
+        double                    tol = 1e-8);
 
     ~BatchPfDriver() = default;
 
@@ -612,20 +702,34 @@ struct BatchPfDriver {
     }
 
     // -------------------------------------------------------------------------
-    // solve_JT_batch — batched adjoint solve Jᵀ λ = x̄ per active slot, in
+    // solve_JT_batch — batched adjoint solve Jᵀ λ = x̄ per active row, in
     // ORIGINAL row order both ways (see BatchAdjoint above; first call builds
-    // everything). Requires solve() to have run with keep_final_jacobian_ so
+    // everything).
+    //
+    // After a chunked solve(): requires keep_final_jacobian_ so
     // d_J_values_batch holds the converged J (alias mode), or a caller-owned
     // [capacity × nnz_J] snapshot of those values (d_J_ext, snapshot mode).
     //
+    // After a continuous solve(): no row's J survives in the chunk buffers
+    // (rows leave at different rounds), and none is stored: J is a function of
+    // the row's converged V, its patched Ybus, its slack weights and its mask
+    // streams -- the run keeps the first (d_V_results, or the caller's
+    // d_V_ext_orig snapshot), the batch source the others. So the rows are
+    // taken S at a time (adjoint chunk c: active rows c*S ..), reloaded into
+    // the slots by the source's own load path, given their converged V, and J
+    // is refilled by the forward's fill sequence (_solve_JT_rebuilt). The
+    // source must be the forward's (the sessions' source_build_counter guard).
+    // d_J_ext / d_Ybus_ext are refused there.
+    //
     //   d_rhs_orig      : [n_contingencies × dim_J]; non-finite entries → 0.
-    //   d_J_ext         : nullptr → use d_J_values_batch.
+    //   d_J_ext         : nullptr → use d_J_values_batch (chunked only).
     //   want_gen_v_grad : also compute the gen_v (Vm-fixed bus) gradient
     //                     contraction into d_gvm_full (see gen_v_adjoint_kernel).
     //   d_Ybus_ext      : snapshot of [capacity × nnz_Y] patched Ybus values
-    //                     (nullptr → d_Ybus_values_batch). gen_v only.
+    //                     (nullptr → d_Ybus_values_batch). gen_v, chunked only.
     //   d_V_ext_orig    : [n_contingencies × n_bus] converged V in original
-    //                     order (nullptr → the chunk's own d_V_batch). gen_v only.
+    //                     order. nullptr → the chunk's own d_V_batch (chunked),
+    //                     d_V_results (continuous). Chunked: gen_v only.
     //   is_vm_fixed_bus : [n_bus] (pv ∪ slack) mask, gen_v only.
     // Results: d_JT_sol_full_ptr() [n_contingencies × dim_J] and, when asked,
     // d_gvm_full_ptr() [n_contingencies × n_bus]; rows of compacted-out
@@ -652,6 +756,10 @@ struct BatchPfDriver {
     const cudaComplexType* ybus_values_ptr() const {
         return thrust::raw_pointer_cast(d_Ybus_values_batch.data());
     }
+
+    // Per-row outcome of the last solve() (see row_iters_ / row_status_).
+    const std::vector<int>& row_iterations() const { return row_iters_; }
+    const std::vector<int>& row_status()     const { return row_status_; }
 
     // -------------------------------------------------------------------------
     // copy_results_to_host  — syncs cs and copies V_results + residuals.
@@ -729,6 +837,14 @@ struct BatchPfDriver {
     // contingency, no result map). Requires set_bus_q_check(). The caller gates
     // it on the base solve's own convergence flag.
     void run_bus_q_check_n();
+    // Per-row skip mask of the plan's entries (uint8, 1 = do not check that
+    // entry on that row), (n_contingencies x n_check) in ORIGINAL row order; an
+    // empty vector drops it. Requires set_bus_q_check(); kept across the
+    // re-seeding it does on every run (dropped when the entry count changes).
+    // The reactive-limit outer loop's second pass: a bus it switched to PQ at
+    // its limit is not held by its machines on that row.
+    void upload_bus_q_row_skip(const std::vector<unsigned char>& mask, int n_cols);
+    bool has_bus_q_row_skip() const { return bus_q_skip_stride_ > 0; }
 
     // compute_physical_violations: same contract as set_bus_q_check for the droop
     // P-saturation check. tol_mw is converted to pu with sn_mva. The per-line
@@ -768,6 +884,10 @@ struct BatchPfDriver {
     // matrix drops them. Same lifetime rules as upload_gen_p_targets.
     void upload_gen_pv_release_targets(const RealMatRM& targets);
     bool has_gen_pv_release_targets() const { return gen_pv_release_target_stride_ > 0; }
+    // The same skip mask for the release plan's entries (a machine the outer
+    // loop released on that row is PV there, no longer pinned at its limit).
+    void upload_gen_pv_release_row_skip(const std::vector<unsigned char>& mask, int n_cols);
+    bool has_gen_pv_release_row_skip() const { return gen_pv_release_skip_stride_ > 0; }
     void run_gen_pv_release_check_n();
 
     // physical_checks::before_solve's bookkeeping: the key of the last full
@@ -817,10 +937,67 @@ struct BatchPfDriver {
     BatchPfDriverContext make_context();
 
 private:
+    // -------------------------------------------------------------------------
+    // Slot schedule staging (both schedulers): one page-locked host block and
+    // its device twin, [4 * S] ints laid out as
+    //   [0, S)   load_slot  -- slots being loaded
+    //   [S, 2S)  load_row   -- active row each receives (-1 = base case)
+    //   [2S, 3S) evict      -- active row of each slot leaving this round, -1 else
+    //   [3S, 4S) slot_row   -- active row every slot holds after the load
+    // shipped with ONE H->D per chunk / round, and the per-slot residuals of a
+    // continuous round brought back with one D->H. sched_done_ is recorded
+    // after each H->D so the host never rewrites a block still being copied.
+    // -------------------------------------------------------------------------
+    PinnedBuffer<int>                     h_sched_;
+    thrust::device_vector<int>            d_sched_;
+    PinnedBuffer<cuda_real_type>          h_slot_res_;
+    thrust::device_vector<cuda_real_type> d_slot_res_;
+    CudaEvent                             sched_done_;
+
+    int*       h_load_slot() { return h_sched_.ptr; }
+    int*       h_load_row()  { return h_sched_.ptr + batch_size_; }
+    int*       h_evict()     { return h_sched_.ptr + 2 * batch_size_; }
+    int*       h_slot_row()  { return h_sched_.ptr + 3 * batch_size_; }
+    const int* d_load_slot() const { return thrust::raw_pointer_cast(d_sched_.data()); }
+    const int* d_load_row()  const { return d_load_slot() + batch_size_; }
+    const int* d_evict()     const { return d_load_slot() + 2 * batch_size_; }
+    const int* d_slot_row()  const { return d_load_slot() + 3 * batch_size_; }
+
+    void _wait_sched_upload() { sched_done_.synchronize(); }
+    void _upload_sched();
+    SlotLoadView  _load_view(int n_load, int chunk, int n_real);
+    SlotTableView _table_view(int chunk);
+    // Fill the listed slots (source_.load_slots) and their Newton state.
+    void _load(const SlotLoadView& L, CudaTimer& timer, BatchTimings& t);
+    // The NR buffers of the current slot table (masks re-bound by the source).
+    NrIterBuffers _bound_nr_buffers(const SlotTableView& T);
+    void _solve_continuous(BatchTimings& t);
+    // Host copy of the source's active -> original row map (empty = identity).
+    std::vector<int> h_a2o_;
+    int _orig_row(int a) const { return h_a2o_.empty() ? a : h_a2o_[static_cast<size_t>(a)]; }
+
     void _solve_chunk(int c_start, int actual_batch, BatchTimings& t);
+
+    // Building blocks shared by the chunked and the continuous schedules (see
+    // their definitions in batch_pf_driver.cu). d_slot_active: [n_slots] the
+    // active row each slot holds (-1 = skip the slot), or nullptr for the
+    // chunk's own c_start + s.
+    NrIterBuffers _make_nr_buffers();
+    void _init_slot_state(const NrIterBuffers& buf, const SlotLoadView& L);
+    void _residual_pass(const NrIterBuffers& buf, int n_slots, cuda_real_type* d_out,
+                        int c_start, const int* d_result_map, const int* d_slot_active,
+                        CudaTimer& timer, BatchTimings& t);
+    void _evict(const NrIterBuffers& buf, int n_slots, int c_start, const int* d_slot_active,
+                CudaTimer& timer, BatchTimings& t);
     // First-call setup of the adjoint: skeleton transpose + position map,
     // buffers, cuDSS ANALYSIS of Jᵀ (with the forward's config).
     void _prepare_adjoint();
+    // Permute the J values of every slot into Jᵀ and (re)factorize it.
+    void _factor_JT(const cuda_real_type* d_J_slots, CudaTimer& timer);
+    // solve_JT_batch after a continuous solve(): J rebuilt per adjoint chunk.
+    void _solve_JT_rebuilt(const cuda_real_type* d_rhs_orig, bool want_gen_v_grad,
+                           const cudaComplexType* d_V_ext_orig,
+                           const std::vector<char>& is_vm_fixed_bus);
     // First-call setup of the gen_v contraction data (Ybus transpose-position
     // map, bus→row maps, Vm-fixed mask).
     void _prepare_gen_v_adjoint(const std::vector<char>& is_vm_fixed_bus);

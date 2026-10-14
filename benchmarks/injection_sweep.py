@@ -65,6 +65,13 @@ def get_parser():
         "--refactor_period", type=int, default=1,
         help="refactor period N for direct_refactor_every_n (default: 1)")
     parser.add_argument(
+        "--scheduling", default="chunked", choices=["chunked", "continuous"],
+        help="batch scheduling; with 'continuous', nb_iter is each row's budget "
+             "(default: chunked)")
+    parser.add_argument(
+        "--nb_iter_per_round", type=int, default=1,
+        help="continuous scheduling: iterations between two checks (default: 1)")
+    parser.add_argument(
         "--sigma", type=float, default=_DEFAULT_SIGMA,
         help=f"log-normal σ for per-load scaling "
              f"(default: {_DEFAULT_SIGMA:.4f} ≈ 95%% of multipliers in [0.95, 1.05])")
@@ -185,7 +192,9 @@ def main(args):
           f"(strategy={args.strategy}, batch_size={batch_size}, "
           f"nb_iter={nb_iter}, n_scenarios={n_total}) ...")
 
-    sweep = InjectionSweepGPU(grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6)
+    sweep = InjectionSweepGPU(grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6,
+                              scheduling=args.scheduling,
+                              nb_iter_per_round=args.nb_iter_per_round)
     # branch data (needed for compute_flows) is extracted automatically from
     # `grid` -- call sweep.set_branch_data(...) only in explicit-array mode.
 

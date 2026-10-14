@@ -28,7 +28,7 @@ MAX_IT, TOL = 30, 1e-10
 
 
 def _droop_grid(pmax12=300., pmax21=300., p0=10., k_mw_per_deg=5., status=0,
-                b1=3, b2=9, lf1=0.01, lf2=0.02):
+                b1=3, b2=9, lf1=0.01, lf2=0.02, frozen=False):
     """case14 with one droop-enabled VSC-VSC hvdc line (the augmented-features
     helper, with the limits and the regime as parameters), ac-solved."""
     pn = pytest.importorskip("pandapower.networks")
@@ -44,10 +44,15 @@ def _droop_grid(pmax12=300., pmax21=300., p0=10., k_mw_per_deg=5., status=0,
             [0], [0], np.array([lf1]), np.array([lf2]), [False], [False],
             np.array([1.0]), np.array([1.0]), np.array([0.0]), np.array([0.0]),
             np.array([-_BIG_Q]), np.array([_BIG_Q]), np.array([-_BIG_Q]), np.array([_BIG_Q]),
-            np.array([1.0]), np.array([1.0]), [0], np.array([20.0]),
-            np.array([0.0]), np.array([0.0]), [True],
+            np.array([1.0]), np.array([1.0]), [0], np.array([pmax12 if frozen else 20.0]),
+            np.array([0.0]), np.array([0.0]), [not frozen],
             np.array([p0]), np.array([k_mw_per_deg]),
             np.array([pmax12]), np.array([pmax21]))
+        if frozen:
+            # what bake_outer_loops leaves: droop off, set-point at the 1->2 limit
+            if not hasattr(grid, "set_hvdc_ac_emulation_frozen"):
+                pytest.skip("this lightsim2grid build has no set_hvdc_ac_emulation_frozen")
+            grid.set_hvdc_ac_emulation_frozen([True])
         if status != 0:
             grid.set_status_droop_hvdc(0, int(status))
         grid.tell_solver_need_reset()
@@ -151,6 +156,68 @@ def test_saturation_detected_both_directions(solver_atol, p0, pmax12, pmax21, si
     assert sum(len(x) for x in got) > 0
     _assert_same(expected, _got(got), atol_mw)
     assert not ca.get_physical_violations_truncated().any()
+
+
+def _expected_release_from_V(grid, V_solver, tol_mw=0.):
+    """the release check recomputed from a converged voltage vector (solver numbering),
+    for a line frozen 1 -> 2: [(hvdc id, 1, flow MW, limit MW)]"""
+    me2s = np.asarray(grid.id_me_to_ac_solver(), dtype=int)
+    out = []
+    for h in grid.get_dclines():
+        if not h.ac_emulation_frozen:
+            continue
+        th1 = np.angle(V_solver[me2s[h.bus1_id]]); th2 = np.angle(V_solver[me2s[h.bus2_id]])
+        raw = h.droop_p0_mw + h.droop_k_mw_per_rad * (th1 - th2)
+        if raw < h.pmax_1to2_mw - tol_mw:
+            out.append((h.id, 1, raw, h.pmax_1to2_mw))
+    return out
+
+
+@needs_bridge
+@pytest.mark.parametrize("p0,released", [(-20., True), (60., False)])
+def test_frozen_line_release(solver_atol, p0, released):
+    """a line frozen at its 1->2 limit (droop off, set-point there): reported as
+    HVDC_AC_EMULATION_RELEASE when its droop, from the row's angles, asks for less --
+    lightsim2grid's own report in N, the droop recomputed on its contingency
+    voltages in N-1"""
+    from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid.contingency_analysis import LimitViolationType, ViolationCategory
+    grid, v0 = _droop_grid(pmax12=15., p0=p0, frozen=True)
+    h = grid.get_dclines()[0]
+    assert h.ac_emulation_frozen and not h.droop_enabled
+    atol_mw = 50. * float(grid.get_sn_mva()) * solver_atol
+    ctgs = _n1(grid)
+
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10, compute_physical_violations=True)
+    ca.physical_violation_tol_mva = 0.
+    ca.add_contingencies_by_branch_id(ctgs)
+    ca.compute()
+
+    n = _hvdc_only([ca.get_physical_violations_n()])[0]
+    ls_n = [el for el in grid.get_physical_violations(True, 0., 0.)
+            if el.violation_type == type(el.violation_type).HVDC_AC_EMULATION_RELEASE]
+    assert len(n) == len(ls_n) == int(released)
+    for v, el in zip(n, ls_n):
+        assert v.violation_type == LimitViolationType.HVDC_AC_EMULATION_RELEASE
+        assert v.category == ViolationCategory.PHYSICAL
+        assert (v.element_id, v.side) == (el.element_id, el.side) == (0, 1)
+        np.testing.assert_allclose(v.value, el.value, atol=atol_mw)
+        np.testing.assert_allclose(v.limit, 15., atol=atol_mw)
+
+    ref = ContingencyAnalysisCPP(grid)
+    for c in ctgs:
+        ref.add_n1(int(c[0]))
+    ref.compute(v0.copy(), MAX_IT, TOL)
+    Vs = np.asarray(ref.get_voltages())
+    n_bus = grid.get_Ybus_solver().shape[0]
+    expected = [_expected_release_from_V(grid, Vs[r, :n_bus]) if ref.converged_mask()[r] else []
+                for r in range(len(ctgs))]
+    got = ca.get_physical_violations()
+    assert (sum(len(x) for x in expected) > 0) == released
+    _assert_same(expected, _got(got), atol_mw)
+    for row in _hvdc_only(got):
+        assert all(v.violation_type == LimitViolationType.HVDC_AC_EMULATION_RELEASE for v in row)
 
 
 @needs_bridge
