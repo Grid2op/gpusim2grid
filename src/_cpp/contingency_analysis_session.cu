@@ -23,7 +23,8 @@
 #include <thrust/fill.h>
 #include <thrust/execution_policy.h>
 
-#include <algorithm>
+#include <algorithm>   // std::max
+#include <cmath>       // std::abs
 #include <stdexcept>
 #include <string>
 #include <limits>
@@ -118,6 +119,7 @@ void ContingencyAnalysisSession::_build_base_state()
         debug_base_case_, /*base_case_only=*/true,
         scaling_max_voltage_change_, max_dVa_, max_dVm_);
     t_base_case_ms_ = ms_since(t_base_start);
+    ++base_state_generation_;
 
     // Build the handle_disconnected_grid mask configuration from the base case
     // (per-bus identity-row metadata + angle reference + VC row positions) and
@@ -132,18 +134,8 @@ int ContingencyAnalysisSession::_wanted_reference_bus()
     if (grid_ref_bus_ < 0 || !auto_reference_slack_ || !handle_disconnected_grid_ || !has_contingencies_)
         return grid_ref_bus_;
     if (!auto_ref_valid_) {
-        std::vector<int>    cand_bus;
-        std::vector<double> cand_w;
-        const LedgerData& ld = *base_ledger_;
-        for (int b = 0; b < ld.n_bus && b < static_cast<int>(ld.slack_weights.size()); ++b)
-            if (ld.p_row_of_bus[static_cast<size_t>(b)] >= 0 && ld.slack_weights[static_cast<size_t>(b)] != 0.) {
-                cand_bus.push_back(b);
-                cand_w.push_back(ld.slack_weights[static_cast<size_t>(b)]);
-            }
-        auto_ref_choice_ = choose_reference_bus(contingencies_, Ybus_rm_.outerIndexPtr(),
-                                                Ybus_rm_.innerIndexPtr(), Ybus_rm_,
-                                                cand_bus, cand_w, forced_ref_bus_);
-        if (auto_ref_choice_ < 0) auto_ref_choice_ = grid_ref_bus_;
+        auto_ref_choice_ = choose_reference_bus_from_ledger(contingencies_, Ybus_rm_, *base_ledger_,
+                                                            forced_ref_bus_, grid_ref_bus_);
         auto_ref_valid_ = true;
     }
     return auto_ref_choice_;
@@ -199,6 +191,27 @@ void ContingencyAnalysisSession::build_contingencies(
     }
     has_contingencies_ = true;
     auto_ref_valid_    = false;
+    ++contingencies_generation_;   // the live driver's source is stale now
+}
+
+BatchDriverConfig ContingencyAnalysisSession::_current_config() const
+{
+    BatchDriverConfig c;
+    c.n_scenarios                = static_cast<int>(contingencies_.size());
+    c.batch_size                 = batch_size_;
+    c.refactor_period            = refactor_period_;
+    c.strategy                   = strategy_type_;
+    c.reordering_alg             = reordering_alg_;
+    c.matching_alg               = matching_alg_;
+    c.pivot_epsilon_alg          = pivot_epsilon_alg_;
+    c.scaling_max_voltage_change = scaling_max_voltage_change_;
+    c.max_dVa                    = max_dVa_;
+    c.max_dVm                    = max_dVm_;
+    c.mask_mode                  = handle_disconnected_grid_;
+    c.base_state_generation      = base_state_generation_;
+    c.rows_generation            = contingencies_generation_;
+    c.scheduling                 = scheduling_;
+    return c;
 }
 
 // =============================================================================
@@ -229,86 +242,112 @@ void ContingencyAnalysisSession::run()
         _build_base_state();
     }
 
-    // Reset any masking flags set on a previous run() (the contingency list is
-    // mutated in place across runs; compute_component_masks / check_connectivity
-    // expect to start from a clean state).
-    // lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned on
-    // every contingency, as in the grid's own solve (AcPfNrState pins them too)
-    std::vector<std::pair<int, double>> held_pins;
-    for (size_t j = 0; j < base_state_->h_vc_held.size(); ++j)
-        if (base_state_->h_vc_held[j])
-            held_pins.emplace_back(static_cast<int>(j), base_state_->h_vc_q_held[j]);
-    for (auto& ctg : contingencies_) {
-        ctg.disconnected = false;
-        ctg.masked_buses.clear();
-        ctg.stranded_groups.clear();
-        ctg.pinned_buses.clear();
-        ctg.vc_pinned_ctrl = held_pins;
-    }
+    // Hot run: same settings, same contingency list as the live driver --
+    // keep it (allocations, block-diagonal structure, cuDSS ANALYSIS, the
+    // policy's factorization state) and its source (connectivity, masks,
+    // patches already on the device); only solve() runs again. Otherwise
+    // build both, as the first run() does. The continuous schedule always
+    // rebuilds its driver (its reuse is docs/dev_notes/continuous_batching.md
+    // A.6 item 2), as in ScenarioSweepSession.
+    const BatchDriverConfig cfg = _current_config();
+    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
 
-    // Host preprocessing (resolve_indices + connectivity/masking + build_flat_patches)
-    // captured by the BatchSource; mutates contingencies_ in-place so that
-    // disconnected flags are observable below for the disconnected count.
-    // The source rebalances the chunk size over the ACTIVE (simulated) count;
-    // we read it back so the driver chunks consistently with the source.
-    ContingencyBatch source(
-        contingencies_,
-        Ybus_rm_.outerIndexPtr(),
-        Ybus_rm_.innerIndexPtr(),
-        Ybus_rm_,
-        batch_size_,
-        (handle_disconnected_grid_ || !held_pins.empty()) ? &mask_cfg_ : nullptr,
-        handle_disconnected_grid_);
-    // Continuous: batch_size_ slots, never more than the simulated rows.
-    used_batch_size_ = continuous ? std::max(1, std::min(batch_size_, source.n_active()))
-                                  : source.used_batch_size();
+    if (cold) {
+        // Reset any masking flags set on a previous run() (the contingency
+        // list is mutated in place across runs; compute_component_masks /
+        // check_connectivity expect to start from a clean state). A hot run
+        // keeps them: they describe the live source.
+        // lightsim2grid's held controllers (set_hold_frozen_regulators) are
+        // pinned on every contingency, as in the grid's own solve (AcPfNrState
+        // pins them too)
+        std::vector<std::pair<int, double>> held_pins;
+        for (size_t j = 0; j < base_state_->h_vc_held.size(); ++j)
+            if (base_state_->h_vc_held[j])
+                held_pins.emplace_back(static_cast<int>(j), base_state_->h_vc_q_held[j]);
+        for (auto& ctg : contingencies_) {
+            ctg.disconnected = false;
+            ctg.masked_buses.clear();
+            ctg.stranded_groups.clear();
+            ctg.pinned_buses.clear();
+            ctg.vc_pinned_ctrl = held_pins;
+        }
 
-    // redistribute_slack: the pre-pass of what each contingency's island took
-    // out, on the masks the source just computed -- handed to the source
-    // before its driver uploads it.
-    if (redistribute_slack_) {
-        _check_redistribute_slack();
-        const int n_bus = base_state_->n_bus;
-        const double sn = slack_rd_.sn_mva;
-        const auto no_gen_off = [](int, int) { return false; };
-        slack_rows_ = slack_redistribution::prepass_all(
-            slack_rd_, static_cast<int>(contingencies_.size()), n_bus,
-            [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; },
-            [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; },
-            no_gen_off,
-            [this](int, int g) { return static_cast<double>(slack_rd_.gen_target_p_mw(g)); },
-            [this, sn](int, int b) { return static_cast<double>(h_Sbus_base_(b).real()) * sn; });
-        int ref_bus = -1;
-        for (int b = 0; b < n_bus && b < static_cast<int>(mask_cfg_.is_reference_bus.size()); ++b)
-            if (mask_cfg_.is_reference_bus[static_cast<size_t>(b)]) { ref_bus = b; break; }
-        const std::vector<cuda_real_type> w_rows = slack_redistribution::build_row_weights(
-            slack_rd_, slack_rows_, static_cast<int>(contingencies_.size()), no_gen_off, n_bus,
-            base_state_->h_slack_bus, base_state_->h_slack_w, ref_bus);
-        std::vector<std::vector<std::pair<int, double>>> dp_rows(slack_rows_.size());
-        for (size_t r = 0; r < slack_rows_.size(); ++r) dp_rows[r] = slack_rows_[r].dp_pu;
-        source.set_slack_redistribution_host(w_rows, base_state_->n_slack, dp_rows);
+        // Host preprocessing (resolve_indices + connectivity/masking +
+        // build_flat_patches) captured by the BatchSource; mutates
+        // contingencies_ in-place so that disconnected flags are observable
+        // below for the disconnected count. The source rebalances the chunk
+        // size over the ACTIVE (simulated) count; we read it back so the
+        // driver chunks consistently with the source.
+        ContingencyBatch source(
+            contingencies_,
+            Ybus_rm_.outerIndexPtr(),
+            Ybus_rm_.innerIndexPtr(),
+            Ybus_rm_,
+            batch_size_,
+            (handle_disconnected_grid_ || !held_pins.empty()) ? &mask_cfg_ : nullptr,
+            handle_disconnected_grid_);
+        // Continuous: batch_size_ slots, never more than the simulated rows.
+        used_batch_size_ = continuous ? std::max(1, std::min(batch_size_, source.n_active()))
+                                      : source.used_batch_size();
+
+        // redistribute_slack: the pre-pass of what each contingency's island took
+        // out, on the masks the source just computed -- handed to the source
+        // before its driver uploads it.
+        if (redistribute_slack_) {
+            _check_redistribute_slack();
+            const int n_bus = base_state_->n_bus;
+            const double sn = slack_rd_.sn_mva;
+            const auto no_gen_off = [](int, int) { return false; };
+            slack_rows_ = slack_redistribution::prepass_all(
+                slack_rd_, static_cast<int>(contingencies_.size()), n_bus,
+                [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; },
+                [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; },
+                no_gen_off,
+                [this](int, int g) { return static_cast<double>(slack_rd_.gen_target_p_mw(g)); },
+                [this, sn](int, int b) { return static_cast<double>(h_Sbus_base_(b).real()) * sn; });
+            int ref_bus = -1;
+            for (int b = 0; b < n_bus && b < static_cast<int>(mask_cfg_.is_reference_bus.size()); ++b)
+                if (mask_cfg_.is_reference_bus[static_cast<size_t>(b)]) { ref_bus = b; break; }
+            const std::vector<cuda_real_type> w_rows = slack_redistribution::build_row_weights(
+                slack_rd_, slack_rows_, static_cast<int>(contingencies_.size()), no_gen_off, n_bus,
+                base_state_->h_slack_bus, base_state_->h_slack_w, ref_bus);
+            std::vector<std::vector<std::pair<int, double>>> dp_rows(slack_rows_.size());
+            for (size_t r = 0; r < slack_rows_.size(); ++r) dp_rows[r] = slack_rows_[r].dp_pu;
+            source.set_slack_redistribution_host(w_rows, base_state_->n_slack, dp_rows);
+        } else {
+            slack_rows_.clear();
+        }
+
+        // New driver: allocation, block-diagonal structure, cuDSS ANALYSIS.
+        // Free the old one first so the two never coexist on the device.
+        solver_.reset();
+        solver_ = std::make_unique<ContingencyAnalysisSolver>(
+            *base_state_,
+            std::move(source),
+            static_cast<int>(contingencies_.size()),
+            used_batch_size_,
+            nb_iter_,
+            strategy_type_,
+            refactor_period_,
+            reordering_alg_,
+            matching_alg_,
+            pivot_epsilon_alg_,
+            scaling_max_voltage_change_,
+            max_dVa_,
+            max_dVm_,
+            scheduling_,
+            nb_iter_per_round_,
+            tol_);
+        driver_cfg_ = cfg;
+        ++driver_build_counter_;
     } else {
-        slack_rows_.clear();
+        // One-time costs (allocation, ANALYSIS, source preprocessing) are
+        // not paid again: report them as 0 for this run.
+        solver_->mark_reused(/*hot=*/true);
     }
-
-    // (Re-)construct the solver — allows run() to be called multiple times.
-    solver_ = std::make_unique<ContingencyAnalysisSolver>(
-        *base_state_,
-        std::move(source),
-        static_cast<int>(contingencies_.size()),
-        used_batch_size_,
-        nb_iter_,
-        strategy_type_,
-        refactor_period_,
-        reordering_alg_,
-        matching_alg_,
-        pivot_epsilon_alg_,
-        scaling_max_voltage_change_,
-        max_dVa_,
-        max_dVm_,
-        scheduling_,
-        nb_iter_per_round_,
-        tol_);
+    solver_->nb_iter_           = nb_iter_;   // per-run knobs, no rebuild needed
+    solver_->nb_iter_per_round_ = nb_iter_per_round_;
+    solver_->tol_               = tol_;
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop
@@ -485,14 +524,11 @@ void ContingencyAnalysisSession::compute_flows()
     const int n = n_ctg * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
-        thrust::host_vector<cuda_real_type> h_or = solver_->d_or_amps_results;
-        thrust::host_vector<cuda_real_type> h_ex = solver_->d_ex_amps_results;
+        // Through the driver's pinned staging buffer (download_into).
         h_or_amps_.resize(n);
         h_ex_amps_.resize(n);
-        for (int i = 0; i < n; ++i) {
-            h_or_amps_(i) = static_cast<eigen_real_type>(h_or[static_cast<size_t>(i)]);
-            h_ex_amps_(i) = static_cast<eigen_real_type>(h_ex[static_cast<size_t>(i)]);
-        }
+        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
+        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
     }
     timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
 }
@@ -716,12 +752,8 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
-    thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = eigen_cplx_type(
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
@@ -733,10 +765,8 @@ RealVect ContingencyAnalysisSession::get_residuals() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
-    thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_residuals);   // pinned, pipelined
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }
@@ -879,6 +909,7 @@ void ContingencyAnalysisSession::set_slack_redistribution_data(const SlackRedist
     data.validate(base_state_->n_bus);
     slack_rd_     = data;
     has_slack_rd_ = true;
+    ++contingencies_generation_;   // a live pre-pass was built on the old data
 }
 
 SlackRedistributionReport ContingencyAnalysisSession::get_slack_redistribution_report() const
@@ -902,6 +933,12 @@ void ContingencyAnalysisSession::_check_redistribute_slack() const
             "ContingencyAnalysisSession: redistribute_slack is incompatible with the "
             "'direct_base_case_factors' strategy (it reuses the base-case factors, which cannot "
             "take a saturated unit out of a contingency's slack).");
+    // the pre-pass reads a row's island off the per-unit base Sbus with
+    // slack_rd_.sn_mva: another base would mis-scale every lost MW
+    if (std::abs(slack_rd_.sn_mva - sn_mva_) > 1e-9 * std::max(1.0, std::abs(sn_mva_)))
+        throw std::runtime_error(
+            "ContingencyAnalysisSession: the slack participants were given with another sn_mva "
+            "than the branch data's (set_branch_data).");
 }
 
 void ContingencyAnalysisSession::set_gen_p_capability(const GenPPlanData& plan)

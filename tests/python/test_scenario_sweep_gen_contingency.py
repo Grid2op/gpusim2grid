@@ -293,6 +293,32 @@ def test_rebuild_on_change(case, solver_atol):
 
 @requires_gpu
 @needs_bridge
+def test_v_base_view_outlives_a_base_state_rebuild(case, solver_atol):
+    """v_base_dlpack()'s tensor co-owns the base state: the rebuild a new
+    reserved set triggers leaves it on the previous base case, not on freed
+    memory (re-allocating after the rebuild must not overwrite it)"""
+    torch = pytest.importorskip("torch")
+    non_slack = [g for g in range(case["n_gen"]) if g not in case["slack_gens"]]
+    sw = _sweep(case, 2)
+    sw.compute(batch_size=4)
+    view = torch.from_dlpack(sw.solver.v_base_dlpack())
+    before = view.clone()
+
+    mask = np.zeros((2, case["n_gen"]), dtype=bool)
+    mask[0, non_slack[0]] = True
+    sw.set_contingency_gens(mask)
+    sw.compute(batch_size=4)                 # new reserved set: base state rebuilt
+    junk = [torch.full((view.numel(),), 1e6, dtype=view.dtype, device=view.device)
+            for _ in range(64)]
+    torch.cuda.synchronize()
+    assert torch.equal(view, before)
+    del junk
+    np.testing.assert_allclose(torch.from_dlpack(sw.solver.v_base_dlpack()).cpu().numpy(),
+                               before.cpu().numpy(), atol=solver_atol)
+
+
+@requires_gpu
+@needs_bridge
 def test_with_injections(case, solver_atol):
     """This row's own injections AND this row's own generator out."""
     non_slack = [g for g in range(case["n_gen"]) if g not in case["slack_gens"]]

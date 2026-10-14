@@ -40,6 +40,7 @@
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
+#include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -65,7 +66,23 @@ struct InjectionSweepSession {
     // Owned GPU state
     // =========================================================================
     std::unique_ptr<AcPfNrState>        base_state_;
-    std::unique_ptr<InjectionSweepSolver> solver_;   // null until run()
+    std::unique_ptr<InjectionSweepSolver> solver_;   // null until run(); then kept
+
+    // =========================================================================
+    // Driver persistence (see BatchDriverConfig): run() keeps solver_ -- its
+    // allocations, cuDSS ANALYSIS and factorization state -- while the
+    // settings snapshot it was built with (including n_scenarios) is
+    // unchanged ("hot" run). New injections / gen_v for the same row count
+    // are loaded into the live source (InjectionBatch::set_rows); any other
+    // change builds a new driver, as before.
+    //   injections_dirty_ / gen_v_dirty_ : set by set_injections / set_gen_v.
+    //   driver_build_counter_            : drivers built so far.
+    // =========================================================================
+    BatchDriverConfig driver_cfg_;
+    bool injections_dirty_    = false;
+    bool gen_v_dirty_         = false;
+    int  driver_build_counter_ = 0;
+    BatchDriverConfig _current_config() const;
 
     // RowMajor Ybus copy — needed by BatchPfDriver to build the block-diag CSR.
     Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm_;

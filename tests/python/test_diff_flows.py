@@ -205,3 +205,59 @@ class TestComputeFlows:
             nondet_tol=1e-6,   # CUDA scatter_add has float rounding non-determinism
         )
         assert result
+
+
+class TestHalfOpenEndpoint:
+
+    def test_minus_one_endpoint_matches_the_kernel_convention(self):
+        """A side at bus -1 (Kron-reduced half-open end) must not index V[-1].
+
+        Same convention as compute_branch_flows_kernel: that side has V = 0
+        and no terminal current, and the base current uses the live
+        endpoint's nominal voltage. The last bus is given a different voltage
+        and nominal kV so that reading it by mistake changes every output.
+        """
+        from gpusim2grid.differentiable import compute_flows
+
+        cdt, rdt, dev = torch.complex128, torch.float64, "cuda"
+        V = torch.tensor([[1.0 + 0.0j, 0.98 - 0.05j, 1.02 + 0.01j, 0.7 + 0.3j],
+                          [1.0 + 0.0j, 0.97 - 0.06j, 1.01 + 0.02j, 0.6 + 0.2j]],
+                         dtype=cdt, device=dev, requires_grad=True)
+        vn_kv = torch.tensor([138.0, 138.0, 20.0, 400.0], dtype=rdt, device=dev)
+        # branch 0: regular (0 -> 1); branch 1: open "to" end (2 -> -1);
+        # branch 2: open "from" end (-1 -> 1)
+        b_from = torch.tensor([0, 2, -1], device=dev)
+        b_to = torch.tensor([1, -1, 1], device=dev)
+        yff = torch.tensor([1 - 5j, 0.0 + 0.02j, 7 - 7j], dtype=cdt, device=dev)
+        yft = torch.tensor([-1 + 5j, 3 - 3j, 5 - 5j], dtype=cdt, device=dev)
+        ytf = torch.tensor([-1 + 5j, 4 - 4j, 6 - 6j], dtype=cdt, device=dev)
+        ytt = torch.tensor([1 - 5j, 8 - 8j, 0.0 + 0.03j], dtype=cdt, device=dev)
+        sn_mva = 100.0
+
+        out = compute_flows(V, yff, yft, ytf, ytt, b_from, b_to, vn_kv, sn_mva)
+
+        Vd = V.detach()
+        zero = torch.zeros(2, dtype=cdt, device=dev)
+        I_or = torch.stack([yff[0] * Vd[:, 0] + yft[0] * Vd[:, 1],
+                            yff[1] * Vd[:, 2],
+                            zero], dim=1)
+        I_ex = torch.stack([ytf[0] * Vd[:, 0] + ytt[0] * Vd[:, 1],
+                            zero,
+                            ytt[2] * Vd[:, 1]], dim=1)
+        V_or = torch.stack([Vd[:, 0], Vd[:, 2], zero], dim=1)
+        V_ex = torch.stack([Vd[:, 1], zero, Vd[:, 1]], dim=1)
+        base = sn_mva * 1e6 / (np.sqrt(3.0) * vn_kv[[0, 2, 1]] * 1e3)
+        S_or = V_or * I_or.conj()
+        S_ex = V_ex * I_ex.conj()
+        torch.testing.assert_close(out["i_or_a"], I_or.abs() * base)
+        torch.testing.assert_close(out["i_ex_a"], I_ex.abs() * base)
+        torch.testing.assert_close(out["p_or_mw"], S_or.real * sn_mva)
+        torch.testing.assert_close(out["q_or_mvar"], S_or.imag * sn_mva)
+        torch.testing.assert_close(out["p_ex_mw"], S_ex.real * sn_mva)
+        torch.testing.assert_close(out["q_ex_mvar"], S_ex.imag * sn_mva)
+
+        # The -1 side contributes nothing, and nothing reaches the last bus
+        # (only branch 1's live end, bus 2, and bus 1 / bus 0 are read).
+        sum(v.sum() for v in out.values()).backward()
+        assert torch.isfinite(torch.view_as_real(V.grad)).all()
+        assert torch.all(V.grad[:, 3] == 0)

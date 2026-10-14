@@ -49,6 +49,8 @@ from ..contingency_analysis._limit_violations import (
     ViolationCategory,
     violation_category,
     LimitViolation,
+    LimitViolationsEngineMixin,
+    LimitViolationsFacadeMixin,
 )
 from ..contingency_analysis._physical_checks import (
     PhysicalChecksEngineMixin,
@@ -88,7 +90,7 @@ def _resolve_strategy(strategy):
 
 
 class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
-                           SchedulingEngineMixin):
+                           SchedulingEngineMixin, LimitViolationsEngineMixin):
     """Stateful GPU row-aligned combined topology + injection sweep.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -444,51 +446,6 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         self._s.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
                            branch_limit_a2_ka, int(n_lines))
 
-    @property
-    def violation_tol(self):
-        """float: residual tolerance for the DIVERGENCE check, independent of
-        tol_base. Takes effect on the next run()."""
-        return self._s.violation_tol
-
-    @violation_tol.setter
-    def violation_tol(self, value):
-        self._s.violation_tol = float(value)
-
-    @property
-    def violation_rel_tol(self):
-        """float: relative margin a value must clear past its limit to be
-        reported by compute_limit_violations (lightsim2grid's
-        ``violation_rel_tol``, default ``1e-9``): CURRENT when
-        ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when ``v > vmax * (1 + tol)``,
-        LOW_VOLTAGE when ``v < vmin * (1 - tol)``. A value on its limit up to
-        rounding -- a bus a regulator holds exactly at its vmax -- is then not
-        reported, whichever side of the limit the last bit of the solve put it
-        on. ``0`` gives the bare strict comparisons. In [0, 1[; takes effect on
-        the next run(). (An FP32 build cannot resolve 1e-9: there, a value
-        needs a tolerance of ~1e-6 to be absorbed.)"""
-        return self._s.violation_rel_tol
-
-    @violation_rel_tol.setter
-    def violation_rel_tol(self, value):
-        value = float(value)
-        if not (0. <= value < 1.):
-            raise ValueError(f"violation_rel_tol must be in [0, 1[ (got {value}).")
-        self._s.violation_rel_tol = value
-
-    @property
-    def violation_capacity(self):
-        """int: violation records kept per scenario AND per violation type
-        (K): the K most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones,
-        ranked by ``|value / limit - 1|`` (so a LOW_VOLTAGE ranks by how far
-        below its limit it fell). Bounds the compact output at
-        n_scenarios * 3 * K regardless of grid size. Takes effect on the next
-        run(); default 16."""
-        return self._s.violation_capacity
-
-    @violation_capacity.setter
-    def violation_capacity(self, value):
-        self._s.violation_capacity = int(value)
-
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per scenario (row order
         matches set_injections()/set_topology()'s input rows). A
@@ -624,8 +581,11 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         """Zero-copy DLPack capsule of base-case voltages, shape [n_bus].
 
         Pass to ``torch.from_dlpack()`` or ``jax.dlpack.from_dlpack()`` for a
-        zero-copy GPU tensor.  The solver must remain alive while the tensor
-        is in use.
+        zero-copy GPU tensor.  The tensor co-owns the base state it views: a
+        ``run()`` that rebuilds the base state (a generator contingency mask
+        changing the reserved buses, the automatic reference slack moving)
+        leaves it showing the *previous* base case -- take a new capsule
+        then.
         """
         return self._s.v_base_dlpack()
 

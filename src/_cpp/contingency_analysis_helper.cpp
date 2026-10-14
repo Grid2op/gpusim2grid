@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "contingency_analysis_helper.hpp"
+#include "ledger_data.hpp"   // LedgerData (choose_reference_bus_from_ledger)
 
 #include <algorithm>        // std::lower_bound, std::min, std::sort, std::max_element
 #include <cmath>            // std::abs
@@ -929,4 +930,27 @@ void build_tripped_branch_table(
         h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size());
         h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
     }
+}
+
+// ---------------------------------------------------------------------------
+// choose_reference_bus_from_ledger
+// ---------------------------------------------------------------------------
+int choose_reference_bus_from_ledger(
+    const std::vector<Contingency>&                               contingencies,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
+    const LedgerData&                                             ld,
+    int                                                           forced,
+    int                                                           fallback)
+{
+    std::vector<int>    cand_bus;
+    std::vector<double> cand_w;
+    for (int b = 0; b < ld.n_bus && b < static_cast<int>(ld.slack_weights.size()); ++b)
+        if (ld.p_row_of_bus[static_cast<size_t>(b)] >= 0 && ld.slack_weights[static_cast<size_t>(b)] != 0.) {
+            cand_bus.push_back(b);
+            cand_w.push_back(ld.slack_weights[static_cast<size_t>(b)]);
+        }
+    const int choice = choose_reference_bus(contingencies, Ybus_rm.outerIndexPtr(),
+                                            Ybus_rm.innerIndexPtr(), Ybus_rm,
+                                            cand_bus, cand_w, forced);
+    return choice < 0 ? fallback : choice;
 }

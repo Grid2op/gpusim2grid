@@ -14,7 +14,7 @@
 //   §4  AcPfNrState::copy_V_to_host
 //   §5  acpf_nr_gpu()            (thin public wrapper, Python-facing)
 //   §6  AcPfNrSession            (stateful wrapper for DLPack zero-copy export)
-//   §7  AcPfNrState::prepare_JT / solve_JT  (adjoint primitive)
+//   §7  AcPfNrState::resolve / ensure_JT / solve_JT  (re-solve + adjoint primitive)
 //
 // Device kernels (fill_FP, fill_FQ, fill_J, update_Va, update_Vm,
 //                 compute_residuals) live in acpf_nr_kernels.cuh and are
@@ -53,6 +53,7 @@
 #include <thrust/functional.h>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
+#include <thrust/scatter.h>
 
 #include <cusparse.h>
 #include <cudss.h>
@@ -66,6 +67,7 @@
 #include <iostream>
 #include <vector>
 #include <cassert>
+#include <cmath>       // isnan / NAN (NanMaxFunctor)
 
 // ---------------------------------------------------------------------------
 // Error-checking macros — throw on failure so the AcPfNrState constructor
@@ -107,6 +109,17 @@
 struct AbsFunctor {
     __host__ __device__
     cuda_real_type operator()(cuda_real_type x) const { return fabs(x); }
+};
+
+// NaN-propagating max for the ‖F‖∞ reductions below. thrust::maximum is
+// `a < b ? b : a`, which drops a NaN `b`: an all-NaN F would reduce to the
+// initial 0 and read as converged. Same sticky-NaN rule as the batched
+// compute_residuals_kernel.
+struct NanMaxFunctor {
+    __host__ __device__
+    cuda_real_type operator()(cuda_real_type a, cuda_real_type b) const {
+        return (isnan(a) || isnan(b)) ? cuda_real_type(NAN) : (b > a ? b : a);
+    }
 };
 
 // =============================================================================
@@ -299,6 +312,192 @@ static void build_scatter_maps_aug(
 }
 
 // =============================================================================
+// §2c  Single-system NR loop helpers  (shared by the ctor and resolve())
+// =============================================================================
+
+// Non-owning pointer bundle — views into the single-system device vectors.
+// Not const: the NR step-scaling and pin fields are set via post-init
+// assignment (positional aggregate init can't skip over the trailing
+// handle_disconnected_grid masking fields, which this single-system state
+// never uses). The step-scaling scratch (d_scale_max_d{theta,vm}) must
+// already be sized when scaling is on (the ctor does it).
+static NrIterBuffers make_single_system_buffers(AcPfNrState& s)
+{
+    NrIterBuffers buf {
+        thrust::raw_pointer_cast(s.d_J_values.data()),
+        thrust::raw_pointer_cast(s.d_V.data()),
+        thrust::raw_pointer_cast(s.d_Ibus.data()),
+        thrust::raw_pointer_cast(s.d_F.data()),
+        thrust::raw_pointer_cast(s.d_dx.data()),
+        thrust::raw_pointer_cast(s.d_Ybus_values.data()),
+        thrust::raw_pointer_cast(s.d_Ybus_outer.data()),
+        thrust::raw_pointer_cast(s.d_Ybus_inner.data()),
+        thrust::raw_pointer_cast(s.d_map_j11.data()),
+        thrust::raw_pointer_cast(s.d_map_j12.data()),
+        thrust::raw_pointer_cast(s.d_map_j21.data()),
+        thrust::raw_pointer_cast(s.d_map_j22.data()),
+        thrust::raw_pointer_cast(s.d_p_buses.data()),
+        thrust::raw_pointer_cast(s.d_p_rows.data()),
+        s.n_p,
+        thrust::raw_pointer_cast(s.d_q_buses.data()),
+        thrust::raw_pointer_cast(s.d_q_rows.data()),
+        s.n_q,
+        thrust::raw_pointer_cast(s.d_theta_buses.data()),
+        thrust::raw_pointer_cast(s.d_theta_cols.data()),
+        s.n_theta,
+        thrust::raw_pointer_cast(s.d_vm_buses.data()),
+        thrust::raw_pointer_cast(s.d_vm_cols.data()),
+        s.n_vm,
+        thrust::raw_pointer_cast(s.d_Sbus.data()),
+        /*sbus_stride=*/0,   // single-system NR: shared Sbus
+        // MultiSlack (inactive: slack_col=-1, empty vectors → nullptr; kernels skipped)
+        s.slack_col,
+        s.n_slack,
+        thrust::raw_pointer_cast(s.d_slack_prow.data()),
+        thrust::raw_pointer_cast(s.d_slack_w.data()),
+        thrust::raw_pointer_cast(s.d_slack_feat_pos.data()),
+        thrust::raw_pointer_cast(s.d_slack_absorbed.data()),
+        // HVDC angle-droop (inactive when n_hvdc==0; kernels + J-zeroing skipped)
+        s.n_hvdc,
+        /*zero_J_before_fill=*/(s.n_hvdc > 0),
+        thrust::raw_pointer_cast(s.d_hvdc_bus1.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_bus2.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_status.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_p0.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_k.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_lf1.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_lf2.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_r.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_pmax12.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_pmax21.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_prow1.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_prow2.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_h11.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_h12.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_h21.data()),
+        thrust::raw_pointer_cast(s.d_hvdc_h22.data()),
+        // VoltageControl (inactive when n_vc_ctrl==0; kernels skipped)
+        s.n_vc_ctrl,
+        s.n_vc_grp,
+        s.n_vc_share,
+        s.n_vc_feat,
+        thrust::raw_pointer_cast(s.d_vc_qrow.data()),
+        thrust::raw_pointer_cast(s.d_vc_qcol.data()),
+        thrust::raw_pointer_cast(s.d_vc_slope.data()),
+        thrust::raw_pointer_cast(s.d_vc_reg_bus.data()),
+        thrust::raw_pointer_cast(s.d_vc_vrow.data()),
+        thrust::raw_pointer_cast(s.d_vc_grp_start.data()),
+        thrust::raw_pointer_cast(s.d_vc_grp_count.data()),
+        thrust::raw_pointer_cast(s.d_vc_vset.data()),
+        thrust::raw_pointer_cast(s.d_vc_sh_row.data()),
+        thrust::raw_pointer_cast(s.d_vc_sh_first.data()),
+        thrust::raw_pointer_cast(s.d_vc_sh_other.data()),
+        thrust::raw_pointer_cast(s.d_vc_sh_wfirst.data()),
+        thrust::raw_pointer_cast(s.d_vc_sh_wother.data()),
+        thrust::raw_pointer_cast(s.d_vc_feat_pos.data()),
+        thrust::raw_pointer_cast(s.d_vc_feat_val.data()),
+        thrust::raw_pointer_cast(s.d_vc_q.data()),
+    };
+
+    // NR step-scaling (MaxVoltageChange) -- see acpf_nr_state.cuh's own doc on
+    // the constructor params. Off by default; the scratch buffers stay empty
+    // (buf.d_scale_max_d{theta,vm} stay nullptr) unless enabled, matching
+    // every other opt-in extension of the state.
+    buf.scaling_max_voltage_change = s.scaling_max_voltage_change_;
+    buf.max_dVa = static_cast<cuda_real_type>(s.max_dVa_);
+    buf.max_dVm = static_cast<cuda_real_type>(s.max_dVm_);
+    if (s.scaling_max_voltage_change_) {
+        buf.d_scale_max_dtheta = thrust::raw_pointer_cast(s.d_scale_max_dtheta.data());
+        buf.d_scale_max_dvm    = thrust::raw_pointer_cast(s.d_scale_max_dvm.data());
+    }
+
+    // Switchable Vm buses: their Q rows stay identity-pinned in this base
+    // solve (see h_switchable_buses' own doc). Reuses the batch mask fields
+    // with slot 0; no-op (null / 0) on every un-extended ledger.
+    if (s.n_pin > 0) {
+        buf.d_J_outer_mask = thrust::raw_pointer_cast(s.d_J_outer.data());
+        buf.d_mask_slot    = thrust::raw_pointer_cast(s.d_pin_slot.data());
+        buf.d_mask_row     = thrust::raw_pointer_cast(s.d_pin_row.data());
+        buf.d_mask_diag    = thrust::raw_pointer_cast(s.d_pin_diag.data());
+        buf.n_mask_rows    = s.n_pin;
+    }
+    // Held controllers: offset out of the mismatch, pinned in this base solve.
+    if (s.has_vc_held) {
+        buf.d_vc_qoff    = thrust::raw_pointer_cast(s.d_vc_qoff.data());
+        buf.d_vcp_slot   = thrust::raw_pointer_cast(s.d_hold_vcp_slot.data());
+        buf.d_vcp_row    = thrust::raw_pointer_cast(s.d_hold_vcp_row.data());
+        buf.d_vcp_ctrl   = thrust::raw_pointer_cast(s.d_hold_vcp_ctrl.data());
+        buf.d_vcp_target = thrust::raw_pointer_cast(s.d_hold_vcp_target.data());
+        buf.n_vcp        = s.n_hold_vcp;
+        if (s.n_hold_jov > 0) {
+            buf.d_jov_slot = thrust::raw_pointer_cast(s.d_hold_jov_slot.data());
+            buf.d_jov_pos  = thrust::raw_pointer_cast(s.d_hold_jov_pos.data());
+            buf.d_jov_val  = thrust::raw_pointer_cast(s.d_hold_jov_val.data());
+            buf.n_jov      = s.n_hold_jov;
+        }
+    }
+    return buf;
+}
+
+// The Newton-Raphson loop proper, from whatever d_V / d_Sbus / extension
+// state the caller left: FACTORIZATION at iteration 0, REFACTORIZATION after
+// (ANALYSIS must already be done). Accumulates into t (nb_iter, converged and
+// the per-phase totals).
+//
+//   Convergence is checked AFTER each full NR step (option B): nr_iter_step
+//   runs SpMV + fill_F + fill_J + factorize + solve + update_V, and the
+//   mismatch left in d_F is tested immediately after.
+//
+//   Trade-off: the iteration on which ‖F‖∞ first drops below tol has
+//   already performed a fill_J + factorize + solve + update_V that was
+//   technically unnecessary (dx ≈ 0 for a converged system).  This is
+//   acceptable: one extra factorize per solve call is negligible compared
+//   to the overall NR cost, and it keeps the loop body uniform with
+//   contingency_solver.cu.
+static void run_single_system_nr(AcPfNrState& s, const NrIterBuffers& buf,
+                                 int max_iter, eigen_real_type tol,
+                                 CudaTimer& timer, AcPfTimings& t)
+{
+    for (int iter = 0; iter < max_iter; ++iter)
+    {
+        t.nb_iter++;
+
+        NrIterTimings step;
+        nr_iter_step(s.spmv, s.dss, s.dss_A, s.dss_x, s.dss_b, buf,
+                     s.n_bus, s.n_pvpq, s.n_pq, s.dim_J, s.nnz_Y, s.nnz_J,
+                     /*actual_batch=*/1, s.cs, timer,
+                     /*first_factorize=*/(iter == 0), step);
+        t.t_spmv            += step.t_spmv;
+        t.t_fill_F          += step.t_fill_F;
+        t.t_fill_J          += step.t_fill_J;
+        t.t_first_factorize += step.t_first_factorize;
+        t.t_refactorize     += step.t_refactorize;
+        if (iter > 0) t.n_refactorize++;
+        t.t_solve           += step.t_solve;
+        t.t_update_V        += step.t_update_V;
+
+        // ‖F‖∞ convergence check on the mismatch left by nr_iter_step.
+        // d_F holds −[ΔP, ΔQ] of the just-updated V; no extra SpMV needed.
+        timer.start();
+        cuda_real_type norm_F = thrust::transform_reduce(
+            thrust::cuda::par.on(s.cs),
+            s.d_F.begin(), s.d_F.end(),
+            AbsFunctor{},
+            cuda_real_type(0.),
+            NanMaxFunctor{});
+        t.t_mismatch += timer.stop_ms();
+
+        if (norm_F < static_cast<cuda_real_type>(tol)) {
+            t.converged = true;
+            break;
+        }
+    }
+    // §4.8 (post-loop final check) is no longer needed: nr_iter_step always
+    // recomputes d_F before the convergence test above, so t.converged is
+    // accurate whether the loop exited via break or by exhausting max_iter.
+}
+
+// =============================================================================
 // §4  AcPfNrState constructor
 // =============================================================================
 
@@ -328,6 +527,11 @@ AcPfNrState::AcPfNrState(
     pivot_epsilon_alg_ = pivot_epsilon_alg;
     debug_base_case_   = debug_base_case;
     base_case_only_    = base_case_only;
+    max_iter_          = max_iter;
+    tol_               = tol;
+    scaling_max_voltage_change_ = scaling_max_voltage_change;
+    max_dVa_           = max_dVa;
+    max_dVm_           = max_dVm;
 
     // Wall clock for the mixed CPU+GPU init phase; chrono is appropriate here
     // because the work is heterogeneous (CPU preprocessing + device uploads +
@@ -561,6 +765,7 @@ AcPfNrState::AcPfNrState(
         // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
         cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
         for (int i = 0; i < n_bus; ++i) sa0 += static_cast<cuda_real_type>(Sbus_host(i).real());
+        slack_absorbed0_ = sa0;
         std::vector<cuda_real_type> h_sa(1, sa0);
         upload_h2d(d_slack_absorbed, h_sa.data(), 1, cs);
     }
@@ -962,7 +1167,7 @@ AcPfNrState::AcPfNrState(
     //                   context. Always true for the normal iterative loop
     //                   (!presolved_v) and for AcPfNrSession (base_case_only_
     //                   ==false -- it's the production solver and must keep a
-    //                   factorization alive for run()/prepare_JT()). For
+    //                   factorization alive for resolve()/solve_JT()). For
     //                   ContingencyAnalysisSession's/InjectionSweepSession's
     //                   base_state_ (base_case_only_==true) under presolved_v
     //                   with ground truth available, this is false: fill_J
@@ -1044,140 +1249,15 @@ AcPfNrState::AcPfNrState(
         timings.t_ground_truth_check_ms = ledger->t_ground_truth_check_ms;
 
     // =========================================================================
-    // 4.6  Newton-Raphson loop  (all computation on cs)
-    //
-    //   Convergence is checked AFTER each full NR step (option B): nr_iter_step
-    //   runs SpMV + fill_F + fill_J + factorize + solve + update_V, and the
-    //   mismatch left in d_F is tested immediately after.
-    //
-    //   Trade-off: the iteration on which ‖F‖∞ first drops below tol has
-    //   already performed a fill_J + factorize + solve + update_V that was
-    //   technically unnecessary (dx ≈ 0 for a converged system).  This is
-    //   acceptable: one extra factorize per solve call is negligible compared
-    //   to the overall NR cost, and it keeps the loop body uniform with
-    //   contingency_solver.cu.
+    // 4.6  Newton-Raphson loop  (all computation on cs; see run_single_system_nr)
     // =========================================================================
 
-    // Non-owning pointer bundle — views into the single-system device vectors.
-    // Not const: the NR step-scaling fields are set via post-init assignment
-    // below (positional aggregate init can't skip over the trailing
-    // handle_disconnected_grid masking fields, which this single-system state
-    // never uses).
-    NrIterBuffers buf {
-        thrust::raw_pointer_cast(d_J_values.data()),
-        thrust::raw_pointer_cast(d_V.data()),
-        thrust::raw_pointer_cast(d_Ibus.data()),
-        thrust::raw_pointer_cast(d_F.data()),
-        thrust::raw_pointer_cast(d_dx.data()),
-        thrust::raw_pointer_cast(d_Ybus_values.data()),
-        thrust::raw_pointer_cast(d_Ybus_outer.data()),
-        thrust::raw_pointer_cast(d_Ybus_inner.data()),
-        thrust::raw_pointer_cast(d_map_j11.data()),
-        thrust::raw_pointer_cast(d_map_j12.data()),
-        thrust::raw_pointer_cast(d_map_j21.data()),
-        thrust::raw_pointer_cast(d_map_j22.data()),
-        thrust::raw_pointer_cast(d_p_buses.data()),
-        thrust::raw_pointer_cast(d_p_rows.data()),
-        n_p,
-        thrust::raw_pointer_cast(d_q_buses.data()),
-        thrust::raw_pointer_cast(d_q_rows.data()),
-        n_q,
-        thrust::raw_pointer_cast(d_theta_buses.data()),
-        thrust::raw_pointer_cast(d_theta_cols.data()),
-        n_theta,
-        thrust::raw_pointer_cast(d_vm_buses.data()),
-        thrust::raw_pointer_cast(d_vm_cols.data()),
-        n_vm,
-        thrust::raw_pointer_cast(d_Sbus.data()),
-        /*sbus_stride=*/0,   // single-system NR: shared Sbus
-        // MultiSlack (inactive: slack_col=-1, empty vectors → nullptr; kernels skipped)
-        slack_col,
-        n_slack,
-        thrust::raw_pointer_cast(d_slack_prow.data()),
-        thrust::raw_pointer_cast(d_slack_w.data()),
-        thrust::raw_pointer_cast(d_slack_feat_pos.data()),
-        thrust::raw_pointer_cast(d_slack_absorbed.data()),
-        // HVDC angle-droop (inactive when n_hvdc==0; kernels + J-zeroing skipped)
-        n_hvdc,
-        /*zero_J_before_fill=*/(n_hvdc > 0),
-        thrust::raw_pointer_cast(d_hvdc_bus1.data()),
-        thrust::raw_pointer_cast(d_hvdc_bus2.data()),
-        thrust::raw_pointer_cast(d_hvdc_status.data()),
-        thrust::raw_pointer_cast(d_hvdc_p0.data()),
-        thrust::raw_pointer_cast(d_hvdc_k.data()),
-        thrust::raw_pointer_cast(d_hvdc_lf1.data()),
-        thrust::raw_pointer_cast(d_hvdc_lf2.data()),
-        thrust::raw_pointer_cast(d_hvdc_r.data()),
-        thrust::raw_pointer_cast(d_hvdc_pmax12.data()),
-        thrust::raw_pointer_cast(d_hvdc_pmax21.data()),
-        thrust::raw_pointer_cast(d_hvdc_prow1.data()),
-        thrust::raw_pointer_cast(d_hvdc_prow2.data()),
-        thrust::raw_pointer_cast(d_hvdc_h11.data()),
-        thrust::raw_pointer_cast(d_hvdc_h12.data()),
-        thrust::raw_pointer_cast(d_hvdc_h21.data()),
-        thrust::raw_pointer_cast(d_hvdc_h22.data()),
-        // VoltageControl (inactive when n_vc_ctrl==0; kernels skipped)
-        n_vc_ctrl,
-        n_vc_grp,
-        n_vc_share,
-        n_vc_feat,
-        thrust::raw_pointer_cast(d_vc_qrow.data()),
-        thrust::raw_pointer_cast(d_vc_qcol.data()),
-        thrust::raw_pointer_cast(d_vc_slope.data()),
-        thrust::raw_pointer_cast(d_vc_reg_bus.data()),
-        thrust::raw_pointer_cast(d_vc_vrow.data()),
-        thrust::raw_pointer_cast(d_vc_grp_start.data()),
-        thrust::raw_pointer_cast(d_vc_grp_count.data()),
-        thrust::raw_pointer_cast(d_vc_vset.data()),
-        thrust::raw_pointer_cast(d_vc_sh_row.data()),
-        thrust::raw_pointer_cast(d_vc_sh_first.data()),
-        thrust::raw_pointer_cast(d_vc_sh_other.data()),
-        thrust::raw_pointer_cast(d_vc_sh_wfirst.data()),
-        thrust::raw_pointer_cast(d_vc_sh_wother.data()),
-        thrust::raw_pointer_cast(d_vc_feat_pos.data()),
-        thrust::raw_pointer_cast(d_vc_feat_val.data()),
-        thrust::raw_pointer_cast(d_vc_q.data()),
-    };
-
-    // NR step-scaling (MaxVoltageChange) -- see acpf_nr_state.cuh's own doc on
-    // the constructor params. Off by default; the scratch buffers stay empty
-    // (buf.d_scale_max_d{theta,vm} stay nullptr) unless enabled, matching
-    // every other opt-in extension in this constructor.
-    buf.scaling_max_voltage_change = scaling_max_voltage_change;
-    buf.max_dVa = static_cast<cuda_real_type>(max_dVa);
-    buf.max_dVm = static_cast<cuda_real_type>(max_dVm);
-    if (scaling_max_voltage_change) {
+    // NR step-scaling scratch (size 1, single-system) -- only when enabled.
+    if (scaling_max_voltage_change_) {
         d_scale_max_dtheta.resize(1);
         d_scale_max_dvm.resize(1);
-        buf.d_scale_max_dtheta = thrust::raw_pointer_cast(d_scale_max_dtheta.data());
-        buf.d_scale_max_dvm    = thrust::raw_pointer_cast(d_scale_max_dvm.data());
     }
-
-    // Switchable Vm buses: their Q rows stay identity-pinned in this base
-    // solve (see h_switchable_buses' own doc). Reuses the batch mask fields
-    // with slot 0; no-op (null / 0) on every un-extended ledger.
-    if (n_pin > 0) {
-        buf.d_J_outer_mask = thrust::raw_pointer_cast(d_J_outer.data());
-        buf.d_mask_slot    = thrust::raw_pointer_cast(d_pin_slot.data());
-        buf.d_mask_row     = thrust::raw_pointer_cast(d_pin_row.data());
-        buf.d_mask_diag    = thrust::raw_pointer_cast(d_pin_diag.data());
-        buf.n_mask_rows    = n_pin;
-    }
-    // Held controllers: offset out of the mismatch, pinned in this base solve.
-    if (has_vc_held) {
-        buf.d_vc_qoff    = thrust::raw_pointer_cast(d_vc_qoff.data());
-        buf.d_vcp_slot   = thrust::raw_pointer_cast(d_hold_vcp_slot.data());
-        buf.d_vcp_row    = thrust::raw_pointer_cast(d_hold_vcp_row.data());
-        buf.d_vcp_ctrl   = thrust::raw_pointer_cast(d_hold_vcp_ctrl.data());
-        buf.d_vcp_target = thrust::raw_pointer_cast(d_hold_vcp_target.data());
-        buf.n_vcp        = n_hold_vcp;
-        if (n_hold_jov > 0) {
-            buf.d_jov_slot = thrust::raw_pointer_cast(d_hold_jov_slot.data());
-            buf.d_jov_pos  = thrust::raw_pointer_cast(d_hold_jov_pos.data());
-            buf.d_jov_val  = thrust::raw_pointer_cast(d_hold_jov_val.data());
-            buf.n_jov      = n_hold_jov;
-        }
-    }
+    NrIterBuffers buf = make_single_system_buffers(*this);
 
     CudaTimer timer(cs);  // stream-aware: events recorded on cs
 
@@ -1187,7 +1267,7 @@ AcPfNrState::AcPfNrState(
         //
         //   Vinit is trusted to already be converged (e.g. lightsim2grid's CPU
         //   KLU solve). Run steps ①-④ once at Vinit — fill_F/fill_J/FACTORIZE —
-        //   to validate ‖F(Vinit)‖∞ and prepare J's factors for prepare_JT() /
+        //   to validate ‖F(Vinit)‖∞ and prepare J's factors for ensure_JT() /
         //   the direct_base_case_factors batch strategy. d_V itself is NEVER
         //   touched by update_Va/update_Vm in this branch: it stays bit-identical
         //   to the caller-supplied Vinit instead of being perturbed by the
@@ -1282,7 +1362,7 @@ AcPfNrState::AcPfNrState(
             d_F.begin(), d_F.end(),
             AbsFunctor{},
             cuda_real_type(0.),
-            thrust::maximum<cuda_real_type>());
+            NanMaxFunctor{});
         timings.t_mismatch += timer.stop_ms();
 
         // Guard against tol being tuned for lightsim2grid's FP64 CPU check
@@ -1308,46 +1388,10 @@ AcPfNrState::AcPfNrState(
                 "init_from_n_powerflow or re-check the CPU base-case solve.");
         }
         // d_V left untouched at Vinit; d_J_values holds J(Vinit), already
-        // factorized via dss -- ready for prepare_JT() and the
+        // factorized via dss -- ready for ensure_JT() and the
         // direct_base_case_factors batch strategy.
     } else {
-        for (int iter = 0; iter < max_iter; ++iter)
-        {
-            timings.nb_iter++;
-
-            NrIterTimings step;
-            nr_iter_step(spmv, dss, dss_A, dss_x, dss_b, buf,
-                         n_bus, n_pvpq, n_pq, dim_J, nnz_Y, nnz_J,
-                         /*actual_batch=*/1, cs, timer,
-                         /*first_factorize=*/(iter == 0), step);
-            timings.t_spmv            += step.t_spmv;
-            timings.t_fill_F          += step.t_fill_F;
-            timings.t_fill_J          += step.t_fill_J;
-            timings.t_first_factorize += step.t_first_factorize;
-            timings.t_refactorize     += step.t_refactorize;
-            if (iter > 0) timings.n_refactorize++;
-            timings.t_solve           += step.t_solve;
-            timings.t_update_V        += step.t_update_V;
-
-            // ‖F‖∞ convergence check on the mismatch left by nr_iter_step.
-            // d_F holds −[ΔP, ΔQ] of the just-updated V; no extra SpMV needed.
-            timer.start();
-            cuda_real_type norm_F = thrust::transform_reduce(
-                thrust::cuda::par.on(cs),
-                d_F.begin(), d_F.end(),
-                AbsFunctor{},
-                cuda_real_type(0.),
-                thrust::maximum<cuda_real_type>());
-            timings.t_mismatch += timer.stop_ms();
-
-            if (norm_F < static_cast<cuda_real_type>(tol)) {
-                timings.converged = true;
-                break;
-            }
-        }
-        // §4.8 (post-loop final check) is no longer needed: nr_iter_step always
-        // recomputes d_F before the convergence test above, so timings.converged
-        // is accurate whether the loop exited via break or by exhausting max_iter.
+        run_single_system_nr(*this, buf, max_iter, tol, timer, timings);
     }
 
     // =========================================================================
@@ -1363,12 +1407,10 @@ AcPfNrState::AcPfNrState(
     //   ContingencyAnalysisSolver will call REFACTORIZATION / SOLVE directly
     //   on dss / dss_A / dss_b / dss_x, amortising ANALYSIS across the batch.
 
-    // Build and factor Jᵀ for the adjoint solve (implicit function theorem).
-    // Skipped for base_case_only_ instances (ContingencyAnalysisSession's/
-    // InjectionSweepSession's base_state_): neither ever calls solve_JT() --
-    // only AcPfNrSession's differentiable wrapper does -- so this would be
-    // pure dead work (a full transpose build + its own cuDSS analyze/factorize).
-    if (!base_case_only_) prepare_JT();
+    // Jᵀ for the adjoint solve (implicit function theorem) is NOT built here:
+    // the first solve_JT() builds it (ensure_JT()). A forward-only caller --
+    // most of them, and every base_case_only_ instance -- never pays for its
+    // own cuDSS context, ANALYSIS and FACTORIZATION.
 }
 
 // =============================================================================
@@ -1458,135 +1500,202 @@ AcPfNrSession::AcPfNrSession(
 }
 
 // =============================================================================
-// §7  AcPfNrState adjoint helpers — prepare_JT() and solve_JT()
+// §7  AcPfNrState::resolve — the NR loop again, on everything already built
+// =============================================================================
+
+AcPfTimings AcPfNrState::resolve(Eigen::Ref<const CplxVect> Vinit,
+                                 const CplxVect*            Sbus_host,
+                                 int                        max_iter,
+                                 eigen_real_type            tol)
+{
+    if (dss.handle == nullptr)
+        throw std::runtime_error(
+            "[acpf_nr] resolve(): this state has no cuDSS context "
+            "(a batch session's base-case-only state)");
+    if (Vinit.size() != n_bus)
+        throw std::runtime_error(
+            "[acpf_nr] resolve(): Vinit has size " + std::to_string(Vinit.size())
+            + ", expected n_bus = " + std::to_string(n_bus));
+    if (Sbus_host != nullptr && Sbus_host->size() != n_bus)
+        throw std::runtime_error(
+            "[acpf_nr] resolve(): Sbus has size " + std::to_string(Sbus_host->size())
+            + ", expected n_bus = " + std::to_string(n_bus));
+    if (max_iter < 0) max_iter = max_iter_;
+    if (tol < 0)      tol      = tol_;
+
+    // A fresh record: nothing one-time (context, structure, ANALYSIS) is paid
+    // here, so those fields stay 0, like a reused batch run (mark_reused).
+    AcPfTimings t;
+    auto t_upload_start = std::chrono::steady_clock::now();
+
+    // Same sizes as at construction: upload_h2d's resize is a no-op, so the
+    // pointers the cuSPARSE / cuDSS descriptors hold stay valid.
+    {
+        thrust::host_vector<cudaComplexType> h_v(n_bus);
+        for (int i = 0; i < n_bus; ++i)
+            h_v[i] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>(Vinit(i).real()),
+                static_cast<cuda_real_type>(Vinit(i).imag()));
+        upload_h2d(d_V, h_v.data(), n_bus, cs);
+    }
+    if (Sbus_host != nullptr) {
+        thrust::host_vector<cudaComplexType> h_s(n_bus);
+        cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
+        for (int i = 0; i < n_bus; ++i) {
+            h_s[i] = CudaFunHelper::my_make_cuComplex(
+                static_cast<cuda_real_type>((*Sbus_host)(i).real()),
+                static_cast<cuda_real_type>((*Sbus_host)(i).imag()));
+            sa0 += static_cast<cuda_real_type>((*Sbus_host)(i).real());  // same sum as the ctor
+        }
+        upload_h2d(d_Sbus, h_s.data(), n_bus, cs);
+        slack_absorbed0_ = sa0;
+    }
+
+    // Extension running state restarts where the ctor starts it.
+    if (slack_col >= 0) {
+        std::vector<cuda_real_type> h_sa(1, slack_absorbed0_);
+        upload_h2d(d_slack_absorbed, h_sa.data(), 1, cs);
+    }
+    if (n_vc_ctrl > 0) {
+        if (has_vc_held) copy_d2d(d_vc_q, d_vc_qoff, cs);   // held: at their frozen output
+        else             zero_d(d_vc_q, cs);
+    }
+    cs.synchronize();
+    t.t_upload_ms = ms_since(t_upload_start);
+    t.t_init_ms   = t.t_upload_ms;   // t_host_to_device_ms() = t_init_ms - build_J - context
+
+    NrIterBuffers buf = make_single_system_buffers(*this);
+    CudaTimer timer(cs);
+    run_single_system_nr(*this, buf, max_iter, tol, timer, t);
+
+    copy_d2d(d_V_base,        d_V,        cs);
+    copy_d2d(d_J_values_base, d_J_values, cs);
+    jt_factored_ = false;   // the converged J moved: Jᵀ is refactorized on demand
+    cs.synchronize();
+
+    timings = t;
+    return t;
+}
+
+// =============================================================================
+// §7b AcPfNrState adjoint helpers — ensure_JT() and solve_JT()
 //
 // cuDSS 0.7 exposes CUDSS_CONFIG_SOLVE_MODE for a future transpose mode but
 // documents "Other values are not supported" — only 0 (forward solve) works.
-// We therefore build Jᵀ explicitly via cusparseCsr2cscEx2 (which converts a
-// CSR matrix to CSC, and CSC(A) == CSR(Aᵀ) for any square matrix) and factor
-// it with a dedicated CudssContext.  Both the transpose and its LU factors are
-// computed once at the end of the constructor and reused across all backward
-// passes.
+// We therefore build Jᵀ explicitly: its CSR skeleton by a host counting sort
+// of J's (rows come out sorted, so it is the CSC of J), once, together with
+// the position map d_J_to_JT; its values are J's scattered through that map
+// (the same scheme as BatchAdjoint). It is factored with a dedicated
+// CudssContext. All of it is built by the first solve_JT() -- never by the
+// ctor -- and only the FACTORIZATION is redone after a resolve().
 // =============================================================================
 
-void AcPfNrState::prepare_JT()
+void AcPfNrState::ensure_JT()
 {
-    // Wall-clock timing via chrono (mixed CPU/GPU work: cusparseCsr2cscEx2 +
-    // a full cuDSS analyze+factorize on the transposed system). Synchronize
-    // before sampling the end time so the GPU work is actually complete --
-    // this call was previously entirely untimed, hiding a one-time cost
-    // comparable to t_analyze_ms + t_first_factorize combined.
+    if (jt_factored_) return;
+    if (static_cast<int>(d_J_values_base.size()) != nnz_J || dss.handle == nullptr)
+        throw std::runtime_error(
+            "[acpf_nr] solve_JT(): no converged Jacobian on this state (a "
+            "diagnostic early-stop session or a base-case-only state)");
+
+    // Wall-clock (host transpose + uploads + a cuDSS analyze/factorize on the
+    // transposed system); synchronized before sampling the end time.
     auto t_prep_start = std::chrono::steady_clock::now();
 
-    // Allocate device storage for Jᵀ CSR and work vectors
-    d_JT_outer.resize(dim_J + 1);
-    d_JT_inner.resize(nnz_J);
-    d_JT_values.resize(nnz_J);
-    d_JT_rhs.resize(dim_J);   zero_d(d_JT_rhs, cs);
-    d_JT_sol.resize(dim_J);   zero_d(d_JT_sol, cs);
+    if (!jt_analyzed_) {
+        thrust::host_vector<int> h_outer(d_J_outer);
+        thrust::host_vector<int> h_inner(d_J_inner);
+        std::vector<int> h_JT_outer(static_cast<size_t>(dim_J) + 1, 0);
+        std::vector<int> h_JT_inner(static_cast<size_t>(nnz_J), 0);
+        std::vector<int> h_map(static_cast<size_t>(nnz_J), 0);
+        for (int p = 0; p < nnz_J; ++p) ++h_JT_outer[static_cast<size_t>(h_inner[p]) + 1];
+        for (int j = 0; j < dim_J; ++j) h_JT_outer[static_cast<size_t>(j) + 1] += h_JT_outer[static_cast<size_t>(j)];
+        std::vector<int> fill(h_JT_outer.begin(), h_JT_outer.end() - 1);
+        for (int i = 0; i < dim_J; ++i)
+            for (int p = h_outer[i]; p < h_outer[i + 1]; ++p) {
+                const int pos = fill[static_cast<size_t>(h_inner[p])]++;
+                h_JT_inner[static_cast<size_t>(pos)] = i;
+                h_map[static_cast<size_t>(p)] = pos;
+            }
+        upload_h2d(d_JT_outer, h_JT_outer.data(), h_JT_outer.size(), cs);
+        upload_h2d(d_JT_inner, h_JT_inner.data(), h_JT_inner.size(), cs);
+        upload_h2d(d_J_to_JT,  h_map.data(),      h_map.size(),      cs);
+        d_JT_values.resize(nnz_J);
+        d_JT_rhs.resize(dim_J);   zero_d(d_JT_rhs, cs);
+        d_JT_sol.resize(dim_J);   zero_d(d_JT_sol, cs);
+    }
 
-    // -------------------------------------------------------------------------
-    // Transpose J → Jᵀ via cusparseCsr2cscEx2
-    // A temporary cuSPARSE handle is used here (one-time setup); the main
-    // SpMV handle (spmv.handle) is typed for complex Ybus and must not be
-    // reused for real-valued J operations.
-    // -------------------------------------------------------------------------
-    cusparseHandle_t csp = nullptr;
-    CHK_CSP_AC(cusparseCreate(&csp));
-    CHK_CSP_AC(cusparseSetStream(csp, cs));
+    thrust::scatter(thrust::cuda::par.on(cs),
+                    d_J_values_base.begin(), d_J_values_base.end(),
+                    d_J_to_JT.begin(), d_JT_values.begin());
 
-    size_t buf_sz = 0;
-    CHK_CSP_AC(cusparseCsr2cscEx2_bufferSize(
-        csp,
-        dim_J, dim_J, nnz_J,
-        thrust::raw_pointer_cast(d_J_values_base.data()),
-        thrust::raw_pointer_cast(d_J_outer.data()),
-        thrust::raw_pointer_cast(d_J_inner.data()),
-        thrust::raw_pointer_cast(d_JT_values.data()),
-        thrust::raw_pointer_cast(d_JT_outer.data()),
-        thrust::raw_pointer_cast(d_JT_inner.data()),
-        static_cast<cudaDataType_t>(CudaFunHelper::CUDSS_R_TYPE),  // CUDA_R_32F or CUDA_R_64F
-        CUSPARSE_ACTION_NUMERIC,
-        CUSPARSE_INDEX_BASE_ZERO,
-        CUSPARSE_CSR2CSC_ALG_DEFAULT,
-        &buf_sz));
+    if (!jt_analyzed_) {
+        // Stream must be bound immediately after cudssCreate and before
+        // cudssConfigCreate / cudssDataCreate (mirrors the pattern for dss).
+        CHK_DSS_AC(cudssCreate(&dss_T.handle));
+        CHK_DSS_AC(cudssSetStream(dss_T.handle, cs));
+        CHK_DSS_AC(cudssConfigCreate(&dss_T.config));
+        CHK_DSS_AC(cudssDataCreate(dss_T.handle, &dss_T.data));
+        dss_T.set_reordering_alg(reordering_alg_);
+        dss_T.set_matching_alg(matching_alg_);
+        dss_T.set_pivot_epsilon_alg(pivot_epsilon_alg_);
 
-    void* buf = nullptr;
-    if (buf_sz > 0)
-        CHK_CUDA_AC(cudaMalloc(&buf, buf_sz));
+        dss_AT.create_csr(static_cast<int64_t>(dim_J),
+                          static_cast<int64_t>(nnz_J),
+                          thrust::raw_pointer_cast(d_JT_outer.data()),
+                          thrust::raw_pointer_cast(d_JT_inner.data()),
+                          thrust::raw_pointer_cast(d_JT_values.data()));
+        dss_bT.create_dn(static_cast<int64_t>(dim_J),
+                         thrust::raw_pointer_cast(d_JT_rhs.data()));
+        dss_xT.create_dn(static_cast<int64_t>(dim_J),
+                         thrust::raw_pointer_cast(d_JT_sol.data()));
 
-    CHK_CSP_AC(cusparseCsr2cscEx2(
-        csp,
-        dim_J, dim_J, nnz_J,
-        thrust::raw_pointer_cast(d_J_values_base.data()),
-        thrust::raw_pointer_cast(d_J_outer.data()),
-        thrust::raw_pointer_cast(d_J_inner.data()),
-        thrust::raw_pointer_cast(d_JT_values.data()),
-        thrust::raw_pointer_cast(d_JT_outer.data()),
-        thrust::raw_pointer_cast(d_JT_inner.data()),
-        static_cast<cudaDataType_t>(CudaFunHelper::CUDSS_R_TYPE),
-        CUSPARSE_ACTION_NUMERIC,
-        CUSPARSE_INDEX_BASE_ZERO,
-        CUSPARSE_CSR2CSC_ALG_DEFAULT,
-        buf));
-
-    if (buf) CHK_CUDA_AC(cudaFree(buf));
-    CHK_CSP_AC(cusparseDestroy(csp));
-
-    // -------------------------------------------------------------------------
-    // Factor Jᵀ with a fresh CudssContext
-    // Stream must be bound immediately after cudssCreate and before
-    // cudssConfigCreate / cudssDataCreate (mirrors the pattern for dss above).
-    // -------------------------------------------------------------------------
-    CHK_DSS_AC(cudssCreate(&dss_T.handle));
-    CHK_DSS_AC(cudssSetStream(dss_T.handle, cs));
-    CHK_DSS_AC(cudssConfigCreate(&dss_T.config));
-    CHK_DSS_AC(cudssDataCreate(dss_T.handle, &dss_T.data));
-    dss_T.set_reordering_alg(reordering_alg_);
-    dss_T.set_matching_alg(matching_alg_);
-    dss_T.set_pivot_epsilon_alg(pivot_epsilon_alg_);
-
-    dss_AT.create_csr(static_cast<int64_t>(dim_J),
-                      static_cast<int64_t>(nnz_J),
-                      thrust::raw_pointer_cast(d_JT_outer.data()),
-                      thrust::raw_pointer_cast(d_JT_inner.data()),
-                      thrust::raw_pointer_cast(d_JT_values.data()));
-    dss_bT.create_dn(static_cast<int64_t>(dim_J),
-                     thrust::raw_pointer_cast(d_JT_rhs.data()));
-    dss_xT.create_dn(static_cast<int64_t>(dim_J),
-                     thrust::raw_pointer_cast(d_JT_sol.data()));
-
-    dss_T.analyze(dss_AT, dss_xT, dss_bT);
+        dss_T.analyze(dss_AT, dss_xT, dss_bT);
+        jt_analyzed_ = true;
+    } else {
+        dss_AT.set_values(thrust::raw_pointer_cast(d_JT_values.data()));
+    }
     dss_T.factorize(dss_AT, dss_xT, dss_bT);
 
     cs.synchronize();
-    timings.t_prepare_jt_ms = ms_since(t_prep_start);
+    timings.t_prepare_jt_ms += ms_since(t_prep_start);
+    jt_factored_ = true;
 }
 
 void AcPfNrState::solve_JT(const cuda_real_type* d_rhs, cuda_real_type* d_sol)
 {
+    ensure_JT();
+
+    cuda_real_type* d_JT_rhs_ptr = thrust::raw_pointer_cast(d_JT_rhs.data());
+    cuda_real_type* d_JT_sol_ptr = thrust::raw_pointer_cast(d_JT_sol.data());
+
     // Copy caller's rhs into the internal d_JT_rhs buffer (D→D, stream-ordered)
     CHK_CUDA_AC(cudaMemcpyAsync(
-        thrust::raw_pointer_cast(d_JT_rhs.data()),
-        d_rhs,
+        d_JT_rhs_ptr, d_rhs,
         static_cast<std::size_t>(dim_J) * sizeof(cuda_real_type),
-        cudaMemcpyDeviceToDevice,
-        cs));
+        cudaMemcpyDeviceToDevice, cs));
 
     // Update the RHS pointer in the descriptor (values in d_JT_rhs may change
     // between backward calls even though the sparsity pattern is fixed).
-    dss_bT.set_values(thrust::raw_pointer_cast(d_JT_rhs.data()));
+    dss_bT.set_values(d_JT_rhs_ptr);
 
     // Solve Jᵀ λ = rhs;  solution written to d_JT_sol.
     dss_T.solve(dss_AT, dss_xT, dss_bT);
 
     // Copy solution out to caller's buffer (D→D, stream-ordered)
-    CHK_CUDA_AC(cudaMemcpyAsync(
-        d_sol,
-        thrust::raw_pointer_cast(d_JT_sol.data()),
-        static_cast<std::size_t>(dim_J) * sizeof(cuda_real_type),
-        cudaMemcpyDeviceToDevice,
-        cs));
+    if (d_sol != d_JT_sol_ptr)
+        CHK_CUDA_AC(cudaMemcpyAsync(
+            d_sol, d_JT_sol_ptr,
+            static_cast<std::size_t>(dim_J) * sizeof(cuda_real_type),
+            cudaMemcpyDeviceToDevice, cs));
+}
+
+AcPfTimings AcPfNrSession::resolve(Eigen::Ref<const CplxVect> Vinit,
+                                   const CplxVect*            Sbus,
+                                   int                        max_iter,
+                                   eigen_real_type            tol)
+{
+    return state_->resolve(Vinit, Sbus, max_iter, tol);
 }
 
 AcPfTimings AcPfNrSession::timings() const {

@@ -88,6 +88,15 @@ struct InjectionBatch {
     thrust::device_vector<cuda_real_type> d_gv_all;
     thrust::device_vector<cuda_real_type> d_gv_slots;        // [S * k] the loaded slots' rows, NaN elsewhere
     GenVsetSlots                          gv_vset_;          // VoltageControl set-point columns
+    // The slot capacity and VoltageControl group count initialize() saw, so
+    // set_rows() can size the gen_v scratch for a new override.
+    int                                   gv_capacity_ = 0;
+    int                                   gv_n_vc_grp_ = 0;
+
+    // Upload gen_v_override_ (initialize and set_rows): the active columns, the
+    // rows, the VoltageControl columns and the per-slot scratch -- or, with no
+    // active column, clear the VoltageControl columns a former override set.
+    void _upload_gen_v(cudaStream_t cs);
 
     // -------------------------------------------------------------------------
     // Constructor (host-only).
@@ -121,6 +130,17 @@ struct InjectionBatch {
     //     identical base values from every batch slot.
     // -------------------------------------------------------------------------
     void initialize(BatchPfDriverContext& ctx, cudaStream_t cs);
+
+    // -------------------------------------------------------------------------
+    // set_rows — new injections (and gen_v override) for the SAME row count
+    // on a live source: re-uploads d_Sbus_all and the gen_v arrays only (the
+    // chunk buffers and the tiled Ybus stay). Lets a session keep its driver
+    // -- no allocation, no cuDSS ANALYSIS -- across runs that only change the
+    // scenarios' injections. Stream-ordered on cs.
+    // -------------------------------------------------------------------------
+    void set_rows(std::vector<cudaComplexType>&& h_Sbus_all,
+                  GenVOverride&&                 gen_v_override,
+                  cudaStream_t                   cs);
 
     // -------------------------------------------------------------------------
     // load_slots — fill the listed slots with their rows (see the file doc):

@@ -23,6 +23,8 @@ __all__ = [
     "hvdc_p_violations_from_result",
     "gen_p_violations_from_result",
     "gen_pv_release_violations_from_result",
+    "LimitViolationsEngineMixin",
+    "LimitViolationsFacadeMixin",
 ]
 
 from dataclasses import dataclass
@@ -367,3 +369,79 @@ def compute_violations_n(V, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
                                            float(ex_ka[l]), float(lim2)))
 
     return out
+
+
+class LimitViolationsEngineMixin:
+    """``compute_limit_violations`` settings of the engines
+    (``_ContingencyAnalysisSolver``, ``_ScenarioSweepSolver``), written once:
+    ``self._s`` is the C++ session. A "row" is a contingency or a scenario."""
+
+    @property
+    def violation_tol(self):
+        """float: residual tolerance for the DIVERGENCE check, independent of
+        tol_base. Takes effect on the next run()."""
+        return self._s.violation_tol
+
+    @violation_tol.setter
+    def violation_tol(self, value):
+        self._s.violation_tol = float(value)
+
+    @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by compute_limit_violations (lightsim2grid's
+        ``violation_rel_tol``, default ``1e-9``): CURRENT when
+        ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when ``v > vmax * (1 + tol)``,
+        LOW_VOLTAGE when ``v < vmin * (1 - tol)``. A value on its limit up to
+        rounding -- a bus a regulator holds exactly at its vmax -- is then not
+        reported, whichever side of the limit the last bit of the solve put it
+        on. ``0`` gives the bare strict comparisons. In [0, 1[; takes effect on
+        the next run(). (An FP32 build cannot resolve 1e-9: there, a value
+        needs a tolerance of ~1e-6 to be absorbed.)"""
+        return self._s.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        value = float(value)
+        if not (0. <= value < 1.):
+            raise ValueError(f"violation_rel_tol must be in [0, 1[ (got {value}).")
+        self._s.violation_rel_tol = value
+
+    @property
+    def violation_capacity(self):
+        """int: violation records kept per row AND per violation type (K): the
+        K most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, ranked by
+        ``|value / limit - 1|`` (so a LOW_VOLTAGE ranks by how far below its
+        limit it fell). Bounds the compact output at n_rows * 3 * K regardless
+        of grid size. Takes effect on the next run(); default 16."""
+        return self._s.violation_capacity
+
+    @violation_capacity.setter
+    def violation_capacity(self, value):
+        self._s.violation_capacity = int(value)
+
+
+class LimitViolationsFacadeMixin:
+    """``compute_limit_violations`` settings of the ``*GPU`` facades
+    (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``), written once:
+    ``self._inner`` is the engine."""
+
+    @property
+    def violation_rel_tol(self):
+        """float: relative margin a value must clear past its limit to be
+        reported by :attr:`compute_limit_violations` -- lightsim2grid's
+        ``violation_rel_tol``, same default (``1e-9``) and semantics:
+        CURRENT when ``ka > limit * (1 + tol)``, HIGH_VOLTAGE when
+        ``v > vmax * (1 + tol)``, LOW_VOLTAGE when ``v < vmin * (1 - tol)``.
+        It keeps a value that sits ON its limit by construction (a bus a
+        regulator holds exactly at its vmax) from being reported or not
+        depending on the last bit of the solve -- which made the GPU, the
+        lightsim2grid batch and its one-off solve disagree. ``0`` gives the
+        bare strict comparisons. Also applies to :meth:`get_violations_n`.
+        In [0, 1[; takes effect on the next compute(). An FP32 build cannot
+        resolve 1e-9 (use ~1e-6 there)."""
+        return self._inner.violation_rel_tol
+
+    @violation_rel_tol.setter
+    def violation_rel_tol(self, value):
+        self._inner.violation_rel_tol = value

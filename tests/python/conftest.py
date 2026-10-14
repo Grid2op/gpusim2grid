@@ -19,12 +19,33 @@ from scipy.sparse import csr_matrix
 # GPU availability — skip entire test module if the extension isn't installed
 # ---------------------------------------------------------------------------
 
+def _cuda_device_count() -> int:
+    """Number of visible CUDA devices, via the driver API (0 if no driver).
+
+    The extension links the CUDA runtime statically, so it imports fine on a
+    machine with no GPU/driver at all (e.g. the CI build job); only a device
+    query tells the two apart.
+    """
+    import ctypes
+
+    try:
+        libcuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return 0
+    if libcuda.cuInit(0) != 0:
+        return 0
+    count = ctypes.c_int(0)
+    if libcuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
+        return 0
+    return count.value
+
+
 def _gpu_available() -> bool:
     try:
         import gpusim2grid._gpusim2grid  # noqa: F401
-        return True
     except (ImportError, ModuleNotFoundError):
         return False
+    return _cuda_device_count() > 0
 
 
 requires_gpu = pytest.mark.skipif(

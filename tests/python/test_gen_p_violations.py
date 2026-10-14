@@ -529,6 +529,51 @@ def test_injection_sweep_targets_vary_per_row(solver_atol):
             np.testing.assert_allclose(value - ref[3], (1. - ks[r]) * gen_p[eid], atol=atol)
 
 
+@pytest.mark.parametrize("facade", ["InjectionSweepGPU", "ScenarioSweepGPU"])
+def test_targets_changed_while_the_checks_were_off(facade, solver_atol):
+    """new per-row set-points handed in while compute_physical_violations is
+    off still reach the live driver once the checks are back on, and a run
+    that reuses the whole setup reports the same as a fresh object"""
+    import gpusim2grid
+    grid, _ = _case14_shared_slack()
+    load_p, load_q, gen_p = _elements(grid)
+    rep = lambda a: np.repeat(a[None, :], 3, axis=0)   # noqa: E731
+    gp_a = np.stack([k * gen_p for k in (1.0, 0.95, 1.05)])
+    gp_b = np.stack([k * gen_p for k in (1.0, 1.05, 0.95)])
+    cls = getattr(gpusim2grid, facade)
+
+    def fresh(gp):
+        sw = cls(grid, nb_iter=10, compute_physical_violations=True)
+        sw.physical_violation_tol_mva = 0.
+        sw.set_injections_from_elements(rep(load_p), rep(load_q), gp)
+        sw.compute()
+        return _p_records(sw.get_physical_violations())
+
+    atol = _mw_atol(grid, solver_atol)
+    ref_a, ref_b = fresh(gp_a), fresh(gp_b)
+    assert ref_a != ref_b
+
+    sw = cls(grid, nb_iter=10, compute_physical_violations=True)
+    sw.physical_violation_tol_mva = 0.
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), gp_a)
+    sw.compute()
+    _assert_same(ref_a, _p_records(sw.get_physical_violations()), atol)
+    sw.compute_physical_violations = False
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), gp_b)
+    sw.compute()
+    sw.compute_physical_violations = True
+    sw.compute()
+    _assert_same(ref_b, _p_records(sw.get_physical_violations()), atol)
+    sw.compute()                            # unchanged setup: only re-seeded
+    _assert_same(ref_b, _p_records(sw.get_physical_violations()), atol)
+    sw.physical_violation_tol_mva = 1e9     # a new key: the setup is redone
+    sw.compute()
+    assert all(r == [] for r in _p_records(sw.get_physical_violations()))
+    sw.physical_violation_tol_mva = 0.
+    sw.compute()
+    _assert_same(ref_b, _p_records(sw.get_physical_violations()), atol)
+
+
 # --------------------------------------------------------------- array mode
 @needs_bridge
 def test_tuple_mode_matches_lightsim2grid(solver_atol):

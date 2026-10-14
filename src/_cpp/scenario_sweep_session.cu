@@ -718,18 +718,8 @@ int ScenarioSweepSession::_wanted_reference_bus()
     if (grid_ref_bus_ < 0 || !auto_reference_slack_ || !handle_disconnected_grid_ || !has_topology_)
         return grid_ref_bus_;
     if (!auto_ref_valid_) {
-        std::vector<int>    cand_bus;
-        std::vector<double> cand_w;
-        const LedgerData& ld = *base_ledger_;
-        for (int b = 0; b < ld.n_bus && b < static_cast<int>(ld.slack_weights.size()); ++b)
-            if (ld.p_row_of_bus[static_cast<size_t>(b)] >= 0 && ld.slack_weights[static_cast<size_t>(b)] != 0.) {
-                cand_bus.push_back(b);
-                cand_w.push_back(ld.slack_weights[static_cast<size_t>(b)]);
-            }
-        auto_ref_choice_ = choose_reference_bus(contingencies_, Ybus_rm_.outerIndexPtr(),
-                                                Ybus_rm_.innerIndexPtr(), Ybus_rm_,
-                                                cand_bus, cand_w, forced_ref_bus_);
-        if (auto_ref_choice_ < 0) auto_ref_choice_ = grid_ref_bus_;
+        auto_ref_choice_ = choose_reference_bus_from_ledger(contingencies_, Ybus_rm_, *base_ledger_,
+                                                            forced_ref_bus_, grid_ref_bus_);
         auto_ref_valid_ = true;
     }
     return auto_ref_choice_;
@@ -928,6 +918,20 @@ void ScenarioSweepSession::set_branch_data(
     Eigen::Ref<const RealVect>        bus_vn_kv,
     double sn_mva)
 {
+    // The trip lists refer to branch ids: refuse data that no longer holds
+    // one of them before anything is replaced (the session stays usable).
+    const int n_bra_new = static_cast<int>(branch_from.size());
+    if (has_topology_) {
+        for (const auto& ids : tripped_branches_per_scenario_)
+            for (int id : ids)
+                if (id >= n_bra_new)
+                    throw std::runtime_error(
+                        "ScenarioSweepSession::set_branch_data: the current topology "
+                        "trips branch " + std::to_string(id) + ", out of range for "
+                        "the new " + std::to_string(n_bra_new) + " branches -- call "
+                        "set_topology() with valid ids first");
+    }
+
     h_branch_from_   = branch_from;
     h_branch_to_     = branch_to;
     h_yff_eff_           = yff_eff;
@@ -937,6 +941,34 @@ void ScenarioSweepSession::set_branch_data(
     h_bus_vn_kv_     = bus_vn_kv;
     sn_mva_          = sn_mva;
     has_branch_data_ = true;
+
+    // Branch limits are per branch: a different count makes them stale, so
+    // compute_limit_violations asks for set_limits() again instead of
+    // reading past their end.
+    if (has_limits_ && h_branch_limit_a1_ka_.size() != n_bra_new) {
+        has_limits_            = false;
+        has_violations_result_ = false;
+    }
+
+    // The per-row Ybus patches were built from the previous admittances:
+    // rebuild them from the same trip lists (also marks the topology dirty,
+    // so the next run() builds a new source). A trip list whose row count no
+    // longer matches the injections is left as is: run() refuses it anyway.
+    if (has_topology_ && (!has_injections_ ||
+            static_cast<int>(tripped_branches_per_scenario_.size()) == n_scenarios_)) {
+        const std::vector<std::vector<int>> trips = tripped_branches_per_scenario_;
+        set_topology(trips);
+    }
+
+    // A live driver caches the admittances / flow buffers it uploaded (once
+    // per driver, see compute_flows() and run()). Invalidate them so the new
+    // data -- possibly a different branch count -- is re-uploaded; otherwise
+    // flows / limit violations keep using the old admittances, and a new
+    // tripped-branch id >= the old count indexes past the flow buffers.
+    if (solver_) {
+        solver_->_has_branch_admittances = false;
+        solver_->_has_branch_data        = false;
+    }
 }
 
 // =============================================================================
@@ -1095,6 +1127,13 @@ void ScenarioSweepSession::set_limits(
 // =============================================================================
 void ScenarioSweepSession::run()
 {
+    // Counted on entry, not on success: a run() that throws part-way may
+    // already have swapped the batch source or overwritten the chunk
+    // buffers, so a pending alias-mode backward (run_counter guard) must no
+    // longer trust them -- nor the Jacobian of the previous forward.
+    ++run_counter_;
+    last_run_kept_jacobian_ = false;
+
     if (!has_injections_)
         throw std::runtime_error(
             "ScenarioSweepSession: call set_injections() before run()");
@@ -1229,17 +1268,23 @@ void ScenarioSweepSession::run()
     // is a later step, docs/dev_notes/continuous_batching.md A.6).
     const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
     const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_ || switches_dirty_);
+    const bool new_source = cold || warm;
 
-    if (cold || warm) {
-        if (!has_topology_) {
-            // Default: no branches tripped for any scenario (pure injection sweep).
-            contingencies_.assign(static_cast<size_t>(n_scenarios_), Contingency{});
-            tripped_branches_per_scenario_.assign(
-                static_cast<size_t>(n_scenarios_), std::vector<int>{});
-        }
+    if (new_source && !has_topology_) {
+        // Default: no branches tripped for any scenario (pure injection sweep).
+        contingencies_.assign(static_cast<size_t>(n_scenarios_), Contingency{});
+        tripped_branches_per_scenario_.assign(
+            static_cast<size_t>(n_scenarios_), std::vector<int>{});
+    }
 
-        // Reset the flags of the previous source build -- contingencies_ is
-        // mutated in place by the source ctor below.
+    // Per-row state a new batch source computes from scratch: reset the
+    // disconnected flags from any previous run() (contingencies_ is mutated
+    // in place across runs, and the connectivity checks only ever set them)
+    // and re-derive the per-row PV pins -- every reserved bus stays PV
+    // (identity Q row) except the ones this row turned PQ; nothing reserved
+    // → nothing to pin. A hot run has the same mask, hence the same pins, as
+    // the live source, so it leaves all of this alone.
+    auto reset_rows = [&]() {
         for (size_t r = 0; r < contingencies_.size(); ++r) {
             Contingency& ctg = contingencies_[r];
             ctg.disconnected = false;
@@ -1252,9 +1297,6 @@ void ScenarioSweepSession::run()
             if (has_vc_release_) ctg.vc_released = sw_vc_release_[r];
             ctg.skip = has_skip_ && skip_rows_[r] != 0;
         }
-
-        // Per-row PV pins: every reserved bus stays PV (identity Q row) except
-        // the ones this row turned PQ. Nothing reserved → nothing to pin.
         if (!reserved_buses_.empty()) {
             for (int r = 0; r < n_scenarios_; ++r) {
                 const std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
@@ -1280,7 +1322,8 @@ void ScenarioSweepSession::run()
         if (has_vc_pins_ || base_state_->has_vc_held)
             for (int r = 0; r < n_scenarios_; ++r)
                 contingencies_[static_cast<size_t>(r)].vc_pinned_ctrl = _row_vc_pins(r);
-    }
+    };
+    if (new_source) reset_rows();
 
     const int n_bus = base_state_->n_bus;
 
@@ -1315,7 +1358,53 @@ void ScenarioSweepSession::run()
             "ScenarioSweepSession: injection buffer size does not match "
             "n_scenarios x n_bus (call set_injections() again)");
 
-    if (cold) {
+    // A warm run keeps the live driver's chunk capacity, which the cold run
+    // sized for ITS active rows. If this topology leaves many more rows
+    // active (e.g. the cold run had most rows islanded or skipped), that
+    // capacity would split them into far more chunks than a fresh driver
+    // would use -- rebuild the driver instead once it would take more than
+    // twice a fresh driver's chunk count (a small growth is cheaper served by
+    // one extra chunk than by a new cuDSS analysis). fixed_batch_capacity
+    // keeps batch_size verbatim, so it never needs this.
+    bool build_driver = cold;
+    if (warm) {
+        // New topology / generator mask on the live driver: rebuild only the
+        // source (CPU connectivity + patches + H→D of those) at the driver's
+        // capacity; no analysis, no allocation of the chunk buffers.
+        const int live_capacity = solver_->batch_size_;
+        ScenarioSweepBatch source(
+            contingencies_,
+            Ybus_rm_.outerIndexPtr(),
+            Ybus_rm_.innerIndexPtr(),
+            Ybus_rm_,
+            batch_size_,
+            mask_cfg_,
+            handle_disconnected_grid_,
+            GenVOverride{},
+            /*forced_batch_size=*/live_capacity);
+        int n_active = 0;
+        for (const auto& ctg : contingencies_)
+            if (!ctg.disconnected) ++n_active;
+        const int chunks_live  = (n_active + live_capacity - 1) / live_capacity;
+        const int chunks_fresh = (n_active + batch_size_ - 1) / batch_size_;
+        // keep_final_jacobian needs ONE chunk: rebuild whenever a fresh driver
+        // would give it one and the live capacity would not (the forward
+        // would otherwise refuse a batch_size that is already large enough).
+        const bool too_many_chunks =
+            chunks_live > 2 * chunks_fresh
+            || (keep_final_jacobian_ && chunks_live > 1 && chunks_fresh <= 1);
+        if (!fixed_batch_capacity_ && too_many_chunks) {
+            build_driver = true;
+            reset_rows();          // the cold source below recomputes them
+        } else {
+            solver_->replace_source(std::move(source));
+            used_batch_size_ = live_capacity;
+            solver_->mark_reused(/*hot=*/false);
+            ++source_build_counter_;
+        }
+    }
+
+    if (build_driver) {
         // Host preprocessing (resolve_indices + connectivity/masking +
         // build_flat_patches), mutates contingencies_ in-place so the
         // disconnected flags are observable below. gen_v is set afterwards
@@ -1335,6 +1424,8 @@ void ScenarioSweepSession::run()
                                       : source.used_batch_size();
 
         // New driver: allocation, block-diagonal structure, cuDSS ANALYSIS.
+        // Free the old one first so the two never coexist on the device.
+        solver_.reset();
         solver_ = std::make_unique<ScenarioSweepSolver>(
             *base_state_,
             std::move(source),
@@ -1355,25 +1446,7 @@ void ScenarioSweepSession::run()
         driver_cfg_ = cfg;
         ++driver_build_counter_;
         ++source_build_counter_;
-    } else if (warm) {
-        // New topology / generator mask on the live driver: rebuild only the
-        // source (CPU connectivity + patches + H→D of those) at the driver's
-        // capacity; no analysis, no allocation of the chunk buffers.
-        ScenarioSweepBatch source(
-            contingencies_,
-            Ybus_rm_.outerIndexPtr(),
-            Ybus_rm_.innerIndexPtr(),
-            Ybus_rm_,
-            batch_size_,
-            mask_cfg_,
-            handle_disconnected_grid_,
-            GenVOverride{},
-            /*forced_batch_size=*/solver_->batch_size_);
-        solver_->replace_source(std::move(source));
-        used_batch_size_ = solver_->batch_size_;
-        solver_->mark_reused(/*hot=*/false);
-        ++source_build_counter_;
-    } else {
+    } else if (!warm) {
         // Hot: only injections / gen_v changed (or nothing at all).
         solver_->mark_reused(/*hot=*/true);
     }
@@ -1488,6 +1561,10 @@ void ScenarioSweepSession::run()
             h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
             violation_tol_, violation_rel_tol_, violation_capacity_, n_lines_);
         t_limits_setup_ms = solver_->violation_setup_ms();
+    } else {
+        // The driver outlives the flag: a previous run's set_violation_limits
+        // left the fused check armed, so disarm it explicitly.
+        solver_->_fused_violations_enabled = false;
     }
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
@@ -1528,13 +1605,17 @@ void ScenarioSweepSession::run()
                                     bus_q_row_skip_dirty_ || cold,
                                     &gen_pv_release_row_skip_, gen_pv_release_row_skip_cols_,
                                     gen_pv_release_row_skip_dirty_ || cold});
-    if (phys_.compute_physical_violations)
+    // The targets reached the driver only if the checks ran their setup: with
+    // them off, keep the flags so turning them back on on this same driver
+    // uploads what changed meanwhile.
+    if (phys_.compute_physical_violations) {
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
-    rd_gp_last_ = rd_gp;
-    gen_p_targets_dirty_ = false;
-    gen_pv_release_targets_dirty_ = false;
-    bus_q_row_skip_dirty_ = false;
-    gen_pv_release_row_skip_dirty_ = false;
+        rd_gp_last_ = rd_gp;
+        gen_p_targets_dirty_ = false;
+        gen_pv_release_targets_dirty_ = false;
+        bus_q_row_skip_dirty_ = false;
+        gen_pv_release_row_skip_dirty_ = false;
+    }
 
     timings_ = solver_->solve();
     timings_.t_base_case_ms = t_base_case_ms_;
@@ -1570,7 +1651,6 @@ void ScenarioSweepSession::run()
     skip_dirty_ = false;
     switches_dirty_ = false;
     last_run_kept_jacobian_ = keep_final_jacobian_;
-    ++run_counter_;
 
     solver_->cs.synchronize();
 }
@@ -1753,14 +1833,11 @@ void ScenarioSweepSession::compute_flows()
     const int n = n_scen * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
-        thrust::host_vector<cuda_real_type> h_or = solver_->d_or_amps_results;
-        thrust::host_vector<cuda_real_type> h_ex = solver_->d_ex_amps_results;
+        // Through the driver's pinned staging buffer (download_into).
         h_or_amps_.resize(n);
         h_ex_amps_.resize(n);
-        for (int i = 0; i < n; ++i) {
-            h_or_amps_(i) = static_cast<eigen_real_type>(h_or[static_cast<size_t>(i)]);
-            h_ex_amps_(i) = static_cast<eigen_real_type>(h_ex[static_cast<size_t>(i)]);
-        }
+        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
+        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
     }
     timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
 }
@@ -1794,12 +1871,8 @@ CplxVect ScenarioSweepSession::get_V_results() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies * base_state_->n_bus;
-    thrust::host_vector<cudaComplexType> h_V = solver_->d_V_results;
     CplxVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = eigen_cplx_type(
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].x),
-            static_cast<eigen_real_type>(h_V[static_cast<size_t>(i)].y));
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
 }
@@ -1825,10 +1898,8 @@ RealVect ScenarioSweepSession::get_residuals() const
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
     const int n = solver_->n_contingencies;
-    thrust::host_vector<cuda_real_type> h_res = solver_->d_residuals;
     RealVect out(n);
-    for (int i = 0; i < n; ++i)
-        out(i) = static_cast<eigen_real_type>(h_res[static_cast<size_t>(i)]);
+    solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_residuals);   // pinned, pipelined
     timings_.t_copy_residuals_to_host_ms = ms_since(t_copy_start);
     return out;
 }

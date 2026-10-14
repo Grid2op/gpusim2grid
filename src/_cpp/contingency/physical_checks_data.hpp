@@ -37,6 +37,7 @@
 // =============================================================================
 
 #include <cmath>
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 #include <Eigen/Core>
@@ -105,6 +106,27 @@ struct GenPvReleaseViolationsResult {
     int             stride   = 0;
 };
 
+// What a driver's physical-check setup (physical_checks::before_solve) was
+// made with. A run on the same live driver with an equal key only re-seeds
+// the per-row outputs: the plans already on the device and the base ("n")
+// case report are still those of these settings.
+struct PhysicalSetupKey {
+    std::uint64_t        plan_generation = 0;
+    double               tol_mva = 0., tol_vm_pu = 0., residual_tol = 0., sn_mva = 0.;
+    int                  capacity = 0;
+    const unsigned char* d_gen_off = nullptr;
+    int                  n_gen = 0;
+    bool                 base_converged = false;
+
+    bool operator==(const PhysicalSetupKey& o) const {
+        return plan_generation == o.plan_generation && tol_mva == o.tol_mva
+            && tol_vm_pu == o.tol_vm_pu && residual_tol == o.residual_tol && sn_mva == o.sn_mva
+            && capacity == o.capacity && d_gen_off == o.d_gen_off && n_gen == o.n_gen
+            && base_converged == o.base_converged;
+    }
+    bool operator!=(const PhysicalSetupKey& o) const { return !(*this == o); }
+};
+
 struct PhysicalChecksConfig {
     // ONE opt-in for the whole category (lightsim2grid's compute_physical_
     // violations): every record it produces has ViolationCategory::PHYSICAL,
@@ -137,6 +159,9 @@ struct PhysicalChecksConfig {
     GenPvReleasePlanData gen_pv_release_plan;
     bool   has_gen_pv_release_plan = false;
     bool   has_result     = false;   // a run() with the flag on has happened
+    // bumped by every set_*_plan (part of PhysicalSetupKey): the plans are
+    // only ever replaced through these setters
+    std::uint64_t plan_generation = 0;
 
     // Setters mirror lightsim2grid's: a no-op when unchanged, otherwise the
     // previously computed report is dropped (it was made under other settings).
@@ -175,18 +200,21 @@ struct PhysicalChecksConfig {
         bus_q_plan = plan;
         has_bus_q_plan = true;
         has_result = false;
+        ++plan_generation;
     }
     void set_gen_p_plan(const GenPPlanData& plan, int n_bus) {
         plan.validate(n_bus);
         gen_p_plan = plan;
         has_gen_p_plan = true;
         has_result = false;
+        ++plan_generation;
     }
     void set_gen_pv_release_plan(const GenPvReleasePlanData& plan, int n_bus) {
         plan.validate(n_bus);
         gen_pv_release_plan = plan;
         has_gen_pv_release_plan = true;
         has_result = false;
+        ++plan_generation;
     }
 };
 
