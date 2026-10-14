@@ -82,6 +82,20 @@ def _gpu_ca(grid, branches):
     return ca
 
 
+def _one_off(grid, branch):
+    """The remote control records of lightsim2grid's own single solve with ``branch``
+    (lines then trafos) disconnected."""
+    g = grid.copy()
+    n_lines = len(g.get_lines())
+    if branch < n_lines:
+        g.deactivate_powerline(branch)
+    else:
+        g.deactivate_trafo(branch - n_lines)
+    V = g.ac_pf(np.asarray(grid.get_V()).copy(), MAX_IT, TOL)
+    assert V.shape[0] > 0
+    return _remote(g.get_physical_violations(True, 0., 0.))
+
+
 def _assert_same(ref, got, atol_kv):
     assert [x[:2] for x in ref] == [x[:2] for x in got], f"{ref} vs {got}"
     for a, b in zip(ref, got):
@@ -109,15 +123,23 @@ def test_matches_lightsim2grid(solver_atol, target_v_kv, nb):
     ls.compute_physical_violations = True
     ls.physical_violation_tol_mva = 0.
     ls.physical_violation_tol_vm_pu = 0.
-    ls.add_n1(0)
-    ls.add_n1(5)
+    branches = [0, 5]
+    for b in branches:
+        ls.add_n1(b)
     ls.compute(np.ones(grid.total_bus(), dtype=complex), MAX_IT, TOL)
-    gpu = _gpu_ca(grid, [0, 5])
+    gpu = _gpu_ca(grid, branches)
     atol = 10. * VN_KV * solver_atol
     _assert_same(ref_n, _remote(gpu.get_physical_violations_n()), atol)
-    for row in range(2):
-        _assert_same(_remote(ls.get_physical_violations()[row]),
-                     _remote(gpu.get_physical_violations()[row]), atol)
+    # Every row against lightsim2grid's single solve of that contingency, and against
+    # its ContingencyAnalysisCPP where that converged: lightsim2grid master's batch
+    # leaves branch 5 unconverged after one iteration with B6-G regulating remotely
+    # (the grid stays connected and the single solve converges).
+    ls_conv = np.asarray(ls.converged_mask(), dtype=bool)
+    for row, b in enumerate(branches):
+        got = _remote(gpu.get_physical_violations()[row])
+        _assert_same(_one_off(grid, b), got, atol)
+        if ls_conv[row]:
+            _assert_same(_remote(ls.get_physical_violations()[row]), got, atol)
 
 
 def test_range_off_reports_nothing():
