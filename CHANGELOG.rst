@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
+  remote regulators added or changed since it was built.
 - [ADDED] A contingency or a row can trip an SVC with a standby automaton (lightsim2grid leaves it out): its
   release-check entries and the ``VoltageMonitoring`` loop skip it for that row.
 - [IMPROVED] ``outer_loops=True``: the rows' adjoint terms (``pq_buses``, ``gen_p_fixed``, ...) are only computed
