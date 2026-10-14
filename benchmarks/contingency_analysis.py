@@ -61,11 +61,14 @@ def main(args):
         prng = np.random.default_rng(0)
         cont_ids_both = prng.choice(list(range(n_branches)), size=nb_max_cont_cpu, replace=False)
         cont_ids_both = sorted(cont_ids_both)
-        if ac_Ybus.shape[0] > nb_max_cont_gpu - nb_max_cont_cpu:
-            cont_ids_gpu_only = prng.choice(list(range(n_branches)), size=(nb_max_cont_gpu - nb_max_cont_cpu), replace=False)
+        # the GPU-only contingencies: the branches the CPU does not simulate, all of
+        # them when they fit in the GPU budget, a random subset otherwise
+        others = np.setdiff1d(np.arange(n_branches), cont_ids_both)
+        if others.size > nb_max_cont_gpu - nb_max_cont_cpu:
+            cont_ids_gpu_only = prng.choice(others, size=(nb_max_cont_gpu - nb_max_cont_cpu), replace=False)
             max_ = max_cont
         else:
-            cont_ids_gpu_only = np.asarray([el for el in list(range(n_branches)) if not el in cont_ids_both], dtype=int)
+            cont_ids_gpu_only = others
             max_ = n_branches
     else:
         cont_ids_both = None
