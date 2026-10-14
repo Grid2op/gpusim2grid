@@ -43,6 +43,10 @@ pytestmark.append(pytest.mark.skipif(not _ls_has_remote_check(),
 GEN, LOW_RC, HIGH_RC = 5, 13, 14   # ViolationElementType.GENERATOR, LOW/HIGH_VOLTAGE_REMOTE_CONTROL
 MAX_IT, TOL = 30, 1e-11
 VN_KV = 12.   # the controller's own bus
+# OLF's former minRealisticVoltage / maxRealisticVoltage (0.8 / 1.2 pu) with its 1.02
+# margin: init_from_pypowsybl now reads the installed OLF's defaults (0.5 / 2.0 in recent
+# ones), which no target below would leave. Set explicitly so the test does not depend on it.
+VM_RANGE = (0.8 * 1.02, 1.2 / 1.02)
 
 
 def _grid(target_v_kv):
@@ -55,6 +59,7 @@ def _grid(target_v_kv):
     n.update_generators(id="B6-G", regulated_element_id=load, target_v=target_v_kv,
                         min_q=-9999., max_q=9999.)
     grid = init_from_pypowsybl(n, gen_slack_id="B1-G", sort_index=True)
+    grid.set_remote_voltage_control_vm_range(*VM_RANGE)
     V = grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, TOL)
     assert V.shape[0] > 0
     return grid

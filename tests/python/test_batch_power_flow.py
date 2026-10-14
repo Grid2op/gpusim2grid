@@ -380,10 +380,11 @@ class TestAdjointPrimitives:
         lp = load_p.clone().requires_grad_(True)
         V = pf(load_p=lp, load_q=load_q, gen_p=gen_p)
 
+        # BatchPowerFlow's own forward sets the capacity back to n_scen, so run
+        # the session as that forward does (keep_final_jacobian is still on).
         pf.sweep.solver.batch_size = 1                  # cold rebuild, 3 chunks
-        lp2 = load_p.clone().requires_grad_(True)
         with pytest.raises(RuntimeError, match="keep_final_jacobian"):
-            pf(load_p=lp2, load_q=load_q, gen_p=gen_p)
+            pf.sweep.solver.run()
         with pytest.raises(RuntimeError, match="another forward"):
             V.real.sum().backward()
 
