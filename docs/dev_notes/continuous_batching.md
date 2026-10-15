@@ -9,10 +9,10 @@ item 2 and Part B are not. It is not part of the built documentation (`docs/*.rs
 - **Part A** works on the current code, with no outer loop, and can start now. Its A.6 lists
   what the first version leaves out, to bring back once it is implemented and tested, before
   Part B.
-- **Part B** extends it to OpenLoadFlow-style outer loops. It depends on lightsim2grid's outer
-  loop work (branch `dev_outerloops_refacto`, design note
-  `docs/dev_notes/outer_loops_fixed_sparsity.md` in that repo), and its batch API is still
-  open.
+- **Part B** extends it to OpenLoadFlow-style outer loops. It follows lightsim2grid's outer
+  loop work (branch `dev_outer_batch_perf` of `../lightsim2grid_outerloops`, design note
+  `docs/dev_notes/outer_loops_fixed_sparsity.md` in that repo), whose batches run the loops
+  per row since. Part B was reviewed against it on 2026-10-15; the scope decisions are in B.0.
 
 ## Why
 
@@ -394,13 +394,69 @@ back once Part A is implemented and tested, and before starting the outer loops.
 
 # Part B: extension to outer loops (future)
 
-This part waits on lightsim2grid (see B.6), and comes after Part A's TODO list (A.6). What Part A
-must already do so that B is cheap is in B.7.
+What still waits on lightsim2grid is in B.6. What Part A must already do so that B is cheap,
+and how much of it is done, is in B.7.
+
+## B.0 Decisions (2026-10-15)
+
+Scope of the first version, decided before planning:
+
+1. **Loops.** The four OpenLoadFlow runs by default, in its order: `DistributedSlack`,
+   `AcHvdcAcEmulationLimits`, `VoltageMonitoring`, `ReactiveLimits`. `PhaseControl`,
+   `TransformerVoltageControl` and `ShuntVoltageControl` are left out (an issue to open). They
+   also need accessors lightsim2grid does not expose yet (B.6).
+2. **Facades.** All three batch facades: `ScenarioSweepGPU`, `InjectionSweepGPU` and
+   `ContingencyAnalysisGPU`. The scenario sweep is the general case (an injection sweep is a
+   scenario sweep without trips), so it is built and validated there first.
+3. **Scheduling.** Continuous only. With the outer loops on, chunked scheduling is refused.
+4. **Starting state of a row**, chosen by the caller:
+   - from the N solve (default): a row starts from the N solve's loop state, as lightsim2grid's
+     batches resume from their "n" solve (frozen buses, SVCs switched on, HVDC regimes, moved
+     targets, V);
+   - or from a voltage and grid state the caller provides, as the facades accept today.
+5. **Today's workflow stays.** `bake_outer_loops` + `can_be_pv` + detection + the one-shot
+   `reactive_limits_outer_loop` are kept alongside. Whether they are deprecated is decided
+   later, once both can be compared.
+6. **Parity.** Against lightsim2grid's `NROuter_*` batches, row by row, on French snapshots,
+   to a small tolerance. lightsim2grid against OpenLoadFlow is a separate question, not
+   addressed here.
+7. **Decisions on the host first.** The detection runs on the GPU (B.2). The decision of a routed
+   row runs on the host, with only that row's data copied back. Moving the decisions into
+   kernels comes later (an issue to open).
+8. **Zero pivots are not an issue for cuDSS.** Its REFACTORIZATION does not reuse the pivots of
+   the previous factorization: it pivots as a FACTORIZATION does. The refactorization fallbacks
+   lightsim2grid's KLU hits on rows rewritten by value (`speed_optimisation.md`) do not carry over.
+9. **Jacobian size.** Every switchable bus is reserved up front (the union pattern of B.5).
+   This is accepted on the CPU, so it is accepted on the GPU.
+10. **No gradients** with the outer loops on in the first version: `BatchPowerFlow` and the
+    batched adjoint refuse them (an issue to open).
+
+Issues to open: the three remaining loops (1), the decisions as kernels (7), gradients
+through the outer loops (10).
+
+Prerequisites found while reviewing:
+
+- **A lightsim2grid with `NROuter_*`.** The one in `.venv` (`~/Documents/lightsim2grid`,
+  `dev_1.3.0`) has no `NROuter_*` algorithm. gpusim2grid must be built against the
+  outer-loop branch (`../lightsim2grid_outerloops`, `dev_outer_batch_perf`) until it is merged.
+- **The bridge on an `NROuter_*` grid is unverified.** `extract_ledger_data`
+  (`ls2g_bridge.cpp`) reads the ledger through `LSGrid`'s solver accessors, which `NROuter_*`
+  forwards to its inner Newton (`OuterLoopAlgo.hpp:190-215`). Still to check: the slack and
+  VoltageControl accessors, and the pv labelling, since `NROuter_*` moves the other slack buses
+  into `pv` internally (B.5).
+- **The detection realignment can ship first, on its own.** lightsim2grid added
+  `ViolationCategory::CONTROL` and the types 16-20 (`SLACK_MISMATCH`, `PHASE_CONTROL_P`,
+  `PHASE_LIMITER_CURRENT`, `TRANSFORMER_VOLTAGE_DEADBAND`, `SHUNT_VOLTAGE_CONTROL`), and moved
+  the types 9-12 and 15 into `CONTROL` (`batch_algorithm/LimitViolation.hpp:216-226`).
+  gpusim2grid stops at 15 and still files those as `PHYSICAL`.
 
 ## B.1 Row lifecycle
 
-Once its inner solve has converged, a row has two outcomes instead of one: **fully converged**
-(terminal) or **needs an outer loop**.
+*Reviewed 2026-10-15 against lightsim2grid `dev_outer_batch_perf`.*
+
+Once its inner solve has converged, a row is detected (B.2) and has two outcomes instead of
+one: **done** (no loop would act) or **routed to a loop**. A routed loop either acts (the row
+is patched and re-queued) or ends the row.
 
 ```
             load (default controls, base V)
@@ -409,67 +465,188 @@ Once its inner solve has converged, a row has two outcomes instead of one: **ful
     │                                       └─────────────────────┘
     │                                                                │ converged
     │                                                                ▼
-    │                       DIVERGED / MAX_ITER ◀── budget hit   checks on GPU (eviction)
+    │                DIVERGED / MAX_ITER ◀── budget hit     detection at eviction (B.2)
     │                                                                │
-    │  re-enter (new controls, warm V)                    stable ────┴──── needs action
-    └─────────────────────────── values modified ◀── decide + patch (async stream)
-                                                                     │
-                                              DONE ◀─────────────────┘ (stable)
+    │                                          no loop would act ────┴──── first detected loop
+    │                                                  │                          │
+    │                                                  ▼                          ▼
+    │                                          unrealistic check           decide (B.2, B.3)
+    │                                           ok │      │ fails           │     │       │
+    │                                              ▼      ▼               FAILED  cap   UNSTABLE
+    │                                            DONE  UNREALISTIC          │     │       │
+    │                                                                       ▼     ▼       │
+    │  re-enter (new control state, warm V)                  OUTER_FAILED  OUTER_UNSTABLE │
+    └──────────────────────────────── patched ◀───────────────────────────────────────────┘
 ```
 
-The terminal statuses follow lightsim2grid's `OuterLoopStats`:
+The unrealistic-voltage check runs where B.2 says (every solve, or in robust mode after the
+last loop able to fix it); the diagram shows it only at the end.
 
-- done (STABLE);
-- diverged, or not converged within `max_iter`;
-- an outer loop FAILED (e.g. the slack could not be distributed);
-- the outer-iteration cap was reached (UNSTABLE);
-- unrealistic voltage.
+### Statuses
 
-## B.2 Running every check at once, then routing
+lightsim2grid's outcome of an outer-loop solve is **not one enum**. `OuterLoopStatus` has three
+values only, `STABLE`, `UNSTABLE` and `FAILED` (`outer_loop/BaseOuterLoop.hpp:41`). The rest
+comes from the inner solve's `ErrorType` and a flag. Per row, its batches publish the four
+together in `OuterRowResult` (`batch_algorithm/BaseBatchSweep.hpp:73-96`): `status`,
+`unrealistic_state`, `failed_loop` (the loop's name), plus `nb_outer_iterations` and
+`nb_nr_iterations`. `OuterLoopAlgo.tpp:166-186` maps them as follows:
 
-At eviction, one set of kernels evaluates every loop's trigger on the converged row. That is
-the physical checks of today, realigned on OpenLoadFlow's rules, plus the new triggers. The
-driver of OpenLoadFlow 2.3.0, mirrored by lightsim2grid's `OuterLoopAlgo::compute_pf`, is
-sequential:
+| outcome | `status` | `unrealistic_state` | `ErrorType` |
+|---|---|---|---|
+| done | `STABLE` | false | `NoError` |
+| an inner solve diverged or used its `max_iter` | as left | false | the inner error (`TooManyIterations`, `SingularMatrix`, ...) |
+| a loop failed (e.g. a slack residue it could not share) | `FAILED`, `failed_loop` set | false | `OuterLoopFailed` |
+| `max_outer_iterations` reached | `UNSTABLE` | false | `TooManyIterations`, the **same code** as an inner `max_iter`: tell them apart by `status` |
+| unrealistic voltage | **`STABLE`** | true | `UnrealisticState` |
+
+The last line follows the code. The comment on `OuterLoopStats::unrealistic_state`
+(`BaseOuterLoop.hpp:217`) says the status is then `FAILED`: the code leaves it `STABLE` and
+the comment is wrong, or the reverse. Settle it upstream before pinning parity tests on it.
+
+### In gpusim2grid
+
+`RowStatus` (`contingency/row_status.hpp`) is append-only, and already says the outer loops add
+after its four values (`Converged`, `MaxIter`, `Diverged`, `NotSimulated`). Proposal (names to
+settle):
+
+- the inner outcomes keep their values. `MaxIter` / `Diverged` mean the *last* inner solve
+  failed; the iteration counter is the inner one and restarts at each re-entry (B.3);
+- `OuterFailed`, with a per-row `failed_loop` (index into the loop list);
+- `OuterUnstable` (`max_outer_iterations` reached): its own value, not lightsim2grid's
+  `TooManyIterations` shared with `MaxIter`;
+- `Unrealistic`: its own value. The row is not `Converged`, whatever upstream decides for
+  `status`;
+- per row, next to the status: `nb_outer_iterations` and the Newton iterations summed over
+  every inner solve, as `OuterRowResult`;
+- for parity tests, the sparse per-row result of `OuterRowResult`: moved generator and
+  storage targets, HVDC regimes, phase and ratio taps, shunt sections.
+
+## B.2 Detecting every loop at once, then routing
+
+*Reviewed 2026-10-15 against lightsim2grid `dev_outer_batch_perf`; file:line references are
+to that branch.*
+
+### The driver to reproduce
+
+The driver of OpenLoadFlow 2.3.0, mirrored by lightsim2grid's `OuterLoopAlgo::compute_pf`
+(`OuterLoopAlgo.tpp:112-162`), is sequential:
 
 - it checks the current loop again after each re-solve until that loop is stable, then moves
   on;
-- a pass stops at the last loop that was unstable (never reset between passes);
-- passes repeat while one of them re-solved.
+- a pass stops at the last loop that was unstable (`last_unstable`, never reset between
+  passes);
+- passes repeat while one of them re-solved;
+- a check returns `STABLE`, `UNSTABLE` (act, re-solve) or `FAILED` (terminal for the row).
 
-Evaluating every trigger at once is still equivalent, as long as:
+### Fused detection at eviction
 
-1. each loop's detection **is** the trigger its check acts on. This is lightsim2grid's
-   `BaseOuterLoop` contract: the trigger is computed in one place, `detect`, reused by `check`;
-2. a check that finds the loop stable changes nothing.
+At eviction, the kernels evaluate every loop's detection on the converged row. A detection is
+a pure function of the row's V, its slot's Ybus and its loop state, so the order of the
+detections does not matter and they can be fused. Most of them read the same quantity, the
+bus power `V·conj(Ybus·V)` of the slot:
 
-The decision is then "the first triggered loop from the row's current position in its pass".
-That needs a small per-row driver state: current loop, last unstable loop, pass number, outer
-iteration count, Newton iterations of the current pass.
+- ReactiveLimits reads its reactive part;
+- DistributedSlack reads its active part at the slack;
+- VoltageMonitoring, TransformerVoltageControl and the release tests read |V|;
+- HvdcAcEmulationLimits reads the angles.
 
-Two kinds of loops act without a violation, and are encoded as "act on the first visit, then
-follow the state":
+One kernel computes that power once per slot (today the bus Q and gen P checks each recompute
+it) and then evaluates the per-loop tests. This is the physical checks of today, realigned on
+OpenLoadFlow's rules, plus the new triggers.
 
-- `PhaseControl` and `ShuntVoltageControl` act at their first visit regardless;
-- `TransformerVoltageControl` runs a stage machine (INITIAL / CONTROL / COMPLETE).
+### Routing: the first detected loop
+
+The row is routed to **the first detected loop from its current position in its pass**. Its
+action changes the row's equations; the row is re-queued and re-solved.
+
+This is the sequential driver itself if and only if *detected* means **"its check would
+return `UNSTABLE`"** ("would act"). lightsim2grid's `_detect` means something weaker, "a
+violation exists": it feeds `get_physical_violations` and acts on nothing. For three loops the
+two differ, and the GPU detection must use the stricter test:
+
+| loop | where `_detect` and the check differ | what the GPU detection adds |
+|---|---|---|
+| ReactiveLimits | not detected, yet `UNSTABLE`: a frozen bus whose limit moved (its capability curve read at a new target P), `ReactiveLimitsLoop.cpp:516-526` | a "limit moved" test: `frozen_q` against the limit at the current target P |
+| ReactiveLimits | detected, yet `STABLE`: `max_pq_pv_switch` or "keep the strongest PV bus" blocks every switch | both rules; they need the per-bus PV→PQ switch count, part of the row's loop state (B.3) |
+| DistributedSlack | detected, yet `STABLE`: the units move by less than `moved_fraction · p_residue_eps` (the move is kept), or `FAILED` on a residue that cannot be shared, `DistributedSlackLoop.cpp:155-178` | run `distribute` within the detection: it is cheap and the action needs its result anyway |
+
+Two more rules keep the routing exact:
+
+- **Quiet transitions of the skipped loops.** A loop the router passes over can still change
+  its state. `TransformerVoltageControl` at its INITIAL stage with nothing outside half a
+  deadband switches to COMPLETE and returns `STABLE` (`TransformerVoltageControlLoop.cpp:478-480`),
+  and never acts again. The router applies such transitions to every loop it skips: here a
+  per-row stage flag. Without it, TransformerVoltageControl could act later, once
+  ReactiveLimits moved the voltages, where lightsim2grid does not.
+- **A `STABLE` that changed something.** DistributedSlack's small move changes the targets, and
+  so the limits ReactiveLimits reads at target P, after the later loops were detected. The
+  difference is at tolerance level. For bit parity, apply the move and detect the loops after
+  it again before routing; V is unchanged, so this is cheap.
+
+### Synchronous and asynchronous detections
+
+- **Synchronous** detections (device kernels) are evaluated together and read in loop order.
+- **Asynchronous** ones (a decision run off the main stream or on the host, such as
+  DistributedSlack's `distribute`, host-side today) must all have finished before the row is
+  routed: the row waits for every detection before its new state is decided.
+
+### Per-row driver state
+
+The routing needs a small per-row state, parked with the row (B.3):
+
+- the current loop, `last_unstable`, the pass number;
+- the per-loop count of `UNSTABLE` results (lightsim2grid's `ctx.iteration`), which the
+  first-visit loops below read;
+- the outer-iteration count and the Newton iterations of the current pass;
+- the loops' own state: TransformerVoltageControl's stage, DistributedSlack's current set-points,
+  ReactiveLimits' per-bus state and switch count.
+
+### Loops that act without a violation
+
+These are encoded as "act at count 0, then follow the state":
+
+- `PhaseControl` returns `UNSTABLE` at count 0 whenever a phase shifter exists
+  (`PhaseControlLoop.cpp:119-143`);
+- `ShuntVoltageControl` acts at count 0 if any visible controller is handled
+  (`ShuntVoltageControlLoop.cpp:163-185`);
+- `TransformerVoltageControl` runs a stage machine (INITIAL / CONTROL / COMPLETE). Its INITIAL
+  step acts only if some group is outside half its deadband, not regardless.
+
+### Unrealistic voltage
 
 The unrealistic-voltage check (on the buses whose magnitude is a Newton unknown) runs on every
-solve, or in robust mode only after the last loop able to fix it, exactly as lightsim2grid's
-driver does.
+solve. In robust mode it runs only after the last loop able to fix it, ReactiveLimits or
+TransformerVoltageControl, with its flag reset at every pass (`OuterLoopAlgo.tpp:99-106,
+147-155`).
 
 ## B.3 Decide and patch on a second stream; park the row
 
 - **Streams.** The checks run on the main stream at eviction. Deciding and patching run on a
   second stream, ordered with CUDA events, so a parked row is loaded only once its patch is done.
-  The host only moves row indices between queues and reads counts once per round. The row data
-  stay on the device.
+  In the first version the decision runs on the host (B.0, item 7): only the routed rows' data
+  are copied back, and the patch is uploaded on the second stream. Otherwise the host only moves
+  row indices between queues and reads counts once per round.
 - **Parking.** A row waiting for its patch **leaves its slot**, which is refilled. Keeping it
   frozen in place would idle the slot for a round. The parked state is:
   - its V;
-  - the Newton unknowns beyond V: `slack_absorbed`, controller Q, and later α / ρ / B;
+  - no other Newton unknown. With the single slack of B.5 there is no `slack_absorbed`, and the
+    controller Q enters F linearly, so the Newton iterate does not depend on where it starts
+    (as for today's warm start). Later, α / ρ / B would need parking: they are nonlinear;
   - its **control state** (see B.7);
-  - its per-row loop state: e.g. the PV→PQ switch count of each bus, the units' current targets,
-    the transformer stage.
+  - its driver state (B.2): current loop, `last_unstable`, pass, per-loop count of `UNSTABLE`
+    results, outer iterations, Newton iterations;
+  - its loops' state. For the four loops of B.0 this is, in lightsim2grid:
+    - `DistributedSlack`: the units' current set-points (`current_mw_`), and the moved targets
+      in `OuterInjections`;
+    - `AcHvdcAcEmulationLimits`: the regime of each line (`frozen_dir`, -1 / 0 / +1);
+    - `VoltageMonitoring`: which monitors are switched on (`switched_on_`);
+    - `ReactiveLimits`: per controller bus, `state`, `realistic`, `frozen_q`, `nb_pv_pq`,
+      `target_q`, `target_p`, `monitor_svc` (`ReactiveLimitsLoop.hpp:98-153`);
+    - the controls' own state (`OuterControls.hpp`): PV/PQ of each bus, held controllers,
+      standby SVCs, HVDC regimes, `reset_vm`.
+
+    The loops left out add their own: `TransformerVoltageControl`'s stage, ratios and frozen
+    generators, the taps and the sections.
 - **Re-entry.** Its Ybus and Sbus are rebuilt from its row inputs plus its control state, through
   the **same load path as Part A**:
   - a first load is "default control state + base V";
@@ -490,23 +667,31 @@ Deciding on the GPU means each loop's *action* becomes a kernel, not only its de
 So "reusing lightsim2grid" means:
 
 - the loop list and order (`LSGrid::get_outer_loops()`, each loop's `name()` / `get_params()`);
-- the driver parameters (`OuterLoopDriverParams`: `max_outer_iterations`, robust mode, realistic
-  band);
-- the plans built by its headers, as gpusim2grid already does for detection (`BusQCheck.hpp`,
-  `GenPvReleaseCheck.hpp`, `GenPCheck.hpp`, ...);
-- parity tests, row by row, against its `NROuter_*` algorithms.
+- the driver parameters (`OuterLoopDriverParams`: `max_outer_iterations`, the robust mode
+  `voltage_remote_control_robust_mode`, the realistic band `min/max_realistic_voltage`,
+  `min_nominal_voltage_realistic_check`, `resume_outer_state`; `OuterLoopDriver.hpp:26-38`);
+- the plans built by the check headers the loops themselves build on: `BusQCheck` (ReactiveLimits),
+  `HvdcPCheck` (AcHvdcAcEmulationLimits), `SvcStandbyCheck` (VoltageMonitoring).
+  `GenPCheck` and `GenPvReleaseCheck` serve only the batch physical checks: ReactiveLimits runs
+  its own release test, and the robust mode's `LOW/HIGH_VOLTAGE_REMOTE_CONTROL` come from its
+  own detection;
+- parity tests, row by row, against its `NROuter_*` batches (B.0, item 6). Its per-solve trace
+  of decisions (`OuterLoopStats::decisions`) is the oracle when a row differs.
 
 lightsim2grid's loop classes themselves are not called. Calling them per row on the host
 (through an `OuterControls` subclass) would give parity by construction, but would need each
 row's V on the host at every outer iteration, and the AssistFlux prototype measured host-side
 checks at 30 s out of 68 s before moving them to kernels.
 
-A rare case can still be sent to the host with only that row's data: a truncated report, or a
-group configuration the kernels do not handle.
+The first version still decides on the host (B.0, item 7), but only for the rows the GPU
+detection routed, with only their data: the checks themselves, the 30 s above, stay on the
+device. The decisions move into kernels later. Even then, a rare case can go to the host the
+same way: a truncated report, or a group configuration the kernels do not handle.
 
 ## B.5 Device mechanisms, per loop
 
-The table follows OpenLoadFlow's default order. The first four loops are on by default.
+The table follows OpenLoadFlow's default order. The first four loops are on by default, and
+are the scope of the first version (B.0, item 1); the last row is left to an issue.
 
 | loop | what it changes in the solve | already in gpusim2grid | new |
 |---|---|---|---|
@@ -516,28 +701,76 @@ The table follows OpenLoadFlow's default order. The first four loops are on by d
 | ReactiveLimits | PV↔PQ, group controllers held at a limit, V = 1 restart | `set_pv_pq_switches`, `set_vc_controller_pins` / `_releases`, `Contingency::pinned_buses`, `vm_reseed` | applied as control state at re-entry instead of per-run inputs |
 | PhaseControl, TransformerVoltageControl, ShuntVoltageControl (off by default) | new unknowns α / ρ / B; the transformer or shunt Ybus entries patched every Newton iteration | per-slot Ybus values | `BranchControl` / `ShuntControl` as kernels: the Ybus patch, dS/dα and dS/dρ, the custom rows, a limiter's current |
 
-The inner Newton of lightsim2grid's outer-loop algorithms has a single slack:
-`use_distributed_slack=False` (`drop_multislack_augmentation`) already reproduces it. The
-Jacobian pattern comes from lightsim2grid's `NROuter_*` system: the union of everything its
+The Jacobian pattern comes from lightsim2grid's `NROuter_*` system: the union of everything its
 loops reserve.
+
+### The slack: single slack, as lightsim2grid
+
+*Reviewed 2026-10-15 against lightsim2grid `dev_outer_batch_perf`.*
+
+With the outer loops on, gpusim2grid uses a **single-slack inner Newton**, as lightsim2grid's
+`NROuter_*` algorithms do, and shares the slack only through the `DistributedSlack` loop. A
+distributed slack inside the Newton *and* the outer loops together is not part of
+lightsim2grid yet. It is only a proposal there (`docs/dev_notes/slack_handling_refactor.md`,
+"A distributed-slack Newton inside `NROuter_*`": the Newton shares by `slack_absorbed`, and the
+loop only caps units at their limits and redistributes what they no longer take). Follow
+lightsim2grid when it lands; until then, no parity reference exists for it.
+
+What "single slack" means changed with lightsim2grid commit `148e2e52`
+(`OuterLoopAlgo.tpp:47-58`):
+
+- only the reference bus, `slack_ids(0)`, is P-free, with its angle as the datum;
+- every **other** slack bus is moved into `pv` and **keeps its P equation**. It also gets a Vm
+  unknown and a Q equation when no local regulator pins its voltage
+  (`VoltageControlPlan::free_vm_slack_buses`). Left as slack buses, they would take whatever P
+  closes the balance, and a target the loop moves onto one of their units would change
+  nothing.
+
+`use_distributed_slack=False` does **not** reproduce this. `drop_multislack_augmentation`
+(`ls2g_bridge.cpp:344-372`) removes the P equation of *every* slack bus, which is
+`NRSing_*`'s layout (several P-free buses at fixed angles). It matches `NROuter_*` only on a
+grid with one slack bus. So:
+
+- **take the ledger from lightsim2grid's `NROuter_*` solve**, not from a transform of the
+  `NR_*` ledger. On an `NROuter_*` grid, `get_J_solver()` and the ledger's bus maps are
+  forwarded to the inner Newton (`OuterLoopAlgo.hpp:190-215`), so `extract_ledger_data`
+  reads them as they are. This also brings the union pattern and the other slack buses' Vm
+  columns, and gives parity by construction. The `BranchControl` / `ShuntControl` slots are
+  not readable yet (B.6);
+- with the outer loops on, **refuse** `use_distributed_slack=True` and `redistribute_slack`,
+  as lightsim2grid's batches refuse `redistribute_slack` with an `NROuter_*` algorithm
+  (`BaseBatchSweep.cpp:504`: it needs an algorithm whose `distributes_slack()` is true). The `DistributedSlack` loop is
+  OpenLoadFlow's version of that pre-pass;
+- the MultiSlack kernels (`slack_col < 0`) and the per-row slack weights (`slack_w_stride`) are
+  then simply off. The `DistributedSlack` loop acts only on Sbus values (its row above).
 
 ## B.6 What waits on lightsim2grid
 
-- **The ledger** of an `NROuter_*` solve (its union pattern), with accessors for the
-  `BranchControl` / `ShuntControl` columns and rows.
-- **Row-aware loops.** Detection already honours `OuterContext::masked` and `id_me_to_solver`,
-  but the actions read the grid directly. For instance, `DistributedSlackLoop::_initialize`
-  collects its units through `grid.id_me_to_ac_solver()`, and `BranchControl::_add_entry` reads
-  the transformer's status off the grid. The parity reference must take a row's tripped branches,
-  islanded buses and disconnected generators into account.
-- **Detection realigned on OpenLoadFlow.** This is a breaking change of the check outputs, with
-  new trigger kinds (`SLACK_MISMATCH`, `UNREALISTIC_VOLTAGE`, `REACTIVE_LIMIT_MOVED`, ...). The
-  gpusim2grid kernels and enums follow it.
-- **The starting state of a contingency row.** OpenLoadFlow's security analysis restores the N
-  state after the loops (PV / PQ labels, moved targets, taps). The other option is to start from
-  scratch. Today's workflow (`bake_outer_loops` + `can_be_pv` + detection + the one-shot second
-  pass of `reactive_limits_outer_loop`) approximates the first. The second pass becomes a special
-  case of B, to be replaced by it.
+*Reviewed 2026-10-15 against `dev_outer_batch_perf`: most of the list has landed.*
+
+- **The ledger of an `NROuter_*` solve: partly available.** `get_J_solver()` and the bus maps
+  are forwarded to the inner Newton (`OuterLoopAlgo.hpp:190-215`), so the bridge can read them
+  (to verify, B.0). The `BranchControl` / `ShuntControl` columns and rows, and those of the
+  held and standby controllers, are private with no getter (`NRSystem.hpp:1776-1789`). The
+  first ones matter only for the loops left out; the held / standby rows are needed for
+  `VoltageMonitoring` and `ReactiveLimits`.
+- **Row-aware loops: half done.** `OuterRowView` / `OuterGridView` hand a row's trips,
+  islanded buses, disconnected units and targets to the loops, and
+  `DistributedSlackLoop::_initialize` goes through it now. `BranchControl::_add_entry` still
+  reads the transformer's status off the grid (`NRSystemBranchControl.cpp:43-48`): it matters
+  only for the loops left out.
+- **Detection realigned on OpenLoadFlow: done.** The new types are 16-20 and the
+  `CONTROL` category (B.0, prerequisites). `UNREALISTIC_VOLTAGE` and `REACTIVE_LIMIT_MOVED`,
+  named here before, do not exist. An unrealistic voltage is the `unrealistic_state` flag
+  (B.1), and a moved limit is a decision of ReactiveLimits, not a violation type.
+- **The starting state of a row: done.** A batch row seeded from the "n" solve resumes from a
+  copy of that solve's loops: frozen buses, SVCs switched on, HVDC regimes, taps and sections,
+  the moved targets unless the row sets its own, and V (`OuterLoopAlgo.tpp:44-46`). A TimeSeries
+  row chains on the previous one, and any other row starts from the grid. B.0 item 4 follows
+  this. Today's workflow (`bake_outer_loops` + `can_be_pv` + detection + the one-shot second
+  pass of `reactive_limits_outer_loop`) approximates the default and is kept (B.0, item 5).
+- **Still open upstream:** whether an unrealistic stop is `STABLE` or `FAILED` (B.1), and the
+  slack refactor (B.5).
 
 ## B.7 What Part A must already do so that B is cheap
 
@@ -551,3 +784,30 @@ loops reserve.
    not only in the user-facing result buffers.
 4. **Keep the status enum and the per-row iteration counter extensible:** the counter becomes
    the inner counter, and the status gains the outer outcomes.
+
+*State of the code, 2026-10-15 (`dev_outerloops`):*
+
+| item | state |
+|---|---|
+| 1. inputs apart from the control state | **Not done, and the largest piece of Part B.** The control state is still a per-run input baked into the source when it is built. The `ScenarioSweepBatch` constructor builds the pins, stranded groups, `vm_reseed`, masks and patches of every row at once from `std::vector<Contingency>` (`scenario_sweep_batch.cuh:233-298`). The per-row streams are then gathered by `SegmentGather` from immutable host segments. Changing one row's control state means rebuilding the whole source, or a cold rebuild when the reserved buses change (`scenario_sweep_session.cu:186`). Only the slack correction and weights, `gen_v` and `v_init` can be set on the live source. |
+| 2. warm V and warm unknowns | **Partial, and enough.** Warm V works in continuous mode, but in `ScenarioSweepBatch` only (`load_slots`, `scenario_sweep_batch.cu:175-183`). `ContingencyBatch` and `InjectionBatch` have none, and B.0 item 2 needs all three facades: either these sources get it, or those facades go through `ScenarioSweepBatch` (to settle in the plan). No warm unknowns are needed (B.3). |
+| 3. check records the scheduler can read | **Partial.** `_solve_continuous` runs every check at eviction (`batch_pf_driver.cu:1667`, `1704-1900`), but the records exist only in the user-facing top-K buffers. The scheduler reads only the residuals. A per-row summary of what was detected is still to add. |
+| 4. extensible status and counter | **Done.** `RowStatus` is append-only (`row_status.hpp`), with one counter per row, reset when a slot is loaded. |
+
+Also not done: A.6 item 2. Every continuous run is cold (the sessions rebuild the driver), and
+`nb_iter_per_round` / `tol` are not in the driver config snapshot.
+
+*First version, 2026-10-15 (`ScenarioSweepGPU(outer_loops=True)`, CLAUDE.md "Outer loops"):*
+
+- **Item 1** is solved per slot rather than per row: a row stays in its slot from its first
+  load to its end, so its control state (`outer::SlotControls`) exists only for the rows in
+  flight and is written to dense per-slot device buffers (pins, held controllers, `v_set`,
+  hvdc regimes) plus a sparse Sbus correction re-applied over the row's own Sbus. The
+  immutable per-row segments are untouched: the reserved-bus pins moved out of the mask
+  streams.
+- **Item 2** is not needed: a re-solved row keeps its V in its slot (B.3's parking is left
+  for when the decisions are asynchronous).
+- **Item 3**: the scheduler gathers, per converged slot, V, the computed and scheduled power
+  at the buses the loops read and the controllers' Q, and the host runs the loops' exact
+  checks on them (B.2's "would act" superset filter on the device is not there yet: every
+  converged row comes back, a few kB each).
