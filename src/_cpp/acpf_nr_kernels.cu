@@ -831,6 +831,7 @@ __global__ void hvdc_adjust_mismatch_kernel(
     const int*             __restrict__ bus1,
     const int*             __restrict__ bus2,
     const int*             __restrict__ status,
+    int                                 status_stride,   // 0: shared, n_hvdc: per slot
     const cuda_real_type*  __restrict__ p0,
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
@@ -860,7 +861,7 @@ __global__ void hvdc_adjust_mismatch_kernel(
     const cuda_real_type raw = p0[e] + k[e] * (th1 - th2);
 
     cuda_real_type p1_flow, p2_flow;
-    hvdc_flows_pu(status[e], raw, lf1[e], lf2[e], r[e], pmax12[e], pmax21[e],
+    hvdc_flows_pu(status[b * status_stride + e], raw, lf1[e], lf2[e], r[e], pmax12[e], pmax21[e],
                   p1_flow, p2_flow);
 
     // mis(bus) += p_flow  ⇒  residual d_F[p_row] -= p_flow
@@ -874,6 +875,7 @@ __global__ void hvdc_fill_feature_kernel(
     const int*             __restrict__ bus1,
     const int*             __restrict__ bus2,
     const int*             __restrict__ status,
+    int                                 status_stride,   // 0: shared, n_hvdc: per slot
     const cuda_real_type*  __restrict__ p0,
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
@@ -893,7 +895,7 @@ __global__ void hvdc_fill_feature_kernel(
     const ptrdiff_t b   = tid / n_hvdc;
     const int       e   = static_cast<int>(tid % n_hvdc);
     if (b >= actual_batch) return;
-    if (status[e] != 0) return;   // saturated: constant injection, zero slopes
+    if (status[b * status_stride + e] != 0) return;   // saturated: constant injection, zero slopes
 
     const cudaComplexType V1 = d_V[b * n_bus + bus1[e]];
     const cudaComplexType V2 = d_V[b * n_bus + bus2[e]];

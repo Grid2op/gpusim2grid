@@ -275,6 +275,8 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
 bool bridge_has_gen_pv_release();
 // lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators, PR #220)
 bool bridge_has_hold_frozen();
+// lightsim2grid's outer loops (NROuter_*, branch dev_outer_batch_perf)
+bool bridge_has_outer_loops();
 
 // Build an InjectionSweepSession from a solved LSGrid (branch data set when
 // with_branch_data=true so compute_flows() works without extra setup).
@@ -335,5 +337,57 @@ make_ss_session_from_lsgrid(
     double max_dVm_override = -1.0,
     // See the use_distributed_slack note above make_ca_session_from_lsgrid.
     bool   use_distributed_slack = true);
+
+// What a batch running lightsim2grid's outer loops solves, read off a solved
+// NROuter_* grid: its single-slack inner Newton (the reference alone P-free, the
+// other slack buses PV), its ledger as it is (the union pattern every loop
+// reserved, LedgerData::outer_loops) with the switchable buses, and the rows'
+// starting V (the grid's, its generator buses at their set-points).
+struct OuterInputs {
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus;
+    CplxVect        V0, Sbus;
+    Eigen::VectorXi slack, pv, pq;
+    RealVect        slack_weights;
+    LedgerData      ledger;
+};
+OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n = false);
+
+// A ScenarioSweepSession running lightsim2grid's outer loops (the grid's own,
+// an NROuter_* grid, solved): continuous scheduling, the rows starting from the
+// grid's voltages (generator buses at their set-points) and default controls.
+// keep_trace: each row's decision trace in its OuterRowResult.
+std::shared_ptr<ScenarioSweepSession>
+make_ss_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    batch_size,
+    int    nb_iter,
+    int    device,
+    bool   compute_limit_violations = false,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    bool   keep_trace = false,
+    // every row resumes from where the grid's own solve left its loops (lightsim2grid's
+    // init_from_n_powerflow), starting from its voltages as they are
+    bool   resume_from_n = false);
+
+// The same for a contingency analysis (each contingency keeps the grid's targets)
+// and an injection sweep (set_outer_gen_p_rows: the rows' own).
+std::shared_ptr<ContingencyAnalysisSession>
+make_ca_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid, int batch_size, int nb_iter, int device,
+    bool compute_limit_violations = false,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    bool keep_trace = false, bool resume_from_n = false);
+std::shared_ptr<InjectionSweepSession>
+make_is_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid, int batch_size, int nb_iter, int device,
+    bool with_branch_data = true,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    bool keep_trace = false, bool resume_from_n = false);
 
 #endif  // LS2G_BRIDGE_HPP

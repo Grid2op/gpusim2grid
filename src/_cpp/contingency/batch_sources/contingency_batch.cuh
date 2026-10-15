@@ -63,7 +63,10 @@ struct ContingencyBatch {
     // slot get its own Sbus row (d_Sbus_batch, stride n_bus) -- a batch that
     // needs none keeps the shared buffer, bit-identical.
     // -------------------------------------------------------------------------
-    int sbus_stride(int n_bus) const { return slack_.has_dp() ? n_bus : 0; }
+    int sbus_stride(int n_bus) const { return (slack_.has_dp() || slot_sbus_) ? n_bus : 0; }
+    // The outer loops correct each row's Sbus (moved targets, frozen Q): every slot
+    // then gets its own Sbus row too. Set BEFORE the source is handed to its driver.
+    bool slot_sbus_ = false;
 
     // -------------------------------------------------------------------------
     // Host-side preprocessing results (filled in the ctor; uploaded in initialize)
@@ -287,6 +290,10 @@ struct ContingencyBatch {
     // -------------------------------------------------------------------------
     void load_slots(BatchPfDriverContext& ctx, const SlotLoadView& L,
                     cudaStream_t cs, CudaTimer& timer, BatchTimings& t);
+
+    // The listed slots' Sbus back to the base case's (the outer loops: a row re-solved
+    // in place, before its new correction). Needs slot_sbus_.
+    void reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView& L, cudaStream_t cs);
 
     void bind_slots(NrIterBuffers& buf, const SlotTableView& T, const int* d_J_outer,
                     cudaStream_t cs)

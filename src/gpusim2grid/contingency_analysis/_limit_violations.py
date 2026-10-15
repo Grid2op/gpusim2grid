@@ -110,7 +110,7 @@ class LimitViolationType(IntEnum):
     #: the target it would hold: it absorbs too much for that target, and
     #: OpenLoadFlow's ReactiveLimits loop would switch it back to PV (the PQ ->
     #: PV direction, the mirror of LOW_Q / HIGH_Q; lightsim2grid PR #216).
-    #: Category PHYSICAL. value the regulated voltage, limit the target, kV.
+    #: Category CONTROL. value the regulated voltage, limit the target, kV.
     LOW_VOLTAGE_AT_MIN_Q = 9
     #: ... and the mirror: pinned at its MAXIMUM, regulated bus ABOVE the target.
     HIGH_VOLTAGE_AT_MAX_Q = 10
@@ -118,7 +118,7 @@ class LimitViolationType(IntEnum):
     #: (lightsim2grid's ``LSGrid.set_svc_standby``) whose regulated bus sits
     #: BELOW the automaton's low threshold: OpenLoadFlow's
     #: MonitoringVoltageOuterLoop would switch it to voltage control. Category
-    #: PHYSICAL. value the regulated voltage, limit the threshold, kV.
+    #: CONTROL. value the regulated voltage, limit the threshold, kV.
     LOW_VOLTAGE_SVC_STANDBY = 11
     #: ... and the mirror: regulated bus ABOVE the high threshold.
     HIGH_VOLTAGE_SVC_STANDBY = 12
@@ -133,9 +133,21 @@ class LimitViolationType(IntEnum):
     #: An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
     #: ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop, from the row's angles,
     #: asks for less than that limit: OpenLoadFlow would have left it in AC
-    #: emulation. Category PHYSICAL. side the frozen direction, value that flow,
+    #: emulation. Category CONTROL. side the frozen direction, value that flow,
     #: limit the pmax, MW.
     HVDC_AC_EMULATION_RELEASE = 15
+    #: The types 16-20 mirror lightsim2grid's outer-loop detection (category
+    #: CONTROL); no gpusim2grid check reports them yet. The single slack bus
+    #: absorbed more than OpenLoadFlow's slackBusPMaxMismatch (GRID, MW).
+    SLACK_MISMATCH = 16
+    #: A phase tap changer's regulated active power off its target (TRAFO, MW).
+    PHASE_CONTROL_P = 17
+    #: A phase tap changer's limited current above its limit (TRAFO, A).
+    PHASE_LIMITER_CURRENT = 18
+    #: A bus ratio tap changers regulate, off half their deadband (BUS, kV).
+    TRANSFORMER_VOLTAGE_DEADBAND = 19
+    #: A bus shunt sections regulate, off its target (BUS, kV).
+    SHUNT_VOLTAGE_CONTROL = 20
 
 
 class ViolationCategory(IntEnum):
@@ -149,14 +161,19 @@ class ViolationCategory(IntEnum):
     PHYSICAL : a limit of the equipment itself, which nothing can leave: the
         converged solution is NOT physically realizable, the control it assumes
         cannot happen. LOW_Q, HIGH_Q, HIGH_P (= HVDC_P_SATURATION), LOW_P,
-        LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
-        HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL,
-        HIGH_VOLTAGE_REMOTE_CONTROL, HVDC_AC_EMULATION_RELEASE.
+        LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL.
     SOLVER : not a limit at all, what the solver did. NOT_SIMULATED, DIVERGENCE.
+    CONTROL : a control or automaton the solution did not apply: the state is
+        reachable, just not the one an outer loop would settle in.
+        LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
+        HIGH_VOLTAGE_SVC_STANDBY, HVDC_AC_EMULATION_RELEASE, SLACK_MISMATCH,
+        PHASE_CONTROL_P, PHASE_LIMITER_CURRENT, TRANSFORMER_VOLTAGE_DEADBAND,
+        SHUNT_VOLTAGE_CONTROL.
     """
     OPERATIONAL = 0
     PHYSICAL = 1
     SOLVER = 2
+    CONTROL = 3
 
 
 def violation_category(violation_type):
@@ -167,14 +184,20 @@ def violation_category(violation_type):
         return ViolationCategory.OPERATIONAL
     if t in (LimitViolationType.LOW_Q, LimitViolationType.HIGH_Q,
              LimitViolationType.HVDC_P_SATURATION, LimitViolationType.LOW_P,
-             LimitViolationType.LOW_VOLTAGE_AT_MIN_Q,
+             LimitViolationType.LOW_VOLTAGE_REMOTE_CONTROL,
+             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL):
+        return ViolationCategory.PHYSICAL
+    if t in (LimitViolationType.LOW_VOLTAGE_AT_MIN_Q,
              LimitViolationType.HIGH_VOLTAGE_AT_MAX_Q,
              LimitViolationType.LOW_VOLTAGE_SVC_STANDBY,
              LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY,
-             LimitViolationType.LOW_VOLTAGE_REMOTE_CONTROL,
-             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL,
-             LimitViolationType.HVDC_AC_EMULATION_RELEASE):
-        return ViolationCategory.PHYSICAL
+             LimitViolationType.HVDC_AC_EMULATION_RELEASE,
+             LimitViolationType.SLACK_MISMATCH,
+             LimitViolationType.PHASE_CONTROL_P,
+             LimitViolationType.PHASE_LIMITER_CURRENT,
+             LimitViolationType.TRANSFORMER_VOLTAGE_DEADBAND,
+             LimitViolationType.SHUNT_VOLTAGE_CONTROL):
+        return ViolationCategory.CONTROL
     return ViolationCategory.SOLVER
 
 

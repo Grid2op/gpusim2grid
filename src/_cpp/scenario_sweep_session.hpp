@@ -51,6 +51,7 @@
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
 #include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
+#include "outer/outer_hook.hpp"                  // outer::OuterHook
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -318,6 +319,7 @@ struct ScenarioSweepSession {
     // hot run puts the plain weights back).
     // =========================================================================
     bool                    redistribute_slack_ = false;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
     SlackRedistributionData slack_rd_;
     bool                    has_slack_rd_ = false;
     RealMatRM               gen_p_rows_;
@@ -807,6 +809,20 @@ struct ScenarioSweepSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; docs/dev_notes/continuous_batching.md
+    // Part B): the model deciding on every row, built by the bridge off an
+    // NROuter_* grid (its session is built on that grid's own ledger). With it,
+    // run() needs the continuous schedule and refuses what the first version
+    // leaves out (generator contingencies, handle_disconnected_grid, gen_v,
+    // redistribute_slack, the reactive-limit switches, the physical checks, a
+    // strategy other than direct_refactor_every). The rows start from the
+    // grid's voltages, their loops from the grid's state.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);

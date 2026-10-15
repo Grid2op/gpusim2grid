@@ -1162,6 +1162,24 @@ void ScenarioSweepSession::run()
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
     if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+    if (outer_) {
+        auto refuse = [](const std::string& what) {
+            throw std::runtime_error("ScenarioSweepSession: the outer loops do not support " + what + " yet");
+        };
+        if (!continuous)
+            throw std::runtime_error("ScenarioSweepSession: the outer loops need scheduling='continuous'");
+        if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
+            refuse("a strategy other than 'direct_refactor_every'");
+        if (has_gen_off_)           refuse("generator contingencies (set_contingency_gens)");
+        if (handle_disconnected_grid_) refuse("handle_disconnected_grid");
+        if (has_gen_v_)             refuse("set_gen_v");
+        if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
+        if (has_switches_ || has_vc_pins_ || has_vc_release_)
+            refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
+        if (phys_.compute_physical_violations) refuse("compute_physical_violations");
+        if (keep_final_jacobian_)   refuse("gradients (keep_final_jacobian)");
+        if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
+    }
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
         throw std::runtime_error(
@@ -1230,7 +1248,8 @@ void ScenarioSweepSession::run()
         for (const auto& v : sw_vc_release_) if (!v.empty()) { any_switch = true; break; }
     }
     const int want_ref = _wanted_reference_bus();
-    if (required != reserved_buses_ || want_ref != ref_bus_) {
+    // the outer loops' ledger carries its own switchable buses: nothing to rebuild
+    if (!outer_ && (required != reserved_buses_ || want_ref != ref_bus_)) {
         ref_bus_ = want_ref;
         _build_base_state(required);
     }
@@ -1297,7 +1316,8 @@ void ScenarioSweepSession::run()
             if (has_vc_release_) ctg.vc_released = sw_vc_release_[r];
             ctg.skip = has_skip_ && skip_rows_[r] != 0;
         }
-        if (!reserved_buses_.empty()) {
+        // (the outer loops pin the switchable buses per slot themselves)
+        if (!reserved_buses_.empty() && !outer_) {
             for (int r = 0; r < n_scenarios_; ++r) {
                 const std::vector<int>& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
                 std::vector<int>& pinned = contingencies_[static_cast<size_t>(r)].pinned_buses;
@@ -1319,7 +1339,7 @@ void ScenarioSweepSession::run()
         }
         // ... and the VoltageControl controllers held at a fixed Q: lightsim2grid's held
         // ones on every row that does not release them, then the caller's
-        if (has_vc_pins_ || base_state_->has_vc_held)
+        if (!outer_ && (has_vc_pins_ || base_state_->has_vc_held))
             for (int r = 0; r < n_scenarios_; ++r)
                 contingencies_[static_cast<size_t>(r)].vc_pinned_ctrl = _row_vc_pins(r);
     };
@@ -1617,6 +1637,16 @@ void ScenarioSweepSession::run()
         gen_pv_release_row_skip_dirty_ = false;
     }
 
+    // The outer loops: the model decides on every row; it starts the rows' loops
+    // from their own generator set-points.
+    solver_->outer_hook_ = outer_.get();
+    if (outer_) {
+        std::vector<double> gp;
+        if (gen_p_rows_.size() > 0 && gen_p_rows_.rows() == n_scenarios_)
+            gp.assign(gen_p_rows_.data(), gen_p_rows_.data() + gen_p_rows_.size());
+        outer_->set_row_targets(n_scenarios_, std::move(gp), {});
+    }
+
     timings_ = solver_->solve();
     timings_.t_base_case_ms = t_base_case_ms_;
     timings_.t_preprocess_ms += t_sbus_build_ms_;
@@ -1663,6 +1693,9 @@ void ScenarioSweepSession::solve_JT_batch(const void* d_rhs_orig, const void* d_
                                           const void* d_Ybus_ext, const void* d_V_ext_orig,
                                           std::uintptr_t producer_stream)
 {
+    if (outer_)
+        throw std::runtime_error("ScenarioSweepSession::solve_JT_batch: no gradients through the "
+                                 "outer loops yet (each slot holds its last row's controls)");
     if (!solver_)
         throw std::runtime_error(
             "ScenarioSweepSession::solve_JT_batch: call run() first");

@@ -214,6 +214,16 @@ struct AcPfNrState {
     std::vector<int>            h_vc_held;
     std::vector<double>         h_vc_q_held;
     bool                        has_vc_held = false;
+    //   outer loops (LedgerData::outer_loops): what the may_hold_ formulation of
+    //   VoltageControl writes per slot (outer/outer_kernels.cuh) -- per controller
+    //   its (v_row, q_col) slot and, for a non-first one, its sharing row and that
+    //   row's entry on each controller of its group (flat, h_vch_rowpos_off); per
+    //   group its (v_row, vm_col(reg)). Empty otherwise.
+    bool                        vc_may_hold = false;
+    std::vector<int>            h_vch_rowpos_off, h_vch_rowpos;
+    thrust::device_vector<cuda_real_type> d_vc_weight;
+    thrust::device_vector<int>  d_vch_slope_pos, d_vch_vm_pos, d_vch_sh_row,
+                                d_vch_rowpos_off, d_vch_rowpos;
 
     // Switchable Vm buses (LedgerData::switchable_vm_buses, sorted): their Q
     // rows are identity-PINNED in this single-system base solve (the base
@@ -224,6 +234,11 @@ struct AcPfNrState {
     std::vector<int>            h_switchable_buses;
     int                         n_pin = 0;
     thrust::device_vector<int>  d_pin_slot, d_pin_row, d_pin_diag;
+    // ... and per switchable bus (h_switchable_buses' order, -1 where it owns no
+    // Q row): its Q row and (q_row, vm_col) position, what the outer loops pin
+    // per slot (NrIterBuffers::d_oc_pin_*)
+    std::vector<int>            h_sw_qrow, h_sw_qdiag;
+    thrust::device_vector<int>  d_sw_qrow, d_sw_qdiag;
 
     // -------------------------------------------------------------------------
     // MultiSlack (distributed slack in the Jacobian) — slack_col < 0 when absent.

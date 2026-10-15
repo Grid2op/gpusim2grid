@@ -147,6 +147,15 @@ struct LedgerData {
     // their last local controller is off). Empty on every un-extended ledger.
     std::vector<int>    switchable_vm_buses;
 
+    // ---- lightsim2grid's outer loops (the ledger of an NROuter_* solve) -------
+    // The Jacobian is the union pattern every loop reserved: the switchable buses
+    // above (PV ones pinned per slot), every droop hvdc regime and, when a loop may
+    // hold a controller (VoltageControl::set_may_hold_controllers), each group's
+    // (v_row, q_col_first) slot and every sharing row's entry on every controller.
+    // The batch then fills VoltageControl in its may_hold_ formulation (outer/
+    // outer_kernels.cuh). Single slack: slack_col is -1.
+    bool                outer_loops = false;
+
     int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
     int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }
     bool has_voltage_control() const { return !vc_bus.empty(); }

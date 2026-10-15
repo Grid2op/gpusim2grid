@@ -474,6 +474,7 @@ __global__ void hvdc_adjust_mismatch_kernel(
     const int*             __restrict__ bus1,
     const int*             __restrict__ bus2,
     const int*             __restrict__ status,
+    int                                 status_stride,   // 0: shared, n_hvdc: per slot
     const cuda_real_type*  __restrict__ p0,
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
@@ -494,6 +495,7 @@ __global__ void hvdc_fill_feature_kernel(
     const int*             __restrict__ bus1,
     const int*             __restrict__ bus2,
     const int*             __restrict__ status,
+    int                                 status_stride,   // 0: shared, n_hvdc: per slot
     const cuda_real_type*  __restrict__ p0,
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,

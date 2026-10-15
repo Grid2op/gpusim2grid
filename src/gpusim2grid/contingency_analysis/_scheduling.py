@@ -43,6 +43,13 @@ class RowStatus(IntEnum):
     #: dropped by the pre-check (would disconnect the grid, strands the angle
     #: reference, ...), never solved
     NOT_SIMULATED = 3
+    #: the outer loops (``outer_loops=True``): a loop failed, e.g. a slack
+    #: mismatch it could not share (lightsim2grid's ``OuterLoopStatus.FAILED``)
+    OUTER_FAILED = 4
+    #: the outer loops: ``max_outer_iterations`` reached (``UNSTABLE``)
+    OUTER_UNSTABLE = 5
+    #: the outer loops: converged to an unrealistic voltage
+    UNREALISTIC = 6
 
 
 def default_tol():

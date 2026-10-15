@@ -6,7 +6,7 @@ find_package(CUDAToolkit REQUIRED COMPONENTS cublas cudart cusolver cusparse)
 # was found at configure time (see ../CMakeLists.txt). It is a CUDA-free .cpp.
 set(_gpusim2grid_ls2g_sources "")
 if(GPUSIM2GRID_LS2G_CORE_FOUND)
-    list(APPEND _gpusim2grid_ls2g_sources ls2g_bridge.cpp)
+    list(APPEND _gpusim2grid_ls2g_sources ls2g_bridge.cpp outer/ls2g_outer_model.cpp)
 endif()
 
 pybind11_add_module(
@@ -17,6 +17,7 @@ pybind11_add_module(
     contingency_analysis_helper.cpp
     ledger_extend.cpp
     acpf_nr_kernels.cu
+    outer/outer_kernels.cu
     contingency_analysis_session.cu
     contingency/batch_pf_driver.cu
     contingency/violation_kernels.cu

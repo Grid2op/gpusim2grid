@@ -382,6 +382,11 @@ struct ScenarioSweepBatch {
     void load_slots(BatchPfDriverContext& ctx, const SlotLoadView& L,
                     cudaStream_t cs, CudaTimer& timer, BatchTimings& t);
 
+    // The listed slots' Sbus rows read again from the rows (the outer loops: a
+    // row re-solved in place gets its row's own Sbus back before its new
+    // correction). The redistribute_slack correction is not supported there.
+    void reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView& L, cudaStream_t cs);
+
     void bind_slots(NrIterBuffers& buf, const SlotTableView& T, const int* d_J_outer,
                     cudaStream_t cs)
     {

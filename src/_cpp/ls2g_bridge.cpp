@@ -8,6 +8,7 @@
 
 #include "ls2g_bridge.hpp"
 #include "ledger_extend.hpp"   // materialize_vc_custom_rows, reserve_stranded_controller_slots
+#include "outer/ls2g_outer_model.hpp"   // the outer loops' model (lightsim2grid's NROuter_*)
 #include "timing_utils.hpp"    // ms_since
 
 #include <batch_algorithm/BusQCheck.hpp>   // ls2g::bus_q_check::build_bus_q_plan (lightsim2grid >= PR #206)
@@ -27,6 +28,14 @@
 
 #if __has_include(<batch_algorithm/HvdcPCheck.hpp>)
 #include <batch_algorithm/HvdcPCheck.hpp>   // ls2g::hvdc_p_check (LSGrid::set_hvdc_ac_emulation_frozen)
+#endif
+
+// lightsim2grid's outer loops (NROuter_*, branch dev_outer_batch_perf): its check plans
+// are then built on an OuterGridView (the grid as one batch row sees it; a null row is
+// the grid itself, in its AC labelling).
+#if __has_include(<powerflow_algorithm/outer_loop/OuterRowView.hpp>)
+#include <powerflow_algorithm/outer_loop/OuterRowView.hpp>
+#define GPUSIM2GRID_HAVE_LS2G_OUTER_LOOPS 1
 #endif
 
 #include <chrono>
@@ -774,7 +783,9 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
                 ld.vc_q_held.assign(ld.vc_held.size(), 0.);
                 const auto& gens = grid.get_generators();
                 for (size_t j = 0; j < ld.vc_held.size(); ++j) {
-                    if (!ld.vc_held[j]) continue;
+                    // a held generator holds its target Q; a held SVC (a voltage
+                    // monitor of the outer loops) 0 (VoltageControl::update_state)
+                    if (!ld.vc_held[j] || ld.vc_kind[j] != 0) continue;
                     const int gen_id = ld.vc_elem_id[j];
                     if (gens.get_status(gen_id))
                         ld.vc_q_held[j] = gens.get_target_q_mvar(gen_id) / grid.get_sn_mva();
@@ -1030,10 +1041,14 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
     // lightsim2grid's own routing, on the labelling the session solves in (the
     // AC cache of a solved grid) and the same controller list the ledger was
     // read from (extract_ledger_data).
+    ls2g::bus_q_check::BusQPlan plan;
+#ifdef GPUSIM2GRID_HAVE_LS2G_OUTER_LOOPS
+    ls2g::bus_q_check::build_bus_q_plan(ls2g::OuterGridView(grid, nullptr), plan);
+#else
     ls2g::VoltageControlSolverData ctrl;
     grid.fill_voltage_control_solver_data(ctrl, /*ac=*/true);
-    ls2g::bus_q_check::BusQPlan plan;
     ls2g::bus_q_check::build_bus_q_plan(grid, grid.id_me_to_ac_solver(), ctrl, plan);
+#endif
 
     const ls2g::GeneratorContainer& gens  = grid.get_generators();
     const ls2g::StorageContainer&   stos  = grid.get_storages();
@@ -1160,6 +1175,15 @@ bool bridge_has_gen_pv_release()
 bool bridge_has_hold_frozen()
 {
     return has_vc_held<ls2g::VoltageControlSolverData>::value;
+}
+
+bool bridge_has_outer_loops()
+{
+#ifdef GPUSIM2GRID_HAVE_LS2G_OUTER_LOOPS
+    return true;
+#else
+    return false;
+#endif
 }
 
 // the station's end of a release entry (an HVDC one: a VSC station frozen at a limit);
@@ -1413,5 +1437,220 @@ make_ss_session_from_lsgrid(
         session->set_limits(ld.bus_vmin_kv, ld.bus_vmax_kv,
                             ld.limit_a1_ka, ld.limit_a2_ka, n_lines);
     }
+    return session;
+}
+
+// =============================================================================
+// The outer loops (docs/dev_notes/continuous_batching.md, Part B): a scenario
+// sweep posing the system of the grid's NROuter_* solve -- its single-slack
+// inner Newton (the reference bus alone P-free, the other slack buses PV with
+// their P equation) on the union pattern its loops reserved -- with the model
+// of those loops deciding on every row (outer/ls2g_outer_model.hpp).
+// =============================================================================
+OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
+{
+#ifndef GPUSIM2GRID_HAVE_LS2G_OUTER_LOOPS
+    (void)grid; (void)resume_from_n;
+    throw std::runtime_error("gpusim2grid was built against a lightsim2grid without outer loops "
+                             "(NROuter_*, branch dev_outer_batch_perf)");
+#else
+    if (!grid.get_algo().supports_outer_loops())
+        throw std::runtime_error("the outer loops need a grid whose algorithm is an NROuter_* one, "
+                                 "solved (grid.change_algorithm('NROuter_KLU'); grid.ac_pf(...))");
+    // only the four default loops are ported (outer/ls2g_outer_model.cpp); another one
+    // would also append custom rows after VoltageControl's, which the base state
+    // reads as the last rows of J
+    for (const auto& loop : grid.get_outer_loops()) {
+        const std::string name = loop->name();
+        if (name != "DistributedSlack" && name != "AcHvdcAcEmulationLimits" &&
+            name != "VoltageMonitoring" && name != "ReactiveLimits")
+            throw std::runtime_error("gpusim2grid's outer loops: the loop '" + name + "' is not "
+                                     "supported (DistributedSlack, AcHvdcAcEmulationLimits, "
+                                     "VoltageMonitoring and ReactiveLimits are)");
+    }
+    OuterInputs in;
+    auto& g = const_cast<ls2g::LSGrid&>(grid);
+    in.Ybus = g.get_Ybus_solver();
+    if (in.Ybus.rows() == 0)
+        throw std::runtime_error("extract_outer_inputs: empty Ybus -- solve the grid first");
+    const int n_bus = static_cast<int>(in.Ybus.rows());
+
+    // OuterLoopAlgo::compute_pf: the reference alone is a slack bus; the others are PV
+    Eigen::VectorXi slack = grid.get_slack_ids_solver_numpy();
+    Eigen::VectorXi pv    = grid.get_pv_solver_numpy();
+    in.pq = grid.get_pq_solver_numpy();
+    if (slack.size() == 0) throw std::runtime_error("extract_outer_inputs: no slack bus");
+    in.slack = slack.head(1);
+    in.pv.resize(pv.size() + slack.size() - 1);
+    in.pv.head(pv.size()) = pv;
+    in.pv.tail(slack.size() - 1) = slack.tail(slack.size() - 1);
+    in.slack_weights = RealVect::Ones(1);
+
+    // the inner Newton's ledger, as it is (the NROuter_* accessors forward to it)
+    in.ledger = extract_ledger_data(grid, /*presolved_v=*/false, 0.);
+    if (in.ledger.slack_col >= 0)
+        throw std::runtime_error("extract_outer_inputs: the grid's ledger has a distributed slack: "
+                                 "solve it with its NROuter_* algorithm first");
+    in.ledger.outer_loops = true;
+    // the base state trusts V0 without a check; its controllers' Q is never read by
+    // the slots (they start from the plan's held output, _init_slot_state): seed it
+    // instead of deriving it with a cuDSS solve on the base system
+    if (in.ledger.vc_n_controllers() > 0) {
+        in.ledger.vc_q_gt.assign(static_cast<size_t>(in.ledger.vc_n_controllers()), 0.);
+        if (in.ledger.vc_q_held.size() == in.ledger.vc_q_gt.size()) in.ledger.vc_q_gt = in.ledger.vc_q_held;
+        in.ledger.has_ext_state_ground_truth = true;
+    }
+    // the switchable buses: a Vm column and a Q row on a bus the labelling holds at
+    // its set-point (PV or a slack), except the slack buses nothing pins locally --
+    // the reference included (VoltageControlPlan::free_vm_slack_buses): Base gives
+    // those a live Q equation, not a reserved, pinned one
+    {
+        const std::set<int> free_vm = grid.get_free_vm_slack_solver_buses();
+        std::vector<int> sw_buses;
+        auto consider = [&](int b) {
+            if (b < 0 || b >= n_bus) return;
+            if (in.ledger.vm_col_of_bus[static_cast<size_t>(b)] < 0 ||
+                in.ledger.q_row_of_bus[static_cast<size_t>(b)] < 0) return;
+            if (free_vm.count(b)) return;
+            sw_buses.push_back(b);
+        };
+        for (Eigen::Index k = 0; k < in.pv.size(); ++k) consider(in.pv(k));
+        consider(in.slack(0));
+        std::sort(sw_buses.begin(), sw_buses.end());
+        sw_buses.erase(std::unique(sw_buses.begin(), sw_buses.end()), sw_buses.end());
+        in.ledger.switchable_vm_buses = sw_buses;
+    }
+
+    // the rows start from the grid's voltages: as they are when they resume from its
+    // solve (init_from_n_powerflow: the buses it froze keep their magnitude), else its
+    // generators' buses at their set-points (BaseBatchSolverSynch::_solve_n_case's
+    // seed_vm_keeping): a PV bus keeps the magnitude it starts from
+    in.V0 = grid.get_V_solver();
+    if (!resume_from_n) {
+        Eigen::Ref<ls2g::CplxVect> Vr(in.V0);
+        grid.get_generators().set_vm(Vr, grid.get_ac_layout().id_me_to_solver);
+    }
+    in.Sbus = grid.get_Sbus_solver();
+    return in;
+#endif
+}
+
+std::shared_ptr<ScenarioSweepSession>
+make_ss_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    batch_size,
+    int    nb_iter,
+    int    device,
+    bool   compute_limit_violations,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   keep_trace,
+    bool   resume_from_n)
+{
+    OuterInputs in = extract_outer_inputs(grid, resume_from_n);
+    const int n_bus = static_cast<int>(in.Ybus.rows());
+    // the base state trusts V0 as it is (no residual check: the grid's own state was
+    // solved with its loops' controls, which the base state does not carry)
+    auto session = std::make_shared<ScenarioSweepSession>(
+        in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
+        batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
+        device, &in.ledger, /*presolved_v=*/true,
+        reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
+        /*scaling=*/false, 0.5, 0.1);
+    session->scheduling_ = BatchScheduling::Continuous;
+
+    session->set_gen_contingency_data(extract_gen_contingency_data(grid, n_bus));
+    BranchData bd = extract_branch_data(grid, n_bus);
+    session->set_branch_data(bd.branch_from, bd.branch_to,
+                             bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
+                             bd.bus_vn_kv, bd.sn_mva);
+    session->set_slack_redistribution_data(extract_slack_redistribution_data(grid, n_bus));
+    if (compute_limit_violations) {
+        session->set_compute_limit_violations(true);
+        LimitData ld = extract_limits(grid, n_bus);
+        const int n_lines = static_cast<int>(grid.get_powerlines_as_data().nb());
+        session->set_limits(ld.bus_vmin_kv, ld.bus_vmax_kv, ld.limit_a1_ka, ld.limit_a2_ka, n_lines);
+    }
+
+    outer::Ls2gModelOptions opt;
+    opt.keep_trace = keep_trace;
+    opt.resume_from_n = resume_from_n;
+    session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
+    return session;
+}
+
+std::shared_ptr<ContingencyAnalysisSession>
+make_ca_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    batch_size,
+    int    nb_iter,
+    int    device,
+    bool   compute_limit_violations,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   keep_trace,
+    bool   resume_from_n)
+{
+    OuterInputs in = extract_outer_inputs(grid, resume_from_n);
+    const int n_bus = static_cast<int>(in.Ybus.rows());
+    auto session = std::make_shared<ContingencyAnalysisSession>(
+        in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
+        batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
+        device, &in.ledger, /*presolved_v=*/true,
+        reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
+        /*scaling=*/false, 0.5, 0.1);
+    session->scheduling_ = BatchScheduling::Continuous;
+    BranchData bd = extract_branch_data(grid, n_bus);
+    session->set_branch_data(bd.branch_from, bd.branch_to,
+                             bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
+                             bd.bus_vn_kv, bd.sn_mva);
+    session->set_slack_redistribution_data(extract_slack_redistribution_data(grid, n_bus));
+    if (compute_limit_violations) {
+        session->set_compute_limit_violations(true);
+        LimitData ld = extract_limits(grid, n_bus);
+        const int n_lines = static_cast<int>(grid.get_powerlines_as_data().nb());
+        session->set_limits(ld.bus_vmin_kv, ld.bus_vmax_kv, ld.limit_a1_ka, ld.limit_a2_ka, n_lines);
+    }
+    outer::Ls2gModelOptions opt;
+    opt.keep_trace = keep_trace;
+    opt.resume_from_n = resume_from_n;
+    session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
+    return session;
+}
+
+std::shared_ptr<InjectionSweepSession>
+make_is_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    batch_size,
+    int    nb_iter,
+    int    device,
+    bool   with_branch_data,
+    ReorderingAlg reordering_alg,
+    MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg,
+    bool   keep_trace,
+    bool   resume_from_n)
+{
+    OuterInputs in = extract_outer_inputs(grid, resume_from_n);
+    const int n_bus = static_cast<int>(in.Ybus.rows());
+    auto session = std::make_shared<InjectionSweepSession>(
+        in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
+        batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
+        device, &in.ledger, /*presolved_v=*/true,
+        reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
+        /*scaling=*/false, 0.5, 0.1);
+    session->scheduling_ = BatchScheduling::Continuous;
+    if (with_branch_data) {
+        BranchData bd = extract_branch_data(grid, n_bus);
+        session->set_branch_data(bd.branch_from, bd.branch_to,
+                                 bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
+                                 bd.bus_vn_kv, bd.sn_mva);
+    }
+    outer::Ls2gModelOptions opt;
+    opt.keep_trace = keep_trace;
+    opt.resume_from_n = resume_from_n;
+    session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
     return session;
 }

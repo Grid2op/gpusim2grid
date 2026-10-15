@@ -7,8 +7,9 @@ the three batch engines and their ``*GPU`` facades expose them (one mixin
 each, so the API is written once). Same names and contract as lightsim2grid's:
 one flag for the whole category, every record of ``get_physical_violations()``
 has ``category == ViolationCategory.PHYSICAL`` -- the converged solution
-assumes a control the equipment cannot hold -- and the next physical limit
-needs no new flag.
+assumes a control the equipment cannot hold -- or ``CONTROL`` for the releases
+(a frozen machine, an idle standby SVC, a saturated hvdc droop an outer loop
+would put back), and the next physical limit needs no new flag.
 
 Today the category holds five checks, all detection-only (no bus is switched
 PV -> PQ or back, no line is saturated, no machine is taken out of the slack,
@@ -100,7 +101,8 @@ class PhysicalChecksEngineMixin:
         the generators / storage units carrying the distributed slack whose
         converged active power left their [min_p, max_p] (``LOW_P`` /
         ``HIGH_P``). Same contract as lightsim2grid's flag of the same name:
-        every record has ``category == PHYSICAL``. Detection only, nothing is
+        every record has ``category == PHYSICAL`` (``CONTROL`` for the
+        releases). Detection only, nothing is
         enforced. Needs :meth:`set_bus_q_capability` (the facades do it from
         the grid); :meth:`set_gen_p_capability` is optional. Default False;
         changing it drops the previous report; takes effect on the next

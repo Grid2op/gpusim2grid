@@ -677,8 +677,13 @@ AcPfNrState::AcPfNrState(
         h_switchable_buses.clear();
         if (ledger != nullptr) h_switchable_buses = ledger->switchable_vm_buses;
         std::vector<int> h_pin_slot, h_pin_row, h_pin_diag;
-        for (int bus : h_switchable_buses) {
+        h_sw_qrow.assign(h_switchable_buses.size(), -1);
+        h_sw_qdiag.assign(h_switchable_buses.size(), -1);
+        for (size_t k = 0; k < h_switchable_buses.size(); ++k) {
+            const int bus = h_switchable_buses[k];
             if (bus < 0 || bus >= n_bus || h_q_row_of_bus[bus] < 0) continue;
+            h_sw_qrow[k]  = h_q_row_of_bus[bus];
+            h_sw_qdiag[k] = h_q_diag_pos[bus];
             h_pin_slot.push_back(0);
             h_pin_row.push_back(h_q_row_of_bus[bus]);
             h_pin_diag.push_back(h_q_diag_pos[bus]);
@@ -688,6 +693,10 @@ AcPfNrState::AcPfNrState(
             upload_h2d(d_pin_slot, h_pin_slot.data(), n_pin, cs);
             upload_h2d(d_pin_row,  h_pin_row.data(),  n_pin, cs);
             upload_h2d(d_pin_diag, h_pin_diag.data(), n_pin, cs);
+        }
+        if (!h_sw_qrow.empty()) {
+            upload_h2d(d_sw_qrow,  h_sw_qrow.data(),  h_sw_qrow.size(),  cs);
+            upload_h2d(d_sw_qdiag, h_sw_qdiag.data(), h_sw_qdiag.size(), cs);
         }
     }
 
@@ -984,6 +993,35 @@ AcPfNrState::AcPfNrState(
             }
         }
         n_vc_feat = static_cast<int>(feat_pos.size());
+
+        // the outer loops' may_hold_ formulation: every position it writes per slot
+        // (see vc_hold_fill_J_kernel), read off lightsim2grid's union pattern
+        vc_may_hold = ledger->outer_loops;
+        if (vc_may_hold) {
+            std::vector<cuda_real_type> w(n_vc_ctrl);
+            std::vector<int> sh_row_c(n_vc_ctrl, -1);
+            h_vch_rowpos_off.assign(n_vc_ctrl, -1);
+            h_vch_rowpos.clear();
+            for (int j = 0; j < n_vc_ctrl; ++j) w[j] = static_cast<cuda_real_type>(ledger->vc_weight[j]);
+            for (int g = 0; g < n_vc_grp; ++g) {
+                const int first = ledger->vc_grp_start[g];
+                const int cnt   = ledger->vc_grp_count[g];
+                for (int k = 0; k < cnt - 1; ++k) {
+                    const int j = first + (k + 1);
+                    sh_row_c[j] = share[g][k];
+                    h_vch_rowpos_off[j] = static_cast<int>(h_vch_rowpos.size());
+                    for (int o = 0; o < cnt; ++o)
+                        h_vch_rowpos.push_back(find_J_pos(share[g][k], qcol[first + o]));
+                }
+            }
+            if (h_vch_rowpos.empty()) h_vch_rowpos.push_back(-1);   // never read; keeps the pointer valid
+            upload_h2d(d_vc_weight,      w.data(),                       n_vc_ctrl, cs);
+            upload_h2d(d_vch_slope_pos,  h_vc_ctrl_vrow_qcol_pos.data(), n_vc_ctrl, cs);
+            upload_h2d(d_vch_vm_pos,     h_vc_vrow_vmcol_pos.data(),     n_vc_grp,  cs);
+            upload_h2d(d_vch_sh_row,     sh_row_c.data(),                n_vc_ctrl, cs);
+            upload_h2d(d_vch_rowpos_off, h_vch_rowpos_off.data(),        n_vc_ctrl, cs);
+            upload_h2d(d_vch_rowpos,     h_vch_rowpos.data(),            h_vch_rowpos.size(), cs);
+        }
         if (n_vc_share > 0) {
             upload_h2d(d_vc_sh_row,    sh_row.data(),    n_vc_share, cs);
             upload_h2d(d_vc_sh_first,  sh_first.data(),  n_vc_share, cs);

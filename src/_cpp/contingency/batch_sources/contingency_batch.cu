@@ -26,7 +26,7 @@ void ContingencyBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
             "[contingency_batch] per-row slack weight count does not match the base "
             "case's participant count");
     slack_.upload(ctx.batch_size, cs);
-    if (slack_.has_dp())
+    if (slack_.has_dp() || slot_sbus_)
         d_Sbus_batch.resize(static_cast<size_t>(ctx.batch_size) * ctx.n_bus);
 }
 
@@ -80,15 +80,15 @@ void ContingencyBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadView&
     // ④  Sbus: the shared base case, unless a redistribute_slack correction
     //     exists (base Sbus per slot, then the row's correction); the row's
     //     slack weights when some row was re-weighted.
-    if (!slack_.has_dp() && !slack_.has_weights()) return;
+    if (!slack_.has_dp() && !slack_.has_weights() && !slot_sbus_) return;
     timer.start();
-    if (slack_.has_dp()) {
+    if (slack_.has_dp() || slot_sbus_) {
         cudaComplexType* dst = thrust::raw_pointer_cast(d_Sbus_batch.data());
         launch_gather_rows_to_slots(dst, static_cast<const cudaComplexType*>(nullptr),
                                     thrust::raw_pointer_cast(ctx.base.d_Sbus.data()),
                                     L, ctx.n_bus, cs);
         cb_chk_cuda(cudaGetLastError(), "Sbus rows");
-        slack_.apply_dp(dst, L, ctx.n_bus, cs);
+        if (slack_.has_dp()) slack_.apply_dp(dst, L, ctx.n_bus, cs);
     }
     slack_.load_weights(L, thrust::raw_pointer_cast(ctx.base.d_slack_w.data()), cs);
     t.t_tile_Sbus += timer.stop_ms();
@@ -96,6 +96,17 @@ void ContingencyBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadView&
 
 const cudaComplexType* ContingencyBatch::d_Sbus_ptr(const BatchPfDriverContext& ctx) const
 {
-    return slack_.has_dp() ? thrust::raw_pointer_cast(d_Sbus_batch.data())
-                           : thrust::raw_pointer_cast(ctx.base.d_Sbus.data());
+    return (slack_.has_dp() || slot_sbus_) ? thrust::raw_pointer_cast(d_Sbus_batch.data())
+                                           : thrust::raw_pointer_cast(ctx.base.d_Sbus.data());
+}
+
+void ContingencyBatch::reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView& L, cudaStream_t cs)
+{
+    if (!slot_sbus_)
+        throw std::runtime_error("[contingency_batch] reload_sbus needs a per-slot Sbus (slot_sbus_)");
+    launch_gather_rows_to_slots(thrust::raw_pointer_cast(d_Sbus_batch.data()),
+                                static_cast<const cudaComplexType*>(nullptr),
+                                thrust::raw_pointer_cast(ctx.base.d_Sbus.data()),
+                                L, ctx.n_bus, cs);
+    cb_chk_cuda(cudaGetLastError(), "Sbus reload");
 }

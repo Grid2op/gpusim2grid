@@ -77,6 +77,38 @@ Jacobian from the forward and rebuilds them in the backward (see below).
 .. autoclass:: gpusim2grid.RowStatus
    :members:
 
+Outer loops
+~~~~~~~~~~~
+
+With ``outer_loops=True`` the three batch facades run the grid's own outer
+loops on every row -- lightsim2grid's ``NROuter_*`` algorithm and its loops,
+OpenLoadFlow's defaults: ``DistributedSlack``, ``AcHvdcAcEmulationLimits``,
+``VoltageMonitoring``, ``ReactiveLimits``, with their parameters and the
+driver's (``max_outer_iterations``, the robust mode, the realistic voltage
+band). The grid must have been solved with that algorithm. Each row's inner
+Newton solves run on the GPU (the continuous schedule; ``nb_iter`` is the budget
+of each), its loops decide on the host after each one, and a row they change is
+re-solved in place from its voltages. With ``init_from_n_powerflow=True`` (the
+default) every row resumes from where the grid's own solve left its loops (its
+voltages, its frozen buses, its switched-on SVCs, its hvdc regimes), as
+lightsim2grid's batches with ``init_from_n_powerflow`` do.
+
+``get_row_status()`` then also reports ``OUTER_FAILED`` (a loop failed, e.g. a
+slack mismatch it could not share), ``OUTER_UNSTABLE`` (``max_outer_iterations``
+reached) and ``UNREALISTIC``, and ``get_outer_results()`` gives lightsim2grid's
+per-row ``OuterRowResult`` (``keep_outer_trace=True`` keeps the decision trace).
+Not supported yet: ``handle_disconnected_grid``, generator contingencies,
+``set_gen_v``, ``redistribute_slack``, the physical checks, gradients.
+
+.. code-block:: python
+
+    grid.change_algorithm("NROuter_KLU")
+    grid.ac_pf(V0, 30, 1e-8)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=30)
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_branches)])
+    ca.compute(batch_size=512)
+    ca.get_outer_results()[0].nb_outer_iterations
+
 Contingency analysis
 --------------------
 
@@ -167,7 +199,10 @@ with lightsim2grid's names and contract. Unlike the operational limits above,
 its records say that the converged solution is **not a state the grid can
 reach at all** — the control it assumes cannot be held by the equipment: every
 entry of :meth:`~gpusim2grid.ContingencyAnalysisGPU.get_physical_violations`
-has ``category ==`` :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.PHYSICAL`.
+has ``category ==`` :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.PHYSICAL`,
+or :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.CONTROL` for a release
+(a control an outer loop would put back: a frozen machine, an idle standby SVC, a
+saturated hvdc droop).
 One flag for the whole category, so the next physical limit needs no new one.
 Each check is the first pass of a PowSyBl OpenLoadFlow *outer loop*, as a
 detection: nothing is switched or re-solved, the row is only reported. They

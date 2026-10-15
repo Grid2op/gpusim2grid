@@ -30,6 +30,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
+from .._outer_loops import _check_outer_loops_args
 
 __all__ = ["InjectionSweepGPU"]
 
@@ -140,7 +141,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         Only meaningful on the lightsim2grid-bridge path; the explicit-array
         and Python-fallback paths have no ledger and always solve the bare
         system.
-    scheduling : {"chunked", "continuous"}, default "chunked"
+    scheduling : {"chunked", "continuous"} or None, default None
+        ``None``: ``"chunked"``, or ``"continuous"`` with ``outer_loops``.
         How the rows go through the batch. ``"chunked"``: ``ceil(n_rows /
         batch_size)`` chunks, every row runs exactly ``nb_iter`` Newton
         iterations. ``"continuous"``: ``batch_size`` slots; every
@@ -161,6 +163,11 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         lightsim2grid compares the same way but takes its ``tol`` in MVA
         (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
         build). Mutable.
+    outer_loops, keep_outer_trace : bool, default False
+        Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
+        row; see :class:`ScenarioSweepGPU`. Each row's generator targets are the ones :meth:`set_injections_from_elements` gives. With
+        ``init_from_n_powerflow`` (default) the rows resume from where the
+        grid's own solve left its loops. :meth:`get_outer_results`.
 
     Examples
     --------
@@ -192,9 +199,15 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
-                 compute_physical_violations=False, scheduling="chunked",
-                 nb_iter_per_round=1, tol=None):
+                 compute_physical_violations=False, scheduling=None,
+                 nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        self._outer_loops = bool(outer_loops)
+        if scheduling is None:
+            scheduling = "continuous" if self._outer_loops else "chunked"
+        if self._outer_loops:
+            _check_outer_loops_args(grid, use_bridge, scheduling,
+                                    compute_physical_violations=compute_physical_violations)
 
         # Single source of truth, resolved once here and applied at
         # construction time to BOTH the base-case solve and the batch solver
@@ -229,7 +242,20 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
-            if use_bridge:
+            if self._outer_loops:
+                # the grid's own outer loops (see ScenarioSweepGPU's outer_loops)
+                session = _cpp._make_is_outer_session_from_lsgrid(
+                    grid, 100, int(nb_iter), _normalize_device(device), bool(auto_branch_data),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    keep_trace=bool(keep_outer_trace),
+                    resume_from_n=bool(init_from_n_powerflow))
+                self._inner = _InjectionSweepSolver._wrap_session(
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
+            elif use_bridge:
                 session = _cpp._make_is_session_from_lsgrid(
                     grid, bool(init_from_n_powerflow), 100, int(nb_iter),
                     int(max_iter_base), float(tol_base), _normalize_device(device),
@@ -322,6 +348,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         self._gen_p_rows = None
         self._push_gen_p_targets()
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
+        if self._outer_loops:
+            self._inner._s.set_outer_gen_p_rows([])
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
         """Store per-element injections, mirroring lightsim2grid's own batch API.
@@ -368,6 +396,23 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
         self._gen_p_rows = np.asarray(gen_p, dtype=np.float64)
         self._push_gen_p_targets()
+        # ... and the outer loops start from them (DistributedSlack's units,
+        # ReactiveLimits' capability curves)
+        if self._outer_loops:
+            self._inner._s.set_outer_gen_p_rows(list(self._gen_p_rows.ravel()))
+
+    @property
+    def outer_loops(self):
+        """bool: whether the grid's own outer loops run on every row (see
+        :class:`ScenarioSweepGPU`'s ``outer_loops``)."""
+        return self._outer_loops
+
+    def get_outer_results(self):
+        """Per row, the outcome of its outer loops (see
+        :meth:`ScenarioSweepGPU.get_outer_results`). Needs ``outer_loops=True``."""
+        if not self._outer_loops:
+            raise RuntimeError("get_outer_results() needs outer_loops=True")
+        return self._inner._s.get_outer_results()
 
     def set_gen_v(self, gen_v):
         """Store per-scenario generator target voltage magnitude (vm_pu, NOT kV).

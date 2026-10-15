@@ -130,3 +130,12 @@ void InjectionBatch::load_slots(BatchPfDriverContext& ctx,
     _chk_cuda(cudaGetLastError(), "Sbus rows");
     t.t_tile_Sbus += timer.stop_ms();
 }
+
+void InjectionBatch::reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView& L, cudaStream_t cs)
+{
+    launch_gather_rows_to_slots(thrust::raw_pointer_cast(d_Sbus_batch.data()),
+                                thrust::raw_pointer_cast(d_Sbus_all.data()),
+                                thrust::raw_pointer_cast(ctx.base.d_Sbus.data()),
+                                L, ctx.n_bus, cs);
+    _chk_cuda(cudaGetLastError(), "Sbus reload");
+}

@@ -48,6 +48,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
+from .._outer_loops import _check_outer_loops_args
 
 __all__ = ["ScenarioSweepGPU"]
 
@@ -106,7 +107,39 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         of a row; see :class:`ContingencyAnalysisGPU`. A continuous run always
         rebuilds its batch driver; its batched adjoint rebuilds each row's
         Jacobian from the converged voltages (``keep_final_jacobian`` is not
-        needed there).
+        needed there). ``None`` (default): ``"chunked"``, or ``"continuous"``
+        with ``outer_loops``.
+    outer_loops : bool, default False
+        Run the grid's own outer loops on every row: lightsim2grid's
+        ``NROuter_*`` algorithm (``grid.change_algorithm("NROuter_KLU")``, the
+        grid solved with it) and its loops -- DistributedSlack,
+        AcHvdcAcEmulationLimits, VoltageMonitoring, ReactiveLimits -- with
+        their parameters and the driver's (``max_outer_iterations``, the
+        robust mode, the realistic voltage band). The rows are solved on the
+        GPU by its single-slack inner Newton; their loops decide on the host
+        after each converged inner solve, and a row their loops change is
+        re-solved in place from its voltages. Continuous scheduling only;
+        ``nb_iter`` is the budget of each inner solve. Each row starts from
+        the grid's voltages (its generator buses at their set-points) and the
+        grid's controls, as a lightsim2grid batch without
+        ``init_from_n_powerflow`` -- or, with ``init_from_n_powerflow=True``
+        (the default), from where the grid's own solve left its loops, as
+        lightsim2grid's batch with it: the grid's voltages as they are, the
+        buses its loops froze (frozen again at each row's own limit), the
+        SVCs switched on, the hvdc regimes, the targets they moved (but where
+        the row sets its own: :meth:`set_injections_from_elements` sets every
+        generator's). The loops read the rows' generator targets from
+        :meth:`set_injections_from_elements`; with the per-bus
+        :meth:`set_injections` they start from the grid's (DistributedSlack's
+        units, the capability curves ReactiveLimits reads), whatever the rows'
+        Sbus carries. ``nb_iter_per_round`` must be 1. Not supported yet:
+        ``handle_disconnected_grid``,
+        :meth:`set_contingency_gens`, :meth:`set_gen_v`, ``redistribute_slack``,
+        ``compute_physical_violations``, gradients. See :meth:`get_outer_results`.
+    keep_outer_trace : bool, default False
+        With ``outer_loops``: keep each row's decision trace
+        (``get_outer_results()[i].decisions``, lightsim2grid's
+        ``OuterLoopStats.decisions``).
 
     Examples
     --------
@@ -149,9 +182,17 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
-                 reference_slack="auto", scheduling="chunked", nb_iter_per_round=1,
-                 tol=None):
+                 reference_slack="auto", scheduling=None, nb_iter_per_round=1,
+                 tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        self._outer_loops = bool(outer_loops)
+        if scheduling is None:
+            scheduling = "continuous" if self._outer_loops else "chunked"
+        if self._outer_loops:
+            _check_outer_loops_args(grid, use_bridge, scheduling,
+                                    handle_disconnected_grid=handle_disconnected_grid,
+                                    redistribute_slack=redistribute_slack,
+                                    compute_physical_violations=compute_physical_violations)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
@@ -191,7 +232,24 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
-            if use_bridge:
+            if self._outer_loops:
+                # The grid's own outer loops (lightsim2grid's NROuter_*): the session
+                # poses its inner Newton's system, the model decides on every row --
+                # see ls2g_bridge.cpp:make_ss_outer_session_from_lsgrid.
+                session = _cpp._make_ss_outer_session_from_lsgrid(
+                    grid, 100, int(nb_iter), _normalize_device(device),
+                    bool(compute_limit_violations),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    keep_trace=bool(keep_outer_trace),
+                    resume_from_n=bool(init_from_n_powerflow))
+                self._inner = _ScenarioSweepSolver._wrap_session(
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
+                self._n_branches = self._inner._s.n_branches
+            elif use_bridge:
                 # Branch data is always set -- set_topology() needs it, not
                 # just compute_flows() -- see ls2g_bridge.cpp:make_ss_session_from_lsgrid.
                 # When compute_limit_violations is True, the bridge also pulls
@@ -294,6 +352,28 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         if redistribute_slack:
             self.redistribute_slack = True
         self.reference_slack = reference_slack
+
+    # ------------------------------------------------------------ outer loops
+    @property
+    def outer_loops(self):
+        """bool: whether the grid's own outer loops (lightsim2grid's NROuter_*:
+        DistributedSlack, AcHvdcAcEmulationLimits, VoltageMonitoring,
+        ReactiveLimits) run on every row (construction-time only)."""
+        return self._outer_loops
+
+    def get_outer_results(self):
+        """Per row, the outcome of its outer loops after the last
+        :meth:`compute` -- lightsim2grid's ``OuterRowResult``: ``status``
+        (0 STABLE, 1 UNSTABLE, 2 FAILED), ``unrealistic_state``,
+        ``failed_loop``, ``nb_outer_iterations``, ``nb_nr_iterations`` and what
+        the loops moved, as ``(id, value)`` pairs (``gen_target_p``,
+        ``storage_target_p``, ``hvdc_regime``). Needs
+        ``outer_loops=True``. A row's :class:`RowStatus` (:meth:`get_row_status`)
+        says the same in one value: CONVERGED, OUTER_FAILED, OUTER_UNSTABLE,
+        UNREALISTIC, or MAX_ITER / DIVERGED for its last inner solve."""
+        if not self._outer_loops:
+            raise RuntimeError("get_outer_results() needs outer_loops=True")
+        return self._inner._s.get_outer_results()
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,

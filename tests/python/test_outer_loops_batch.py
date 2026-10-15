@@ -1,0 +1,363 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+"""The outer loops on the GPU (``ScenarioSweepGPU(outer_loops=True)``,
+docs/dev_notes/continuous_batching.md Part B) against lightsim2grid's own
+``NROuter_*`` batch, row by row.
+
+lightsim2grid's batch solves each row with the grid's loops (DistributedSlack,
+AcHvdcAcEmulationLimits, VoltageMonitoring, ReactiveLimits): its inner Newton,
+then the loops' checks, a re-solve whenever one acts. gpusim2grid runs the
+inner solves on the device and the same checks on the host, so a row ends at
+the same voltages, after the same number of outer iterations, with the same
+targets moved -- when both start from the same voltages (the loops stop on
+thresholds, so where they stop depends on where the solve starts): here the
+grid's own, its generator buses at their set-points, what lightsim2grid's batch
+seeds from the ``v_init`` it is given.
+"""
+
+import warnings
+
+import numpy as np
+import pytest
+
+from conftest import requires_gpu
+import gpusim2grid._gpusim2grid as _cpp
+
+pytestmark = [
+    requires_gpu,
+    pytest.mark.skipif(not getattr(_cpp, "have_ls2g_outer_loops", False),
+                       reason="gpusim2grid built against a lightsim2grid without NROuter_*"),
+    pytest.mark.skipif(bool(_cpp.is_fp32), reason="parity with lightsim2grid's double-precision NR"),
+]
+
+OUTER = "NROuter_KLU"
+MAX_IT = 30
+TOL_MVA = 1e-8          # lightsim2grid's tol is in MVA: ||F||inf < tol / sn_mva
+N_ROWS = 8
+CONVERGED, MAX_ITER, DIVERGED, NOT_SIMULATED = 0, 1, 2, 3
+OUTER_FAILED, OUTER_UNSTABLE, UNREALISTIC = 4, 5, 6
+
+
+def _case14(q_limit=15., distributed=True):
+    """case14, its generators short of reactive power (ReactiveLimits switches
+    buses PQ) and sharing the slack in proportion to their maximum output
+    (DistributedSlack re-shares whatever a row changes in the balance) --
+    lightsim2grid's own test grid (tests/test_outer_batch.py)."""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    net = pn.case14()
+    net.gen["min_q_mvar"] = -q_limit
+    net.gen["max_q_mvar"] = q_limit
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(net)
+    nb_gen = len(grid.get_generators())
+    grid.set_gen_p_limits(np.zeros(nb_gen), np.full(nb_gen, 300.))
+    if distributed:
+        grid.set_gen_can_participate_slack([True] * nb_gen, np.full(nb_gen, 300.))
+    grid.change_algorithm(OUTER)
+    V = grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    assert V.size > 0
+    return grid
+
+
+def _rows(grid, n_rows=N_ROWS, trips=True):
+    """load increase per row (+5 % each), line i + 1 tripped on row i"""
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    scale = 1. + 0.05 * np.arange(n_rows)
+    rows = {
+        "gen_p": np.outer(np.ones(n_rows), gen_p),
+        "load_p": np.outer(scale, load_p),
+        "load_q": np.outer(np.ones(n_rows), load_q),
+        "lines": [[i + 1] for i in range(n_rows)] if trips else [[] for _ in range(n_rows)],
+    }
+    return rows
+
+
+def _lightsim2grid(grid, rows):
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    n_rows = rows["load_p"].shape[0]
+    batch = ScenarioSweepCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.modify_gen_p(rows["gen_p"])
+    batch.modify_load_p(rows["load_p"])
+    batch.modify_load_q(rows["load_q"])
+    mask = np.zeros((n_rows, len(grid.get_lines())), dtype=bool)
+    for i, lines in enumerate(rows["lines"]):
+        mask[i, lines] = True
+    batch.set_contingency_lines(mask)
+    batch.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, TOL_MVA)
+    return batch
+
+
+def _gpu(grid, rows, batch_size, tol_mva=TOL_MVA, init_from_n_powerflow=False, **kwargs):
+    from gpusim2grid import ScenarioSweepGPU
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n_powerflow,
+                          tol=tol_mva / grid.get_sn_mva(), **kwargs)
+    sw.set_injections_from_elements(rows["load_p"], rows["load_q"], rows["gen_p"])
+    sw.set_topology(rows["lines"])
+    sw.compute(batch_size=batch_size)
+    return sw
+
+
+def _V(sw, grid, n_rows):
+    n_bus = grid.get_Ybus_solver().shape[0]
+    return sw.V_results.to_numpy().reshape(n_rows, n_bus)
+
+
+@pytest.fixture(scope="module")
+def case14():
+    return _case14()
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, N_ROWS])
+def test_rows_match_lightsim2grid_batch(case14, batch_size):
+    grid = case14
+    rows = _rows(grid)
+    ls = _lightsim2grid(grid, rows)
+    sw = _gpu(grid, rows, batch_size, keep_outer_trace=True)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+
+    V_ls = np.asarray(ls.get_voltages())[:, buses]
+    V = _V(sw, grid, N_ROWS)
+    conv_ls = np.asarray(ls.converged_mask(), dtype=bool)
+    status = np.asarray(sw.get_row_status())
+    res_ls = ls.get_outer_results()
+    res = sw.get_outer_results()
+    for i in range(N_ROWS):
+        msg = f"row {i}: gpusim2grid {res[i].decisions} / lightsim2grid status {res_ls[i].status}"
+        assert (status[i] == CONVERGED) == bool(conv_ls[i]), msg
+        assert int(res[i].status) == int(res_ls[i].status), msg
+        assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        if conv_ls[i]:
+            np.testing.assert_allclose(V[i], V_ls[i], rtol=0., atol=1e-8, err_msg=msg)
+            moved_ls = dict(res_ls[i].gen_target_p)
+            moved = dict(res[i].gen_target_p)
+            assert moved.keys() == moved_ls.keys(), msg
+            for g in moved:
+                assert moved[g] == pytest.approx(moved_ls[g], abs=1e-6), msg
+
+
+def test_a_row_the_loops_act_on_is_resolved(case14):
+    """The base grid itself as one row: its loops act (case14's PV buses are
+    short of reactive power), and the row ends where lightsim2grid's single
+    NROuter solve ends."""
+    grid = case14
+    rows = _rows(grid, n_rows=1, trips=False)
+    rows["load_p"] = rows["load_p"] / 1.   # the grid's own loads
+    sw = _gpu(grid, rows, 1, keep_outer_trace=True)
+    res = sw.get_outer_results()[0]
+    assert res.nb_outer_iterations > 0, res.decisions
+    assert sw.get_row_status()[0] == CONVERGED
+    ls = _lightsim2grid(grid, rows)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    np.testing.assert_allclose(_V(sw, grid, 1)[0], np.asarray(ls.get_voltages())[0, buses],
+                               rtol=0., atol=1e-8)
+
+
+def test_ample_reactive_limits_only_the_slack_is_shared():
+    """Ample reactive limits: ReactiveLimits never acts; DistributedSlack shares each
+    row's extra load (the slack's own unit takes part by default)."""
+    grid = _case14(q_limit=1e4, distributed=False)
+    rows = _rows(grid)
+    sw = _gpu(grid, rows, 4, keep_outer_trace=True)
+    res = sw.get_outer_results()
+    assert not any("ReactiveLimits" in d and "not taken" not in d for r in res for d in r.decisions)
+    ls = _lightsim2grid(grid, rows)
+    _compare_with_batch(_V(sw, grid, N_ROWS), np.asarray(sw.get_row_status()), res, ls, grid, N_ROWS)
+
+
+def test_refusals(case14):
+    from gpusim2grid import ScenarioSweepGPU
+    with pytest.raises(ValueError, match="continuous"):
+        ScenarioSweepGPU(case14, outer_loops=True, scheduling="chunked")
+    with pytest.raises(ValueError, match="handle_disconnected_grid"):
+        ScenarioSweepGPU(case14, outer_loops=True, handle_disconnected_grid=True)
+    sw = ScenarioSweepGPU(case14, outer_loops=True, init_from_n_powerflow=False)
+    rows = _rows(case14, n_rows=2)
+    sw.set_injections_from_elements(rows["load_p"], rows["load_q"], rows["gen_p"])
+    sw.strategy = "direct_base_case_factors"
+    with pytest.raises(RuntimeError, match="direct_refactor_every"):
+        sw.compute(batch_size=2)
+    with pytest.raises(RuntimeError, match="outer_loops"):
+        ScenarioSweepGPU(case14, init_from_n_powerflow=False).get_outer_results()
+
+
+def test_grid_without_nrouter_is_refused():
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from gpusim2grid import ScenarioSweepGPU
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(pn.case14())
+    grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    with pytest.raises(RuntimeError, match="NROuter"):
+        ScenarioSweepGPU(grid, outer_loops=True)
+
+
+# --------------------------------------------------------------------------------------
+# Every loop and controller configuration of test_outer_model_cpu.py (which checks the
+# host port alone against lightsim2grid), now with the inner solves on the GPU: each row
+# against lightsim2grid's single NROuter solve of the row's grid, from the same start.
+# --------------------------------------------------------------------------------------
+def _rows_vs_single_solves(make_grid, scales, tol_mva, batch_size, start=None):
+    base = make_grid()
+    v0 = np.full(base.total_bus(), 1.0 + 0j) if start is None else start(base)
+    assert base.ac_pf(v0, MAX_IT, tol_mva).size > 0
+    load_p0 = np.asarray(base.get_load_target_p(), dtype=float)
+    load_q0 = np.array([l.target_q_mvar for l in base.get_loads()], dtype=float)
+    gen_p0 = np.array([g.target_p_mw for g in base.get_generators()], dtype=float)
+    n = len(scales)
+    rows = {"gen_p": np.outer(np.ones(n), gen_p0), "load_p": np.outer(scales, load_p0),
+            "load_q": np.outer(np.ones(n), load_q0), "lines": [[] for _ in range(n)]}
+    sw = _gpu(base, rows, batch_size, tol_mva=tol_mva, keep_outer_trace=True)
+    V = _V(sw, base, n)
+    status = np.asarray(sw.get_row_status())
+    res = sw.get_outer_results()
+    for i, s in enumerate(scales):
+        row = make_grid()
+        for load_id, p in enumerate(load_p0):
+            row.change_p_load(load_id, float(p * s))
+        V_ref = row.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, tol_mva)
+        stats = row.get_algo().get_outer_loop_stats()
+        msg = (f"row {i}: " + "\n".join(res[i].decisions) + "\n---- lightsim2grid\n" +
+               "\n".join(str(d) for d in stats.decisions))
+        assert res[i].nb_outer_iterations == stats.nb_outer_iterations, msg
+        assert int(res[i].status) == int(stats.status), msg
+        assert (status[i] == CONVERGED) == (V_ref.size > 0), msg
+        if V_ref.size > 0:
+            buses = np.asarray(row.id_ac_solver_to_me(), dtype=int)
+            np.testing.assert_allclose(V[i], V_ref[buses], rtol=0., atol=1e-8, err_msg=msg)
+    return sw
+
+
+@pytest.mark.parametrize("kwargs", [dict(), dict(p0=-60., pmax12=300., pmax21=20.), dict(pmax12=300.)])
+def test_gpu_hvdc_ac_emulation_limits(kwargs):
+    from test_outer_model_cpu import _case14_hvdc
+    _rows_vs_single_solves(lambda: _case14_hvdc(**kwargs), [1., 1.05, 1.1], TOL_MVA, 2)
+
+
+@pytest.mark.parametrize("low_pu, high_pu", [(0.90, 1.00), (1.10, 1.20), (0.90, 1.20)])
+def test_gpu_voltage_monitoring(low_pu, high_pu):
+    from test_outer_model_cpu import _ieee14_standby_svc
+    _rows_vs_single_solves(lambda: _ieee14_standby_svc(low_pu, high_pu), [1., 1.05], 1e-10, 2)
+
+
+@pytest.mark.parametrize("regulators, qmin, qmax", [
+    (("B6-G", "B8-G"), (-10., -10.), (10., 10.)),
+    (("B6-G", "B8-G"), (-100., -3.), (3., 100.)),
+    (("B3-G", "B6-G", "B8-G"), (-100., -100., -3.), (100., 3., 100.)),
+    (("B3-G", "B6-G", "B8-G"), (-100., -3., -3.), (3., 100., 100.)),
+])
+def test_gpu_reactive_limits_on_a_voltage_control_group(regulators, qmin, qmax):
+    from test_outer_model_cpu import _ieee14_remote_group
+    _rows_vs_single_solves(lambda: _ieee14_remote_group(qmax, regulators, qmin=qmin),
+                           [1., 1.05, 1.1], 1e-10, 3)
+
+
+def test_gpu_ieee300_reactive_limits():
+    from test_outer_model_cpu import _ieee300
+
+    def dc_start(grid):
+        flat = np.full(grid.total_bus(), 1.0 + 0j)
+        return np.exp(1j * np.angle(grid.dc_pf(flat, 30, 1e-12)))
+
+    _rows_vs_single_solves(_ieee300, [1., 1.005, 1.01], 1e-9, 2, start=dc_start)
+
+
+# --------------------------------------------------------------------------------------
+# The two other facades, and init_from_n_powerflow (the rows resume from the "n" solve)
+# --------------------------------------------------------------------------------------
+def _v_batch(grid, init_from_n):
+    """what lightsim2grid's batch is given: rows that do not resume start from it
+    (gpusim2grid's start: the grid's V); rows that do resume from the batch's own "n"
+    solve, which must land where the grid's did -- so from the same start (flat 1.04)"""
+    if init_from_n:
+        return np.full(grid.total_bus(), 1.04 + 0j)
+    return np.asarray(grid.get_V(), dtype=complex)
+
+
+def _compare_with_batch(V, status, res, batch, grid, n_rows):
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V_ls = np.asarray(batch.get_voltages())[:, buses]
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    res_ls = batch.get_outer_results()
+    for i in range(n_rows):
+        msg = f"row {i}: " + "\n".join(res[i].decisions)
+        assert int(res[i].status) == int(res_ls[i].status), msg
+        assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        assert (status[i] == CONVERGED) == bool(conv[i]), msg
+        if conv[i]:
+            np.testing.assert_allclose(V[i], V_ls[i], rtol=0., atol=1e-8, err_msg=msg)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_contingency_analysis_matches_lightsim2grid(init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _case14()
+    batch = ContingencyAnalysisCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = init_from_n
+    for line_id in range(N_ROWS):
+        batch.add_n1(line_id)
+    batch.compute(_v_batch(grid, init_from_n), MAX_IT, TOL_MVA)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, keep_outer_trace=True,
+                                init_from_n_powerflow=init_from_n, tol=TOL_MVA / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[i] for i in range(N_ROWS)])
+    ca.compute(batch_size=3)
+    n_bus = grid.get_Ybus_solver().shape[0]
+    _compare_with_batch(ca.V_results.to_numpy().reshape(N_ROWS, n_bus), np.asarray(ca.get_row_status()),
+                        ca.get_outer_results(), batch, grid, N_ROWS)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_injection_sweep_matches_lightsim2grid(init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
+    from gpusim2grid import InjectionSweepGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _case14()
+    rows = _rows(grid, trips=False)
+    batch = InjectionSweepCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = init_from_n
+    batch.modify_gen_p(rows["gen_p"])
+    batch.modify_load_p(rows["load_p"])
+    batch.modify_load_q(rows["load_q"])
+    batch.compute(_v_batch(grid, init_from_n), MAX_IT, TOL_MVA)
+    sw = InjectionSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, keep_outer_trace=True,
+                           init_from_n_powerflow=init_from_n, tol=TOL_MVA / grid.get_sn_mva())
+    sw.set_injections_from_elements(rows["load_p"], rows["load_q"], rows["gen_p"])
+    sw.compute(batch_size=3)
+    n_bus = grid.get_Ybus_solver().shape[0]
+    _compare_with_batch(sw.V_results.to_numpy().reshape(N_ROWS, n_bus), np.asarray(sw.get_row_status()),
+                        sw.get_outer_results(), batch, grid, N_ROWS)
+
+
+def test_scenario_sweep_resumes_from_the_n_solve(case14):
+    if not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = case14
+    rows = _rows(grid)
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    batch = ScenarioSweepCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = True
+    batch.modify_gen_p(rows["gen_p"])
+    batch.modify_load_p(rows["load_p"])
+    batch.modify_load_q(rows["load_q"])
+    mask = np.zeros((N_ROWS, len(grid.get_lines())), dtype=bool)
+    for i, lines in enumerate(rows["lines"]):
+        mask[i, lines] = True
+    batch.set_contingency_lines(mask)
+    batch.compute(_v_batch(grid, True), MAX_IT, TOL_MVA)
+    sw = _gpu(grid, rows, 3, init_from_n_powerflow=True, keep_outer_trace=True)
+    _compare_with_batch(_V(sw, grid, N_ROWS), np.asarray(sw.get_row_status()),
+                        sw.get_outer_results(), batch, grid, N_ROWS)

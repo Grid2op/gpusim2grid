@@ -104,7 +104,23 @@ enum class LimitViolationType  : int {
     // less than that limit: OpenLoadFlow would have left it in AC emulation. element_type
     // HVDC, side the direction it is frozen in, value that flow, limit the pmax, MW.
     // Written by check_hvdc_p_violations_kernel.
-    HVDC_AC_EMULATION_RELEASE = 15
+    HVDC_AC_EMULATION_RELEASE = 15,
+    // The types 16-20 mirror lightsim2grid's outer-loop detection (LimitViolation.hpp,
+    // ViolationCategory::CONTROL); no gpusim2grid kernel writes them yet.
+    // The single slack bus absorbed more than OpenLoadFlow's slackBusPMaxMismatch: its
+    // DistributedSlack loop would share it. element_type GRID, value the mismatch and
+    // limit the threshold, MW.
+    SLACK_MISMATCH = 16,
+    // A phase tap changer regulating the active power of one side off its target by more
+    // than its deadband (TRAFO, value / limit in MW).
+    PHASE_CONTROL_P = 17,
+    // A phase tap changer limiting the current of one side above that limit (TRAFO, A).
+    PHASE_LIMITER_CURRENT = 18,
+    // A bus that ratio tap changers regulate off their target by more than half the
+    // deadband (BUS, kV).
+    TRANSFORMER_VOLTAGE_DEADBAND = 19,
+    // A bus that shunt sections regulate off its target (BUS, kV).
+    SHUNT_VOLTAGE_CONTROL = 20
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -113,12 +129,14 @@ enum class LimitViolationType  : int {
 //   PHYSICAL    : a limit of the equipment itself, which nothing can leave: the
 //                 converged solution is not physically realizable (LOW_Q,
 //                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
-//                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
-//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
-//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL,
-//                 HVDC_AC_EMULATION_RELEASE).
+//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
-enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
+//   CONTROL     : a control or automaton the solution did not apply; the state is
+//                 reachable, just not the one the controls settle in
+//                 (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
+//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
+//                 HVDC_AC_EMULATION_RELEASE and the types 16-20).
+enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2, CONTROL = 3 };
 
 inline ViolationCategory violation_category(LimitViolationType t) noexcept
 {
@@ -131,14 +149,20 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::HIGH_Q:
         case LimitViolationType::HVDC_P_SATURATION:   // == HIGH_P
         case LimitViolationType::LOW_P:
+        case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
+        case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
+            return ViolationCategory::PHYSICAL;
         case LimitViolationType::LOW_VOLTAGE_AT_MIN_Q:
         case LimitViolationType::HIGH_VOLTAGE_AT_MAX_Q:
         case LimitViolationType::LOW_VOLTAGE_SVC_STANDBY:
         case LimitViolationType::HIGH_VOLTAGE_SVC_STANDBY:
-        case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
-        case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
         case LimitViolationType::HVDC_AC_EMULATION_RELEASE:
-            return ViolationCategory::PHYSICAL;
+        case LimitViolationType::SLACK_MISMATCH:
+        case LimitViolationType::PHASE_CONTROL_P:
+        case LimitViolationType::PHASE_LIMITER_CURRENT:
+        case LimitViolationType::TRANSFORMER_VOLTAGE_DEADBAND:
+        case LimitViolationType::SHUNT_VOLTAGE_CONTROL:
+            return ViolationCategory::CONTROL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;
     }

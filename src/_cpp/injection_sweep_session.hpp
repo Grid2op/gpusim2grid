@@ -45,7 +45,8 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 #include "contingency/physical_checks_data.hpp"
-#include "contingency/row_status.hpp"   // BatchScheduling, RowStatus  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"   // BatchScheduling, RowStatus
+#include "outer/outer_hook.hpp"          // outer::OuterHook  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 
 #include <memory>
 #include <vector>
@@ -173,6 +174,8 @@ struct InjectionSweepSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
+    std::vector<double>               outer_gen_p_;  // the rows' generator targets (MW, row-major)
     // per-row set-points of the active-power check (set_gen_p_targets); empty
     // = the plan's base ones for every row
     RealMatRM gen_p_targets_;
@@ -333,6 +336,17 @@ struct InjectionSweepSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; see ScenarioSweepSession's): the model
+    // deciding on every row, built by the bridge off an NROuter_* grid.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    // the rows' generator targets (MW, n_rows x n_gen, row-major; empty: the grid's),
+    // what their loops start from
+    void set_outer_gen_p_rows(std::vector<double> gen_p) { outer_gen_p_ = std::move(gen_p); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);

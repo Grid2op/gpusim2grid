@@ -30,6 +30,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
+from .._outer_loops import _check_outer_loops_args
 from ._reactive_limits import ReactiveLimitsStatus
 
 __all__ = ["ContingencyAnalysisGPU", "optimize_reference_slack", "ReactiveLimitsStatus"]
@@ -245,7 +246,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         Newton iterations of the second pass; None = :attr:`nb_iter`. With
         the warm start, fewer usually suffice; a row that does not converge
         is ``DIVERGED`` and keeps its first pass. Mutable.
-    scheduling : {"chunked", "continuous"}, default "chunked"
+    scheduling : {"chunked", "continuous"} or None, default None
+        ``None``: ``"chunked"``, or ``"continuous"`` with ``outer_loops``.
         How the rows go through the batch. ``"chunked"``: ``ceil(n_rows /
         batch_size)`` chunks, every row runs exactly ``nb_iter`` Newton
         iterations. ``"continuous"``: ``batch_size`` slots; every
@@ -268,6 +270,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         lightsim2grid compares the same way but takes its ``tol`` in MVA
         (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
         build). Mutable.
+    outer_loops, keep_outer_trace : bool, default False
+        Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
+        row; see :class:`ScenarioSweepGPU`. Each contingency keeps the grid's targets. With
+        ``init_from_n_powerflow`` (default) the rows resume from where the
+        grid's own solve left its loops. :meth:`get_outer_results`.
 
     Examples
     --------
@@ -298,9 +305,18 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                  compute_physical_violations=False, redistribute_slack=False,
                  reference_slack="auto", reactive_limits_outer_loop=False,
                  outer_loop_min_last_chunk=250, outer_loop_warm_start=True,
-                 outer_loop_nb_iter=None, scheduling="chunked", nb_iter_per_round=1,
-                 tol=None):
+                 outer_loop_nb_iter=None, scheduling=None, nb_iter_per_round=1,
+                 tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        self._outer_loops = bool(outer_loops)
+        if scheduling is None:
+            scheduling = "continuous" if self._outer_loops else "chunked"
+        if self._outer_loops:
+            _check_outer_loops_args(grid, use_bridge, scheduling,
+                                    handle_disconnected_grid=handle_disconnected_grid,
+                                    redistribute_slack=redistribute_slack,
+                                    compute_physical_violations=compute_physical_violations,
+                                    reactive_limits_outer_loop=reactive_limits_outer_loop)
         # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
         # built (lazily) from the same grid with the same construction options
         self._rl_ctor_kwargs = dict(
@@ -365,7 +381,23 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
-            if use_bridge:
+            if self._outer_loops:
+                # the grid's own outer loops (see ScenarioSweepGPU's outer_loops);
+                # every contingency keeps the grid's targets
+                session = _cpp._make_ca_outer_session_from_lsgrid(
+                    grid, 100, int(nb_iter), _normalize_device(device),
+                    bool(compute_limit_violations),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    keep_trace=bool(keep_outer_trace),
+                    resume_from_n=bool(init_from_n_powerflow))
+                self._inner = _ContingencyAnalysisSolver._wrap_session(
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
+                self._n_branches = self._inner._s.n_branches
+            elif use_bridge:
                 # Zero-copy: extract everything in C++ off the solved LSGrid
                 # (no scipy CSR marshalling, branch data set automatically).
                 # When compute_limit_violations is True, the bridge also pulls
@@ -493,6 +525,20 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         self._inner.build_contingencies(branch_ids_per_ctg)
         self._ctg_branch_ids = [list(map(int, ids)) for ids in branch_ids_per_ctg]
+
+    @property
+    def outer_loops(self):
+        """bool: whether the grid's own outer loops run on every contingency (see
+        :class:`ScenarioSweepGPU`'s ``outer_loops``; each contingency keeps the
+        grid's targets)."""
+        return self._outer_loops
+
+    def get_outer_results(self):
+        """Per contingency, the outcome of its outer loops (see
+        :meth:`ScenarioSweepGPU.get_outer_results`). Needs ``outer_loops=True``."""
+        if not self._outer_loops:
+            raise RuntimeError("get_outer_results() needs outer_loops=True")
+        return self._inner._s.get_outer_results()
 
     def compute(self, batch_size=512):
         """Solve every contingency and return the batched voltages.

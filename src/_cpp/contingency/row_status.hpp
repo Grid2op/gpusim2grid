@@ -35,6 +35,11 @@ enum class RowStatus : int {
     MaxIter      = 1,   // nb_iter budget used, residual finite but >= tol
     Diverged     = 2,   // residual not finite
     NotSimulated = 3,   // dropped by the pre-check, never solved
+    // The outer loops (outer/outer_hook.hpp). MaxIter / Diverged then say the
+    // row's LAST inner solve failed.
+    OuterFailed   = 4,  // a loop failed (e.g. a slack mismatch it could not share)
+    OuterUnstable = 5,  // max_outer_iterations reached
+    Unrealistic   = 6,  // converged to an unrealistic voltage
 };
 
 // Default convergence tolerance of a row, ||F||inf < tol with F in per unit

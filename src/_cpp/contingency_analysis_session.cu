@@ -233,6 +233,19 @@ void ContingencyAnalysisSession::run()
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
     if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+    if (outer_) {
+        auto refuse = [](const std::string& what) {
+            throw std::runtime_error("ContingencyAnalysisSession: the outer loops do not support " + what + " yet");
+        };
+        if (!continuous)
+            throw std::runtime_error("ContingencyAnalysisSession: the outer loops need scheduling='continuous'");
+        if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
+            refuse("a strategy other than 'direct_refactor_every'");
+        if (phys_.compute_physical_violations) refuse("compute_physical_violations");
+        if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
+        if (handle_disconnected_grid_) refuse("handle_disconnected_grid");
+        if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
+    }
 
     // Automatic reference slack: the participant the fewest contingencies
     // strand; a change moves it in the ledger and rebuilds the base state.
@@ -260,8 +273,9 @@ void ContingencyAnalysisSession::run()
         // lightsim2grid's held controllers (set_hold_frozen_regulators) are
         // pinned on every contingency, as in the grid's own solve (AcPfNrState
         // pins them too)
+        // (the outer loops pin every held controller per slot themselves)
         std::vector<std::pair<int, double>> held_pins;
-        for (size_t j = 0; j < base_state_->h_vc_held.size(); ++j)
+        for (size_t j = 0; j < base_state_->h_vc_held.size() && !outer_; ++j)
             if (base_state_->h_vc_held[j])
                 held_pins.emplace_back(static_cast<int>(j), base_state_->h_vc_q_held[j]);
         for (auto& ctg : contingencies_) {
@@ -289,6 +303,8 @@ void ContingencyAnalysisSession::run()
         // Continuous: batch_size_ slots, never more than the simulated rows.
         used_batch_size_ = continuous ? std::max(1, std::min(batch_size_, source.n_active()))
                                       : source.used_batch_size();
+        // the outer loops correct each row's Sbus: one per slot
+        source.slot_sbus_ = static_cast<bool>(outer_);
 
         // redistribute_slack: the pre-pass of what each contingency's island took
         // out, on the masks the source just computed -- handed to the source
@@ -403,6 +419,10 @@ void ContingencyAnalysisSession::run()
     // compute_limit_violations_ is set, the compact violation buffers too —
     // see check_limit_violations_kernel in _solve_chunk).
     // solve() carries preprocess/alloc/analysis timings from the ctor.
+    // The outer loops: the model decides on every row (a contingency keeps the
+    // grid's targets).
+    solver_->outer_hook_ = outer_.get();
+    if (outer_) outer_->set_row_targets(static_cast<int>(contingencies_.size()), {}, {});
     timings_ = solver_->solve();
 
     // Wire in base-case and one-time setup timings captured before/during

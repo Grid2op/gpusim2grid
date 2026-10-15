@@ -72,7 +72,8 @@ InjectionSweepSession::InjectionSweepSession(
     (void)slack_weights;
     // lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned per
     // row by the mask streams, which an injection sweep does not have
-    if (ledger != nullptr)
+    // (the outer loops pin every held controller per slot themselves)
+    if (ledger != nullptr && !ledger->outer_loops)
         for (int h : ledger->vc_held)
             if (h)
                 throw std::runtime_error(
@@ -196,6 +197,18 @@ void InjectionSweepSession::run()
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
     if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+    if (outer_) {
+        auto refuse = [](const std::string& what) {
+            throw std::runtime_error("InjectionSweepSession: the outer loops do not support " + what + " yet");
+        };
+        if (!continuous)
+            throw std::runtime_error("InjectionSweepSession: the outer loops need scheduling='continuous'");
+        if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
+            refuse("a strategy other than 'direct_refactor_every'");
+        if (phys_.compute_physical_violations) refuse("compute_physical_violations");
+        if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
+        if (has_gen_v_)             refuse("set_gen_v");
+    }
 
     // Hot run: same settings and row count as the live driver -- keep it
     // (allocations, cuDSS ANALYSIS, the policy's factorization state); new
@@ -299,6 +312,10 @@ void InjectionSweepSession::run()
         gen_p_targets_dirty_ = false;
         gen_pv_release_targets_dirty_ = false;
     }
+
+    // The outer loops: the model decides on every row, from the rows' own targets.
+    solver_->outer_hook_ = outer_.get();
+    if (outer_) outer_->set_row_targets(n_scenarios_, outer_gen_p_, {});
 
     timings_ = solver_->solve();
     if (!cold) {

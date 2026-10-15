@@ -66,6 +66,7 @@
 #include "physical_checks_data.hpp"               // PhysicalSetupKey
 #include "row_status.hpp"                         // BatchScheduling, RowStatus
 #include "slot_schedule.cuh"                      // SlotLoadView, SlotTableView, PinnedBuffer
+#include "../outer/outer_hook.hpp"                // outer::OuterHook
 #include "strategies/cudss_batch_solver.cuh"
 #include "strategies/policy_refactor_every.cuh"
 #include "strategies/policy_base_case_factors.cuh"
@@ -600,6 +601,17 @@ struct BatchPfDriver {
     std::vector<int> row_status_;
 
     // -------------------------------------------------------------------------
+    // Outer loops (outer/outer_hook.hpp, docs/dev_notes/continuous_batching.md
+    // Part B): null, or the model deciding on every converged row. Continuous
+    // scheduling only. Not owned: the session keeps it alive across solve().
+    // A row stays in its slot until the model is done with it: when its loops
+    // act, the slot's control state is rewritten and the row re-solved in
+    // place, from its converged V. row_iters_ then holds the iterations of the
+    // row's LAST inner solve.
+    // -------------------------------------------------------------------------
+    outer::OuterHook* outer_hook_ = nullptr;
+
+    // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
     //   base_state       — must outlive this object; cuDSS ANALYSIS already done.
@@ -977,6 +989,32 @@ private:
     int _orig_row(int a) const { return h_a2o_.empty() ? a : h_a2o_[static_cast<size_t>(a)]; }
 
     void _solve_chunk(int c_start, int actual_batch, BatchTimings& t);
+
+    // ---- outer loops: the per-slot control state on the device -------------
+    // Dense per slot, mirrored on the host ([S * n] each, outer::SlotControls'
+    // layout); the gather buffer of the converged slots ([S * oc_stride_]:
+    // V, V.conj(Ibus), Sbus at the watched buses, controller Q, unrealistic flag).
+    thrust::device_vector<unsigned char>  d_oc_pin_, d_oc_plan_held_;
+    thrust::device_vector<cuda_real_type> d_oc_held_q_, d_oc_vset_;
+    thrust::device_vector<int>            d_oc_hvdc_;
+    std::vector<unsigned char>            h_oc_pin_, h_oc_plan_held_;
+    std::vector<cuda_real_type>           h_oc_held_q_, h_oc_vset_;
+    std::vector<int>                      h_oc_hvdc_;
+    thrust::device_vector<int>            d_oc_watch_, d_oc_cand_bus_, d_oc_cand_pin_, d_oc_list_;
+    thrust::device_vector<cuda_real_type> d_oc_gather_;
+    PinnedBuffer<cuda_real_type>          h_oc_gather_;
+    thrust::device_vector<int>            d_oc_ds_slot_, d_oc_ds_bus_, d_oc_vr_slot_, d_oc_vr_bus_;
+    thrust::device_vector<cuda_real_type> d_oc_ds_p_, d_oc_ds_q_, d_oc_vr_vm_;
+    int oc_stride_ = 0;
+    // sizes the buffers for this solve (outer_hook_ set)
+    void _oc_setup();
+    // the hook's control state of `slots` to the device; with `reload_sbus`
+    // their Sbus rows are first re-read from the source (a re-entering row:
+    // its previous correction is replaced, not added to). Applies the slots'
+    // pending |V| resets.
+    void _oc_write_controls(const std::vector<int>& slots, bool reload_sbus);
+    // the converged slots `slots` gathered to the host; returns the row stride
+    void _oc_gather(const std::vector<int>& slots, const NrIterBuffers& buf);
 
     // Building blocks shared by the chunked and the continuous schedules (see
     // their definitions in batch_pf_driver.cu). d_slot_active: [n_slots] the

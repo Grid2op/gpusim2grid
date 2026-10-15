@@ -200,7 +200,7 @@ def test_frozen_line_release(solver_atol, p0, released):
     assert len(n) == len(ls_n) == int(released)
     for v, el in zip(n, ls_n):
         assert v.violation_type == LimitViolationType.HVDC_AC_EMULATION_RELEASE
-        assert v.category == ViolationCategory.PHYSICAL
+        assert v.category == ViolationCategory.CONTROL
         assert (v.element_id, v.side) == (el.element_id, el.side) == (0, 1)
         np.testing.assert_allclose(v.value, el.value, atol=atol_mw)
         np.testing.assert_allclose(v.limit, 15., atol=atol_mw)

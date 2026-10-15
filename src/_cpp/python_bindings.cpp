@@ -17,6 +17,7 @@
 
 #ifdef GPUSIM2GRID_HAVE_LS2G
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
+#include "outer/ls2g_outer_model.hpp"        // the outer-loop model (test harness)
 #include "ledger_extend.hpp"                 // move_reference (test hook)
 #include "Ls2gAbiTag.hpp"                    // ls2g_current_abi_tag, core_abi_tag
 #endif
@@ -24,6 +25,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <pybind11/complex.h>
 #include <pybind11/eigen.h>
 
 #include <optional>
@@ -1393,11 +1395,41 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .value("Continuous", BatchScheduling::Continuous,
              "batch_size slots; a row leaves as soon as it converged (residual < tol), "
              "diverged or used its nb_iter budget, and its slot is refilled at once.");
+  pybind11::class_<outer::RowResult>(m, "OuterRowResult",
+      "The outcome of one row's outer loops (lightsim2grid's OuterRowResult).")
+      .def_readonly("status", &outer::RowResult::status,
+                    "OuterLoopStatus: 0 STABLE, 1 UNSTABLE (max_outer_iterations), 2 FAILED; -1 never ran")
+      .def_readonly("unrealistic_state", &outer::RowResult::unrealistic)
+      .def_readonly("failed_loop", &outer::RowResult::failed_loop)
+      .def_readonly("nb_outer_iterations", &outer::RowResult::nb_outer_iterations)
+      .def_readonly("nb_nr_iterations", &outer::RowResult::nb_nr_iterations,
+                    "Newton iterations summed over every inner solve, at least 1 per solve")
+      .def_property_readonly("gen_target_p", [](const outer::RowResult& r) {
+            std::vector<std::pair<int, double>> out;
+            for (size_t k = 0; k < r.gen_ids.size(); ++k) out.emplace_back(r.gen_ids[k], r.gen_target_p_mw[k]);
+            return out;
+        }, "(generator id, MW): the target a loop (DistributedSlack) moved it to")
+      .def_property_readonly("storage_target_p", [](const outer::RowResult& r) {
+            std::vector<std::pair<int, double>> out;
+            for (size_t k = 0; k < r.storage_ids.size(); ++k) out.emplace_back(r.storage_ids[k], r.storage_target_p_mw[k]);
+            return out;
+        }, "(storage id, MW, load convention): the same for the storage units")
+      .def_property_readonly("hvdc_regime", [](const outer::RowResult& r) {
+            std::vector<std::pair<int, int>> out;
+            for (size_t k = 0; k < r.hvdc_ids.size(); ++k) out.emplace_back(r.hvdc_ids[k], r.hvdc_regime[k]);
+            return out;
+        }, "(hvdc line id, regime) where AcHvdcAcEmulationLimits changed it")
+      .def_readonly("decisions", &outer::RowResult::decisions,
+                    "the decision trace, when the session keeps it (keep_trace)");
+
   pybind11::enum_<RowStatus>(m, "RowStatus")
       .value("Converged",    RowStatus::Converged,    "||F||inf < tol")
       .value("MaxIter",      RowStatus::MaxIter,      "nb_iter budget used, residual >= tol")
       .value("Diverged",     RowStatus::Diverged,     "residual not finite")
-      .value("NotSimulated", RowStatus::NotSimulated, "dropped by the pre-check, never solved");
+      .value("NotSimulated", RowStatus::NotSimulated, "dropped by the pre-check, never solved")
+      .value("OuterFailed",   RowStatus::OuterFailed,   "an outer loop failed")
+      .value("OuterUnstable", RowStatus::OuterUnstable, "max_outer_iterations reached")
+      .value("Unrealistic",   RowStatus::Unrealistic,   "converged to an unrealistic voltage");
 
   pybind11::enum_<ContingencySolverType>(m, "ContingencySolverType")
       .value("DirectRefactorEvery",   ContingencySolverType::DirectRefactorEvery,
@@ -1604,6 +1636,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy per-contingency ||F||inf residuals to host: (n_contingencies,) float64.")
     .def("get_row_iterations", &ContingencyAnalysisSession::get_row_iterations,
          "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def_property_readonly("has_outer_model", &ContingencyAnalysisSession::has_outer_model,
+                   "Whether the outer loops (lightsim2grid's NROuter_* ones) decide on every row.")
+    .def("get_outer_results", [](const ContingencyAnalysisSession& s) {
+            const outer::OuterHook* m = s.outer_model();
+            if (m == nullptr)
+                throw std::runtime_error("no outer loops on this session");
+            std::vector<outer::RowResult> out;
+            for (int r = 0; r < m->n_rows(); ++r) out.push_back(m->row_result(r));
+            return out;
+        },
+        "Per row (original order), the outcome of its outer loops after the last run() "
+        "(lightsim2grid's OuterRowResult).")
     .def("get_row_status", &ContingencyAnalysisSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("overwrite_row_outcomes", &ContingencyAnalysisSession::overwrite_row_outcomes,
@@ -1941,6 +1985,22 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
     .def("get_row_iterations", &InjectionSweepSession::get_row_iterations,
          "(n_scenarios,) int: Newton iterations each row ran in the last run().")
+    .def_property_readonly("has_outer_model", &InjectionSweepSession::has_outer_model,
+                   "Whether the outer loops (lightsim2grid's NROuter_* ones) decide on every row.")
+    .def("get_outer_results", [](const InjectionSweepSession& s) {
+            const outer::OuterHook* m = s.outer_model();
+            if (m == nullptr)
+                throw std::runtime_error("no outer loops on this session");
+            std::vector<outer::RowResult> out;
+            for (int r = 0; r < m->n_rows(); ++r) out.push_back(m->row_result(r));
+            return out;
+        },
+        "Per row (original order), the outcome of its outer loops after the last run() "
+        "(lightsim2grid's OuterRowResult).")
+    .def("set_outer_gen_p_rows", [](InjectionSweepSession& s, std::vector<double> gen_p) {
+            s.set_outer_gen_p_rows(std::move(gen_p)); },
+        "The rows' generator targets (MW, row-major n_rows x n_gen; empty: the grid's), "
+        "what their outer loops start from.")
     .def("get_row_status", &InjectionSweepSession::get_row_status,
          "(n_scenarios,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &InjectionSweepSession::get_or_amps,
@@ -2339,6 +2399,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "budget (takes effect on the next run())")
     .def_readwrite("scheduling", &ScenarioSweepSession::scheduling_,
                    "BatchScheduling (takes effect on the next run())")
+    .def_property_readonly("has_outer_model", &ScenarioSweepSession::has_outer_model,
+                   "Whether the outer loops (lightsim2grid's NROuter_* ones) decide on every row.")
+    .def("get_outer_results", [](const ScenarioSweepSession& s) {
+            const outer::OuterHook* m = s.outer_model();
+            if (m == nullptr)
+                throw std::runtime_error("ScenarioSweepSession: no outer loops (build the session "
+                                         "with _make_ss_outer_session_from_lsgrid)");
+            std::vector<outer::RowResult> out;
+            for (int r = 0; r < m->n_rows(); ++r) out.push_back(m->row_result(r));
+            return out;
+        },
+        "Per row (original order), the outcome of its outer loops after the last run() "
+        "(lightsim2grid's OuterRowResult).")
     .def_readwrite("nb_iter_per_round", &ScenarioSweepSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
@@ -3017,13 +3090,166 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "grid; only the numeric injections differ. Used by the differentiable "
         "power-flow path.");
 
+    // Test-only: the outer-loop model driven from Python, its inner solves done by
+    // the caller (tests/python/test_outer_model_cpu.py checks the host port of
+    // lightsim2grid's loops without a GPU).
+    struct OuterModelHarness {
+        OuterInputs in;
+        std::shared_ptr<outer::OuterHook> model;
+    };
+    pybind11::class_<OuterModelHarness>(m, "_OuterModelHarness")
+        .def(pybind11::init([](pybind11::object grid_py, bool keep_trace, bool resume_from_n) {
+                ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+                OuterModelHarness h;
+                h.in = extract_outer_inputs(grid, resume_from_n);
+                outer::Ls2gModelOptions opt;
+                opt.keep_trace = keep_trace;
+                opt.resume_from_n = resume_from_n;
+                h.model = outer::make_ls2g_outer_model(grid, h.in.ledger, opt);
+                return h;
+            }), pybind11::arg("grid"), pybind11::arg("keep_trace") = true,
+            pybind11::arg("resume_from_n") = false)
+        .def_property_readonly("V0", [](const OuterModelHarness& h) { return h.in.V0; })
+        .def_property_readonly("slack", [](const OuterModelHarness& h) { return h.in.slack; })
+        .def_property_readonly("pv", [](const OuterModelHarness& h) { return h.in.pv; })
+        .def_property_readonly("pq", [](const OuterModelHarness& h) { return h.in.pq; })
+        .def_property_readonly("pin_bus", [](const OuterModelHarness& h) { return h.model->layout().pin_bus; })
+        .def_property_readonly("watch_bus", [](const OuterModelHarness& h) { return h.model->layout().watch_bus; })
+        .def_property_readonly("realistic_bus", [](const OuterModelHarness& h) { return h.model->layout().realistic_bus; })
+        .def_property_readonly("vm_col_of_bus", [](const OuterModelHarness& h) { return h.in.ledger.vm_col_of_bus; })
+        .def_property_readonly("n_ctrl", [](const OuterModelHarness& h) { return h.model->layout().n_ctrl; })
+        .def_property_readonly("ledger", [](const OuterModelHarness& h) {
+                const LedgerData& L = h.in.ledger;
+                pybind11::dict d;
+                d["p_row_of_bus"] = L.p_row_of_bus;   d["q_row_of_bus"] = L.q_row_of_bus;
+                d["theta_col_of_bus"] = L.theta_col_of_bus; d["vm_col_of_bus"] = L.vm_col_of_bus;
+                d["vc_bus"] = L.vc_bus; d["vc_kind"] = L.vc_kind; d["vc_group"] = L.vc_group;
+                d["vc_slope"] = L.vc_slope; d["vc_weight"] = L.vc_weight; d["vc_q_held"] = L.vc_q_held;
+                d["vc_reg_bus"] = L.vc_reg_bus; d["vc_grp_start"] = L.vc_grp_start;
+                d["vc_grp_count"] = L.vc_grp_count; d["vc_v_set"] = L.vc_v_set;
+                d["hvdc_bus1"] = L.hvdc_bus1; d["hvdc_bus2"] = L.hvdc_bus2; d["hvdc_p0"] = L.hvdc_p0;
+                d["hvdc_k"] = L.hvdc_k; d["hvdc_lf1"] = L.hvdc_lf1; d["hvdc_lf2"] = L.hvdc_lf2;
+                d["hvdc_r"] = L.hvdc_r; d["hvdc_pmax12"] = L.hvdc_pmax12; d["hvdc_pmax21"] = L.hvdc_pmax21;
+                return d;
+            })
+        .def("set_row_targets", [](OuterModelHarness& h, int n_rows, std::vector<double> gen_p) {
+                h.model->set_row_targets(n_rows, std::move(gen_p), {});
+            })
+        .def("begin", [](OuterModelHarness& h, int n_slots, int n_rows) { h.model->begin(n_slots, n_rows); })
+        .def("load", [](OuterModelHarness& h, int slot, int row) { h.model->load(slot, row); })
+        .def("controls", [](OuterModelHarness& h, int slot) {
+                const outer::SlotControls& c = h.model->controls(slot);
+                pybind11::dict d;
+                d["pin"] = std::vector<int>(c.pin.begin(), c.pin.end());
+                d["held_q"] = c.held_q;
+                d["plan_held"] = std::vector<int>(c.plan_held.begin(), c.plan_held.end());
+                d["v_set"] = c.v_set;
+                d["hvdc_status"] = c.hvdc_status;
+                d["sbus_bus"] = c.sbus_bus;
+                d["sbus_dp"] = c.sbus_dp;
+                d["sbus_dq"] = c.sbus_dq;
+                d["vm_reset_bus"] = c.vm_reset_bus;
+                d["vm_reset_vm"] = c.vm_reset_vm;
+                return d;
+            })
+        .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
+        .def("on_solved", [](OuterModelHarness& h, int slot, bool converged, int nr_iter, int inner_status,
+                             std::vector<std::complex<double>> V, std::vector<std::complex<double>> S,
+                             std::vector<std::complex<double>> Sb, std::vector<double> vc_q, bool unrealistic) {
+                std::vector<double> vr, vi, sr, si, br, bi;
+                for (auto z : V)  { vr.push_back(z.real()); vi.push_back(z.imag()); }
+                for (auto z : S)  { sr.push_back(z.real()); si.push_back(z.imag()); }
+                for (auto z : Sb) { br.push_back(z.real()); bi.push_back(z.imag()); }
+                outer::SlotData d;
+                d.v_re = vr.data(); d.v_im = vi.data(); d.s_re = sr.data(); d.s_im = si.data();
+                d.sb_re = br.data(); d.sb_im = bi.data(); d.vc_q = vc_q.data(); d.unrealistic = unrealistic;
+                int row_status = inner_status;
+                const outer::Next next = h.model->on_solved(slot, converged, nr_iter, inner_status,
+                                                            converged ? &d : nullptr, row_status);
+                return std::make_pair(static_cast<int>(next), row_status);
+            })
+        .def("row_result", [](const OuterModelHarness& h, int row) { return h.model->row_result(row); });
+
+    m.def("_make_ca_outer_session_from_lsgrid",
+        [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
+           ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+           bool keep_trace, bool resume_from_n) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_ca_outer_session_from_lsgrid(
+                grid, batch_size, nb_iter, device, flag,
+                reordering_alg, matching_alg, pivot_epsilon_alg, keep_trace, resume_from_n);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("batch_size") = 100,
+        pybind11::arg("nb_iter") = 10,
+        pybind11::arg("device") = -1,
+        pybind11::arg("compute_limit_violations") = false,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
+        pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("keep_trace") = false,
+        pybind11::arg("resume_from_n") = false,
+        "A ContingencyAnalysisSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
+
+    m.def("_make_is_outer_session_from_lsgrid",
+        [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
+           ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+           bool keep_trace, bool resume_from_n) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_is_outer_session_from_lsgrid(
+                grid, batch_size, nb_iter, device, flag,
+                reordering_alg, matching_alg, pivot_epsilon_alg, keep_trace, resume_from_n);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("batch_size") = 100,
+        pybind11::arg("nb_iter") = 10,
+        pybind11::arg("device") = -1,
+        pybind11::arg("with_branch_data") = true,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
+        pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("keep_trace") = false,
+        pybind11::arg("resume_from_n") = false,
+        "An InjectionSweepSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
+
+    m.def("_make_ss_outer_session_from_lsgrid",
+        [](pybind11::object grid_py, int batch_size, int nb_iter, int device,
+           bool compute_limit_violations, ReorderingAlg reordering_alg,
+           MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, bool keep_trace,
+           bool resume_from_n) {
+            ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            return make_ss_outer_session_from_lsgrid(
+                grid, batch_size, nb_iter, device, compute_limit_violations,
+                reordering_alg, matching_alg, pivot_epsilon_alg, keep_trace, resume_from_n);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("batch_size") = 100,
+        pybind11::arg("nb_iter") = 10,
+        pybind11::arg("device") = -1,
+        pybind11::arg("compute_limit_violations") = false,
+        pybind11::arg("reordering_alg") = ReorderingAlg::Default,
+        pybind11::arg("matching_alg") = MatchingAlg::None,
+        pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("keep_trace") = false,
+        pybind11::arg("resume_from_n") = false,
+        "A ScenarioSweepSession running the grid's outer loops (its algorithm an "
+        "NROuter_* one, solved): continuous scheduling; each row starts from the grid's "
+        "voltages, its generators' buses at their set-points, and default controls. "
+        "nb_iter is the iteration budget of each inner solve.");
+
     m.attr("have_ls2g_bridge") = true;
+    // the outer loops need lightsim2grid's NROuter_* (branch dev_outer_batch_perf)
+    m.attr("have_ls2g_outer_loops") = bridge_has_outer_loops();
+    // ... and resuming its rows from the grid's own solve needs its loops' state
+    m.attr("have_ls2g_outer_resume") = outer::ls2g_outer_resume_available();
     // the PQ -> PV release plan needs lightsim2grid PR #216 (can_be_pv)
     m.attr("have_ls2g_gen_pv_release") = bridge_has_gen_pv_release();
     // the held controllers need lightsim2grid PR #220 (set_hold_frozen_regulators)
     m.attr("have_ls2g_hold_frozen") = bridge_has_hold_frozen();
 #else
     m.attr("have_ls2g_bridge") = false;
+    m.attr("have_ls2g_outer_loops") = false;
+    m.attr("have_ls2g_outer_resume") = false;
     m.attr("have_ls2g_gen_pv_release") = false;
     m.attr("have_ls2g_hold_frozen") = false;
 #endif

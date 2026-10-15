@@ -147,6 +147,10 @@ struct InjectionBatch {
                     CudaTimer&            timer,
                     BatchTimings&         t);
 
+    // The listed slots' Sbus rows read again from the rows (the outer loops: a row
+    // re-solved in place gets its own Sbus back before its new correction).
+    void reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView& L, cudaStream_t cs);
+
     // -------------------------------------------------------------------------
     // bind_slots — point the NrIterBuffers at this batch's per-slot data: the
     // VoltageControl set-points a gen_v column drives (base's shared array

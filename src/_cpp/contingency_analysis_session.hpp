@@ -38,6 +38,7 @@
 #include "contingency_analysis_helper.hpp"
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
+#include "outer/outer_hook.hpp"                  // outer::OuterHook
 #include "ledger_data.hpp"                      // LedgerData (the stored base ledger)
 #include "slack_redistribution.hpp"              // SlackRedistributionData, slack_redistribution::RowResult
 #include "reordering_alg.hpp"
@@ -188,6 +189,7 @@ struct ContingencyAnalysisSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
 
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
     // the participants snapshot, the base injections the pre-pass reads a
@@ -400,6 +402,14 @@ struct ContingencyAnalysisSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; see ScenarioSweepSession's): the model
+    // deciding on every row, built by the bridge off an NROuter_* grid.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);
