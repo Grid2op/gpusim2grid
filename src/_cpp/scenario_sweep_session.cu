@@ -1173,8 +1173,7 @@ void ScenarioSweepSession::run()
         auto refuse = [](const std::string& what) {
             throw std::runtime_error("ScenarioSweepSession: the outer loops do not support " + what + " yet");
         };
-        if (!continuous)
-            throw std::runtime_error("ScenarioSweepSession: the outer loops need scheduling='continuous'");
+        check_outer_loops_scheduling("ScenarioSweepSession", continuous, nb_iter_per_round_);
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
         if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
@@ -1182,7 +1181,6 @@ void ScenarioSweepSession::run()
             refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
         if (keep_final_jacobian_)   refuse("gradients (keep_final_jacobian)");
-        if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
     }
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)

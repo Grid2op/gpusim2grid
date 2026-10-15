@@ -173,8 +173,19 @@ def test_ample_reactive_limits_only_the_slack_is_shared():
 
 def test_refusals(case14):
     from gpusim2grid import ScenarioSweepGPU
-    with pytest.raises(ValueError, match="continuous"):
+    # by design, not planned: at construction and at a run, both being mutable
+    with pytest.raises(ValueError, match="continuous.*not planned"):
         ScenarioSweepGPU(case14, outer_loops=True, scheduling="chunked")
+    with pytest.raises(ValueError, match="nb_iter_per_round=1.*not planned"):
+        ScenarioSweepGPU(case14, outer_loops=True, nb_iter_per_round=2)
+    for name, value, match in (("scheduling", "chunked", "continuous.*not planned"),
+                               ("nb_iter_per_round", 2, "nb_iter_per_round=1.*not planned")):
+        sw = ScenarioSweepGPU(case14, outer_loops=True, init_from_n_powerflow=False)
+        rows = _rows(case14, n_rows=2)
+        sw.set_injections_from_elements(rows["load_p"], rows["load_q"], rows["gen_p"])
+        setattr(sw, name, value)
+        with pytest.raises(ValueError, match=match):
+            sw.compute(batch_size=2)
     with pytest.raises(ValueError, match="redistribute_slack"):
         ScenarioSweepGPU(case14, outer_loops=True, redistribute_slack=True)
     sw = ScenarioSweepGPU(case14, outer_loops=True, init_from_n_powerflow=False)

@@ -10,6 +10,8 @@ CPU base-case (N) power flow, and runs the batched contingencies on the GPU.
 It is a thin, batch-oriented facade over :class:`_ContingencyAnalysisSolver`.
 """
 
+import warnings
+
 import numpy as np
 
 from . import (
@@ -32,6 +34,22 @@ from .._ls2g_utils import (
 from .. import _gpusim2grid as _cpp
 from .._outer_loops import _check_outer_loops_args
 from ._reactive_limits import ReactiveLimitsStatus
+
+
+def _check_reactive_limits_outer_loop(value):
+    if bool(value) != value:
+        raise ValueError("The `reactive_limits_outer_loop` attribute must be a boolean.")
+    return bool(value)
+
+
+def _warn_reactive_limits_outer_loop_deprecated():
+    # stacklevel 3: the caller of the constructor / of the attribute assignment
+    warnings.warn(
+        "reactive_limits_outer_loop is deprecated and will be removed in a future version: "
+        "use outer_loops=True instead, which runs lightsim2grid's ReactiveLimits outer loop "
+        "(PV <-> PQ) on every row until it is stable, with the other default outer loops.",
+        DeprecationWarning, stacklevel=3)
+
 
 __all__ = ["ContingencyAnalysisGPU", "optimize_reference_slack", "ReactiveLimitsStatus"]
 
@@ -213,6 +231,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         and Python-fallback paths have no ledger and always solve the bare
         system.
     reactive_limits_outer_loop : bool, default False
+        .. deprecated:: 0.2.0
+            Use ``outer_loops=True``: lightsim2grid's own outer loops,
+            ``ReactiveLimits`` (PV <-> PQ) among them, run on every row until
+            they are stable.
+
         Opt-in: after the batch, re-solve ONCE the contingencies whose
         physical checks report a reactive-limit switch this loop handles --
         ``LOW_Q`` / ``HIGH_Q`` on a bus its own machines hold (switched to
@@ -257,12 +280,18 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         the iterations it needs, not the hardest row's. ``nb_iter`` is then
         each row's budget (a row runs a multiple of ``nb_iter_per_round``, at
         least one round). Continuous refuses the ``'direct_iter0_only'`` /
-        ``'direct_refactor_every_n'`` strategies. Mutable.
+        ``'direct_refactor_every_n'`` strategies. With ``outer_loops``, only
+        ``"continuous"`` is supported, by design (not planned to change): a
+        row the loops change is re-solved in its own slot while the others
+        go on, which a chunk cannot do. Mutable.
     nb_iter_per_round : int, default 1
         Continuous scheduling: iterations between two convergence checks. A
         check (one SpMV + mismatch) is cheap next to a refactorization, so 1
         is usually fastest: on case6515rte N-1, 1 / 2 / 4 took 6.7 / 8.6 /
-        9.2 s. Mutable.
+        9.2 s. With ``outer_loops``, only 1 is supported, by design (not
+        planned to change): each inner solve must stop at the iteration
+        lightsim2grid's does, so that the loops decide on the same state.
+        Mutable.
     tol : float or None, default None
         A row has converged when ``||F||inf < tol``, per unit like
         :meth:`last_residuals`: when it leaves (continuous) and its
@@ -272,7 +301,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         build). Mutable.
     outer_loops, keep_outer_trace : bool, default False
         Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
-        row; see :class:`ScenarioSweepGPU`. Each contingency keeps the grid's targets. With
+        row; see :class:`ScenarioSweepGPU`. Requires ``scheduling="continuous"`` and
+        ``nb_iter_per_round=1``, by design (neither is planned to change). Each contingency keeps the grid's targets. With
         ``init_from_n_powerflow`` (default) the rows resume from where the
         grid's own solve left its loops. :meth:`get_outer_results`.
 
@@ -312,7 +342,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if scheduling is None:
             scheduling = "continuous" if self._outer_loops else "chunked"
         if self._outer_loops:
-            _check_outer_loops_args(grid, use_bridge, scheduling,
+            _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     redistribute_slack=redistribute_slack,
                                     compute_physical_violations=compute_physical_violations,
                                     reactive_limits_outer_loop=reactive_limits_outer_loop)
@@ -330,7 +360,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._rl_ctx = None
         self._rl_result = None
         self._ctg_branch_ids = None
-        self.reactive_limits_outer_loop = reactive_limits_outer_loop
+        if reactive_limits_outer_loop:
+            _warn_reactive_limits_outer_loop_deprecated()
+        self._reactive_limits_outer_loop = _check_reactive_limits_outer_loop(reactive_limits_outer_loop)
         self.outer_loop_min_last_chunk = outer_loop_min_last_chunk
         self.outer_loop_warm_start = outer_loop_warm_start
         self.outer_loop_nb_iter = outer_loop_nb_iter
@@ -565,14 +597,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """bool: re-solve once, with the switches applied, the contingencies
         whose physical checks report a reactive-limit switch this loop handles
         (see the constructor's doc). Default False; takes effect on the next
-        :meth:`compute`."""
+        :meth:`compute`. Deprecated: use ``outer_loops=True``."""
         return self._reactive_limits_outer_loop
 
     @reactive_limits_outer_loop.setter
     def reactive_limits_outer_loop(self, value):
-        if bool(value) != value:
-            raise ValueError("The `reactive_limits_outer_loop` attribute must be a boolean.")
-        self._reactive_limits_outer_loop = bool(value)
+        value = _check_reactive_limits_outer_loop(value)
+        if value:
+            _warn_reactive_limits_outer_loop_deprecated()
+        self._reactive_limits_outer_loop = value
 
     @property
     def outer_loop_min_last_chunk(self):

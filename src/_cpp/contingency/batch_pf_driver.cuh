@@ -136,6 +136,29 @@ inline void check_continuous_scheduling(ContingencySolverType strategy,
 }
 
 // -----------------------------------------------------------------------------
+// check_outer_loops_scheduling -- what the outer loops need of the schedule, by
+// design (not planned to change): scheduling='continuous', since a row the loops
+// change is re-solved in its own slot while the other slots go on, which a
+// chunk (every row the same nb_iter iterations) cannot do; and
+// nb_iter_per_round == 1, since each inner solve must stop at the iteration
+// lightsim2grid's does, so that the loops decide on the same state.
+// Throws std::invalid_argument (ValueError in Python).
+// -----------------------------------------------------------------------------
+inline void check_outer_loops_scheduling(const char* session, bool continuous, int nb_iter_per_round)
+{
+    if (!continuous)
+        throw std::invalid_argument(
+            std::string(session) + ": the outer loops run on scheduling='continuous' only, by "
+            "design (a row the loops change is re-solved in its own slot while the others go "
+            "on, which a chunk cannot do); 'chunked' is not supported and is not planned to be");
+    if (nb_iter_per_round != 1)
+        throw std::invalid_argument(
+            std::string(session) + ": the outer loops need nb_iter_per_round=1, by design (each "
+            "inner solve must stop at the iteration lightsim2grid's does, so that the loops "
+            "decide on the same state); other values are not supported and are not planned to be");
+}
+
+// -----------------------------------------------------------------------------
 // BatchAdjoint — the batched transposed system Jᵀ λ = x̄ (one per batch slot),
 // built LAZILY by BatchPfDriver::solve_JT_batch on its first call and reused
 // by every later call (requirements: nothing exists until the first backward;

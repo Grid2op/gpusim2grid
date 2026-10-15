@@ -152,10 +152,14 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         the iterations it needs, not the hardest row's. ``nb_iter`` is then
         each row's budget (a row runs a multiple of ``nb_iter_per_round``, at
         least one round). Continuous refuses the ``'direct_iter0_only'`` /
-        ``'direct_refactor_every_n'`` strategies. Mutable.
+        ``'direct_refactor_every_n'`` strategies. With ``outer_loops``, only
+        ``"continuous"`` is supported, by design (not planned to change): a
+        row the loops change is re-solved in its own slot while the others
+        go on, which a chunk cannot do. Mutable.
     nb_iter_per_round : int, default 1
         Continuous scheduling: iterations between two convergence checks; see
-        :class:`ContingencyAnalysisGPU`. Mutable.
+:class:`ContingencyAnalysisGPU`. With ``outer_loops``, only 1 is
+        supported, by design (not planned to change). Mutable.
     tol : float or None, default None
         A row has converged when ``||F||inf < tol``, per unit like
         :meth:`last_residuals`: when it leaves (continuous) and its
@@ -165,7 +169,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         build). Mutable.
     outer_loops, keep_outer_trace : bool, default False
         Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
-        row; see :class:`ScenarioSweepGPU`. Each row's generator targets are the ones :meth:`set_injections_from_elements` gives. With
+        row; see :class:`ScenarioSweepGPU`. Requires ``scheduling="continuous"`` and
+        ``nb_iter_per_round=1``, by design (neither is planned to change). Each row's generator targets are the ones :meth:`set_injections_from_elements` gives. With
         ``init_from_n_powerflow`` (default) the rows resume from where the
         grid's own solve left its loops. :meth:`get_outer_results`.
 
@@ -206,7 +211,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         if scheduling is None:
             scheduling = "continuous" if self._outer_loops else "chunked"
         if self._outer_loops:
-            _check_outer_loops_args(grid, use_bridge, scheduling,
+            _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations)
 
         # Single source of truth, resolved once here and applied at

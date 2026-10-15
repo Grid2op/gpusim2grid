@@ -237,12 +237,10 @@ void ContingencyAnalysisSession::run()
         auto refuse = [](const std::string& what) {
             throw std::runtime_error("ContingencyAnalysisSession: the outer loops do not support " + what + " yet");
         };
-        if (!continuous)
-            throw std::runtime_error("ContingencyAnalysisSession: the outer loops need scheduling='continuous'");
+        check_outer_loops_scheduling("ContingencyAnalysisSession", continuous, nb_iter_per_round_);
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
-        if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
         if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
     }
 

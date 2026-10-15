@@ -108,7 +108,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         rebuilds its batch driver; its batched adjoint rebuilds each row's
         Jacobian from the converged voltages (``keep_final_jacobian`` is not
         needed there). ``None`` (default): ``"chunked"``, or ``"continuous"``
-        with ``outer_loops``.
+        with ``outer_loops``, which supports only ``"continuous"`` and
+        ``nb_iter_per_round=1`` (by design, see ``outer_loops``).
     outer_loops : bool, default False
         Run the grid's own outer loops on every row: lightsim2grid's
         ``NROuter_*`` algorithm (``grid.change_algorithm("NROuter_KLU")``, the
@@ -118,8 +119,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         robust mode, the realistic voltage band). The rows are solved on the
         GPU by its single-slack inner Newton; their loops decide on the host
         after each converged inner solve, and a row their loops change is
-        re-solved in place from its voltages. Continuous scheduling only;
-        ``nb_iter`` is the budget of each inner solve. Each row starts from
+        re-solved in place from its voltages; ``nb_iter`` is the budget of
+        each inner solve. Each row starts from
         the grid's voltages (its generator buses at their set-points) and the
         grid's controls, as a lightsim2grid batch without
         ``init_from_n_powerflow`` -- or, with ``init_from_n_powerflow=True``
@@ -132,7 +133,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         :meth:`set_injections_from_elements`; with the per-bus
         :meth:`set_injections` they start from the grid's (DistributedSlack's
         units, the capability curves ReactiveLimits reads), whatever the rows'
-        Sbus carries. ``nb_iter_per_round`` must be 1. A row's masked buses
+        Sbus carries. A row's masked buses
         (``handle_disconnected_grid``), the generators it disconnects
         (:meth:`set_contingency_gens`, which may only release a bus the loops
         reserved -- ReactiveLimits reserves every bus its own machines hold) and
@@ -140,6 +141,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         lightsim2grid's batch shows them. Not supported yet:
         ``redistribute_slack`` (the DistributedSlack loop does that job),
         ``compute_physical_violations``, gradients. See :meth:`get_outer_results`.
+        Requires ``scheduling="continuous"`` (the default with it) and
+        ``nb_iter_per_round=1``, by design -- neither ``"chunked"`` nor another
+        ``nb_iter_per_round`` is supported, nor planned to be: a row the loops
+        change is re-solved in its own slot while the others go on, which a
+        chunk (every row the same ``nb_iter`` iterations) cannot do, and each
+        inner solve must stop at the iteration lightsim2grid's does, so that
+        the loops decide on the same state.
     keep_outer_trace : bool, default False
         With ``outer_loops``: keep each row's decision trace
         (``get_outer_results()[i].decisions``, lightsim2grid's
@@ -193,7 +201,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         if scheduling is None:
             scheduling = "continuous" if self._outer_loops else "chunked"
         if self._outer_loops:
-            _check_outer_loops_args(grid, use_bridge, scheduling,
+            _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     redistribute_slack=redistribute_slack,
                                     compute_physical_violations=compute_physical_violations)
 

@@ -9,6 +9,8 @@ Change Log
   on every row (continuous scheduling), the inner solves on the GPU; ``get_outer_results()``.
 - [ADDED] ``outer_loops=True`` with ``handle_disconnected_grid``, ``set_contingency_gens`` and
   ``set_gen_v``: each row's loops see its masks, units off and set-points as lightsim2grid's do.
+- [IMPROVED] ``reactive_limits_outer_loop`` is deprecated: use ``outer_loops=True``, which runs
+  lightsim2grid's ``ReactiveLimits`` loop (PV <-> PQ) on every row until it is stable.
 - [FIXED] ``outer_loops=True`` with ``init_from_n_powerflow=False``: rows start at every voltage
   source's set-point (stations, SVCs, storage units too) and use the grid's Newton step scaling.
 - [ADDED] ``scheduling="continuous"`` on the three batch facades: a row leaves its slot once

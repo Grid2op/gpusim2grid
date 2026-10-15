@@ -33,6 +33,8 @@ from gpusim2grid import _gpusim2grid as _cpp
 
 pytestmark = [
     requires_gpu,
+    # the deprecated option is still what these tests pin
+    pytest.mark.filterwarnings("ignore:reactive_limits_outer_loop is deprecated:DeprecationWarning"),
     pytest.mark.skipif(not getattr(_cpp, "have_ls2g_hold_frozen", False),
                        reason="needs the bridge built against a lightsim2grid with "
                               "set_hold_frozen_regulators"),

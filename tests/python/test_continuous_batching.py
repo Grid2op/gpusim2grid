@@ -429,6 +429,7 @@ def test_scenario_sweep_reload_hygiene(case14, solver_atol):
 # =============================================================================
 # The reactive-limit outer loop's second pass
 # =============================================================================
+@pytest.mark.filterwarnings("ignore:reactive_limits_outer_loop is deprecated:DeprecationWarning")
 @pytest.mark.skipif(bool(is_fp32), reason="the outer loop's first pass needs residuals "
                     "below violation_tol (1e-6), out of an FP32 build's reach")
 def test_reactive_limits_outer_loop_continuous(solver_atol):

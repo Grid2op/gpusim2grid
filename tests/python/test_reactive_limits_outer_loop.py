@@ -20,6 +20,8 @@ machine frozen PQ at its min_q on bus 4 (flagged ``can_be_pv``, target 1.005
 pu) that tripping line 1-4 releases. Its N state is within every limit.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -28,6 +30,8 @@ from gpusim2grid import _gpusim2grid as _cpp
 
 pytestmark = [
     requires_gpu,
+    # the deprecated option is still what these tests pin
+    pytest.mark.filterwarnings("ignore:reactive_limits_outer_loop is deprecated:DeprecationWarning"),
     pytest.mark.skipif(not getattr(_cpp, "have_ls2g_gen_pv_release", False),
                        reason="needs the bridge built against a lightsim2grid with can_be_pv"),
 ]
@@ -383,6 +387,24 @@ def test_needs_the_physical_checks():
     ca.add_contingencies_by_branch_id([[0]])
     with pytest.raises(RuntimeError, match="compute_physical_violations"):
         ca.compute(batch_size=4)
+
+
+def test_deprecated():
+    """Asking for it, at construction or later, says to use outer_loops=True; the
+    default (off) says nothing."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    grid, _ = _build()
+    with pytest.warns(DeprecationWarning, match="outer_loops=True") as rec:
+        ContingencyAnalysisGPU(grid, nb_iter=10, compute_physical_violations=True,
+                               reactive_limits_outer_loop=True)
+    assert rec[0].filename == __file__
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        ca = ContingencyAnalysisGPU(grid, nb_iter=10, compute_physical_violations=True)
+        ca.reactive_limits_outer_loop = False
+    with pytest.warns(DeprecationWarning, match="outer_loops=True") as rec:
+        ca.reactive_limits_outer_loop = True
+    assert rec[0].filename == __file__
 
 
 def test_off_by_default():
