@@ -24,7 +24,8 @@ def get_parser():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--network", default="ieee300",
                         help="pypowsybl network name (ieee14, ieee118, ieee300, ...) or an IIDM file")
-    parser.add_argument("--n_ctg", type=int, default=1000, help="contingencies (lines, first ones)")
+    parser.add_argument("--n_ctg", type=int, default=1000, help="contingencies (lines closed at both ends, at random)")
+    parser.add_argument("--seed", type=int, default=0, help="which lines")
     parser.add_argument("--batch_size", type=int, default=256, help="GPU slots")
     parser.add_argument("--nb_iter", type=int, default=30, help="iteration budget of each inner solve")
     parser.add_argument("--tol_mva", type=float, default=1e-6, help="Newton tolerance, MVA (lightsim2grid's unit)")
@@ -37,28 +38,52 @@ def get_parser():
 
 
 def load(network):
+    """The grid as lightsim2grid's own outer-loop comparison builds it
+    (utils/olf_outer_compare.py): its default slack generator, half-open lines kept,
+    zero-impedance branches fused, OpenLoadFlow's loading rules, its max-voltage-change
+    step scaling, NROuter_KLU with the default loops. Returns the grid and its start
+    (OpenLoadFlow's DC_VALUES: the angles of a DC load flow, 1 pu)."""
     import pypowsybl as pp
-    from lightsim2grid.network.from_pypowsybl import init as init_from_pypowsybl
-    net = pp.network.load(network) if network.endswith((".xiidm", ".iidm", ".xz", ".zip")) \
-        else getattr(pp.network, f"create_{network}")()
+    from lightsim2grid.network.from_pypowsybl import init as init_from_pypowsybl, OlfLoadingParameters
+    from lightsim2grid.network.from_pypowsybl._aux_add_slack import _default_distributed_slack
+    from lightsim2grid.lightsim2grid_cpp import ScalingPolicyType
+    if network.endswith((".xiidm", ".iidm", ".xz", ".zip")):
+        net = pp.network.load(network, {"iidm.die.with-extensions": "all"})
+    else:
+        net = getattr(pp.network, f"create_{network}")()
+    gen_slack_id = next(iter(_default_distributed_slack(net, net.get_generators())))
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
-        grid = init_from_pypowsybl(net, olf_rules=True)
+        grid = init_from_pypowsybl(net, gen_slack_id=gen_slack_id, sort_index=False, buses_for_sub=False,
+                                   keep_half_open_lines=True, fuse_zero_impedance_branches=True, init_vm_pu=1.,
+                                   olf_rules=OlfLoadingParameters(reactive_limits=True, svc_voltage_monitoring=True))
     grid.change_algorithm("NROuter_KLU")
-    return grid
+    grid.set_keep_vinit_at_group_controlled_buses(True)
+    cfg = grid.get_ac_algo_config()
+    ip, rp = list(cfg.int_params), list(cfg.real_params)
+    ip[0] = int(ScalingPolicyType.MaxVoltageChange)
+    rp[0], rp[1] = 1.0, 0.4
+    cfg.int_params, cfg.real_params = ip, rp
+    grid.set_ac_algo_config(cfg)
+    flat = np.full(grid.total_bus(), 1.0 + 0j)
+    grid.set_dc_distribute_slack_on_can_participate(True)
+    v_dc = grid.dc_pf(flat, 50, 1e-8)
+    v0 = np.exp(1j * np.angle(v_dc)) if v_dc.shape[0] > 0 else flat
+    return grid, v0
 
 
 def main(args):
-    grid = load(args.network)
-    v0 = np.full(grid.total_bus(), 1.0 + 0j)
+    grid, v0 = load(args.network)
     t0 = time.perf_counter()
     if grid.ac_pf(v0, args.nb_iter, args.tol_mva).size == 0:
         raise RuntimeError("the 'n' solve did not converge")
     print(f"n solve: {1e3 * (time.perf_counter() - t0):.1f} ms, "
           f"{grid.get_algo().get_outer_loop_stats().nb_outer_iterations} outer iterations, "
           f"loops {[l.name() for l in grid.get_outer_loops()]}")
-    n_lines = len(grid.get_lines())
-    ctgs = list(range(min(args.n_ctg, n_lines)))
+    # lines closed at both ends, drawn at random (the same ones for a seed)
+    closed = [i for i, line in enumerate(grid.get_lines()) if line.connected_global]
+    rng = np.random.default_rng(args.seed)
+    ctgs = sorted(rng.choice(closed, size=min(args.n_ctg, len(closed)), replace=False).tolist())
     start = v0 if args.init_from_n else np.asarray(grid.get_V(), dtype=complex)
 
     warmup()

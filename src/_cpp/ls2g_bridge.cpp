@@ -1527,8 +1527,23 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
     // seed_vm_keeping): a PV bus keeps the magnitude it starts from
     in.V0 = grid.get_V_solver();
     if (!resume_from_n) {
+        // seed_vm_keeping (LSGrid.cpp): with set_keep_vinit_at_group_controlled_buses,
+        // the buses a voltage-control group holds keep the magnitude they start from
+        std::vector<int> held;
+        if (grid.get_keep_vinit_at_group_controlled_buses())
+            held = grid.get_ac_layout().voltage_control.group_controlled_solver_buses(
+                grid.get_ac_layout().id_me_to_solver);
+        std::vector<ls2g::cplx_type> kept;
+        for (int b : held) kept.push_back(in.V0(b));
+        // LSGrid's own seed: every voltage source, not only the generators (a station
+        // or a storage unit a loop froze in the grid's solve is off its set-point there)
         Eigen::Ref<ls2g::CplxVect> Vr(in.V0);
-        grid.get_generators().set_vm(Vr, grid.get_ac_layout().id_me_to_solver);
+        const auto& me_to_solver = grid.get_ac_layout().id_me_to_solver;
+        grid.get_generators().set_vm(Vr, me_to_solver);
+        grid.get_dclines().set_vm(Vr, me_to_solver);
+        grid.get_svcs().set_vm(Vr, me_to_solver);
+        grid.get_storages().set_vm(Vr, me_to_solver);
+        for (size_t k = 0; k < held.size(); ++k) in.V0(held[k]) = kept[k];
     }
     in.Sbus = grid.get_Sbus_solver();
     return in;
@@ -1550,6 +1565,8 @@ make_ss_outer_session_from_lsgrid(
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
+    // the step scaling of the grid's own (inner) Newton
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
     // the base state trusts V0 as it is (no residual check: the grid's own state was
     // solved with its loops' controls, which the base state does not carry)
     auto session = std::make_shared<ScenarioSweepSession>(
@@ -1557,7 +1574,7 @@ make_ss_outer_session_from_lsgrid(
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
         device, &in.ledger, /*presolved_v=*/true,
         reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
-        /*scaling=*/false, 0.5, 0.1);
+        scaling, max_dVa, max_dVm);
     session->scheduling_ = BatchScheduling::Continuous;
 
     session->set_gen_contingency_data(extract_gen_contingency_data(grid, n_bus));
@@ -1595,12 +1612,14 @@ make_ca_outer_session_from_lsgrid(
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
+    // the step scaling of the grid's own (inner) Newton
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
         device, &in.ledger, /*presolved_v=*/true,
         reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
-        /*scaling=*/false, 0.5, 0.1);
+        scaling, max_dVa, max_dVm);
     session->scheduling_ = BatchScheduling::Continuous;
     BranchData bd = extract_branch_data(grid, n_bus);
     session->set_branch_data(bd.branch_from, bd.branch_to,
@@ -1635,12 +1654,14 @@ make_is_outer_session_from_lsgrid(
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
+    // the step scaling of the grid's own (inner) Newton
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
     auto session = std::make_shared<InjectionSweepSession>(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
         device, &in.ledger, /*presolved_v=*/true,
         reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
-        /*scaling=*/false, 0.5, 0.1);
+        scaling, max_dVa, max_dVm);
     session->scheduling_ = BatchScheduling::Continuous;
     if (with_branch_data) {
         BranchData bd = extract_branch_data(grid, n_bus);

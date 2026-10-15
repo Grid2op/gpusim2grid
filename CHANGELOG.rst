@@ -9,6 +9,8 @@ Change Log
   on every row (continuous scheduling), the inner solves on the GPU; ``get_outer_results()``.
 - [ADDED] ``outer_loops=True`` with ``handle_disconnected_grid``, ``set_contingency_gens`` and
   ``set_gen_v``: each row's loops see its masks, units off and set-points as lightsim2grid's do.
+- [FIXED] ``outer_loops=True`` with ``init_from_n_powerflow=False``: rows start at every voltage
+  source's set-point (stations, SVCs, storage units too) and use the grid's Newton step scaling.
 - [ADDED] ``scheduling="continuous"`` on the three batch facades: a row leaves its slot once
   converged, diverged or out of its ``nb_iter`` budget, and the slot is refilled at once.
 - [ADDED] ``get_row_status()`` / ``get_row_iterations()`` (``RowStatus``) and ``tol``: each row's
