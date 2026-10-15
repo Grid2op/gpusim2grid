@@ -132,9 +132,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         :meth:`set_injections_from_elements`; with the per-bus
         :meth:`set_injections` they start from the grid's (DistributedSlack's
         units, the capability curves ReactiveLimits reads), whatever the rows'
-        Sbus carries. ``nb_iter_per_round`` must be 1. Not supported yet:
-        ``handle_disconnected_grid``,
-        :meth:`set_contingency_gens`, :meth:`set_gen_v`, ``redistribute_slack``,
+        Sbus carries. ``nb_iter_per_round`` must be 1. A row's masked buses
+        (``handle_disconnected_grid``), the generators it disconnects
+        (:meth:`set_contingency_gens`, which may only release a bus the loops
+        reserved -- ReactiveLimits reserves every bus its own machines hold) and
+        its voltage set-points (:meth:`set_gen_v`) are seen by its loops as
+        lightsim2grid's batch shows them. Not supported yet:
+        ``redistribute_slack`` (the DistributedSlack loop does that job),
         ``compute_physical_violations``, gradients. See :meth:`get_outer_results`.
     keep_outer_trace : bool, default False
         With ``outer_loops``: keep each row's decision trace
@@ -190,7 +194,6 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             scheduling = "continuous" if self._outer_loops else "chunked"
         if self._outer_loops:
             _check_outer_loops_args(grid, use_bridge, scheduling,
-                                    handle_disconnected_grid=handle_disconnected_grid,
                                     redistribute_slack=redistribute_slack,
                                     compute_physical_violations=compute_physical_violations)
 

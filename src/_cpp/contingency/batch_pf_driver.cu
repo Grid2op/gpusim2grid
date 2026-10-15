@@ -1769,6 +1769,12 @@ NrIterBuffers BatchPfDriver<BatchSource>::_bound_nr_buffers(const SlotTableView&
     // VoltageControl set-points of the slots' rows (no-ops for what the source
     // does not carry; base's shared arrays, stride 0, otherwise).
     source_.bind_slots(buf, T, thrust::raw_pointer_cast(base.d_J_outer.data()), cs);
+    // the outer loops own each slot's v_set (the row's gen_v on a group is in it, with
+    // the standby SVCs their loops switch on): it wins over the source's
+    if (outer_hook_ != nullptr && oc_stride_ > 0 && base.n_vc_ctrl > 0 && base.vc_may_hold) {
+        buf.d_vc_vset      = thrust::raw_pointer_cast(d_oc_vset_.data());
+        buf.vc_vset_stride = base.n_vc_grp;
+    }
     return buf;
 }
 

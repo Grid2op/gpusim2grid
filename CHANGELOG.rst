@@ -7,6 +7,8 @@ Change Log
   lightsim2grid; the types 16-20 of its outer-loop detection are mirrored.
 - [ADDED] ``outer_loops=True`` on the three batch facades: lightsim2grid's ``NROuter_*`` outer loops
   on every row (continuous scheduling), the inner solves on the GPU; ``get_outer_results()``.
+- [ADDED] ``outer_loops=True`` with ``handle_disconnected_grid``, ``set_contingency_gens`` and
+  ``set_gen_v``: each row's loops see its masks, units off and set-points as lightsim2grid's do.
 - [ADDED] ``scheduling="continuous"`` on the three batch facades: a row leaves its slot once
   converged, diverged or out of its ``nb_iter`` budget, and the slot is refilled at once.
 - [ADDED] ``get_row_status()`` / ``get_row_iterations()`` (``RowStatus``) and ``tol``: each row's

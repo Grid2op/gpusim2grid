@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 #include <complex>
 #include <limits>
 #include <map>
@@ -83,9 +84,27 @@ struct RlBus {
     int pin = -1;            // a local bus' switchable index
 };
 
+// ReactiveLimits' plan for one kind of row -- the grid's, or a row that masks buses or
+// disconnects generators (ReactiveLimitsLoop::_initialize on that row's view): bus_q_check's
+// entries plus one per voltage monitor, and the controller buses built on them (their
+// target P is the row's, filled at load)
+struct RlPlan {
+    ls2g::bus_q_check::BusQPlan plan;
+    std::vector<int> monitor_of_entry;
+    std::vector<RlBus> buses;
+    bool has_monitor = false;
+};
+
 // everything one row carries through its solves
 struct SlotState {
     int row = -1;
+    // ---- the row as its loops see it (OuterRowView; its layout and masked list point
+    // into the model and this slot) ---------------------------------------------------------
+    ls2g::OuterRowView rowv;
+    std::vector<int> masked;              // sorted solver buses the row masks
+    std::shared_ptr<const RlPlan> rl;
+    std::vector<int> active;              // the loops is_needed on this row (indices into loops_)
+    int last_fixing = -1;
     // ---- control state (OuterControls + OuterInjections) -------------------
     std::vector<unsigned char> pq;        // per switchable bus: 1 PQ (unpinned)
     std::vector<double> held_q;           // per controller, pu, NaN not held by value
@@ -175,6 +194,7 @@ public:
     const RowResult& row_result(int row) const override { return results_.at(static_cast<size_t>(row)); }
     int n_rows() const override { return n_rows_; }
     void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) override;
+    void set_row_overrides(RowOverrides overrides) override { ov_ = std::move(overrides); }
 
 private:
     // ---- static data -------------------------------------------------------------
@@ -182,7 +202,8 @@ private:
     // the loops read at run time. Its solver layout is NOT copied (a copy starts
     // cold): everything that needs it is read off the caller's grid at construction.
     std::shared_ptr<ls2g::LSGrid> grid_;
-    std::vector<double> gen_target_p0_, sto_target_p0_;   // the grid's, MW
+    ls2g::SolverBusLayout sbl_;          // the caller's grid's AC labelling (a copy has none)
+    ls2g::OuterGridView view(const SlotState& st) const { return ls2g::OuterGridView(*grid_, &st.rowv); }
     Ls2gModelOptions opt_;
     Layout layout_;
     double sn_ = 1.;
@@ -190,8 +211,7 @@ private:
     int slack_bus_ = -1;
     std::vector<int> widx_;                  // solver bus -> watch index
     std::vector<int> pin_of_bus_;            // solver bus -> switchable index
-    std::vector<LoopDecl> active_;           // is_needed loops, in order
-    int last_fixing_ = -1;
+    std::vector<LoopDecl> loops_;            // the grid's loops, in order
     ls2g::OuterLoopDriverParams params_;
     // VoltageControl, ledger order (== the layout's plan)
     std::vector<int> vc_bus_, vc_kind_, vc_elem_, vc_group_, vc_plan_held_;
@@ -202,15 +222,11 @@ private:
     std::vector<int> hvdc_id_, hvdc_bus1_, hvdc_bus2_, hvdc_status0_;
     std::vector<double> hvdc_p0_, hvdc_k_, hvdc_lf1_, hvdc_lf2_, hvdc_r_, hvdc_pmax12_, hvdc_pmax21_;
     // plans
-    ls2g::bus_q_check::BusQPlan rl_plan_;          // + one entry per voltage monitor
-    std::vector<RlBus> rl_template_;               // target_p filled per row
-    std::vector<double> rl_target_q_of_bus_;
+    std::shared_ptr<const RlPlan> rl0_;            // the grid's (a row without masks / units off)
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
     ls2g::svc_standby_check::SvcStandbyPlan monitors_;
     std::vector<int> svc_ctrl_;                    // svc id -> its held controller (-1)
-    std::vector<ls2g::slack_redistribution::Participant> ds_units0_;
-    std::vector<int> ds_unit_bus0_;
-    std::vector<int> gen_bus_solver_, sto_bus_solver_;
+    std::vector<int> held_svcs_;                   // the standby SVCs the plan holds, sorted
     // where the grid's own solve left the loops (Ls2gModelOptions::resume_from_n)
     bool resume_ = false;
     std::vector<double> resume_gen_p_, resume_sto_p_;   // moved targets, MW, NaN untouched
@@ -221,49 +237,32 @@ private:
     // ---- per run ------------------------------------------------------------------
     int n_rows_ = 0;
     std::vector<double> row_gen_p_, row_sto_p_;    // [n_rows * n_gen], [n_rows * n_sto]
+    RowOverrides ov_;                              // the rows' masks, units off, set-points
     std::vector<SlotState> slots_;
     std::vector<RowResult> results_;
 
     // ---- helpers ------------------------------------------------------------------
-    double row_gen(const SlotState& st, int g) const {
-        if (st.row >= 0 && !row_gen_p_.empty()) {
-            const double v = row_gen_p_[static_cast<size_t>(st.row) * n_gen_ + g];
-            if (std::isfinite(v)) return v;
-        }
-        return gen_target_p0_[static_cast<size_t>(g)];
-    }
-    bool row_sets_gen(const SlotState& st, int g) const {
-        return st.row >= 0 && !row_gen_p_.empty() &&
-               std::isfinite(row_gen_p_[static_cast<size_t>(st.row) * n_gen_ + g]);
-    }
-    bool row_sets_sto(const SlotState& st, int s) const {
-        return st.row >= 0 && !row_sto_p_.empty() &&
-               std::isfinite(row_sto_p_[static_cast<size_t>(st.row) * n_sto_ + s]);
-    }
-    double row_sto(const SlotState& st, int s) const {
-        if (st.row >= 0 && !row_sto_p_.empty()) {
-            const double v = row_sto_p_[static_cast<size_t>(st.row) * n_sto_ + s];
-            if (std::isfinite(v)) return v;
-        }
-        return sto_target_p0_[static_cast<size_t>(s)];
-    }
     // OuterInjections::gen_target_p_in_force / storage_target_p_in_force
     double gen_in_force(const SlotState& st, int g) const {
         if (!st.gen_target_p.empty() && !std::isnan(st.gen_target_p[static_cast<size_t>(g)]))
             return st.gen_target_p[static_cast<size_t>(g)];
-        return row_gen(st, g);
+        return view(st).gen_target_p(g);
     }
     double sto_in_force(const SlotState& st, int s) const {
         if (!st.storage_target_p.empty() && !std::isnan(st.storage_target_p[static_cast<size_t>(s)]))
             return st.storage_target_p[static_cast<size_t>(s)];
-        return row_sto(st, s);
+        return view(st).storage_target_p(s);
     }
     // OuterGridView::gen_target_p_override: the loops' value, else the row's, else NaN
     double gen_override(const SlotState& st, int g) const {
-        if (!st.gen_target_p.empty() && !std::isnan(st.gen_target_p[static_cast<size_t>(g)]))
-            return st.gen_target_p[static_cast<size_t>(g)];
-        return row_sets_gen(st, g) ? row_gen(st, g) : NaN;
+        static_assert(std::is_same<ls2g::real_type, double>::value, "lightsim2grid built in double");
+        return view(st).gen_target_p_override(st.gen_target_p, g);
     }
+    // the plan, units and active loops of the row a slot holds (its view set already)
+    std::shared_ptr<const RlPlan> build_rl_plan(const ls2g::OuterGridView& v) const;
+    void collect_units(const ls2g::OuterGridView& v, std::vector<ls2g::slack_redistribution::Participant>& units,
+                       std::vector<int>& bus) const;
+    void set_active(SlotState& st) const;
     void add_injection(SlotState& st, int bus, cplx ds) const {
         if (ds == cplx(0., 0.)) return;
         st.target_delta[bus] += ds;
@@ -358,12 +357,12 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
         loops.push_back(d);
     }
 
-    const ls2g::OuterGridView v(grid, nullptr);
+    sbl_ = grid.get_ac_layout();
+    // the grid seen as a row that changes nothing, on the model's own copy
+    SlotState grid_row;
+    grid_row.rowv.layout = &sbl_;
+    const ls2g::OuterGridView v = view(grid_row);
     const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();
-    for (int gid = 0; gid < n_gen_; ++gid) gen_target_p0_.push_back(v.gen_target_p(gid));
-    for (int sid = 0; sid < n_sto_; ++sid) sto_target_p0_.push_back(v.storage_target_p(sid));
-    for (int gid = 0; gid < n_gen_; ++gid) gen_bus_solver_.push_back(v.gen_bus_solver(gid));
-    for (int sid = 0; sid < n_sto_; ++sid) sto_bus_solver_.push_back(v.storage_bus_solver(sid));
 
     // where the grid's last solve left its loops
     resume_ = opt.resume_from_n;
@@ -423,21 +422,12 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
         for (int e = 0; e < ledger.n_hvdc(); ++e) hvdc_id_.push_back(e);
 
     // ---- the plans (each loop's is_needed / initialize, on the grid's own view) ----------
+    // the switchable buses first: a local controller bus of the plan must be one
+    layout_.pin_bus = ledger.switchable_vm_buses;
+    pin_of_bus_.assign(static_cast<size_t>(n_bus_), -1);
+    for (size_t k = 0; k < layout_.pin_bus.size(); ++k) pin_of_bus_[static_cast<size_t>(layout_.pin_bus[k])] = static_cast<int>(k);
     // ReactiveLimits: bus_q_check's plan, plus one entry per voltage monitor
-    ls2g::bus_q_check::build_bus_q_plan(v, rl_plan_);
-    std::vector<int> monitor_of_entry(rl_plan_.buses.size(), -1);
-    bool has_monitor = false;
-    for (int c = 0; c < ctrl.n_controllers(); ++c) {
-        if (!ctrl.is_held(c) || ctrl.kind(c) != ls2g::VoltageControlSolverData::SVC) continue;
-        has_monitor = true;
-        ls2g::bus_q_check::BusQEntry entry;
-        entry.bus_solver = ctrl.bus(c);
-        entry.bus_grid = v.id_solver_to_me()[ctrl.bus(c)].cast_int();
-        entry.svc_ids.push_back(ctrl.elem_id(c));
-        entry.ctrl_pos.push_back(c);
-        rl_plan_.buses.push_back(entry);
-        monitor_of_entry.push_back(ctrl.elem_id(c));
-    }
+    rl0_ = build_rl_plan(v);
     // HvdcAcEmulationLimits: the lines in AC emulation
     {
         ls2g::hvdc_p_check::HvdcPPlan plan;
@@ -445,119 +435,18 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
         for (const auto& line : plan.lines) if (line.frozen_dir == 0) hvdc_plan0_.lines.push_back(line);
     }
     // VoltageMonitoring: the standby SVCs the plan holds
-    std::vector<int> held_svcs;
     for (int c = 0; c < ctrl.n_controllers(); ++c)
-        if (ctrl.kind(c) == ls2g::VoltageControlSolverData::SVC && ctrl.is_held(c)) held_svcs.push_back(ctrl.elem_id(c));
-    std::sort(held_svcs.begin(), held_svcs.end());
+        if (ctrl.kind(c) == ls2g::VoltageControlSolverData::SVC && ctrl.is_held(c)) held_svcs_.push_back(ctrl.elem_id(c));
+    std::sort(held_svcs_.begin(), held_svcs_.end());
     {
         ls2g::svc_standby_check::SvcStandbyPlan plan;
         ls2g::svc_standby_check::build_svc_standby_plan(g, v.id_me_to_solver(), plan);
         for (const auto& e : plan.svcs)
-            if (std::binary_search(held_svcs.begin(), held_svcs.end(), e.svc_id)) monitors_.svcs.push_back(e);
+            if (std::binary_search(held_svcs_.begin(), held_svcs_.end(), e.svc_id)) monitors_.svcs.push_back(e);
     }
-    // DistributedSlack: collect_units on the grid
-    {
-        const auto& gens = g.get_generators();
-        const auto& stos = g.get_storages();
-        const auto& to_me = v.id_solver_to_me();
-        auto add = [&](ls2g::slack_redistribution::UnitKind kind, int el, int bus, double w,
-                       double inj, double mn, double mx) {
-            if (!(w > 0.) || bus < 0) return;
-            ls2g::slack_redistribution::Participant u;
-            u.kind = kind; u.el_id = el; u.bus = to_me[bus].cast_int(); u.injection_mw = inj;
-            u.weight = w; u.min_p_mw = mn; u.max_p_mw = mx; u.in_slack = false;
-            ds_units0_.push_back(u);
-            ds_unit_bus0_.push_back(bus);
-        };
-        for (int el = 0; el < gens.nb(); ++el)
-            add(ls2g::slack_redistribution::UnitKind::GENERATOR, el, v.gen_bus_solver(el),
-                gens.get_can_participate_slack_weight(el), v.gen_target_p(el), gens.get_min_p(el), gens.get_max_p(el));
-        for (int el = 0; el < stos.nb(); ++el)
-            add(ls2g::slack_redistribution::UnitKind::STORAGE, el, v.storage_bus_solver(el),
-                stos.get_can_participate_slack_weight(el), -v.storage_target_p(el), stos.get_min_p(el), stos.get_max_p(el));
-    }
-    // is_needed, in order (OpenLoadFlow's filter)
-    for (const LoopDecl& d : loops) {
-        bool needed = false;
-        switch (d.kind) {
-            case Kind::DistributedSlack:  needed = !ds_units0_.empty(); break;
-            case Kind::HvdcLimits:        needed = !hvdc_plan0_.empty(); break;
-            case Kind::VoltageMonitoring: {
-                const auto& svcs = g.get_svcs();
-                for (int id : held_svcs)
-                    if (svcs.get_regulated_bus_id(id) == svcs.get_bus_id()(id).cast_int()) needed = true;
-                break;
-            }
-            case Kind::ReactiveLimits:    needed = !rl_plan_.empty() || has_monitor; break;
-        }
-        if (needed) active_.push_back(d);
-    }
-    if (params_.voltage_remote_control_robust_mode)
-        for (size_t i = 0; i < active_.size(); ++i)
-            if (active_[i].kind == Kind::ReactiveLimits) last_fixing_ = static_cast<int>(i);
-
-    // ---- the switchable buses ------------------------------------------------------------
-    layout_.pin_bus = ledger.switchable_vm_buses;
-    pin_of_bus_.assign(static_cast<size_t>(n_bus_), -1);
-    for (size_t k = 0; k < layout_.pin_bus.size(); ++k) pin_of_bus_[static_cast<size_t>(layout_.pin_bus[k])] = static_cast<int>(k);
-
-    // ReactiveLimits' controller buses, but for their row's target P (ReactiveLimitsLoop::_initialize)
-    {
-        const auto& gens = g.get_generators();
-        const auto& stos = g.get_storages();
-        const auto& hvdcs = g.get_dclines();
-        const auto vn_kv = g.get_bus_vn_kv();
-        rl_target_q_of_bus_.assign(v.id_solver_to_me().size(), 0.);
-        for (int gid = 0; gid < gens.nb(); ++gid) {
-            const int b = v.gen_bus_solver(gid);
-            if (b >= 0 && static_cast<size_t>(b) < rl_target_q_of_bus_.size())
-                rl_target_q_of_bus_[static_cast<size_t>(b)] += gens.get_target_q()(gid);
-        }
-        for (size_t k = 0; k < rl_plan_.buses.size(); ++k) {
-            const auto& entry = rl_plan_.buses[k];
-            RlBus bus;
-            bus.entry = static_cast<int>(k);
-            bus.bus_solver = entry.bus_solver;
-            bus.local = entry.ctrl_pos.empty() && entry.svc_ids.empty();
-            bus.monitor_svc = monitor_of_entry[k];
-            bus.reg_bus_solver = entry.bus_solver;
-            bus.nominal_v = vn_kv(entry.bus_grid);
-            if (bus.local) {
-                bus.pin = pin_of_bus_[static_cast<size_t>(entry.bus_solver)];
-                if (bus.pin < 0)
-                    throw std::runtime_error("outer model: the controller bus " + std::to_string(entry.bus_solver) +
-                                             " has no reserved Vm column (is the grid's algorithm an NROuter_* one, "
-                                             "solved with its loops?)");
-            }
-            bool has_target = false;
-            if (!bus.local) {
-                const int gr = ctrl.group(entry.ctrl_pos.front());
-                bus.group = gr;
-                bus.reg_bus_solver = ctrl.reg_bus(gr);
-                bus.target_vm = ctrl.v_set(gr);
-                has_target = true;
-                const int reg_grid = v.id_solver_to_me()[bus.reg_bus_solver].cast_int();
-                if (reg_grid >= 0) bus.nominal_v = vn_kv(reg_grid);
-            }
-            bus.target_q = rl_target_q_of_bus_[static_cast<size_t>(entry.bus_solver)];
-            for (int gid : entry.gen_ids)
-                if (!has_target) { bus.target_vm = v.gen_target_vm(gid); has_target = true; }
-            for (int sid : entry.storage_ids) {
-                bus.min_q += stos.get_min_q(sid);
-                bus.max_q += stos.get_max_q(sid);
-                if (!has_target) { bus.target_vm = v.storage_target_vm(sid); has_target = true; }
-            }
-            for (const auto& station : entry.station_ids) {
-                bus.min_q += hvdcs.get_station_min_q_mvar(station.first, station.second);
-                bus.max_q += hvdcs.get_station_max_q_mvar(station.first, station.second);
-                if (!has_target) {
-                    bus.target_vm = hvdcs.get_station_target_vm_pu(station.first, station.second);
-                    has_target = true;
-                }
-            }
-            rl_template_.push_back(bus);
-        }
-    }
+    loops_ = loops;
+    // the robust mode's last loop able to fix an unrealistic state, and is_needed: per row
+    // (set_active), since a row disconnecting units changes the participants and the plan
 
     // ---- the layout ------------------------------------------------------------------------
     layout_.n_ctrl = nc;
@@ -565,8 +454,8 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     layout_.n_hvdc = ledger.n_hvdc();
     std::vector<int> watch;
     watch.push_back(slack_bus_);
-    for (const auto& e : rl_plan_.buses) watch.push_back(e.bus_solver);
-    for (const RlBus& b : rl_template_) watch.push_back(b.reg_bus_solver);
+    for (const auto& e : rl0_->plan.buses) watch.push_back(e.bus_solver);
+    for (const RlBus& b : rl0_->buses) watch.push_back(b.reg_bus_solver);
     for (int c = 0; c < nc; ++c) watch.push_back(vc_bus_[static_cast<size_t>(c)]);
     for (int e = 0; e < layout_.n_hvdc; ++e) { watch.push_back(hvdc_bus1_[static_cast<size_t>(e)]); watch.push_back(hvdc_bus2_[static_cast<size_t>(e)]); }
     for (const auto& line : hvdc_plan0_.lines) { watch.push_back(line.bus1_solver); watch.push_back(line.bus2_solver); }
@@ -608,6 +497,15 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
         throw std::runtime_error("outer model: the rows' generator targets do not match the batch's rows");
     if (!row_sto_p_.empty() && row_sto_p_.size() != static_cast<size_t>(n_rows) * n_sto_)
         throw std::runtime_error("outer model: the rows' storage targets do not match the batch's rows");
+    auto check = [&](bool ok, const char* what) {
+        if (!ok) throw std::runtime_error(std::string("outer model: the rows' ") + what +
+                                          " do not match the batch's rows");
+    };
+    check(ov_.masked.empty() || ov_.masked.size() == static_cast<size_t>(n_rows), "masked buses");
+    check(ov_.gen_off.empty() || ov_.gen_off.size() == static_cast<size_t>(n_rows) * n_gen_, "disconnected generators");
+    check(ov_.gen_vm.empty() || ov_.gen_vm.size() == static_cast<size_t>(n_rows) * n_gen_, "generator set-points");
+    check(ov_.pq_buses.empty() || ov_.pq_buses.size() == static_cast<size_t>(n_rows), "released buses");
+    check(ov_.vc_v_set.empty() || ov_.vc_v_set.size() == static_cast<size_t>(n_rows) * layout_.n_grp, "group set-points");
     n_rows_ = n_rows;
     slots_.assign(static_cast<size_t>(n_slots), SlotState());
     results_.assign(static_cast<size_t>(n_rows), RowResult());
@@ -625,26 +523,205 @@ void Ls2gOuterModel::load(int slot, int row)
     st.held_q.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
     st.svc_on.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
     st.hvdc_regime.assign(static_cast<size_t>(layout_.n_hvdc), 2);
+    // the row as its loops see it (BaseBatchSweep::_fill_outer_row_view)
+    st.rowv.layout = &sbl_;
+    bool changes_units = false;
+    if (row >= 0) {
+        const size_t r = static_cast<size_t>(row);
+        auto row_of = [&](const std::vector<double>& m, int n, std::vector<ls2g::real_type>& out) {
+            if (m.empty() || n <= 0) return;
+            out.assign(m.begin() + static_cast<ptrdiff_t>(r * n), m.begin() + static_cast<ptrdiff_t>((r + 1) * n));
+        };
+        row_of(row_gen_p_, n_gen_, st.rowv.gens.target_p);
+        row_of(row_sto_p_, n_sto_, st.rowv.storages.target_p);
+        row_of(ov_.gen_vm, n_gen_, st.rowv.gens.target_vm);
+        if (!ov_.gen_off.empty()) {
+            st.rowv.gens.off.assign(ov_.gen_off.begin() + static_cast<ptrdiff_t>(r * n_gen_),
+                                    ov_.gen_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_gen_));
+            for (char o : st.rowv.gens.off) changes_units = changes_units || o != 0;
+        }
+        if (r < ov_.masked.size() && !ov_.masked[r].empty()) {
+            st.masked = ov_.masked[r];
+            std::sort(st.masked.begin(), st.masked.end());
+            st.rowv.masked = &st.masked;
+        }
+        // the switchable buses a generator contingency leaves without a regulator start PQ
+        if (r < ov_.pq_buses.size())
+            for (int b : ov_.pq_buses[r]) {
+                const int k = (b >= 0 && b < n_bus_) ? pin_of_bus_[static_cast<size_t>(b)] : -1;
+                if (k < 0)
+                    throw std::runtime_error("outer model: a generator contingency releases bus " + std::to_string(b) +
+                                             ", which the outer loops' ledger has not reserved");
+                st.pq[static_cast<size_t>(k)] = 1;
+            }
+    }
+    // the grid's plan, unless the row changes what it is built from: the units it
+    // disconnects, the buses it masks, its machines' voltage set-points (a local bus'
+    // target_vm, what its release test compares with)
+    const bool own_plan = changes_units || !st.masked.empty() || !st.rowv.gens.target_vm.empty();
+    st.rl = own_plan ? build_rl_plan(view(st)) : rl0_;
+    set_active(st);
     if (row >= 0) {
         if (resume_) {
             // OuterLoopAlgo::_take_targets: the targets the loops moved there, but where
             // the row sets its own
+            const ls2g::OuterGridView v = view(st);
             for (size_t gid = 0; gid < resume_gen_p_.size(); ++gid) {
                 const int g = static_cast<int>(gid);
-                if (std::isnan(resume_gen_p_[gid]) || row_sets_gen(st, g)) continue;
-                if (gen_bus_solver_[gid] >= 0) move_gen(st, g, gen_bus_solver_[gid], resume_gen_p_[gid]);
+                if (std::isnan(resume_gen_p_[gid]) || v.row_sets_gen_target_p(g)) continue;
+                const int bus = v.gen_bus_solver(g);
+                if (bus >= 0) move_gen(st, g, bus, resume_gen_p_[gid]);
             }
             for (size_t sid = 0; sid < resume_sto_p_.size(); ++sid) {
                 const int s = static_cast<int>(sid);
-                if (std::isnan(resume_sto_p_[sid]) || row_sets_sto(st, s)) continue;
-                if (sto_bus_solver_[sid] >= 0) move_storage(st, s, sto_bus_solver_[sid], resume_sto_p_[sid]);
+                if (std::isnan(resume_sto_p_[sid]) || v.row_sets_storage_target_p(s)) continue;
+                const int bus = v.storage_bus_solver(s);
+                if (bus >= 0) move_storage(st, s, bus, resume_sto_p_[sid]);
             }
         }
         init_loops(st);
         if (resume_) resume_loops(st);
-        st.check_unrealistic = last_fixing_ < 0;
+        st.check_unrealistic = st.last_fixing < 0;
     }
     materialize(st);
+}
+
+void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
+                                   std::vector<ls2g::slack_redistribution::Participant>& units,
+                                   std::vector<int>& bus_of) const
+{
+    // DistributedSlackLoop's collect_units: the participants of this row
+    units.clear();
+    bus_of.clear();
+    const auto& gens = grid_->get_generators();
+    const auto& stos = grid_->get_storages();
+    const auto& to_me = v.id_solver_to_me();
+    auto add = [&](ls2g::slack_redistribution::UnitKind kind, int el, int bus, double w,
+                   double inj, double mn, double mx) {
+        if (!(w > 0.) || bus < 0) return;
+        ls2g::slack_redistribution::Participant u;
+        u.kind = kind; u.el_id = el; u.bus = to_me[bus].cast_int(); u.injection_mw = inj;
+        u.weight = w; u.min_p_mw = mn; u.max_p_mw = mx; u.in_slack = false;
+        units.push_back(u);
+        bus_of.push_back(bus);
+    };
+    for (int el = 0; el < gens.nb(); ++el)
+        add(ls2g::slack_redistribution::UnitKind::GENERATOR, el, v.gen_bus_solver(el),
+            gens.get_can_participate_slack_weight(el), v.gen_target_p(el), gens.get_min_p(el), gens.get_max_p(el));
+    for (int el = 0; el < stos.nb(); ++el)
+        add(ls2g::slack_redistribution::UnitKind::STORAGE, el, v.storage_bus_solver(el),
+            stos.get_can_participate_slack_weight(el), -v.storage_target_p(el), stos.get_min_p(el), stos.get_max_p(el));
+}
+
+std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGridView& v) const
+{
+    auto rl = std::make_shared<RlPlan>();
+    // ReactiveLimitsLoop::_initialize: bus_q_check's plan on this view, plus one entry per
+    // voltage monitor (a held SVC controller of the plan)
+    ls2g::bus_q_check::build_bus_q_plan(v, rl->plan);
+    rl->monitor_of_entry.assign(rl->plan.buses.size(), -1);
+    const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();
+    for (int c = 0; c < ctrl.n_controllers(); ++c) {
+        if (!ctrl.is_held(c) || ctrl.kind(c) != ls2g::VoltageControlSolverData::SVC) continue;
+        rl->has_monitor = true;
+        ls2g::bus_q_check::BusQEntry entry;
+        entry.bus_solver = ctrl.bus(c);
+        entry.bus_grid = v.id_solver_to_me()[ctrl.bus(c)].cast_int();
+        entry.svc_ids.push_back(ctrl.elem_id(c));
+        entry.ctrl_pos.push_back(c);
+        rl->plan.buses.push_back(entry);
+        rl->monitor_of_entry.push_back(ctrl.elem_id(c));
+    }
+    const auto& gens = grid_->get_generators();
+    const auto& stos = grid_->get_storages();
+    const auto& hvdcs = grid_->get_dclines();
+    const auto vn_kv = grid_->get_bus_vn_kv();
+    // the robust mode's: the target Q of every generator ON in this row, summed per bus
+    std::vector<double> target_q_of_bus(v.id_solver_to_me().size(), 0.);
+    for (int gid = 0; gid < gens.nb(); ++gid) {
+        const int b = v.gen_bus_solver(gid);
+        if (b >= 0 && static_cast<size_t>(b) < target_q_of_bus.size())
+            target_q_of_bus[static_cast<size_t>(b)] += gens.get_target_q()(gid);
+    }
+    for (size_t k = 0; k < rl->plan.buses.size(); ++k) {
+        const auto& entry = rl->plan.buses[k];
+        RlBus bus;
+        bus.entry = static_cast<int>(k);
+        bus.bus_solver = entry.bus_solver;
+        bus.local = entry.ctrl_pos.empty() && entry.svc_ids.empty();
+        bus.monitor_svc = rl->monitor_of_entry[k];
+        bus.reg_bus_solver = entry.bus_solver;
+        bus.nominal_v = vn_kv(entry.bus_grid);
+        if (bus.local) {
+            bus.pin = pin_of_bus_[static_cast<size_t>(entry.bus_solver)];
+            if (bus.pin < 0)
+                throw std::runtime_error("outer model: the controller bus " + std::to_string(entry.bus_solver) +
+                                         " has no reserved Vm column (is the grid's algorithm an NROuter_* one, "
+                                         "solved with its loops?)");
+        }
+        bool has_target = false;
+        if (!bus.local) {
+            const int gr = ctrl.group(entry.ctrl_pos.front());
+            bus.group = gr;
+            bus.reg_bus_solver = ctrl.reg_bus(gr);
+            bus.target_vm = ctrl.v_set(gr);
+            has_target = true;
+            const int reg_grid = v.id_solver_to_me()[bus.reg_bus_solver].cast_int();
+            if (reg_grid >= 0) bus.nominal_v = vn_kv(reg_grid);
+        }
+        bus.target_q = target_q_of_bus[static_cast<size_t>(entry.bus_solver)];
+        for (int gid : entry.gen_ids)
+            if (!has_target) { bus.target_vm = v.gen_target_vm(gid); has_target = true; }
+        for (int sid : entry.storage_ids) {
+            bus.min_q += stos.get_min_q(sid);
+            bus.max_q += stos.get_max_q(sid);
+            if (!has_target) { bus.target_vm = v.storage_target_vm(sid); has_target = true; }
+        }
+        for (const auto& station : entry.station_ids) {
+            bus.min_q += hvdcs.get_station_min_q_mvar(station.first, station.second);
+            bus.max_q += hvdcs.get_station_max_q_mvar(station.first, station.second);
+            if (!has_target) {
+                bus.target_vm = hvdcs.get_station_target_vm_pu(station.first, station.second);
+                has_target = true;
+            }
+        }
+        rl->buses.push_back(bus);
+    }
+    return rl;
+}
+
+void Ls2gOuterModel::set_active(SlotState& st) const
+{
+    // OpenLoadFlow's isNeeded filter on this row, and the robust mode's last loop able to
+    // fix an unrealistic state
+    st.active.clear();
+    st.last_fixing = -1;
+    const ls2g::OuterGridView v = view(st);
+    for (size_t i = 0; i < loops_.size(); ++i) {
+        const LoopDecl& d = loops_[i];
+        bool needed = false;
+        switch (d.kind) {
+            case Kind::DistributedSlack: {
+                std::vector<ls2g::slack_redistribution::Participant> units;
+                std::vector<int> bus;
+                collect_units(v, units, bus);
+                needed = !units.empty();
+                break;
+            }
+            case Kind::HvdcLimits:        needed = !hvdc_plan0_.empty(); break;
+            case Kind::VoltageMonitoring: {
+                const auto& svcs = grid_->get_svcs();
+                for (int id : held_svcs_)
+                    if (svcs.get_regulated_bus_id(id) == svcs.get_bus_id()(id).cast_int()) needed = true;
+                break;
+            }
+            case Kind::ReactiveLimits:    needed = !st.rl->plan.empty() || st.rl->has_monitor; break;
+        }
+        if (needed) st.active.push_back(static_cast<int>(i));
+    }
+    if (params_.voltage_remote_control_robust_mode)
+        for (size_t i = 0; i < st.active.size(); ++i)
+            if (loops_[static_cast<size_t>(st.active[i])].kind == Kind::ReactiveLimits) st.last_fixing = static_cast<int>(i);
 }
 
 void Ls2gOuterModel::clear_vm_reset(int slot)
@@ -658,12 +735,12 @@ void Ls2gOuterModel::clear_vm_reset(int slot)
 
 void Ls2gOuterModel::init_loops(SlotState& st) const
 {
-    for (const LoopDecl& d : active_) {
+    for (int li : st.active) {
+        const LoopDecl& d = loops_[static_cast<size_t>(li)];
         switch (d.kind) {
             case Kind::DistributedSlack: {
                 // DistributedSlackLoop::_initialize: each unit from its target in force
-                st.ds_units = ds_units0_;
-                st.ds_unit_bus = ds_unit_bus0_;
+                collect_units(view(st), st.ds_units, st.ds_unit_bus);
                 for (auto& u : st.ds_units)
                     u.injection_mw = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR
                         ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
@@ -678,9 +755,9 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                 st.vm_switched_on.clear();
                 break;
             case Kind::ReactiveLimits: {
-                st.rl_buses = rl_template_;
+                st.rl_buses = st.rl->buses;
                 for (RlBus& bus : st.rl_buses) {
-                    const auto& entry = rl_plan_.buses[static_cast<size_t>(bus.entry)];
+                    const auto& entry = st.rl->plan.buses[static_cast<size_t>(bus.entry)];
                     bus.target_p = 0.;
                     for (int gid : entry.gen_ids) bus.target_p += gen_in_force(st, gid);
                     for (int sid : entry.storage_ids) bus.target_p -= sto_in_force(st, sid);
@@ -694,7 +771,8 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
 void Ls2gOuterModel::resume_loops(SlotState& st) const
 {
     RowView rv{nullptr, &widx_, &resume_V_};
-    for (const LoopDecl& d : active_) {
+    for (int li : st.active) {
+        const LoopDecl& d = loops_[static_cast<size_t>(li)];
         switch (d.kind) {
             case Kind::DistributedSlack:   // its units start from the targets in force: taken above
                 break;
@@ -758,6 +836,12 @@ void Ls2gOuterModel::materialize(SlotState& st) const
     c.held_q = st.held_q;
     c.plan_held.assign(static_cast<size_t>(layout_.n_ctrl), 0);
     c.v_set = vc_v_set_;
+    // the row's gen_v on a group (BaseBatchSweep::_apply_step_vc_v_set)
+    if (st.row >= 0 && !ov_.vc_v_set.empty())
+        for (int g = 0; g < layout_.n_grp; ++g) {
+            const double vs = ov_.vc_v_set[static_cast<size_t>(st.row) * layout_.n_grp + g];
+            if (std::isfinite(vs)) c.v_set[static_cast<size_t>(g)] = vs;
+        }
     for (int j = 0; j < layout_.n_ctrl; ++j) {
         const size_t jj = static_cast<size_t>(j);
         c.plan_held[jj] = vc_plan_held_[jj];
@@ -880,7 +964,7 @@ int Ls2gOuterModel::check_hvdc(SlotState& st, const LoopDecl& L, const RowView& 
         Va(line.bus2_solver) = std::arg(rv.V(line.bus2_solver));
     }
     std::vector<ls2g::LimitViolation> trigger;
-    ls2g::hvdc_p_check::check_hvdc_p_violations(st.hvdc_plan, Va, 0., nullptr, trigger);
+    ls2g::hvdc_p_check::check_hvdc_p_violations(st.hvdc_plan, Va, 0., st.rowv.masked, trigger);
     if (trigger.empty()) return STABLE;
     bool changed = false;
     for (const auto& v : trigger) {
@@ -921,7 +1005,7 @@ int Ls2gOuterModel::check_vm(SlotState& st, const LoopDecl& L, const RowView& rv
         V(e.svc_bus_solver) = rv.V(e.svc_bus_solver);
     }
     std::vector<ls2g::LimitViolation> trigger;
-    ls2g::svc_standby_check::check_svc_standby_violations(idle, V, 0., nullptr, trigger);
+    ls2g::svc_standby_check::check_svc_standby_violations(idle, V, 0., st.rowv.masked, trigger);
     if (trigger.empty()) return STABLE;
     const auto& svcs = grid_->get_svcs();
     bool changed = false;
@@ -948,7 +1032,7 @@ int Ls2gOuterModel::check_vm(SlotState& st, const LoopDecl& L, const RowView& rv
 // =============================================================================
 double Ls2gOuterModel::rl_bus_q(const SlotState& st, const RowView& rv, const RlBus& bus) const
 {
-    const auto& entry = rl_plan_.buses[static_cast<size_t>(bus.entry)];
+    const auto& entry = st.rl->plan.buses[static_cast<size_t>(bus.entry)];
     double q = mis_bus(st, rv, st.ctl, bus.bus_solver).imag();
     for (int pos : entry.ctrl_pos) q += rv.d->vc_q[pos];
     return q * sn_;
@@ -959,7 +1043,7 @@ void Ls2gOuterModel::rl_limits(const SlotState& st, const RowView* rv, const RlB
 {
     q_min = bus.min_q;
     q_max = bus.max_q;
-    const auto& entry = rl_plan_.buses[static_cast<size_t>(bus.entry)];
+    const auto& entry = st.rl->plan.buses[static_cast<size_t>(bus.entry)];
     for (int gid : entry.gen_ids) {
         ls2g::real_type lo, hi;
         grid_->gen_limits_at_outer_target(gid, static_cast<ls2g::real_type>(gen_override(st, gid)), lo, hi);
@@ -1020,7 +1104,7 @@ std::vector<char> Ls2gOuterModel::rl_groups_holding(const SlotState& st) const
 void Ls2gOuterModel::rl_freeze(SlotState& st, const RowView& rv, RlBus& bus, double q_mvar, int state) const
 {
     if (!bus.local) {
-        const auto& entry = rl_plan_.buses[static_cast<size_t>(bus.entry)];
+        const auto& entry = st.rl->plan.buses[static_cast<size_t>(bus.entry)];
         for (int c : entry.ctrl_pos) {
             double q = rl_controller_limit(st, rv, c, state > 0);
             if (bus.realistic && vc_kind_[static_cast<size_t>(c)] == ls2g::VoltageControlSolverData::GEN)
@@ -1041,7 +1125,7 @@ void Ls2gOuterModel::rl_freeze(SlotState& st, const RowView& rv, RlBus& bus, dou
 void Ls2gOuterModel::rl_release(SlotState& st, RlBus& bus) const
 {
     if (!bus.local) {
-        const auto& entry = rl_plan_.buses[static_cast<size_t>(bus.entry)];
+        const auto& entry = st.rl->plan.buses[static_cast<size_t>(bus.entry)];
         for (int c : entry.ctrl_pos) st.held_q[static_cast<size_t>(c)] = NaN;
         bus.state = 0;
         bus.realistic = false;
@@ -1191,7 +1275,7 @@ Next Ls2gOuterModel::on_solved(int slot, bool converged, int nr_iter, int inner_
         st.first = false;
         if (!st.solver_ok) return finish(st, row_status, inner_status);
         // the first pass
-        st.pass_check_unrealistic = last_fixing_ < 0;
+        st.pass_check_unrealistic = st.last_fixing < 0;
         st.old_total = st.total_nr;
         ++st.nb_passes;
         st.i = 0;
@@ -1202,18 +1286,18 @@ Next Ls2gOuterModel::on_solved(int slot, bool converged, int nr_iter, int inner_
     if (st.solver_ok && st.nb_outer < params_.max_outer_iterations)
         return drive(st, rv, row_status, inner_status, /*recheck=*/true);
     // the loop's do-while ends: its epilogue, then the next loop (which stops the pass)
-    if (!st.pass_check_unrealistic && st.i == last_fixing_ && st.solver_ok && data != nullptr && data->unrealistic) {
+    if (!st.pass_check_unrealistic && st.i == st.last_fixing && st.solver_ok && data != nullptr && data->unrealistic) {
         st.unrealistic = true;
         st.solver_ok = false;
     }
-    if (st.i == last_fixing_) st.pass_check_unrealistic = true;
+    if (st.i == st.last_fixing) st.pass_check_unrealistic = true;
     ++st.i;
     return drive(st, rv, row_status, inner_status);
 }
 
 Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, int inner_status, bool recheck)
 {
-    const int n = static_cast<int>(active_.size());
+    const int n = static_cast<int>(st.active.size());
     for (;;) {
         // the for loop over the loops of a pass, from loop i
         const bool stop = !recheck &&
@@ -1224,7 +1308,7 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
             // the pass is over: another one while a re-solve added Newton iterations
             if (st.total_nr > st.old_total && st.solver_ok && st.last_status != FAILED &&
                 st.nb_outer < params_.max_outer_iterations) {
-                st.pass_check_unrealistic = last_fixing_ < 0;
+                st.pass_check_unrealistic = st.last_fixing < 0;
                 st.old_total = st.total_nr;
                 ++st.nb_passes;
                 st.i = 0;
@@ -1232,7 +1316,7 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
             }
             return finish(st, row_status, inner_status);
         }
-        const LoopDecl& L = active_[static_cast<size_t>(st.i)];
+        const LoopDecl& L = loops_[static_cast<size_t>(st.active[static_cast<size_t>(st.i)])];
         const int status = check(st, L, rv);
         st.last_status = status;
         st.last_name = L.name;
@@ -1243,11 +1327,11 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
             return Next::Resolve;
         }
         // STABLE or FAILED: the loop's do-while ends here
-        if (!st.pass_check_unrealistic && st.i == last_fixing_ && st.solver_ok && rv.d != nullptr && rv.d->unrealistic) {
+        if (!st.pass_check_unrealistic && st.i == st.last_fixing && st.solver_ok && rv.d != nullptr && rv.d->unrealistic) {
             st.unrealistic = true;
             st.solver_ok = false;
         }
-        if (st.i == last_fixing_) st.pass_check_unrealistic = true;
+        if (st.i == st.last_fixing) st.pass_check_unrealistic = true;
         ++st.i;
     }
 }

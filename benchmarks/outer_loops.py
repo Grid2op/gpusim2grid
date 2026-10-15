@@ -30,6 +30,8 @@ def get_parser():
     parser.add_argument("--tol_mva", type=float, default=1e-6, help="Newton tolerance, MVA (lightsim2grid's unit)")
     parser.add_argument("--init_from_n", action="store_true",
                         help="the rows resume from the 'n' solve's loops (init_from_n_powerflow)")
+    parser.add_argument("--handle_disconnected_grid", action="store_true",
+                        help="solve a contingency that islands buses on its main component")
     parser.add_argument("--skip_cpu", action="store_true", help="time the GPU only")
     return parser
 
@@ -63,6 +65,7 @@ def main(args):
     t0 = time.perf_counter()
     ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=args.nb_iter,
                                 init_from_n_powerflow=args.init_from_n,
+                                handle_disconnected_grid=args.handle_disconnected_grid,
                                 tol=args.tol_mva / grid.get_sn_mva())
     ca.add_contingencies_by_branch_id([[c] for c in ctgs])
     t_build = time.perf_counter() - t0
@@ -85,6 +88,7 @@ def main(args):
     batch = ContingencyAnalysisCPP(grid)
     batch.change_algorithm("NROuter_KLU")
     batch.init_from_n_powerflow = args.init_from_n
+    batch.handle_disconnected_grid = args.handle_disconnected_grid
     for c in ctgs:
         batch.add_n1(c)
     t0 = time.perf_counter()
@@ -101,10 +105,13 @@ def main(args):
     diff_outer = [i for i in range(len(ctgs)) if res[i].nb_outer_iterations != res_ls[i].nb_outer_iterations]
     diff_conv = [i for i in range(len(ctgs)) if (status[i] == 0) != conv[i]]
     both = (status == 0) & conv
-    err = np.abs(V[both] - V_ls[both]).max(axis=1) if both.any() else np.zeros(0)
+    # masked buses: NaN here; compare the finite entries, and that both mask the same ones
+    fin = np.isfinite(V[both])
+    diff = np.where(fin, np.abs(V[both] - V_ls[both]), 0.)
+    err = np.nan_to_num(diff, nan=np.inf).max(axis=1) if both.any() else np.zeros(0)
     print(f"agreement: {len(diff_conv)} rows converge on one side only, {len(diff_outer)} rows with "
           f"another number of outer iterations, max |dV| {err.max() if err.size else 0.:.2e} "
-          f"(> 1e-6 on {int((err > 1e-6).sum())} rows)")
+          f"(> 1e-6 on {int((err > 1e-6).sum())} rows), {int((~fin).sum())} masked bus voltages")
 
 
 if __name__ == "__main__":

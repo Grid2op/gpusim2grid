@@ -12,6 +12,7 @@
 #include "contingency/batch_pf_driver.cuh"
 #include "contingency/batch_sources/scenario_sweep_batch.cuh"
 #include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
+#include <limits>
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel, zero_branch_flows_kernel
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
@@ -162,6 +163,12 @@ ScenarioSweepSession::ScenarioSweepSession(
                          base_state_->h_vm_col_of_bus,
                          base_ledger_ ? base_ledger_->vc_reg_bus : std::vector<int>{},
                          h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+    // The outer loops' ledger gives the switchable buses a Vm column, pinned while PV:
+    // their |V| is still the set-point a gen_v column re-seeds
+    if (base_ledger_ && base_ledger_->outer_loops)
+        for (int b : base_ledger_->switchable_vm_buses)
+            if (b >= 0 && b < static_cast<int>(h_is_vm_fixed_bus_.size()))
+                h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
 }
 
 // =============================================================================
@@ -1170,9 +1177,6 @@ void ScenarioSweepSession::run()
             throw std::runtime_error("ScenarioSweepSession: the outer loops need scheduling='continuous'");
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
-        if (has_gen_off_)           refuse("generator contingencies (set_contingency_gens)");
-        if (handle_disconnected_grid_) refuse("handle_disconnected_grid");
-        if (has_gen_v_)             refuse("set_gen_v");
         if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
         if (has_switches_ || has_vc_pins_ || has_vc_release_)
             refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
@@ -1248,7 +1252,13 @@ void ScenarioSweepSession::run()
         for (const auto& v : sw_vc_release_) if (!v.empty()) { any_switch = true; break; }
     }
     const int want_ref = _wanted_reference_bus();
-    // the outer loops' ledger carries its own switchable buses: nothing to rebuild
+    // the outer loops' ledger carries its own switchable buses: nothing to rebuild, and a
+    // generator contingency may only release one of them
+    if (outer_ && !required.empty())
+        throw std::runtime_error(
+            "ScenarioSweepSession: a generator contingency releases bus " + std::to_string(required.front()) +
+            ", which the outer loops' ledger has not reserved (ReactiveLimits reserves every bus "
+            "its own machines hold)");
     if (!outer_ && (required != reserved_buses_ || want_ref != ref_bus_)) {
         ref_bus_ = want_ref;
         _build_base_state(required);
@@ -1645,6 +1655,40 @@ void ScenarioSweepSession::run()
         if (gen_p_rows_.size() > 0 && gen_p_rows_.rows() == n_scenarios_)
             gp.assign(gen_p_rows_.data(), gen_p_rows_.data() + gen_p_rows_.size());
         outer_->set_row_targets(n_scenarios_, std::move(gp), {});
+        // ... and what else the rows change, as their loops see it
+        outer::RowOverrides ov;
+        const int n_gen = static_cast<int>(gen_bus_.size());
+        if (handle_disconnected_grid_) {
+            ov.masked.resize(static_cast<size_t>(n_scenarios_));
+            for (int r = 0; r < n_scenarios_; ++r)
+                ov.masked[static_cast<size_t>(r)] = contingencies_[static_cast<size_t>(r)].masked_buses;
+        }
+        if (has_gen_off_ && gen_off_.rows() == n_scenarios_) {
+            ov.gen_off.assign(static_cast<size_t>(n_scenarios_) * gen_off_.cols(), 0);
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (Eigen::Index g = 0; g < gen_off_.cols(); ++g)
+                    ov.gen_off[static_cast<size_t>(r) * gen_off_.cols() + g] = gen_off_(r, g) ? 1 : 0;
+            ov.pq_buses = row_pv_to_pq_;
+        }
+        if (has_gen_v_ && gen_v_.rows() == n_scenarios_ && gen_v_.cols() == n_gen) {
+            ov.gen_vm.resize(static_cast<size_t>(n_scenarios_) * n_gen);
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (int g = 0; g < n_gen; ++g) ov.gen_vm[static_cast<size_t>(r) * n_gen + g] = gen_v_(r, g);
+            // the groups' v_set the rows' gen_v drives (build_gen_v_override's columns)
+            const GenVOverride gvo = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+            const int n_grp = base_state_->n_vc_grp;
+            if (gvo.has_vc_columns() && n_grp > 0) {
+                const int k = gvo.k_active();
+                ov.vc_v_set.assign(static_cast<size_t>(n_scenarios_) * n_grp, std::numeric_limits<double>::quiet_NaN());
+                for (int r = 0; r < n_scenarios_; ++r)
+                    for (int j = 0; j < k; ++j) {
+                        const int grp = gvo.h_active_vc_group[static_cast<size_t>(j)];
+                        const double val = static_cast<double>(gvo.h_gen_v_all[static_cast<size_t>(r) * k + j]);
+                        if (grp >= 0 && std::isfinite(val)) ov.vc_v_set[static_cast<size_t>(r) * n_grp + grp] = val;
+                    }
+            }
+        }
+        outer_->set_row_overrides(std::move(ov));
     }
 
     timings_ = solver_->solve();

@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "injection_sweep_session.hpp"
+#include <limits>
 #include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
@@ -100,6 +101,11 @@ InjectionSweepSession::InjectionSweepSession(
                          base_state_->h_vm_col_of_bus,
                          ledger ? ledger->vc_reg_bus : std::vector<int>{},
                          h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+    // the outer loops' switchable buses keep a gen_v re-seed (see ScenarioSweepSession's ctor)
+    if (ledger != nullptr && ledger->outer_loops)
+        for (int b : ledger->switchable_vm_buses)
+            if (b >= 0 && b < static_cast<int>(h_is_vm_fixed_bus_.size()))
+                h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
     if (ledger) {
         h_vc_v_set_ = ledger->vc_v_set;
         h_vc_group_fixed_.assign(ledger->vc_reg_bus.size(), 0);
@@ -207,7 +213,6 @@ void InjectionSweepSession::run()
             refuse("a strategy other than 'direct_refactor_every'");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
         if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
-        if (has_gen_v_)             refuse("set_gen_v");
     }
 
     // Hot run: same settings and row count as the live driver -- keep it
@@ -315,7 +320,30 @@ void InjectionSweepSession::run()
 
     // The outer loops: the model decides on every row, from the rows' own targets.
     solver_->outer_hook_ = outer_.get();
-    if (outer_) outer_->set_row_targets(n_scenarios_, outer_gen_p_, {});
+    if (outer_) {
+        outer_->set_row_targets(n_scenarios_, outer_gen_p_, {});
+        // the rows' generator set-points, and the groups' v_set they drive
+        outer::RowOverrides ov;
+        const int n_gen = static_cast<int>(gen_bus_.size());
+        if (has_gen_v_ && gen_v_.rows() == n_scenarios_ && gen_v_.cols() == n_gen) {
+            ov.gen_vm.resize(static_cast<size_t>(n_scenarios_) * n_gen);
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (int g = 0; g < n_gen; ++g) ov.gen_vm[static_cast<size_t>(r) * n_gen + g] = gen_v_(r, g);
+            const GenVOverride gvo = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+            const int n_grp = base_state_->n_vc_grp;
+            if (gvo.has_vc_columns() && n_grp > 0) {
+                const int k = gvo.k_active();
+                ov.vc_v_set.assign(static_cast<size_t>(n_scenarios_) * n_grp, std::numeric_limits<double>::quiet_NaN());
+                for (int r = 0; r < n_scenarios_; ++r)
+                    for (int j = 0; j < k; ++j) {
+                        const int grp = gvo.h_active_vc_group[static_cast<size_t>(j)];
+                        const double val = static_cast<double>(gvo.h_gen_v_all[static_cast<size_t>(r) * k + j]);
+                        if (grp >= 0 && std::isfinite(val)) ov.vc_v_set[static_cast<size_t>(r) * n_grp + grp] = val;
+                    }
+            }
+        }
+        outer_->set_row_overrides(std::move(ov));
+    }
 
     timings_ = solver_->solve();
     if (!cold) {

@@ -97,8 +97,10 @@ lightsim2grid's batches with ``init_from_n_powerflow`` do.
 slack mismatch it could not share), ``OUTER_UNSTABLE`` (``max_outer_iterations``
 reached) and ``UNREALISTIC``, and ``get_outer_results()`` gives lightsim2grid's
 per-row ``OuterRowResult`` (``keep_outer_trace=True`` keeps the decision trace).
-Not supported yet: ``handle_disconnected_grid``, generator contingencies,
-``set_gen_v``, ``redistribute_slack``, the physical checks, gradients.
+A row's islanded buses (``handle_disconnected_grid``), its generator
+contingencies and its ``set_gen_v`` set-points are seen by its loops as
+lightsim2grid's batches show them. Not supported yet: ``redistribute_slack``
+(the ``DistributedSlack`` loop does that job), the physical checks, gradients.
 
 .. code-block:: python
 

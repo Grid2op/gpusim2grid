@@ -243,7 +243,6 @@ void ContingencyAnalysisSession::run()
             refuse("a strategy other than 'direct_refactor_every'");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
         if (nb_iter_per_round_ != 1) refuse("nb_iter_per_round != 1 (a row's inner solves must stop where lightsim2grid's do)");
-        if (handle_disconnected_grid_) refuse("handle_disconnected_grid");
         if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
     }
 
@@ -422,7 +421,16 @@ void ContingencyAnalysisSession::run()
     // The outer loops: the model decides on every row (a contingency keeps the
     // grid's targets).
     solver_->outer_hook_ = outer_.get();
-    if (outer_) outer_->set_row_targets(static_cast<int>(contingencies_.size()), {}, {});
+    if (outer_) {
+        outer_->set_row_targets(static_cast<int>(contingencies_.size()), {}, {});
+        // the buses each contingency masks, as its loops see them
+        outer::RowOverrides ov;
+        if (handle_disconnected_grid_) {
+            ov.masked.resize(contingencies_.size());
+            for (size_t r = 0; r < contingencies_.size(); ++r) ov.masked[r] = contingencies_[r].masked_buses;
+        }
+        outer_->set_row_overrides(std::move(ov));
+    }
     timings_ = solver_->solve();
 
     // Wire in base-case and one-time setup timings captured before/during

@@ -76,6 +76,23 @@ struct SlotData {
 
 enum class Next : int { Resolve = 0, Done = 1 };
 
+// What the rows change beyond their injections, as the loops see it (lightsim2grid's
+// OuterRowView); every member optional, empty = no row changes it.
+struct RowOverrides {
+    // per row, the solver buses handle_disconnected_grid masks
+    std::vector<std::vector<int>> masked;
+    // n_rows x n_gen, row-major: 1 = the row disconnects the generator (set_contingency_gens)
+    std::vector<char> gen_off;
+    // n_rows x n_gen, row-major: the generators' voltage set-points, pu (NaN: the grid's)
+    std::vector<double> gen_vm;
+    // per row, the switchable buses it starts PQ (a generator contingency took their last
+    // regulator)
+    std::vector<std::vector<int>> pq_buses;
+    // n_rows x n_grp, row-major: the VoltageControl groups' v_set the row's gen_v gives
+    // (NaN: the grid's)
+    std::vector<double> vc_v_set;
+};
+
 // Mirrors lightsim2grid's OuterRowResult (BaseBatchSweep.hpp).
 struct RowResult {
     int  status = -1;            // OuterLoopStatus: 0 STABLE, 1 UNSTABLE, 2 FAILED; -1 never ran
@@ -120,6 +137,8 @@ public:
     // loops start from (DistributedSlack's units, ReactiveLimits' capability
     // curves). Their effect on Sbus is the caller's (the row's injections).
     virtual void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) = 0;
+    // The rows' other changes (see RowOverrides); replaces the previous ones.
+    virtual void set_row_overrides(RowOverrides overrides) = 0;
 };
 
 }  // namespace outer

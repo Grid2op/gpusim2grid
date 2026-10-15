@@ -313,7 +313,6 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             scheduling = "continuous" if self._outer_loops else "chunked"
         if self._outer_loops:
             _check_outer_loops_args(grid, use_bridge, scheduling,
-                                    handle_disconnected_grid=handle_disconnected_grid,
                                     redistribute_slack=redistribute_slack,
                                     compute_physical_violations=compute_physical_violations,
                                     reactive_limits_outer_loop=reactive_limits_outer_loop)
