@@ -570,6 +570,7 @@ def _check_rows(sw, ls, grid, n_rows, flows=True):
         assert int(res[i].status) == int(res_ls[i].status), msg
         assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
         assert sorted(res[i].phase_tap) == sorted(res_ls[i].phase_tap), msg
+        assert sorted(res[i].ratio_tap) == sorted(res_ls[i].ratio_tap), msg
         if conv_ls[i]:
             np.testing.assert_allclose(V[i], V_ls[i], rtol=0., atol=1e-8, err_msg=msg)
     if flows:
@@ -713,3 +714,99 @@ def test_phase_control_current_violations_at_the_moved_tap():
         got, ref = pick(v), pick(v_ls)
         assert len(got) == len(ref) == 1, (i, v, v_ls)
         assert got[0] == pytest.approx(ref[0], rel=1e-8)
+
+
+
+# --------------------------------------------------------------------------------------
+# TransformerVoltageControl: a ratio tap changer's ratio a Newton unknown (BranchControl's
+# ratio column and its group's rows), the low voltage generators frozen meanwhile;
+# lightsim2grid's _tap_grid (ReactiveLimits too)
+# --------------------------------------------------------------------------------------
+def _tvc():
+    import test_outer_model_cpu as cpu
+    grid = cpu._tvc_grid("T4-9-1", 12.6, 0.1, reactive_limits=True, use_initial_tap_position=True,
+                         max_controlled_nominal_voltage=120.)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
+    t = next(i for i, tr in enumerate(grid.get_trafos()) if tr.name == "T4-9-1")
+    return grid, t
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_transformer_voltage_control_contingency_analysis(init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid, trafo = _tvc()
+    n_line = len(grid.get_lines())
+    branches = [1, 2, 3, 5, n_line + trafo]          # sorted: lightsim2grid's row order
+    ls = ContingencyAnalysisCPP(grid)
+    for b in branches:
+        ls.add_n1(b)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = init_from_n
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                                tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    ca.add_contingencies_by_branch_id([[b] for b in branches])
+    ca.compute(batch_size=2)
+    res = _check_rows(ca, ls, grid, len(branches))
+    assert any(r.ratio_tap for r in res)
+    assert not [t for t, _ in res[-1].ratio_tap if t == trafo]
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_transformer_voltage_control_scenario_sweep(init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    from gpusim2grid import ScenarioSweepGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid, _ = _tvc()
+    n_rows, n_line = 5, len(grid.get_lines())
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.02 * np.arange(n_rows)
+    rows = [[], [1], [2], [], [3]]
+    ls = ScenarioSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = init_from_n
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    lines = np.zeros((n_rows, n_line), dtype=bool)
+    for i, br in enumerate(rows):
+        lines[i, br] = True
+    ls.set_contingency_lines(lines)
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                          tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    sw.set_topology(rows)
+    sw.compute(batch_size=2)
+    _check_rows(sw, ls, grid, n_rows)
+
+
+def test_transformer_voltage_control_injection_sweep():
+    from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
+    from gpusim2grid import InjectionSweepGPU
+    grid, _ = _tvc()
+    n_rows = 6
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.03 * np.arange(n_rows)
+    ls = InjectionSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = InjectionSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                           tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    sw.compute(batch_size=2)
+    res = _check_rows(sw, ls, grid, n_rows)
+    assert any(r.ratio_tap for r in res)

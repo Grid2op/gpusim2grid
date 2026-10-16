@@ -1117,7 +1117,8 @@ AcPfNrState::AcPfNrState(
             return (it == e || *it != col) ? -1 : static_cast<int>(it - inner);
         };
         std::vector<int> ypos(4 * static_cast<size_t>(n_bc)), jpos(9 * static_cast<size_t>(n_bc), -1),
-                         row(n_bc, -1), col(n_bc, -1);
+                         row(n_bc, -1), col(n_bc, -1), rcol(n_bc, -1),
+                         jpos_r(4 * static_cast<size_t>(n_bc), -1);
         for (int e = 0; e < n_bc; ++e) {
             const int b1 = ledger->bc_bus1[e], b2 = ledger->bc_bus2[e];
             const int yp[4] = {find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b1, b1),
@@ -1130,13 +1131,21 @@ AcPfNrState::AcPfNrState(
                 ypos[4 * e + k] = yp[k];
             }
             const int c = ledger->bc_shift_col[e], r = ledger->bc_shift_row[e];
-            if (c < 0) continue;
-            col[e] = c;
-            row[e] = r;
             const int* Jo = J_outer_h.data();
             const int* Ji = J_inner_h.data();
             const int p1 = ledger->p_row_of_bus[b1], q1 = ledger->q_row_of_bus[b1];
             const int p2 = ledger->p_row_of_bus[b2], q2 = ledger->q_row_of_bus[b2];
+            const int rc = ledger->bc_ratio_col[e];
+            if (rc >= 0) {
+                rcol[e] = rc;
+                jpos_r[4 * e + 0] = find_pos(Jo, Ji, p1, rc);
+                jpos_r[4 * e + 1] = find_pos(Jo, Ji, q1, rc);
+                jpos_r[4 * e + 2] = find_pos(Jo, Ji, p2, rc);
+                jpos_r[4 * e + 3] = find_pos(Jo, Ji, q2, rc);
+            }
+            if (c < 0) continue;
+            col[e] = c;
+            row[e] = r;
             const int jp[9] = {find_pos(Jo, Ji, p1, c), find_pos(Jo, Ji, q1, c),
                                find_pos(Jo, Ji, p2, c), find_pos(Jo, Ji, q2, c),
                                find_pos(Jo, Ji, r, c),
@@ -1165,6 +1174,42 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_bc_col, col.data(), n_bc, cs);
         upload_h2d(d_bc_ypos, ypos.data(), ypos.size(), cs);
         upload_h2d(d_bc_jpos, jpos.data(), jpos.size(), cs);
+        upload_h2d(d_bc_rcol, rcol.data(), n_bc, cs);
+        upload_h2d(d_bc_jpos_r, jpos_r.data(), jpos_r.size(), cs);
+        // the solved ratio groups (BranchControl's RatioGroup)
+        n_bc_grp = static_cast<int>(ledger->bc_grp_bus.size());
+        {
+            std::vector<int> gs{0}, gm, gr, gjvm, gjs, gjc;
+            std::vector<cuda_real_type> gt;
+            const int* Jo = J_outer_h.data();
+            const int* Ji = J_inner_h.data();
+            for (int g = 0; g < n_bc_grp; ++g) {
+                const auto& mem = ledger->bc_grp_members[g];
+                const auto& rows = ledger->bc_grp_rows[g];
+                if (rows.size() != mem.size())
+                    throw std::runtime_error("AcPfNrState: a ratio group's rows are not its members'");
+                const int n = static_cast<int>(mem.size());
+                gjs.push_back(static_cast<int>(gjc.size()));
+                for (int j = 0; j < n; ++j) {
+                    gm.push_back(mem[j]);
+                    gr.push_back(rows[j]);
+                    gjvm.push_back(find_pos(Jo, Ji, rows[j], ledger->bc_grp_vm_col[g]));
+                    for (int m = 0; m < n; ++m) gjc.push_back(find_pos(Jo, Ji, rows[j], ledger->bc_ratio_col[mem[m]]));
+                }
+                gs.push_back(static_cast<int>(gm.size()));
+                gt.push_back(static_cast<cuda_real_type>(ledger->bc_grp_target[g]));
+            }
+            if (gm.empty()) { gm.push_back(-1); gr.push_back(-1); gjvm.push_back(-1); gjc.push_back(-1); gjs.push_back(0); gt.push_back(0); }
+            upload_h2d(d_bc_grp_start, gs.data(), gs.size(), cs);
+            upload_h2d(d_bc_grp_member, gm.data(), gm.size(), cs);
+            upload_h2d(d_bc_grp_row, gr.data(), gr.size(), cs);
+            upload_h2d(d_bc_grp_jvm, gjvm.data(), gjvm.size(), cs);
+            upload_h2d(d_bc_grp_jstart, gjs.data(), gjs.size(), cs);
+            upload_h2d(d_bc_grp_jcol, gjc.data(), gjc.size(), cs);
+            upload_h2d(d_bc_grp_bus, ledger->bc_grp_bus.empty() ? gm.data() : ledger->bc_grp_bus.data(),
+                       std::max<size_t>(ledger->bc_grp_bus.size(), 1), cs);
+            upload_h2d(d_bc_grp_target, gt.data(), gt.size(), cs);
+        }
         const auto sign = to_real(ledger->bc_sign), rexp = to_real(ledger->bc_rexp),
                    pt = to_real(ledger->bc_p_target), at = to_real(ledger->bc_a_tap0),
                    rt = to_real(ledger->bc_rho_tap0);
@@ -1184,7 +1229,9 @@ AcPfNrState::AcPfNrState(
         d_bcs_rho_tap.assign(rt.begin(), rt.end());
         d_bcs_tap.assign(tap0.begin(), tap0.end());
         d_bcs_applied.assign(yeff0.begin(), yeff0.end());
+        d_bcs_rho_target.assign(rt.begin(), rt.end());
         d_bcs_on.assign(static_cast<size_t>(n_bc), 0);
+        d_bcs_ron.assign(static_cast<size_t>(n_bc), 0);
         d_bcs_out.assign(static_cast<size_t>(n_bc), 0);
     }
 

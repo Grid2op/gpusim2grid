@@ -331,9 +331,12 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
                 buf.d_vc_grp_start, buf.d_vc_grp_count,
                 buf.n_vc_ctrl, buf.n_vc_grp, n_bus, dim_J, batch);
     }
-    // BranchControl: the shift rows
+    // BranchControl: the shift rows, the ratio groups' rows
     if (buf.bc.n_bc > 0)
         bc_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.bc, buf.bcs, n_bus, dim_J, batch);
+    if (buf.bc.n_grp > 0)
+        bc_group_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.n_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.bc, buf.bcs, n_bus, dim_J, batch);
 }
 
@@ -367,10 +370,13 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
             buf.d_vch_slope_pos, buf.d_vch_vm_pos, buf.d_vch_rowpos_off, buf.d_vch_rowpos,
             buf.d_vc_grp_start, buf.d_vc_grp_count,
             buf.n_vc_ctrl, buf.n_vc_grp, nnz_J, batch);
-    // BranchControl: dS/da on the two buses and the shift rows
+    // BranchControl: dS/da, dS/drho on the two buses, the shift rows, the ratio groups' rows
     if (buf.bc.n_bc > 0)
         bc_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.bc, buf.bcs, n_bus, nnz_J, batch);
+    if (buf.bc.n_grp > 0)
+        bc_group_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.n_grp, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.bc, buf.bcs, nnz_J, batch);
 }
 
 inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cudaStream_t cs)

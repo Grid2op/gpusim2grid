@@ -44,6 +44,22 @@ struct BcStatic {
     const cudaComplexType* yeff0 = nullptr;     // [4 n_bc] the block the container stamps
     const cuda_real_type* a_tap0 = nullptr;     // [n_bc] the grid's taps' shift and ratio
     const cuda_real_type* rho_tap0 = nullptr;
+    // the ratio columns (TransformerVoltageControl): per transformer its column (-1 none) and
+    // the J positions of dS/drho, (p1,rcol) (q1,rcol) (p2,rcol) (q2,rcol)
+    const int* rcol = nullptr;            // [n_bc]
+    const int* jpos_r = nullptr;          // [4 n_bc]
+    // its solved ratio groups: group g's members are grp_member[grp_start[g] .. grp_start[g+1]),
+    // one row each (grp_row, same order); grp_jvm the J position of (row, vm_col(bus)) per
+    // member, grp_jcol of (row_j, rcol_m) per (j, m) pair, flat from grp_jstart[g]
+    int n_grp = 0;
+    const int* grp_start = nullptr;       // [n_grp + 1]
+    const int* grp_member = nullptr;      // flat
+    const int* grp_row = nullptr;         // flat
+    const int* grp_jvm = nullptr;         // flat
+    const int* grp_jstart = nullptr;      // [n_grp]
+    const int* grp_jcol = nullptr;        // flat, n_j^2 per group
+    const int* grp_bus = nullptr;         // [n_grp] the regulated bus
+    const cuda_real_type* grp_target = nullptr;   // [n_grp] pu
 };
 
 struct BcSlots {   // per slot, [batch * n_bc] (blocks [batch * n_bc * 4])
@@ -54,7 +70,9 @@ struct BcSlots {   // per slot, [batch * n_bc] (blocks [batch * n_bc * 4])
     cuda_real_type*  rho_tap = nullptr;
     cudaComplexType* tap = nullptr;       // the block at the slot's taps
     cudaComplexType* applied = nullptr;   // the block stamped in the slot's Ybus now
+    cuda_real_type*  rho_target = nullptr;
     unsigned char*   on = nullptr;        // phase control on
+    unsigned char*   ron = nullptr;       // ratio (voltage) control on
     unsigned char*   out = nullptr;       // the row does not have it: nothing stamped, never patched
 };
 
@@ -68,6 +86,16 @@ __global__ void bc_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaC
 __global__ void bc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaComplexType* __restrict__ d_V,
                                  BcStatic st, BcSlots sl, int n_bus, int nnz_J, int batch);
 
+// One thread per (slot, solved ratio group): its rows' residuals (assign), BranchControl::
+// fill_custom_rows: per member, off "rho = rho_target", the first one on "Vm(bus) = target",
+// any other one on "mean(rho) = rho".
+__global__ void bc_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
+                                         BcStatic st, BcSlots sl, int n_bus, int dim_J, int batch);
+
+// One thread per (slot, solved ratio group): its rows' J entries, every position assigned.
+__global__ void bc_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, BcStatic st, BcSlots sl,
+                                       int nnz_J, int batch);
+
 // One thread per (slot, transformer): the Newton step on the shift (BranchControl::
 // apply_step), then the block patched into the slot's Ybus (d_Ybus may be null: the
 // state moves, nothing is patched).
@@ -80,7 +108,8 @@ __global__ void bc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComp
 // d_out (nothing stamped then), the block the container stamped taken as applied. Then
 // a re-tap (d_retap set: the taps' block, shift, ratio from d_tap / d_a_tap / d_rho_tap,
 // the shift and ratio back to them), then the requested control (d_ctl: -1 untouched,
-// 0 off -- its target where the shift is --, 1 on), then the block patched into Ybus.
+// 0 off -- its target where the shift is --, 1 on; d_rctl the same for the ratio), then the
+// block patched into Ybus.
 // The per-listed-slot inputs are [n_list * n_bc] (blocks [n_list * n_bc * 4]).
 __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
                                    const int* __restrict__ d_slots, int n_list, bool fresh,
@@ -90,6 +119,7 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
                                    const cuda_real_type* __restrict__ d_a_tap,
                                    const cuda_real_type* __restrict__ d_rho_tap,
                                    const signed char* __restrict__ d_ctl,
+                                   const signed char* __restrict__ d_rctl,
                                    int nnz_Y);
 
 // One thread per (slot, transformer), the slots whose d_evict entry is >= 0 (null:

@@ -32,6 +32,7 @@
 #include <powerflow_algorithm/outer_loop/ReactiveLimitsLoop.hpp>
 #include <powerflow_algorithm/outer_loop/OuterLoopDriver.hpp>
 #include <powerflow_algorithm/outer_loop/PhaseControlLoop.hpp>
+#include <powerflow_algorithm/outer_loop/TransformerVoltageControlLoop.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,8 @@
 #include <complex>
 #include <limits>
 #include <map>
+#include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -49,7 +52,8 @@ namespace {
 using cplx = std::complex<double>;
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 
-enum class Kind { DistributedSlack, HvdcLimits, VoltageMonitoring, ReactiveLimits, PhaseControl };
+enum class Kind { DistributedSlack, HvdcLimits, VoltageMonitoring, ReactiveLimits, PhaseControl,
+                  TransformerVoltageControl };
 enum Status { STABLE = 0, UNSTABLE = 1, FAILED = 2 };   // OuterLoopStatus
 
 struct LoopDecl {
@@ -63,6 +67,23 @@ struct LoopDecl {
     double rl_max_mismatch = 1e-4, rl_base_mva = 100.;
     bool   rl_robust = true;
     double rl_vmin = 0.5, rl_vmax = 2., rl_margin = 1.02, rl_restart = 1.;
+    // TransformerVoltageControl: the grid's loop, for its groups(view) and parameters
+    std::shared_ptr<const ls2g::TransformerVoltageControlLoop> tvc;
+};
+
+// TransformerVoltageControlLoop's per-solve state
+struct TvcRatio {   // TransformerRatioManager's, per transformer
+    double initial = 1., min = 1., max = 1.;
+    double shared_min = 1., shared_max = 1., shared_initial = 1.;
+};
+struct TvcFrozen {  // a generator bus frozen by INITIAL
+    int entry;
+    int bus_solver;
+    bool local;
+    double target_vm;
+};
+struct TvcBranch {  // a branch closed in the row: its solver buses, its trafo id (-1: a line)
+    int bus1, bus2, trafo;
 };
 
 // ReactiveLimitsLoop::ControllerBus
@@ -94,6 +115,7 @@ struct RlPlan {
     std::vector<int> monitor_of_entry;
     std::vector<RlBus> buses;
     bool has_monitor = false;
+    size_t n_bus_q = 0;    // plan.buses' entries before the monitors: bus_q_check's own plan
 };
 
 // everything one row carries through its solves
@@ -125,6 +147,12 @@ struct SlotState {
     std::vector<std::pair<int, double>> vm_switched_on;
     std::vector<RlBus> rl_buses;
     std::vector<ls2g::PhaseControlLoop::Shifter> pc_shifters;
+    int tvc_step = 0;                     // 0 INITIAL, 1 CONTROL, 2 COMPLETE
+    std::vector<ls2g::TransformerVoltageControlLoop::Group> tvc_groups;
+    std::vector<char> tvc_enabled, tvc_controller;   // per trafo id
+    std::vector<TvcRatio> tvc_ratios;                // per trafo id
+    std::vector<TvcFrozen> tvc_frozen;
+    std::set<int> suspended;              // OuterControls::suspended (solver buses)
     // ---- BranchControl, per transformer (the ledger's order): what the slot's system holds,
     // as lightsim2grid's BranchControl::Entry, and what the loops asked of it (its
     // PhaseShifterControl / RatioTapControl) ----------------------------------------------------
@@ -315,6 +343,19 @@ private:
     int check_vm(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_rl(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_pc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
+    int check_tvc(SlotState& st, const LoopDecl& L, const RowView& rv) const;
+    // TransformerVoltageControlLoop's helpers
+    void tvc_set_on(SlotState& st, int t, bool on) const;
+    int  tvc_closest_tap(const SlotState& st, int t, double value) const;
+    std::vector<TvcBranch> tvc_closed_branches(const ls2g::OuterGridView& v) const;
+    double tvc_limit(const SlotState& st, const LoopDecl& L) const;
+    bool tvc_voltage_control_off(const SlotState& st, int bus) const;
+    void tvc_freeze(SlotState& st, const RowView& rv, double limit, const std::vector<TvcBranch>& closed) const;
+    void tvc_release(SlotState& st) const;
+    void tvc_fix_controls(SlotState& st, const std::vector<TvcBranch>& closed) const;
+    int  bc_entry(int trafo) const {
+        return (trafo >= 0 && trafo < n_trafo_) ? bc_of_trafo_[static_cast<size_t>(trafo)] : -1;
+    }
     // BranchControl helpers: the block at shift a and ratio rho (BranchControl::_block_at),
     // a re-tap's data (BranchControl::_retap), the current through a side (::current)
     void bc_block_at(const SlotState& st, int e, double a, double rho, cplx blk[4]) const;
@@ -382,10 +423,13 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
             d.rl_restart = p.robust_restart_vm_pu;
         } else if (dynamic_cast<const ls2g::PhaseControlLoop*>(lp.get())) {
             d.kind = Kind::PhaseControl;
+        } else if (auto* tv = dynamic_cast<const ls2g::TransformerVoltageControlLoop*>(lp.get())) {
+            d.kind = Kind::TransformerVoltageControl;
+            d.tvc = std::make_shared<const ls2g::TransformerVoltageControlLoop>(tv->params());
         } else {
             throw std::runtime_error("gpusim2grid's outer loops: the loop '" + d.name +
                                      "' is not supported (DistributedSlack, AcHvdcAcEmulationLimits, "
-                                     "VoltageMonitoring, ReactiveLimits and PhaseControl are)");
+                                     "VoltageMonitoring, ReactiveLimits, PhaseControl and TransformerVoltageControl are)");
         }
         loops.push_back(d);
     }
@@ -510,6 +554,10 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     for (const auto& line : hvdc_plan0_.lines) { watch.push_back(line.bus1_solver); watch.push_back(line.bus2_solver); }
     for (const auto& m : monitors_.svcs) { watch.push_back(m.reg_bus_solver); watch.push_back(m.svc_bus_solver); }
     for (int e = 0; e < n_bc_; ++e) { watch.push_back(bc_b1_[static_cast<size_t>(e)]); watch.push_back(bc_b2_[static_cast<size_t>(e)]); }
+    // the buses the transformers regulate (every group, a row's are among them)
+    for (const LoopDecl& d : loops_)
+        if (d.kind == Kind::TransformerVoltageControl)
+            for (const auto& gr : d.tvc->groups(v)) watch.push_back(gr.bus_solver);
     watch.erase(std::remove_if(watch.begin(), watch.end(), [&](int b) { return b < 0 || b >= n_bus_; }), watch.end());
     std::sort(watch.begin(), watch.end());
     watch.erase(std::unique(watch.begin(), watch.end()), watch.end());
@@ -727,6 +775,7 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
     // ReactiveLimitsLoop::_initialize: bus_q_check's plan on this view, plus one entry per
     // voltage monitor (a held SVC controller of the plan)
     ls2g::bus_q_check::build_bus_q_plan(v, rl->plan);
+    rl->n_bus_q = rl->plan.buses.size();
     rl->monitor_of_entry.assign(rl->plan.buses.size(), -1);
     const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();
     for (int c = 0; c < ctrl.n_controllers(); ++c) {
@@ -760,13 +809,8 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
         bus.monitor_svc = rl->monitor_of_entry[k];
         bus.reg_bus_solver = entry.bus_solver;
         bus.nominal_v = vn_kv(entry.bus_grid);
-        if (bus.local) {
-            bus.pin = pin_of_bus_[static_cast<size_t>(entry.bus_solver)];
-            if (bus.pin < 0)
-                throw std::runtime_error("outer model: the controller bus " + std::to_string(entry.bus_solver) +
-                                         " has no reserved Vm column (is the grid's algorithm an NROuter_* one, "
-                                         "solved with its loops?)");
-        }
+        // the switchable bus a loop freezing it switches (-1: none reserved, no loop does)
+        if (bus.local) bus.pin = pin_of_bus_[static_cast<size_t>(entry.bus_solver)];
         bool has_target = false;
         if (!bus.local) {
             const int gr = ctrl.group(entry.ctrl_pos.front());
@@ -827,12 +871,18 @@ void Ls2gOuterModel::set_active(SlotState& st) const
             }
             case Kind::ReactiveLimits:    needed = !st.rl->plan.empty() || st.rl->has_monitor; break;
             case Kind::PhaseControl:      needed = true; break;   // stable at once without a shifter
+            case Kind::TransformerVoltageControl:
+                for (const auto& gr : d.tvc->groups(v)) needed = needed || !gr.hidden;
+                break;
         }
         if (needed) st.active.push_back(static_cast<int>(i));
     }
+    // (BaseOuterLoop::can_fix_unrealistic_state: ReactiveLimits, TransformerVoltageControl)
     if (params_.voltage_remote_control_robust_mode)
-        for (size_t i = 0; i < st.active.size(); ++i)
-            if (loops_[static_cast<size_t>(st.active[i])].kind == Kind::ReactiveLimits) st.last_fixing = static_cast<int>(i);
+        for (size_t i = 0; i < st.active.size(); ++i) {
+            const Kind k = loops_[static_cast<size_t>(st.active[i])].kind;
+            if (k == Kind::ReactiveLimits || k == Kind::TransformerVoltageControl) st.last_fixing = static_cast<int>(i);
+        }
 }
 
 void Ls2gOuterModel::clear_vm_reset(int slot)
@@ -868,6 +918,23 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
             case Kind::VoltageMonitoring:
                 st.vm_switched_on.clear();
                 break;
+            case Kind::TransformerVoltageControl: {
+                // TransformerVoltageControlLoop::_initialize: every voltage control off
+                st.tvc_groups = d.tvc->groups(view(st));
+                st.tvc_step = 0;
+                st.tvc_frozen.clear();
+                st.tvc_enabled.assign(static_cast<size_t>(n_trafo_), 0);
+                st.tvc_controller.assign(static_cast<size_t>(n_trafo_), 0);
+                st.tvc_ratios.assign(static_cast<size_t>(n_trafo_), TvcRatio());
+                for (const auto& gr : st.tvc_groups)
+                    for (int t : gr.trafos) st.tvc_controller[static_cast<size_t>(t)] = 1;
+                for (int t = 0; t < n_trafo_; ++t) {
+                    if (!st.tvc_controller[static_cast<size_t>(t)]) continue;
+                    const int e = bc_entry(t);
+                    if (e >= 0 && bc_ratio_[static_cast<size_t>(e)]) st.bc_rctl[static_cast<size_t>(e)] = 0;
+                }
+                break;
+            }
             case Kind::PhaseControl: {
                 // PhaseControlLoop::_initialize: the active power controllers regulate from the
                 // first solve on
@@ -901,6 +968,7 @@ void Ls2gOuterModel::resume_loops(SlotState& st) const
         switch (d.kind) {
             case Kind::DistributedSlack:   // its units start from the targets in force: taken above
             case Kind::PhaseControl:       // restarts (its taps are carried: load)
+            case Kind::TransformerVoltageControl:
                 break;
             case Kind::HvdcLimits:
                 // HvdcAcEmulationLimitsLoop::_initialize: each line in the regime the solve
@@ -1311,6 +1379,10 @@ void Ls2gOuterModel::rl_freeze(SlotState& st, const RowView& rv, RlBus& bus, dou
         bus.frozen_q = q_mvar;
         return;
     }
+    if (bus.pin < 0)
+        throw std::runtime_error("outer model: the controller bus " + std::to_string(bus.bus_solver) +
+                                 " has no reserved Vm column (is the grid's algorithm an NROuter_* one, "
+                                 "solved with its loops?)");
     // Sbus(b).imag = imag(Sbus_target(b)) + q / sn, the bus PQ
     st.freeze_q[bus.bus_solver] = q_mvar / sn_;
     st.pq[static_cast<size_t>(bus.pin)] = 1;
@@ -1351,6 +1423,8 @@ int Ls2gOuterModel::check_rl(SlotState& st, const LoopDecl& L, const RowView& rv
     for (size_t k = 0; k < st.rl_buses.size(); ++k) {
         const RlBus& bus = st.rl_buses[k];
         const int ki = static_cast<int>(k);
+        // a bus whose voltage control another loop suspended (TransformerVoltageControl)
+        if (st.suspended.count(bus.bus_solver)) continue;
         double target_vm = bus.target_vm;
         if (bus.monitor_svc >= 0) {
             const int c = svc_ctrl_[static_cast<size_t>(bus.monitor_svc)];
@@ -1448,8 +1522,341 @@ int Ls2gOuterModel::check(SlotState& st, const LoopDecl& L, const RowView& rv, i
         case Kind::VoltageMonitoring: return check_vm(st, L, rv);
         case Kind::ReactiveLimits:    return check_rl(st, L, rv);
         case Kind::PhaseControl:      return check_pc(st, L, rv, iteration);
+        case Kind::TransformerVoltageControl: return check_tvc(st, L, rv);
     }
     return STABLE;
+}
+
+// =============================================================================
+// TransformerVoltageControlLoop (AFTER_GENERATOR_VOLTAGE_CONTROL)
+// =============================================================================
+void Ls2gOuterModel::tvc_set_on(SlotState& st, int t, bool on) const
+{
+    st.tvc_enabled[static_cast<size_t>(t)] = on ? 1 : 0;
+    const int e = bc_entry(t);
+    if (e >= 0 && bc_ratio_[static_cast<size_t>(e)]) st.bc_rctl[static_cast<size_t>(e)] = on ? 1 : 0;
+}
+
+int Ls2gOuterModel::tvc_closest_tap(const SlotState& st, int t, double value) const
+{
+    // PiModelArray.roundR1ToClosestTap: the current position unless another is strictly closer;
+    // at the phase tap the solve has it at (a phase shifter's, the grid's otherwise)
+    const auto& trafos = grid_->get_trafos();
+    const auto& ptc = trafos.get_tap_changers(true);
+    const auto& rtc = trafos.get_tap_changers(false);
+    const int e = bc_entry(t);
+    const int ppos = (e >= 0 && bc_phase_[static_cast<size_t>(e)]) ? st.bc_pos[static_cast<size_t>(e)]
+                                                                  : (ptc.has(t) ? ptc.position(t) : 0);
+    int best = st.bc_rpos[static_cast<size_t>(e)];
+    double best_distance = std::abs(value - trafos.ratio_at(t, best, ppos));
+    for (int pos = rtc.low_tap(t); pos <= rtc.high_tap(t); ++pos) {
+        const double distance = std::abs(value - trafos.ratio_at(t, pos, ppos));
+        if (distance < best_distance) { best = pos; best_distance = distance; }
+    }
+    return best;
+}
+
+std::vector<TvcBranch> Ls2gOuterModel::tvc_closed_branches(const ls2g::OuterGridView& v) const
+{
+    std::vector<TvcBranch> res;
+    int b1, b2;
+    for (int el = 0; el < n_line_; ++el)
+        if (v.line_closed(el, b1, b2)) res.push_back(TvcBranch{b1, b2, -1});
+    for (int el = 0; el < n_trafo_; ++el)
+        if (v.trafo_closed(el, b1, b2)) res.push_back(TvcBranch{b1, b2, el});
+    return res;
+}
+
+double Ls2gOuterModel::tvc_limit(const SlotState& st, const LoopDecl& L) const
+{
+    const double p = L.tvc->params().max_controlled_nominal_voltage;
+    if (p >= 0.) return p;
+    // GeneratorVoltageControlManager.computeDefaultMinNominalVoltageLimit
+    double res = std::numeric_limits<ls2g::real_type>::min();
+    const ls2g::OuterGridView v = view(st);
+    const auto vn_kv = grid_->get_bus_vn_kv();
+    const auto& to_me = v.id_solver_to_me();
+    for (const auto& gr : st.tvc_groups) {
+        bool valid = true;
+        for (int t : gr.trafos) {
+            int b1, b2;
+            if (!v.trafo_closed(t, b1, b2) || vn_kv(to_me[b1].cast_int()) == vn_kv(to_me[b2].cast_int())) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) res = std::max(res, static_cast<double>(vn_kv(gr.bus_grid)));
+    }
+    return res;
+}
+
+bool Ls2gOuterModel::tvc_voltage_control_off(const SlotState& st, int bus) const
+{
+    // a controller bus whose voltage control a loop took away: switched PQ, or suspended
+    const int k = (bus >= 0 && bus < n_bus_) ? pin_of_bus_[static_cast<size_t>(bus)] : -1;
+    return (k >= 0 && st.pq[static_cast<size_t>(k)]) || st.suspended.count(bus) > 0;
+}
+
+void Ls2gOuterModel::tvc_freeze(SlotState& st, const RowView& rv, double limit,
+                                const std::vector<TvcBranch>& closed) const
+{
+    // disableGeneratorVoltageControlsUnderMaxControlledNominalVoltage: a controller bus frozen at
+    // its bus' injection, which OpenLoadFlow takes as the generation (its load counted twice)
+    const ls2g::OuterGridView v = view(st);
+    const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();
+    const auto& to_me = v.id_solver_to_me();
+    const auto vn_kv = grid_->get_bus_vn_kv();
+    const auto& trafos = grid_->get_trafos();
+    std::vector<char> on_controller(static_cast<size_t>(vn_kv.size()), 0);
+    for (int t = 0; t < n_trafo_; ++t) {
+        if (!st.tvc_controller[static_cast<size_t>(t)]) continue;
+        for (const int b : {trafos.get_bus_side_1(t).cast_int(), trafos.get_bus_side_2(t).cast_int()})
+            if (b >= 0 && b < static_cast<int>(vn_kv.size())) on_controller[static_cast<size_t>(b)] = 1;
+    }
+    std::vector<double> min_connected(static_cast<size_t>(to_me.size()), NaN);
+    for (const TvcBranch& br : closed) {
+        const double vv = std::max(vn_kv(to_me[br.bus1].cast_int()), vn_kv(to_me[br.bus2].cast_int()));
+        for (const int b : {br.bus1, br.bus2}) {
+            double& m = min_connected[static_cast<size_t>(b)];
+            m = std::isnan(m) ? vv : std::min(m, vv);
+        }
+    }
+    std::vector<double> load_q(static_cast<size_t>(n_bus_), 0.);
+    const int nb_loads = grid_->get_loads().nb();
+    for (int l = 0; l < nb_loads; ++l) {
+        const int b = v.load_bus_solver(l);
+        if (b >= 0 && b < n_bus_) load_q[static_cast<size_t>(b)] += v.load_target_q(l) / sn_;
+    }
+    const auto& buses = st.rl->plan.buses;
+    for (size_t k = 0; k < st.rl->n_bus_q; ++k) {
+        const auto& entry = buses[k];
+        const bool local = entry.ctrl_pos.empty() && entry.svc_ids.empty();
+        int controlled_grid = entry.bus_grid;
+        if (!local) controlled_grid = to_me[ctrl.reg_bus(ctrl.group(entry.ctrl_pos.front()))].cast_int();
+        if (controlled_grid < 0 || vn_kv(controlled_grid) > limit) continue;
+        const int b = entry.bus_solver;
+        if (tvc_voltage_control_off(st, b)) continue;
+        if (!local) {
+            bool held = false;
+            for (int c : entry.ctrl_pos) held = held || std::isfinite(st.held_q[static_cast<size_t>(c)]);
+            if (held) continue;
+        }
+        // GeneratorVoltageControlManager.hasStepUpTransformers
+        bool step_up;
+        if (!entry.station_ids.empty()) step_up = true;
+        else if (on_controller[static_cast<size_t>(entry.bus_grid)]) step_up = false;
+        else {
+            const double min_v = min_connected[static_cast<size_t>(entry.bus_solver)];
+            step_up = min_v > vn_kv(entry.bus_grid) && min_v > limit;
+        }
+        if (step_up) continue;
+        double target_vm = rv.vm(b);
+        if (!entry.gen_ids.empty()) target_vm = v.gen_target_vm(entry.gen_ids.front());
+        else if (!entry.storage_ids.empty()) target_vm = v.storage_target_vm(entry.storage_ids.front());
+        const double load = load_q[static_cast<size_t>(b)];
+        if (local) {
+            // the regulating units' output now (they are out of Sbus): the bus' residual
+            const double q_gen = mis_bus(st, rv, st.ctl, b).imag();
+            st.freeze_q[b] = q_gen - load;
+            const int pin = pin_of_bus_[static_cast<size_t>(b)];
+            if (pin >= 0) st.pq[static_cast<size_t>(pin)] = 1;
+        } else {
+            bool first = true;
+            for (int c : entry.ctrl_pos) {
+                double q = rv.d->vc_q[c];
+                if (first) q -= load;
+                first = false;
+                st.held_q[static_cast<size_t>(c)] = q;
+            }
+        }
+        st.suspended.insert(b);
+        st.tvc_frozen.push_back(TvcFrozen{static_cast<int>(k), b, local, target_vm});
+    }
+}
+
+void Ls2gOuterModel::tvc_release(SlotState& st) const
+{
+    for (const TvcFrozen& f : st.tvc_frozen) {
+        if (f.local) {
+            st.freeze_q.erase(f.bus_solver);
+            const int pin = pin_of_bus_[static_cast<size_t>(f.bus_solver)];
+            if (pin >= 0) st.pq[static_cast<size_t>(pin)] = 0;
+            reset_vm(st, f.bus_solver, f.target_vm);
+        } else {
+            for (int c : st.rl->plan.buses[static_cast<size_t>(f.entry)].ctrl_pos) st.held_q[static_cast<size_t>(c)] = NaN;
+        }
+        st.suspended.erase(f.bus_solver);
+    }
+    st.tvc_frozen.clear();
+}
+
+void Ls2gOuterModel::tvc_fix_controls(SlotState& st, const std::vector<TvcBranch>& closed) const
+{
+    // LfNetwork.fixTransformerVoltageControls: a transformer whose other side, once every
+    // transformer switched on is taken out, keeps no PV bus is switched off
+    std::vector<int> parent(static_cast<size_t>(n_bus_));
+    std::iota(parent.begin(), parent.end(), 0);
+    auto root = [&](int x) {
+        while (parent[static_cast<size_t>(x)] != x) {
+            parent[static_cast<size_t>(x)] = parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+            x = parent[static_cast<size_t>(x)];
+        }
+        return x;
+    };
+    auto join = [&](int a, int b) {
+        if (a < 0 || b < 0 || a >= n_bus_ || b >= n_bus_) return;
+        parent[static_cast<size_t>(root(a))] = root(b);
+    };
+    for (const TvcBranch& br : closed) {
+        if (br.trafo >= 0 && st.tvc_enabled[static_cast<size_t>(br.trafo)]) continue;
+        join(br.bus1, br.bus2);
+    }
+    std::set<int> with_pv;
+    const auto& buses = st.rl->plan.buses;
+    for (size_t k = 0; k < st.rl->n_bus_q; ++k) {
+        const auto& entry = buses[k];
+        if (!(entry.ctrl_pos.empty() && entry.svc_ids.empty())) continue;
+        if (tvc_voltage_control_off(st, entry.bus_solver)) continue;
+        with_pv.insert(root(entry.bus_solver));
+    }
+    const ls2g::OuterGridView v = view(st);
+    for (const auto& gr : st.tvc_groups)
+        for (int t : gr.trafos) {
+            if (!st.tvc_enabled[static_cast<size_t>(t)]) continue;
+            int b1, b2;
+            if (!v.trafo_closed(t, b1, b2)) continue;
+            int other;
+            if (gr.bus_solver == b1) other = b2;
+            else if (gr.bus_solver == b2) other = b1;
+            else continue;
+            if (!with_pv.count(root(other))) tvc_set_on(st, t, false);
+        }
+}
+
+int Ls2gOuterModel::check_tvc(SlotState& st, const LoopDecl& L, const RowView& rv) const
+{
+    if (st.tvc_step == 2 || st.tvc_groups.empty()) return STABLE;
+    // nothing to do without a transformer the inner algorithm can act on (a reserved control)
+    auto reserved = [&](int t) { const int e = bc_entry(t); return e >= 0 && bc_ratio_[static_cast<size_t>(e)]; };
+    bool any = false;
+    for (const auto& gr : st.tvc_groups) for (int t : gr.trafos) any = any || reserved(t);
+    if (!any) return STABLE;
+    const auto& trafos = grid_->get_trafos();
+    const auto& ptc = trafos.get_tap_changers(true);
+    const auto& rtc = trafos.get_tap_changers(false);
+    const auto& tp = L.tvc->params();
+    auto ratio_now = [&](int t) { return rv.bc_rho(bc_entry(t)); };
+    auto phase_pos = [&](int t) {
+        const int e = bc_entry(t);
+        return (e >= 0 && bc_phase_[static_cast<size_t>(e)]) ? st.bc_pos[static_cast<size_t>(e)]
+                                                             : (ptc.has(t) ? ptc.position(t) : 0);
+    };
+
+    if (st.tvc_step == 0) {
+        bool need_run = false;
+        for (const auto& gr : st.tvc_groups) {
+            if (gr.hidden) continue;
+            const double v = rv.vm(gr.bus_solver);
+            const bool outside = !(std::abs(gr.target - v) <= gr.half_deadband);
+            record(st, L.name, "SWITCH_ON", outside, gr.bus_solver, std::abs(gr.target - v), gr.half_deadband);
+            if (!outside) continue;
+            for (int t : gr.trafos) {
+                if (!reserved(t)) continue;   // handled_ratio
+                tvc_set_on(st, t, true);
+                need_run = true;
+            }
+        }
+        // TransformerRatioManager: the ratios of the transformers switched on
+        for (const auto& gr : st.tvc_groups) {
+            std::vector<int> on;
+            for (int t : gr.trafos) if (st.tvc_enabled[static_cast<size_t>(t)]) on.push_back(t);
+            if (on.empty()) continue;
+            double a = 0., b = 0., sum_min = 0., sum_max = 0.;
+            for (int t : on) {
+                TvcRatio& r = st.tvc_ratios[static_cast<size_t>(t)];
+                const int ppos = ptc.has(t) ? phase_pos(t) : 0;
+                r.initial = ratio_now(t);
+                r.min = std::numeric_limits<double>::infinity();
+                r.max = -std::numeric_limits<double>::infinity();
+                for (int pos = rtc.low_tap(t); pos <= rtc.high_tap(t); ++pos) {
+                    const double value = trafos.ratio_at(t, pos, ppos);
+                    r.min = std::min(r.min, value);
+                    r.max = std::max(r.max, value);
+                }
+                if (r.max != r.min) {
+                    a += (r.max - r.initial) / (r.max - r.min);
+                    b += (r.initial - r.min) / (r.max - r.min);
+                } else {
+                    a += 1.;
+                    b += 1.;
+                }
+                sum_min += r.min;
+                sum_max += r.max;
+            }
+            const double n = static_cast<double>(on.size());
+            for (int t : on) {
+                TvcRatio& r = st.tvc_ratios[static_cast<size_t>(t)];
+                if (tp.use_initial_tap_position) {
+                    r.shared_min = sum_min / n;
+                    r.shared_max = sum_max / n;
+                    r.shared_initial = (r.shared_min * a + r.shared_max * b) / n;
+                } else {
+                    r.shared_min = r.min;
+                    r.shared_max = r.max;
+                    r.shared_initial = r.initial;
+                }
+            }
+        }
+        if (!need_run) {
+            st.tvc_step = 2;
+            return STABLE;
+        }
+        const std::vector<TvcBranch> closed = tvc_closed_branches(view(st));
+        tvc_freeze(st, rv, tvc_limit(st, L), closed);
+        tvc_fix_controls(st, closed);
+        st.tvc_step = 1;
+        return UNSTABLE;
+    }
+
+    // CONTROL: the ratios out of their range rounded to their extreme tap
+    bool out_of_range = false;
+    for (const auto& gr : st.tvc_groups)
+        for (int t : gr.trafos) {
+            if (!st.tvc_enabled[static_cast<size_t>(t)]) continue;
+            const TvcRatio& r = st.tvc_ratios[static_cast<size_t>(t)];
+            const double value = ratio_now(t);
+            if (value < r.shared_min || value > r.shared_max) {
+                const double edge = value > r.shared_max ? r.shared_max : r.shared_min;
+                record(st, L.name, "ROUND_TO_RANGE", true, t, value, edge);
+                st.bc_req_rtap[static_cast<size_t>(bc_entry(t))] = tvc_closest_tap(st, t, edge);
+                tvc_set_on(st, t, false);
+                out_of_range = true;
+            }
+        }
+    if (!out_of_range) {
+        // updateContinuousRatio, then every transformer rounded and switched off
+        for (const auto& gr : st.tvc_groups) {
+            if (gr.hidden) continue;
+            for (int t : gr.trafos) {
+                if (!reserved(t)) continue;   // handled_ratio
+                double value = ratio_now(t);
+                if (st.tvc_enabled[static_cast<size_t>(t)] && tp.use_initial_tap_position) {
+                    const TvcRatio& r = st.tvc_ratios[static_cast<size_t>(t)];
+                    value = value >= r.shared_initial
+                        ? r.initial + (value - r.shared_initial) * (r.max - r.initial) / (r.shared_max - r.shared_initial)
+                        : r.initial - (r.shared_initial - value) * (r.initial - r.min) / (r.shared_initial - r.shared_min);
+                }
+                const int position = tvc_closest_tap(st, t, value);
+                st.bc_req_rtap[static_cast<size_t>(bc_entry(t))] = position;
+                record(st, L.name, "ROUND_TAP", true, t, value, static_cast<double>(position));
+                tvc_set_on(st, t, false);
+            }
+        }
+        tvc_release(st);
+        st.tvc_step = 2;
+    }
+    // in any case, the loop must run again
+    return UNSTABLE;
 }
 
 // =============================================================================

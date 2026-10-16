@@ -1461,10 +1461,12 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
     for (const auto& loop : grid.get_outer_loops()) {
         const std::string name = loop->name();
         if (name != "DistributedSlack" && name != "AcHvdcAcEmulationLimits" &&
-            name != "VoltageMonitoring" && name != "ReactiveLimits" && name != "PhaseControl")
+            name != "VoltageMonitoring" && name != "ReactiveLimits" && name != "PhaseControl" &&
+            name != "TransformerVoltageControl")
             throw std::runtime_error("gpusim2grid's outer loops: the loop '" + name + "' is not "
                                      "supported (DistributedSlack, AcHvdcAcEmulationLimits, "
-                                     "VoltageMonitoring, ReactiveLimits and PhaseControl are)");
+                                     "VoltageMonitoring, ReactiveLimits, PhaseControl and "
+                                     "TransformerVoltageControl are)");
     }
     OuterInputs in;
     auto& g = const_cast<ls2g::LSGrid&>(grid);

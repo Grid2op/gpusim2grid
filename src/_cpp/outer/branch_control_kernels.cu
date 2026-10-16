@@ -91,15 +91,28 @@ __global__ void bc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaCom
     if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
     const ptrdiff_t b = tid / st.n_bc;
     const int e = static_cast<int>(tid % st.n_bc);
-    if (st.col[e] < 0) return;
+    const bool has_r = st.rcol != nullptr && st.rcol[e] >= 0;
+    if (st.col[e] < 0 && !has_r) return;
     const ptrdiff_t idx = tid;
     cuda_real_type* J = d_J + b * nnz_J;
-    const int* jp = st.jpos + 9 * e;
     const cudaComplexType* y = sl.applied + 4 * idx;
     const cudaComplexType V1 = d_V[b * n_bus + st.b1[e]];
     const cudaComplexType V2 = d_V[b * n_bus + st.b2[e]];
     const cudaComplexType v1_y12_v2 = cmul(V1, cconj(cmul(y[1], V2)));
     const cudaComplexType v2_y21_v1 = cmul(V2, cconj(cmul(y[2], V1)));
+    if (has_r) {
+        // dy11/drho = 2 e y11 / rho, dy12/drho = e y12 / rho, dy21/drho = e y21 / rho
+        const cuda_real_type k = st.rexp[e] / sl.rho[idx];
+        const cudaComplexType dS1 = cscale(cadd(cscale(cmul(V1, cconj(cmul(y[0], V1))), cuda_real_type(2)), v1_y12_v2), k);
+        const cudaComplexType dS2 = cscale(v2_y21_v1, k);
+        const int* jr = st.jpos_r + 4 * e;
+        if (jr[0] >= 0) J[jr[0]] = re(dS1);
+        if (jr[1] >= 0) J[jr[1]] = im(dS1);
+        if (jr[2] >= 0) J[jr[2]] = re(dS2);
+        if (jr[3] >= 0) J[jr[3]] = im(dS2);
+    }
+    if (st.col[e] < 0) return;
+    const int* jp = st.jpos + 9 * e;
     // S1 = V1 conj(y11 V1 + y12 V2), S2 = V2 conj(y21 V1 + y22 V2); dy12/da = j s y12,
     // dy21/da = -j s y21
     const cudaComplexType dS1 = cscale(jmul(v1_y12_v2), -st.sign[e]);
@@ -138,6 +151,62 @@ __global__ void bc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaCom
     if (jp[8] >= 0) J[jp[8]] = d_vm2;
 }
 
+__global__ void bc_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
+                                         BcStatic st, BcSlots sl, int n_bus, int dim_J, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_grp) return;
+    const ptrdiff_t b = tid / st.n_grp;
+    const int g = static_cast<int>(tid % st.n_grp);
+    const int s0 = st.grp_start[g], n = st.grp_start[g + 1] - s0;
+    cuda_real_type mean = 0;
+    for (int j = 0; j < n; ++j) mean += sl.rho[b * st.n_bc + st.grp_member[s0 + j]];
+    mean /= static_cast<cuda_real_type>(n);
+    bool first_on = true;
+    for (int j = 0; j < n; ++j) {
+        const ptrdiff_t idx = b * st.n_bc + st.grp_member[s0 + j];
+        cuda_real_type F;
+        if (!sl.ron[idx]) {
+            F = sl.rho[idx] - sl.rho_target[idx];
+        } else if (first_on) {
+            first_on = false;
+            F = C::my_cuCabs(d_V[b * n_bus + st.grp_bus[g]]) - st.grp_target[g];
+        } else {
+            F = mean - sl.rho[idx];
+        }
+        d_F[b * dim_J + st.grp_row[s0 + j]] = -F;
+    }
+}
+
+__global__ void bc_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, BcStatic st, BcSlots sl,
+                                       int nnz_J, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_grp) return;
+    const ptrdiff_t b = tid / st.n_grp;
+    const int g = static_cast<int>(tid % st.n_grp);
+    const int s0 = st.grp_start[g], n = st.grp_start[g + 1] - s0;
+    cuda_real_type* J = d_J + b * nnz_J;
+    const int* jc = st.grp_jcol + st.grp_jstart[g];
+    const cuda_real_type inv_n = cuda_real_type(1) / static_cast<cuda_real_type>(n);
+    bool first_on = true;
+    for (int j = 0; j < n; ++j) {
+        const ptrdiff_t idx = b * st.n_bc + st.grp_member[s0 + j];
+        // every form's positions zero, then the row's own
+        for (int m = 0; m < n; ++m) if (jc[j * n + m] >= 0) J[jc[j * n + m]] = cuda_real_type(0);
+        if (st.grp_jvm[s0 + j] >= 0) J[st.grp_jvm[s0 + j]] = cuda_real_type(0);
+        if (!sl.ron[idx]) {
+            if (jc[j * n + j] >= 0) J[jc[j * n + j]] = cuda_real_type(1);
+        } else if (first_on) {
+            first_on = false;
+            if (st.grp_jvm[s0 + j] >= 0) J[st.grp_jvm[s0 + j]] = cuda_real_type(1);
+        } else {
+            for (int m = 0; m < n; ++m)
+                if (jc[j * n + m] >= 0) J[jc[j * n + m]] = m == j ? inv_n - cuda_real_type(1) : inv_n;
+        }
+    }
+}
+
 __global__ void bc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComplexType* __restrict__ d_Ybus,
                                BcStatic st, BcSlots sl, int dim_J, int nnz_Y, int batch)
 {
@@ -145,10 +214,13 @@ __global__ void bc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComp
     if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
     const ptrdiff_t b = tid / st.n_bc;
     const int e = static_cast<int>(tid % st.n_bc);
-    if (st.col[e] < 0 || sl.out[tid]) return;
-    const cuda_real_type da = d_dx[b * dim_J + st.col[e]];
-    if (da == cuda_real_type(0)) return;
+    const bool has_r = st.rcol != nullptr && st.rcol[e] >= 0;
+    if ((st.col[e] < 0 && !has_r) || sl.out[tid]) return;
+    const cuda_real_type da = st.col[e] >= 0 ? d_dx[b * dim_J + st.col[e]] : cuda_real_type(0);
+    const cuda_real_type dr = has_r ? d_dx[b * dim_J + st.rcol[e]] : cuda_real_type(0);
+    if (da == cuda_real_type(0) && dr == cuda_real_type(0)) return;
     sl.a[tid] += da;
+    sl.rho[tid] += dr;
     if (d_Ybus != nullptr) patch(d_Ybus, st, sl, b, tid, e, nnz_Y);
 }
 
@@ -160,6 +232,7 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
                                    const cuda_real_type* __restrict__ d_a_tap,
                                    const cuda_real_type* __restrict__ d_rho_tap,
                                    const signed char* __restrict__ d_ctl,
+                                   const signed char* __restrict__ d_rctl,
                                    int nnz_Y)
 {
     const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -180,7 +253,9 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
         sl.a[idx] = st.a_tap0[e];
         sl.rho[idx] = st.rho_tap0[e];
         sl.a_target[idx] = st.a_tap0[e];
+        sl.rho_target[idx] = st.rho_tap0[e];
         sl.on[idx] = 0;
+        sl.ron[idx] = 0;
     }
     if (sl.out[idx]) return;
     if (d_retap[tid]) {
@@ -191,11 +266,17 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
         sl.a[idx] = sl.a_tap[idx];
         sl.rho[idx] = sl.rho_tap[idx];
         sl.a_target[idx] = sl.a_tap[idx];
+        sl.rho_target[idx] = sl.rho_tap[idx];
     }
-    // BranchControl::set_control_on (a transformer without a shift column has no control)
+    // BranchControl::set_control_on (a transformer without a shift column has no control),
+    // then set_ratio_control_on (the same for the ratio column)
     if (st.col[e] >= 0 && d_ctl[tid] >= 0) {
         sl.on[idx] = d_ctl[tid] == 1;
         if (d_ctl[tid] == 0) sl.a_target[idx] = sl.a[idx];
+    }
+    if (st.rcol != nullptr && st.rcol[e] >= 0 && d_rctl != nullptr && d_rctl[tid] >= 0) {
+        sl.ron[idx] = d_rctl[tid] == 1;
+        if (d_rctl[tid] == 0) sl.rho_target[idx] = sl.rho[idx];
     }
     if (d_Ybus != nullptr) patch(d_Ybus, st, sl, s, idx, e, nnz_Y);
 }

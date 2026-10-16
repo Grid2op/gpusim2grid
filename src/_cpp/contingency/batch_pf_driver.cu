@@ -1577,6 +1577,8 @@ BcSlots BatchPfDriver<BatchSource>::_bc_slots()
     b.applied = thrust::raw_pointer_cast(d_bc_applied_.data());
     b.on = thrust::raw_pointer_cast(d_bc_on_.data());
     b.out = thrust::raw_pointer_cast(d_bc_out_.data());
+    b.rho_target = thrust::raw_pointer_cast(d_bc_rho_target_.data());
+    b.ron = thrust::raw_pointer_cast(d_bc_ron_.data());
     return b;
 }
 
@@ -1616,7 +1618,8 @@ void BatchPfDriver<BatchSource>::_oc_setup()
         d_bc_a_.resize(n); d_bc_rho_.resize(n); d_bc_a_target_.resize(n);
         d_bc_a_tap_.resize(n); d_bc_rho_tap_.resize(n);
         d_bc_tap_.resize(4 * n); d_bc_applied_.resize(4 * n);
-        d_bc_on_.assign(n, 0); d_bc_out_.assign(n, 0);
+        d_bc_rho_target_.resize(n);
+        d_bc_on_.assign(n, 0); d_bc_out_.assign(n, 0); d_bc_ron_.assign(n, 0);
     }
     const int n_watch = static_cast<int>(Lo.watch_bus.size());
     // ... then BranchControl's shifts and ratios, then the unrealistic flag
@@ -1729,13 +1732,14 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
         std::vector<unsigned char> out(n, 0), retap(n, 0);
         std::vector<cudaComplexType> tap(4 * n);
         std::vector<cuda_real_type> a_tap(n), rho_tap(n);
-        std::vector<signed char> ctl(n, -1);
+        std::vector<signed char> ctl(n, -1), rctl(n, -1);
         for (size_t i = 0; i < slots.size(); ++i) {
             const outer::SlotControls& c = outer_hook_->controls(slots[i]);
             for (int e = 0; e < nb; ++e) {
                 const size_t k = i * nb + static_cast<size_t>(e);
                 out[k] = c.bc_out[static_cast<size_t>(e)];
                 ctl[k] = c.bc_ctl[static_cast<size_t>(e)];
+                rctl[k] = c.bc_rctl[static_cast<size_t>(e)];
                 a_tap[k] = static_cast<cuda_real_type>(c.bc_a_tap[static_cast<size_t>(e)]);
                 rho_tap[k] = static_cast<cuda_real_type>(c.bc_rho_tap[static_cast<size_t>(e)]);
                 for (int q = 0; q < 4; ++q)
@@ -1752,6 +1756,7 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
         upload_h2d(d_bc_in_a_tap_, a_tap.data(), n, cs);
         upload_h2d(d_bc_in_rho_tap_, rho_tap.data(), n, cs);
         upload_h2d(d_bc_in_ctl_, ctl.data(), n, cs);
+        upload_h2d(d_bc_in_rctl_, rctl.data(), n, cs);
         bc_controls_kernel<<<nr_grid_size(static_cast<long long>(n), BS), BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
             thrust::raw_pointer_cast(d_bc_list_.data()), static_cast<int>(slots.size()),
@@ -1762,6 +1767,7 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
             thrust::raw_pointer_cast(d_bc_in_a_tap_.data()),
             thrust::raw_pointer_cast(d_bc_in_rho_tap_.data()),
             thrust::raw_pointer_cast(d_bc_in_ctl_.data()),
+            thrust::raw_pointer_cast(d_bc_in_rctl_.data()),
             base.nnz_Y);
         CHK_CUDA_BPF(cudaGetLastError());
         cs.synchronize();   // the staging vectors above die here

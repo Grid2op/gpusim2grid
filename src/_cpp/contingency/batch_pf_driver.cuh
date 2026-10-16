@@ -1031,14 +1031,15 @@ private:
     int oc_stride_ = 0;
     // BranchControl per slot (outer/branch_control_kernels.cuh's BcSlots: [S * n_bc],
     // blocks [S * n_bc * 4]) and what _oc_write_controls stages for the listed slots
-    thrust::device_vector<cuda_real_type>  d_bc_a_, d_bc_rho_, d_bc_a_target_, d_bc_a_tap_, d_bc_rho_tap_;
+    thrust::device_vector<cuda_real_type>  d_bc_a_, d_bc_rho_, d_bc_a_target_, d_bc_a_tap_, d_bc_rho_tap_,
+                                           d_bc_rho_target_;
     thrust::device_vector<cudaComplexType> d_bc_tap_, d_bc_applied_;
-    thrust::device_vector<unsigned char>   d_bc_on_, d_bc_out_;
+    thrust::device_vector<unsigned char>   d_bc_on_, d_bc_out_, d_bc_ron_;
     thrust::device_vector<int>             d_bc_list_;
     thrust::device_vector<unsigned char>   d_bc_in_out_, d_bc_in_retap_;
     thrust::device_vector<cudaComplexType> d_bc_in_tap_;
     thrust::device_vector<cuda_real_type>  d_bc_in_a_tap_, d_bc_in_rho_tap_;
-    thrust::device_vector<signed char>     d_bc_in_ctl_;
+    thrust::device_vector<signed char>     d_bc_in_ctl_, d_bc_in_rctl_;
     BcSlots _bc_slots();
     thrust::device_vector<int>             d_branch_bc_;   // [n_branches_] the transformer entry, -1
 public:

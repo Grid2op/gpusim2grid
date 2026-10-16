@@ -279,13 +279,16 @@ class _FullSystem:
         # solving for their shift (a column, a row)
         self.nb = len(L["bc_trafo"])
         self.bc_col = np.flatnonzero(np.asarray(L["bc_shift_col"], dtype=int) >= 0) if self.nb else np.zeros(0, int)
+        self.bc_rcol = np.flatnonzero(np.asarray(L["bc_ratio_col"], dtype=int) >= 0) if self.nb else np.zeros(0, int)
         yeff = np.asarray(L["bc_yeff0"], dtype=float).reshape(-1, 4, 2) if self.nb else np.zeros((0, 4, 2))
         self.bc_yeff = yeff[:, :, 0] + 1j * yeff[:, :, 1]
         # the slot's BranchControl state (BranchControl::Entry), set by controls()
         self.bc_a = np.zeros(self.nb)
         self.bc_rho = np.ones(self.nb)
         self.bc_a_target = np.zeros(self.nb)
+        self.bc_rho_target = np.ones(self.nb)
         self.bc_on = np.zeros(self.nb, dtype=bool)
+        self.bc_ron = np.zeros(self.nb, dtype=bool)
         self.bc_out = np.zeros(self.nb, dtype=bool)
         self.bc_a_tap = np.zeros(self.nb)
         self.bc_rho_tap = np.ones(self.nb)
@@ -303,19 +306,28 @@ class _FullSystem:
             self.bc_tap = tap[:, :, 0] + 1j * tap[:, :, 1]
             self.bc_a, self.bc_rho = self.bc_a_tap.copy(), self.bc_rho_tap.copy()
             self.bc_a_target = self.bc_a.copy()
+            self.bc_rho_target = self.bc_rho.copy()
             self.bc_on[:] = False
+            self.bc_ron[:] = False
         for e in c["bc_retap"]:
             self.bc_a_tap[e] = c["bc_a_tap"][e]
             self.bc_rho_tap[e] = c["bc_rho_tap"][e]
             self.bc_tap[e] = tap[e, :, 0] + 1j * tap[e, :, 1]
             self.bc_a[e], self.bc_rho[e] = self.bc_a_tap[e], self.bc_rho_tap[e]
             self.bc_a_target[e] = self.bc_a[e]
+            self.bc_rho_target[e] = self.bc_rho[e]
         for e, req in enumerate(c["bc_ctl"]):
             if self.bc_out[e] or req < 0:
                 continue
             self.bc_on[e] = req == 1
             if req == 0:
                 self.bc_a_target[e] = self.bc_a[e]
+        for e, req in enumerate(c["bc_rctl"]):
+            if self.bc_out[e] or req < 0 or e not in self.bc_rcol:
+                continue
+            self.bc_ron[e] = req == 1
+            if req == 0:
+                self.bc_rho_target[e] = self.bc_rho[e]
 
     def block(self, e, a, rho):
         """BranchControl::_block_at"""
@@ -327,24 +339,27 @@ class _FullSystem:
         t = self.bc_tap[e]
         return np.array([t[0] * f * f, t[1] * f * rot, t[2] * f * np.conj(rot), t[3]])
 
-    def ybus(self, a):
-        """the slot's Ybus at shifts `a`: the row's (the grid's blocks) patched by value"""
+    def ybus(self, a, rho=None):
+        """the slot's Ybus at shifts `a` and ratios `rho`: the row's (the grid's blocks) patched
+        by value"""
+        rho = self.bc_rho if rho is None else rho
         Y = self.Y.astype(complex).copy()
         for e in range(self.nb):
             if self.bc_out[e]:
                 continue
             b1, b2 = self.L["bc_bus1"][e], self.L["bc_bus2"][e]
-            d = self.block(e, a[e], self.bc_rho[e]) - self.bc_yeff[e]
+            d = self.block(e, a[e], rho[e]) - self.bc_yeff[e]
             Y[b1, b1] += d[0]
             Y[b1, b2] += d[1]
             Y[b2, b1] += d[2]
             Y[b2, b2] += d[3]
         return Y
 
-    def residual(self, V, q, Sbus, c, vm_bus, a=None):
+    def residual(self, V, q, Sbus, c, vm_bus, a=None, rho=None):
         L = self.L
         a = self.bc_a if a is None else a
-        Y = self.ybus(a) if self.nb else self.Y
+        rho = self.bc_rho if rho is None else rho
+        Y = self.ybus(a, rho) if self.nb else self.Y
         S = V * np.conj(Y @ V)
         mis = S - Sbus
         Va = np.angle(V)
@@ -384,11 +399,24 @@ class _FullSystem:
             if not self.bc_on[e]:
                 rows.append([a[e] - self.bc_a_target[e]])
                 continue
-            y = self.block(e, a[e], self.bc_rho[e])
+            y = self.block(e, a[e], rho[e])
             V1, V2 = V[L["bc_bus1"][e]], V[L["bc_bus2"][e]]
             p = (V1 * np.conj(y[0] * V1 + y[1] * V2)).real if L["bc_side"][e] == 1 else \
                 (V2 * np.conj(y[2] * V1 + y[3] * V2)).real
             rows.append([p - L["bc_p_target"][e]])
+        # the ratio groups' rows: per member its ratio held, the first one on holds the bus'
+        # voltage, any other one on shares the mean ratio
+        for g, members in enumerate(L["bc_grp_members"]):
+            mean = np.mean([rho[m] for m in members])
+            first_on = True
+            for m in members:
+                if not self.bc_ron[m]:
+                    rows.append([rho[m] - self.bc_rho_target[m]])
+                elif first_on:
+                    first_on = False
+                    rows.append([abs(V[L["bc_grp_bus"][g]]) - L["bc_grp_target"][g]])
+                else:
+                    rows.append([mean - rho[m]])
         return np.concatenate([np.asarray(r, dtype=float) for r in rows])
 
     def solve(self, V, q, Sbus, c, tol, max_it):
@@ -397,35 +425,35 @@ class _FullSystem:
         vm_bus = np.flatnonzero(vm_unknown)
         nt, nv = self.th_bus.size, vm_bus.size
 
-        nq = len(q)
+        nq, na = len(q), self.bc_col.size
 
         def unpack(x):
             Va, Vm = np.angle(V0).copy(), np.abs(V0).copy()
             Va[self.th_bus] = x[:nt]
             Vm[vm_bus] = x[nt:nt + nv]
             a = self.bc_a.copy()
-            a[self.bc_col] = x[nt + nv + nq:]
-            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a
+            a[self.bc_col] = x[nt + nv + nq:nt + nv + nq + na]
+            rho = self.bc_rho.copy()
+            rho[self.bc_rcol] = x[nt + nv + nq + na:]
+            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a, rho
 
         V0 = V.copy()
-        x = np.concatenate([np.angle(V)[self.th_bus], np.abs(V)[vm_bus], q, self.bc_a[self.bc_col]])
+        x = np.concatenate([np.angle(V)[self.th_bus], np.abs(V)[vm_bus], q, self.bc_a[self.bc_col],
+                            self.bc_rho[self.bc_rcol]])
         for it in range(max_it + 1):
-            Vx, qx, ax = unpack(x)
-            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax)
-            if np.max(np.abs(F)) < tol:
-                self.bc_a = ax
-                return Vx, qx, True, it, vm_unknown
-            if it == max_it:
-                self.bc_a = ax
-                return Vx, qx, False, it, vm_unknown
+            Vx, qx, ax, rx = unpack(x)
+            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax, rx)
+            if np.max(np.abs(F)) < tol or it == max_it:
+                self.bc_a, self.bc_rho = ax, rx
+                return Vx, qx, np.max(np.abs(F)) < tol, it, vm_unknown
             J = np.empty((F.size, x.size))
             for k in range(x.size):
                 d = np.zeros(x.size)
                 d[k] = 1e-7
-                Vp, qp, ap = unpack(x + d)
-                Vm_, qm, am = unpack(x - d)
-                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus, ap) -
-                           self.residual(Vm_, qm, Sbus, c, vm_bus, am)) / 2e-7
+                Vp, qp, ap, rp = unpack(x + d)
+                Vm_, qm, am, rm = unpack(x - d)
+                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus, ap, rp) -
+                           self.residual(Vm_, qm, Sbus, c, vm_bus, am, rm)) / 2e-7
             x = x - np.linalg.solve(J, F)
         raise AssertionError("unreachable")
 
@@ -449,7 +477,7 @@ def _run_row_full(h, row, Ybus, Sbus_row, tol_pu):
         first = False
         h.clear_vm_reset(0)
         V, q, conv, nr, vm_unknown = sysm.solve(V, q, Sbus, c, tol_pu, MAX_IT)
-        S = V * np.conj((sysm.ybus(sysm.bc_a) if sysm.nb else Ybus) @ V)
+        S = V * np.conj((sysm.ybus(sysm.bc_a, sysm.bc_rho) if sysm.nb else Ybus) @ V)
         cand = [b for b in realistic if vm_unknown[b]]
         unrealistic = bool(np.any((np.abs(V[cand]) < 0.5) | (np.abs(V[cand]) > 2.))) if cand else False
         nxt, status = h.on_solved(0, conv, nr, CONVERGED if conv else MAX_ITER,
@@ -806,3 +834,80 @@ def test_phase_control_rows_resume_from_the_n_solve(mode):
         assert (status == CONVERGED) == bool(conv[i]), msg
         if conv[i]:
             np.testing.assert_allclose(V, V_ls[i][buses], rtol=0., atol=1e-8, err_msg=msg)
+
+
+# --------------------------------------------------------------------------------------
+# TransformerVoltageControl: a ratio tap changer regulating a bus' voltage (its ratio a
+# Newton unknown, then rounded), the low voltage generators frozen meanwhile; lightsim2grid's
+# own test grid (IEEE 14, a tap changer on a transformer, 0.9 .. 1.1 in 21 steps)
+# --------------------------------------------------------------------------------------
+def _tvc_grid(trafo, target_kv, deadband_kv, reactive_limits=False, line_off=None, trafo_off=False,
+              load_scale=1., **loop_kw):
+    pytest.importorskip("pypowsybl")
+    _ls2g_tests_dir()
+    import test_transformer_voltage_control as T
+    from lightsim2grid.algorithm import ReactiveLimits, TransformerVoltageControl
+    grid = T._grid(T._net(trafo, target_kv, deadband_kv), reactive_limits=reactive_limits)
+    grid.clear_outer_loops()
+    if reactive_limits:
+        grid.add_outer_loop(ReactiveLimits())
+    grid.add_outer_loop(TransformerVoltageControl(**loop_kw))
+    grid.change_algorithm(OUTER)
+    if load_scale != 1.:
+        for load_id, p in enumerate(np.asarray(grid.get_load_target_p())):
+            grid.change_p_load(load_id, float(p) * load_scale)
+    if line_off is not None:
+        grid.deactivate_powerline(line_off)
+    if trafo_off:
+        grid.deactivate_trafo(next(i for i, t in enumerate(grid.get_trafos()) if t.name == trafo))
+    return grid
+
+
+def _check_tvc(trafo, target_kv, deadband_kv, branch_off=None, row_kwargs=None, **grid_kw):
+    row_kwargs = row_kwargs or {}
+    make = lambda **kw: _tvc_grid(trafo, target_kv, deadband_kv, **grid_kw, **kw)
+    res, stats = _compare_single_solve(make, tol_mva=1e-10, branch_off=branch_off, **row_kwargs)
+    base = make()
+    base.ac_pf(np.full(base.total_bus(), 1. + 0j), MAX_IT, 1e-10)
+    row = make(**row_kwargs)
+    row.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ref = [(i, t.res_ratio_tap_position) for i, t in enumerate(row.get_trafos())
+           if t.res_ratio_tap_position != t.ratio_tap_position]
+    assert sorted(res.ratio_tap) == sorted(ref), (res.ratio_tap, ref, res.decisions)
+    return res
+
+
+@pytest.mark.parametrize("target_kv, deadband_kv", [(12.6, 0.1), (12.4, 0.05), (12.5, 0.02), (12.0, 0.1)])
+def test_transformer_voltage_control(target_kv, deadband_kv):
+    # switched on, solved, rounded (at 12.6 kV back onto the grid's own tap)
+    res = _check_tvc("T4-9-1", target_kv, deadband_kv)
+    assert any("ROUND_TAP" in d for d in res.decisions), res.decisions
+
+
+def test_transformer_voltage_control_with_reactive_limits():
+    _check_tvc("T4-9-1", 12.3, 0.05, reactive_limits=True)
+
+
+def test_transformer_voltage_control_hidden_by_a_generator():
+    res = _check_tvc("T5-6-1", 12.6, 0.1)
+    assert not res.ratio_tap
+
+
+@pytest.mark.parametrize("loop_kw", [dict(use_initial_tap_position=True, max_controlled_nominal_voltage=120.),
+                                     dict(max_controlled_nominal_voltage=120.)])
+def test_transformer_voltage_control_frozen_generators(loop_kw):
+    # lightsim2grid's _tap_grid: ReactiveLimits too, the generators of up to 120 kV frozen
+    _check_tvc("T4-9-1", 12.6, 0.1, reactive_limits=True, **loop_kw)
+
+
+@pytest.mark.parametrize("row_kwargs, branch_off", [(dict(load_scale=1.05), None), (dict(line_off=1), [1])])
+def test_transformer_voltage_control_rows(row_kwargs, branch_off):
+    _check_tvc("T4-9-1", 12.6, 0.1, branch_off=branch_off, row_kwargs=row_kwargs, reactive_limits=True,
+               use_initial_tap_position=True, max_controlled_nominal_voltage=120.)
+
+
+def test_transformer_voltage_control_row_opening_the_transformer():
+    grid = _tvc_grid("T4-9-1", 12.6, 0.1)
+    t = next(i for i, tr in enumerate(grid.get_trafos()) if tr.name == "T4-9-1")
+    res = _check_tvc("T4-9-1", 12.6, 0.1, branch_off=[len(grid.get_lines()) + t], row_kwargs=dict(trafo_off=True))
+    assert not res.ratio_tap

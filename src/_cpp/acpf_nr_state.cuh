@@ -286,9 +286,15 @@ struct AcPfNrState {
     thrust::device_vector<int>             d_bc_ypos, d_bc_jpos;
     thrust::device_vector<cuda_real_type>  d_bc_sign, d_bc_rexp, d_bc_p_target, d_bc_a_tap0, d_bc_rho_tap0;
     thrust::device_vector<cudaComplexType> d_bc_tap0, d_bc_yeff0;
-    thrust::device_vector<cuda_real_type>  d_bcs_a, d_bcs_rho, d_bcs_a_target, d_bcs_a_tap, d_bcs_rho_tap;
+    thrust::device_vector<int>             d_bc_rcol, d_bc_jpos_r;
+    int n_bc_grp = 0;
+    thrust::device_vector<int>             d_bc_grp_start, d_bc_grp_member, d_bc_grp_row, d_bc_grp_jvm,
+                                           d_bc_grp_jstart, d_bc_grp_jcol, d_bc_grp_bus;
+    thrust::device_vector<cuda_real_type>  d_bc_grp_target;
+    thrust::device_vector<cuda_real_type>  d_bcs_a, d_bcs_rho, d_bcs_a_target, d_bcs_a_tap, d_bcs_rho_tap,
+                                           d_bcs_rho_target;
     thrust::device_vector<cudaComplexType> d_bcs_tap, d_bcs_applied;
-    thrust::device_vector<unsigned char>   d_bcs_on, d_bcs_out;
+    thrust::device_vector<unsigned char>   d_bcs_on, d_bcs_out, d_bcs_ron;
     BcStatic bc_static() const {
         BcStatic b;
         b.n_bc = n_bc;
@@ -306,6 +312,17 @@ struct AcPfNrState {
         b.yeff0 = thrust::raw_pointer_cast(d_bc_yeff0.data());
         b.a_tap0 = thrust::raw_pointer_cast(d_bc_a_tap0.data());
         b.rho_tap0 = thrust::raw_pointer_cast(d_bc_rho_tap0.data());
+        b.rcol = thrust::raw_pointer_cast(d_bc_rcol.data());
+        b.jpos_r = thrust::raw_pointer_cast(d_bc_jpos_r.data());
+        b.n_grp = n_bc_grp;
+        b.grp_start = thrust::raw_pointer_cast(d_bc_grp_start.data());
+        b.grp_member = thrust::raw_pointer_cast(d_bc_grp_member.data());
+        b.grp_row = thrust::raw_pointer_cast(d_bc_grp_row.data());
+        b.grp_jvm = thrust::raw_pointer_cast(d_bc_grp_jvm.data());
+        b.grp_jstart = thrust::raw_pointer_cast(d_bc_grp_jstart.data());
+        b.grp_jcol = thrust::raw_pointer_cast(d_bc_grp_jcol.data());
+        b.grp_bus = thrust::raw_pointer_cast(d_bc_grp_bus.data());
+        b.grp_target = thrust::raw_pointer_cast(d_bc_grp_target.data());
         return b;
     }
     BcSlots bc_base_slots() {
@@ -319,6 +336,8 @@ struct AcPfNrState {
         b.applied = thrust::raw_pointer_cast(d_bcs_applied.data());
         b.on = thrust::raw_pointer_cast(d_bcs_on.data());
         b.out = thrust::raw_pointer_cast(d_bcs_out.data());
+        b.rho_target = thrust::raw_pointer_cast(d_bcs_rho_target.data());
+        b.ron = thrust::raw_pointer_cast(d_bcs_ron.data());
         return b;
     }
 
