@@ -705,7 +705,9 @@ void Ls2gOuterModel::set_active(SlotState& st) const
                 std::vector<ls2g::slack_redistribution::Participant> units;
                 std::vector<int> bus;
                 collect_units(v, units, bus);
-                needed = !units.empty();
+                // a unit off the slack bus to take the mismatch: the slack bus' own units would
+                // only take what it already absorbs (DistributedSlackLoop::_has_participant)
+                needed = std::any_of(bus.begin(), bus.end(), [&](int b) { return b != slack_bus_; });
                 break;
             }
             case Kind::HvdcLimits:        needed = !hvdc_plan0_.empty(); break;

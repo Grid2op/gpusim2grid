@@ -157,8 +157,10 @@ def test_host_model_matches_single_nrouter_solve(load_scale, line_off):
 
 
 def test_ample_reactive_limits_only_the_slack_is_shared():
-    """Ample reactive limits: ReactiveLimits never acts, DistributedSlack shares
-    the row's extra load (the slack's own unit takes part by default) once."""
+    """Ample reactive limits: ReactiveLimits never acts; the slack's own unit is the
+    only participant, so DistributedSlack does not run (lightsim2grid's
+    DistributedSlackLoop::_is_needed asks for a unit off the slack bus): the slack
+    bus keeps the row's extra load."""
     base = _case14(q_limit=1e4, distributed=False)
     base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
     h = _cpp._OuterModelHarness(base, keep_trace=True)
@@ -170,8 +172,8 @@ def test_ample_reactive_limits_only_the_slack_is_shared():
                          int(np.asarray(h.slack)[0]))
     res = h.row_result(0)
     assert status == CONVERGED
-    assert res.nb_outer_iterations == stats.nb_outer_iterations == 1
-    assert not any("ReactiveLimits" in d for d in res.decisions)
+    assert res.nb_outer_iterations == stats.nb_outer_iterations == 0
+    assert not any("ReactiveLimits" in d or "DistributedSlack" in d for d in res.decisions)
     buses = np.asarray(row.id_ac_solver_to_me(), dtype=int)
     np.testing.assert_allclose(V, V_ref[buses], rtol=0., atol=1e-8)
 

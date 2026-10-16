@@ -160,8 +160,8 @@ def test_a_row_the_loops_act_on_is_resolved(case14):
 
 
 def test_ample_reactive_limits_only_the_slack_is_shared():
-    """Ample reactive limits: ReactiveLimits never acts; DistributedSlack shares each
-    row's extra load (the slack's own unit takes part by default)."""
+    """Ample reactive limits: ReactiveLimits never acts; the slack's own unit is the
+    only participant, so DistributedSlack does not run (as lightsim2grid)."""
     grid = _case14(q_limit=1e4, distributed=False)
     rows = _rows(grid)
     sw = _gpu(grid, rows, 4, keep_outer_trace=True)
