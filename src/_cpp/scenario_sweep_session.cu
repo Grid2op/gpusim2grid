@@ -1137,6 +1137,7 @@ void ScenarioSweepSession::set_limits(
 // =============================================================================
 void ScenarioSweepSession::run()
 {
+    const auto t_run0 = std::chrono::steady_clock::now();
     // Counted on entry, not on success: a run() that throws part-way may
     // already have swapped the batch source or overwritten the chunk
     // buffers, so a pending alias-mode backward (run_counter guard) must no
@@ -1735,6 +1736,7 @@ void ScenarioSweepSession::run()
     last_run_kept_jacobian_ = keep_final_jacobian_;
 
     solver_->cs.synchronize();
+    timings_.t_session_run_wall_ms = ms_since(t_run0);
 }
 
 // =============================================================================

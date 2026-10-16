@@ -192,6 +192,7 @@ BatchDriverConfig InjectionSweepSession::_current_config() const
 // =============================================================================
 void InjectionSweepSession::run()
 {
+    const auto t_run0 = std::chrono::steady_clock::now();
     if (!has_injections_)
         throw std::runtime_error(
             "InjectionSweepSession: call set_injections() before run()");
@@ -379,6 +380,7 @@ void InjectionSweepSession::run()
     physical_checks::after_solve(phys_, timings_, t_phys);
 
     solver_->cs.synchronize();
+    timings_.t_session_run_wall_ms = ms_since(t_run0);
 }
 
 // =============================================================================

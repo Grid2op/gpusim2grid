@@ -78,8 +78,10 @@ def load(network):
 def print_breakdown(t, compute_ms):
     """Where compute() went (wall ms): the Newton rounds on the GPU, the slot loads and
     evictions, and the scheduler's per-round host work split into the residual sync, the
-    outer-loop gather, the host model's decisions and the rest; the controls upload
-    apart. Every GPU phase is timed with a sync, so the parts add up to wall time."""
+    outer-loop gather, the host model's decisions and the rest; the controls upload and the
+    model's slot loads apart; then what no phase covers, from the driver's and the session's
+    whole-call wall clocks. Every GPU phase is timed with a sync, so the parts add up to wall
+    time."""
     w = lambda *names: sum(getattr(t, n).wall_ms for n in names)
     newton = w("t_spmv", "t_fill_F", "t_fill_J", "t_first_factorize", "t_refactorize",
                "t_solve", "t_update_V")
@@ -94,7 +96,11 @@ def print_breakdown(t, compute_ms):
             ("schedule (host, per round)", sched),
             *[(f"  {k}", v) for k, v in parts.items()],
             ("outer controls upload", t.t_oc_controls.wall_ms),
-            ("outside the driver (session, Python)", compute_ms - t.t_chunks_total_wall_ms)]
+            ("outer model loads (begin, load)", t.t_oc_load.wall_ms),
+            ("driver, untimed", t.t_driver_solve_wall_ms - t.t_chunks_total_wall_ms),
+            ("session around solve() (cold build)", t.t_session_run_wall_ms - t.t_driver_solve_wall_ms),
+            ("  of which cuDSS ANALYSIS", t.t_analysis_ms),
+            ("outside the session (Python)", compute_ms - t.t_session_run_wall_ms)]
     n = max(t.n_rounds, 1)
     print(f"     breakdown of compute() ({compute_ms:.0f} ms, {t.n_rounds} rounds):")
     for name, v in rows:

@@ -222,6 +222,7 @@ BatchDriverConfig ContingencyAnalysisSession::_current_config() const
 // =============================================================================
 void ContingencyAnalysisSession::run()
 {
+    const auto t_run0 = std::chrono::steady_clock::now();
     if (!has_contingencies_)
         throw std::runtime_error(
             "ContingencyAnalysisSession: call build_contingencies() before run()");
@@ -485,6 +486,7 @@ void ContingencyAnalysisSession::run()
     timings_.n_disconnected = n_disconnected;
     has_violations_result_ = compute_limit_violations_;
     physical_checks::after_solve(phys_, timings_, t_phys);
+    timings_.t_session_run_wall_ms = ms_since(t_run0);
 }
 
 // =============================================================================

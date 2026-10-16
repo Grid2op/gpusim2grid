@@ -400,6 +400,17 @@ struct BatchTimings {
     // outer loops: the controls of the re-entering / loaded slots
     // (_oc_write_controls: host packing, H->D, Sbus re-read, sync), wall.
     TimingEntry t_oc_controls;
+    // outer loops: the host model's own setup of the run and of every slot
+    // (OuterHook::begin, _oc_setup, OuterHook::load on each (re)load), wall.
+    TimingEntry t_oc_load;
+
+    // Whole-call wall clocks (ms), to find what no phase above covers:
+    // BatchPfDriver::solve() from entry to return, and the session's run()
+    // around it (source build, driver build + cuDSS ANALYSIS of a cold run,
+    // the outer loops' row inputs, the post-solve folding). Not added to any
+    // total.
+    double t_driver_solve_wall_ms = 0.;
+    double t_session_run_wall_ms  = 0.;
 
     // --- metadata ---
     //
@@ -452,7 +463,8 @@ struct BatchTimings {
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
               + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
-              + t_flow_computation + t_schedule + t_oc_controls).wall_ms;
+              + t_flow_computation + t_schedule + t_oc_controls
+              + t_oc_load).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

@@ -901,6 +901,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Part of t_schedule, outer loops: the host model's decisions (on_solved), wall")
         .def_readonly("t_oc_controls", &BatchTimings::t_oc_controls,
                       "Outer loops: upload of the re-entering / loaded slots' controls, wall")
+        .def_readonly("t_oc_load", &BatchTimings::t_oc_load,
+                      "Outer loops: the host model's setup of the run and of each (re)loaded slot "
+                      "(begin, load), wall")
+        .def_readonly("t_driver_solve_wall_ms", &BatchTimings::t_driver_solve_wall_ms,
+                      "Wall clock of the batch driver's whole solve() (ms); not in any total")
+        .def_readonly("t_session_run_wall_ms", &BatchTimings::t_session_run_wall_ms,
+                      "Wall clock of the session's whole run() (ms), solve() included; not in any total")
         .def_readonly("scheduling", &BatchTimings::scheduling,
                       "BatchScheduling of the run: 0 = chunked, 1 = continuous")
         .def_readonly("nb_iter_per_round", &BatchTimings::nb_iter_per_round,
@@ -1052,6 +1059,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["oc_gather"]         = entry_dict(t.t_oc_gather);
             gpu_compute["oc_decide"]         = entry_dict(t.t_oc_decide);
             gpu_compute["oc_controls"]       = entry_dict(t.t_oc_controls);
+            gpu_compute["oc_load"]           = entry_dict(t.t_oc_load);
 
             py::dict d2h;
             d2h["total"]                      = t.t_device_to_host_ms();
@@ -1081,6 +1089,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
             result["gpu_compute"]  = gpu_compute;
             result["d2h"]          = d2h;
             result["adjoint"]      = adjoint;
+            // whole-call wall clocks, outside every bucket above
+            py::dict wall;
+            wall["driver_solve_ms"] = t.t_driver_solve_wall_ms;
+            wall["session_run_ms"]  = t.t_session_run_wall_ms;
+            result["wall"]         = wall;
             return result;
         }, "Nested dict view of the coarse timing buckets: "
            "{'total': ms, 'cpu_preproc': {'total': ms, ...}, 'h2d': {'total': ms, ...}, "

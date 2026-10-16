@@ -1282,6 +1282,7 @@ void BatchPfDriver<BatchSource>::copy_flow_results_to_host(
 template <typename BatchSource>
 BatchTimings BatchPfDriver<BatchSource>::solve()
 {
+    const auto t_solve0 = std::chrono::steady_clock::now();
     BatchTimings t;
     ++n_solves_;
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
@@ -1383,6 +1384,7 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
                                   : RowStatus::MaxIter);
         }
     }
+    t.t_driver_solve_wall_ms = ms_since(t_solve0);
     return t;
 }
 
@@ -2370,8 +2372,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     long long useful = 0;     // row-iterations spent on real rows
 
     if (hook != nullptr) {
+        const auto t_l0 = std::chrono::steady_clock::now();
         _oc_setup();
         hook->begin(S, n_contingencies);
+        t.t_oc_load += TimingEntry{0., ms_since(t_l0)};
     }
 
     // Initial load: every slot (the queue's first rows, phantoms past its end).
@@ -2389,13 +2393,17 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     _upload_sched();
     _load(_load_view(S, -1, n_live), timer, t);
     if (hook != nullptr) {
+        const auto t_l0 = std::chrono::steady_clock::now();
         std::vector<int> all(static_cast<size_t>(S));
         for (int s = 0; s < S; ++s) {
             all[static_cast<size_t>(s)] = s;
             const int a = h_slot_row()[s];
             hook->load(s, a >= 0 ? _orig_row(a) : -1);
         }
+        const auto t_c0 = std::chrono::steady_clock::now();
+        t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
         _oc_write_controls(all, /*reload_sbus=*/false);
+        t.t_oc_controls += TimingEntry{0., ms_since(t_c0)};
     }
     NrIterBuffers buf = _bound_nr_buffers(_table_view(-1));
 
@@ -2552,11 +2560,13 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         if (n_live == 0) break;   // everything left; no round follows
         _load(_load_view(n_load, -1, n_load_real), timer, t);
         if (hook != nullptr) {
+            const auto t_l0 = std::chrono::steady_clock::now();
             for (int s : loaded) {
                 const int a = h_slot_row()[s];
                 hook->load(s, a >= 0 ? _orig_row(a) : -1);
             }
             const auto t_c0 = std::chrono::steady_clock::now();
+            t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
             _oc_write_controls(loaded, /*reload_sbus=*/false);
             t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_c0).count()};
