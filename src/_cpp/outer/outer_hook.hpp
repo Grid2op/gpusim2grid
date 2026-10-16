@@ -35,6 +35,7 @@ struct Layout {
     int n_grp  = 0;   // VoltageControl groups
     int n_hvdc = 0;   // droop hvdc entries (ledger order)
     int n_bc   = 0;   // BranchControl's transformers (LedgerData::bc_*, its order)
+    int n_sc   = 0;   // ShuntControl's controllers (LedgerData::sc_*, its order)
     // The buses whose V, computed power V.conj(Ybus.V) and scheduled power (the
     // slot's Sbus) are copied back for each converged slot: everything the loops read.
     std::vector<int> watch_bus;
@@ -74,6 +75,12 @@ struct SlotControls {
     std::vector<double>        bc_tap;          // [8 * n_bc]
     std::vector<double>        bc_a_tap, bc_rho_tap;
     std::vector<signed char>   bc_ctl, bc_rctl;
+    // ShuntControl, per controller [n_sc]: the sections the loop switched (one-shot, sc_set
+    // lists the controllers; their susceptance sc_b_new, pu), then the requested control
+    // (sc_ctl, -1 untouched, 0 off -- its target where B is --, 1 on)
+    std::vector<int>           sc_set;
+    std::vector<double>        sc_b_new;
+    std::vector<signed char>   sc_ctl;
 };
 
 // What the device gathered for one converged slot, as host doubles, indexed
@@ -88,6 +95,7 @@ struct SlotData {
     const double* vc_q  = nullptr;   // controllers' reactive injection, pu
     const double* bc_a  = nullptr;   // BranchControl's shift and ratio unknowns [n_bc]
     const double* bc_rho = nullptr;
+    const double* sc_b  = nullptr;   // ShuntControl's susceptances [n_sc]
     bool unrealistic = false;        // some Layout::realistic_bus outside the band
 };
 

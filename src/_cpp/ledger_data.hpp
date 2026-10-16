@@ -186,6 +186,7 @@ struct LedgerData {
     // otherwise) and its bus' Q row; then its solved groups, as the ratio groups above.
     std::vector<int>              sc_bus, sc_col, sc_q_row;
     std::vector<std::vector<int>> sc_shunts;
+    std::vector<double>           sc_b0;          // its susceptance as the grid has it (ShuntControl::_reset), pu
     std::vector<int>              sc_grp_bus, sc_grp_vm_col;
     std::vector<double>           sc_grp_target;
     std::vector<std::vector<int>> sc_grp_members, sc_grp_rows;

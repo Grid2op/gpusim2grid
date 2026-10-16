@@ -571,6 +571,7 @@ def _check_rows(sw, ls, grid, n_rows, flows=True):
         assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
         assert sorted(res[i].phase_tap) == sorted(res_ls[i].phase_tap), msg
         assert sorted(res[i].ratio_tap) == sorted(res_ls[i].ratio_tap), msg
+        assert sorted(res[i].shunt_sections) == sorted(res_ls[i].shunt_sections), msg
         if conv_ls[i]:
             np.testing.assert_allclose(V[i], V_ls[i], rtol=0., atol=1e-8, err_msg=msg)
     if flows:
@@ -810,3 +811,146 @@ def test_transformer_voltage_control_injection_sweep():
     sw.compute(batch_size=2)
     res = _check_rows(sw, ls, grid, n_rows)
     assert any(r.ratio_tap for r in res)
+
+
+
+# --------------------------------------------------------------------------------------
+# ShuntVoltageControl: a shunt controller's susceptance a Newton unknown (ShuntControl), its
+# bus' Ybus diagonal patched by value, then dispatched to sections
+# --------------------------------------------------------------------------------------
+def _shunts(bus="B9", target_kv=13.2, sections=(3, 1)):
+    import test_outer_model_cpu as cpu
+    grid = cpu._shunt_grid(bus, target_kv, sections)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
+    return grid
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_shunt_voltage_control_contingency_analysis(init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _shunts()
+    branches = [0, 1, 2, 3, 5]
+    ls = ContingencyAnalysisCPP(grid)
+    for b in branches:
+        ls.add_n1(b)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = init_from_n
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                                tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    ca.add_contingencies_by_branch_id([[b] for b in branches])
+    ca.compute(batch_size=2)
+    res = _check_rows(ca, ls, grid, len(branches), flows=False)
+    if not init_from_n:
+        assert any(r.shunt_sections for r in res)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_shunt_voltage_control_scenario_sweep(init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    from gpusim2grid import ScenarioSweepGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _shunts()
+    n_rows, n_line = 4, len(grid.get_lines())
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.03 * np.arange(n_rows)
+    rows = [[], [1], [], [2]]
+    ls = ScenarioSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = init_from_n
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    lines = np.zeros((n_rows, n_line), dtype=bool)
+    for i, br in enumerate(rows):
+        lines[i, br] = True
+    ls.set_contingency_lines(lines)
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                          tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    sw.set_topology(rows)
+    sw.compute(batch_size=2)
+    _check_rows(sw, ls, grid, n_rows, flows=False)
+
+
+def test_shunt_voltage_control_injection_sweep():
+    from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
+    from gpusim2grid import InjectionSweepGPU
+    grid = _shunts()
+    n_rows = 6
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.03 * np.arange(n_rows)
+    ls = InjectionSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = InjectionSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                           tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    # fewer slots than rows: a slot's Ybus diagonal back to the grid's between two rows
+    sw.compute(batch_size=2)
+    res = _check_rows(sw, ls, grid, n_rows, flows=False)
+    assert any(r.shunt_sections for r in res)
+
+
+def test_all_seven_loops_together():
+    """the four default loops, PhaseControl, TransformerVoltageControl and ShuntVoltageControl
+    on one grid (a phase shifter, a ratio tap changer and two regulating shunts), OpenLoadFlow's
+    order, against lightsim2grid's contingency analysis"""
+    import sys, os
+    import lightsim2grid
+    sys.path.insert(0, os.path.join(os.path.dirname(lightsim2grid.__file__), "tests"))
+    import pandas as pd
+    import test_shunt_voltage_control as S
+    import test_phase_control as P
+    from lightsim2grid.algorithm import PhaseControl, TransformerVoltageControl, ShuntVoltageControl
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    net = S._net("B9", 13.2, (3, 1), with_trafo_control=False)
+    ptc = pd.DataFrame.from_records(
+        index="id", columns=["id", "target_deadband", "regulation_mode", "low_tap", "tap", "regulating", "regulated_side"],
+        data=[(P.PST, 0., "ACTIVE_POWER_CONTROL", -10, 0, False, "ONE")])
+    steps = pd.DataFrame.from_records(index="id", columns=["id", "b", "g", "r", "x", "rho", "alpha"],
+                                      data=[(P.PST, 0., 0., 0., 0.5 * a, 1., float(a)) for a in range(-10, 11)])
+    net.create_phase_tap_changers(ptc, steps)
+    net.update_phase_tap_changers(id=P.PST, regulation_value=45., regulating=True)
+    rtc = pd.DataFrame.from_records(
+        index="id", columns=["id", "target_deadband", "target_v", "oltc", "low_tap", "tap", "regulating", "regulated_side"],
+        data=[("T4-7-1", 0.1, 12.0, True, 0, 10, False, "TWO")])
+    rsteps = pd.DataFrame.from_records(index="id", columns=["id", "b", "g", "r", "x", "rho"],
+                                       data=[("T4-7-1", 0., 0., 0., 0., 0.9 + 0.01 * k) for k in range(21)])
+    net.create_ratio_tap_changers(rtc, rsteps)
+    net.update_ratio_tap_changers(id="T4-7-1", regulating=True)
+    grid = S._grid(net)
+    for loop in (PhaseControl(), TransformerVoltageControl(), ShuntVoltageControl()):
+        grid.add_outer_loop(loop)
+    grid.change_algorithm(OUTER)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
+    names = [l.name() for l in grid.get_outer_loops()]
+    assert names[-3:] == ["PhaseControl", "TransformerVoltageControl", "ShuntVoltageControl"], names
+    branches = [0, 1, 2, 3]
+    ls = ContingencyAnalysisCPP(grid)
+    for b in branches:
+        ls.add_n1(b)
+    ls.change_algorithm(OUTER)
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                                tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    ca.add_contingencies_by_branch_id([[b] for b in branches])
+    ca.compute(batch_size=2)
+    res = _check_rows(ca, ls, grid, len(branches))
+    loops_acting = {d.split(" #")[0] for r in res for d in r.decisions if "not taken" not in d}
+    assert {"PhaseControl", "TransformerVoltageControl", "ShuntVoltageControl"} <= loops_acting, loops_acting

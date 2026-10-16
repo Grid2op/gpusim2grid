@@ -56,6 +56,27 @@ struct LedgerData;            // ledger_data.hpp (host); optional augmented-J in
 // =============================================================================
 // AcPfNrState
 // =============================================================================
+// CtlGroups' device storage (outer/branch_control_kernels.cuh), built from a ledger's groups
+// (their regulated bus, its Vm column, target, members and rows) against the J skeleton
+struct CtlGroupsDevice {
+    int n_grp = 0;
+    thrust::device_vector<int> start, member, row, jvm, jstart, jcol, bus;
+    thrust::device_vector<cuda_real_type> target;
+    CtlGroups view() const {
+        CtlGroups g;
+        g.n_grp = n_grp;
+        g.start = thrust::raw_pointer_cast(start.data());
+        g.member = thrust::raw_pointer_cast(member.data());
+        g.row = thrust::raw_pointer_cast(row.data());
+        g.jvm = thrust::raw_pointer_cast(jvm.data());
+        g.jstart = thrust::raw_pointer_cast(jstart.data());
+        g.jcol = thrust::raw_pointer_cast(jcol.data());
+        g.bus = thrust::raw_pointer_cast(bus.data());
+        g.target = thrust::raw_pointer_cast(target.data());
+        return g;
+    }
+};
+
 struct AcPfNrState {
 
     // -------------------------------------------------------------------------
@@ -287,10 +308,7 @@ struct AcPfNrState {
     thrust::device_vector<cuda_real_type>  d_bc_sign, d_bc_rexp, d_bc_p_target, d_bc_a_tap0, d_bc_rho_tap0;
     thrust::device_vector<cudaComplexType> d_bc_tap0, d_bc_yeff0;
     thrust::device_vector<int>             d_bc_rcol, d_bc_jpos_r;
-    int n_bc_grp = 0;
-    thrust::device_vector<int>             d_bc_grp_start, d_bc_grp_member, d_bc_grp_row, d_bc_grp_jvm,
-                                           d_bc_grp_jstart, d_bc_grp_jcol, d_bc_grp_bus;
-    thrust::device_vector<cuda_real_type>  d_bc_grp_target;
+    CtlGroupsDevice                        bc_groups;
     thrust::device_vector<cuda_real_type>  d_bcs_a, d_bcs_rho, d_bcs_a_target, d_bcs_a_tap, d_bcs_rho_tap,
                                            d_bcs_rho_target;
     thrust::device_vector<cudaComplexType> d_bcs_tap, d_bcs_applied;
@@ -314,15 +332,34 @@ struct AcPfNrState {
         b.rho_tap0 = thrust::raw_pointer_cast(d_bc_rho_tap0.data());
         b.rcol = thrust::raw_pointer_cast(d_bc_rcol.data());
         b.jpos_r = thrust::raw_pointer_cast(d_bc_jpos_r.data());
-        b.n_grp = n_bc_grp;
-        b.grp_start = thrust::raw_pointer_cast(d_bc_grp_start.data());
-        b.grp_member = thrust::raw_pointer_cast(d_bc_grp_member.data());
-        b.grp_row = thrust::raw_pointer_cast(d_bc_grp_row.data());
-        b.grp_jvm = thrust::raw_pointer_cast(d_bc_grp_jvm.data());
-        b.grp_jstart = thrust::raw_pointer_cast(d_bc_grp_jstart.data());
-        b.grp_jcol = thrust::raw_pointer_cast(d_bc_grp_jcol.data());
-        b.grp_bus = thrust::raw_pointer_cast(d_bc_grp_bus.data());
-        b.grp_target = thrust::raw_pointer_cast(d_bc_grp_target.data());
+        b.grp = bc_groups.view();
+        return b;
+    }
+    // ShuntControl (outer loops: ShuntVoltageControl) — n_sc == 0 when absent; d_scs_* the
+    // base solve's own one-slot state
+    int n_sc = 0;
+    thrust::device_vector<int>             d_sc_bus, d_sc_col, d_sc_jq, d_sc_ypos;
+    thrust::device_vector<cuda_real_type>  d_sc_b0;
+    CtlGroupsDevice                        sc_groups;
+    thrust::device_vector<cuda_real_type>  d_scs_b, d_scs_b_applied, d_scs_b_target;
+    thrust::device_vector<unsigned char>   d_scs_on;
+    ScStatic sc_static() const {
+        ScStatic b;
+        b.n_sc = n_sc;
+        b.bus = thrust::raw_pointer_cast(d_sc_bus.data());
+        b.col = thrust::raw_pointer_cast(d_sc_col.data());
+        b.jq = thrust::raw_pointer_cast(d_sc_jq.data());
+        b.ypos = thrust::raw_pointer_cast(d_sc_ypos.data());
+        b.b0 = thrust::raw_pointer_cast(d_sc_b0.data());
+        b.grp = sc_groups.view();
+        return b;
+    }
+    ScSlots sc_base_slots() {
+        ScSlots b;
+        b.b = thrust::raw_pointer_cast(d_scs_b.data());
+        b.b_applied = thrust::raw_pointer_cast(d_scs_b_applied.data());
+        b.b_target = thrust::raw_pointer_cast(d_scs_b_target.data());
+        b.on = thrust::raw_pointer_cast(d_scs_on.data());
         return b;
     }
     BcSlots bc_base_slots() {

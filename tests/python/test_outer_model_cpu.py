@@ -282,6 +282,13 @@ class _FullSystem:
         self.bc_rcol = np.flatnonzero(np.asarray(L["bc_ratio_col"], dtype=int) >= 0) if self.nb else np.zeros(0, int)
         yeff = np.asarray(L["bc_yeff0"], dtype=float).reshape(-1, 4, 2) if self.nb else np.zeros((0, 4, 2))
         self.bc_yeff = yeff[:, :, 0] + 1j * yeff[:, :, 1]
+        # ShuntControl: the shunt controllers (one susceptance per bus), the ones solving for it
+        self.ns = len(L["sc_bus"])
+        self.sc_col = np.flatnonzero(np.asarray(L["sc_col"], dtype=int) >= 0) if self.ns else np.zeros(0, int)
+        self.sc_b0 = np.asarray(L["sc_b0"], dtype=float) if self.ns else np.zeros(0)
+        self.sc_b = self.sc_b0.copy()
+        self.sc_b_target = self.sc_b0.copy()
+        self.sc_on = np.zeros(self.ns, dtype=bool)
         # the slot's BranchControl state (BranchControl::Entry), set by controls()
         self.bc_a = np.zeros(self.nb)
         self.bc_rho = np.ones(self.nb)
@@ -293,6 +300,22 @@ class _FullSystem:
         self.bc_a_tap = np.zeros(self.nb)
         self.bc_rho_tap = np.ones(self.nb)
         self.bc_tap = np.zeros((self.nb, 4), dtype=complex)
+
+    def apply_sc_controls(self, c, first):
+        """NROuterInner::apply_controls on ShuntControl: sections, then the controls"""
+        if self.ns == 0:
+            return
+        if first:   # ShuntControl::_reset
+            self.sc_b, self.sc_b_target = self.sc_b0.copy(), self.sc_b0.copy()
+            self.sc_on[:] = False
+        for e in c["sc_set"]:
+            self.sc_b[e] = self.sc_b_target[e] = c["sc_b_new"][e]
+        for e, req in enumerate(c["sc_ctl"]):
+            if req < 0 or e not in self.sc_col:
+                continue
+            self.sc_on[e] = req == 1
+            if req == 0:
+                self.sc_b_target[e] = self.sc_b[e]
 
     def apply_bc_controls(self, c, first):
         """NROuterInner::apply_controls on BranchControl: re-taps, then the controls"""
@@ -339,11 +362,15 @@ class _FullSystem:
         t = self.bc_tap[e]
         return np.array([t[0] * f * f, t[1] * f * rot, t[2] * f * np.conj(rot), t[3]])
 
-    def ybus(self, a, rho=None):
-        """the slot's Ybus at shifts `a` and ratios `rho`: the row's (the grid's blocks) patched
-        by value"""
+    def ybus(self, a, rho=None, b=None):
+        """the slot's Ybus at shifts `a`, ratios `rho` and shunt susceptances `b`: the row's (the
+        grid's blocks) patched by value"""
         rho = self.bc_rho if rho is None else rho
+        b = self.sc_b if b is None else b
         Y = self.Y.astype(complex).copy()
+        for e in range(self.ns):
+            bus = self.L["sc_bus"][e]
+            Y[bus, bus] += 1j * (b[e] - self.sc_b0[e])
         for e in range(self.nb):
             if self.bc_out[e]:
                 continue
@@ -355,11 +382,12 @@ class _FullSystem:
             Y[b2, b2] += d[3]
         return Y
 
-    def residual(self, V, q, Sbus, c, vm_bus, a=None, rho=None):
+    def residual(self, V, q, Sbus, c, vm_bus, a=None, rho=None, b=None):
         L = self.L
         a = self.bc_a if a is None else a
         rho = self.bc_rho if rho is None else rho
-        Y = self.ybus(a, rho) if self.nb else self.Y
+        b = self.sc_b if b is None else b
+        Y = self.ybus(a, rho, b) if (self.nb or self.ns) else self.Y
         S = V * np.conj(Y @ V)
         mis = S - Sbus
         Va = np.angle(V)
@@ -417,6 +445,18 @@ class _FullSystem:
                     rows.append([abs(V[L["bc_grp_bus"][g]]) - L["bc_grp_target"][g]])
                 else:
                     rows.append([mean - rho[m]])
+        # the shunt groups' rows, the same three forms on the susceptances
+        for g, members in enumerate(L["sc_grp_members"]):
+            mean = np.mean([b[m] for m in members])
+            first_on = True
+            for m in members:
+                if not self.sc_on[m]:
+                    rows.append([b[m] - self.sc_b_target[m]])
+                elif first_on:
+                    first_on = False
+                    rows.append([abs(V[L["sc_grp_bus"][g]]) - L["sc_grp_target"][g]])
+                else:
+                    rows.append([mean - b[m]])
         return np.concatenate([np.asarray(r, dtype=float) for r in rows])
 
     def solve(self, V, q, Sbus, c, tol, max_it):
@@ -425,35 +465,38 @@ class _FullSystem:
         vm_bus = np.flatnonzero(vm_unknown)
         nt, nv = self.th_bus.size, vm_bus.size
 
-        nq, na = len(q), self.bc_col.size
+        nq, na, nr = len(q), self.bc_col.size, self.bc_rcol.size
 
         def unpack(x):
             Va, Vm = np.angle(V0).copy(), np.abs(V0).copy()
             Va[self.th_bus] = x[:nt]
             Vm[vm_bus] = x[nt:nt + nv]
+            o = nt + nv + nq
             a = self.bc_a.copy()
-            a[self.bc_col] = x[nt + nv + nq:nt + nv + nq + na]
+            a[self.bc_col] = x[o:o + na]
             rho = self.bc_rho.copy()
-            rho[self.bc_rcol] = x[nt + nv + nq + na:]
-            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a, rho
+            rho[self.bc_rcol] = x[o + na:o + na + nr]
+            b = self.sc_b.copy()
+            b[self.sc_col] = x[o + na + nr:]
+            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a, rho, b
 
         V0 = V.copy()
         x = np.concatenate([np.angle(V)[self.th_bus], np.abs(V)[vm_bus], q, self.bc_a[self.bc_col],
-                            self.bc_rho[self.bc_rcol]])
+                            self.bc_rho[self.bc_rcol], self.sc_b[self.sc_col]])
         for it in range(max_it + 1):
-            Vx, qx, ax, rx = unpack(x)
-            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax, rx)
+            Vx, qx, ax, rx, bx = unpack(x)
+            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax, rx, bx)
             if np.max(np.abs(F)) < tol or it == max_it:
-                self.bc_a, self.bc_rho = ax, rx
+                self.bc_a, self.bc_rho, self.sc_b = ax, rx, bx
                 return Vx, qx, np.max(np.abs(F)) < tol, it, vm_unknown
             J = np.empty((F.size, x.size))
             for k in range(x.size):
                 d = np.zeros(x.size)
                 d[k] = 1e-7
-                Vp, qp, ap, rp = unpack(x + d)
-                Vm_, qm, am, rm = unpack(x - d)
-                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus, ap, rp) -
-                           self.residual(Vm_, qm, Sbus, c, vm_bus, am, rm)) / 2e-7
+                Vp, qp, ap, rp, bp = unpack(x + d)
+                Vm_, qm, am, rm, bm = unpack(x - d)
+                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus, ap, rp, bp) -
+                           self.residual(Vm_, qm, Sbus, c, vm_bus, am, rm, bm)) / 2e-7
             x = x - np.linalg.solve(J, F)
         raise AssertionError("unreachable")
 
@@ -474,15 +517,16 @@ def _run_row_full(h, row, Ybus, Sbus_row, tol_pu):
         for b, vm in zip(c["vm_reset_bus"], c["vm_reset_vm"]):
             V[b] = vm * V[b] / abs(V[b])
         sysm.apply_bc_controls(c, first)
+        sysm.apply_sc_controls(c, first)
         first = False
         h.clear_vm_reset(0)
         V, q, conv, nr, vm_unknown = sysm.solve(V, q, Sbus, c, tol_pu, MAX_IT)
-        S = V * np.conj((sysm.ybus(sysm.bc_a, sysm.bc_rho) if sysm.nb else Ybus) @ V)
+        S = V * np.conj((sysm.ybus(sysm.bc_a, sysm.bc_rho, sysm.sc_b) if (sysm.nb or sysm.ns) else Ybus) @ V)
         cand = [b for b in realistic if vm_unknown[b]]
         unrealistic = bool(np.any((np.abs(V[cand]) < 0.5) | (np.abs(V[cand]) > 2.))) if cand else False
         nxt, status = h.on_solved(0, conv, nr, CONVERGED if conv else MAX_ITER,
                                   list(V[watch]), list(S[watch]), list(Sbus[watch]), list(q), unrealistic,
-                                  list(sysm.bc_a), list(sysm.bc_rho))
+                                  list(sysm.bc_a), list(sysm.bc_rho), list(sysm.sc_b))
         if nxt == DONE:
             return V, status
     raise AssertionError("the row never ended")
@@ -911,3 +955,63 @@ def test_transformer_voltage_control_row_opening_the_transformer():
     t = next(i for i, tr in enumerate(grid.get_trafos()) if tr.name == "T4-9-1")
     res = _check_tvc("T4-9-1", 12.6, 0.1, branch_off=[len(grid.get_lines()) + t], row_kwargs=dict(trafo_off=True))
     assert not res.ratio_tap
+
+
+# --------------------------------------------------------------------------------------
+# ShuntVoltageControl: the regulating shunts of a bus one susceptance, a Newton unknown in the
+# first solve, then dispatched to sections (largest shunt first); lightsim2grid's own test grid
+# (IEEE 14, two linear shunts on a bus, 10 x 0.02 S and 4 x 0.05 S)
+# --------------------------------------------------------------------------------------
+def _shunt_grid(bus, target_kv, sections=(3, 1), with_trafo_control=False, line_off=None, load_scale=1.):
+    pytest.importorskip("pypowsybl")
+    _ls2g_tests_dir()
+    import test_shunt_voltage_control as S
+    from lightsim2grid.algorithm import ShuntVoltageControl, TransformerVoltageControl
+    grid = S._grid(S._net(bus, target_kv, sections, with_trafo_control))
+    grid.clear_outer_loops()
+    if with_trafo_control:
+        grid.add_outer_loop(TransformerVoltageControl())
+    grid.add_outer_loop(ShuntVoltageControl())
+    grid.change_algorithm(OUTER)
+    if load_scale != 1.:
+        for load_id, p in enumerate(np.asarray(grid.get_load_target_p())):
+            grid.change_p_load(load_id, float(p) * load_scale)
+    if line_off is not None:
+        grid.deactivate_powerline(line_off)
+    return grid
+
+
+def _check_shunts(*args, branch_off=None, row_kwargs=None, **kw):
+    row_kwargs = row_kwargs or {}
+    make = lambda **k: _shunt_grid(*args, **kw, **k)
+    res, _ = _compare_single_solve(make, tol_mva=1e-10, branch_off=branch_off, **row_kwargs)
+    base = make()
+    base.ac_pf(np.full(base.total_bus(), 1. + 0j), MAX_IT, 1e-10)
+    row = make(**row_kwargs)
+    row.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ref = [(i, sh.res_section_count) for i, sh in enumerate(row.get_shunts())
+           if hasattr(sh, "res_section_count") and sh.res_section_count != sh.section_count]
+    assert sorted(res.shunt_sections) == sorted(ref), (res.shunt_sections, ref, res.decisions)
+    return res
+
+
+@pytest.mark.parametrize("bus, target_kv, sections", [("B9", 12.8, (3, 1)), ("B9", 13.2, (3, 1)),
+                                                      ("B9", 12.4, (3, 1)), ("B10", 12.8, (5, 0))])
+def test_shunt_voltage_control(bus, target_kv, sections):
+    res = _check_shunts(bus, target_kv, sections)
+    assert any("ROUND_SECTIONS" in d for d in res.decisions), res.decisions
+
+
+def test_shunt_voltage_control_hidden_by_a_generator():
+    res = _check_shunts("B6", 12.8, (0, 2))
+    assert not res.decisions and not res.shunt_sections
+
+
+def test_shunt_voltage_control_hidden_by_a_transformer():
+    res = _check_shunts("B9", 13.2, (0, 2), with_trafo_control=True)
+    assert not any("ROUND_SECTIONS" in d for d in res.decisions)
+
+
+@pytest.mark.parametrize("row_kwargs, branch_off", [(dict(load_scale=1.05), None), (dict(line_off=1), [1])])
+def test_shunt_voltage_control_rows(row_kwargs, branch_off):
+    _check_shunts("B9", 13.2, (3, 1), branch_off=branch_off, row_kwargs=row_kwargs)

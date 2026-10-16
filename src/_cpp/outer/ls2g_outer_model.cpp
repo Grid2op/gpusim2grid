@@ -33,6 +33,7 @@
 #include <powerflow_algorithm/outer_loop/OuterLoopDriver.hpp>
 #include <powerflow_algorithm/outer_loop/PhaseControlLoop.hpp>
 #include <powerflow_algorithm/outer_loop/TransformerVoltageControlLoop.hpp>
+#include <powerflow_algorithm/outer_loop/ShuntVoltageControlLoop.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -53,7 +54,7 @@ using cplx = std::complex<double>;
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 
 enum class Kind { DistributedSlack, HvdcLimits, VoltageMonitoring, ReactiveLimits, PhaseControl,
-                  TransformerVoltageControl };
+                  TransformerVoltageControl, ShuntVoltageControl };
 enum Status { STABLE = 0, UNSTABLE = 1, FAILED = 2 };   // OuterLoopStatus
 
 struct LoopDecl {
@@ -153,6 +154,14 @@ struct SlotState {
     std::vector<TvcRatio> tvc_ratios;                // per trafo id
     std::vector<TvcFrozen> tvc_frozen;
     std::set<int> suspended;              // OuterControls::suspended (solver buses)
+    std::vector<ls2g::ShuntVoltageControlLoop::Group> sv_groups;
+    // ---- ShuntControl, per controller (the ledger's order): its shunts' section counts
+    // (ShuntControl::Entry::counts), a switch pending (ShuntSectionControl::take_sections)
+    // and its susceptance then, the requested control --------------------------------------
+    std::vector<std::vector<int>> sc_counts;
+    std::vector<char>   sc_pending;
+    std::vector<double> sc_b_new;
+    std::vector<signed char> sc_ctl;
     // ---- BranchControl, per transformer (the ledger's order): what the slot's system holds,
     // as lightsim2grid's BranchControl::Entry, and what the loops asked of it (its
     // PhaseShifterControl / RatioTapControl) ----------------------------------------------------
@@ -203,6 +212,7 @@ struct RowView {
     cplx Sbus(int b) const { const int k = w(b); return {d->sb_re[k], d->sb_im[k]}; }
     double bc_a(int e)   const { return d->bc_a[e]; }
     double bc_rho(int e) const { return d->bc_rho[e]; }
+    double sc_b(int e)   const { return d->sc_b[e]; }
     double vm(int b) const { return std::abs(V(b)); }
 };
 
@@ -271,6 +281,11 @@ private:
     std::vector<int> bc_trafo_, bc_b1_, bc_b2_, bc_phase_, bc_ratio_, bc_has_col_;
     std::vector<double> bc_sign_, bc_rexp_;
     std::vector<int> bc_of_trafo_;                 // trafo id -> entry (-1)
+    // ShuntControl, the ledger's order (LedgerData::sc_*)
+    int n_sc_ = 0;
+    std::vector<int> sc_bus_, sc_of_bus_;          // solver bus -> controller (-1)
+    std::vector<std::vector<int>> sc_shunts_;
+    std::set<int> tvc_buses_;                      // the buses the reserved ratio groups regulate
     // plans
     std::shared_ptr<const RlPlan> rl0_;            // the grid's (a row without masks / units off)
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
@@ -285,6 +300,7 @@ private:
     std::vector<std::pair<int, double>> resume_svc_on_;
     std::map<int, std::pair<int, bool>> resume_frozen_; // solver bus -> (state, realistic)
     std::vector<int> resume_phase_tap_, resume_ratio_tap_;   // by trafo id, INT_MIN: not carried
+    std::vector<int> resume_sections_;                       // by shunt id, INT_MIN: not carried
     // ---- per run ------------------------------------------------------------------
     int n_rows_ = 0;
     std::vector<double> row_gen_p_, row_sto_p_;    // [n_rows * n_gen], [n_rows * n_sto]
@@ -344,6 +360,11 @@ private:
     int check_rl(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_pc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
     int check_tvc(SlotState& st, const LoopDecl& L, const RowView& rv) const;
+    int check_svc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
+    // ShuntControl::set_sections (the counts clamped, the susceptance they give)
+    void sc_set_sections(SlotState& st, int e, const std::vector<int>& counts) const;
+    // ShuntVoltageControlLoop::_dispatch
+    std::vector<int> svc_dispatch(const std::vector<int>& ids, double b) const;
     // TransformerVoltageControlLoop's helpers
     void tvc_set_on(SlotState& st, int t, bool on) const;
     int  tvc_closest_tap(const SlotState& st, int t, double value) const;
@@ -423,13 +444,16 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
             d.rl_restart = p.robust_restart_vm_pu;
         } else if (dynamic_cast<const ls2g::PhaseControlLoop*>(lp.get())) {
             d.kind = Kind::PhaseControl;
+        } else if (dynamic_cast<const ls2g::ShuntVoltageControlLoop*>(lp.get())) {
+            d.kind = Kind::ShuntVoltageControl;
         } else if (auto* tv = dynamic_cast<const ls2g::TransformerVoltageControlLoop*>(lp.get())) {
             d.kind = Kind::TransformerVoltageControl;
             d.tvc = std::make_shared<const ls2g::TransformerVoltageControlLoop>(tv->params());
         } else {
             throw std::runtime_error("gpusim2grid's outer loops: the loop '" + d.name +
                                      "' is not supported (DistributedSlack, AcHvdcAcEmulationLimits, "
-                                     "VoltageMonitoring, ReactiveLimits, PhaseControl and TransformerVoltageControl are)");
+                                     "VoltageMonitoring, ReactiveLimits, PhaseControl, TransformerVoltageControl and "
+                                     "ShuntVoltageControl are)");
         }
         loops.push_back(d);
     }
@@ -470,6 +494,7 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
         // the tap positions the solve settled on (OuterLoopAlgo::_apply_carried_positions)
         resume_phase_tap_.assign(point->phase_tap.begin(), point->phase_tap.end());
         resume_ratio_tap_.assign(point->ratio_tap.begin(), point->ratio_tap.end());
+        resume_sections_.assign(point->sections.begin(), point->sections.end());
 #endif
     }
 
@@ -504,6 +529,14 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     for (int e = 0; e < n_bc_; ++e) bc_has_col_[static_cast<size_t>(e)] = ledger.bc_shift_col[static_cast<size_t>(e)] >= 0;
     bc_of_trafo_.assign(static_cast<size_t>(n_trafo_), -1);
     for (int e = 0; e < n_bc_; ++e) bc_of_trafo_[static_cast<size_t>(bc_trafo_[static_cast<size_t>(e)])] = e;
+
+    // ---- ShuntControl, as the ledger has it ----------------------------------------------
+    n_sc_ = ledger.n_sc();
+    sc_bus_ = ledger.sc_bus;
+    sc_shunts_ = ledger.sc_shunts;
+    sc_of_bus_.assign(static_cast<size_t>(n_bus_), -1);
+    for (int e = 0; e < n_sc_; ++e) sc_of_bus_[static_cast<size_t>(sc_bus_[static_cast<size_t>(e)])] = e;
+    tvc_buses_.insert(ledger.bc_grp_bus.begin(), ledger.bc_grp_bus.end());
 
     // ---- droop hvdc, as the ledger has it ------------------------------------------------
     hvdc_bus1_ = ledger.hvdc_bus1; hvdc_bus2_ = ledger.hvdc_bus2; hvdc_status0_ = ledger.hvdc_status;
@@ -545,6 +578,7 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     layout_.n_grp  = ledger.vc_n_groups();
     layout_.n_hvdc = ledger.n_hvdc();
     layout_.n_bc   = n_bc_;
+    layout_.n_sc   = n_sc_;
     std::vector<int> watch;
     watch.push_back(slack_bus_);
     for (const auto& e : rl0_->plan.buses) watch.push_back(e.bus_solver);
@@ -699,6 +733,17 @@ void Ls2gOuterModel::load(int slot, int row)
             for (int k = 0; k < 4; ++k) st.bc_tap[4 * e + static_cast<size_t>(k)] = cplx(tap[static_cast<size_t>(k)].real(), tap[static_cast<size_t>(k)].imag());
         }
     }
+    // ShuntControl: the grid's sections (ShuntControl::_reset), no control requested yet
+    {
+        const auto& shunts = grid_->get_shunts();
+        st.sc_counts.assign(static_cast<size_t>(n_sc_), {});
+        for (int e = 0; e < n_sc_; ++e)
+            for (int sh : sc_shunts_[static_cast<size_t>(e)])
+                st.sc_counts[static_cast<size_t>(e)].push_back(shunts.get_section_count(sh));
+        st.sc_pending.assign(static_cast<size_t>(n_sc_), 0);
+        st.sc_b_new.assign(static_cast<size_t>(n_sc_), 0.);
+        st.sc_ctl.assign(static_cast<size_t>(n_sc_), -1);
+    }
     set_active(st);
     st.loop_iter.assign(st.active.size(), 0);
     if (row >= 0) {
@@ -733,6 +778,18 @@ void Ls2gOuterModel::load(int slot, int row)
                 }
                 if (bc_ratio_[ee] && t < resume_ratio_tap_.size() && resume_ratio_tap_[t] != none)
                     st.bc_req_rtap[ee] = resume_ratio_tap_[t];
+            }
+            // ... and every shunt controller all of whose shunts have a carried count
+            for (int e = 0; e < n_sc_; ++e) {
+                std::vector<int> counts;
+                const int none = std::numeric_limits<int>::min();
+                bool all = true;
+                for (int sh : sc_shunts_[static_cast<size_t>(e)]) {
+                    const int c = static_cast<size_t>(sh) < resume_sections_.size() ? resume_sections_[static_cast<size_t>(sh)] : none;
+                    if (c == none) { all = false; break; }
+                    counts.push_back(c);
+                }
+                if (all && !counts.empty()) sc_set_sections(st, e, counts);
             }
         }
         init_loops(st);
@@ -874,6 +931,9 @@ void Ls2gOuterModel::set_active(SlotState& st) const
             case Kind::TransformerVoltageControl:
                 for (const auto& gr : d.tvc->groups(v)) needed = needed || !gr.hidden;
                 break;
+            case Kind::ShuntVoltageControl:
+                for (const auto& gr : ls2g::ShuntVoltageControlLoop::groups(v, tvc_buses_)) needed = needed || !gr.hidden;
+                break;
         }
         if (needed) st.active.push_back(static_cast<int>(i));
     }
@@ -892,9 +952,11 @@ void Ls2gOuterModel::clear_vm_reset(int slot)
     st.vm_reset_vm.clear();
     st.ctl.vm_reset_bus.clear();
     st.ctl.vm_reset_vm.clear();
-    // RatioTapControl::take_tap: applied once
+    // RatioTapControl::take_tap, ShuntSectionControl::take_sections: applied once
     std::fill(st.bc_req_rtap.begin(), st.bc_req_rtap.end(), std::numeric_limits<int>::min());
     st.ctl.bc_retap.clear();
+    std::fill(st.sc_pending.begin(), st.sc_pending.end(), 0);
+    st.ctl.sc_set.clear();
 }
 
 void Ls2gOuterModel::init_loops(SlotState& st) const
@@ -918,6 +980,18 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
             case Kind::VoltageMonitoring:
                 st.vm_switched_on.clear();
                 break;
+            case Kind::ShuntVoltageControl: {
+                // ShuntVoltageControlLoop::_initialize: every controller on for the first solve
+                st.sv_groups = ls2g::ShuntVoltageControlLoop::groups(view(st), tvc_buses_);
+                for (const auto& gr : st.sv_groups) {
+                    if (gr.hidden) continue;
+                    for (int bus : gr.controller_buses) {
+                        const int e = (bus >= 0 && bus < n_bus_) ? sc_of_bus_[static_cast<size_t>(bus)] : -1;
+                        if (e >= 0) st.sc_ctl[static_cast<size_t>(e)] = 1;
+                    }
+                }
+                break;
+            }
             case Kind::TransformerVoltageControl: {
                 // TransformerVoltageControlLoop::_initialize: every voltage control off
                 st.tvc_groups = d.tvc->groups(view(st));
@@ -969,6 +1043,7 @@ void Ls2gOuterModel::resume_loops(SlotState& st) const
             case Kind::DistributedSlack:   // its units start from the targets in force: taken above
             case Kind::PhaseControl:       // restarts (its taps are carried: load)
             case Kind::TransformerVoltageControl:
+            case Kind::ShuntVoltageControl:
                 break;
             case Kind::HvdcLimits:
                 // HvdcAcEmulationLimitsLoop::_initialize: each line in the regime the solve
@@ -1081,6 +1156,28 @@ void Ls2gOuterModel::materialize(SlotState& st) const
     c.bc_rho_tap = st.bc_rho_tap;
     c.bc_ctl = st.bc_ctl;
     c.bc_rctl = st.bc_rctl;
+    // ShuntControl: the sections switched (once), then the controls
+    c.sc_set.clear();
+    for (int e = 0; e < n_sc_; ++e) if (st.sc_pending[static_cast<size_t>(e)]) c.sc_set.push_back(e);
+    c.sc_b_new = st.sc_b_new;
+    c.sc_ctl = st.sc_ctl;
+}
+
+void Ls2gOuterModel::sc_set_sections(SlotState& st, int e, const std::vector<int>& counts) const
+{
+    const size_t ee = static_cast<size_t>(e);
+    const auto& ids = sc_shunts_[ee];
+    if (counts.size() != ids.size()) return;
+    const auto& shunts = grid_->get_shunts();
+    double b = 0.;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        const int sh = ids[i];
+        const int count = std::max(0, std::min(counts[i], shunts.get_max_section_count(sh)));
+        st.sc_counts[ee][i] = count;
+        if (shunts.get_status()[static_cast<size_t>(sh)]) b -= shunts.section_q(sh, count) / sn_;
+    }
+    st.sc_b_new[ee] = b;
+    st.sc_pending[ee] = 1;
 }
 
 void Ls2gOuterModel::bc_retap(SlotState& st, int e, int rpos, int pos) const
@@ -1523,6 +1620,7 @@ int Ls2gOuterModel::check(SlotState& st, const LoopDecl& L, const RowView& rv, i
         case Kind::ReactiveLimits:    return check_rl(st, L, rv);
         case Kind::PhaseControl:      return check_pc(st, L, rv, iteration);
         case Kind::TransformerVoltageControl: return check_tvc(st, L, rv);
+        case Kind::ShuntVoltageControl: return check_svc(st, L, rv, iteration);
     }
     return STABLE;
 }
@@ -1860,6 +1958,68 @@ int Ls2gOuterModel::check_tvc(SlotState& st, const LoopDecl& L, const RowView& r
 }
 
 // =============================================================================
+// ShuntVoltageControlLoop (WITH_GENERATOR_VOLTAGE_CONTROL)
+// =============================================================================
+std::vector<int> Ls2gOuterModel::svc_dispatch(const std::vector<int>& ids, double b) const
+{
+    const auto& shunts = grid_->get_shunts();
+    auto b_at = [&](int sh, int count) { return -shunts.section_q(sh, count) / sn_; };
+    // the largest first (the B between its fewest sections and its most), a stable order
+    std::vector<size_t> order(ids.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::vector<double> magnitude(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const int sh = ids[i];
+        magnitude[i] = std::abs(b_at(sh, shunts.get_max_section_count(sh)) - b_at(sh, shunts.get_min_section_count(sh)));
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t c) { return magnitude[a] > magnitude[c]; });
+    std::vector<int> counts(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) counts[i] = shunts.get_section_count(ids[i]);
+    double residue = b;
+    size_t remaining = ids.size();
+    for (size_t i : order) {
+        const int sh = ids[i];
+        const double share = residue / static_cast<double>(remaining--);
+        // roundBToClosestSection: the current count unless another is strictly closer
+        int best = counts[i];
+        double best_distance = std::abs(share - b_at(sh, best));
+        for (int count = shunts.get_min_section_count(sh); count <= shunts.get_max_section_count(sh); ++count) {
+            const double distance = std::abs(share - b_at(sh, count));
+            if (distance < best_distance) { best = count; best_distance = distance; }
+        }
+        counts[i] = best;
+        residue -= b_at(sh, best);
+    }
+    return counts;
+}
+
+int Ls2gOuterModel::check_svc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const
+{
+    if (iteration != 0 || st.sv_groups.empty()) return STABLE;
+    auto entry = [&](int bus) { return (bus >= 0 && bus < n_bus_) ? sc_of_bus_[static_cast<size_t>(bus)] : -1; };
+    // nothing to do without a controller the inner algorithm can act on
+    bool supported = false;
+    for (const auto& gr : st.sv_groups) for (int bus : gr.controller_buses) supported = supported || entry(bus) >= 0;
+    if (!supported) return STABLE;
+    bool any = false;
+    for (const auto& gr : st.sv_groups) {
+        if (gr.hidden) continue;
+        for (size_t c = 0; c < gr.controller_buses.size(); ++c) {
+            const int bus = gr.controller_buses[c];
+            const int e = entry(bus);
+            if (e < 0) continue;
+            st.sc_ctl[static_cast<size_t>(e)] = 0;
+            const double b = rv.sc_b(e);
+            sc_set_sections(st, e, svc_dispatch(gr.shunts[c], b));
+            // the susceptance the Newton solved for (pu), rounded to sections
+            record(st, L.name, "ROUND_SECTIONS", true, bus, b, NaN);
+            any = true;
+        }
+    }
+    return any ? UNSTABLE : STABLE;
+}
+
+// =============================================================================
 // PhaseControlLoop::_check
 // =============================================================================
 int Ls2gOuterModel::check_pc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const
@@ -2043,6 +2203,18 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status)
             if (!std::isnan(st.storage_target_p[s])) { r.storage_ids.push_back(static_cast<int>(s)); r.storage_target_p_mw.push_back(st.storage_target_p[s]); }
         for (size_t e = 0; e < st.hvdc_regime.size(); ++e)
             if (st.hvdc_regime[e] != 2) { r.hvdc_ids.push_back(hvdc_id_[e]); r.hvdc_regime.push_back(st.hvdc_regime[e]); }
+        // the section counts the loops left, where they differ from the grid's
+        {
+            const auto& shunts = grid_->get_shunts();
+            for (int e = 0; e < n_sc_; ++e)
+                for (size_t i = 0; i < sc_shunts_[static_cast<size_t>(e)].size(); ++i) {
+                    const int sh = sc_shunts_[static_cast<size_t>(e)][i];
+                    const int c = st.sc_counts[static_cast<size_t>(e)][i];
+                    if (shunts.has_sections(sh) && shunts.get_section_count(sh) == c) continue;
+                    r.shunt_ids.push_back(sh);
+                    r.shunt_sections.push_back(c);
+                }
+        }
         // the positions the loops handled, where they differ from the grid's
         // (BaseBatchSweep::_record_row_outer), and the blocks the row's flows use
         // (_record_row_trafo_blocks)

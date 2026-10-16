@@ -1462,11 +1462,11 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
         const std::string name = loop->name();
         if (name != "DistributedSlack" && name != "AcHvdcAcEmulationLimits" &&
             name != "VoltageMonitoring" && name != "ReactiveLimits" && name != "PhaseControl" &&
-            name != "TransformerVoltageControl")
+            name != "TransformerVoltageControl" && name != "ShuntVoltageControl")
             throw std::runtime_error("gpusim2grid's outer loops: the loop '" + name + "' is not "
                                      "supported (DistributedSlack, AcHvdcAcEmulationLimits, "
-                                     "VoltageMonitoring, ReactiveLimits, PhaseControl and "
-                                     "TransformerVoltageControl are)");
+                                     "VoltageMonitoring, ReactiveLimits, PhaseControl, "
+                                     "TransformerVoltageControl and ShuntVoltageControl are)");
     }
     OuterInputs in;
     auto& g = const_cast<ls2g::LSGrid&>(grid);
@@ -1537,11 +1537,17 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
             L.bc_grp_members.push_back(g.members);
             L.bc_grp_rows.push_back(g.rows);
         }
+        const auto& shunts = grid.get_shunts();
         for (const auto& c : lay.shunts) {
             L.sc_bus.push_back(c.bus_solver);
             L.sc_col.push_back(c.column ? c.col : -1);
             L.sc_q_row.push_back(c.column ? c.q_row : -1);
             L.sc_shunts.push_back(c.shunts);
+            // ShuntControl::_reset: the shunts' own q (MVar at 1 pu, absorbing), what Ybus holds
+            double b0 = 0.;
+            for (int s : c.shunts)
+                if (shunts.get_status()[static_cast<size_t>(s)]) b0 -= shunts.get_target_q()(s) / grid.get_sn_mva();
+            L.sc_b0.push_back(b0);
         }
         for (const auto& g : lay.shunt_groups) {
             L.sc_grp_bus.push_back(g.bus_solver);

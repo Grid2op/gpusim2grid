@@ -315,6 +315,58 @@ static void build_scatter_maps_aug(
 // §2c  Single-system NR loop helpers  (shared by the ctor and resolve())
 // =============================================================================
 
+// CtlGroupsDevice from a ledger's groups (BranchControl's ratio groups, ShuntControl's groups):
+// per group its regulated bus, that bus' Vm column, its target, its members (entries of the
+// control, whose unknowns are `entry_col`) and one row per member; the J positions resolved
+// against the skeleton (J_outer / J_inner, CSR)
+static void build_ctl_groups(CtlGroupsDevice& out, const std::vector<int>& bus, const std::vector<int>& vm_col,
+                             const std::vector<double>& target, const std::vector<std::vector<int>>& members,
+                             const std::vector<std::vector<int>>& rows, const std::vector<int>& entry_col,
+                             const int* J_outer, const int* J_inner, cudaStream_t cs)
+{
+    auto find_pos = [&](int row, int col) -> int {
+        if (row < 0 || col < 0) return -1;
+        const int* b = J_inner + J_outer[row];
+        const int* e = J_inner + J_outer[row + 1];
+        const int* it = std::lower_bound(b, e, col);
+        return (it == e || *it != col) ? -1 : static_cast<int>(it - J_inner);
+    };
+    out.n_grp = static_cast<int>(bus.size());
+    std::vector<int> gs{0}, gm, gr, gjvm, gjs, gjc;
+    std::vector<cuda_real_type> gt;
+    for (int g = 0; g < out.n_grp; ++g) {
+        const auto& mem = members[static_cast<size_t>(g)];
+        const auto& rw = rows[static_cast<size_t>(g)];
+        if (rw.size() != mem.size())
+            throw std::runtime_error("AcPfNrState: a control group's rows are not its members'");
+        const int n = static_cast<int>(mem.size());
+        gjs.push_back(static_cast<int>(gjc.size()));
+        for (int j = 0; j < n; ++j) {
+            gm.push_back(mem[static_cast<size_t>(j)]);
+            gr.push_back(rw[static_cast<size_t>(j)]);
+            gjvm.push_back(find_pos(rw[static_cast<size_t>(j)], vm_col[static_cast<size_t>(g)]));
+            for (int m = 0; m < n; ++m)
+                gjc.push_back(find_pos(rw[static_cast<size_t>(j)], entry_col[static_cast<size_t>(mem[static_cast<size_t>(m)])]));
+        }
+        gs.push_back(static_cast<int>(gm.size()));
+        gt.push_back(static_cast<cuda_real_type>(target[static_cast<size_t>(g)]));
+    }
+    std::vector<int> gb = bus;
+    // placeholders keep the pointers valid when there is no group
+    if (gm.empty()) { gm.push_back(-1); gr.push_back(-1); gjvm.push_back(-1); gjc.push_back(-1); }
+    if (gjs.empty()) gjs.push_back(0);
+    if (gt.empty()) gt.push_back(0);
+    if (gb.empty()) gb.push_back(-1);
+    upload_h2d(out.start, gs.data(), gs.size(), cs);
+    upload_h2d(out.member, gm.data(), gm.size(), cs);
+    upload_h2d(out.row, gr.data(), gr.size(), cs);
+    upload_h2d(out.jvm, gjvm.data(), gjvm.size(), cs);
+    upload_h2d(out.jstart, gjs.data(), gjs.size(), cs);
+    upload_h2d(out.jcol, gjc.data(), gjc.size(), cs);
+    upload_h2d(out.bus, gb.data(), gb.size(), cs);
+    upload_h2d(out.target, gt.data(), gt.size(), cs);
+}
+
 // Non-owning pointer bundle — views into the single-system device vectors.
 // Not const: the NR step-scaling and pin fields are set via post-init
 // assignment (positional aggregate init can't skip over the trailing
@@ -425,6 +477,10 @@ static NrIterBuffers make_single_system_buffers(AcPfNrState& s)
     if (s.n_bc > 0) {
         buf.bc   = s.bc_static();
         buf.bcs  = s.bc_base_slots();
+    }
+    if (s.n_sc > 0) {
+        buf.sc   = s.sc_static();
+        buf.scs  = s.sc_base_slots();
     }
     // Held controllers: offset out of the mismatch, pinned in this base solve.
     if (s.has_vc_held) {
@@ -1177,39 +1233,9 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_bc_rcol, rcol.data(), n_bc, cs);
         upload_h2d(d_bc_jpos_r, jpos_r.data(), jpos_r.size(), cs);
         // the solved ratio groups (BranchControl's RatioGroup)
-        n_bc_grp = static_cast<int>(ledger->bc_grp_bus.size());
-        {
-            std::vector<int> gs{0}, gm, gr, gjvm, gjs, gjc;
-            std::vector<cuda_real_type> gt;
-            const int* Jo = J_outer_h.data();
-            const int* Ji = J_inner_h.data();
-            for (int g = 0; g < n_bc_grp; ++g) {
-                const auto& mem = ledger->bc_grp_members[g];
-                const auto& rows = ledger->bc_grp_rows[g];
-                if (rows.size() != mem.size())
-                    throw std::runtime_error("AcPfNrState: a ratio group's rows are not its members'");
-                const int n = static_cast<int>(mem.size());
-                gjs.push_back(static_cast<int>(gjc.size()));
-                for (int j = 0; j < n; ++j) {
-                    gm.push_back(mem[j]);
-                    gr.push_back(rows[j]);
-                    gjvm.push_back(find_pos(Jo, Ji, rows[j], ledger->bc_grp_vm_col[g]));
-                    for (int m = 0; m < n; ++m) gjc.push_back(find_pos(Jo, Ji, rows[j], ledger->bc_ratio_col[mem[m]]));
-                }
-                gs.push_back(static_cast<int>(gm.size()));
-                gt.push_back(static_cast<cuda_real_type>(ledger->bc_grp_target[g]));
-            }
-            if (gm.empty()) { gm.push_back(-1); gr.push_back(-1); gjvm.push_back(-1); gjc.push_back(-1); gjs.push_back(0); gt.push_back(0); }
-            upload_h2d(d_bc_grp_start, gs.data(), gs.size(), cs);
-            upload_h2d(d_bc_grp_member, gm.data(), gm.size(), cs);
-            upload_h2d(d_bc_grp_row, gr.data(), gr.size(), cs);
-            upload_h2d(d_bc_grp_jvm, gjvm.data(), gjvm.size(), cs);
-            upload_h2d(d_bc_grp_jstart, gjs.data(), gjs.size(), cs);
-            upload_h2d(d_bc_grp_jcol, gjc.data(), gjc.size(), cs);
-            upload_h2d(d_bc_grp_bus, ledger->bc_grp_bus.empty() ? gm.data() : ledger->bc_grp_bus.data(),
-                       std::max<size_t>(ledger->bc_grp_bus.size(), 1), cs);
-            upload_h2d(d_bc_grp_target, gt.data(), gt.size(), cs);
-        }
+        build_ctl_groups(bc_groups, ledger->bc_grp_bus, ledger->bc_grp_vm_col, ledger->bc_grp_target,
+                         ledger->bc_grp_members, ledger->bc_grp_rows, ledger->bc_ratio_col,
+                         J_outer_h.data(), J_inner_h.data(), cs);
         const auto sign = to_real(ledger->bc_sign), rexp = to_real(ledger->bc_rexp),
                    pt = to_real(ledger->bc_p_target), at = to_real(ledger->bc_a_tap0),
                    rt = to_real(ledger->bc_rho_tap0);
@@ -1233,6 +1259,40 @@ AcPfNrState::AcPfNrState(
         d_bcs_on.assign(static_cast<size_t>(n_bc), 0);
         d_bcs_ron.assign(static_cast<size_t>(n_bc), 0);
         d_bcs_out.assign(static_cast<size_t>(n_bc), 0);
+    }
+
+    // ShuntControl (outer loops: ShuntVoltageControl): per controller its bus' Ybus diagonal
+    // position, the J position of its column in its bus' Q row, the grid's susceptance; its
+    // groups; and the base solve's own state (nothing patched into its Ybus)
+    if (ledger != nullptr && ledger->n_sc() > 0) {
+        n_sc = ledger->n_sc();
+        std::vector<int> jq(n_sc, -1), ypos(n_sc, -1);
+        auto find_pos = [](const int* outer, const int* inner, int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int* b = inner + outer[row];
+            const int* e = inner + outer[row + 1];
+            const int* it = std::lower_bound(b, e, col);
+            return (it == e || *it != col) ? -1 : static_cast<int>(it - inner);
+        };
+        for (int e = 0; e < n_sc; ++e) {
+            const int bus = ledger->sc_bus[e];
+            ypos[e] = find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), bus, bus);
+            if (ypos[e] < 0) throw std::runtime_error("AcPfNrState: a shunt controller's bus has no Ybus diagonal");
+            jq[e] = find_pos(J_outer_h.data(), J_inner_h.data(), ledger->sc_q_row[e], ledger->sc_col[e]);
+        }
+        const std::vector<cuda_real_type> b0(ledger->sc_b0.begin(), ledger->sc_b0.end());
+        upload_h2d(d_sc_bus, ledger->sc_bus.data(), n_sc, cs);
+        upload_h2d(d_sc_col, ledger->sc_col.data(), n_sc, cs);
+        upload_h2d(d_sc_jq, jq.data(), n_sc, cs);
+        upload_h2d(d_sc_ypos, ypos.data(), n_sc, cs);
+        upload_h2d(d_sc_b0, b0.data(), n_sc, cs);
+        build_ctl_groups(sc_groups, ledger->sc_grp_bus, ledger->sc_grp_vm_col, ledger->sc_grp_target,
+                         ledger->sc_grp_members, ledger->sc_grp_rows, ledger->sc_col,
+                         J_outer_h.data(), J_inner_h.data(), cs);
+        d_scs_b.assign(b0.begin(), b0.end());
+        d_scs_b_applied.assign(b0.begin(), b0.end());
+        d_scs_b_target.assign(b0.begin(), b0.end());
+        d_scs_on.assign(static_cast<size_t>(n_sc), 0);
     }
 
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)

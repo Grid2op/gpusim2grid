@@ -3152,6 +3152,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 d["bc_p_target"] = L.bc_p_target; d["bc_yeff0"] = L.bc_yeff0;
                 d["bc_grp_bus"] = L.bc_grp_bus; d["bc_grp_target"] = L.bc_grp_target;
                 d["bc_grp_members"] = L.bc_grp_members;
+                d["sc_bus"] = L.sc_bus; d["sc_col"] = L.sc_col; d["sc_b0"] = L.sc_b0;
+                d["sc_grp_bus"] = L.sc_grp_bus; d["sc_grp_target"] = L.sc_grp_target;
+                d["sc_grp_members"] = L.sc_grp_members;
                 return d;
             })
         .def("set_row_targets", [](OuterModelHarness& h, int n_rows, std::vector<double> gen_p) {
@@ -3179,6 +3182,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 d["bc_rho_tap"] = c.bc_rho_tap;
                 d["bc_ctl"] = std::vector<int>(c.bc_ctl.begin(), c.bc_ctl.end());
                 d["bc_rctl"] = std::vector<int>(c.bc_rctl.begin(), c.bc_rctl.end());
+                d["sc_set"] = c.sc_set;
+                d["sc_b_new"] = c.sc_b_new;
+                d["sc_ctl"] = std::vector<int>(c.sc_ctl.begin(), c.sc_ctl.end());
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
@@ -3196,7 +3202,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def("on_solved", [](OuterModelHarness& h, int slot, bool converged, int nr_iter, int inner_status,
                              std::vector<std::complex<double>> V, std::vector<std::complex<double>> S,
                              std::vector<std::complex<double>> Sb, std::vector<double> vc_q, bool unrealistic,
-                             std::vector<double> bc_a, std::vector<double> bc_rho) {
+                             std::vector<double> bc_a, std::vector<double> bc_rho, std::vector<double> sc_b) {
                 std::vector<double> vr, vi, sr, si, br, bi;
                 for (auto z : V)  { vr.push_back(z.real()); vi.push_back(z.imag()); }
                 for (auto z : S)  { sr.push_back(z.real()); si.push_back(z.imag()); }
@@ -3208,6 +3214,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 if (converged && (bc_a.size() != n_bc || bc_rho.size() != n_bc))
                     throw std::invalid_argument("on_solved: bc_a / bc_rho must hold one value per BranchControl transformer");
                 d.bc_a = bc_a.data(); d.bc_rho = bc_rho.data();
+                if (converged && sc_b.size() != static_cast<size_t>(h.model->layout().n_sc))
+                    throw std::invalid_argument("on_solved: sc_b must hold one value per ShuntControl controller");
+                d.sc_b = sc_b.data();
                 int row_status = inner_status;
                 const outer::Next next = h.model->on_solved(slot, converged, nr_iter, inner_status,
                                                             converged ? &d : nullptr, row_status);
@@ -3215,7 +3224,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
             }, pybind11::arg("slot"), pybind11::arg("converged"), pybind11::arg("nr_iter"),
             pybind11::arg("inner_status"), pybind11::arg("V"), pybind11::arg("S"), pybind11::arg("Sb"),
             pybind11::arg("vc_q"), pybind11::arg("unrealistic"),
-            pybind11::arg("bc_a") = std::vector<double>(), pybind11::arg("bc_rho") = std::vector<double>())
+            pybind11::arg("bc_a") = std::vector<double>(), pybind11::arg("bc_rho") = std::vector<double>(),
+            pybind11::arg("sc_b") = std::vector<double>())
         .def("row_result", [](const OuterModelHarness& h, int row) { return h.model->row_result(row); });
 
     m.def("_make_ca_outer_session_from_lsgrid",

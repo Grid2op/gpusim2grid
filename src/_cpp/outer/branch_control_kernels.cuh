@@ -26,6 +26,26 @@
 #include "../cu_complex_utils.h"
 #include "../dtypes.hpp"
 
+// The solved groups of a continuous control (BranchControl's ratio groups, ShuntControl's
+// groups): group g's members are member[start[g] .. start[g+1]) (indices into the control's
+// entries), one row each (row, same order); jvm the J position of (row, vm_col(bus)) per member,
+// jcol of (row_j, col_m) per (j, m) pair, flat from jstart[g]. Each row holds by value
+//     x_j = x_target_j               (its control off)
+//     Vm(bus) = target               (the first one on)
+//     mean(x) = x_j                  (any other one on)
+// (BranchControl / ShuntControl::fill_custom_rows).
+struct CtlGroups {
+    int n_grp = 0;
+    const int* start = nullptr;       // [n_grp + 1]
+    const int* member = nullptr;      // flat
+    const int* row = nullptr;         // flat
+    const int* jvm = nullptr;         // flat
+    const int* jstart = nullptr;      // [n_grp]
+    const int* jcol = nullptr;        // flat, n_j^2 per group
+    const int* bus = nullptr;         // [n_grp] the regulated bus
+    const cuda_real_type* target = nullptr;   // [n_grp] pu
+};
+
 struct BcStatic {
     int n_bc = 0;
     const int* b1 = nullptr;              // [n_bc] solver buses
@@ -48,18 +68,7 @@ struct BcStatic {
     // the J positions of dS/drho, (p1,rcol) (q1,rcol) (p2,rcol) (q2,rcol)
     const int* rcol = nullptr;            // [n_bc]
     const int* jpos_r = nullptr;          // [4 n_bc]
-    // its solved ratio groups: group g's members are grp_member[grp_start[g] .. grp_start[g+1]),
-    // one row each (grp_row, same order); grp_jvm the J position of (row, vm_col(bus)) per
-    // member, grp_jcol of (row_j, rcol_m) per (j, m) pair, flat from grp_jstart[g]
-    int n_grp = 0;
-    const int* grp_start = nullptr;       // [n_grp + 1]
-    const int* grp_member = nullptr;      // flat
-    const int* grp_row = nullptr;         // flat
-    const int* grp_jvm = nullptr;         // flat
-    const int* grp_jstart = nullptr;      // [n_grp]
-    const int* grp_jcol = nullptr;        // flat, n_j^2 per group
-    const int* grp_bus = nullptr;         // [n_grp] the regulated bus
-    const cuda_real_type* grp_target = nullptr;   // [n_grp] pu
+    CtlGroups grp;                        // its solved ratio groups (the members' ratio columns)
 };
 
 struct BcSlots {   // per slot, [batch * n_bc] (blocks [batch * n_bc * 4])
@@ -86,15 +95,59 @@ __global__ void bc_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaC
 __global__ void bc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaComplexType* __restrict__ d_V,
                                  BcStatic st, BcSlots sl, int n_bus, int nnz_J, int batch);
 
-// One thread per (slot, solved ratio group): its rows' residuals (assign), BranchControl::
-// fill_custom_rows: per member, off "rho = rho_target", the first one on "Vm(bus) = target",
-// any other one on "mean(rho) = rho".
-__global__ void bc_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
-                                         BcStatic st, BcSlots sl, int n_bus, int dim_J, int batch);
+// ---- ShuntControl (ShuntVoltageControl): the regulating shunts of a bus are ONE controller
+// with a susceptance B (pu; its bus' Ybus diagonal holds j B), patched by value; a solved
+// group's controller owns a column, dQ/dB = -|V|^2 in its bus' Q row
+struct ScStatic {
+    int n_sc = 0;
+    const int* bus = nullptr;             // [n_sc] solver bus
+    const int* col = nullptr;             // [n_sc] the susceptance column, -1 none
+    const int* jq = nullptr;              // [n_sc] J position of (q_row, col), -1 none
+    const int* ypos = nullptr;            // [n_sc] Ybus position of (bus, bus)
+    const cuda_real_type* b0 = nullptr;   // [n_sc] the grid's susceptance
+    CtlGroups grp;                        // its solved groups
+};
+struct ScSlots {   // per slot, [batch * n_sc]
+    cuda_real_type* b = nullptr;
+    cuda_real_type* b_applied = nullptr;  // what the slot's Ybus holds
+    cuda_real_type* b_target = nullptr;
+    unsigned char*  on = nullptr;
+};
 
-// One thread per (slot, solved ratio group): its rows' J entries, every position assigned.
-__global__ void bc_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, BcStatic st, BcSlots sl,
-                                       int nnz_J, int batch);
+// One thread per (slot, controller with a column): dQ/dB.
+__global__ void sc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaComplexType* __restrict__ d_V,
+                                 ScStatic st, ScSlots sl, int n_bus, int nnz_J, int batch);
+// One thread per (slot, controller with a column): the step on B, then its Ybus patch.
+__global__ void sc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComplexType* __restrict__ d_Ybus,
+                               ScStatic st, ScSlots sl, int dim_J, int nnz_Y, int batch);
+// One thread per (listed slot, controller): NROuterInner::apply_controls on ShuntControl. `fresh`:
+// ShuntControl::_reset at the grid's sections; then the sections the loop switched (d_set:
+// B = d_b_new, its target too), then the requested control (d_ctl -1 / 0 off, target where B
+// is / 1 on), then the Ybus patch. Inputs [n_list * n_sc].
+__global__ void sc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic st, ScSlots sl,
+                                   const int* __restrict__ d_slots, int n_list, bool fresh,
+                                   const unsigned char* __restrict__ d_set,
+                                   const cuda_real_type* __restrict__ d_b_new,
+                                   const signed char* __restrict__ d_ctl, int nnz_Y);
+// One thread per (slot, controller), the slots whose d_evict entry is >= 0 (null: every slot):
+// the slot's Ybus back to the grid's susceptance.
+__global__ void sc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic st, ScSlots sl,
+                                  const int* __restrict__ d_evict, int nnz_Y, int batch);
+// One thread per (listed slot, controller): its B into the gather buffer at `offset`.
+__global__ void sc_gather_kernel(cuda_real_type* __restrict__ d_out, ScStatic st, ScSlots sl,
+                                 const int* __restrict__ d_slots, int n_list, int offset, int stride);
+
+// One thread per (slot, group): its rows' residuals (assign), see CtlGroups. x, x_target,
+// on: the control's per slot values ([batch * n_ent]).
+__global__ void ctl_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
+                                          CtlGroups g, const cuda_real_type* __restrict__ x,
+                                          const cuda_real_type* __restrict__ x_target,
+                                          const unsigned char* __restrict__ on, int n_ent,
+                                          int n_bus, int dim_J, int batch);
+
+// One thread per (slot, group): its rows' J entries, every position assigned.
+__global__ void ctl_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, CtlGroups g,
+                                        const unsigned char* __restrict__ on, int n_ent, int nnz_J, int batch);
 
 // One thread per (slot, transformer): the Newton step on the shift (BranchControl::
 // apply_step), then the block patched into the slot's Ybus (d_Ybus may be null: the

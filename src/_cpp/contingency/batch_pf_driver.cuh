@@ -1041,6 +1041,11 @@ private:
     thrust::device_vector<cuda_real_type>  d_bc_in_a_tap_, d_bc_in_rho_tap_;
     thrust::device_vector<signed char>     d_bc_in_ctl_, d_bc_in_rctl_;
     BcSlots _bc_slots();
+    // ShuntControl per slot ([S * n_sc]) and its staging
+    thrust::device_vector<cuda_real_type>  d_sc_b_, d_sc_b_applied_, d_sc_b_target_, d_sc_in_b_;
+    thrust::device_vector<unsigned char>   d_sc_on_, d_sc_in_set_;
+    thrust::device_vector<signed char>     d_sc_in_ctl_;
+    ScSlots _sc_slots();
     thrust::device_vector<int>             d_branch_bc_;   // [n_branches_] the transformer entry, -1
 public:
     // The outer loops moved some transformers' taps: their flows of each row recomputed

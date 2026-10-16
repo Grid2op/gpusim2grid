@@ -151,55 +151,58 @@ __global__ void bc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaCom
     if (jp[8] >= 0) J[jp[8]] = d_vm2;
 }
 
-__global__ void bc_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
-                                         BcStatic st, BcSlots sl, int n_bus, int dim_J, int batch)
+__global__ void ctl_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
+                                          CtlGroups g, const cuda_real_type* __restrict__ x,
+                                          const cuda_real_type* __restrict__ x_target,
+                                          const unsigned char* __restrict__ on, int n_ent,
+                                          int n_bus, int dim_J, int batch)
 {
     const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_grp) return;
-    const ptrdiff_t b = tid / st.n_grp;
-    const int g = static_cast<int>(tid % st.n_grp);
-    const int s0 = st.grp_start[g], n = st.grp_start[g + 1] - s0;
+    if (tid >= static_cast<ptrdiff_t>(batch) * g.n_grp) return;
+    const ptrdiff_t b = tid / g.n_grp;
+    const int k = static_cast<int>(tid % g.n_grp);
+    const int s0 = g.start[k], n = g.start[k + 1] - s0;
     cuda_real_type mean = 0;
-    for (int j = 0; j < n; ++j) mean += sl.rho[b * st.n_bc + st.grp_member[s0 + j]];
+    for (int j = 0; j < n; ++j) mean += x[b * n_ent + g.member[s0 + j]];
     mean /= static_cast<cuda_real_type>(n);
     bool first_on = true;
     for (int j = 0; j < n; ++j) {
-        const ptrdiff_t idx = b * st.n_bc + st.grp_member[s0 + j];
+        const ptrdiff_t idx = b * n_ent + g.member[s0 + j];
         cuda_real_type F;
-        if (!sl.ron[idx]) {
-            F = sl.rho[idx] - sl.rho_target[idx];
+        if (!on[idx]) {
+            F = x[idx] - x_target[idx];
         } else if (first_on) {
             first_on = false;
-            F = C::my_cuCabs(d_V[b * n_bus + st.grp_bus[g]]) - st.grp_target[g];
+            F = C::my_cuCabs(d_V[b * n_bus + g.bus[k]]) - g.target[k];
         } else {
-            F = mean - sl.rho[idx];
+            F = mean - x[idx];
         }
-        d_F[b * dim_J + st.grp_row[s0 + j]] = -F;
+        d_F[b * dim_J + g.row[s0 + j]] = -F;
     }
 }
 
-__global__ void bc_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, BcStatic st, BcSlots sl,
-                                       int nnz_J, int batch)
+__global__ void ctl_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, CtlGroups g,
+                                        const unsigned char* __restrict__ on, int n_ent, int nnz_J, int batch)
 {
     const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_grp) return;
-    const ptrdiff_t b = tid / st.n_grp;
-    const int g = static_cast<int>(tid % st.n_grp);
-    const int s0 = st.grp_start[g], n = st.grp_start[g + 1] - s0;
+    if (tid >= static_cast<ptrdiff_t>(batch) * g.n_grp) return;
+    const ptrdiff_t b = tid / g.n_grp;
+    const int k = static_cast<int>(tid % g.n_grp);
+    const int s0 = g.start[k], n = g.start[k + 1] - s0;
     cuda_real_type* J = d_J + b * nnz_J;
-    const int* jc = st.grp_jcol + st.grp_jstart[g];
+    const int* jc = g.jcol + g.jstart[k];
     const cuda_real_type inv_n = cuda_real_type(1) / static_cast<cuda_real_type>(n);
     bool first_on = true;
     for (int j = 0; j < n; ++j) {
-        const ptrdiff_t idx = b * st.n_bc + st.grp_member[s0 + j];
+        const ptrdiff_t idx = b * n_ent + g.member[s0 + j];
         // every form's positions zero, then the row's own
         for (int m = 0; m < n; ++m) if (jc[j * n + m] >= 0) J[jc[j * n + m]] = cuda_real_type(0);
-        if (st.grp_jvm[s0 + j] >= 0) J[st.grp_jvm[s0 + j]] = cuda_real_type(0);
-        if (!sl.ron[idx]) {
+        if (g.jvm[s0 + j] >= 0) J[g.jvm[s0 + j]] = cuda_real_type(0);
+        if (!on[idx]) {
             if (jc[j * n + j] >= 0) J[jc[j * n + j]] = cuda_real_type(1);
         } else if (first_on) {
             first_on = false;
-            if (st.grp_jvm[s0 + j] >= 0) J[st.grp_jvm[s0 + j]] = cuda_real_type(1);
+            if (g.jvm[s0 + j] >= 0) J[g.jvm[s0 + j]] = cuda_real_type(1);
         } else {
             for (int m = 0; m < n; ++m)
                 if (jc[j * n + m] >= 0) J[jc[j * n + m]] = m == j ? inv_n - cuda_real_type(1) : inv_n;
@@ -309,4 +312,97 @@ __global__ void bc_gather_kernel(cuda_real_type* __restrict__ d_out, BcStatic st
     const ptrdiff_t idx = static_cast<ptrdiff_t>(d_slots[i]) * st.n_bc + e;
     d_out[i * stride + offset + e] = sl.a[idx];
     d_out[i * stride + offset + st.n_bc + e] = sl.rho[idx];
+}
+
+// =============================================================================
+// ShuntControl (NRSystemShuntControl.cpp)
+// =============================================================================
+namespace {
+__device__ __forceinline__ void sc_patch(cudaComplexType* Y, const ScStatic& st, const ScSlots& sl,
+                                         ptrdiff_t s, ptrdiff_t idx, int e, int nnz_Y)
+{
+    cudaComplexType* p = Y + s * nnz_Y + st.ypos[e];
+    *p = cadd(*p, cx(0, sl.b[idx] - sl.b_applied[idx]));
+    sl.b_applied[idx] = sl.b[idx];
+}
+}  // namespace
+
+__global__ void sc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaComplexType* __restrict__ d_V,
+                                 ScStatic st, ScSlots sl, int n_bus, int nnz_J, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_sc) return;
+    const ptrdiff_t b = tid / st.n_sc;
+    const int e = static_cast<int>(tid % st.n_sc);
+    if (st.jq[e] < 0) return;
+    // S = V conj(j B V) = -j B |V|^2
+    const cudaComplexType V = d_V[b * n_bus + st.bus[e]];
+    d_J[b * nnz_J + st.jq[e]] = -(re(V) * re(V) + im(V) * im(V));
+    (void)sl;
+}
+
+__global__ void sc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComplexType* __restrict__ d_Ybus,
+                               ScStatic st, ScSlots sl, int dim_J, int nnz_Y, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_sc) return;
+    const ptrdiff_t b = tid / st.n_sc;
+    const int e = static_cast<int>(tid % st.n_sc);
+    if (st.col[e] < 0) return;
+    const cuda_real_type db = d_dx[b * dim_J + st.col[e]];
+    if (db == cuda_real_type(0)) return;
+    sl.b[tid] += db;
+    if (d_Ybus != nullptr) sc_patch(d_Ybus, st, sl, b, tid, e, nnz_Y);
+}
+
+__global__ void sc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic st, ScSlots sl,
+                                   const int* __restrict__ d_slots, int n_list, bool fresh,
+                                   const unsigned char* __restrict__ d_set,
+                                   const cuda_real_type* __restrict__ d_b_new,
+                                   const signed char* __restrict__ d_ctl, int nnz_Y)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n_list) * st.n_sc) return;
+    const ptrdiff_t i = tid / st.n_sc;
+    const int e = static_cast<int>(tid % st.n_sc);
+    const ptrdiff_t s = d_slots[i];
+    const ptrdiff_t idx = s * st.n_sc + e;
+    if (fresh) {
+        sl.b[idx] = st.b0[e];
+        sl.b_applied[idx] = st.b0[e];
+        sl.b_target[idx] = st.b0[e];
+        sl.on[idx] = 0;
+    }
+    if (d_set[tid]) {   // ShuntControl::set_sections
+        sl.b[idx] = d_b_new[tid];
+        sl.b_target[idx] = d_b_new[tid];
+    }
+    if (st.col[e] >= 0 && d_ctl[tid] >= 0) {   // ShuntControl::set_control_on
+        sl.on[idx] = d_ctl[tid] == 1;
+        if (d_ctl[tid] == 0) sl.b_target[idx] = sl.b[idx];
+    }
+    if (d_Ybus != nullptr) sc_patch(d_Ybus, st, sl, s, idx, e, nnz_Y);
+}
+
+__global__ void sc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic st, ScSlots sl,
+                                  const int* __restrict__ d_evict, int nnz_Y, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_sc) return;
+    const ptrdiff_t s = tid / st.n_sc;
+    const int e = static_cast<int>(tid % st.n_sc);
+    if (d_evict != nullptr && d_evict[s] < 0) return;
+    cudaComplexType* p = d_Ybus + s * nnz_Y + st.ypos[e];
+    *p = cadd(*p, cx(0, st.b0[e] - sl.b_applied[tid]));
+    sl.b_applied[tid] = st.b0[e];
+}
+
+__global__ void sc_gather_kernel(cuda_real_type* __restrict__ d_out, ScStatic st, ScSlots sl,
+                                 const int* __restrict__ d_slots, int n_list, int offset, int stride)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n_list) * st.n_sc) return;
+    const ptrdiff_t i = tid / st.n_sc;
+    const int e = static_cast<int>(tid % st.n_sc);
+    d_out[i * stride + offset + e] = sl.b[static_cast<ptrdiff_t>(d_slots[i]) * st.n_sc + e];
 }

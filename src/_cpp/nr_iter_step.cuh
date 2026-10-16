@@ -250,6 +250,8 @@ struct NrIterBuffers {
     // (d_Ybus_values_mut; null: the state moves, nothing is patched). n_bc == 0: off.
     BcStatic               bc;
     BcSlots                bcs;
+    ScStatic               sc;      // ShuntControl, the same way (n_sc == 0: off)
+    ScSlots                scs;
     cudaComplexType*       d_Ybus_values_mut = nullptr;
     int                    nnz_Y_bc = 0;            // per-slot Ybus stride for the patch
 
@@ -335,9 +337,15 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
     if (buf.bc.n_bc > 0)
         bc_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.bc, buf.bcs, n_bus, dim_J, batch);
-    if (buf.bc.n_grp > 0)
-        bc_group_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.n_grp, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.bc, buf.bcs, n_bus, dim_J, batch);
+    if (buf.bc.grp.n_grp > 0)
+        ctl_group_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.bc.grp, buf.bcs.rho, buf.bcs.rho_target, buf.bcs.ron, buf.bc.n_bc,
+            n_bus, dim_J, batch);
+    // ShuntControl: its groups' rows
+    if (buf.sc.grp.n_grp > 0)
+        ctl_group_mismatch_kernel<<<nr_grid_size((long long)batch * buf.sc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.sc.grp, buf.scs.b, buf.scs.b_target, buf.scs.on, buf.sc.n_sc,
+            n_bus, dim_J, batch);
 }
 
 inline void nr_feature_zero_J(const NrIterBuffers& buf, int nnz_J, int batch, cudaStream_t cs)
@@ -374,9 +382,16 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
     if (buf.bc.n_bc > 0)
         bc_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.bc, buf.bcs, n_bus, nnz_J, batch);
-    if (buf.bc.n_grp > 0)
-        bc_group_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.n_grp, BS), BS, 0, cs>>>(
-            buf.d_J_values, buf.bc, buf.bcs, nnz_J, batch);
+    if (buf.bc.grp.n_grp > 0)
+        ctl_group_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.bc.grp, buf.bcs.ron, buf.bc.n_bc, nnz_J, batch);
+    // ShuntControl: dQ/dB, its groups' rows
+    if (buf.sc.n_sc > 0)
+        sc_fill_J_kernel<<<nr_grid_size((long long)batch * buf.sc.n_sc, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.d_V, buf.sc, buf.scs, n_bus, nnz_J, batch);
+    if (buf.sc.grp.n_grp > 0)
+        ctl_group_fill_J_kernel<<<nr_grid_size((long long)batch * buf.sc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.sc.grp, buf.scs.on, buf.sc.n_sc, nnz_J, batch);
 }
 
 inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cudaStream_t cs)
@@ -392,6 +407,9 @@ inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cu
     if (buf.bc.n_bc > 0)
         bc_step_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
             buf.d_dx, buf.d_Ybus_values_mut, buf.bc, buf.bcs, dim_J, buf.nnz_Y_bc, batch);
+    if (buf.sc.n_sc > 0)
+        sc_step_kernel<<<nr_grid_size((long long)batch * buf.sc.n_sc, BS), BS, 0, cs>>>(
+            buf.d_dx, buf.d_Ybus_values_mut, buf.sc, buf.scs, dim_J, buf.nnz_Y_bc, batch);
 }
 
 // -----------------------------------------------------------------------------
