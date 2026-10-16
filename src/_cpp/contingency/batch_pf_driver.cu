@@ -1779,7 +1779,7 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
         upload_h2d(d_bc_in_rho_tap_, rho_tap.data(), n, cs);
         upload_h2d(d_bc_in_ctl_, ctl.data(), n, cs);
         upload_h2d(d_bc_in_rctl_, rctl.data(), n, cs);
-        bc_controls_kernel<<<nr_grid_size(static_cast<long long>(n), BS), BS, 0, cs>>>(
+        bc_controls_kernel<<<nr_grid_size(static_cast<long long>(slots.size()), BS), BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
             thrust::raw_pointer_cast(d_bc_list_.data()), static_cast<int>(slots.size()),
             /*fresh=*/!reload_sbus,
@@ -2525,7 +2525,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         // the transformers the leaving rows' loops moved: their slots' Ybus back to the
         // grid's blocks (a source that never reloads Ybus, an injection sweep, reuses it)
         if (hook != nullptr && base.n_bc > 0)
-            bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S) * base.n_bc, BS), BS, 0, cs>>>(
+            bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S), BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
                 d_evict(), base.nnz_Y, S);
         if (hook != nullptr && base.n_sc > 0)
@@ -2548,7 +2548,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
 
     // every slot's Ybus back to the grid's blocks (the phantom slots' too)
     if (hook != nullptr && base.n_bc > 0) {
-        bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S) * base.n_bc, BS), BS, 0, cs>>>(
+        bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S), BS), BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
             /*d_evict=*/nullptr, base.nnz_Y, S);
         CHK_CUDA_BPF(cudaGetLastError());

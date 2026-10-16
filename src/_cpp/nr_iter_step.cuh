@@ -405,7 +405,7 @@ inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cu
     // BranchControl: the shift steps, its block patched into the slot's Ybus (the next
     // SpMV reads it)
     if (buf.bc.n_bc > 0)
-        bc_step_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+        bc_step_kernel<<<nr_grid_size((long long)batch, BS), BS, 0, cs>>>(
             buf.d_dx, buf.d_Ybus_values_mut, buf.bc, buf.bcs, dim_J, buf.nnz_Y_bc, batch);
     if (buf.sc.n_sc > 0)
         sc_step_kernel<<<nr_grid_size((long long)batch * buf.sc.n_sc, BS), BS, 0, cs>>>(

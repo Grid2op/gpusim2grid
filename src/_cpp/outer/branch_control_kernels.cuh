@@ -149,13 +149,14 @@ __global__ void ctl_group_mismatch_kernel(cuda_real_type* __restrict__ d_F, cons
 __global__ void ctl_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, CtlGroups g,
                                         const unsigned char* __restrict__ on, int n_ent, int nnz_J, int batch);
 
-// One thread per (slot, transformer): the Newton step on the shift (BranchControl::
+// One thread per slot, its transformers in order (parallel transformers patch the same Ybus
+// coefficients): the Newton step on the shift and the ratio (BranchControl::
 // apply_step), then the block patched into the slot's Ybus (d_Ybus may be null: the
 // state moves, nothing is patched).
 __global__ void bc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComplexType* __restrict__ d_Ybus,
                                BcStatic st, BcSlots sl, int dim_J, int nnz_Y, int batch);
 
-// One thread per (listed slot, transformer): what the outer-loop model asks of it before
+// One thread per listed slot, its transformers in order: what the outer-loop model asks of them before
 // the slot is solved (outer::SlotControls, lightsim2grid's NROuterInner::apply_controls).
 // `fresh`: the slot was just loaded -- BranchControl::_reset at the grid's taps, out from
 // d_out (nothing stamped then), the block the container stamped taken as applied. Then
@@ -175,8 +176,8 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
                                    const signed char* __restrict__ d_rctl,
                                    int nnz_Y);
 
-// One thread per (slot, transformer), the slots whose d_evict entry is >= 0 (null:
-// every slot): the slot's Ybus back to what it held when the row was loaded (the
+// One thread per slot, its transformers in order; the slots whose d_evict entry is >= 0
+// (null: every slot): the slot's Ybus back to what it held when the row was loaded (the
 // container's block, nothing for a transformer the row opens), for the next row.
 __global__ void bc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
                                   const int* __restrict__ d_evict, int nnz_Y, int batch);

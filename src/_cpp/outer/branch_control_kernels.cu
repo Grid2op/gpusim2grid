@@ -213,18 +213,21 @@ __global__ void ctl_group_fill_J_kernel(cuda_real_type* __restrict__ d_J, CtlGro
 __global__ void bc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComplexType* __restrict__ d_Ybus,
                                BcStatic st, BcSlots sl, int dim_J, int nnz_Y, int batch)
 {
-    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
-    const ptrdiff_t b = tid / st.n_bc;
-    const int e = static_cast<int>(tid % st.n_bc);
-    const bool has_r = st.rcol != nullptr && st.rcol[e] >= 0;
-    if ((st.col[e] < 0 && !has_r) || sl.out[tid]) return;
-    const cuda_real_type da = st.col[e] >= 0 ? d_dx[b * dim_J + st.col[e]] : cuda_real_type(0);
-    const cuda_real_type dr = has_r ? d_dx[b * dim_J + st.rcol[e]] : cuda_real_type(0);
-    if (da == cuda_real_type(0) && dr == cuda_real_type(0)) return;
-    sl.a[tid] += da;
-    sl.rho[tid] += dr;
-    if (d_Ybus != nullptr) patch(d_Ybus, st, sl, b, tid, e, nnz_Y);
+    // one thread per slot, its transformers in order: parallel ones patch the same Ybus
+    // coefficients (as BranchControl::apply_step, in its order)
+    const ptrdiff_t b = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    for (int e = 0; e < st.n_bc; ++e) {
+        const ptrdiff_t idx = b * st.n_bc + e;
+        const bool has_r = st.rcol != nullptr && st.rcol[e] >= 0;
+        if ((st.col[e] < 0 && !has_r) || sl.out[idx]) continue;
+        const cuda_real_type da = st.col[e] >= 0 ? d_dx[b * dim_J + st.col[e]] : cuda_real_type(0);
+        const cuda_real_type dr = has_r ? d_dx[b * dim_J + st.rcol[e]] : cuda_real_type(0);
+        if (da == cuda_real_type(0) && dr == cuda_real_type(0)) continue;
+        sl.a[idx] += da;
+        sl.rho[idx] += dr;
+        if (d_Ybus != nullptr) patch(d_Ybus, st, sl, b, idx, e, nnz_Y);
+    }
 }
 
 __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
@@ -238,11 +241,12 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
                                    const signed char* __restrict__ d_rctl,
                                    int nnz_Y)
 {
-    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= static_cast<ptrdiff_t>(n_list) * st.n_bc) return;
-    const ptrdiff_t i = tid / st.n_bc;
-    const int e = static_cast<int>(tid % st.n_bc);
+    // one thread per listed slot, its transformers in order (see bc_step_kernel)
+    const ptrdiff_t i = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n_list) return;
     const ptrdiff_t s = d_slots[i];
+    for (int e = 0; e < st.n_bc; ++e) {
+    const ptrdiff_t tid = i * st.n_bc + e;
     const ptrdiff_t idx = s * st.n_bc + e;
     if (fresh) {
         // BranchControl::_reset (and drop_out_of_row)
@@ -260,7 +264,7 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
         sl.on[idx] = 0;
         sl.ron[idx] = 0;
     }
-    if (sl.out[idx]) return;
+    if (sl.out[idx]) continue;
     if (d_retap[tid]) {
         // BranchControl::_retap
         for (int k = 0; k < 4; ++k) sl.tap[4 * idx + k] = d_tap[4 * tid + k];
@@ -282,23 +286,26 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
         if (d_rctl[tid] == 0) sl.rho_target[idx] = sl.rho[idx];
     }
     if (d_Ybus != nullptr) patch(d_Ybus, st, sl, s, idx, e, nnz_Y);
+    }
 }
 
 __global__ void bc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
                                   const int* __restrict__ d_evict, int nnz_Y, int batch)
 {
-    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
-    const ptrdiff_t s = tid / st.n_bc;
-    const int e = static_cast<int>(tid % st.n_bc);
+    // one thread per slot, its transformers in order (see bc_step_kernel)
+    const ptrdiff_t s = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (s >= batch) return;
     if (d_evict != nullptr && d_evict[s] < 0) return;
-    if (sl.out[tid]) return;
     cudaComplexType* Ys = d_Ybus + s * nnz_Y;
-    cudaComplexType* applied = sl.applied + 4 * tid;
-    for (int k = 0; k < 4; ++k) {
-        const int p = st.ypos[4 * e + k];
-        Ys[p] = cadd(Ys[p], csub(st.yeff0[4 * e + k], applied[k]));
-        applied[k] = st.yeff0[4 * e + k];
+    for (int e = 0; e < st.n_bc; ++e) {
+        const ptrdiff_t idx = s * st.n_bc + e;
+        if (sl.out[idx]) continue;
+        cudaComplexType* applied = sl.applied + 4 * idx;
+        for (int k = 0; k < 4; ++k) {
+            const int p = st.ypos[4 * e + k];
+            Ys[p] = cadd(Ys[p], csub(st.yeff0[4 * e + k], applied[k]));
+            applied[k] = st.yeff0[4 * e + k];
+        }
     }
 }
 

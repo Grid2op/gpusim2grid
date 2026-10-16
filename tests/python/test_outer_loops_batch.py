@@ -954,3 +954,58 @@ def test_all_seven_loops_together():
     res = _check_rows(ca, ls, grid, len(branches))
     loops_acting = {d.split(" #")[0] for r in res for d in r.decisions if "not taken" not in d}
     assert {"PhaseControl", "TransformerVoltageControl", "ShuntVoltageControl"} <= loops_acting, loops_acting
+
+
+def _parallel_ratio_group(target_kv, side2_tap=10):
+    """IEEE 14 with a second transformer in parallel with T4-9-1, both with a ratio tap changer
+    regulating bus 9: one ratio group of two members, whose blocks patch the same Ybus
+    coefficients"""
+    import sys, os, warnings
+    import pandas as pd
+    import pypowsybl as pp
+    import lightsim2grid
+    sys.path.insert(0, os.path.join(os.path.dirname(lightsim2grid.__file__), "tests"))
+    import test_transformer_voltage_control as T
+    from lightsim2grid.algorithm import TransformerVoltageControl
+    net = pp.network.create_ieee14()
+    t = net.get_2_windings_transformers(all_attributes=True).loc["T4-9-1"]
+    net.create_2_windings_transformers(pd.DataFrame.from_records(
+        index="id", columns=["id", "voltage_level1_id", "bus1_id", "voltage_level2_id", "bus2_id",
+                             "rated_u1", "rated_u2", "r", "x", "g", "b"],
+        data=[("T4-9-2", t.voltage_level1_id, "B4", t.voltage_level2_id, "B9", t.rated_u1, t.rated_u2,
+               t.r * 1.3, t.x * 1.3, t.g, t.b)]))
+    for name, tap in (("T4-9-1", 10), ("T4-9-2", side2_tap)):
+        net.create_ratio_tap_changers(
+            pd.DataFrame.from_records(index="id", columns=["id", "target_deadband", "target_v", "oltc", "low_tap",
+                                                           "tap", "regulating", "regulated_side"],
+                                      data=[(name, 0.1, target_kv, True, 0, tap, False, "TWO")]),
+            pd.DataFrame.from_records(index="id", columns=["id", "b", "g", "r", "x", "rho"],
+                                      data=[(name, 0., 0., 0., 0., 0.9 + 0.01 * k) for k in range(21)]))
+        net.update_ratio_tap_changers(id=name, regulating=True)
+    grid = T._grid(net)
+    grid.clear_outer_loops()
+    grid.add_outer_loop(TransformerVoltageControl())
+    grid.change_algorithm(OUTER)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
+    return grid
+
+
+@pytest.mark.parametrize("target_kv, side2_tap", [(12.6, 12), (12.3, 10)])
+def test_transformer_voltage_control_parallel_group(target_kv, side2_tap):
+    """two parallel transformers of one group: the slot's Ybus patched once per transformer,
+    in order (one thread per slot), not by racing threads"""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    grid = _parallel_ratio_group(target_kv, side2_tap)
+    branches = [0, 1, 2, 3]
+    ls = ContingencyAnalysisCPP(grid)
+    for b in branches:
+        ls.add_n1(b)
+    ls.change_algorithm(OUTER)
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                                tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    ca.add_contingencies_by_branch_id([[b] for b in branches])
+    ca.compute(batch_size=2)
+    res = _check_rows(ca, ls, grid, len(branches))
+    assert any(len(r.ratio_tap) == 2 for r in res)
