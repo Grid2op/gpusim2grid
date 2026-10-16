@@ -403,8 +403,8 @@ Scope of the first version, decided before planning:
 
 1. **Loops.** The four OpenLoadFlow runs by default, in its order: `DistributedSlack`,
    `AcHvdcAcEmulationLimits`, `VoltageMonitoring`, `ReactiveLimits`. `PhaseControl`,
-   `TransformerVoltageControl` and `ShuntVoltageControl` are left out (an issue to open). They
-   also need accessors lightsim2grid does not expose yet (B.6).
+   `TransformerVoltageControl` and `ShuntVoltageControl` are left out (issue #22). They
+   also need accessors lightsim2grid does not expose yet (B.6). *Since done: B.8.*
 2. **Facades.** All three batch facades: `ScenarioSweepGPU`, `InjectionSweepGPU` and
    `ContingencyAnalysisGPU`. The scenario sweep is the general case (an injection sweep is a
    scenario sweep without trips), so it is built and validated there first.
@@ -646,7 +646,8 @@ TransformerVoltageControl, with its flag reset at every pass (`OuterLoopAlgo.tpp
       standby SVCs, HVDC regimes, `reset_vm`.
 
     The loops left out add their own: `TransformerVoltageControl`'s stage, ratios and frozen
-    generators, the taps and the sections.
+    generators, the taps and the sections. (Done per slot, B.8: none of the three resumes its
+    own state, only the positions carry over.)
 - **Re-entry.** Its Ybus and Sbus are rebuilt from its row inputs plus its control state, through
   the **same load path as Part A**:
   - a first load is "default control state + base V";
@@ -699,7 +700,7 @@ are the scope of the first version (B.0, item 1); the last row is left to an iss
 | AcHvdcAcEmulationLimits | the droop regime of each line | droop kernels, the HVDC P check | per-row regime (today shared by the whole batch) |
 | VoltageMonitoring | an idle standby SVC's "Q = 0" row becomes its voltage row | held controllers, per-row `v_set` (`GenVsetSlots`), the standby check | enrol the monitors as held controllers in the ledger |
 | ReactiveLimits | PV↔PQ, group controllers held at a limit, V = 1 restart | `set_pv_pq_switches`, `set_vc_controller_pins` / `_releases`, `Contingency::pinned_buses`, `vm_reseed` | applied as control state at re-entry instead of per-run inputs |
-| PhaseControl, TransformerVoltageControl, ShuntVoltageControl (off by default) | new unknowns α / ρ / B; the transformer or shunt Ybus entries patched every Newton iteration | per-slot Ybus values | `BranchControl` / `ShuntControl` as kernels: the Ybus patch, dS/dα and dS/dρ, the custom rows, a limiter's current |
+| PhaseControl, TransformerVoltageControl, ShuntVoltageControl (off by default) | new unknowns α / ρ / B; the transformer or shunt Ybus entries patched every Newton iteration | per-slot Ybus values | **done (B.8)**: `BranchControl` / `ShuntControl` as kernels -- the Ybus patch, dS/dα, dS/dρ, dQ/dB, the custom rows; a limiter's current on the host |
 
 The Jacobian pattern comes from lightsim2grid's `NROuter_*` system: the union of everything its
 loops reserve.
@@ -736,7 +737,7 @@ grid with one slack bus. So:
   forwarded to the inner Newton (`OuterLoopAlgo.hpp:190-215`), so `extract_ledger_data`
   reads them as they are. This also brings the union pattern and the other slack buses' Vm
   columns, and gives parity by construction. The `BranchControl` / `ShuntControl` slots are
-  not readable yet (B.6);
+  read through `get_algo().get_outer_control_layout()` (B.8);
 - with the outer loops on, **refuse** `use_distributed_slack=True` and `redistribute_slack`,
   as lightsim2grid's batches refuse `redistribute_slack` with an `NROuter_*` algorithm
   (`BaseBatchSweep.cpp:504`: it needs an algorithm whose `distributes_slack()` is true). The `DistributedSlack` loop is
@@ -748,17 +749,15 @@ grid with one slack bus. So:
 
 *Reviewed 2026-10-15 against `dev_outer_batch_perf`: most of the list has landed.*
 
-- **The ledger of an `NROuter_*` solve: partly available.** `get_J_solver()` and the bus maps
-  are forwarded to the inner Newton (`OuterLoopAlgo.hpp:190-215`), so the bridge can read them
-  (to verify, B.0). The `BranchControl` / `ShuntControl` columns and rows, and those of the
-  held and standby controllers, are private with no getter (`NRSystem.hpp:1776-1789`). The
-  first ones matter only for the loops left out; the held / standby rows are needed for
-  `VoltageMonitoring` and `ReactiveLimits`.
-- **Row-aware loops: half done.** `OuterRowView` / `OuterGridView` hand a row's trips,
-  islanded buses, disconnected units and targets to the loops, and
-  `DistributedSlackLoop::_initialize` goes through it now. `BranchControl::_add_entry` still
-  reads the transformer's status off the grid (`NRSystemBranchControl.cpp:43-48`): it matters
-  only for the loops left out.
+- **The ledger of an `NROuter_*` solve: available.** `get_J_solver()` and the bus maps
+  are forwarded to the inner Newton (`OuterLoopAlgo.hpp:190-215`), so the bridge reads them.
+  The `BranchControl` / `ShuntControl` columns and rows: `get_algo().get_outer_control_layout()`
+  (lightsim2grid c05fe34e, plain API, B.8).
+- **Row-aware loops: done for the rows gpusim2grid poses** (trips, islands, units off). A
+  transformer a row opens is out of that solve's BranchControl (`drop_out_of_row`, c05fe34e);
+  a shunt controller on an island controls nothing. A row that *moves* a branch's end
+  (lightsim2grid's topological actions) still has some grid reads in the loops; gpusim2grid
+  has no such rows.
 - **Detection realigned on OpenLoadFlow: done.** The new types are 16-20 and the
   `CONTROL` category (B.0, prerequisites). `UNREALISTIC_VOLTAGE` and `REACTIVE_LIMIT_MOVED`,
   named here before, do not exist. An unrealistic voltage is the `unrealistic_state` flag
@@ -811,3 +810,34 @@ Also not done: A.6 item 2. Every continuous run is cold (the sessions rebuild th
   at the buses the loops read and the controllers' Q, and the host runs the loops' exact
   checks on them (B.2's "would act" superset filter on the device is not there yet: every
   converged row comes back, a few kB each).
+
+
+## B.8 The three remaining loops (issue #22, 2026-10-16)
+
+`PhaseControl`, `TransformerVoltageControl` and `ShuntVoltageControl` run on the GPU like the
+four default loops: all seven OpenLoadFlow loops lightsim2grid runs, in its order, on the three
+batch facades, with parity to lightsim2grid's `NROuter_*` batches and single solves (voltages to
+~1e-15, the same taps, sections and outer counts). CLAUDE.md "Outer loops" describes the code.
+
+- **Upstream first** (lightsim2grid, `dev_outer_batch_perf`): `get_outer_control_layout()`, the
+  rows and columns BranchControl and ShuntControl own; and three bugs, each pinned by a test run
+  red before its fix:
+  - an opened regulating transformer got its block back in a single solve's Ybus, at stale
+    positions (`update_state` runs before the rebuild), and a batch row tripping it, resumed
+    from the "n" solve, got the tap the "n" solve carried patched onto it (c05fe34e);
+  - ShuntVoltageControl switched on a controller on a row's island, and the row diverged
+    (c05fe34e);
+  - the current check of a transformer at moved taps used the grid's block, while its flows
+    used the moved one (5bcf9c89).
+- **No loop state to resume.** None of the three reads `ctx.resume`: a row resuming from the
+  "n" solve starts them afresh, only the taps and sections the "n" solve settled on carried
+  (`OuterResumePoint::phase_tap / ratio_tap / sections`, already public). So item 3 of
+  issue #22's "missing on the lightsim2grid side" needed nothing.
+- **Per slot, by value, one analysis.** The new unknowns (α, ρ, B) and their blocks live per
+  slot; the Ybus is patched in place at every Newton step and restored when the row leaves
+  (an injection sweep never reloads it). The rows' controls replay `NROuterInner::
+  apply_controls` before each solve (a moved phase tap re-taps every time, a ratio tap or a
+  section switch once). The host reads the shifts, ratios and susceptances from the gather and
+  rebuilds currents and active powers from V and the blocks it knows.
+- **VoltageControl's rows** are no longer J's last ones once these controls reserve their own
+  after them: in outer mode the bridge freezes them from `get_group_v_row()`.
