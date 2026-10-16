@@ -427,6 +427,9 @@ void ContingencyAnalysisSession::run()
             ov.masked.resize(contingencies_.size());
             for (size_t r = 0; r < contingencies_.size(); ++r) ov.masked[r] = contingencies_[r].masked_buses;
         }
+        // ... and the branches it opens (a transformer it opens holds nothing in its Ybus)
+        ov.branch_off.resize(contingencies_.size());
+        for (size_t r = 0; r < contingencies_.size(); ++r) ov.branch_off[r] = contingencies_[r].tripped_branches;
         outer_->set_row_overrides(std::move(ov));
     }
     timings_ = solver_->solve();
@@ -522,6 +525,8 @@ void ContingencyAnalysisSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_ctg, /*d_result_map=*/nullptr);
+    // the transformers the outer loops left on other taps: at the row's final taps
+    solver_->override_outer_trafo_flows();
 
     // Zero flows for tripped branches (they carry no current by definition).
     // Build flat indices: c * n_bra + l for each (c, l) where branch l is

@@ -82,6 +82,41 @@ __device__ __forceinline__ void atomic_max_nonneg(double* addr, double val) {
 }
 
 // =============================================================================
+// override_branch_flows_kernel
+// =============================================================================
+__global__ void override_branch_flows_kernel(
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ d_row,
+    const int*             __restrict__ d_branch,
+    const cudaComplexType* __restrict__ d_blk,
+    const int*             __restrict__ d_branch_from,
+    const int*             __restrict__ d_branch_to,
+    const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
+          cuda_real_type*  __restrict__ d_or_amps,
+          cuda_real_type*  __restrict__ d_ex_amps,
+    int n_bus, int n_branches, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const ptrdiff_t r = d_row[i];
+    const int l = d_branch[i];
+    const int bf = d_branch_from[l];
+    const int bt = d_branch_to[l];
+    const cudaComplexType zero = CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType Vi = (bf >= 0) ? d_V[r * n_bus + bf] : zero;
+    const cudaComplexType Vj = (bt >= 0) ? d_V[r * n_bus + bt] : zero;
+    const cudaComplexType* y = d_blk + 4 * static_cast<ptrdiff_t>(i);
+    const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
+        CudaFunHelper::my_cuCmul(y[0], Vi), CudaFunHelper::my_cuCmul(y[1], Vj)) : zero;
+    const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
+        CudaFunHelper::my_cuCmul(y[2], Vi), CudaFunHelper::my_cuCmul(y[3], Vj)) : zero;
+    const ptrdiff_t out_idx = r * n_branches + l;
+    d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
+    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
+}
+
+// =============================================================================
 // compute_branch_flows_kernel
 // =============================================================================
 __global__ void compute_branch_flows_kernel(

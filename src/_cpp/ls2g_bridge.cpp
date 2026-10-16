@@ -1457,16 +1457,14 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
     if (!grid.get_algo().supports_outer_loops())
         throw std::runtime_error("the outer loops need a grid whose algorithm is an NROuter_* one, "
                                  "solved (grid.change_algorithm('NROuter_KLU'); grid.ac_pf(...))");
-    // only the four default loops are ported (outer/ls2g_outer_model.cpp); another one
-    // would also append custom rows after VoltageControl's, which the base state
-    // reads as the last rows of J
+    // the loops ported (outer/ls2g_outer_model.cpp)
     for (const auto& loop : grid.get_outer_loops()) {
         const std::string name = loop->name();
         if (name != "DistributedSlack" && name != "AcHvdcAcEmulationLimits" &&
-            name != "VoltageMonitoring" && name != "ReactiveLimits")
+            name != "VoltageMonitoring" && name != "ReactiveLimits" && name != "PhaseControl")
             throw std::runtime_error("gpusim2grid's outer loops: the loop '" + name + "' is not "
                                      "supported (DistributedSlack, AcHvdcAcEmulationLimits, "
-                                     "VoltageMonitoring and ReactiveLimits are)");
+                                     "VoltageMonitoring, ReactiveLimits and PhaseControl are)");
     }
     OuterInputs in;
     auto& g = const_cast<ls2g::LSGrid&>(grid);
@@ -1492,6 +1490,79 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
         throw std::runtime_error("extract_outer_inputs: the grid's ledger has a distributed slack: "
                                  "solve it with its NROuter_* algorithm first");
     in.ledger.outer_loops = true;
+    // BranchControl / ShuntControl, as the grid's solve reserved them; their custom rows come
+    // after VoltageControl's, so these are no longer "the last rows of J": read off the system
+    {
+        const ls2g::OuterControlLayout lay = grid.get_algo().get_outer_control_layout();
+        const auto& trafos = grid.get_trafos();
+        LedgerData& L = in.ledger;
+        L.bc_n_lines = grid.get_lines().nb();
+        for (const auto& b : lay.branches) {
+            L.bc_trafo.push_back(b.trafo);
+            L.bc_bus1.push_back(b.bus1_solver);
+            L.bc_bus2.push_back(b.bus2_solver);
+            L.bc_phase.push_back(b.phase ? 1 : 0);
+            L.bc_ratio.push_back(b.ratio ? 1 : 0);
+            L.bc_shift_col.push_back(b.shift_column ? b.shift_col : -1);
+            L.bc_shift_row.push_back(b.shift_column ? b.shift_row : -1);
+            L.bc_ratio_col.push_back(b.ratio_column ? b.ratio_col : -1);
+            L.bc_sign.push_back(static_cast<double>(trafos.shift_sign(b.trafo)));
+            L.bc_rexp.push_back(static_cast<double>(trafos.ratio_exponent(b.trafo)));
+            // BranchControl::_reset, the grid's taps
+            const auto& ptc = trafos.get_tap_changers(true);
+            const auto& rtc = trafos.get_tap_changers(false);
+            const ls2g::TrafoInfo info = trafos[b.trafo];
+            const int t = b.trafo;
+            const int pos = ptc.has(t) ? ptc.position(t) : 0;
+            const int rpos = rtc.has(t) ? rtc.position(t) : 0;
+            L.bc_side.push_back(ptc.has(t) && ptc.regulated(t) == 2 ? 2 : 1);
+            L.bc_p_target.push_back(ptc.has(t) ? static_cast<double>(ptc.target(t) / grid.get_sn_mva()) : 0.);
+            L.bc_a_tap0.push_back(static_cast<double>(info.shift_rad));
+            L.bc_rho_tap0.push_back(static_cast<double>((ptc.has(t) || rtc.has(t)) ? trafos.ratio_at(t, rpos, pos) : info.ratio));
+            const auto tap = trafos.pi_block_at(t, rpos, pos, info.shift_rad);
+            const ls2g::cplx_type yeff[4] = {info.yac_eff_11, info.yac_eff_12, info.yac_eff_21, info.yac_eff_22};
+            for (int k = 0; k < 4; ++k) {
+                L.bc_tap0.push_back(static_cast<double>(tap[k].real()));
+                L.bc_tap0.push_back(static_cast<double>(tap[k].imag()));
+                L.bc_yeff0.push_back(static_cast<double>(yeff[k].real()));
+                L.bc_yeff0.push_back(static_cast<double>(yeff[k].imag()));
+            }
+        }
+        for (const auto& g : lay.ratio_groups) {
+            L.bc_grp_bus.push_back(g.bus_solver);
+            L.bc_grp_vm_col.push_back(g.vm_col);
+            L.bc_grp_target.push_back(static_cast<double>(g.target_vm));
+            L.bc_grp_members.push_back(g.members);
+            L.bc_grp_rows.push_back(g.rows);
+        }
+        for (const auto& c : lay.shunts) {
+            L.sc_bus.push_back(c.bus_solver);
+            L.sc_col.push_back(c.column ? c.col : -1);
+            L.sc_q_row.push_back(c.column ? c.q_row : -1);
+            L.sc_shunts.push_back(c.shunts);
+        }
+        for (const auto& g : lay.shunt_groups) {
+            L.sc_grp_bus.push_back(g.bus_solver);
+            L.sc_grp_vm_col.push_back(g.vm_col);
+            L.sc_grp_target.push_back(static_cast<double>(g.target_vm));
+            L.sc_grp_members.push_back(g.members);
+            L.sc_grp_rows.push_back(g.rows);
+        }
+        // VoltageControl's rows: per group its voltage row, then its sharing rows
+        if (L.has_voltage_control()) {
+            const Eigen::VectorXi v_rows = grid.get_algo().get_group_v_row();
+            if (v_rows.size() != L.vc_n_groups())
+                throw std::runtime_error("extract_outer_inputs: the grid's voltage-control rows are not the ledger's");
+            L.vc_v_rows.assign(static_cast<size_t>(L.vc_n_groups()), -1);
+            L.vc_share_rows.assign(static_cast<size_t>(L.vc_n_groups()), std::vector<int>());
+            for (int g = 0; g < L.vc_n_groups(); ++g) {
+                const int v_row = v_rows(g);
+                L.vc_v_rows[static_cast<size_t>(g)] = v_row;
+                for (int k = 1; k < L.vc_grp_count[static_cast<size_t>(g)]; ++k)
+                    L.vc_share_rows[static_cast<size_t>(g)].push_back(v_row + k);
+            }
+        }
+    }
     // the base state trusts V0 without a check; its controllers' Q is never read by
     // the slots (they start from the plan's held output, _init_slot_state): seed it
     // instead of deriving it with a cuDSS solve on the base system

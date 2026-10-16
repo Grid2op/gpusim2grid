@@ -180,7 +180,13 @@ __global__ void check_limit_violations_kernel(
           int*             __restrict__ d_out_truncated,
           int*             __restrict__ d_out_count_low_voltage,
           int*             __restrict__ d_out_count_high_voltage,
-          int*             __restrict__ d_out_count_current);
+          int*             __restrict__ d_out_count_current,
+    // BranchControl (outer loops): per branch, the transformer entry of a branch whose pi
+    // block the slot holds itself (-1, or null: the shared *_eff), and the slots' blocks
+    // ([batch * n_bc * 4], BcSlots::applied)
+    const int*             __restrict__ d_branch_bc = nullptr,
+    const cudaComplexType* __restrict__ d_bc_applied = nullptr,
+    int n_bc = 0);
 
 // -----------------------------------------------------------------------------
 // check_bus_q_violations_kernel  (compute_physical_violations, lightsim2grid

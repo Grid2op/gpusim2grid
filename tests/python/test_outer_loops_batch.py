@@ -539,3 +539,177 @@ def test_injection_sweep_gen_v():
     sw.compute(batch_size=2)
     _compare_with_batch(sw.V_results.to_numpy().reshape(5, -1), np.asarray(sw.get_row_status()),
                         sw.get_outer_results(), batch, grid, 5)
+
+
+# --------------------------------------------------------------------------------------
+# PhaseControl: a phase shifter's shift a Newton unknown, its pi block patched by value in
+# each slot's Ybus at every Newton step (outer/branch_control_kernels.cuh); the three
+# facades against lightsim2grid's own batches
+# --------------------------------------------------------------------------------------
+def _pst(mode):
+    """lightsim2grid's PhaseControl test grid, solved, and the shifter's id: regulating 7 MW
+    above its uncontrolled flow, or limiting its current to 80 % of it"""
+    import test_outer_model_cpu as cpu
+    p1, i1 = cpu._pst_flow()
+    target = p1 + 7. if mode == "ACTIVE_POWER_CONTROL" else 0.8 * i1
+    grid = cpu._pst_grid(mode, target)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
+    return grid, cpu._pst_id(grid)
+
+
+def _check_rows(sw, ls, grid, n_rows, flows=True):
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = _V(sw, grid, n_rows)
+    V_ls = np.asarray(ls.get_voltages())[:, buses]
+    conv_ls = np.asarray(ls.converged_mask(), dtype=bool)
+    status = np.asarray(sw.get_row_status())
+    res, res_ls = sw.get_outer_results(), ls.get_outer_results()
+    for i in range(n_rows):
+        msg = f"row {i}: {res[i].decisions}"
+        assert (status[i] == CONVERGED) == bool(conv_ls[i]), msg
+        assert int(res[i].status) == int(res_ls[i].status), msg
+        assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        assert sorted(res[i].phase_tap) == sorted(res_ls[i].phase_tap), msg
+        if conv_ls[i]:
+            np.testing.assert_allclose(V[i], V_ls[i], rtol=0., atol=1e-8, err_msg=msg)
+    if flows:
+        # the shifter's current at the taps each row settled on
+        sw.compute_flows()
+        ls.compute_flows()
+        amps = np.asarray(sw.or_amps.to_numpy() if hasattr(sw.or_amps, "to_numpy") else sw.or_amps).reshape(n_rows, -1)
+        amps_ls = np.asarray(ls.get_flows())
+        ok = conv_ls
+        np.testing.assert_allclose(amps[ok], amps_ls[ok] * _flow_unit(amps_ls, amps), rtol=1e-7, atol=1e-6)
+    return res
+
+
+def _flow_unit(amps_ls, amps):
+    """lightsim2grid's flows in kA, gpusim2grid's in A"""
+    return 1000.
+
+
+@pytest.mark.parametrize("mode", ["ACTIVE_POWER_CONTROL", "CURRENT_LIMITER"])
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_phase_control_scenario_sweep(mode, init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    from gpusim2grid import ScenarioSweepGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid, pst = _pst(mode)
+    n_rows, n_line = 5, len(grid.get_lines())
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.03 * np.arange(n_rows)
+    rows = [[], [2], [3], [n_line + pst], []]       # the 4th row opens the shifter
+    ls = ScenarioSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = init_from_n
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    lines = np.zeros((n_rows, n_line), dtype=bool)
+    trafos = np.zeros((n_rows, len(grid.get_trafos())), dtype=bool)
+    for i, br in enumerate(rows):
+        for b in br:
+            if b < n_line:
+                lines[i, b] = True
+            else:
+                trafos[i, b - n_line] = True
+    ls.set_contingency_lines(lines)
+    ls.set_contingency_trafos(trafos)
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                          tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    sw.set_topology(rows)
+    sw.compute(batch_size=2)
+    res = _check_rows(sw, ls, grid, n_rows)
+    assert any(r.phase_tap for r in res)
+    assert not [t for t, _ in res[3].phase_tap if t == pst]
+
+
+@pytest.mark.parametrize("mode", ["ACTIVE_POWER_CONTROL", "CURRENT_LIMITER"])
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_phase_control_contingency_analysis(mode, init_from_n):
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid, pst = _pst(mode)
+    n_line = len(grid.get_lines())
+    branches = [0, 2, 3, 5, n_line + pst]           # sorted: lightsim2grid's row order
+    ls = ContingencyAnalysisCPP(grid)
+    for b in branches:
+        ls.add_n1(b)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = init_from_n
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                                tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    ca.add_contingencies_by_branch_id([[b] for b in branches])
+    ca.compute(batch_size=2)
+    _check_rows(ca, ls, grid, len(branches))
+
+
+@pytest.mark.parametrize("mode", ["ACTIVE_POWER_CONTROL", "CURRENT_LIMITER"])
+def test_phase_control_injection_sweep(mode):
+    from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
+    from gpusim2grid import InjectionSweepGPU
+    grid, _ = _pst(mode)
+    n_rows = 6
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.04 * np.arange(n_rows)
+    ls = InjectionSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = InjectionSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                           tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    # fewer slots than rows: a slot's Ybus (an injection sweep never reloads it) carries the
+    # next row only once the previous one's taps were undone
+    sw.compute(batch_size=2)
+    _check_rows(sw, ls, grid, n_rows)
+
+
+def test_phase_control_current_violations_at_the_moved_tap():
+    """The current check (compute_limit_violations) reads a moved shifter's block at the
+    taps its row settled on, as lightsim2grid's (its row trafo blocks)"""
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    from gpusim2grid import ScenarioSweepGPU
+    grid, pst = _pst("ACTIVE_POWER_CONTROL")
+    lim = np.full(len(grid.get_trafos()), np.nan)
+    lim[pst] = 0.5 * grid.get_trafos()[pst].res_a1_ka   # violated on every row
+    grid.set_trafo_current_limit_side1(lim)
+    n_rows = 4
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    scale = 1. + 0.03 * np.arange(n_rows)
+    ls = ScenarioSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.compute_limit_violations = True
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(scale, load_p))
+    ls.modify_load_q(np.outer(np.ones(n_rows), load_q))
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                          tol=1e-10 / grid.get_sn_mva(), compute_limit_violations=True)
+    sw.set_injections_from_elements(np.outer(scale, load_p), np.outer(np.ones(n_rows), load_q),
+                                    np.outer(np.ones(n_rows), gen_p))
+    sw.compute(batch_size=2)
+    res = sw.get_outer_results()
+    assert all(r.phase_tap for r in res)      # every row moved it
+    for i, (v, v_ls) in enumerate(zip(sw.get_violations(), ls.get_violations())):
+        pick = lambda vs: [x.value for x in vs if int(x.element_id) == pst and x.element_type.name == "TRAFO"
+                           and x.violation_type.name == "CURRENT"]
+        got, ref = pick(v), pick(v_ls)
+        assert len(got) == len(ref) == 1, (i, v, v_ls)
+        assert got[0] == pytest.approx(ref[0], rel=1e-8)

@@ -1661,6 +1661,12 @@ void ScenarioSweepSession::run()
             for (int r = 0; r < n_scenarios_; ++r)
                 ov.masked[static_cast<size_t>(r)] = contingencies_[static_cast<size_t>(r)].masked_buses;
         }
+        // the branches each row opens (a transformer it opens holds nothing in its Ybus)
+        if (contingencies_.size() == static_cast<size_t>(n_scenarios_)) {
+            ov.branch_off.resize(static_cast<size_t>(n_scenarios_));
+            for (int r = 0; r < n_scenarios_; ++r)
+                ov.branch_off[static_cast<size_t>(r)] = contingencies_[static_cast<size_t>(r)].tripped_branches;
+        }
         if (has_gen_off_ && gen_off_.rows() == n_scenarios_) {
             ov.gen_off.assign(static_cast<size_t>(n_scenarios_) * gen_off_.cols(), 0);
             for (int r = 0; r < n_scenarios_; ++r)
@@ -1883,6 +1889,8 @@ void ScenarioSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_scen, /*d_result_map=*/nullptr);
+    // the transformers the outer loops left on other taps: at the row's final taps
+    solver_->override_outer_trafo_flows();
 
     // Zero flows for each scenario's own tripped branches (they carry no
     // current by definition) — same pattern as ContingencyAnalysisSession.

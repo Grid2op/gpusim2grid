@@ -199,7 +199,10 @@ __global__ void check_limit_violations_kernel(
           int*             __restrict__ d_out_truncated,
           int*             __restrict__ d_out_count_low_voltage,
           int*             __restrict__ d_out_count_high_voltage,
-          int*             __restrict__ d_out_count_current)
+          int*             __restrict__ d_out_count_current,
+    const int*             __restrict__ d_branch_bc,
+    const cudaComplexType* __restrict__ d_bc_applied,
+    int n_bc)
 {
     // local_c widened to ptrdiff_t: local_c * n_bus below (the d_V offset) is
     // the same at-risk product as fill_J_kernel's own J_base once
@@ -303,11 +306,17 @@ __global__ void check_limit_violations_kernel(
         const int bt = d_branch_to[l];
         const cudaComplexType Vi = (bf >= 0) ? d_V[local_c * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
         const cudaComplexType Vj = (bt >= 0) ? d_V[local_c * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
+        // a transformer whose taps the outer loops move: the block the slot holds now
+        cudaComplexType yff = d_yff_eff[l], yft = d_yft_eff[l], ytf = d_ytf_eff[l], ytt = d_ytt_eff[l];
+        if (d_branch_bc != nullptr && d_branch_bc[l] >= 0) {
+            const cudaComplexType* y = d_bc_applied + 4 * (local_c * n_bc + d_branch_bc[l]);
+            yff = y[0]; yft = y[1]; ytf = y[2]; ytt = y[3];
+        }
         const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_yff_eff[l], Vi), CudaFunHelper::my_cuCmul(d_yft_eff[l], Vj))
+            CudaFunHelper::my_cuCmul(yff, Vi), CudaFunHelper::my_cuCmul(yft, Vj))
             : CudaFunHelper::my_make_cuComplex(0., 0.);
         const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_ytf_eff[l], Vi), CudaFunHelper::my_cuCmul(d_ytt_eff[l], Vj))
+            CudaFunHelper::my_cuCmul(ytf, Vi), CudaFunHelper::my_cuCmul(ytt, Vj))
             : CudaFunHelper::my_make_cuComplex(0., 0.);
         // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
         const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l] * cuda_real_type(0.001);

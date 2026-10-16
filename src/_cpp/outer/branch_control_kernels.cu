@@ -1,0 +1,231 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// =============================================================================
+// outer/branch_control_kernels.cu -- see branch_control_kernels.cuh. The formulas
+// follow lightsim2grid's NRSystemBranchControl.cpp line by line.
+// =============================================================================
+
+#include "branch_control_kernels.cuh"
+
+#include <cmath>
+
+namespace {
+
+using C = CudaFunHelper;
+
+__device__ __forceinline__ cudaComplexType cx(cuda_real_type re, cuda_real_type im) { return C::my_make_cuComplex(re, im); }
+__device__ __forceinline__ cudaComplexType cmul(cudaComplexType a, cudaComplexType b) { return C::my_cuCmul(a, b); }
+__device__ __forceinline__ cudaComplexType cadd(cudaComplexType a, cudaComplexType b) { return C::my_cuCadd(a, b); }
+__device__ __forceinline__ cudaComplexType csub(cudaComplexType a, cudaComplexType b) { return C::my_cuCsub(a, b); }
+__device__ __forceinline__ cudaComplexType cconj(cudaComplexType a) { return C::my_cuConj(a); }
+__device__ __forceinline__ cudaComplexType cscale(cudaComplexType a, cuda_real_type k) {
+    return cx(C::my_cuCreal(a) * k, C::my_cuCimag(a) * k);
+}
+__device__ __forceinline__ cuda_real_type re(cudaComplexType a) { return C::my_cuCreal(a); }
+__device__ __forceinline__ cuda_real_type im(cudaComplexType a) { return C::my_cuCimag(a); }
+// j * a
+__device__ __forceinline__ cudaComplexType jmul(cudaComplexType a) { return cx(-im(a), re(a)); }
+
+// BranchControl::_block_at: the taps' block at shift a and ratio rho
+__device__ __forceinline__ void block_at(const BcStatic& st, const BcSlots& sl, ptrdiff_t idx, int e,
+                                         cuda_real_type a, cuda_real_type rho, cudaComplexType blk[4])
+{
+    const cuda_real_type d = st.sign[e] * (a - sl.a_tap[idx]);
+    const cudaComplexType rot = cx(cos(d), sin(d));
+    const cuda_real_type f = pow(rho / sl.rho_tap[idx], st.rexp[e]);
+    const cudaComplexType* tap = sl.tap + 4 * idx;
+    blk[0] = cscale(tap[0], f * f);
+    blk[1] = cmul(cscale(tap[1], f), rot);
+    blk[2] = cmul(cscale(tap[2], f), cconj(rot));
+    blk[3] = tap[3];
+}
+
+// BranchControl::_patch
+__device__ __forceinline__ void patch(cudaComplexType* Y, const BcStatic& st, const BcSlots& sl,
+                                      ptrdiff_t s, ptrdiff_t idx, int e, int nnz_Y)
+{
+    cudaComplexType blk[4];
+    block_at(st, sl, idx, e, sl.a[idx], sl.rho[idx], blk);
+    cudaComplexType* Ys = Y + s * nnz_Y;
+    cudaComplexType* applied = sl.applied + 4 * idx;
+    for (int k = 0; k < 4; ++k) {
+        const int p = st.ypos[4 * e + k];
+        Ys[p] = cadd(Ys[p], csub(blk[k], applied[k]));
+        applied[k] = blk[k];
+    }
+}
+
+}  // namespace
+
+__global__ void bc_mismatch_kernel(cuda_real_type* __restrict__ d_F, const cudaComplexType* __restrict__ d_V,
+                                   BcStatic st, BcSlots sl, int n_bus, int dim_J, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
+    const ptrdiff_t b = tid / st.n_bc;
+    const int e = static_cast<int>(tid % st.n_bc);
+    if (st.col[e] < 0) return;
+    const ptrdiff_t idx = tid;
+    cuda_real_type F;
+    if (!sl.on[idx]) {
+        F = sl.a[idx] - sl.a_target[idx];
+    } else {
+        // the block at the current shift is the one stamped (BranchControl::fill_custom_rows at dx = 0)
+        const cudaComplexType* y = sl.applied + 4 * idx;
+        const cudaComplexType V1 = d_V[b * n_bus + st.b1[e]];
+        const cudaComplexType V2 = d_V[b * n_bus + st.b2[e]];
+        const cuda_real_type p = st.side[e] == 1
+            ? re(cmul(V1, cconj(cadd(cmul(y[0], V1), cmul(y[1], V2)))))
+            : re(cmul(V2, cconj(cadd(cmul(y[2], V1), cmul(y[3], V2)))));
+        F = p - st.p_target[e];
+    }
+    d_F[b * dim_J + st.row[e]] = -F;
+}
+
+__global__ void bc_fill_J_kernel(cuda_real_type* __restrict__ d_J, const cudaComplexType* __restrict__ d_V,
+                                 BcStatic st, BcSlots sl, int n_bus, int nnz_J, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
+    const ptrdiff_t b = tid / st.n_bc;
+    const int e = static_cast<int>(tid % st.n_bc);
+    if (st.col[e] < 0) return;
+    const ptrdiff_t idx = tid;
+    cuda_real_type* J = d_J + b * nnz_J;
+    const int* jp = st.jpos + 9 * e;
+    const cudaComplexType* y = sl.applied + 4 * idx;
+    const cudaComplexType V1 = d_V[b * n_bus + st.b1[e]];
+    const cudaComplexType V2 = d_V[b * n_bus + st.b2[e]];
+    const cudaComplexType v1_y12_v2 = cmul(V1, cconj(cmul(y[1], V2)));
+    const cudaComplexType v2_y21_v1 = cmul(V2, cconj(cmul(y[2], V1)));
+    // S1 = V1 conj(y11 V1 + y12 V2), S2 = V2 conj(y21 V1 + y22 V2); dy12/da = j s y12,
+    // dy21/da = -j s y21
+    const cudaComplexType dS1 = cscale(jmul(v1_y12_v2), -st.sign[e]);
+    const cudaComplexType dS2 = cscale(jmul(v2_y21_v1), st.sign[e]);
+    if (jp[0] >= 0) J[jp[0]] = re(dS1);
+    if (jp[1] >= 0) J[jp[1]] = im(dS1);
+    if (jp[2] >= 0) J[jp[2]] = re(dS2);
+    if (jp[3] >= 0) J[jp[3]] = im(dS2);
+    for (int k = 5; k < 9; ++k) if (jp[k] >= 0) J[jp[k]] = cuda_real_type(0);
+    if (!sl.on[idx]) {
+        J[jp[4]] = cuda_real_type(1);
+        return;
+    }
+    const cuda_real_type vm1 = C::my_cuCabs(V1);
+    const cuda_real_type vm2 = C::my_cuCabs(V2);
+    cuda_real_type d_th1, d_th2, d_vm1, d_vm2, d_a;
+    if (st.side[e] == 1) {
+        const cudaComplexType S1 = cmul(V1, cconj(cadd(cmul(y[0], V1), cmul(y[1], V2))));
+        d_th1 = re(jmul(v1_y12_v2));
+        d_th2 = -d_th1;
+        d_vm1 = re(cadd(S1, cscale(cconj(y[0]), vm1 * vm1))) / vm1;
+        d_vm2 = re(v1_y12_v2) / vm2;
+        d_a = re(dS1);
+    } else {
+        const cudaComplexType S2 = cmul(V2, cconj(cadd(cmul(y[2], V1), cmul(y[3], V2))));
+        d_th2 = re(jmul(v2_y21_v1));
+        d_th1 = -d_th2;
+        d_vm2 = re(cadd(S2, cscale(cconj(y[3]), vm2 * vm2))) / vm2;
+        d_vm1 = re(v2_y21_v1) / vm1;
+        d_a = re(dS2);
+    }
+    J[jp[4]] = d_a;
+    if (jp[5] >= 0) J[jp[5]] = d_th1;
+    if (jp[6] >= 0) J[jp[6]] = d_th2;
+    if (jp[7] >= 0) J[jp[7]] = d_vm1;
+    if (jp[8] >= 0) J[jp[8]] = d_vm2;
+}
+
+__global__ void bc_step_kernel(const cuda_real_type* __restrict__ d_dx, cudaComplexType* __restrict__ d_Ybus,
+                               BcStatic st, BcSlots sl, int dim_J, int nnz_Y, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
+    const ptrdiff_t b = tid / st.n_bc;
+    const int e = static_cast<int>(tid % st.n_bc);
+    if (st.col[e] < 0 || sl.out[tid]) return;
+    const cuda_real_type da = d_dx[b * dim_J + st.col[e]];
+    if (da == cuda_real_type(0)) return;
+    sl.a[tid] += da;
+    if (d_Ybus != nullptr) patch(d_Ybus, st, sl, b, tid, e, nnz_Y);
+}
+
+__global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
+                                   const int* __restrict__ d_slots, int n_list, bool fresh,
+                                   const unsigned char* __restrict__ d_out,
+                                   const unsigned char* __restrict__ d_retap,
+                                   const cudaComplexType* __restrict__ d_tap,
+                                   const cuda_real_type* __restrict__ d_a_tap,
+                                   const cuda_real_type* __restrict__ d_rho_tap,
+                                   const signed char* __restrict__ d_ctl,
+                                   int nnz_Y)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n_list) * st.n_bc) return;
+    const ptrdiff_t i = tid / st.n_bc;
+    const int e = static_cast<int>(tid % st.n_bc);
+    const ptrdiff_t s = d_slots[i];
+    const ptrdiff_t idx = s * st.n_bc + e;
+    if (fresh) {
+        // BranchControl::_reset (and drop_out_of_row)
+        sl.out[idx] = d_out[tid];
+        for (int k = 0; k < 4; ++k) {
+            sl.tap[4 * idx + k] = st.tap0[4 * e + k];
+            sl.applied[4 * idx + k] = sl.out[idx] ? cx(0, 0) : st.yeff0[4 * e + k];
+        }
+        sl.a_tap[idx] = st.a_tap0[e];
+        sl.rho_tap[idx] = st.rho_tap0[e];
+        sl.a[idx] = st.a_tap0[e];
+        sl.rho[idx] = st.rho_tap0[e];
+        sl.a_target[idx] = st.a_tap0[e];
+        sl.on[idx] = 0;
+    }
+    if (sl.out[idx]) return;
+    if (d_retap[tid]) {
+        // BranchControl::_retap
+        for (int k = 0; k < 4; ++k) sl.tap[4 * idx + k] = d_tap[4 * tid + k];
+        sl.a_tap[idx] = d_a_tap[tid];
+        sl.rho_tap[idx] = d_rho_tap[tid];
+        sl.a[idx] = sl.a_tap[idx];
+        sl.rho[idx] = sl.rho_tap[idx];
+        sl.a_target[idx] = sl.a_tap[idx];
+    }
+    // BranchControl::set_control_on (a transformer without a shift column has no control)
+    if (st.col[e] >= 0 && d_ctl[tid] >= 0) {
+        sl.on[idx] = d_ctl[tid] == 1;
+        if (d_ctl[tid] == 0) sl.a_target[idx] = sl.a[idx];
+    }
+    if (d_Ybus != nullptr) patch(d_Ybus, st, sl, s, idx, e, nnz_Y);
+}
+
+__global__ void bc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
+                                  const int* __restrict__ d_evict, int nnz_Y, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(batch) * st.n_bc) return;
+    const ptrdiff_t s = tid / st.n_bc;
+    const int e = static_cast<int>(tid % st.n_bc);
+    if (d_evict != nullptr && d_evict[s] < 0) return;
+    if (sl.out[tid]) return;
+    cudaComplexType* Ys = d_Ybus + s * nnz_Y;
+    cudaComplexType* applied = sl.applied + 4 * tid;
+    for (int k = 0; k < 4; ++k) {
+        const int p = st.ypos[4 * e + k];
+        Ys[p] = cadd(Ys[p], csub(st.yeff0[4 * e + k], applied[k]));
+        applied[k] = st.yeff0[4 * e + k];
+    }
+}
+
+__global__ void bc_gather_kernel(cuda_real_type* __restrict__ d_out, BcStatic st, BcSlots sl,
+                                 const int* __restrict__ d_slots, int n_list, int offset, int stride)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n_list) * st.n_bc) return;
+    const ptrdiff_t i = tid / st.n_bc;
+    const int e = static_cast<int>(tid % st.n_bc);
+    const ptrdiff_t idx = static_cast<ptrdiff_t>(d_slots[i]) * st.n_bc + e;
+    d_out[i * stride + offset + e] = sl.a[idx];
+    d_out[i * stride + offset + st.n_bc + e] = sl.rho[idx];
+}

@@ -31,6 +31,7 @@
 #include <powerflow_algorithm/outer_loop/VoltageMonitoringLoop.hpp>
 #include <powerflow_algorithm/outer_loop/ReactiveLimitsLoop.hpp>
 #include <powerflow_algorithm/outer_loop/OuterLoopDriver.hpp>
+#include <powerflow_algorithm/outer_loop/PhaseControlLoop.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -48,7 +49,7 @@ namespace {
 using cplx = std::complex<double>;
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 
-enum class Kind { DistributedSlack, HvdcLimits, VoltageMonitoring, ReactiveLimits };
+enum class Kind { DistributedSlack, HvdcLimits, VoltageMonitoring, ReactiveLimits, PhaseControl };
 enum Status { STABLE = 0, UNSTABLE = 1, FAILED = 2 };   // OuterLoopStatus
 
 struct LoopDecl {
@@ -123,7 +124,20 @@ struct SlotState {
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan;
     std::vector<std::pair<int, double>> vm_switched_on;
     std::vector<RlBus> rl_buses;
+    std::vector<ls2g::PhaseControlLoop::Shifter> pc_shifters;
+    // ---- BranchControl, per transformer (the ledger's order): what the slot's system holds,
+    // as lightsim2grid's BranchControl::Entry, and what the loops asked of it (its
+    // PhaseShifterControl / RatioTapControl) ----------------------------------------------------
+    std::vector<unsigned char> bc_out;     // the row does not have it (drop_out_of_row)
+    std::vector<int>    bc_pos, bc_rpos;   // the taps it is at
+    std::vector<double> bc_a_tap, bc_rho_tap;
+    std::vector<cplx>   bc_tap;            // [4 * n_bc] the block at the taps
+    std::vector<unsigned char> bc_moved;   // PhaseShifterControl::tap_moved (for the solve)
+    std::vector<int>    bc_req_tap;        // ... its requested_tap
+    std::vector<int>    bc_req_rtap;       // RatioTapControl: a move once (INT_MIN: none)
+    std::vector<signed char> bc_ctl, bc_rctl;   // requested controls, -1 untouched
     // ---- driver state (OuterLoopAlgo::compute_pf) -----------------------------
+    std::vector<int> loop_iter; // per active loop: its UNSTABLE count (OuterContext::iteration)
     bool first = true;          // the first solve has not ended yet
     int  i = 0;                 // the loop being checked
     int  last_unstable = -1;
@@ -159,6 +173,8 @@ struct RowView {
     }
     cplx S(int b)    const { const int k = w(b); return {d->s_re[k], d->s_im[k]}; }
     cplx Sbus(int b) const { const int k = w(b); return {d->sb_re[k], d->sb_im[k]}; }
+    double bc_a(int e)   const { return d->bc_a[e]; }
+    double bc_rho(int e) const { return d->bc_rho[e]; }
     double vm(int b) const { return std::abs(V(b)); }
 };
 
@@ -192,6 +208,7 @@ public:
     Next on_solved(int slot, bool converged, int nr_iter, int inner_status,
                    const SlotData* data, int& row_status) override;
     const RowResult& row_result(int row) const override { return results_.at(static_cast<size_t>(row)); }
+    void row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const override;
     int n_rows() const override { return n_rows_; }
     void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) override;
     void set_row_overrides(RowOverrides overrides) override { ov_ = std::move(overrides); }
@@ -221,6 +238,11 @@ private:
     // droop hvdc, ledger order
     std::vector<int> hvdc_id_, hvdc_bus1_, hvdc_bus2_, hvdc_status0_;
     std::vector<double> hvdc_p0_, hvdc_k_, hvdc_lf1_, hvdc_lf2_, hvdc_r_, hvdc_pmax12_, hvdc_pmax21_;
+    // BranchControl, the ledger's order (LedgerData::bc_*)
+    int n_bc_ = 0, n_line_ = 0, n_trafo_ = 0;
+    std::vector<int> bc_trafo_, bc_b1_, bc_b2_, bc_phase_, bc_ratio_, bc_has_col_;
+    std::vector<double> bc_sign_, bc_rexp_;
+    std::vector<int> bc_of_trafo_;                 // trafo id -> entry (-1)
     // plans
     std::shared_ptr<const RlPlan> rl0_;            // the grid's (a row without masks / units off)
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
@@ -234,12 +256,15 @@ private:
     std::map<int, int> resume_hvdc_;                    // hvdc id -> regime
     std::vector<std::pair<int, double>> resume_svc_on_;
     std::map<int, std::pair<int, bool>> resume_frozen_; // solver bus -> (state, realistic)
+    std::vector<int> resume_phase_tap_, resume_ratio_tap_;   // by trafo id, INT_MIN: not carried
     // ---- per run ------------------------------------------------------------------
     int n_rows_ = 0;
     std::vector<double> row_gen_p_, row_sto_p_;    // [n_rows * n_gen], [n_rows * n_sto]
     RowOverrides ov_;                              // the rows' masks, units off, set-points
     std::vector<SlotState> slots_;
     std::vector<RowResult> results_;
+    std::vector<std::vector<int>>    row_blk_trafo_;   // row_trafo_blocks, per row
+    std::vector<std::vector<double>> row_blk_;
 
     // ---- helpers ------------------------------------------------------------------
     // OuterInjections::gen_target_p_in_force / storage_target_p_in_force
@@ -284,11 +309,17 @@ private:
     void init_loops(SlotState& st) const;
     // OuterLoopAlgo::_take_targets and the loops' initialize with ctx.resume
     void resume_loops(SlotState& st) const;
-    int check(SlotState& st, const LoopDecl& L, const RowView& rv) const;
+    int check(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
     int check_ds(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_hvdc(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_vm(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_rl(SlotState& st, const LoopDecl& L, const RowView& rv) const;
+    int check_pc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
+    // BranchControl helpers: the block at shift a and ratio rho (BranchControl::_block_at),
+    // a re-tap's data (BranchControl::_retap), the current through a side (::current)
+    void bc_block_at(const SlotState& st, int e, double a, double rho, cplx blk[4]) const;
+    void bc_retap(SlotState& st, int e, int rpos, int pos) const;
+    void bc_current(const SlotState& st, const RowView& rv, int e, int side, double& i_pu, double& di_da) const;
     // ReactiveLimits helpers
     double rl_bus_q(const SlotState& st, const RowView& rv, const RlBus& bus) const;
     void rl_limits(const SlotState& st, const RowView* rv, const RlBus& bus, double& qmin, double& qmax) const;
@@ -349,10 +380,12 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
             d.rl_vmax = p.max_realistic_voltage;
             d.rl_margin = p.realistic_voltage_margin;
             d.rl_restart = p.robust_restart_vm_pu;
+        } else if (dynamic_cast<const ls2g::PhaseControlLoop*>(lp.get())) {
+            d.kind = Kind::PhaseControl;
         } else {
             throw std::runtime_error("gpusim2grid's outer loops: the loop '" + d.name +
                                      "' is not supported (DistributedSlack, AcHvdcAcEmulationLimits, "
-                                     "VoltageMonitoring and ReactiveLimits are)");
+                                     "VoltageMonitoring, ReactiveLimits and PhaseControl are)");
         }
         loops.push_back(d);
     }
@@ -390,6 +423,9 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
                     resume_frozen_.emplace(fb.bus_solver, std::make_pair(fb.state, fb.realistic));  // the first per bus
             }
         }
+        // the tap positions the solve settled on (OuterLoopAlgo::_apply_carried_positions)
+        resume_phase_tap_.assign(point->phase_tap.begin(), point->phase_tap.end());
+        resume_ratio_tap_.assign(point->ratio_tap.begin(), point->ratio_tap.end());
 #endif
     }
 
@@ -412,6 +448,18 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     for (int c = 0; c < nc; ++c)
         if (vc_kind_[static_cast<size_t>(c)] == ls2g::VoltageControlSolverData::SVC && vc_plan_held_[static_cast<size_t>(c)])
             svc_ctrl_[static_cast<size_t>(vc_elem_[static_cast<size_t>(c)])] = c;
+
+    // ---- BranchControl, as the ledger has it ---------------------------------------------
+    n_bc_ = ledger.n_bc();
+    n_line_ = g.get_lines().nb();
+    n_trafo_ = g.get_trafos().nb();
+    bc_trafo_ = ledger.bc_trafo; bc_b1_ = ledger.bc_bus1; bc_b2_ = ledger.bc_bus2;
+    bc_phase_ = ledger.bc_phase; bc_ratio_ = ledger.bc_ratio;
+    bc_sign_ = ledger.bc_sign; bc_rexp_ = ledger.bc_rexp;
+    bc_has_col_.assign(static_cast<size_t>(n_bc_), 0);
+    for (int e = 0; e < n_bc_; ++e) bc_has_col_[static_cast<size_t>(e)] = ledger.bc_shift_col[static_cast<size_t>(e)] >= 0;
+    bc_of_trafo_.assign(static_cast<size_t>(n_trafo_), -1);
+    for (int e = 0; e < n_bc_; ++e) bc_of_trafo_[static_cast<size_t>(bc_trafo_[static_cast<size_t>(e)])] = e;
 
     // ---- droop hvdc, as the ledger has it ------------------------------------------------
     hvdc_bus1_ = ledger.hvdc_bus1; hvdc_bus2_ = ledger.hvdc_bus2; hvdc_status0_ = ledger.hvdc_status;
@@ -452,6 +500,7 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     layout_.n_ctrl = nc;
     layout_.n_grp  = ledger.vc_n_groups();
     layout_.n_hvdc = ledger.n_hvdc();
+    layout_.n_bc   = n_bc_;
     std::vector<int> watch;
     watch.push_back(slack_bus_);
     for (const auto& e : rl0_->plan.buses) watch.push_back(e.bus_solver);
@@ -460,6 +509,7 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     for (int e = 0; e < layout_.n_hvdc; ++e) { watch.push_back(hvdc_bus1_[static_cast<size_t>(e)]); watch.push_back(hvdc_bus2_[static_cast<size_t>(e)]); }
     for (const auto& line : hvdc_plan0_.lines) { watch.push_back(line.bus1_solver); watch.push_back(line.bus2_solver); }
     for (const auto& m : monitors_.svcs) { watch.push_back(m.reg_bus_solver); watch.push_back(m.svc_bus_solver); }
+    for (int e = 0; e < n_bc_; ++e) { watch.push_back(bc_b1_[static_cast<size_t>(e)]); watch.push_back(bc_b2_[static_cast<size_t>(e)]); }
     watch.erase(std::remove_if(watch.begin(), watch.end(), [&](int b) { return b < 0 || b >= n_bus_; }), watch.end());
     std::sort(watch.begin(), watch.end());
     watch.erase(std::unique(watch.begin(), watch.end()), watch.end());
@@ -506,9 +556,12 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.gen_vm.empty() || ov_.gen_vm.size() == static_cast<size_t>(n_rows) * n_gen_, "generator set-points");
     check(ov_.pq_buses.empty() || ov_.pq_buses.size() == static_cast<size_t>(n_rows), "released buses");
     check(ov_.vc_v_set.empty() || ov_.vc_v_set.size() == static_cast<size_t>(n_rows) * layout_.n_grp, "group set-points");
+    check(ov_.branch_off.empty() || ov_.branch_off.size() == static_cast<size_t>(n_rows), "opened branches");
     n_rows_ = n_rows;
     slots_.assign(static_cast<size_t>(n_slots), SlotState());
     results_.assign(static_cast<size_t>(n_rows), RowResult());
+    row_blk_trafo_.assign(static_cast<size_t>(n_rows), {});
+    row_blk_.assign(static_cast<size_t>(n_rows), {});
 }
 
 // =============================================================================
@@ -545,6 +598,15 @@ void Ls2gOuterModel::load(int slot, int row)
             std::sort(st.masked.begin(), st.masked.end());
             st.rowv.masked = &st.masked;
         }
+        // the branches its contingency opens (BaseBatchSweep::_fill_outer_row_view)
+        if (r < ov_.branch_off.size() && !ov_.branch_off[r].empty()) {
+            st.rowv.lines.off.assign(static_cast<size_t>(n_line_), 0);
+            st.rowv.trafos.off.assign(static_cast<size_t>(n_trafo_), 0);
+            for (int br : ov_.branch_off[r]) {
+                if (br >= 0 && br < n_line_) st.rowv.lines.off[static_cast<size_t>(br)] = 1;
+                else if (br >= n_line_ && br < n_line_ + n_trafo_) st.rowv.trafos.off[static_cast<size_t>(br - n_line_)] = 1;
+            }
+        }
         // the switchable buses a generator contingency leaves without a regulator start PQ
         if (r < ov_.pq_buses.size())
             for (int b : ov_.pq_buses[r]) {
@@ -560,7 +622,37 @@ void Ls2gOuterModel::load(int slot, int row)
     // target_vm, what its release test compares with)
     const bool own_plan = changes_units || !st.masked.empty() || !st.rowv.gens.target_vm.empty();
     st.rl = own_plan ? build_rl_plan(view(st)) : rl0_;
+    // BranchControl: what the slot's system holds at the grid's taps (BranchControl::_reset),
+    // without the transformers the row opens (drop_out_of_row); no control requested yet
+    // (OuterControls::reset_states)
+    {
+        const size_t nb = static_cast<size_t>(n_bc_);
+        const auto& trafos = grid_->get_trafos();
+        const auto& ptc = trafos.get_tap_changers(true);
+        const auto& rtc = trafos.get_tap_changers(false);
+        const ls2g::OuterGridView v = view(st);
+        st.bc_out.assign(nb, 0);
+        st.bc_pos.assign(nb, 0); st.bc_rpos.assign(nb, 0);
+        st.bc_a_tap.assign(nb, 0.); st.bc_rho_tap.assign(nb, 1.);
+        st.bc_tap.assign(4 * nb, cplx(0., 0.));
+        st.bc_moved.assign(nb, 0); st.bc_req_tap.assign(nb, 0);
+        st.bc_req_rtap.assign(nb, std::numeric_limits<int>::min());
+        st.bc_ctl.assign(nb, -1); st.bc_rctl.assign(nb, -1);
+        for (size_t e = 0; e < nb; ++e) {
+            const int t = bc_trafo_[e];
+            int b1 = -1, b2 = -1;
+            st.bc_out[e] = !(v.trafo_closed(t, b1, b2) && b1 == bc_b1_[e] && b2 == bc_b2_[e]);
+            const ls2g::TrafoInfo info = trafos[t];
+            st.bc_pos[e] = ptc.has(t) ? ptc.position(t) : 0;
+            st.bc_rpos[e] = rtc.has(t) ? rtc.position(t) : 0;
+            st.bc_a_tap[e] = info.shift_rad;
+            st.bc_rho_tap[e] = (ptc.has(t) || rtc.has(t)) ? trafos.ratio_at(t, st.bc_rpos[e], st.bc_pos[e]) : info.ratio;
+            const auto tap = trafos.pi_block_at(t, st.bc_rpos[e], st.bc_pos[e], info.shift_rad);
+            for (int k = 0; k < 4; ++k) st.bc_tap[4 * e + static_cast<size_t>(k)] = cplx(tap[static_cast<size_t>(k)].real(), tap[static_cast<size_t>(k)].imag());
+        }
+    }
     set_active(st);
+    st.loop_iter.assign(st.active.size(), 0);
     if (row >= 0) {
         if (resume_) {
             // OuterLoopAlgo::_take_targets: the targets the loops moved there, but where
@@ -577,6 +669,22 @@ void Ls2gOuterModel::load(int slot, int row)
                 if (std::isnan(resume_sto_p_[sid]) || v.row_sets_storage_target_p(s)) continue;
                 const int bus = v.storage_bus_solver(s);
                 if (bus >= 0) move_storage(st, s, bus, resume_sto_p_[sid]);
+            }
+        }
+        if (resume_) {
+            // OuterLoopAlgo::_apply_carried_positions: every tap control moved to the position
+            // the solve resumed from left it at (a transformer the row opens takes nothing)
+            for (int e = 0; e < n_bc_; ++e) {
+                const size_t ee = static_cast<size_t>(e);
+                if (st.bc_out[ee]) continue;
+                const size_t t = static_cast<size_t>(bc_trafo_[ee]);
+                const int none = std::numeric_limits<int>::min();
+                if (bc_phase_[ee] && t < resume_phase_tap_.size() && resume_phase_tap_[t] != none) {
+                    st.bc_moved[ee] = 1;
+                    st.bc_req_tap[ee] = resume_phase_tap_[t];
+                }
+                if (bc_ratio_[ee] && t < resume_ratio_tap_.size() && resume_ratio_tap_[t] != none)
+                    st.bc_req_rtap[ee] = resume_ratio_tap_[t];
             }
         }
         init_loops(st);
@@ -718,6 +826,7 @@ void Ls2gOuterModel::set_active(SlotState& st) const
                 break;
             }
             case Kind::ReactiveLimits:    needed = !st.rl->plan.empty() || st.rl->has_monitor; break;
+            case Kind::PhaseControl:      needed = true; break;   // stable at once without a shifter
         }
         if (needed) st.active.push_back(static_cast<int>(i));
     }
@@ -733,6 +842,9 @@ void Ls2gOuterModel::clear_vm_reset(int slot)
     st.vm_reset_vm.clear();
     st.ctl.vm_reset_bus.clear();
     st.ctl.vm_reset_vm.clear();
+    // RatioTapControl::take_tap: applied once
+    std::fill(st.bc_req_rtap.begin(), st.bc_req_rtap.end(), std::numeric_limits<int>::min());
+    st.ctl.bc_retap.clear();
 }
 
 void Ls2gOuterModel::init_loops(SlotState& st) const
@@ -756,6 +868,17 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
             case Kind::VoltageMonitoring:
                 st.vm_switched_on.clear();
                 break;
+            case Kind::PhaseControl: {
+                // PhaseControlLoop::_initialize: the active power controllers regulate from the
+                // first solve on
+                st.pc_shifters = ls2g::PhaseControlLoop::shifters(view(st));
+                for (const auto& sh : st.pc_shifters) {
+                    if (sh.mode != ls2g::RegulationMode::ACTIVE_POWER || !sh.regulates) continue;
+                    const int e = bc_of_trafo_[static_cast<size_t>(sh.trafo)];
+                    if (e >= 0 && bc_phase_[static_cast<size_t>(e)]) st.bc_ctl[static_cast<size_t>(e)] = 1;
+                }
+                break;
+            }
             case Kind::ReactiveLimits: {
                 st.rl_buses = st.rl->buses;
                 for (RlBus& bus : st.rl_buses) {
@@ -777,6 +900,7 @@ void Ls2gOuterModel::resume_loops(SlotState& st) const
         const LoopDecl& d = loops_[static_cast<size_t>(li)];
         switch (d.kind) {
             case Kind::DistributedSlack:   // its units start from the targets in force: taken above
+            case Kind::PhaseControl:       // restarts (its taps are carried: load)
                 break;
             case Kind::HvdcLimits:
                 // HvdcAcEmulationLimitsLoop::_initialize: each line in the regime the solve
@@ -867,6 +991,76 @@ void Ls2gOuterModel::materialize(SlotState& st) const
     }
     c.vm_reset_bus = st.vm_reset_bus;
     c.vm_reset_vm = st.vm_reset_vm;
+    // BranchControl (NROuterInner::apply_controls): the phase taps the loops moved (again
+    // before every solve, PhaseShifterControl::tap_moved being for the whole solve), the ratio
+    // taps once (RatioTapControl::take_tap), then the controls they asked for
+    c.bc_out = st.bc_out;
+    c.bc_retap.clear();
+    for (int e = 0; e < n_bc_; ++e) {
+        const size_t ee = static_cast<size_t>(e);
+        if (st.bc_out[ee]) continue;
+        bool retap = false;
+        if (st.bc_moved[ee]) { bc_retap(st, e, st.bc_rpos[ee], st.bc_req_tap[ee]); retap = true; }
+        if (st.bc_req_rtap[ee] != std::numeric_limits<int>::min()) { bc_retap(st, e, st.bc_req_rtap[ee], st.bc_pos[ee]); retap = true; }
+        if (retap) c.bc_retap.push_back(e);
+    }
+    c.bc_tap.assign(8 * static_cast<size_t>(n_bc_), 0.);
+    for (size_t k = 0; k < 4 * static_cast<size_t>(n_bc_); ++k) {
+        c.bc_tap[2 * k] = st.bc_tap[k].real();
+        c.bc_tap[2 * k + 1] = st.bc_tap[k].imag();
+    }
+    c.bc_a_tap = st.bc_a_tap;
+    c.bc_rho_tap = st.bc_rho_tap;
+    c.bc_ctl = st.bc_ctl;
+    c.bc_rctl = st.bc_rctl;
+}
+
+void Ls2gOuterModel::bc_retap(SlotState& st, int e, int rpos, int pos) const
+{
+    // BranchControl::_retap (set_tap / set_ratio_tap ignore a position off the table)
+    const size_t ee = static_cast<size_t>(e);
+    const int t = bc_trafo_[ee];
+    const auto& trafos = grid_->get_trafos();
+    const auto& ptc = trafos.get_tap_changers(true);
+    const auto& rtc = trafos.get_tap_changers(false);
+    if (pos != st.bc_pos[ee] && (!ptc.has(t) || pos < ptc.low_tap(t) || pos > ptc.high_tap(t))) pos = st.bc_pos[ee];
+    if (rpos != st.bc_rpos[ee] && (!rtc.has(t) || rpos < rtc.low_tap(t) || rpos > rtc.high_tap(t))) rpos = st.bc_rpos[ee];
+    st.bc_pos[ee] = pos;
+    st.bc_rpos[ee] = rpos;
+    if (ptc.has(t)) st.bc_a_tap[ee] = ptc.alpha_at(t, pos);
+    st.bc_rho_tap[ee] = trafos.ratio_at(t, rpos, pos);
+    const auto tap = trafos.pi_block_at(t, rpos, pos, st.bc_a_tap[ee]);
+    for (int k = 0; k < 4; ++k) st.bc_tap[4 * ee + static_cast<size_t>(k)] = cplx(tap[static_cast<size_t>(k)].real(), tap[static_cast<size_t>(k)].imag());
+}
+
+void Ls2gOuterModel::bc_block_at(const SlotState& st, int e, double a, double rho, cplx blk[4]) const
+{
+    // BranchControl::_block_at
+    const size_t ee = static_cast<size_t>(e);
+    if (st.bc_out[ee]) { for (int k = 0; k < 4; ++k) blk[k] = cplx(0., 0.); return; }
+    const double d = bc_sign_[ee] * (a - st.bc_a_tap[ee]);
+    const cplx rot(std::cos(d), std::sin(d));
+    const double f = std::pow(rho / st.bc_rho_tap[ee], bc_rexp_[ee]);
+    blk[0] = st.bc_tap[4 * ee] * f * f;
+    blk[1] = st.bc_tap[4 * ee + 1] * f * rot;
+    blk[2] = st.bc_tap[4 * ee + 2] * f * std::conj(rot);
+    blk[3] = st.bc_tap[4 * ee + 3];
+}
+
+void Ls2gOuterModel::bc_current(const SlotState& st, const RowView& rv, int e, int side,
+                                double& i_pu, double& di_da) const
+{
+    // BranchControl::current, on the block stamped now
+    const size_t ee = static_cast<size_t>(e);
+    cplx y[4];
+    bc_block_at(st, e, rv.bc_a(e), rv.bc_rho(e), y);
+    const cplx V1 = rv.V(bc_b1_[ee]);
+    const cplx V2 = rv.V(bc_b2_[ee]);
+    const cplx J(0., 1.);
+    const cplx I = side == 1 ? y[0] * V1 + y[1] * V2 : y[2] * V1 + y[3] * V2;
+    const cplx dI = side == 1 ? J * bc_sign_[ee] * y[1] * V2 : -J * bc_sign_[ee] * y[2] * V1;
+    i_pu = std::abs(I);
+    di_da = i_pu > 0. ? std::real(std::conj(I) * dI) / i_pu : 0.;
 }
 
 cplx Ls2gOuterModel::mis_bus(const SlotState& st, const RowView& rv, const SlotControls& c, int b) const
@@ -1246,15 +1440,94 @@ int Ls2gOuterModel::check_rl(SlotState& st, const LoopDecl& L, const RowView& rv
     return changed ? UNSTABLE : STABLE;
 }
 
-int Ls2gOuterModel::check(SlotState& st, const LoopDecl& L, const RowView& rv) const
+int Ls2gOuterModel::check(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const
 {
     switch (L.kind) {
         case Kind::DistributedSlack:  return check_ds(st, L, rv);
         case Kind::HvdcLimits:        return check_hvdc(st, L, rv);
         case Kind::VoltageMonitoring: return check_vm(st, L, rv);
         case Kind::ReactiveLimits:    return check_rl(st, L, rv);
+        case Kind::PhaseControl:      return check_pc(st, L, rv, iteration);
     }
     return STABLE;
+}
+
+// =============================================================================
+// PhaseControlLoop::_check
+// =============================================================================
+int Ls2gOuterModel::check_pc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const
+{
+    // nothing to do without a phase shifter the inner algorithm can act on (one the batch's
+    // system handles: its controls are those of the grid's solve)
+    auto entry = [&](int trafo) {
+        const int e = bc_of_trafo_[static_cast<size_t>(trafo)];
+        return (e >= 0 && bc_phase_[static_cast<size_t>(e)]) ? e : -1;
+    };
+    bool any = false;
+    for (const auto& sh : st.pc_shifters) any = any || entry(sh.trafo) >= 0;
+    if (!any) return STABLE;
+    const auto& trafos = grid_->get_trafos();
+    const auto& ptc = trafos.get_tap_changers(true);
+    if (iteration == 0) {
+        // the active power controllers are switched off, their shift rounded to the closest
+        // tap (the current one unless another is strictly closer)
+        for (const auto& sh : st.pc_shifters) {
+            if (sh.mode != ls2g::RegulationMode::ACTIVE_POWER || !sh.regulates) continue;
+            const int e = entry(sh.trafo);
+            if (e < 0) continue;
+            const size_t ee = static_cast<size_t>(e);
+            st.bc_ctl[ee] = 0;
+            const double a = rv.bc_a(e);
+            int best = st.bc_pos[ee];
+            double best_distance = std::abs(a - ptc.alpha_at(sh.trafo, best));
+            for (int pos = ptc.low_tap(sh.trafo); pos <= ptc.high_tap(sh.trafo); ++pos) {
+                const double distance = std::abs(a - ptc.alpha_at(sh.trafo, pos));
+                if (distance < best_distance) { best = pos; best_distance = distance; }
+            }
+            st.bc_moved[ee] = 1;
+            st.bc_req_tap[ee] = best;
+            record(st, L.name, "ROUND_TAP", true, sh.trafo, a, ptc.alpha_at(sh.trafo, best));
+        }
+        // OpenLoadFlow re-solves whenever there is a phase shifter, limiters included
+        return UNSTABLE;
+    }
+    // the current limiters above their limit move one tap, the way that lowers the current
+    bool moved = false;
+    const auto vn_kv = grid_->get_bus_vn_kv();
+    for (const auto& sh : st.pc_shifters) {
+        if (sh.mode != ls2g::RegulationMode::CURRENT_LIMITER) continue;
+        const int e = entry(sh.trafo);
+        if (e < 0) continue;
+        const size_t ee = static_cast<size_t>(e);
+        double i_pu, di_da;
+        bc_current(st, rv, e, sh.side, i_pu, di_da);
+        const int bus = (sh.side == 1 ? trafos.get_bus_side_1(sh.trafo) : trafos.get_bus_side_2(sh.trafo)).cast_int();
+        const double i_a = i_pu * sn_ * 1000. / (std::sqrt(3.) * vn_kv(bus));
+        if (!(ptc.target(sh.trafo) < i_a)) {
+            record(st, L.name, "KEPT_TAP", false, sh.trafo, i_a, ptc.target(sh.trafo));
+            continue;
+        }
+        // PiModelArray.shiftOneTapPositionToChangeA1
+        const bool increase = !(di_da > 0.);
+        const double a = rv.bc_a(e);
+        int pos = st.bc_pos[ee];
+        const int old_pos = pos;
+        if (pos < ptc.high_tap(sh.trafo)) {
+            const double next = ptc.alpha_at(sh.trafo, pos + 1);
+            if ((increase && next > a) || (!increase && next < a)) ++pos;
+        }
+        if (pos > ptc.low_tap(sh.trafo)) {
+            const double previous = ptc.alpha_at(sh.trafo, pos - 1);
+            if ((increase && previous > a) || (!increase && previous < a)) --pos;
+        }
+        record(st, L.name, "MOVE_TAP", pos != old_pos, sh.trafo, i_a, ptc.target(sh.trafo));
+        if (pos != old_pos) {
+            st.bc_moved[ee] = 1;
+            st.bc_req_tap[ee] = pos;
+            moved = true;
+        }
+    }
+    return moved ? UNSTABLE : STABLE;
 }
 
 // =============================================================================
@@ -1319,10 +1592,11 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
             return finish(st, row_status, inner_status);
         }
         const LoopDecl& L = loops_[static_cast<size_t>(st.active[static_cast<size_t>(st.i)])];
-        const int status = check(st, L, rv);
+        const int status = check(st, L, rv, st.loop_iter[static_cast<size_t>(st.i)]);
         st.last_status = status;
         st.last_name = L.name;
         if (status == UNSTABLE) {
+            ++st.loop_iter[static_cast<size_t>(st.i)];
             st.last_unstable = st.i;
             st.check_unrealistic = st.pass_check_unrealistic;
             materialize(st);
@@ -1362,9 +1636,42 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status)
             if (!std::isnan(st.storage_target_p[s])) { r.storage_ids.push_back(static_cast<int>(s)); r.storage_target_p_mw.push_back(st.storage_target_p[s]); }
         for (size_t e = 0; e < st.hvdc_regime.size(); ++e)
             if (st.hvdc_regime[e] != 2) { r.hvdc_ids.push_back(hvdc_id_[e]); r.hvdc_regime.push_back(st.hvdc_regime[e]); }
+        // the positions the loops handled, where they differ from the grid's
+        // (BaseBatchSweep::_record_row_outer), and the blocks the row's flows use
+        // (_record_row_trafo_blocks)
+        {
+            const auto& trafos = grid_->get_trafos();
+            const auto& ptc = trafos.get_tap_changers(true);
+            const auto& rtc = trafos.get_tap_changers(false);
+            auto& bt = row_blk_trafo_[static_cast<size_t>(st.row)];
+            auto& bb = row_blk_[static_cast<size_t>(st.row)];
+            bt.clear();
+            bb.clear();
+            for (int e = 0; e < n_bc_; ++e) {
+                const size_t ee = static_cast<size_t>(e);
+                const int t = bc_trafo_[ee];
+                const bool ph = bc_phase_[ee] && !(ptc.has(t) && ptc.position(t) == st.bc_pos[ee]);
+                const bool ra = bc_ratio_[ee] && !(rtc.has(t) && rtc.position(t) == st.bc_rpos[ee]);
+                if (ph) { r.phase_tap_ids.push_back(t); r.phase_tap.push_back(st.bc_pos[ee]); }
+                if (ra) { r.ratio_tap_ids.push_back(t); r.ratio_tap.push_back(st.bc_rpos[ee]); }
+                if (!ph && !ra) continue;
+                const int rpos = ra ? st.bc_rpos[ee] : (rtc.has(t) ? rtc.position(t) : 0);
+                const int ppos = ph ? st.bc_pos[ee] : (ptc.has(t) ? ptc.position(t) : 0);
+                const double shift = ptc.has(t) ? ptc.alpha_at(t, ppos) : trafos[t].shift_rad;
+                const auto blk = trafos.pi_block_at(t, rpos, ppos, shift);
+                bt.push_back(t);
+                for (int k = 0; k < 4; ++k) { bb.push_back(blk[static_cast<size_t>(k)].real()); bb.push_back(blk[static_cast<size_t>(k)].imag()); }
+            }
+        }
         r.decisions = std::move(st.trace);
     }
     return Next::Done;
+}
+
+void Ls2gOuterModel::row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const
+{
+    trafo = row_blk_trafo_.at(static_cast<size_t>(row));
+    block = row_blk_.at(static_cast<size_t>(row));
 }
 
 }  // namespace

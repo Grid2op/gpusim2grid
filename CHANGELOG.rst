@@ -13,6 +13,8 @@ Change Log
   lightsim2grid's ``ReactiveLimits`` loop (PV <-> PQ) on every row until it is stable.
 - [FIXED] ``outer_loops=True`` with ``init_from_n_powerflow=False``: rows start at every voltage
   source's set-point (stations, SVCs, storage units too) and use the grid's Newton step scaling.
+- [ADDED] ``outer_loops=True`` with lightsim2grid's ``PhaseControl`` loop: phase shifters solved for
+  their shift then rounded, current limiters moved tap by tap; flows and current limits at the moved taps.
 - [FIXED] ``outer_loops=True``: ``DistributedSlack`` does not run when only the slack bus' own units
   participate, as lightsim2grid now (they would only take what that bus already absorbs).
 - [ADDED] ``scheduling="continuous"`` on the three batch facades: a row leaves its slot once

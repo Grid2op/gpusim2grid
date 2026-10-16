@@ -31,6 +31,7 @@
 #include "dtypes.hpp"
 #include "cu_complex_utils.h"
 #include "outer/outer_kernels.cuh"
+#include "outer/branch_control_kernels.cuh"
 
 #include <limits>
 
@@ -244,6 +245,13 @@ struct NrIterBuffers {
     const int*             d_vch_sh_row     = nullptr; // [n_vc_ctrl] its sharing row, -1 for a first one
     const int*             d_vch_rowpos_off = nullptr; // [n_vc_ctrl] into d_vch_rowpos, -1 for a first one
     const int*             d_vch_rowpos     = nullptr; // flat: per sharing row, its entry on each controller
+    // BranchControl (outer/branch_control_kernels.cuh): the transformers whose pi block
+    // follows their shift / ratio, patched into the slot's Ybus at every Newton step
+    // (d_Ybus_values_mut; null: the state moves, nothing is patched). n_bc == 0: off.
+    BcStatic               bc;
+    BcSlots                bcs;
+    cudaComplexType*       d_Ybus_values_mut = nullptr;
+    int                    nnz_Y_bc = 0;            // per-slot Ybus stride for the patch
 
     // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
     // launched) unless enabled. Mirrors lightsim2grid's own
@@ -323,6 +331,10 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
                 buf.d_vc_grp_start, buf.d_vc_grp_count,
                 buf.n_vc_ctrl, buf.n_vc_grp, n_bus, dim_J, batch);
     }
+    // BranchControl: the shift rows
+    if (buf.bc.n_bc > 0)
+        bc_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.bc, buf.bcs, n_bus, dim_J, batch);
 }
 
 inline void nr_feature_zero_J(const NrIterBuffers& buf, int nnz_J, int batch, cudaStream_t cs)
@@ -355,6 +367,10 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
             buf.d_vch_slope_pos, buf.d_vch_vm_pos, buf.d_vch_rowpos_off, buf.d_vch_rowpos,
             buf.d_vc_grp_start, buf.d_vc_grp_count,
             buf.n_vc_ctrl, buf.n_vc_grp, nnz_J, batch);
+    // BranchControl: dS/da on the two buses and the shift rows
+    if (buf.bc.n_bc > 0)
+        bc_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.d_V, buf.bc, buf.bcs, n_bus, nnz_J, batch);
 }
 
 inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cudaStream_t cs)
@@ -365,6 +381,11 @@ inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cu
     if (buf.n_vc_ctrl > 0)
         vc_apply_step_kernel<<<nr_grid_size((long long)batch * buf.n_vc_ctrl, BS), BS, 0, cs>>>(
             buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, batch);
+    // BranchControl: the shift steps, its block patched into the slot's Ybus (the next
+    // SpMV reads it)
+    if (buf.bc.n_bc > 0)
+        bc_step_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+            buf.d_dx, buf.d_Ybus_values_mut, buf.bc, buf.bcs, dim_J, buf.nnz_Y_bc, batch);
 }
 
 // -----------------------------------------------------------------------------

@@ -275,10 +275,77 @@ class _FullSystem:
         self.q_plan = np.zeros(self.nc)
         if len(L["vc_q_held"]) == self.nc:
             self.q_plan = np.asarray(L["vc_q_held"], dtype=float)
+        # BranchControl: the transformers whose block follows their shift / ratio, the ones
+        # solving for their shift (a column, a row)
+        self.nb = len(L["bc_trafo"])
+        self.bc_col = np.flatnonzero(np.asarray(L["bc_shift_col"], dtype=int) >= 0) if self.nb else np.zeros(0, int)
+        yeff = np.asarray(L["bc_yeff0"], dtype=float).reshape(-1, 4, 2) if self.nb else np.zeros((0, 4, 2))
+        self.bc_yeff = yeff[:, :, 0] + 1j * yeff[:, :, 1]
+        # the slot's BranchControl state (BranchControl::Entry), set by controls()
+        self.bc_a = np.zeros(self.nb)
+        self.bc_rho = np.ones(self.nb)
+        self.bc_a_target = np.zeros(self.nb)
+        self.bc_on = np.zeros(self.nb, dtype=bool)
+        self.bc_out = np.zeros(self.nb, dtype=bool)
+        self.bc_a_tap = np.zeros(self.nb)
+        self.bc_rho_tap = np.ones(self.nb)
+        self.bc_tap = np.zeros((self.nb, 4), dtype=complex)
 
-    def residual(self, V, q, Sbus, c, vm_bus):
+    def apply_bc_controls(self, c, first):
+        """NROuterInner::apply_controls on BranchControl: re-taps, then the controls"""
+        if self.nb == 0:
+            return
+        tap = np.asarray(c["bc_tap"], dtype=float).reshape(-1, 4, 2)
+        self.bc_out = np.asarray(c["bc_out"], dtype=bool)
+        if first:   # BranchControl::_reset: the grid's taps
+            self.bc_a_tap = np.asarray(c["bc_a_tap"], dtype=float).copy()
+            self.bc_rho_tap = np.asarray(c["bc_rho_tap"], dtype=float).copy()
+            self.bc_tap = tap[:, :, 0] + 1j * tap[:, :, 1]
+            self.bc_a, self.bc_rho = self.bc_a_tap.copy(), self.bc_rho_tap.copy()
+            self.bc_a_target = self.bc_a.copy()
+            self.bc_on[:] = False
+        for e in c["bc_retap"]:
+            self.bc_a_tap[e] = c["bc_a_tap"][e]
+            self.bc_rho_tap[e] = c["bc_rho_tap"][e]
+            self.bc_tap[e] = tap[e, :, 0] + 1j * tap[e, :, 1]
+            self.bc_a[e], self.bc_rho[e] = self.bc_a_tap[e], self.bc_rho_tap[e]
+            self.bc_a_target[e] = self.bc_a[e]
+        for e, req in enumerate(c["bc_ctl"]):
+            if self.bc_out[e] or req < 0:
+                continue
+            self.bc_on[e] = req == 1
+            if req == 0:
+                self.bc_a_target[e] = self.bc_a[e]
+
+    def block(self, e, a, rho):
+        """BranchControl::_block_at"""
+        if self.bc_out[e]:
+            return np.zeros(4, dtype=complex)
+        d = self.L["bc_sign"][e] * (a - self.bc_a_tap[e])
+        rot = np.exp(1j * d)
+        f = (rho / self.bc_rho_tap[e]) ** self.L["bc_rexp"][e]
+        t = self.bc_tap[e]
+        return np.array([t[0] * f * f, t[1] * f * rot, t[2] * f * np.conj(rot), t[3]])
+
+    def ybus(self, a):
+        """the slot's Ybus at shifts `a`: the row's (the grid's blocks) patched by value"""
+        Y = self.Y.astype(complex).copy()
+        for e in range(self.nb):
+            if self.bc_out[e]:
+                continue
+            b1, b2 = self.L["bc_bus1"][e], self.L["bc_bus2"][e]
+            d = self.block(e, a[e], self.bc_rho[e]) - self.bc_yeff[e]
+            Y[b1, b1] += d[0]
+            Y[b1, b2] += d[1]
+            Y[b2, b1] += d[2]
+            Y[b2, b2] += d[3]
+        return Y
+
+    def residual(self, V, q, Sbus, c, vm_bus, a=None):
         L = self.L
-        S = V * np.conj(self.Y @ V)
+        a = self.bc_a if a is None else a
+        Y = self.ybus(a) if self.nb else self.Y
+        S = V * np.conj(Y @ V)
         mis = S - Sbus
         Va = np.angle(V)
         for e in range(len(L["hvdc_bus1"])):
@@ -312,6 +379,16 @@ class _FullSystem:
                     rows.append([Q(0) - hq[first]])
                 else:
                     rows.append([L["vc_weight"][first + ref] * Q(m) - L["vc_weight"][j] * Q(ref)])
+        # BranchControl's shift rows: the shift held, or the regulated side's P on target
+        for e in self.bc_col:
+            if not self.bc_on[e]:
+                rows.append([a[e] - self.bc_a_target[e]])
+                continue
+            y = self.block(e, a[e], self.bc_rho[e])
+            V1, V2 = V[L["bc_bus1"][e]], V[L["bc_bus2"][e]]
+            p = (V1 * np.conj(y[0] * V1 + y[1] * V2)).real if L["bc_side"][e] == 1 else \
+                (V2 * np.conj(y[2] * V1 + y[3] * V2)).real
+            rows.append([p - L["bc_p_target"][e]])
         return np.concatenate([np.asarray(r, dtype=float) for r in rows])
 
     def solve(self, V, q, Sbus, c, tol, max_it):
@@ -320,29 +397,35 @@ class _FullSystem:
         vm_bus = np.flatnonzero(vm_unknown)
         nt, nv = self.th_bus.size, vm_bus.size
 
+        nq = len(q)
+
         def unpack(x):
             Va, Vm = np.angle(V0).copy(), np.abs(V0).copy()
             Va[self.th_bus] = x[:nt]
             Vm[vm_bus] = x[nt:nt + nv]
-            return Vm * np.exp(1j * Va), x[nt + nv:]
+            a = self.bc_a.copy()
+            a[self.bc_col] = x[nt + nv + nq:]
+            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a
 
         V0 = V.copy()
-        x = np.concatenate([np.angle(V)[self.th_bus], np.abs(V)[vm_bus], q])
+        x = np.concatenate([np.angle(V)[self.th_bus], np.abs(V)[vm_bus], q, self.bc_a[self.bc_col]])
         for it in range(max_it + 1):
-            Vx, qx = unpack(x)
-            F = self.residual(Vx, qx, Sbus, c, vm_bus)
+            Vx, qx, ax = unpack(x)
+            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax)
             if np.max(np.abs(F)) < tol:
+                self.bc_a = ax
                 return Vx, qx, True, it, vm_unknown
             if it == max_it:
+                self.bc_a = ax
                 return Vx, qx, False, it, vm_unknown
             J = np.empty((F.size, x.size))
             for k in range(x.size):
                 d = np.zeros(x.size)
                 d[k] = 1e-7
-                Vp, qp = unpack(x + d)
-                Vm_, qm = unpack(x - d)
-                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus) -
-                           self.residual(Vm_, qm, Sbus, c, vm_bus)) / 2e-7
+                Vp, qp, ap = unpack(x + d)
+                Vm_, qm, am = unpack(x - d)
+                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus, ap) -
+                           self.residual(Vm_, qm, Sbus, c, vm_bus, am)) / 2e-7
             x = x - np.linalg.solve(J, F)
         raise AssertionError("unreachable")
 
@@ -354,6 +437,7 @@ def _run_row_full(h, row, Ybus, Sbus_row, tol_pu):
     V = np.asarray(h.V0).copy()
     h.load(0, row)
     q = np.where(np.asarray(h.controls(0)["plan_held"], dtype=bool), sysm.q_plan, 0.)
+    first = True
     for _ in range(100):
         c = h.controls(0)
         Sbus = Sbus_row.copy()
@@ -361,25 +445,32 @@ def _run_row_full(h, row, Ybus, Sbus_row, tol_pu):
             Sbus[b] += dp + 1j * dq
         for b, vm in zip(c["vm_reset_bus"], c["vm_reset_vm"]):
             V[b] = vm * V[b] / abs(V[b])
+        sysm.apply_bc_controls(c, first)
+        first = False
         h.clear_vm_reset(0)
         V, q, conv, nr, vm_unknown = sysm.solve(V, q, Sbus, c, tol_pu, MAX_IT)
-        S = V * np.conj(Ybus @ V)
+        S = V * np.conj((sysm.ybus(sysm.bc_a) if sysm.nb else Ybus) @ V)
         cand = [b for b in realistic if vm_unknown[b]]
         unrealistic = bool(np.any((np.abs(V[cand]) < 0.5) | (np.abs(V[cand]) > 2.))) if cand else False
         nxt, status = h.on_solved(0, conv, nr, CONVERGED if conv else MAX_ITER,
-                                  list(V[watch]), list(S[watch]), list(Sbus[watch]), list(q), unrealistic)
+                                  list(V[watch]), list(S[watch]), list(Sbus[watch]), list(q), unrealistic,
+                                  list(sysm.bc_a), list(sysm.bc_rho))
         if nxt == DONE:
             return V, status
     raise AssertionError("the row never ended")
 
 
-def _compare_single_solve(make_grid, tol_mva=TOL_MVA, start=None, **row_kwargs):
+def _compare_single_solve(make_grid, tol_mva=TOL_MVA, start=None, branch_off=None, **row_kwargs):
     """the model on make_grid()'s rows (its inner solves in numpy) against
-    lightsim2grid's single NROuter solve of the same grid, from the same start"""
+    lightsim2grid's single NROuter solve of the same grid, from the same start;
+    `branch_off`: the branches the row opens (lines then trafos), told to the model
+    (make_grid(**row_kwargs) opens them on the reference)"""
     base = make_grid()
     v0 = np.full(base.total_bus(), 1.0 + 0j) if start is None else start(base)
     assert base.ac_pf(v0, MAX_IT, tol_mva).size > 0
     h = _cpp._OuterModelHarness(base, keep_trace=True)
+    if branch_off is not None:
+        h.set_branch_off([list(branch_off)])
     h.begin(1, 1)
     row = make_grid(**row_kwargs)
     V_ref = row.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, tol_mva)
@@ -586,3 +677,132 @@ def test_rows_resume_from_the_n_solve(q_limit):
         first_rl = next((d for d in res.decisions if d.startswith("ReactiveLimits")), "")
         resumed += "KEPT_PQ" in first_rl or "PQ_TO_PV" in first_rl
     assert resumed > 0
+
+
+# --------------------------------------------------------------------------------------
+# PhaseControl: a phase shifter regulating its active power (its shift a Newton unknown,
+# then rounded to the closest tap), or limiting its current (one tap at a time); its pi
+# block patched by value at every Newton iteration (BranchControl)
+# --------------------------------------------------------------------------------------
+def _pst_module():
+    pytest.importorskip("pypowsybl")
+    _ls2g_tests_dir()
+    import test_phase_control as P
+    return P
+
+
+def _pst_grid(mode, target, load_scale=1., line_off=None, pst_off=False, regulating=True):
+    """lightsim2grid's PhaseControl test grid (IEEE 14, a phase tap changer on T5-6-1, -10 ..
+    10 degrees) with its default loops and PhaseControl"""
+    P = _pst_module()
+    from lightsim2grid.algorithm import PhaseControl
+    grid = P._grid(P._net(mode, target, regulating=regulating))
+    grid.add_outer_loop(PhaseControl())
+    grid.change_algorithm(OUTER)
+    if load_scale != 1.:
+        for load_id, p in enumerate(np.asarray(grid.get_load_target_p())):
+            grid.change_p_load(load_id, float(p) * load_scale)
+    if line_off is not None:
+        grid.deactivate_powerline(line_off)
+    if pst_off:
+        grid.deactivate_trafo(_pst_id(grid))
+    return grid
+
+
+def _pst_id(grid):
+    return next(i for i, t in enumerate(grid.get_trafos()) if t.name == _pst_module().PST)
+
+
+def _pst_flow():
+    """the shifter's flow and current with no control (MW, kA)"""
+    grid = _pst_grid("ACTIVE_POWER_CONTROL", 0., regulating=False)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
+    t = grid.get_trafos()[_pst_id(grid)]
+    return t.res_p1_mw, t.res_a1_ka * 1000.
+
+
+def _check_pst(mode, target, branch_off=None, **row_kwargs):
+    res, stats = _compare_single_solve(lambda **kw: _pst_grid(mode, target, **kw), tol_mva=1e-10,
+                                       branch_off=branch_off, **row_kwargs)
+    row = _pst_grid(mode, target, **row_kwargs)
+    row.ac_pf(np.full(row.total_bus(), 1. + 0j), MAX_IT, 1e-10)
+    # the taps it settled on: those of lightsim2grid's single solve of the row's grid
+    ref = [(i, t.res_phase_tap_position) for i, t in enumerate(row.get_trafos())
+           if t.res_phase_tap_position != t.phase_tap_position]
+    assert sorted(res.phase_tap) == sorted(ref), (res.phase_tap, ref)
+    return res, stats
+
+
+@pytest.mark.parametrize("delta_mw", [7., -12.3, 30.])
+def test_phase_control_active_power(delta_mw):
+    p1, _ = _pst_flow()
+    res, _ = _check_pst("ACTIVE_POWER_CONTROL", p1 + delta_mw)
+    assert res.phase_tap   # rounded somewhere off the grid's tap
+
+
+@pytest.mark.parametrize("factor, moves", [(0.8, True), (0.95, True), (1.1, False)])
+def test_phase_control_current_limiter(factor, moves):
+    _, i1 = _pst_flow()
+    res, _ = _check_pst("CURRENT_LIMITER", factor * i1)
+    assert bool(res.phase_tap) == moves
+
+
+@pytest.mark.parametrize("row_kwargs", [dict(load_scale=1.05), dict(line_off=2)])
+def test_phase_control_rows(row_kwargs):
+    p1, _ = _pst_flow()
+    branch_off = [row_kwargs["line_off"]] if "line_off" in row_kwargs else None
+    _check_pst("ACTIVE_POWER_CONTROL", p1 + 7., branch_off=branch_off, **row_kwargs)
+
+
+def test_phase_control_row_opening_the_shifter():
+    # the row has no such transformer: nothing of it in Ybus, no tap for it
+    p1, _ = _pst_flow()
+    grid = _pst_grid("ACTIVE_POWER_CONTROL", p1 + 7.)
+    branch_off = [len(grid.get_lines()) + _pst_id(grid)]
+    res, _ = _check_pst("ACTIVE_POWER_CONTROL", p1 + 7., branch_off=branch_off, pst_off=True)
+    assert not res.phase_tap
+
+
+@pytest.mark.skipif(not getattr(_cpp, "have_ls2g_outer_resume", False),
+                    reason="lightsim2grid without its loops' state accessors")
+@pytest.mark.parametrize("mode", ["ACTIVE_POWER_CONTROL", "CURRENT_LIMITER"])
+def test_phase_control_rows_resume_from_the_n_solve(mode):
+    """lightsim2grid's ContingencyAnalysisCPP with init_from_n_powerflow: each row starts from
+    the tap the "n" solve settled on (OuterLoopAlgo::_apply_carried_positions), PhaseControl
+    itself restarting (its controllers on again); the row opening the shifter has none"""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    p1, i1 = _pst_flow()
+    target = p1 + 7. if mode == "ACTIVE_POWER_CONTROL" else 0.8 * i1
+    base = _pst_grid(mode, target)
+    v0 = np.full(base.total_bus(), 1. + 0j)
+    assert base.ac_pf(v0, MAX_IT, 1e-10).size > 0
+    assert base.get_trafos()[_pst_id(base)].res_phase_tap_position != 0   # a tap to carry
+    n_line = len(base.get_lines())
+    branches = [0, 2, 3, n_line + _pst_id(base)]    # sorted: the batch's row order
+    batch = ContingencyAnalysisCPP(base)
+    for b in branches:
+        batch.add_n1(b)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = True
+    batch.compute(v0, MAX_IT, 1e-10)
+    V_ls = np.asarray(batch.get_voltages())
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    res_ls = batch.get_outer_results()
+
+    h = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=True)
+    h.set_branch_off([[b] for b in branches])
+    h.begin(1, len(branches))
+    buses = np.asarray(base.id_ac_solver_to_me(), dtype=int)
+    for i, b in enumerate(branches):
+        row = _pst_grid(mode, target, line_off=b if b < n_line else None, pst_off=b >= n_line)
+        row.ac_pf(v0, MAX_IT, 1e-10)   # its Ybus and Sbus
+        V, status = _run_row_full(h, i, row.get_Ybus_solver().toarray(), np.asarray(row.get_Sbus_solver()),
+                                  1e-10 / row.get_sn_mva())
+        res = h.row_result(i)
+        msg = f"row {i} (branch {b}):\n" + "\n".join(res.decisions)
+        assert res.nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        assert int(res.status) == int(res_ls[i].status), msg
+        assert sorted(res.phase_tap) == sorted(res_ls[i].phase_tap), msg
+        assert (status == CONVERGED) == bool(conv[i]), msg
+        if conv[i]:
+            np.testing.assert_allclose(V, V_ls[i][buses], rtol=0., atol=1e-8, err_msg=msg)

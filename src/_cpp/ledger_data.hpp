@@ -156,6 +156,43 @@ struct LedgerData {
     // outer_kernels.cuh). Single slack: slack_col is -1.
     bool                outer_loops = false;
 
+    // ---- lightsim2grid's BranchControl (outer loops: PhaseControl, TransformerVoltageControl)
+    // Per transformer it handles, in its order (OuterControlLayout::branches, read off the
+    // grid's NROuter_* solve): the grid trafo id, its two solver buses, the shift column +
+    // row it owns when a phase controller solving for its shift (-1 otherwise), the ratio
+    // column when in a solved ratio group (-1 otherwise), and TrafoContainer's shift_sign /
+    // ratio_exponent. Its pi block is patched per slot at every Newton iteration
+    // (contingency/branch_control_kernels.cuh). Empty when no such loop runs.
+    std::vector<int>    bc_trafo, bc_bus1, bc_bus2;
+    int                 bc_n_lines = 0;               // the branches before the trafos (lines-then-trafos)
+    std::vector<int>    bc_phase, bc_ratio;           // 1: handled for its phase / its ratio
+    std::vector<int>    bc_shift_col, bc_shift_row, bc_ratio_col;
+    std::vector<double> bc_sign, bc_rexp;
+    // as the grid has it (BranchControl::_reset): the phase controller's regulated side
+    // (1, 2) and active power target (pu), the block at the grid's taps and the taps' shift
+    // and ratio, and the block the container stamps in Ybus (yac_eff), each block 8 doubles
+    // (re, im of y11 y12 y21 y22)
+    std::vector<int>    bc_side;
+    std::vector<double> bc_p_target, bc_a_tap0, bc_rho_tap0, bc_tap0, bc_yeff0;
+    // its solved ratio groups: the regulated bus, its Vm column and target (pu), the members
+    // (indices into the bc_* entries) and one row per member
+    std::vector<int>    bc_grp_bus, bc_grp_vm_col;
+    std::vector<double> bc_grp_target;
+    std::vector<std::vector<int>> bc_grp_members, bc_grp_rows;
+
+    // ---- lightsim2grid's ShuntControl (outer loops: ShuntVoltageControl) -------------------
+    // Per shunt controller (the regulating shunts of one bus, OuterControlLayout::shunts): its
+    // solver bus, its shunts (grid ids), the susceptance column of a solved group (-1
+    // otherwise) and its bus' Q row; then its solved groups, as the ratio groups above.
+    std::vector<int>              sc_bus, sc_col, sc_q_row;
+    std::vector<std::vector<int>> sc_shunts;
+    std::vector<int>              sc_grp_bus, sc_grp_vm_col;
+    std::vector<double>           sc_grp_target;
+    std::vector<std::vector<int>> sc_grp_members, sc_grp_rows;
+
+    int  n_bc() const { return static_cast<int>(bc_trafo.size()); }
+    int  n_sc() const { return static_cast<int>(sc_bus.size()); }
+
     int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
     int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }
     bool has_voltage_control() const { return !vc_bus.empty(); }

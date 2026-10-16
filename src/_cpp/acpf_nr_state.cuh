@@ -49,6 +49,7 @@
                                // CuSpMV, CudaTimer
 #include "cu_complex_utils.h" // cudaComplexType, CudaFunHelper, CUDA_C_TYPE …
 #include "timing_utils.hpp"   // AcPfTimings, TimingEntry
+#include "outer/branch_control_kernels.cuh"  // BcStatic, BcSlots
 
 struct LedgerData;            // ledger_data.hpp (host); optional augmented-J input
 
@@ -271,6 +272,55 @@ struct AcPfNrState {
     int n_hvdc_frz = 0;
     thrust::device_vector<int>            d_hvdc_frz_bus1, d_hvdc_frz_bus2, d_hvdc_frz_dir, d_hvdc_frz_id;
     thrust::device_vector<cuda_real_type> d_hvdc_frz_p0, d_hvdc_frz_k, d_hvdc_frz_limit;
+
+    // -------------------------------------------------------------------------
+    // BranchControl (outer loops: PhaseControl, TransformerVoltageControl) — n_bc == 0
+    // when absent. Static per transformer (outer/branch_control_kernels.cuh's BcStatic);
+    // d_bcs_* the base solve's own one-slot state (BcSlots), the batch driver keeps
+    // its own per slot.
+    // -------------------------------------------------------------------------
+    int n_bc = 0;
+    std::vector<int>                       h_bc_trafo;   // grid trafo id per transformer
+    int                                    bc_n_lines = 0;   // its branch index is bc_n_lines + trafo id
+    thrust::device_vector<int>             d_bc_b1, d_bc_b2, d_bc_side, d_bc_row, d_bc_col;
+    thrust::device_vector<int>             d_bc_ypos, d_bc_jpos;
+    thrust::device_vector<cuda_real_type>  d_bc_sign, d_bc_rexp, d_bc_p_target, d_bc_a_tap0, d_bc_rho_tap0;
+    thrust::device_vector<cudaComplexType> d_bc_tap0, d_bc_yeff0;
+    thrust::device_vector<cuda_real_type>  d_bcs_a, d_bcs_rho, d_bcs_a_target, d_bcs_a_tap, d_bcs_rho_tap;
+    thrust::device_vector<cudaComplexType> d_bcs_tap, d_bcs_applied;
+    thrust::device_vector<unsigned char>   d_bcs_on, d_bcs_out;
+    BcStatic bc_static() const {
+        BcStatic b;
+        b.n_bc = n_bc;
+        b.b1 = thrust::raw_pointer_cast(d_bc_b1.data());
+        b.b2 = thrust::raw_pointer_cast(d_bc_b2.data());
+        b.side = thrust::raw_pointer_cast(d_bc_side.data());
+        b.row = thrust::raw_pointer_cast(d_bc_row.data());
+        b.col = thrust::raw_pointer_cast(d_bc_col.data());
+        b.ypos = thrust::raw_pointer_cast(d_bc_ypos.data());
+        b.jpos = thrust::raw_pointer_cast(d_bc_jpos.data());
+        b.sign = thrust::raw_pointer_cast(d_bc_sign.data());
+        b.rexp = thrust::raw_pointer_cast(d_bc_rexp.data());
+        b.p_target = thrust::raw_pointer_cast(d_bc_p_target.data());
+        b.tap0 = thrust::raw_pointer_cast(d_bc_tap0.data());
+        b.yeff0 = thrust::raw_pointer_cast(d_bc_yeff0.data());
+        b.a_tap0 = thrust::raw_pointer_cast(d_bc_a_tap0.data());
+        b.rho_tap0 = thrust::raw_pointer_cast(d_bc_rho_tap0.data());
+        return b;
+    }
+    BcSlots bc_base_slots() {
+        BcSlots b;
+        b.a = thrust::raw_pointer_cast(d_bcs_a.data());
+        b.rho = thrust::raw_pointer_cast(d_bcs_rho.data());
+        b.a_target = thrust::raw_pointer_cast(d_bcs_a_target.data());
+        b.a_tap = thrust::raw_pointer_cast(d_bcs_a_tap.data());
+        b.rho_tap = thrust::raw_pointer_cast(d_bcs_rho_tap.data());
+        b.tap = thrust::raw_pointer_cast(d_bcs_tap.data());
+        b.applied = thrust::raw_pointer_cast(d_bcs_applied.data());
+        b.on = thrust::raw_pointer_cast(d_bcs_on.data());
+        b.out = thrust::raw_pointer_cast(d_bcs_out.data());
+        return b;
+    }
 
     // -------------------------------------------------------------------------
     // VoltageControl (remote gen + SVC) — n_vc_ctrl == 0 when inactive.

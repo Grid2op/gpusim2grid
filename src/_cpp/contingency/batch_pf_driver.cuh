@@ -1029,6 +1029,25 @@ private:
     thrust::device_vector<int>            d_oc_ds_slot_, d_oc_ds_bus_, d_oc_vr_slot_, d_oc_vr_bus_;
     thrust::device_vector<cuda_real_type> d_oc_ds_p_, d_oc_ds_q_, d_oc_vr_vm_;
     int oc_stride_ = 0;
+    // BranchControl per slot (outer/branch_control_kernels.cuh's BcSlots: [S * n_bc],
+    // blocks [S * n_bc * 4]) and what _oc_write_controls stages for the listed slots
+    thrust::device_vector<cuda_real_type>  d_bc_a_, d_bc_rho_, d_bc_a_target_, d_bc_a_tap_, d_bc_rho_tap_;
+    thrust::device_vector<cudaComplexType> d_bc_tap_, d_bc_applied_;
+    thrust::device_vector<unsigned char>   d_bc_on_, d_bc_out_;
+    thrust::device_vector<int>             d_bc_list_;
+    thrust::device_vector<unsigned char>   d_bc_in_out_, d_bc_in_retap_;
+    thrust::device_vector<cudaComplexType> d_bc_in_tap_;
+    thrust::device_vector<cuda_real_type>  d_bc_in_a_tap_, d_bc_in_rho_tap_;
+    thrust::device_vector<signed char>     d_bc_in_ctl_;
+    BcSlots _bc_slots();
+    thrust::device_vector<int>             d_branch_bc_;   // [n_branches_] the transformer entry, -1
+public:
+    // The outer loops moved some transformers' taps: their flows of each row recomputed
+    // with the block at the row's final taps (outer::OuterHook::row_trafo_blocks), over
+    // d_or_amps_results / d_ex_amps_results (call after compute_branch_flows_kernel).
+    // No-op without an outer model.
+    void override_outer_trafo_flows();
+private:
     // sizes the buffers for this solve (outer_hook_ set)
     void _oc_setup();
     // the hook's control state of `slots` to the device; with `reload_sbus`

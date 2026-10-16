@@ -761,6 +761,23 @@ __global__ void scatter_V_results_kernel(
 // d_result_map     : [n_active] active-slot → original-index map, or nullptr
 //                    for identity (write at c_start + b directly)
 // ---------------------------------------------------------------------------
+// One thread per entry: the flows of branch d_branch[i] of result row d_row[i] recomputed
+// with its own pi block d_blk[4 i .. 4 i + 3] (y11 y12 y21 y22) -- a transformer an outer
+// loop left on other taps than the grid's (lightsim2grid's _record_row_trafo_blocks).
+// d_V is the [n_rows x n_bus] result voltages; the outputs as compute_branch_flows_kernel's.
+__global__ void override_branch_flows_kernel(
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ d_row,
+    const int*             __restrict__ d_branch,
+    const cudaComplexType* __restrict__ d_blk,
+    const int*             __restrict__ d_branch_from,
+    const int*             __restrict__ d_branch_to,
+    const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
+          cuda_real_type*  __restrict__ d_or_amps,
+          cuda_real_type*  __restrict__ d_ex_amps,
+    int n_bus, int n_branches, int n);
+
 __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_V,
     const int*             __restrict__ d_branch_from,

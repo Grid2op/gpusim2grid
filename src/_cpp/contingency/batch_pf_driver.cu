@@ -1516,8 +1516,68 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
             buf.d_hvdc_status      = thrust::raw_pointer_cast(d_oc_hvdc_.data());
             buf.hvdc_status_stride = base.n_hvdc;
         }
+        if (base.n_bc > 0) {
+            buf.bc = base.bc_static();
+            buf.bcs = _bc_slots();
+            buf.d_Ybus_values_mut = thrust::raw_pointer_cast(d_Ybus_values_batch.data());
+            buf.nnz_Y_bc = base.nnz_Y;
+        }
     }
     return buf;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::override_outer_trafo_flows()
+{
+    const int n_lines = base.bc_n_lines;
+    if (outer_hook_ == nullptr || base.n_bc == 0) return;
+    std::vector<int> rows, branches;
+    std::vector<cudaComplexType> blk;
+    std::vector<int> t;
+    std::vector<double> b;
+    for (int r = 0; r < outer_hook_->n_rows(); ++r) {
+        outer_hook_->row_trafo_blocks(r, t, b);
+        for (size_t k = 0; k < t.size(); ++k) {
+            rows.push_back(r);
+            branches.push_back(n_lines + t[k]);
+            for (int q = 0; q < 4; ++q)
+                blk.push_back(CudaFunHelper::my_make_cuComplex(static_cast<cuda_real_type>(b[8 * k + 2 * q]),
+                                                               static_cast<cuda_real_type>(b[8 * k + 2 * q + 1])));
+        }
+    }
+    if (rows.empty()) return;
+    thrust::device_vector<int> d_rows, d_br;
+    thrust::device_vector<cudaComplexType> d_blk;
+    upload_h2d(d_rows, rows.data(), rows.size(), cs);
+    upload_h2d(d_br, branches.data(), branches.size(), cs);
+    upload_h2d(d_blk, blk.data(), blk.size(), cs);
+    const int n = static_cast<int>(rows.size());
+    override_branch_flows_kernel<<<(n + BS - 1) / BS, BS, 0, cs>>>(
+        thrust::raw_pointer_cast(d_V_results.data()),
+        thrust::raw_pointer_cast(d_rows.data()), thrust::raw_pointer_cast(d_br.data()),
+        thrust::raw_pointer_cast(d_blk.data()),
+        thrust::raw_pointer_cast(d_branch_from.data()), thrust::raw_pointer_cast(d_branch_to.data()),
+        thrust::raw_pointer_cast(d_base_current_A.data()), thrust::raw_pointer_cast(d_base_current_ex_A.data()),
+        thrust::raw_pointer_cast(d_or_amps_results.data()), thrust::raw_pointer_cast(d_ex_amps_results.data()),
+        base.n_bus, n_branches_, n);
+    CHK_CUDA_BPF(cudaGetLastError());
+    cs.synchronize();   // the staging vectors die here
+}
+
+template <typename BatchSource>
+BcSlots BatchPfDriver<BatchSource>::_bc_slots()
+{
+    BcSlots b;
+    b.a = thrust::raw_pointer_cast(d_bc_a_.data());
+    b.rho = thrust::raw_pointer_cast(d_bc_rho_.data());
+    b.a_target = thrust::raw_pointer_cast(d_bc_a_target_.data());
+    b.a_tap = thrust::raw_pointer_cast(d_bc_a_tap_.data());
+    b.rho_tap = thrust::raw_pointer_cast(d_bc_rho_tap_.data());
+    b.tap = thrust::raw_pointer_cast(d_bc_tap_.data());
+    b.applied = thrust::raw_pointer_cast(d_bc_applied_.data());
+    b.on = thrust::raw_pointer_cast(d_bc_on_.data());
+    b.out = thrust::raw_pointer_cast(d_bc_out_.data());
+    return b;
 }
 
 // =============================================================================
@@ -1537,6 +1597,8 @@ void BatchPfDriver<BatchSource>::_oc_setup()
         throw std::runtime_error("[batch_pf] outer loops: the model's layout does not match the base state");
     if (base.n_vc_ctrl > 0 && !base.vc_may_hold)
         throw std::runtime_error("[batch_pf] outer loops need the ledger of an NROuter_* solve (LedgerData::outer_loops)");
+    if (Lo.n_bc != base.n_bc)
+        throw std::runtime_error("[batch_pf] outer loops: the model's transformers are not the base state's");
     h_oc_pin_.assign(static_cast<size_t>(S) * n_pin, 1);
     h_oc_held_q_.assign(static_cast<size_t>(S) * Lo.n_ctrl, std::numeric_limits<cuda_real_type>::quiet_NaN());
     h_oc_plan_held_.assign(static_cast<size_t>(S) * Lo.n_ctrl, 0);
@@ -1549,8 +1611,16 @@ void BatchPfDriver<BatchSource>::_oc_setup()
     d_oc_vset_.resize(std::max<size_t>(h_oc_vset_.size(), 1));
     d_oc_hvdc_.resize(std::max<size_t>(h_oc_hvdc_.size(), 1));
 
+    if (base.n_bc > 0) {
+        const size_t n = static_cast<size_t>(S) * base.n_bc;
+        d_bc_a_.resize(n); d_bc_rho_.resize(n); d_bc_a_target_.resize(n);
+        d_bc_a_tap_.resize(n); d_bc_rho_tap_.resize(n);
+        d_bc_tap_.resize(4 * n); d_bc_applied_.resize(4 * n);
+        d_bc_on_.assign(n, 0); d_bc_out_.assign(n, 0);
+    }
     const int n_watch = static_cast<int>(Lo.watch_bus.size());
-    oc_stride_ = 6 * n_watch + Lo.n_ctrl + 1;
+    // ... then BranchControl's shifts and ratios, then the unrealistic flag
+    oc_stride_ = 6 * n_watch + Lo.n_ctrl + 2 * base.n_bc + 1;
     std::vector<int> watch = Lo.watch_bus;
     if (watch.empty()) watch.push_back(0);
     upload_h2d(d_oc_watch_, watch.data(), watch.size(), cs);
@@ -1598,7 +1668,6 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
             vr_slot.push_back(s); vr_bus.push_back(c.vm_reset_bus[k]);
             vr_vm.push_back(static_cast<cuda_real_type>(c.vm_reset_vm[k]));
         }
-        outer_hook_->clear_vm_reset(s);
     }
     // the dense arrays whole: a few kB per slot at most
     if (!h_oc_pin_.empty())       upload_h2d(d_oc_pin_, h_oc_pin_.data(), h_oc_pin_.size(), cs);
@@ -1652,9 +1721,56 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
             thrust::raw_pointer_cast(d_oc_vr_bus_.data()),
             thrust::raw_pointer_cast(d_oc_vr_vm_.data()), n, n_bus);
     }
+    // BranchControl: what the loops asked of the slots' transformers (a fresh load first
+    // resets them to the grid's taps), then their blocks patched into the slots' Ybus
+    if (base.n_bc > 0) {
+        const int nb = base.n_bc;
+        const size_t n = slots.size() * static_cast<size_t>(nb);
+        std::vector<unsigned char> out(n, 0), retap(n, 0);
+        std::vector<cudaComplexType> tap(4 * n);
+        std::vector<cuda_real_type> a_tap(n), rho_tap(n);
+        std::vector<signed char> ctl(n, -1);
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const outer::SlotControls& c = outer_hook_->controls(slots[i]);
+            for (int e = 0; e < nb; ++e) {
+                const size_t k = i * nb + static_cast<size_t>(e);
+                out[k] = c.bc_out[static_cast<size_t>(e)];
+                ctl[k] = c.bc_ctl[static_cast<size_t>(e)];
+                a_tap[k] = static_cast<cuda_real_type>(c.bc_a_tap[static_cast<size_t>(e)]);
+                rho_tap[k] = static_cast<cuda_real_type>(c.bc_rho_tap[static_cast<size_t>(e)]);
+                for (int q = 0; q < 4; ++q)
+                    tap[4 * k + static_cast<size_t>(q)] = CudaFunHelper::my_make_cuComplex(
+                        static_cast<cuda_real_type>(c.bc_tap[8 * static_cast<size_t>(e) + 2 * q]),
+                        static_cast<cuda_real_type>(c.bc_tap[8 * static_cast<size_t>(e) + 2 * q + 1]));
+            }
+            for (int e : c.bc_retap) retap[i * nb + static_cast<size_t>(e)] = 1;
+        }
+        upload_h2d(d_bc_list_, slots.data(), slots.size(), cs);
+        upload_h2d(d_bc_in_out_, out.data(), n, cs);
+        upload_h2d(d_bc_in_retap_, retap.data(), n, cs);
+        upload_h2d(d_bc_in_tap_, tap.data(), tap.size(), cs);
+        upload_h2d(d_bc_in_a_tap_, a_tap.data(), n, cs);
+        upload_h2d(d_bc_in_rho_tap_, rho_tap.data(), n, cs);
+        upload_h2d(d_bc_in_ctl_, ctl.data(), n, cs);
+        bc_controls_kernel<<<nr_grid_size(static_cast<long long>(n), BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
+            thrust::raw_pointer_cast(d_bc_list_.data()), static_cast<int>(slots.size()),
+            /*fresh=*/!reload_sbus,
+            thrust::raw_pointer_cast(d_bc_in_out_.data()),
+            thrust::raw_pointer_cast(d_bc_in_retap_.data()),
+            thrust::raw_pointer_cast(d_bc_in_tap_.data()),
+            thrust::raw_pointer_cast(d_bc_in_a_tap_.data()),
+            thrust::raw_pointer_cast(d_bc_in_rho_tap_.data()),
+            thrust::raw_pointer_cast(d_bc_in_ctl_.data()),
+            base.nnz_Y);
+        CHK_CUDA_BPF(cudaGetLastError());
+        cs.synchronize();   // the staging vectors above die here
+    }
     CHK_CUDA_BPF(cudaGetLastError());
     // the host vectors above are read by asynchronous copies
     cs.synchronize();
+    // the slots' one-shot edits (|V| resets, re-taps) are applied
+    for (int s : slots) outer_hook_->clear_vm_reset(s);
 }
 
 template <typename BatchSource>
@@ -1682,6 +1798,10 @@ void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const
         n, static_cast<int>(Lo.realistic_bus.size()), static_cast<int>(Lo.pin_bus.size()),
         base.n_bus, oc_stride_,
         static_cast<cuda_real_type>(Lo.min_realistic_v), static_cast<cuda_real_type>(Lo.max_realistic_v));
+    if (base.n_bc > 0)
+        bc_gather_kernel<<<nr_grid_size(static_cast<long long>(n) * base.n_bc, BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_oc_gather_.data()), base.bc_static(), _bc_slots(),
+            thrust::raw_pointer_cast(d_oc_list_.data()), n, 6 * n_watch + Lo.n_ctrl, oc_stride_);
     CHK_CUDA_BPF(cudaGetLastError());
     CHK_CUDA_BPF(cudaMemcpyAsync(h_oc_gather_.ptr, thrust::raw_pointer_cast(d_oc_gather_.data()),
                                  static_cast<size_t>(n) * oc_stride_ * sizeof(cuda_real_type),
@@ -1872,6 +1992,16 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
     if (n_slots > 0 && _fused_violations_enabled) {
         timer.start();
         const TrippedBranchTable trip = source_.tripped_branch_table();
+        // the transformers the outer loops handle: their block is the slot's own
+        const bool bc_branches = outer_hook_ != nullptr && base.n_bc > 0 && d_slot_active != nullptr;
+        if (bc_branches && d_branch_bc_.size() != static_cast<size_t>(n_branches_)) {
+            std::vector<int> map(static_cast<size_t>(n_branches_), -1);
+            for (int e = 0; e < base.n_bc; ++e) {
+                const int l = base.bc_n_lines + base.h_bc_trafo[static_cast<size_t>(e)];
+                if (l >= 0 && l < n_branches_) map[static_cast<size_t>(l)] = e;
+            }
+            d_branch_bc_.assign(map.begin(), map.end());
+        }
         check_limit_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_residuals.data()),
@@ -1904,7 +2034,10 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
             thrust::raw_pointer_cast(d_violation_truncated.data()),
             thrust::raw_pointer_cast(d_violation_count_low_voltage.data()),
             thrust::raw_pointer_cast(d_violation_count_high_voltage.data()),
-            thrust::raw_pointer_cast(d_violation_count_current.data()));
+            thrust::raw_pointer_cast(d_violation_count_current.data()),
+            bc_branches ? thrust::raw_pointer_cast(d_branch_bc_.data()) : nullptr,
+            bc_branches ? thrust::raw_pointer_cast(d_bc_applied_.data()) : nullptr,
+            base.n_bc);
         CHK_CUDA_BPF(cudaGetLastError());
         t.t_violation_check += timer.stop_ms();
     }
@@ -2265,6 +2398,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                     data.sb_re = gbuf.data() + 4 * n_watch;
                     data.sb_im = gbuf.data() + 5 * n_watch;
                     data.vc_q  = gbuf.data() + 6 * n_watch;
+                    data.bc_a  = gbuf.data() + 6 * n_watch + Lo.n_ctrl;
+                    data.bc_rho = data.bc_a + base.n_bc;
                     data.unrealistic = gbuf[static_cast<size_t>(oc_stride_ - 1)] != 0.;
                 }
                 int final_status = static_cast<int>(st);
@@ -2322,6 +2457,12 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             dim_J, S, /*c_start=*/0, d_result_map, d_evict());
         t.t_residual += timer.stop_ms();
         _evict(buf, S, /*c_start=*/0, d_evict(), timer, t);
+        // the transformers the leaving rows' loops moved: their slots' Ybus back to the
+        // grid's blocks (a source that never reloads Ybus, an injection sweep, reuses it)
+        if (hook != nullptr && base.n_bc > 0)
+            bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S) * base.n_bc, BS), BS, 0, cs>>>(
+                thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
+                d_evict(), base.nnz_Y, S);
 
         // ---- refill the freed slots ---------------------------------------
         if (n_live == 0) break;   // everything left; no round follows
@@ -2334,6 +2475,14 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             _oc_write_controls(loaded, /*reload_sbus=*/false);
         }
         buf = _bound_nr_buffers(_table_view(-1));
+    }
+
+    // every slot's Ybus back to the grid's blocks (the phantom slots' too)
+    if (hook != nullptr && base.n_bc > 0) {
+        bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S) * base.n_bc, BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
+            /*d_evict=*/nullptr, base.nnz_Y, S);
+        CHK_CUDA_BPF(cudaGetLastError());
     }
 
     t.n_rounds  = rounds;

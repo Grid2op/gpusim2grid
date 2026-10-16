@@ -18,6 +18,7 @@ pybind11_add_module(
     ledger_extend.cpp
     acpf_nr_kernels.cu
     outer/outer_kernels.cu
+    outer/branch_control_kernels.cu
     contingency_analysis_session.cu
     contingency/batch_pf_driver.cu
     contingency/violation_kernels.cu

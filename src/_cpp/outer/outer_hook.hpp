@@ -34,6 +34,7 @@ struct Layout {
     int n_ctrl = 0;   // VoltageControl controllers (ledger order)
     int n_grp  = 0;   // VoltageControl groups
     int n_hvdc = 0;   // droop hvdc entries (ledger order)
+    int n_bc   = 0;   // BranchControl's transformers (LedgerData::bc_*, its order)
     // The buses whose V, computed power V.conj(Ybus.V) and scheduled power (the
     // slot's Sbus) are copied back for each converged slot: everything the loops read.
     std::vector<int> watch_bus;
@@ -59,6 +60,20 @@ struct SlotControls {
     // One-shot |V| resets (pu), applied at the next (re)load of the slot.
     std::vector<int>           vm_reset_bus;
     std::vector<double>        vm_reset_vm;
+    // BranchControl, per transformer [n_bc] (lightsim2grid's NROuterInner::apply_controls,
+    // replayed on the slot before each solve, in its order):
+    //  - bc_out: 1 = the row does not have it (its contingency opened it): nothing of it is
+    //    stamped in the slot's Ybus, it is never patched (BranchControl::drop_out_of_row);
+    //  - a re-tap (one-shot, bc_retap lists the transformers): its tap block bc_tap
+    //    [4 complex as re, im: y11 y12 y21 y22], shift bc_a_tap and ratio bc_rho_tap; the
+    //    shift and ratio unknowns (and their targets) go back to the tap's;
+    //  - then the requested controls, bc_ctl (phase: P = target) and bc_rctl (ratio: the
+    //    group's voltage), -1 untouched, 0 off (its target: where the unknown is now), 1 on.
+    std::vector<unsigned char> bc_out;
+    std::vector<int>           bc_retap;
+    std::vector<double>        bc_tap;          // [8 * n_bc]
+    std::vector<double>        bc_a_tap, bc_rho_tap;
+    std::vector<signed char>   bc_ctl, bc_rctl;
 };
 
 // What the device gathered for one converged slot, as host doubles, indexed
@@ -71,6 +86,8 @@ struct SlotData {
     const double* sb_re = nullptr;   // the slot's scheduled power (its Sbus)
     const double* sb_im = nullptr;
     const double* vc_q  = nullptr;   // controllers' reactive injection, pu
+    const double* bc_a  = nullptr;   // BranchControl's shift and ratio unknowns [n_bc]
+    const double* bc_rho = nullptr;
     bool unrealistic = false;        // some Layout::realistic_bus outside the band
 };
 
@@ -91,6 +108,9 @@ struct RowOverrides {
     // n_rows x n_grp, row-major: the VoltageControl groups' v_set the row's gen_v gives
     // (NaN: the grid's)
     std::vector<double> vc_v_set;
+    // per row, the branches its contingency opens (the lines, then the transformers:
+    // n_lines + trafo id)
+    std::vector<std::vector<int>> branch_off;
 };
 
 // Mirrors lightsim2grid's OuterRowResult (BaseBatchSweep.hpp).
@@ -107,6 +127,10 @@ struct RowResult {
     std::vector<double> storage_target_p_mw;   // load convention, as the container
     std::vector<int>    hvdc_ids;
     std::vector<int>    hvdc_regime;
+    // the tap positions and section counts they settled on, where they differ from the grid's
+    std::vector<int>    phase_tap_ids, phase_tap;
+    std::vector<int>    ratio_tap_ids, ratio_tap;
+    std::vector<int>    shunt_ids, shunt_sections;
     // the decision trace (OuterLoopStats::decisions), when the model keeps it
     std::vector<std::string> decisions;
 };
@@ -122,8 +146,12 @@ public:
     // start from the default control state.
     virtual void load(int slot, int row) = 0;
     virtual const SlotControls& controls(int slot) const = 0;
-    // The driver applied the slot's |V| resets.
+    // The driver applied the slot's one-shot edits (|V| resets, re-taps).
     virtual void clear_vm_reset(int slot) = 0;
+    // The pi block of every transformer the row's loops moved off the grid's taps, at its
+    // final taps (lightsim2grid's _record_row_trafo_blocks): what its flows are computed
+    // with. `trafo` grid ids; `block` 8 doubles per transformer (re, im of y11 y12 y21 y22).
+    virtual void row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const = 0;
     // The inner solve of the row in `slot` ended after `nr_iter` iterations, converged
     // (`data` holds what the device gathered) or not (`inner_status`, a RowStatus).
     // Resolve: the row stays, controls(slot) is its new state. Done: `row_status`

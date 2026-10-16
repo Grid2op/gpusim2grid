@@ -421,6 +421,11 @@ static NrIterBuffers make_single_system_buffers(AcPfNrState& s)
         buf.d_mask_diag    = thrust::raw_pointer_cast(s.d_pin_diag.data());
         buf.n_mask_rows    = s.n_pin;
     }
+    // BranchControl: the base solve's own state (nothing patched into its Ybus)
+    if (s.n_bc > 0) {
+        buf.bc   = s.bc_static();
+        buf.bcs  = s.bc_base_slots();
+    }
     // Held controllers: offset out of the mismatch, pinned in this base solve.
     if (s.has_vc_held) {
         buf.d_vc_qoff    = thrust::raw_pointer_cast(s.d_vc_qoff.data());
@@ -1094,6 +1099,93 @@ AcPfNrState::AcPfNrState(
                 upload_h2d(d_hold_jov_val, jv.data(), jv.size(), cs);
             }
         }
+    }
+
+    // BranchControl (outer loops: PhaseControl, TransformerVoltageControl): per
+    // transformer, its Ybus value positions, the J positions of its shift column / row,
+    // its grid data; and the base solve's own state (one slot, at the grid's taps, its
+    // controls off -- this base solve trusts V0 and patches nothing)
+    if (ledger != nullptr && ledger->n_bc() > 0) {
+        n_bc = ledger->n_bc();
+        h_bc_trafo = ledger->bc_trafo;
+        bc_n_lines = ledger->bc_n_lines;
+        auto find_pos = [](const int* outer, const int* inner, int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int* b = inner + outer[row];
+            const int* e = inner + outer[row + 1];
+            const int* it = std::lower_bound(b, e, col);
+            return (it == e || *it != col) ? -1 : static_cast<int>(it - inner);
+        };
+        std::vector<int> ypos(4 * static_cast<size_t>(n_bc)), jpos(9 * static_cast<size_t>(n_bc), -1),
+                         row(n_bc, -1), col(n_bc, -1);
+        for (int e = 0; e < n_bc; ++e) {
+            const int b1 = ledger->bc_bus1[e], b2 = ledger->bc_bus2[e];
+            const int yp[4] = {find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b1, b1),
+                               find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b1, b2),
+                               find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b2, b1),
+                               find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b2, b2)};
+            for (int k = 0; k < 4; ++k) {
+                if (yp[k] < 0)
+                    throw std::runtime_error("AcPfNrState: a BranchControl transformer has no Ybus coefficient");
+                ypos[4 * e + k] = yp[k];
+            }
+            const int c = ledger->bc_shift_col[e], r = ledger->bc_shift_row[e];
+            if (c < 0) continue;
+            col[e] = c;
+            row[e] = r;
+            const int* Jo = J_outer_h.data();
+            const int* Ji = J_inner_h.data();
+            const int p1 = ledger->p_row_of_bus[b1], q1 = ledger->q_row_of_bus[b1];
+            const int p2 = ledger->p_row_of_bus[b2], q2 = ledger->q_row_of_bus[b2];
+            const int jp[9] = {find_pos(Jo, Ji, p1, c), find_pos(Jo, Ji, q1, c),
+                               find_pos(Jo, Ji, p2, c), find_pos(Jo, Ji, q2, c),
+                               find_pos(Jo, Ji, r, c),
+                               find_pos(Jo, Ji, r, ledger->theta_col_of_bus[b1]),
+                               find_pos(Jo, Ji, r, ledger->theta_col_of_bus[b2]),
+                               find_pos(Jo, Ji, r, ledger->vm_col_of_bus[b1]),
+                               find_pos(Jo, Ji, r, ledger->vm_col_of_bus[b2])};
+            if (jp[4] < 0)
+                throw std::runtime_error("AcPfNrState: a phase shifter's row has no entry on its shift column");
+            for (int k = 0; k < 9; ++k) jpos[9 * e + k] = jp[k];
+        }
+        auto to_real = [](const std::vector<double>& v) {
+            return std::vector<cuda_real_type>(v.begin(), v.end());
+        };
+        auto to_cplx = [](const std::vector<double>& v) {
+            std::vector<cudaComplexType> out(v.size() / 2);
+            for (size_t k = 0; k < out.size(); ++k)
+                out[k] = CudaFunHelper::my_make_cuComplex(static_cast<cuda_real_type>(v[2 * k]),
+                                                          static_cast<cuda_real_type>(v[2 * k + 1]));
+            return out;
+        };
+        upload_h2d(d_bc_b1, ledger->bc_bus1.data(), n_bc, cs);
+        upload_h2d(d_bc_b2, ledger->bc_bus2.data(), n_bc, cs);
+        upload_h2d(d_bc_side, ledger->bc_side.data(), n_bc, cs);
+        upload_h2d(d_bc_row, row.data(), n_bc, cs);
+        upload_h2d(d_bc_col, col.data(), n_bc, cs);
+        upload_h2d(d_bc_ypos, ypos.data(), ypos.size(), cs);
+        upload_h2d(d_bc_jpos, jpos.data(), jpos.size(), cs);
+        const auto sign = to_real(ledger->bc_sign), rexp = to_real(ledger->bc_rexp),
+                   pt = to_real(ledger->bc_p_target), at = to_real(ledger->bc_a_tap0),
+                   rt = to_real(ledger->bc_rho_tap0);
+        upload_h2d(d_bc_sign, sign.data(), n_bc, cs);
+        upload_h2d(d_bc_rexp, rexp.data(), n_bc, cs);
+        upload_h2d(d_bc_p_target, pt.data(), n_bc, cs);
+        upload_h2d(d_bc_a_tap0, at.data(), n_bc, cs);
+        upload_h2d(d_bc_rho_tap0, rt.data(), n_bc, cs);
+        const auto tap0 = to_cplx(ledger->bc_tap0), yeff0 = to_cplx(ledger->bc_yeff0);
+        upload_h2d(d_bc_tap0, tap0.data(), tap0.size(), cs);
+        upload_h2d(d_bc_yeff0, yeff0.data(), yeff0.size(), cs);
+        // the base solve's state: BranchControl::_reset at the grid's taps
+        d_bcs_a.assign(at.begin(), at.end());
+        d_bcs_a_target.assign(at.begin(), at.end());
+        d_bcs_a_tap.assign(at.begin(), at.end());
+        d_bcs_rho.assign(rt.begin(), rt.end());
+        d_bcs_rho_tap.assign(rt.begin(), rt.end());
+        d_bcs_tap.assign(tap0.begin(), tap0.end());
+        d_bcs_applied.assign(yeff0.begin(), yeff0.end());
+        d_bcs_on.assign(static_cast<size_t>(n_bc), 0);
+        d_bcs_out.assign(static_cast<size_t>(n_bc), 0);
     }
 
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)

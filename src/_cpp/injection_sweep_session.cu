@@ -445,6 +445,8 @@ void InjectionSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_scen, /*d_result_map=*/nullptr);
+    // the transformers the outer loops left on other taps: at the row's final taps
+    solver_->override_outer_trafo_flows();
 
     // stop_ms() records + synchronizes the stop event.
     timings_.t_flow_computation += flow_timer.stop_ms();

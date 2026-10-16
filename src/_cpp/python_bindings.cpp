@@ -1419,6 +1419,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
             for (size_t k = 0; k < r.hvdc_ids.size(); ++k) out.emplace_back(r.hvdc_ids[k], r.hvdc_regime[k]);
             return out;
         }, "(hvdc line id, regime) where AcHvdcAcEmulationLimits changed it")
+      .def_property_readonly("phase_tap", [](const outer::RowResult& r) {
+            std::vector<std::pair<int, int>> out;
+            for (size_t k = 0; k < r.phase_tap_ids.size(); ++k) out.emplace_back(r.phase_tap_ids[k], r.phase_tap[k]);
+            return out;
+        }, "(trafo id, phase tap position) where the loops left it off the grid's (PhaseControl)")
+      .def_property_readonly("ratio_tap", [](const outer::RowResult& r) {
+            std::vector<std::pair<int, int>> out;
+            for (size_t k = 0; k < r.ratio_tap_ids.size(); ++k) out.emplace_back(r.ratio_tap_ids[k], r.ratio_tap[k]);
+            return out;
+        }, "(trafo id, ratio tap position) the same for the ratio tap changers")
+      .def_property_readonly("shunt_sections", [](const outer::RowResult& r) {
+            std::vector<std::pair<int, int>> out;
+            for (size_t k = 0; k < r.shunt_ids.size(); ++k) out.emplace_back(r.shunt_ids[k], r.shunt_sections[k]);
+            return out;
+        }, "(shunt id, section count) the same for the shunt sections")
       .def_readonly("decisions", &outer::RowResult::decisions,
                     "the decision trace, when the session keeps it (keep_trace)");
 
@@ -3130,6 +3145,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 d["hvdc_bus1"] = L.hvdc_bus1; d["hvdc_bus2"] = L.hvdc_bus2; d["hvdc_p0"] = L.hvdc_p0;
                 d["hvdc_k"] = L.hvdc_k; d["hvdc_lf1"] = L.hvdc_lf1; d["hvdc_lf2"] = L.hvdc_lf2;
                 d["hvdc_r"] = L.hvdc_r; d["hvdc_pmax12"] = L.hvdc_pmax12; d["hvdc_pmax21"] = L.hvdc_pmax21;
+                d["bc_trafo"] = L.bc_trafo; d["bc_bus1"] = L.bc_bus1; d["bc_bus2"] = L.bc_bus2;
+                d["bc_phase"] = L.bc_phase; d["bc_ratio"] = L.bc_ratio;
+                d["bc_shift_col"] = L.bc_shift_col; d["bc_ratio_col"] = L.bc_ratio_col;
+                d["bc_sign"] = L.bc_sign; d["bc_rexp"] = L.bc_rexp; d["bc_side"] = L.bc_side;
+                d["bc_p_target"] = L.bc_p_target; d["bc_yeff0"] = L.bc_yeff0;
+                d["bc_grp_bus"] = L.bc_grp_bus; d["bc_grp_target"] = L.bc_grp_target;
+                d["bc_grp_members"] = L.bc_grp_members;
                 return d;
             })
         .def("set_row_targets", [](OuterModelHarness& h, int n_rows, std::vector<double> gen_p) {
@@ -3150,12 +3172,31 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 d["sbus_dq"] = c.sbus_dq;
                 d["vm_reset_bus"] = c.vm_reset_bus;
                 d["vm_reset_vm"] = c.vm_reset_vm;
+                d["bc_out"] = std::vector<int>(c.bc_out.begin(), c.bc_out.end());
+                d["bc_retap"] = c.bc_retap;
+                d["bc_tap"] = c.bc_tap;
+                d["bc_a_tap"] = c.bc_a_tap;
+                d["bc_rho_tap"] = c.bc_rho_tap;
+                d["bc_ctl"] = std::vector<int>(c.bc_ctl.begin(), c.bc_ctl.end());
+                d["bc_rctl"] = std::vector<int>(c.bc_rctl.begin(), c.bc_rctl.end());
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
+        .def("set_branch_off", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off) {
+                outer::RowOverrides ov;
+                ov.branch_off = std::move(branch_off);
+                h.model->set_row_overrides(std::move(ov));
+            }, "per row, the branches it opens (lines then trafos)")
+        .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
+                std::vector<int> t;
+                std::vector<double> b;
+                h.model->row_trafo_blocks(row, t, b);
+                return std::make_pair(t, b);
+            })
         .def("on_solved", [](OuterModelHarness& h, int slot, bool converged, int nr_iter, int inner_status,
                              std::vector<std::complex<double>> V, std::vector<std::complex<double>> S,
-                             std::vector<std::complex<double>> Sb, std::vector<double> vc_q, bool unrealistic) {
+                             std::vector<std::complex<double>> Sb, std::vector<double> vc_q, bool unrealistic,
+                             std::vector<double> bc_a, std::vector<double> bc_rho) {
                 std::vector<double> vr, vi, sr, si, br, bi;
                 for (auto z : V)  { vr.push_back(z.real()); vi.push_back(z.imag()); }
                 for (auto z : S)  { sr.push_back(z.real()); si.push_back(z.imag()); }
@@ -3163,11 +3204,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 outer::SlotData d;
                 d.v_re = vr.data(); d.v_im = vi.data(); d.s_re = sr.data(); d.s_im = si.data();
                 d.sb_re = br.data(); d.sb_im = bi.data(); d.vc_q = vc_q.data(); d.unrealistic = unrealistic;
+                const size_t n_bc = static_cast<size_t>(h.model->layout().n_bc);
+                if (converged && (bc_a.size() != n_bc || bc_rho.size() != n_bc))
+                    throw std::invalid_argument("on_solved: bc_a / bc_rho must hold one value per BranchControl transformer");
+                d.bc_a = bc_a.data(); d.bc_rho = bc_rho.data();
                 int row_status = inner_status;
                 const outer::Next next = h.model->on_solved(slot, converged, nr_iter, inner_status,
                                                             converged ? &d : nullptr, row_status);
                 return std::make_pair(static_cast<int>(next), row_status);
-            })
+            }, pybind11::arg("slot"), pybind11::arg("converged"), pybind11::arg("nr_iter"),
+            pybind11::arg("inner_status"), pybind11::arg("V"), pybind11::arg("S"), pybind11::arg("Sb"),
+            pybind11::arg("vc_q"), pybind11::arg("unrealistic"),
+            pybind11::arg("bc_a") = std::vector<double>(), pybind11::arg("bc_rho") = std::vector<double>())
         .def("row_result", [](const OuterModelHarness& h, int row) { return h.model->row_result(row); });
 
     m.def("_make_ca_outer_session_from_lsgrid",
