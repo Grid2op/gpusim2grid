@@ -2421,6 +2421,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                                      static_cast<size_t>(S) * sizeof(cuda_real_type),
                                      cudaMemcpyDeviceToHost, cs));
         cs.synchronize();   // also retires the previous H->D of the staging block
+        const auto t_sched1 = std::chrono::steady_clock::now();
+        t.t_sched_res_sync += TimingEntry{0., std::chrono::duration<double, std::milli>(t_sched1 - t_sched0).count()};
 
         int n_leave = 0;
         reenter.clear();
@@ -2446,7 +2448,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         if (hook != nullptr) {
             const outer::Layout& Lo = hook->layout();
             const int n_watch = static_cast<int>(Lo.watch_bus.size());
+            const auto t_g0 = std::chrono::steady_clock::now();
             _oc_gather(conv, buf);
+            const auto t_g1 = std::chrono::steady_clock::now();
+            t.t_oc_gather += TimingEntry{0., std::chrono::duration<double, std::milli>(t_g1 - t_g0).count()};
             gbuf.resize(static_cast<size_t>(oc_stride_));
             size_t ci = 0;
             for (int s = 0; s < S; ++s) {
@@ -2482,6 +2487,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                     leave_st[static_cast<size_t>(s)] = static_cast<RowStatus>(final_status);
                 }
             }
+            t.t_oc_decide += TimingEntry{0., std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_g1).count()};
         }
         for (int s = 0; s < S; ++s) {
             const int a = h_evict()[s];
@@ -2510,7 +2517,12 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         }
         t.t_schedule += TimingEntry{0., std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_sched0).count()};
-        if (!reenter.empty()) _oc_write_controls(reenter, /*reload_sbus=*/true);
+        if (!reenter.empty()) {
+            const auto t_c0 = std::chrono::steady_clock::now();
+            _oc_write_controls(reenter, /*reload_sbus=*/true);
+            t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_c0).count()};
+        }
         if (n_leave == 0) continue;
 
         // ---- eviction of the leaving slots -------------------------------
@@ -2544,7 +2556,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 const int a = h_slot_row()[s];
                 hook->load(s, a >= 0 ? _orig_row(a) : -1);
             }
+            const auto t_c0 = std::chrono::steady_clock::now();
             _oc_write_controls(loaded, /*reload_sbus=*/false);
+            t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_c0).count()};
         }
         buf = _bound_nr_buffers(_table_view(-1));
     }

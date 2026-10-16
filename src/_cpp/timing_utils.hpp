@@ -389,6 +389,17 @@ struct BatchTimings {
     // the D->H of the slots' residuals, the decisions, the H->D of the
     // eviction map and the load list (wall time; gpu_ms stays 0).
     TimingEntry t_schedule;
+    // its breakdown (wall; NOT added again to any total): the D->H of the S
+    // residuals and the sync it waits on; with outer loops, the gather of the
+    // converged leaving slots (kernels, D->H, sync) and the host model's
+    // decisions (OuterHook::on_solved); the rest (decision loop, eviction map,
+    // load list, H->D) is t_schedule minus these three.
+    TimingEntry t_sched_res_sync;
+    TimingEntry t_oc_gather;
+    TimingEntry t_oc_decide;
+    // outer loops: the controls of the re-entering / loaded slots
+    // (_oc_write_controls: host packing, H->D, Sbus re-read, sync), wall.
+    TimingEntry t_oc_controls;
 
     // --- metadata ---
     //
@@ -441,7 +452,7 @@ struct BatchTimings {
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
               + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
-              + t_flow_computation + t_schedule).wall_ms;
+              + t_flow_computation + t_schedule + t_oc_controls).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

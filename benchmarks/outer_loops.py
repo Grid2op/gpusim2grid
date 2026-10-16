@@ -75,6 +75,32 @@ def load(network):
     return grid, v0
 
 
+def print_breakdown(t, compute_ms):
+    """Where compute() went (wall ms): the Newton rounds on the GPU, the slot loads and
+    evictions, and the scheduler's per-round host work split into the residual sync, the
+    outer-loop gather, the host model's decisions and the rest; the controls upload
+    apart. Every GPU phase is timed with a sync, so the parts add up to wall time."""
+    w = lambda *names: sum(getattr(t, n).wall_ms for n in names)
+    newton = w("t_spmv", "t_fill_F", "t_fill_J", "t_first_factorize", "t_refactorize",
+               "t_solve", "t_update_V")
+    load = w("t_tile_V", "t_tile_Ybus", "t_patch_Ybus", "t_tile_Sbus")
+    evict = w("t_store_V", "t_violation_check", "t_flow_computation")
+    sched = t.t_schedule.wall_ms
+    parts = {"res_sync": t.t_sched_res_sync.wall_ms, "oc_gather": t.t_oc_gather.wall_ms,
+             "oc_decide": t.t_oc_decide.wall_ms}
+    parts["other"] = sched - sum(parts.values())
+    rows = [("Newton rounds (GPU)", newton), ("residual pass + evict residuals", t.t_residual.wall_ms),
+            ("slot loads", load), ("evictions (store V, checks, flows)", evict),
+            ("schedule (host, per round)", sched),
+            *[(f"  {k}", v) for k, v in parts.items()],
+            ("outer controls upload", t.t_oc_controls.wall_ms),
+            ("outside the driver (session, Python)", compute_ms - t.t_chunks_total_wall_ms)]
+    n = max(t.n_rounds, 1)
+    print(f"     breakdown of compute() ({compute_ms:.0f} ms, {t.n_rounds} rounds):")
+    for name, v in rows:
+        print(f"       {name:<38}{v:9.1f} ms {100 * v / compute_ms:5.1f} %  {1e3 * v / n:8.1f} us/round")
+
+
 def main(args):
     grid, v0 = load(args.network)
     t0 = time.perf_counter()
@@ -109,6 +135,7 @@ def main(args):
           f"occupancy {t.occupancy:.2f}")
     print(f"     statuses {dict(zip(*np.unique(status, return_counts=True)))}, "
           f"outer iterations mean {nb_outer.mean():.2f} max {nb_outer.max()}")
+    print_breakdown(t, 1e3 * t_gpu)
     if args.skip_cpu:
         return
 

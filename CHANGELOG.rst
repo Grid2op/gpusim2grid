@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``BatchTimings.t_sched_res_sync`` / ``t_oc_gather`` / ``t_oc_decide`` / ``t_oc_controls``: where
+  a continuous run's per-round host time goes, outer loops included.
 - [ADDED] ``ir_n_steps`` on the four facades and ``BatchPowerFlow``: cuDSS iterative refinement after each
   solve (default 0). Use 1 with ``outer_loops=True``: hard inner solves then converge as lightsim2grid's do.
 - [BREAKING] The release records (types 9-12 and 15) are now ``ViolationCategory.CONTROL``, as in

@@ -892,6 +892,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_schedule", &BatchTimings::t_schedule,
                       "Continuous scheduling only: the scheduler's per-round host work (D->H of "
                       "the slots' residuals, decisions, H->D of the eviction map / load list), wall")
+        .def_readonly("t_sched_res_sync", &BatchTimings::t_sched_res_sync,
+                      "Part of t_schedule: the D->H of the slots' residuals and its sync, wall")
+        .def_readonly("t_oc_gather", &BatchTimings::t_oc_gather,
+                      "Part of t_schedule, outer loops: gather of the converged leaving slots "
+                      "(kernels, D->H, sync), wall")
+        .def_readonly("t_oc_decide", &BatchTimings::t_oc_decide,
+                      "Part of t_schedule, outer loops: the host model's decisions (on_solved), wall")
+        .def_readonly("t_oc_controls", &BatchTimings::t_oc_controls,
+                      "Outer loops: upload of the re-entering / loaded slots' controls, wall")
         .def_readonly("scheduling", &BatchTimings::scheduling,
                       "BatchScheduling of the run: 0 = chunked, 1 = continuous")
         .def_readonly("nb_iter_per_round", &BatchTimings::nb_iter_per_round,
@@ -1039,6 +1048,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["gen_pv_release_check"] = entry_dict(t.t_gen_pv_release_check);
             gpu_compute["flow_computation"]  = entry_dict(t.t_flow_computation);
             gpu_compute["schedule"]          = entry_dict(t.t_schedule);
+            gpu_compute["sched_res_sync"]    = entry_dict(t.t_sched_res_sync);
+            gpu_compute["oc_gather"]         = entry_dict(t.t_oc_gather);
+            gpu_compute["oc_decide"]         = entry_dict(t.t_oc_decide);
+            gpu_compute["oc_controls"]       = entry_dict(t.t_oc_controls);
 
             py::dict d2h;
             d2h["total"]                      = t.t_device_to_host_ms();
