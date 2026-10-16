@@ -30,6 +30,7 @@ struct BatchDriverConfig {
     ReorderingAlg   reordering_alg    = ReorderingAlg::Default;
     MatchingAlg     matching_alg      = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default;
+    int    ir_n_steps = 0;
     bool   scaling_max_voltage_change = false;
     double max_dVa = 0.5, max_dVm = 0.1;
     bool   mask_mode            = false;   // handle_disconnected_grid
@@ -45,7 +46,7 @@ struct BatchDriverConfig {
         return n_scenarios == o.n_scenarios && batch_size == o.batch_size
             && refactor_period == o.refactor_period && strategy == o.strategy
             && reordering_alg == o.reordering_alg && matching_alg == o.matching_alg
-            && pivot_epsilon_alg == o.pivot_epsilon_alg
+            && pivot_epsilon_alg == o.pivot_epsilon_alg && ir_n_steps == o.ir_n_steps
             && scaling_max_voltage_change == o.scaling_max_voltage_change
             && max_dVa == o.max_dVa && max_dVm == o.max_dVm
             && mask_mode == o.mask_mode && fixed_batch_capacity == o.fixed_batch_capacity

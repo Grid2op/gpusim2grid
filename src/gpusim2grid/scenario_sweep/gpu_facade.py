@@ -37,6 +37,7 @@ from . import (
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from .._ls2g_utils import (
     extract_grid_arrays,
@@ -95,6 +96,16 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         single source of truth. ``None`` (default) leaves each at the
         session's own default. See :class:`InjectionSweepGPU` for the full
         description of each knob (identical semantics here).
+    ir_n_steps : int, default 0
+        cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: steps of iterative refinement after
+        each linear solve, base case and batch (forward and adjoint). ``0``
+        (default) solves without refinement. Static pivoting can leave the
+        Jacobian's factors a little inexact; on a hard row (e.g. outer loops
+        releasing a remote voltage controller) the Newton loop may then
+        diverge where lightsim2grid's KLU converges, and one step fixes it at
+        the cost of one more residual and solve per Newton iteration. Mutable:
+        takes effect on the next :meth:`compute` (the base case keeps the
+        construction value).
     debug_base_case : bool, default False
         Opt-in diagnostic; see :class:`InjectionSweepGPU`.
     scaling_max_voltage_change, max_dVa, max_dVm : bool/float or None
@@ -189,7 +200,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
                  use_bridge=None, handle_disconnected_grid=False,
                  compute_limit_violations=False, reordering_alg=None,
-                 matching_alg=None, pivot_epsilon_alg=None,
+                 matching_alg=None, pivot_epsilon_alg=None, ir_n_steps=0,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
@@ -208,6 +219,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
         _pivot_epsilon_alg = 'default' if pivot_epsilon_alg is None else pivot_epsilon_alg
+        _ir_n_steps = _check_ir_n_steps(ir_n_steps)
 
         if isinstance(grid, (tuple, list)):
             # Explicit-array mode: no grid to seed/extract branch data from.
@@ -224,6 +236,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                 pivot_epsilon_alg=_pivot_epsilon_alg,
+                ir_n_steps=_ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 scaling_max_voltage_change=bool(scaling_max_voltage_change),
                 max_dVa=0.5 if max_dVa is None else float(max_dVa),
@@ -253,6 +266,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
                     keep_trace=bool(keep_outer_trace),
                     resume_from_n=bool(init_from_n_powerflow))
                 self._inner = _ScenarioSweepSolver._wrap_session(
@@ -272,6 +286,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     scaling_max_voltage_change_override=(
                         -1 if scaling_max_voltage_change is None
@@ -296,6 +311,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     presolved_v=init_from_n_powerflow,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                     pivot_epsilon_alg=_pivot_epsilon_alg,
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     scaling_max_voltage_change=bool(scaling_max_voltage_change),
                     max_dVa=0.5 if max_dVa is None else float(max_dVa),
@@ -899,6 +915,16 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     @pivot_epsilon_alg.setter
     def pivot_epsilon_alg(self, value):
         self._inner.pivot_epsilon_alg = value
+
+    @property
+    def ir_n_steps(self):
+        """int: cuDSS ``CUDSS_CONFIG_IR_N_STEPS``, iterative refinement steps per
+        batch solve (0 = none). Takes effect on the next :meth:`compute`."""
+        return self._inner.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._inner.ir_n_steps = value
 
     @property
     def timings(self):

@@ -575,6 +575,7 @@ struct BatchPfDriver {
     ReorderingAlg   reordering_alg_    = ReorderingAlg::Default;
     MatchingAlg     matching_alg_      = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int             ir_n_steps_        = 0;   // CUDSS_CONFIG_IR_N_STEPS, forward and adjoint
 
     // -------------------------------------------------------------------------
     // Persistence / adjoint state
@@ -648,6 +649,7 @@ struct BatchPfDriver {
     //   reordering_alg   — CUDSS_CONFIG_REORDERING_ALG for the batch ANALYSIS.
     //   matching_alg     — CUDSS_CONFIG_MATCHING_ALG for the batch ANALYSIS.
     //   pivot_epsilon_alg — CUDSS_CONFIG_PIVOT_EPSILON_ALG for the batch ANALYSIS.
+    //   ir_n_steps       — CUDSS_CONFIG_IR_N_STEPS, iterative refinement per SOLVE.
     // -------------------------------------------------------------------------
     BatchPfDriver(
         AcPfNrState&              base_state,
@@ -660,6 +662,7 @@ struct BatchPfDriver {
         ReorderingAlg             reordering_alg  = ReorderingAlg::Default,
         MatchingAlg               matching_alg    = MatchingAlg::None,
         PivotEpsilonAlg           pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int                       ir_n_steps = 0,
         // NR step-scaling (MaxVoltageChange) -- see the members' own doc. Off
         // by default; see AcPfNrState's own doc for what this fixes.
         bool                      scaling_max_voltage_change = false,

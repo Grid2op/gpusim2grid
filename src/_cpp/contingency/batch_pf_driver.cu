@@ -129,6 +129,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     ReorderingAlg         reordering_alg,
     MatchingAlg           matching_alg,
     PivotEpsilonAlg       pivot_epsilon_alg,
+    int                   ir_n_steps,
     bool                  scaling_max_voltage_change,
     double                max_dVa,
     double                max_dVm,
@@ -150,6 +151,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     , reordering_alg_(reordering_alg)
     , matching_alg_(matching_alg)
     , pivot_epsilon_alg_(pivot_epsilon_alg)
+    , ir_n_steps_(ir_n_steps)
     , scheduling_(scheduling)
     , nb_iter_per_round_(nb_iter_per_round)
     , tol_(tol)
@@ -326,7 +328,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         cs,
         reordering_alg,
         matching_alg,
-        pivot_epsilon_alg);
+        pivot_epsilon_alg,
+        ir_n_steps);
 
     std::visit([&](auto& policy) {
         policy.initialize_from_base(
@@ -2808,7 +2811,7 @@ void BatchPfDriver<BatchSource>::_prepare_adjoint()
         thrust::raw_pointer_cast(A.d_JT_values.data()),
         thrust::raw_pointer_cast(A.d_rhs.data()),
         thrust::raw_pointer_cast(A.d_sol.data()),
-        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_);
+        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_);
     A.n_analysis = 1;
     cs.synchronize();
     A.t_build_ms = bpf_ms_since(t_build_start);

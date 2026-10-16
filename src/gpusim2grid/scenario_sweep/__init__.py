@@ -42,6 +42,7 @@ from ..contingency_analysis import (
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from ..contingency_analysis._limit_violations import (
     ViolationElementType,
@@ -135,7 +136,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
                  device=None, handle_disconnected_grid=False, presolved_v=False,
                  reordering_alg='default',
-                 matching_alg='none', pivot_epsilon_alg='default',
+                 matching_alg='none', pivot_epsilon_alg='default', ir_n_steps=0,
                  debug_base_case=False,
                  scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
                  scheduling='chunked', nb_iter_per_round=1, tol=None):
@@ -152,6 +153,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
             reordering_alg=_resolve_reordering_alg(reordering_alg),
             matching_alg=_resolve_matching_alg(matching_alg),
             pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            ir_n_steps=_check_ir_n_steps(ir_n_steps),
             debug_base_case=bool(debug_base_case),
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
@@ -277,6 +279,17 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     def pivot_epsilon_alg(self, value):
         self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
         self._pivot_epsilon_alg = value if isinstance(value, str) else str(value)
+
+    @property
+    def ir_n_steps(self):
+        """cuDSS CUDSS_CONFIG_IR_N_STEPS: steps of iterative refinement per batch
+        solve (int >= 0, 0 = none). Takes effect on the next run(); the base case
+        keeps the construction value."""
+        return self._s.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._s.ir_n_steps = _check_ir_n_steps(value)
 
     @property
     def handle_disconnected_grid(self):

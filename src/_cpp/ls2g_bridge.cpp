@@ -877,6 +877,7 @@ make_acpf_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
@@ -908,7 +909,7 @@ make_acpf_session_from_lsgrid(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
         diag_stop_before_state_correction,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
         scaling, max_dVa, max_dVm);
 }
 
@@ -921,7 +922,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     int    device,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg)
+    PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps)
 {
     // Same as make_acpf_session_from_lsgrid, but with a caller-supplied Sbus
     // (solver numbering) instead of the grid's own get_Sbus_solver(). Used by
@@ -952,7 +954,7 @@ make_acpf_session_from_lsgrid_with_sbus(
     return std::make_shared<AcPfNrSession>(
         Ybus, V0, Sbus, slack, sw, pv, pq, max_iter, tol, device, &ledger,
         /*presolved_v=*/false, /*diag_stop_before_state_correction=*/false,
-        reordering_alg, matching_alg, pivot_epsilon_alg);
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps);
 }
 
 std::shared_ptr<ContingencyAnalysisSession>
@@ -968,6 +970,7 @@ make_ca_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
@@ -1004,7 +1007,7 @@ make_ca_session_from_lsgrid(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
         scaling, max_dVa, max_dVm);
 
     BranchData bd = extract_branch_data(grid, static_cast<int>(Ybus.rows()));
@@ -1322,6 +1325,7 @@ make_is_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
@@ -1351,7 +1355,7 @@ make_is_session_from_lsgrid(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
         scaling, max_dVa, max_dVm);
 
     if (with_branch_data) {
@@ -1376,6 +1380,7 @@ make_ss_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   debug_base_case,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
@@ -1409,7 +1414,7 @@ make_ss_session_from_lsgrid(
         Ybus, V0, Sbus, slack, sw, pv, pq,
         batch_size, nb_iter, max_iter_base, tol_base, device, &ledger,
         /*presolved_v=*/init_from_n_powerflow,
-        reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
         scaling, max_dVa, max_dVm);
 
     // Per-generator snapshot for set_contingency_gens() (cheap, always).
@@ -1639,6 +1644,7 @@ make_ss_outer_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   keep_trace,
     bool   resume_from_n)
 {
@@ -1652,7 +1658,7 @@ make_ss_outer_session_from_lsgrid(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
         device, &in.ledger, /*presolved_v=*/true,
-        reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, /*debug_base_case=*/false,
         scaling, max_dVa, max_dVm);
     session->scheduling_ = BatchScheduling::Continuous;
 
@@ -1686,6 +1692,7 @@ make_ca_outer_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   keep_trace,
     bool   resume_from_n)
 {
@@ -1697,7 +1704,7 @@ make_ca_outer_session_from_lsgrid(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
         device, &in.ledger, /*presolved_v=*/true,
-        reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, /*debug_base_case=*/false,
         scaling, max_dVa, max_dVm);
     session->scheduling_ = BatchScheduling::Continuous;
     BranchData bd = extract_branch_data(grid, n_bus);
@@ -1728,6 +1735,7 @@ make_is_outer_session_from_lsgrid(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   keep_trace,
     bool   resume_from_n)
 {
@@ -1739,7 +1747,7 @@ make_is_outer_session_from_lsgrid(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
         device, &in.ledger, /*presolved_v=*/true,
-        reordering_alg, matching_alg, pivot_epsilon_alg, /*debug_base_case=*/false,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, /*debug_base_case=*/false,
         scaling, max_dVa, max_dVm);
     session->scheduling_ = BatchScheduling::Continuous;
     if (with_branch_data) {

@@ -1205,14 +1205,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
               Eigen::Ref<const Eigen::VectorXi>           pq,
               int max_iter, eigen_real_type tol, int device,
               bool presolved_v, ReorderingAlg reordering_alg,
-              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
               bool debug_base_case, bool scaling_max_voltage_change,
               double max_dVa, double max_dVm) {
                return std::make_shared<AcPfNrSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    max_iter, tol, device, /*ledger=*/nullptr, presolved_v,
                    /*diag_stop_before_state_correction=*/false, reordering_alg,
-                   matching_alg, pivot_epsilon_alg, debug_base_case,
+                   matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
                    scaling_max_voltage_change, max_dVa, max_dVm);
            }),
          pybind11::arg("Ybus"),
@@ -1229,6 +1229,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("reordering_alg") = ReorderingAlg::Default,
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+         pybind11::arg("ir_n_steps") = 0,
          pybind11::arg("debug_base_case") = false,
          pybind11::arg("scaling_max_voltage_change") = false,
          pybind11::arg("max_dVa") = 0.5,
@@ -1259,6 +1260,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "reference solution.\n"
          "pivot_epsilon_alg: PivotEpsilonAlg, CUDSS_CONFIG_PIVOT_EPSILON_ALG "
          "choice, same scope as reordering_alg. Default: cuDSS's own default.\n"
+         "ir_n_steps: int, CUDSS_CONFIG_IR_N_STEPS, steps of cuDSS iterative "
+         "refinement per SOLVE (forward and adjoint). Default 0 (none).\n"
          "debug_base_case (default False): only meaningful with presolved_v=True "
          "and a MultiSlack/VoltageControl extension active. Forces the "
          "pre-ground-truth cuDSS-solve derivation of slack_absorbed/vc_q even "
@@ -1567,14 +1570,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
               Eigen::Ref<const Eigen::VectorXi>           pq,
               int batch_size, int nb_iter, int max_iter_base, double tol_base,
               int device, bool presolved_v, ReorderingAlg reordering_alg,
-              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
               bool debug_base_case, bool scaling_max_voltage_change,
               double max_dVa, double max_dVm) {
                return std::make_shared<ContingencyAnalysisSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    batch_size, nb_iter, max_iter_base, tol_base, device,
                    /*ledger=*/nullptr, presolved_v,
-                   reordering_alg, matching_alg, pivot_epsilon_alg,
+                   reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps,
                    debug_base_case,
                    scaling_max_voltage_change, max_dVa, max_dVm);
            }),
@@ -1594,6 +1597,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("reordering_alg") = ReorderingAlg::Default,
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+         pybind11::arg("ir_n_steps") = 0,
          pybind11::arg("debug_base_case") = false,
          pybind11::arg("scaling_max_voltage_change") = false,
          pybind11::arg("max_dVa") = 0.5,
@@ -1732,6 +1736,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "default) works here. The other values only work on "
                    "AcPfNrSession's single-system solve, and even there "
                    "MaxDiagProduct/Auto have been observed to silently produce NaN.")
+    .def_readwrite("ir_n_steps", &ContingencyAnalysisSession::ir_n_steps_,
+                   "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
+                   "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
+                   "the next run() (a new driver); the base case keeps the construction value.")
     .def_readwrite("pivot_epsilon_alg", &ContingencyAnalysisSession::pivot_epsilon_alg_,
                    "CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the batch cuDSS "
                    "ANALYSIS (PivotEpsilonAlg enum; takes effect on the next "
@@ -1909,14 +1917,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
               Eigen::Ref<const Eigen::VectorXi>           pq,
               int batch_size, int nb_iter, int max_iter_base, double tol_base,
               int device, bool presolved_v, ReorderingAlg reordering_alg,
-              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
               bool debug_base_case, bool scaling_max_voltage_change,
               double max_dVa, double max_dVm) {
                return std::make_shared<InjectionSweepSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    batch_size, nb_iter, max_iter_base, tol_base, device,
                    /*ledger=*/nullptr, presolved_v,
-                   reordering_alg, matching_alg, pivot_epsilon_alg,
+                   reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps,
                    debug_base_case,
                    scaling_max_voltage_change, max_dVa, max_dVm);
            }),
@@ -1936,6 +1944,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("reordering_alg") = ReorderingAlg::Default,
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+         pybind11::arg("ir_n_steps") = 0,
          pybind11::arg("debug_base_case") = false,
          pybind11::arg("scaling_max_voltage_change") = false,
          pybind11::arg("max_dVa") = 0.5,
@@ -2072,6 +2081,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "default) works here. The other values only work on "
                    "AcPfNrSession's single-system solve, and even there "
                    "MaxDiagProduct/Auto have been observed to silently produce NaN.")
+    .def_readwrite("ir_n_steps", &InjectionSweepSession::ir_n_steps_,
+                   "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
+                   "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
+                   "the next run() (a new driver); the base case keeps the construction value.")
     .def_readwrite("pivot_epsilon_alg", &InjectionSweepSession::pivot_epsilon_alg_,
                    "CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the batch cuDSS "
                    "ANALYSIS (PivotEpsilonAlg enum; takes effect on the next "
@@ -2130,14 +2143,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
               Eigen::Ref<const Eigen::VectorXi>           pq,
               int batch_size, int nb_iter, int max_iter_base, double tol_base,
               int device, bool presolved_v, ReorderingAlg reordering_alg,
-              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+              MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
               bool debug_base_case, bool scaling_max_voltage_change,
               double max_dVa, double max_dVm) {
                return std::make_shared<ScenarioSweepSession>(
                    Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                    batch_size, nb_iter, max_iter_base, tol_base, device,
                    /*ledger=*/nullptr, presolved_v,
-                   reordering_alg, matching_alg, pivot_epsilon_alg,
+                   reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps,
                    debug_base_case,
                    scaling_max_voltage_change, max_dVa, max_dVm);
            }),
@@ -2157,6 +2170,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("reordering_alg") = ReorderingAlg::Default,
          pybind11::arg("matching_alg") = MatchingAlg::None,
          pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+         pybind11::arg("ir_n_steps") = 0,
          pybind11::arg("debug_base_case") = false,
          pybind11::arg("scaling_max_voltage_change") = false,
          pybind11::arg("max_dVa") = 0.5,
@@ -2448,6 +2462,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "(MatchingAlg enum; takes effect on the next run(), which always "
                    "reruns ANALYSIS). Only NoMatching (the default) works in this "
                    "session's batch mode.")
+    .def_readwrite("ir_n_steps", &ScenarioSweepSession::ir_n_steps_,
+                   "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
+                   "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
+                   "the next run() (a new driver); the base case keeps the construction value.")
     .def_readwrite("pivot_epsilon_alg", &ScenarioSweepSession::pivot_epsilon_alg_,
                    "CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the batch cuDSS "
                    "ANALYSIS (PivotEpsilonAlg enum; takes effect on the next "
@@ -2752,7 +2770,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
            int batch_size, int nb_iter, int max_iter_base, double tol_base,
            int device, bool compute_limit_violations,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool debug_base_case,
            int scaling_max_voltage_change_override,
            double max_dVa_override, double max_dVm_override,
            bool use_distributed_slack) {
@@ -2760,7 +2778,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             return make_ca_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, compute_limit_violations,
-                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
                 scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
                 use_distributed_slack);
         },
@@ -2775,6 +2793,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("debug_base_case") = false,
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
@@ -2903,7 +2922,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
            int batch_size, int nb_iter, int max_iter_base, double tol_base,
            int device, bool with_branch_data,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool debug_base_case,
            int scaling_max_voltage_change_override,
            double max_dVa_override, double max_dVm_override,
            bool use_distributed_slack) {
@@ -2911,7 +2930,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             return make_is_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, with_branch_data,
-                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
                 scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
                 use_distributed_slack);
         },
@@ -2926,6 +2945,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("debug_base_case") = false,
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
@@ -2966,7 +2986,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
            int batch_size, int nb_iter, int max_iter_base, double tol_base,
            int device, bool compute_limit_violations,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool debug_base_case,
            int scaling_max_voltage_change_override,
            double max_dVa_override, double max_dVm_override,
            bool use_distributed_slack) {
@@ -2974,7 +2994,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             return make_ss_session_from_lsgrid(
                 grid, init_from_n_powerflow, batch_size, nb_iter,
                 max_iter_base, tol_base, device, compute_limit_violations,
-                reordering_alg, matching_alg, pivot_epsilon_alg, debug_base_case,
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, debug_base_case,
                 scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
                 use_distributed_slack);
         },
@@ -2989,6 +3009,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("debug_base_case") = false,
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
@@ -3021,7 +3042,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         [](pybind11::object grid_py, int max_iter, double tol, int device,
            bool init_from_n_powerflow, bool diag_stop_before_state_correction,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-           PivotEpsilonAlg pivot_epsilon_alg, bool debug_base_case,
+           PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool debug_base_case,
            int scaling_max_voltage_change_override,
            double max_dVa_override, double max_dVm_override,
            bool use_distributed_slack) {
@@ -3029,7 +3050,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             return make_acpf_session_from_lsgrid(
                 grid, max_iter, tol, device, init_from_n_powerflow,
                 diag_stop_before_state_correction, reordering_alg, matching_alg,
-                pivot_epsilon_alg, debug_base_case,
+                pivot_epsilon_alg, ir_n_steps, debug_base_case,
                 scaling_max_voltage_change_override, max_dVa_override, max_dVm_override,
                 use_distributed_slack);
         },
@@ -3042,6 +3063,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("debug_base_case") = false,
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
@@ -3085,11 +3107,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.def("_make_acpf_session_from_lsgrid_with_sbus",
         [](pybind11::object grid_py, Eigen::Ref<const CplxVect> Sbus,
            int max_iter, double tol, int device, ReorderingAlg reordering_alg,
-           MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg) {
+           MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_acpf_session_from_lsgrid_with_sbus(
                 grid, Sbus, max_iter, tol, device, reordering_alg, matching_alg,
-                pivot_epsilon_alg);
+                pivot_epsilon_alg, ir_n_steps);
         },
         pybind11::arg("grid"),
         pybind11::arg("Sbus"),
@@ -3099,6 +3121,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         "Same as _make_acpf_session_from_lsgrid, but with a caller-supplied "
         "complex Sbus (solver numbering) instead of the grid's own Sbus. The "
         "augmented ledger structure is still read off the (previously solved) "
@@ -3230,12 +3253,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
 
     m.def("_make_ca_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
-           ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+           ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
            bool keep_trace, bool resume_from_n) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ca_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
-                reordering_alg, matching_alg, pivot_epsilon_alg, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3245,18 +3268,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
         "A ContingencyAnalysisSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_is_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
-           ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg,
+           ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
            bool keep_trace, bool resume_from_n) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_is_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
-                reordering_alg, matching_alg, pivot_epsilon_alg, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3266,6 +3290,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
         "An InjectionSweepSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
@@ -3273,12 +3298,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.def("_make_ss_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device,
            bool compute_limit_violations, ReorderingAlg reordering_alg,
-           MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, bool keep_trace,
+           MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool keep_trace,
            bool resume_from_n) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ss_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, compute_limit_violations,
-                reordering_alg, matching_alg, pivot_epsilon_alg, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3288,6 +3313,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
         "A ScenarioSweepSession running the grid's outer loops (its algorithm an "
@@ -3322,6 +3348,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         "Solve J*dx = rhs via gpusim2grid's own cuDSS wrapper (analyze -> "
         "factorize -> solve), completely decoupled from any grid/power-flow "
         "construction: J is supplied directly as CSR (indptr, indices, data). "
@@ -3367,6 +3394,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("reordering_alg") = ReorderingAlg::Default,
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
+        pybind11::arg("ir_n_steps") = 0,
         "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
         "same batch-mode env variables and config knobs) on an arbitrary CSR "
         "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "

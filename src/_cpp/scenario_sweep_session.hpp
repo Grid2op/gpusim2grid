@@ -148,6 +148,7 @@ struct ScenarioSweepSession {
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see the other
@@ -390,6 +391,7 @@ struct ScenarioSweepSession {
         ReorderingAlg reordering_alg = ReorderingAlg::Default,
         MatchingAlg matching_alg = MatchingAlg::None,
         PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int ir_n_steps = 0,
         bool   debug_base_case = false,
         bool   scaling_max_voltage_change = false,
         double max_dVa = 0.5,

@@ -131,6 +131,8 @@ struct AcPfNrState {
     // once at construction).
     // -------------------------------------------------------------------------
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    // CUDSS_CONFIG_IR_N_STEPS, same treatment (read at SOLVE)
+    int ir_n_steps_ = 0;
 
     // -------------------------------------------------------------------------
     // debug_base_case_: opt-in diagnostic (presolved_v path only). When true,
@@ -570,6 +572,8 @@ struct AcPfNrState {
         // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for BOTH dss and dss_T's
         // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
         PivotEpsilonAlg                               pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // CUDSS_CONFIG_IR_N_STEPS (iterative refinement per SOLVE) for BOTH dss and dss_T.
+        int                                           ir_n_steps = 0,
         // Opt-in diagnostic (presolved_v path only): force the cuDSS-solve
         // derivation of slack_absorbed/vc_q even when ledger ground truth is
         // available. See debug_base_case_ above. Default false.

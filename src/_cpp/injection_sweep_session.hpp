@@ -106,6 +106,7 @@ struct InjectionSweepSession {
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see AcPfNrState's own
@@ -214,6 +215,7 @@ struct InjectionSweepSession {
         ReorderingAlg reordering_alg = ReorderingAlg::Default,
         MatchingAlg matching_alg = MatchingAlg::None,
         PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int ir_n_steps = 0,
         // Opt-in diagnostic forwarded to base_state_ (see AcPfNrState's own
         // doc): force the pre-ground-truth cuDSS-solve derivation of
         // slack_absorbed/vc_q even when lightsim2grid's own converged values

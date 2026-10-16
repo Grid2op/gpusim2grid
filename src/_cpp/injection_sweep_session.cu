@@ -56,6 +56,7 @@ InjectionSweepSession::InjectionSweepSession(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   debug_base_case,
     bool   scaling_max_voltage_change,
     double max_dVa,
@@ -66,6 +67,7 @@ InjectionSweepSession::InjectionSweepSession(
     , reordering_alg_(reordering_alg)
     , matching_alg_(matching_alg)
     , pivot_epsilon_alg_(pivot_epsilon_alg)
+    , ir_n_steps_(ir_n_steps)
     , scaling_max_voltage_change_(scaling_max_voltage_change)
     , max_dVa_(max_dVa)
     , max_dVm_(max_dVm)
@@ -90,7 +92,7 @@ InjectionSweepSession::InjectionSweepSession(
         static_cast<eigen_real_type>(tol_base),
         device, ledger, presolved_v,
         /*diag_stop_before_state_correction=*/false,
-        reordering_alg, matching_alg, pivot_epsilon_alg,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps,
         debug_base_case, /*base_case_only=*/true,
         scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
@@ -177,6 +179,7 @@ BatchDriverConfig InjectionSweepSession::_current_config() const
     c.reordering_alg             = reordering_alg_;
     c.matching_alg               = matching_alg_;
     c.pivot_epsilon_alg          = pivot_epsilon_alg_;
+    c.ir_n_steps                 = ir_n_steps_;
     c.scaling_max_voltage_change = scaling_max_voltage_change_;
     c.max_dVa                    = max_dVa_;
     c.max_dVm                    = max_dVm_;
@@ -276,6 +279,7 @@ void InjectionSweepSession::run()
             reordering_alg_,
             matching_alg_,
             pivot_epsilon_alg_,
+            ir_n_steps_,
             scaling_max_voltage_change_,
             max_dVa_,
             max_dVm_,

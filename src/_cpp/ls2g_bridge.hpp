@@ -134,6 +134,7 @@ make_acpf_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic (see AcPfNrState's own doc): force the pre-ground-truth
     // cuDSS-solve derivation of slack_absorbed/vc_q even when lightsim2grid's
     // own converged values are available. No-op unless init_from_n_powerflow.
@@ -163,7 +164,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     int    device,
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
-    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0);
 
 // Build a ContingencyAnalysisSession from a solved LSGrid (branch data set).
 // When compute_limit_violations=true, also pulls bus/branch limits off the
@@ -184,6 +186,7 @@ make_ca_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
     bool   debug_base_case = false,
     // NR step-scaling (MaxVoltageChange): by default (-1 / negative sentinels)
@@ -295,6 +298,7 @@ make_is_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
     bool   debug_base_case = false,
     // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
@@ -328,6 +332,7 @@ make_ss_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
     bool   debug_base_case = false,
     // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
@@ -366,6 +371,7 @@ make_ss_outer_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     bool   keep_trace = false,
     // every row resumes from where the grid's own solve left its loops (lightsim2grid's
     // init_from_n_powerflow), starting from its voltages as they are
@@ -380,6 +386,7 @@ make_ca_outer_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     bool keep_trace = false, bool resume_from_n = false);
 std::shared_ptr<InjectionSweepSession>
 make_is_outer_session_from_lsgrid(
@@ -388,6 +395,7 @@ make_is_outer_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     bool keep_trace = false, bool resume_from_n = false);
 
 #endif  // LS2G_BRIDGE_HPP

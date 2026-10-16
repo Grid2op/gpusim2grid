@@ -577,6 +577,7 @@ AcPfNrState::AcPfNrState(
     ReorderingAlg                                reordering_alg,
     MatchingAlg                                  matching_alg,
     PivotEpsilonAlg                              pivot_epsilon_alg,
+    int                                          ir_n_steps,
     bool                                         debug_base_case,
     bool                                         base_case_only,
     bool                                         scaling_max_voltage_change,
@@ -586,6 +587,7 @@ AcPfNrState::AcPfNrState(
     reordering_alg_    = reordering_alg;
     matching_alg_      = matching_alg;
     pivot_epsilon_alg_ = pivot_epsilon_alg;
+    ir_n_steps_        = ir_n_steps;
     debug_base_case_   = debug_base_case;
     base_case_only_    = base_case_only;
     max_iter_          = max_iter;
@@ -1438,6 +1440,7 @@ AcPfNrState::AcPfNrState(
         dss.set_reordering_alg(reordering_alg_);
         dss.set_matching_alg(matching_alg_);
         dss.set_pivot_epsilon_alg(pivot_epsilon_alg_);
+        dss.set_ir_n_steps(ir_n_steps_);
 
         // Sparse J descriptor — values pointer is updated each iteration via
         // cudssMatrixSetValues(); the shape and structure pointers are fixed.
@@ -1719,6 +1722,7 @@ AcPfNrSession::AcPfNrSession(
     ReorderingAlg                                reordering_alg,
     MatchingAlg                                  matching_alg,
     PivotEpsilonAlg                              pivot_epsilon_alg,
+    int                                          ir_n_steps,
     bool                                         debug_base_case,
     bool                                         scaling_max_voltage_change,
     double                                       max_dVa,
@@ -1731,7 +1735,7 @@ AcPfNrSession::AcPfNrSession(
                                             max_iter, tol, device, ledger,
                                             presolved_v, diag_stop_before_state_correction,
                                             reordering_alg, matching_alg,
-                                            pivot_epsilon_alg, debug_base_case,
+                                            pivot_epsilon_alg, ir_n_steps, debug_base_case,
                                             /*base_case_only=*/false,
                                             scaling_max_voltage_change, max_dVa, max_dVm);
 }
@@ -1873,6 +1877,7 @@ void AcPfNrState::ensure_JT()
         dss_T.set_reordering_alg(reordering_alg_);
         dss_T.set_matching_alg(matching_alg_);
         dss_T.set_pivot_epsilon_alg(pivot_epsilon_alg_);
+        dss_T.set_ir_n_steps(ir_n_steps_);
 
         dss_AT.create_csr(static_cast<int64_t>(dim_J),
                           static_cast<int64_t>(nnz_J),
