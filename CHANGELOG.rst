@@ -4,7 +4,7 @@ Change Log
 [0.2.0] 2026-xx-yy
 --------------------
 - [ADDED] ``ir_n_steps`` on the four facades and ``BatchPowerFlow``: cuDSS iterative refinement after each
-  solve (default 0). One step makes hard rows converge where cuDSS's perturbed pivots made them diverge.
+  solve (default 0). Use 1 with ``outer_loops=True``: hard inner solves then converge as lightsim2grid's do.
 - [BREAKING] The release records (types 9-12 and 15) are now ``ViolationCategory.CONTROL``, as in
   lightsim2grid; the types 16-20 of its outer-loop detection are mirrored.
 - [ADDED] ``outer_loops=True`` on the three batch facades: lightsim2grid's ``NROuter_*`` outer loops

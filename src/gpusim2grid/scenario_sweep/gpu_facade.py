@@ -100,10 +100,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: steps of iterative refinement after
         each linear solve, base case and batch (forward and adjoint). ``0``
         (default) solves without refinement. Static pivoting can leave the
-        Jacobian's factors a little inexact; on a hard row (e.g. outer loops
-        releasing a remote voltage controller) the Newton loop may then
-        diverge where lightsim2grid's KLU converges, and one step fixes it at
-        the cost of one more residual and solve per Newton iteration. Mutable:
+        Jacobian's factors a little inexact, which Newton usually absorbs.
+        **With** ``outer_loops=True`` **use 1**: each inner solve must stop at
+        the iteration lightsim2grid's does, and a hard one (e.g. after
+        TransformerVoltageControl releases a held remote voltage controller)
+        can diverge without refinement where lightsim2grid's KLU converges.
+        One step costs one more residual and solve per Newton iteration. Mutable:
         takes effect on the next :meth:`compute` (the base case keeps the
         construction value).
     debug_base_case : bool, default False
@@ -131,7 +133,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         GPU by its single-slack inner Newton; their loops decide on the host
         after each converged inner solve, and a row their loops change is
         re-solved in place from its voltages; ``nb_iter`` is the budget of
-        each inner solve. Each row starts from
+        each inner solve (pass ``ir_n_steps=1``, see there). Each row starts from
         the grid's voltages (its generator buses at their set-points) and the
         grid's controls, as a lightsim2grid batch without
         ``init_from_n_powerflow`` -- or, with ``init_from_n_powerflow=True``

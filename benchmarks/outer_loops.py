@@ -29,6 +29,9 @@ def get_parser():
     parser.add_argument("--batch_size", type=int, default=256, help="GPU slots")
     parser.add_argument("--nb_iter", type=int, default=30, help="iteration budget of each inner solve")
     parser.add_argument("--tol_mva", type=float, default=1e-6, help="Newton tolerance, MVA (lightsim2grid's unit)")
+    parser.add_argument("--ir_n_steps", type=int, default=1,
+                        help="cuDSS iterative refinement steps per solve (gpusim2grid's default is 0; "
+                             "1 keeps hard inner solves at lightsim2grid's iteration counts)")
     parser.add_argument("--init_from_n", action="store_true",
                         help="the rows resume from the 'n' solve's loops (init_from_n_powerflow)")
     parser.add_argument("--handle_disconnected_grid", action="store_true",
@@ -91,7 +94,7 @@ def main(args):
     ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=args.nb_iter,
                                 init_from_n_powerflow=args.init_from_n,
                                 handle_disconnected_grid=args.handle_disconnected_grid,
-                                tol=args.tol_mva / grid.get_sn_mva())
+                                tol=args.tol_mva / grid.get_sn_mva(), ir_n_steps=args.ir_n_steps)
     ca.add_contingencies_by_branch_id([[c] for c in ctgs])
     t_build = time.perf_counter() - t0
     t0 = time.perf_counter()
