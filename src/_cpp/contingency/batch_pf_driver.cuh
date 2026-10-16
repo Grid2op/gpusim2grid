@@ -412,6 +412,11 @@ struct BatchPfDriver {
     thrust::device_vector<cuda_real_type> d_viol_limit;
     thrust::device_vector<int>            d_violation_count;      // [n_contingencies]; -1 = not simulated, else 0..K
     thrust::device_vector<int>            d_violation_truncated;  // [n_contingencies]; 0/1
+    // check_limit_violations_kernel's per-slot scratch (the records it collects
+    // before ranking them): [3 * n_slots * 3K] real, [n_slots * 3K] int, grown
+    // in _evict to the launch's slot count
+    thrust::device_vector<cuda_real_type> d_viol_scratch_real_;
+    thrust::device_vector<int>            d_viol_scratch_key_;
 
     // TRUE, uncapped per-type violation totals -- [n_contingencies]; -1 = not
     // simulated, else the exact count (independent of violation_capacity/K,

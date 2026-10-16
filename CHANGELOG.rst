@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] ``compute_limit_violations``: the operational check runs one GPU block per row, not one thread,
+  same records; it cost tens of ms per call on a real grid, every continuous round.
 - [ADDED] ``BatchTimings.t_sched_res_sync`` / ``t_oc_gather`` / ``t_oc_decide`` / ``t_oc_controls`` /
   ``t_oc_load``: where a continuous run's per-round host time goes, outer loops included.
 - [ADDED] ``BatchTimings.t_driver_solve_wall_ms`` / ``t_session_run_wall_ms``: whole-call wall clocks,

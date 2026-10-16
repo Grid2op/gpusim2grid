@@ -2071,7 +2071,14 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
             }
             d_branch_bc_.assign(map.begin(), map.end());
         }
-        check_limit_violations_kernel<<<(n_slots + BS - 1) / BS, BS, 0, cs>>>(
+        const size_t n_scratch = static_cast<size_t>(n_slots)
+                               * static_cast<size_t>(N_OPERATIONAL_VIOLATION_GROUPS * violation_capacity_);
+        if (d_viol_scratch_key_.size() < n_scratch) {
+            d_viol_scratch_real_.resize(3 * n_scratch);
+            d_viol_scratch_key_.resize(n_scratch);
+        }
+        // one block per slot (see violation_kernels.cuh)
+        check_limit_violations_kernel<<<n_slots, VIOL_BLOCK, 0, cs>>>(
             thrust::raw_pointer_cast(d_V_batch.data()),
             thrust::raw_pointer_cast(d_residuals.data()),
             violation_tol_,
@@ -2104,6 +2111,8 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
             thrust::raw_pointer_cast(d_violation_count_low_voltage.data()),
             thrust::raw_pointer_cast(d_violation_count_high_voltage.data()),
             thrust::raw_pointer_cast(d_violation_count_current.data()),
+            thrust::raw_pointer_cast(d_viol_scratch_real_.data()),
+            thrust::raw_pointer_cast(d_viol_scratch_key_.data()),
             bc_branches ? thrust::raw_pointer_cast(d_branch_bc_.data()) : nullptr,
             bc_branches ? thrust::raw_pointer_cast(d_bc_applied_.data()) : nullptr,
             base.n_bc);

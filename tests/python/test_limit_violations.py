@@ -385,6 +385,198 @@ def test_truncation_keeps_most_severe_per_type(ieee14_grid, ieee14_base_case):
         np.testing.assert_array_equal(got, full.get_violation_counts()[name])
 
 
+_TYPE_ORDER = ("CURRENT", "LOW_VOLTAGE", "HIGH_VOLTAGE")
+
+
+def _scan_key(v, n_lines):
+    """The kernel's scan order inside a type: branch (lines then trafos) then
+    side for CURRENT, bus for the voltage types."""
+    if v.violation_type.name == "CURRENT":
+        l = v.element_id + (n_lines if v.element_type.name == "TRAFO" else 0)
+        return 2 * l + (v.side - 1)
+    return v.element_id
+
+
+def _ranked(records, n_lines, K=None):
+    """The documented record order: types CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE,
+    each sorted by |value/limit - 1| largest first, ties in scan order, the K
+    first of each type kept (all of them with K=None)."""
+    out = []
+    for t in _TYPE_ORDER:
+        of_type = [v for v in records if v.violation_type.name == t]
+        with np.errstate(divide="ignore"):
+            of_type.sort(key=lambda v: (-abs(np.float64(v.value) / v.limit - 1.),
+                                        _scan_key(v, n_lines)))
+        out += of_type if K is None else of_type[:K]
+    return out
+
+
+def _record_key(v):
+    return (int(v.element_type), v.element_id, v.side, int(v.violation_type))
+
+
+@requires_gpu
+def test_truncation_ties_keep_scan_order(ieee14_grid, ieee14_base_case, solver_atol, residual_atol):
+    """Equal severities are kept, and ranked, in scan order. A 0 kA limit
+    gives a CURRENT severity of +inf, vmax = 0 a HIGH_VOLTAGE one of +inf and
+    vmin = +inf a LOW_VOLTAGE one of exactly 1, so each type has a run of ties
+    at the top, the other elements (finite margins) below it. With K inside
+    the tie run the kept records are its first K in scan order; with K past
+    it, the whole run then the most severe of the rest."""
+    cont_branch_ids = [[0], [3], [5]]
+    baseline, n_lines, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids,
+                                         violation_tol=residual_atol)
+    n_branches = baseline._s.n_branches
+    baseline.run()
+    n_bus = ieee14_base_case["n_bus"]
+    V0 = baseline.V_results.to_numpy().reshape(len(cont_branch_ids), n_bus)[0]
+    assert np.all(np.isfinite(V0))
+    vm_kv0 = np.abs(V0) * ieee14_grid.get_bus_vn_kv()
+
+    rng = np.random.default_rng(1)
+    even, odd = np.arange(0, n_bus, 2), np.arange(1, n_bus, 2)
+    bus_vmin_kv = np.full(n_bus, np.nan)
+    bus_vmax_kv = np.full(n_bus, np.nan)
+    bus_vmax_kv[even] = vm_kv0[even] * (1. - rng.uniform(0.01, 0.2, even.size))
+    bus_vmax_kv[even[::2]] = 0.               # HIGH_VOLTAGE ties at +inf
+    bus_vmin_kv[odd] = vm_kv0[odd] * (1. + rng.uniform(0.01, 0.2, odd.size))
+    bus_vmin_kv[odd[::2]] = np.inf            # LOW_VOLTAGE ties at 1
+    limit_a1_ka = rng.uniform(1e-3, 5e-2, n_branches)
+    limit_a2_ka = rng.uniform(1e-3, 5e-2, n_branches)
+    limit_a1_ka[1::3] = 0.                    # CURRENT ties at +inf
+    limit_a2_ka[::4] = 0.
+
+    def run(capacity):
+        solver, _, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids,
+                                     violation_capacity=capacity,
+                                     violation_tol=residual_atol)
+        solver.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        solver.compute_limit_violations = True
+        solver.run()
+        return solver
+
+    full = run(n_bus + 2 * n_branches)
+    assert not full.get_violations_truncated().any()
+    n_ties = [len(odd[::2]), len(even[::2])]   # LOW, HIGH ties per row (every bus violates)
+    for K in (2, max(n_ties) + 2):
+        capped = run(K)
+        for r, (all_rows, kept) in enumerate(zip(full.get_violations(), capped.get_violations())):
+            assert all_rows, f"row {r} must converge with violations"
+            # the uncapped list is itself in the documented order
+            assert [_record_key(v) for v in all_rows] == \
+                [_record_key(v) for v in _ranked(all_rows, n_lines)], f"row {r}"
+            expected = _ranked(all_rows, n_lines, K)
+            assert [_record_key(v) for v in kept] == [_record_key(v) for v in expected], \
+                f"row {r}, K={K}"
+            # two sessions agree to rounding only
+            np.testing.assert_allclose([v.value for v in kept], [v.value for v in expected],
+                                       rtol=solver_atol)
+            np.testing.assert_array_equal([v.limit for v in kept], [v.limit for v in expected])
+        for name, got in capped.get_violation_counts().items():
+            np.testing.assert_array_equal(got, full.get_violation_counts()[name])
+        assert capped.get_violations_truncated().all()
+
+
+@pytest.fixture(scope="module")
+def case300():
+    """pandapower case300 (300 buses, 411 branches): more elements than one
+    block of the violation kernel has threads."""
+    import warnings
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import AlgorithmType
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        grid = init_from_pandapower(pn.case300())
+    grid.change_algorithm(AlgorithmType.NR_KLU)
+    n_bus = grid.get_bus_vn_kv().shape[0]
+    v_init = grid.dc_pf(np.ones(n_bus, dtype=complex), 1, 1e-6)
+    assert grid.ac_pf(v_init.copy(), 30, 1e-8).shape[0] == n_bus
+    slack = grid.get_slack_ids()
+    slack_weights = np.zeros(n_bus)
+    slack_weights[slack] = 1.0 / slack.shape[0]
+    d = {"n_bus": n_bus, "Ybus": grid.get_Ybus_solver().copy(),
+         "Sbus": grid.get_Sbus_solver().copy(), "pv": grid.get_pv(), "pq": grid.get_pq(),
+         "slack": slack, "slack_weights": slack_weights, "v_init": v_init}
+    return grid, d
+
+
+@requires_gpu
+def test_truncation_multi_tile_matches_numpy(case300, solver_atol, residual_atol):
+    """A grid with more buses and branches than the kernel's block has
+    threads: every row's uncapped records are compute_violations_n's on that
+    row's voltages (tripped branch excluded), in the documented order, and the
+    capped ones are their K most severe per type."""
+    from conftest import branch_data_arrays
+    from gpusim2grid.contingency_analysis._limit_violations import compute_violations_n
+    grid, d = case300
+    # an FP32 Newton stalls a few times residual_atol above it on case300
+    violation_tol = 10. * residual_atol
+    branch_data, n_lines, _ = branch_data_arrays(grid)
+    cont_branch_ids = [[1], [8], [14], [n_lines + 27]]   # none disconnects the grid
+    baseline, _, _ = _build_solver(grid, d, cont_branch_ids, batch_size=4,
+                                   violation_tol=violation_tol)
+    n_branches = baseline._s.n_branches
+    assert n_branches > 256 and d["n_bus"] > 256
+    baseline.run()
+    n_bus = d["n_bus"]
+    V = baseline.V_results.to_numpy().reshape(len(cont_branch_ids), n_bus)
+    assert np.all(np.isfinite(V)), "every row must converge for this test"
+    vn_kv = grid.get_bus_vn_kv()
+    vm_kv0 = np.abs(V[0]) * vn_kv
+
+    rng = np.random.default_rng(2)
+    bus_vmin_kv = vm_kv0 * (1. + rng.uniform(-0.05, 0.05, n_bus))
+    bus_vmax_kv = vm_kv0 * (1. + rng.uniform(-0.05, 0.05, n_bus))
+    bus_vmax_kv[bus_vmax_kv < bus_vmin_kv] = np.nan
+    bus_vmin_kv[rng.random(n_bus) < 0.1] = np.nan
+    limit_a1_ka = rng.uniform(0., 0.5, n_branches)
+    limit_a2_ka = rng.uniform(0., 0.5, n_branches)
+    limit_a1_ka[rng.random(n_branches) < 0.1] = np.nan
+
+    def run(capacity):
+        solver, _, _ = _build_solver(grid, d, cont_branch_ids, batch_size=4,
+                                     violation_capacity=capacity, violation_tol=violation_tol)
+        solver.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        solver.compute_limit_violations = True
+        solver.run()
+        return solver
+
+    full = run(n_bus + 2 * n_branches)
+    assert not full.get_violations_truncated().any()
+    sn_mva = branch_data[-1]
+    for r, all_rows in enumerate(full.get_violations()):
+        a1, a2 = limit_a1_ka.copy(), limit_a2_ka.copy()
+        a1[cont_branch_ids[r]] = np.nan
+        a2[cont_branch_ids[r]] = np.nan
+        ref = compute_violations_n(V[r], vn_kv, bus_vmin_kv, bus_vmax_kv, *branch_data[:6],
+                                   a1, a2, sn_mva, n_lines)
+        ref = {_record_key(v): v for v in ref}
+        got = {_record_key(v): v for v in all_rows}
+        assert len(got) == len(all_rows)
+        # nothing within rounding of its limit, so the two sets are the same
+        assert set(got) == set(ref), f"row {r}"
+        for k, v in got.items():
+            # a branch current is a difference of two products: FP32 loses digits there
+            np.testing.assert_allclose(v.value, ref[k].value, rtol=solver_atol, atol=solver_atol)
+        assert [_record_key(v) for v in all_rows] == \
+            [_record_key(v) for v in _ranked(all_rows, n_lines)], f"row {r}"
+    counts = full.get_violation_counts()
+    assert min(counts["current"].min(), counts["low_voltage"].min(),
+               counts["high_voltage"].min()) > 20
+    for K in (1, 5, 20):
+        capped = run(K)
+        for r, (all_rows, kept) in enumerate(zip(full.get_violations(), capped.get_violations())):
+            expected = _ranked(all_rows, n_lines, K)
+            assert [_record_key(v) for v in kept] == [_record_key(v) for v in expected], \
+                f"row {r}, K={K}"
+            np.testing.assert_allclose([v.value for v in kept], [v.value for v in expected],
+                                       rtol=solver_atol)
+        for name, got in capped.get_violation_counts().items():
+            np.testing.assert_array_equal(got, counts[name])
+        assert capped.get_violations_truncated().all()
+
+
 @requires_gpu
 def test_compute_limit_violations_clear_on_change(ieee14_grid, ieee14_base_case):
     """Mirrors lightsim2grid's set_compute_limit_violations: no-op if

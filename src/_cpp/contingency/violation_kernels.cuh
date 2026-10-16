@@ -24,17 +24,32 @@
 #include "tripped_branch_table.hpp"
 #include "limit_violation_types.hpp"   // N_*_VIOLATION_GROUPS
 
+// threads per block of check_limit_violations_kernel (one block per row)
+constexpr int VIOL_BLOCK = 256;
+
 // -----------------------------------------------------------------------------
 // check_limit_violations_kernel
 //
-// One thread PER CONTINGENCY (active slot) in the current chunk -- not per
-// bus, not per (contingency, branch). Each thread owns output slice
-// [out_c*3K, out_c*3K+3K) exclusively (out_c = original contingency index), so
-// there is no cross-thread write hazard and no atomics anywhere in this
-// kernel. n_contingencies is typically large enough on its own to saturate
-// the GPU at one-thread-per-contingency; total FLOPs are identical to a
-// per-bus/per-branch layout either way, so this trades finer-grained
-// parallelism for avoiding atomic-append machinery entirely.
+// One BLOCK of VIOL_BLOCK threads PER CONTINGENCY (active slot): launch it
+// with n_slots blocks; a block whose slot is not checked (d_slot_active = -1,
+// most of them in a continuous round) returns at once. Each block owns output
+// slice [out_c*3K, out_c*3K+3K) exclusively (out_c = original contingency
+// index) and its slot's scratch, so blocks never share a write. Inside the
+// block the threads split the branches and the buses, in four passes over
+// them, each element evaluated by the same (non-inlined) function every time:
+//   1. count: the per-type totals (block reduction);
+//   2. select, for a type with more than K: the bits of its K-th largest
+//      severity T, by an MSD radix select (8-bit digits, the three types at
+//      once; 8 passes in FP64, 4 in FP32);
+//   3. collect: the kept records (all of a type with at most K, else those
+//      above T and the first ties at T in scan order -- tiles in element
+//      order and a block scan inside each) to the scratch;
+//   4. emit: each kept record straight to its rank in its type.
+// So the records are the ones a sequential scan keeping the K most severe
+// would keep (ties to the element scanned first), with no sorted insertion.
+// One thread per contingency (the former layout) scanned every element
+// serially, tens of ms per launch on a real grid even with a single
+// contingency to check.
 //
 // Checks, in order, matching lightsim2grid's ContingencyAnalysis.cpp
 // (check_bus_voltage_violations / check_current_violations) semantics and
@@ -181,6 +196,10 @@ __global__ void check_limit_violations_kernel(
           int*             __restrict__ d_out_count_low_voltage,
           int*             __restrict__ d_out_count_high_voltage,
           int*             __restrict__ d_out_count_current,
+    // [3 * actual_batch * 3K] real and [actual_batch * 3K] int scratch: the
+    // collected records (severity, value, limit; scan key) of each slot
+    cuda_real_type*  __restrict__ d_scratch_real,
+    int*             __restrict__ d_scratch_key,
     // BranchControl (outer loops): per branch, the transformer entry of a branch whose pi
     // block the slot holds itself (-1, or null: the shared *_eff), and the slots' blocks
     // ([batch * n_bc * 4], BcSlots::applied)
@@ -192,8 +211,8 @@ __global__ void check_limit_violations_kernel(
 // check_bus_q_violations_kernel  (compute_physical_violations, lightsim2grid
 // PR #206 parity -- see BusQCheck.hpp there and bus_q_check_data.hpp here)
 //
-// One thread PER active slot, same ownership / no-atomics layout as
-// check_limit_violations_kernel above: records land in this row's exclusive
+// One thread PER active slot (not a block, unlike
+// check_limit_violations_kernel above), no atomics: records land in this row's exclusive
 // slice [out_c*2K, out_c*2K+2K), LOW_Q ones then HIGH_Q ones, each type
 // holding its K largest |value - limit| (MVAr), most severe first; ties keep
 // PLAN order (the order build_bus_q_plan lists the buses, ascending grid bus
