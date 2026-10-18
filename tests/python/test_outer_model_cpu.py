@@ -30,12 +30,16 @@ CONVERGED, MAX_ITER, DIVERGED = 0, 1, 2
 RESOLVE, DONE = 0, 1
 
 
-def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None):
+def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None, extra_load=None):
+    """`extra_load`: (bus, p_mw, q_mvar) of one more load, the last one"""
+    import pandapower as pp
     import pandapower.networks as pn
     from lightsim2grid.network import init_from_pandapower
     net = pn.case14()
     net.gen["min_q_mvar"] = -q_limit
     net.gen["max_q_mvar"] = q_limit
+    if extra_load is not None:
+        pp.create_load(net, bus=extra_load[0], p_mw=extra_load[1], q_mvar=extra_load[2])
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
         grid = init_from_pandapower(net)
@@ -52,13 +56,14 @@ def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None):
     return grid
 
 
-def _newton(Ybus, V, Sbus, ref, vm_unknown, tol, max_it):
+def _newton(Ybus, V, Sbus, ref, vm_unknown, tol, max_it, skip=()):
     """A dense polar Newton: P at every bus but the reference, Q (and a Vm
     unknown) where vm_unknown. Returns (V, converged, iterations); lightsim2grid
-    checks the residual before each step, so does this one."""
+    checks the residual before each step, so does this one. The buses in `skip`
+    (masked by handle_disconnected_grid) have no equation and keep their V."""
     n = V.shape[0]
-    th_idx = np.array([b for b in range(n) if b != ref])
-    vm_idx = np.flatnonzero(vm_unknown)
+    th_idx = np.array([b for b in range(n) if b != ref and b not in skip])
+    vm_idx = np.array([b for b in np.flatnonzero(vm_unknown) if b not in skip], dtype=int)
     for it in range(max_it + 1):
         Ibus = Ybus @ V
         mis = V * np.conj(Ibus) - Sbus
@@ -83,8 +88,9 @@ def _newton(Ybus, V, Sbus, ref, vm_unknown, tol, max_it):
     return V, False, max_it
 
 
-def _run_row(h, row, Ybus, Sbus_row, ref, tol_mva=TOL_MVA, sn_mva=100.):
-    """one row through the model, the inner solves in numpy"""
+def _run_row(h, row, Ybus, Sbus_row, ref, tol_mva=TOL_MVA, sn_mva=100., masked=()):
+    """one row through the model, the inner solves in numpy (a masked bus keeps
+    the V it was loaded with, as on the device)"""
     pin_bus = np.asarray(h.pin_bus, dtype=int)
     watch = np.asarray(h.watch_bus, dtype=int)
     pq = np.asarray(h.pq, dtype=int)
@@ -107,9 +113,9 @@ def _run_row(h, row, Ybus, Sbus_row, ref, tol_mva=TOL_MVA, sn_mva=100.):
         free = pin_bus[~np.asarray(c["pin"], dtype=bool)]
         vm_unknown[free] = True
         vm_unknown[pinned] = False
-        V, conv, nr = _newton(Ybus, V, Sbus, ref, vm_unknown, tol_mva / sn_mva, MAX_IT)
+        V, conv, nr = _newton(Ybus, V, Sbus, ref, vm_unknown, tol_mva / sn_mva, MAX_IT, skip=masked)
         S = V * np.conj(Ybus @ V)
-        cand = [b for b in realistic if vm_unknown[b]]
+        cand = [b for b in realistic if vm_unknown[b] and b not in masked]
         unrealistic = bool(np.any((np.abs(V[cand]) < 0.5) | (np.abs(V[cand]) > 2.))) if cand else False
         nxt, status = h.on_solved(0, conv, nr, CONVERGED if conv else MAX_ITER,
                                   list(V[watch]), list(S[watch]), list(Sbus[watch]), [], unrealistic)
@@ -154,6 +160,59 @@ def test_host_model_matches_single_nrouter_solve(load_scale, line_off):
         if to_solver[gen.bus_id] == ref:
             continue
         assert mw == pytest.approx(gen.res_p_mw, abs=1e-6), msg
+
+
+@pytest.mark.parametrize("load_scale", [1., 1.2, 1.3])
+def test_row_masking_a_voltage_controlled_bus(load_scale):
+    """A row whose contingency strands bus 7 and its regulating generator
+    (handle_disconnected_grid masks the bus): the model builds no plan for it,
+    it filters the grid's ReactiveLimits plan (ls2g_outer_model.cpp's
+    rl_plan_masked). The row must end where lightsim2grid's single solve of the
+    grid without that trafo, generator and bus ends, with the same decisions.
+
+    A load on bus 7 makes the test bite: masking zeroes a bus' equations, not its
+    Sbus, so the device still gathers that load there, and a plan keeping the
+    masked bus would read its generator past its limit and switch it."""
+    TRAFO, GEN, BUS = 3, 3, 7                     # trafo 6-7, the generator on bus 7
+    extra_load = (BUS, 0., 30.)                   # beyond the generator's 15 MVAr
+    base = _case14(distributed=False, extra_load=extra_load)
+    base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    to_base = np.asarray(base.id_me_to_ac_solver(), dtype=int)
+    masked = int(to_base[BUS])
+    h = _cpp._OuterModelHarness(base, keep_trace=True)
+    h.set_branch_off([[len(base.get_lines()) + TRAFO]], masked=[[masked]])
+    h.begin(1, 1)
+
+    row = _case14(distributed=False, load_scale=load_scale, extra_load=extra_load)
+    row.deactivate_trafo(TRAFO)
+    row.deactivate_gen(GEN)
+    row.deactivate_load(len(row.get_loads()) - 1)
+    row.deactivate_bus(BUS)
+    v_start = np.asarray(base.get_V(), dtype=complex)
+    V_ref = row.ac_pf(v_start, MAX_IT, TOL_MVA)
+    stats = row.get_algo().get_outer_loop_stats()
+    # the row's system in the base's solver numbering, nothing at the masked bus
+    row_to_me = np.asarray(row.id_ac_solver_to_me(), dtype=int)
+    idx = to_base[row_to_me]
+    n = len(np.asarray(base.id_ac_solver_to_me()))
+    Ybus = np.zeros((n, n), dtype=complex)
+    Ybus[np.ix_(idx, idx)] = row.get_Ybus_solver().toarray()
+    Sbus_row = np.zeros(n, dtype=complex)
+    Sbus_row[idx] = np.asarray(row.get_Sbus_solver())
+    Sbus_row[masked] = np.asarray(base.get_Sbus_solver())[masked]   # the device's Sbus there
+    ref = int(np.asarray(h.slack)[0])
+
+    V, status = _run_row(h, 0, Ybus, Sbus_row, ref, masked=(masked,))
+    res = h.row_result(0)
+    msg = "\n".join(res.decisions) + "\n---- lightsim2grid\n" + "\n".join(str(d) for d in stats.decisions)
+    # the same decisions, in the same order (loop, outer iteration, action, element)
+    ours = [d.split(", value=")[0] for d in res.decisions]
+    ref_decisions = [str(d)[len("OuterDecision("):].split(", value=")[0] for d in stats.decisions]
+    assert ours == ref_decisions, msg
+    assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
+    assert int(res.status) == int(stats.status), msg
+    assert V_ref.size > 0 and status == CONVERGED, msg
+    np.testing.assert_allclose(V[idx], V_ref[row_to_me], rtol=0., atol=1e-8, err_msg=msg)
 
 
 def test_ample_reactive_limits_only_the_slack_is_shared():

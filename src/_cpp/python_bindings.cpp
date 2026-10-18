@@ -3237,11 +3237,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
-        .def("set_branch_off", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off) {
+        .def("set_branch_off", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off,
+                                  std::vector<std::vector<int>> masked) {
                 outer::RowOverrides ov;
                 ov.branch_off = std::move(branch_off);
+                ov.masked = std::move(masked);
                 h.model->set_row_overrides(std::move(ov));
-            }, "per row, the branches it opens (lines then trafos)")
+            }, pybind11::arg("branch_off"), pybind11::arg("masked") = std::vector<std::vector<int>>{},
+            "per row, the branches it opens (lines then trafos) and, optionally, the solver buses "
+            "handle_disconnected_grid masks")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;

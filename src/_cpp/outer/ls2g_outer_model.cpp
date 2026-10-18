@@ -286,6 +286,10 @@ private:
     std::vector<int> sc_bus_, sc_of_bus_;          // solver bus -> controller (-1)
     std::vector<std::vector<int>> sc_shunts_;
     std::set<int> tvc_buses_;                      // the buses the reserved ratio groups regulate
+    // DistributedSlack's participants of a row that disconnects no unit (their injections are
+    // rewritten from the row's targets in force: init_loops), and their buses
+    std::vector<ls2g::slack_redistribution::Participant> units0_;
+    std::vector<int> units0_bus_;
     // plans
     std::shared_ptr<const RlPlan> rl0_;            // the grid's (a row without masks / units off)
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
@@ -301,6 +305,9 @@ private:
     std::map<int, std::pair<int, bool>> resume_frozen_; // solver bus -> (state, realistic)
     std::vector<int> resume_phase_tap_, resume_ratio_tap_;   // by trafo id, INT_MIN: not carried
     std::vector<int> resume_sections_;                       // by shunt id, INT_MIN: not carried
+    // take_resume_targets on a row that sets no target and disconnects no unit
+    std::vector<double> resume0_gen_target_p_, resume0_sto_target_p_;
+    std::map<int, cplx> resume0_target_delta_;
     // ---- per run ------------------------------------------------------------------
     int n_rows_ = 0;
     std::vector<double> row_gen_p_, row_sto_p_;    // [n_rows * n_gen], [n_rows * n_sto]
@@ -329,6 +336,8 @@ private:
     }
     // the plan, units and active loops of the row a slot holds (its view set already)
     std::shared_ptr<const RlPlan> build_rl_plan(const ls2g::OuterGridView& v) const;
+    std::shared_ptr<const RlPlan> rl_plan_masked(const std::vector<int>& masked) const;
+    void take_resume_targets(SlotState& st) const;
     void collect_units(const ls2g::OuterGridView& v, std::vector<ls2g::slack_redistribution::Participant>& units,
                        std::vector<int>& bus) const;
     void set_active(SlotState& st) const;
@@ -572,6 +581,9 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     loops_ = loops;
     // the robust mode's last loop able to fix an unrealistic state, and is_needed: per row
     // (set_active), since a row disconnecting units changes the participants and the plan
+    // DistributedSlack's participants: collected once here, they depend on a row only
+    // through the units it disconnects (collecting them was most of a slot's load)
+    collect_units(v, units0_, units0_bus_);
 
     // ---- the layout ------------------------------------------------------------------------
     layout_.n_ctrl = nc;
@@ -611,6 +623,15 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     }
     layout_.min_realistic_v = params_.min_realistic_voltage;
     layout_.max_realistic_v = params_.max_realistic_voltage;
+    // the resumed targets of a row that sets none and disconnects no unit: the same for all
+    if (resume_) {
+        SlotState plain;
+        plain.rowv.layout = &sbl_;
+        take_resume_targets(plain);
+        resume0_gen_target_p_ = plain.gen_target_p;
+        resume0_sto_target_p_ = plain.storage_target_p;
+        resume0_target_delta_ = plain.target_delta;
+    }
 }
 
 void Ls2gOuterModel::set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p)
@@ -701,9 +722,10 @@ void Ls2gOuterModel::load(int slot, int row)
     }
     // the grid's plan, unless the row changes what it is built from: the units it
     // disconnects, the buses it masks, its machines' voltage set-points (a local bus'
-    // target_vm, what its release test compares with)
-    const bool own_plan = changes_units || !st.masked.empty() || !st.rowv.gens.target_vm.empty();
-    st.rl = own_plan ? build_rl_plan(view(st)) : rl0_;
+    // target_vm, what its release test compares with); masks alone only filter it
+    if (changes_units || !st.rowv.gens.target_vm.empty()) st.rl = build_rl_plan(view(st));
+    else if (!st.masked.empty())                          st.rl = rl_plan_masked(st.masked);
+    else                                                  st.rl = rl0_;
     // BranchControl: what the slot's system holds at the grid's taps (BranchControl::_reset),
     // without the transformers the row opens (drop_out_of_row); no control requested yet
     // (OuterControls::reset_states)
@@ -744,24 +766,25 @@ void Ls2gOuterModel::load(int slot, int row)
         st.sc_b_new.assign(static_cast<size_t>(n_sc_), 0.);
         st.sc_ctl.assign(static_cast<size_t>(n_sc_), -1);
     }
+    // DistributedSlackLoop's collect_units: the grid's participants, unless the row
+    // disconnects units (their injection is the row's target in force: init_loops)
+    if (changes_units) {
+        collect_units(view(st), st.ds_units, st.ds_unit_bus);
+    } else {
+        st.ds_units = units0_;
+        st.ds_unit_bus = units0_bus_;
+    }
     set_active(st);
     st.loop_iter.assign(st.active.size(), 0);
     if (row >= 0) {
         if (resume_) {
-            // OuterLoopAlgo::_take_targets: the targets the loops moved there, but where
-            // the row sets its own
-            const ls2g::OuterGridView v = view(st);
-            for (size_t gid = 0; gid < resume_gen_p_.size(); ++gid) {
-                const int g = static_cast<int>(gid);
-                if (std::isnan(resume_gen_p_[gid]) || v.row_sets_gen_target_p(g)) continue;
-                const int bus = v.gen_bus_solver(g);
-                if (bus >= 0) move_gen(st, g, bus, resume_gen_p_[gid]);
-            }
-            for (size_t sid = 0; sid < resume_sto_p_.size(); ++sid) {
-                const int s = static_cast<int>(sid);
-                if (std::isnan(resume_sto_p_[sid]) || v.row_sets_storage_target_p(s)) continue;
-                const int bus = v.storage_bus_solver(s);
-                if (bus >= 0) move_storage(st, s, bus, resume_sto_p_[sid]);
+            // the grid's moves, unless the row sets targets or disconnects units
+            if (changes_units || !st.rowv.gens.target_p.empty() || !st.rowv.storages.target_p.empty()) {
+                take_resume_targets(st);
+            } else {
+                st.gen_target_p = resume0_gen_target_p_;
+                st.storage_target_p = resume0_sto_target_p_;
+                st.target_delta = resume0_target_delta_;
             }
         }
         if (resume_) {
@@ -797,6 +820,48 @@ void Ls2gOuterModel::load(int slot, int row)
         st.check_unrealistic = st.last_fixing < 0;
     }
     materialize(st);
+}
+
+void Ls2gOuterModel::take_resume_targets(SlotState& st) const
+{
+    // OuterLoopAlgo::_take_targets: the targets the loops moved there, but where the row sets
+    // its own (on a slot whose injections nothing moved yet)
+    const ls2g::OuterGridView v = view(st);
+    for (size_t gid = 0; gid < resume_gen_p_.size(); ++gid) {
+        const int g = static_cast<int>(gid);
+        if (std::isnan(resume_gen_p_[gid]) || v.row_sets_gen_target_p(g)) continue;
+        const int bus = v.gen_bus_solver(g);
+        if (bus >= 0) move_gen(st, g, bus, resume_gen_p_[gid]);
+    }
+    for (size_t sid = 0; sid < resume_sto_p_.size(); ++sid) {
+        const int s = static_cast<int>(sid);
+        if (std::isnan(resume_sto_p_[sid]) || v.row_sets_storage_target_p(s)) continue;
+        const int bus = v.storage_bus_solver(s);
+        if (bus >= 0) move_storage(st, s, bus, resume_sto_p_[sid]);
+    }
+}
+
+std::shared_ptr<const RlPlan> Ls2gOuterModel::rl_plan_masked(const std::vector<int>& masked) const
+{
+    // build_rl_plan on a row whose only change is its masked buses: bus_q_check's plan skips
+    // a masked bus and nothing else depends on the masks, so it is the grid's plan without
+    // the entries on masked buses (in the same order); the monitors are kept, as there
+    auto rl = std::make_shared<RlPlan>();
+    rl->has_monitor = rl0_->has_monitor;
+    const size_t n = rl0_->plan.buses.size();
+    for (size_t k = 0; k < n; ++k) {
+        const auto& entry = rl0_->plan.buses[k];
+        const bool bus_q = k < rl0_->n_bus_q;
+        if (bus_q && std::binary_search(masked.begin(), masked.end(), entry.bus_solver)) continue;
+        if (bus_q && !entry.ctrl_pos.empty()) rl->plan.needs_controller_q = true;
+        if (bus_q) ++rl->n_bus_q;
+        RlBus bus = rl0_->buses[k];
+        bus.entry = static_cast<int>(rl->plan.buses.size());
+        rl->plan.buses.push_back(entry);
+        rl->monitor_of_entry.push_back(rl0_->monitor_of_entry[k]);
+        rl->buses.push_back(bus);
+    }
+    return rl;
 }
 
 void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
@@ -910,15 +975,12 @@ void Ls2gOuterModel::set_active(SlotState& st) const
         const LoopDecl& d = loops_[i];
         bool needed = false;
         switch (d.kind) {
-            case Kind::DistributedSlack: {
-                std::vector<ls2g::slack_redistribution::Participant> units;
-                std::vector<int> bus;
-                collect_units(v, units, bus);
+            case Kind::DistributedSlack:
                 // a unit off the slack bus to take the mismatch: the slack bus' own units would
                 // only take what it already absorbs (DistributedSlackLoop::_has_participant)
-                needed = std::any_of(bus.begin(), bus.end(), [&](int b) { return b != slack_bus_; });
+                needed = std::any_of(st.ds_unit_bus.begin(), st.ds_unit_bus.end(),
+                                     [&](int b) { return b != slack_bus_; });
                 break;
-            }
             case Kind::HvdcLimits:        needed = !hvdc_plan0_.empty(); break;
             case Kind::VoltageMonitoring: {
                 const auto& svcs = grid_->get_svcs();
@@ -928,12 +990,19 @@ void Ls2gOuterModel::set_active(SlotState& st) const
             }
             case Kind::ReactiveLimits:    needed = !st.rl->plan.empty() || st.rl->has_monitor; break;
             case Kind::PhaseControl:      needed = true; break;   // stable at once without a shifter
-            case Kind::TransformerVoltageControl:
-                for (const auto& gr : d.tvc->groups(v)) needed = needed || !gr.hidden;
+            // the groups of an active loop are kept for its initialize (init_loops)
+            case Kind::TransformerVoltageControl: {
+                auto groups = d.tvc->groups(v);
+                for (const auto& gr : groups) needed = needed || !gr.hidden;
+                if (needed) st.tvc_groups = std::move(groups);
                 break;
-            case Kind::ShuntVoltageControl:
-                for (const auto& gr : ls2g::ShuntVoltageControlLoop::groups(v, tvc_buses_)) needed = needed || !gr.hidden;
+            }
+            case Kind::ShuntVoltageControl: {
+                auto groups = ls2g::ShuntVoltageControlLoop::groups(v, tvc_buses_);
+                for (const auto& gr : groups) needed = needed || !gr.hidden;
+                if (needed) st.sv_groups = std::move(groups);
                 break;
+            }
         }
         if (needed) st.active.push_back(static_cast<int>(i));
     }
@@ -965,8 +1034,8 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
         const LoopDecl& d = loops_[static_cast<size_t>(li)];
         switch (d.kind) {
             case Kind::DistributedSlack: {
-                // DistributedSlackLoop::_initialize: each unit from its target in force
-                collect_units(view(st), st.ds_units, st.ds_unit_bus);
+                // DistributedSlackLoop::_initialize: each unit (collected by load) from its
+                // target in force
                 for (auto& u : st.ds_units)
                     u.injection_mw = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR
                         ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
@@ -981,8 +1050,8 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                 st.vm_switched_on.clear();
                 break;
             case Kind::ShuntVoltageControl: {
-                // ShuntVoltageControlLoop::_initialize: every controller on for the first solve
-                st.sv_groups = ls2g::ShuntVoltageControlLoop::groups(view(st), tvc_buses_);
+                // ShuntVoltageControlLoop::_initialize (its groups built by set_active): every
+                // controller on for the first solve
                 for (const auto& gr : st.sv_groups) {
                     if (gr.hidden) continue;
                     for (int bus : gr.controller_buses) {
@@ -993,8 +1062,8 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                 break;
             }
             case Kind::TransformerVoltageControl: {
-                // TransformerVoltageControlLoop::_initialize: every voltage control off
-                st.tvc_groups = d.tvc->groups(view(st));
+                // TransformerVoltageControlLoop::_initialize (its groups built by set_active):
+                // every voltage control off
                 st.tvc_step = 0;
                 st.tvc_frozen.clear();
                 st.tvc_enabled.assign(static_cast<size_t>(n_trafo_), 0);
@@ -1124,13 +1193,22 @@ void Ls2gOuterModel::materialize(SlotState& st) const
     for (int e = 0; e < layout_.n_hvdc; ++e)
         c.hvdc_status[static_cast<size_t>(e)] = st.hvdc_regime[static_cast<size_t>(e)] == 2
             ? hvdc_status0_[static_cast<size_t>(e)] : st.hvdc_regime[static_cast<size_t>(e)];
-    std::map<int, cplx> ds = st.target_delta;
-    for (const auto& f : st.freeze_q) ds[f.first] += cplx(0., f.second);
+    // target_delta + i.freeze_q, per bus: both sorted by bus, merged without a copy (the
+    // same sums as adding freeze_q into a copy of target_delta)
     c.sbus_bus.clear(); c.sbus_dp.clear(); c.sbus_dq.clear();
-    for (const auto& kv : ds) {
-        c.sbus_bus.push_back(kv.first);
-        c.sbus_dp.push_back(kv.second.real());
-        c.sbus_dq.push_back(kv.second.imag());
+    auto td = st.target_delta.cbegin();
+    auto fq = st.freeze_q.cbegin();
+    while (td != st.target_delta.cend() || fq != st.freeze_q.cend()) {
+        const bool take_td = td != st.target_delta.cend() && (fq == st.freeze_q.cend() || td->first <= fq->first);
+        const bool take_fq = fq != st.freeze_q.cend() && (td == st.target_delta.cend() || fq->first <= td->first);
+        const int bus = take_td ? td->first : fq->first;
+        cplx ds = take_td ? td->second : cplx(0., 0.);
+        if (take_fq) ds += cplx(0., fq->second);
+        c.sbus_bus.push_back(bus);
+        c.sbus_dp.push_back(ds.real());
+        c.sbus_dq.push_back(ds.imag());
+        if (take_td) ++td;
+        if (take_fq) ++fq;
     }
     c.vm_reset_bus = st.vm_reset_bus;
     c.vm_reset_vm = st.vm_reset_vm;
