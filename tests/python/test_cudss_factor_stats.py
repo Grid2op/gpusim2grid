@@ -61,6 +61,47 @@ def test_lu_nnz_grows_with_fill_in():
     assert _bench(B, batch_size=2).lu_nnz > _bench(A, batch_size=2).lu_nnz
 
 
+@pytest.mark.parametrize("n_groups", [2, 5])
+def test_benchmark_raw_cycles_one_handle_over_groups(n_groups, solver_atol):
+    # one handle of 3 matrices pointed at each slice in turn (bind_slice), as
+    # the continuous tail does; slice g's rhs is (g + 1)·A·1: a slice solved
+    # against another's data, or left unsolved, fails the residual check
+    from gpusim2grid import _gpusim2grid as _c
+    A = _random_system()
+    r = _c.benchmark_cudss_batch_raw(
+        A.shape[0], A.indptr.tolist(), A.indices.tolist(), A.data.tolist(),
+        3, 2, n_groups=n_groups)
+    assert r.n_groups == n_groups
+    assert r.n_nonfinite_slots == 0
+    assert r.max_rel_residual < solver_atol
+    assert r.group_cycle_ms > 0.0
+
+
+@pytest.mark.parametrize("launch", ["serial", "streams", "threads"])
+def test_benchmark_raw_independent_handles(launch, solver_atol):
+    # handle h solves slice h, whose rhs is (h + 1)·A·1: a handle solving
+    # another's slice, or a slice left unsolved, fails the residual check
+    from gpusim2grid import _gpusim2grid as _c
+    A = _random_system()
+    r = _c.benchmark_cudss_batch_raw(
+        A.shape[0], A.indptr.tolist(), A.indices.tolist(), A.data.tolist(),
+        3, 2, n_handles=4, handle_launch=launch)
+    assert r.n_handles == 4 and r.handle_launch == launch
+    assert r.n_nonfinite_slots == 0
+    assert r.max_rel_residual < solver_atol
+    assert r.handle_round_ms > 0.0 and r.handle_setup_ms > 0.0
+
+
+def test_benchmark_raw_handles_and_groups_are_exclusive():
+    from gpusim2grid import _gpusim2grid as _c
+    A = _random_system()
+    args = (A.shape[0], A.indptr.tolist(), A.indices.tolist(), A.data.tolist(), 2, 1)
+    with pytest.raises(RuntimeError, match="exclusive"):
+        _c.benchmark_cudss_batch_raw(*args, n_groups=2, n_handles=2)
+    with pytest.raises(RuntimeError, match="handle_launch"):
+        _c.benchmark_cudss_batch_raw(*args, n_handles=2, handle_launch="fibers")
+
+
 def test_session_timings_carry_factor_stats(ieee14_grid, ieee14_base_case):
     from gpusim2grid.contingency_analysis import _ContingencyAnalysisSolver
 

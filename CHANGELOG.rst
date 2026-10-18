@@ -3,6 +3,11 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] ``scheduling="continuous"``: once the queue is empty, the last rows are moved into the
+  first slots and solved in groups of 15 (``tail_max_groups``, ``tail_group_size``). cuDSS 0.8.0's batch
+  costs over 10x more from 16 matrices. ``calibrate_tail_max_groups()`` measures the setting.
+- [ADDED] ``benchmark_cudss_batch_raw(n_groups=...)``: one cuDSS handle cycled over several groups of
+  matrices, as the continuous tail does.
 - [IMPROVED] ``outer_loops=True``: loading a row into its slot is much cheaper on the host; the slack
   participants, resumed targets and reactive-limits plan are built once per grid, not per row.
 - [IMPROVED] ``compute_limit_violations``: the operational check runs one GPU block per row, not one thread,

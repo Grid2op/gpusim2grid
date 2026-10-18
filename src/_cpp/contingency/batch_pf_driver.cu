@@ -258,6 +258,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         h_sched_.resize(static_cast<size_t>(4) * batch_size_);
         d_sched_.resize(static_cast<size_t>(4) * batch_size_);
         h_slot_res_.resize(static_cast<size_t>(batch_size_));
+        h_move_.resize(static_cast<size_t>(2) * batch_size_);
+        d_move_.resize(static_cast<size_t>(2) * batch_size_);
         d_slot_res_.resize(static_cast<size_t>(batch_size_));
         sched_done_.record(cs);
 
@@ -270,47 +272,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     // The last chunk may be smaller, but the descriptor stays valid since the
     // block structure is identical within each block.
     // -------------------------------------------------------------------------
-    CHK_CSP_BPF(cusparseCreate(&spmv_batch.handle));
-    CHK_CSP_BPF(cusparseSetPointerMode(spmv_batch.handle, CUSPARSE_POINTER_MODE_HOST));
-    CHK_CSP_BPF(cusparseSetStream(spmv_batch.handle, cs));
-
-    {
-        const int bd_rows = batch_size_ * n_bus;
-        const int bd_cols = batch_size_ * n_bus;
-        const int bd_nnz  = batch_size_ * nnz_Y;
-
-        CHK_CSP_BPF(cusparseCreateConstCsr(
-            &spmv_batch.mat,
-            bd_rows, bd_cols, bd_nnz,
-            thrust::raw_pointer_cast(d_Ybus_batch_outer.data()),
-            thrust::raw_pointer_cast(d_Ybus_batch_inner.data()),
-            thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
-            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-            CUSPARSE_INDEX_BASE_ZERO, CUDA_C_TYPE));
-
-        CHK_CSP_BPF(cusparseCreateConstDnVec(
-            &spmv_batch.vec_x,
-            bd_cols,
-            thrust::raw_pointer_cast(d_V_batch.data()),
-            CUDA_C_TYPE));
-
-        CHK_CSP_BPF(cusparseCreateDnVec(
-            &spmv_batch.vec_y,
-            bd_rows,
-            thrust::raw_pointer_cast(d_Ibus_batch.data()),
-            CUDA_C_TYPE));
-
-        CHK_CSP_BPF(cusparseSpMV_bufferSize(
-            spmv_batch.handle,
-            CUSPARSE_OPERATION_NON_TRANSPOSE,
-            &h_cplx_one, spmv_batch.mat, spmv_batch.vec_x,
-            &h_cplx_zero, spmv_batch.vec_y,
-            CUDA_C_TYPE, CUSPARSE_SPMV_ALG_DEFAULT,
-            &spmv_batch.buf.size));
-
-        if (spmv_batch.buf.size > 0)
-            CHK_CUDA_BPF(cudaMalloc(&spmv_batch.buf.ptr, spmv_batch.buf.size));
-    }
+    _build_spmv(spmv_batch, batch_size_);
 
     // -------------------------------------------------------------------------
     // cuDSS uniform-batch context + ANALYSIS + policy init
@@ -1347,6 +1309,7 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     // space); _solve_chunk scatters each result to its original index.
     // Per-chunk ANALYSIS of the non-uniform cuDSS modes (0 in uniform mode).
     const double t_chunk_analysis_start = linear_solver_.analysis_ms();
+    spmv_live_ = nullptr;   // the full batch's (a continuous tail swaps it for its rounds)
     if (continuous) {
         _solve_continuous(t);
     } else {
@@ -1986,7 +1949,7 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
     const int nnz_J = base.nnz_J;
     timer.start();
     {
-        spmv_batch.spmv();
+        _spmv().spmv();
 
         if (n_slots > 0) {
             fill_FP_kernel<<<
@@ -2345,6 +2308,194 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
 }
 
 // =============================================================================
+// _build_spmv — the block-diagonal Ybus·V SpMV over the first n_slots slots
+// into `sp`: its handle is created once (bound to cs), its descriptors are
+// replaced. A prefix of the block-diagonal skeleton is a valid CSR as is, so
+// the continuous tail's SpMV is this one over its n_groups * G slots.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_build_spmv(CuSpMV& sp, int n_slots)
+{
+    if (sp.handle == nullptr) {
+        CHK_CSP_BPF(cusparseCreate(&sp.handle));
+        CHK_CSP_BPF(cusparseSetPointerMode(sp.handle, CUSPARSE_POINTER_MODE_HOST));
+        CHK_CSP_BPF(cusparseSetStream(sp.handle, cs));
+    }
+    if (sp.vec_y) { cusparseDestroyDnVec(sp.vec_y);  sp.vec_y = nullptr; }
+    if (sp.vec_x) { cusparseDestroyDnVec(sp.vec_x);  sp.vec_x = nullptr; }
+    if (sp.mat)   { cusparseDestroySpMat(sp.mat);    sp.mat   = nullptr; }
+
+    const int bd_rows = n_slots * base.n_bus;
+    const int bd_nnz  = n_slots * base.nnz_Y;
+    CHK_CSP_BPF(cusparseCreateConstCsr(
+        &sp.mat,
+        bd_rows, bd_rows, bd_nnz,
+        thrust::raw_pointer_cast(d_Ybus_batch_outer.data()),
+        thrust::raw_pointer_cast(d_Ybus_batch_inner.data()),
+        thrust::raw_pointer_cast(d_Ybus_values_batch.data()),
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, CUDA_C_TYPE));
+    CHK_CSP_BPF(cusparseCreateConstDnVec(
+        &sp.vec_x, bd_rows, thrust::raw_pointer_cast(d_V_batch.data()), CUDA_C_TYPE));
+    CHK_CSP_BPF(cusparseCreateDnVec(
+        &sp.vec_y, bd_rows, thrust::raw_pointer_cast(d_Ibus_batch.data()), CUDA_C_TYPE));
+
+    size_t need = 0;
+    CHK_CSP_BPF(cusparseSpMV_bufferSize(
+        sp.handle,
+        CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &h_cplx_one, sp.mat, sp.vec_x,
+        &h_cplx_zero, sp.vec_y,
+        CUDA_C_TYPE, CUSPARSE_SPMV_ALG_DEFAULT,
+        &need));
+    if (need > sp.buf.size) {
+        if (sp.buf.ptr) CHK_CUDA_BPF(cudaFree(sp.buf.ptr));
+        sp.buf.ptr  = nullptr;
+        sp.buf.size = 0;
+        CHK_CUDA_BPF(cudaMalloc(&sp.buf.ptr, need));
+        sp.buf.size = need;
+    }
+}
+
+// =============================================================================
+// _tail_solve — the continuous tail's linear solve over n_groups groups: the
+// handle analysed for tail_group_size_ matrices (built on first use, rebuilt
+// when the group size changed), on the driver's own J / F / dx buffers and
+// with the forward's cuDSS configuration.
+// =============================================================================
+template <typename BatchSource>
+TailSolve BatchPfDriver<BatchSource>::_tail_solve(int n_groups)
+{
+    const int G = tail_group_size_;
+    if (!tail_solver_ || tail_solver_G_ != G) {
+        tail_solver_.reset();
+        tail_solver_ = std::make_unique<CudssBatchSolver>();
+        tail_solver_->initialize(
+            G, base.dim_J, base.nnz_J,
+            thrust::raw_pointer_cast(base.d_J_outer.data()),
+            thrust::raw_pointer_cast(base.d_J_inner.data()),
+            thrust::raw_pointer_cast(d_J_values_batch.data()),
+            thrust::raw_pointer_cast(d_F_batch.data()),
+            thrust::raw_pointer_cast(d_dx_batch.data()),
+            cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_);
+        tail_solver_G_ = G;
+    }
+    TailSolve ts;
+    ts.solver   = tail_solver_.get();
+    ts.G        = G;
+    ts.n_groups = n_groups;
+    ts.dim_J    = base.dim_J;
+    ts.nnz_J    = base.nnz_J;
+    return ts;
+}
+
+// =============================================================================
+// _compact_tail — every live row of a slot in [n_keep, n_cur) moves into a
+// phantom slot below n_keep (n_keep >= the live rows: there are enough), so
+// the rounds can run on the first n_keep slots. What moves is everything a
+// row's next iterations read or carry that lives per slot: V, its Ybus (the
+// contingency patches and the outer loops' tap / shunt stamps, with what they
+// record as stamped), slack_absorbed, the controllers' Q, the source's
+// per-slot rows (Sbus with its corrections, slack weights, v_set), the outer
+// controls (device and host mirrors, BranchControl / ShuntControl state) and
+// the outer model's slot; the host's iteration counter and slot table. J, F,
+// dx and Ibus are rebuilt every iteration. The vacated slot keeps a copy of
+// the row (a valid, finite system: it is never reloaded, never iterated
+// again) and becomes a phantom. The mask streams follow the new slot table at
+// the next _bound_nr_buffers. A NEW per-slot buffer must be added here.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_compact_tail(int n_keep, int n_cur, std::vector<int>& iters,
+                                               BatchTimings& t)
+{
+    const int S = batch_size_;
+    int* slot_row = h_slot_row();
+    int* from = h_move_.ptr;
+    int* to   = h_move_.ptr + S;
+    int n = 0;
+    for (int s = n_keep, p = 0; s < n_cur; ++s) {
+        if (slot_row[s] < 0) continue;
+        while (slot_row[p] >= 0) ++p;
+        from[n] = s;
+        to[n]   = p++;
+        ++n;
+    }
+    if (n == 0) return;
+
+    _wait_sched_upload();   // the slot table is rewritten below
+    for (int i = 0; i < n; ++i) {
+        slot_row[to[i]]   = slot_row[from[i]];
+        slot_row[from[i]] = -1;
+        iters[static_cast<size_t>(to[i])]   = iters[static_cast<size_t>(from[i])];
+        iters[static_cast<size_t>(from[i])] = 0;
+    }
+    int* d_from = thrust::raw_pointer_cast(d_move_.data());
+    int* d_to   = d_from + S;
+    CHK_CUDA_BPF(cudaMemcpyAsync(d_from, from, static_cast<size_t>(n) * sizeof(int),
+                                 cudaMemcpyHostToDevice, cs));
+    CHK_CUDA_BPF(cudaMemcpyAsync(d_to, to, static_cast<size_t>(n) * sizeof(int),
+                                 cudaMemcpyHostToDevice, cs));
+    SlotMoveView M;
+    M.n = n; M.d_from = d_from; M.d_to = d_to; M.h_from = from; M.h_to = to;
+
+    auto raw = [](auto& v) { return thrust::raw_pointer_cast(v.data()); };
+    launch_move_slot_rows(raw(d_V_batch), base.n_bus, M, cs);
+    launch_move_slot_rows(raw(d_Ybus_values_batch), base.nnz_Y, M, cs);
+    if (!d_slack_absorbed_batch.empty()) launch_move_slot_rows(raw(d_slack_absorbed_batch), 1, M, cs);
+    if (!d_vc_q_batch.empty())           launch_move_slot_rows(raw(d_vc_q_batch), base.n_vc_ctrl, M, cs);
+    source_.move_slots(M, base.n_bus, cs);
+
+    if (outer_hook_ != nullptr && oc_stride_ > 0) {
+        const outer::Layout& Lo = outer_hook_->layout();
+        const int n_pin = static_cast<int>(Lo.pin_bus.size());
+        // the host mirrors first (_oc_write_controls uploads them whole)
+        auto move_host = [&](auto& h, int w) {
+            if (w <= 0) return;
+            for (int i = 0; i < n; ++i)
+                std::copy_n(h.begin() + static_cast<ptrdiff_t>(from[i]) * w, w,
+                            h.begin() + static_cast<ptrdiff_t>(to[i]) * w);
+        };
+        move_host(h_oc_pin_, n_pin);
+        move_host(h_oc_held_q_, Lo.n_ctrl);
+        move_host(h_oc_plan_held_, Lo.n_ctrl);
+        move_host(h_oc_vset_, Lo.n_grp);
+        move_host(h_oc_hvdc_, Lo.n_hvdc);
+        if (n_pin > 0)     launch_move_slot_rows(raw(d_oc_pin_), n_pin, M, cs);
+        if (Lo.n_ctrl > 0) {
+            launch_move_slot_rows(raw(d_oc_held_q_), Lo.n_ctrl, M, cs);
+            launch_move_slot_rows(raw(d_oc_plan_held_), Lo.n_ctrl, M, cs);
+        }
+        if (Lo.n_grp > 0)  launch_move_slot_rows(raw(d_oc_vset_), Lo.n_grp, M, cs);
+        if (Lo.n_hvdc > 0) launch_move_slot_rows(raw(d_oc_hvdc_), Lo.n_hvdc, M, cs);
+        if (base.n_bc > 0) {
+            const int w = base.n_bc;
+            launch_move_slot_rows(raw(d_bc_a_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_rho_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_a_target_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_a_tap_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_rho_tap_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_rho_target_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_tap_), 4 * w, M, cs);
+            launch_move_slot_rows(raw(d_bc_applied_), 4 * w, M, cs);
+            launch_move_slot_rows(raw(d_bc_on_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_out_), w, M, cs);
+            launch_move_slot_rows(raw(d_bc_ron_), w, M, cs);
+        }
+        if (base.n_sc > 0) {
+            const int w = base.n_sc;
+            launch_move_slot_rows(raw(d_sc_b_), w, M, cs);
+            launch_move_slot_rows(raw(d_sc_b_applied_), w, M, cs);
+            launch_move_slot_rows(raw(d_sc_b_target_), w, M, cs);
+            launch_move_slot_rows(raw(d_sc_on_), w, M, cs);
+        }
+        for (int i = 0; i < n; ++i) outer_hook_->move(from[i], to[i]);
+    }
+    CHK_CUDA_BPF(cudaGetLastError());
+    _upload_sched();   // the new slot table
+    t.n_slot_moves += n;
+}
+
+// =============================================================================
 // _solve_continuous — the continuous schedule (docs/dev_notes/
 // continuous_batching.md). S = batch_size_ slots, filled from the queue of
 // active rows in order; every round runs k = nb_iter_per_round_ Newton
@@ -2361,6 +2512,14 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
 // Rows are loaded in active order into the freed slots in increasing slot
 // order, so a row's trajectory depends on that row alone. A loaded row always
 // runs at least k iterations (it is first checked after its first round).
+// The tail (tail_max_groups_ > 0, PolicyRefactorEvery): once the queue is
+// empty and the live rows fit in tail_max_groups_ groups of G =
+// tail_group_size_ slots, they are moved into the first n_cur = G * groups
+// slots (_compact_tail) and every later round runs on those slots only (the
+// Newton kernels, the prefix SpMV, the residual pass, the evictions), its
+// linear solve on the G-matrix handle cycled over the groups (TailSolve).
+// n_cur only shrinks: the live rows only leave. A moved row's trajectory is
+// its own up to cuDSS's rounding (another handle factorizes it).
 // =============================================================================
 template <typename BatchSource>
 void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
@@ -2379,6 +2538,35 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     int       q      = 0;     // next active row of the queue
     int       rounds = 0;
     long long useful = 0;     // row-iterations spent on real rows
+    long long run    = 0;     // slot-iterations run (n_cur per round)
+
+    // the tail: the slots the rounds run on (S, then G * groups), its solve
+    const int G = tail_group_size_;
+    const bool tail_ok = tail_max_groups_ > 0 && G >= 1 && G < S
+                         && std::holds_alternative<PolicyRefactorEvery>(policy_);
+    int       n_cur   = S;
+    bool      in_tail = false;
+    TailSolve tail;
+    spmv_live_ = nullptr;
+    // Once the queue is empty: shrink the rounds to the groups the live rows
+    // fit in, when there are few enough of them and that is fewer slots.
+    auto enter_tail = [&](int n_live) {
+        if (!tail_ok || q < n_active_ || n_live <= 0) return;
+        const int groups = (n_live + G - 1) / G;
+        if (groups > tail_max_groups_ || groups * G >= n_cur) return;
+        const auto t_c0 = std::chrono::steady_clock::now();
+        _compact_tail(groups * G, n_cur, iters, t);
+        n_cur = groups * G;
+        if (!spmv_tail_) spmv_tail_ = std::make_unique<CuSpMV>();
+        if (spmv_tail_n_ != n_cur) {
+            _build_spmv(*spmv_tail_, n_cur);
+            spmv_tail_n_ = n_cur;
+        }
+        spmv_live_ = spmv_tail_.get();
+        tail       = _tail_solve(groups);
+        in_tail    = true;
+        t.t_tail_compact += TimingEntry{0., ms_since(t_c0)};
+    };
 
     if (hook != nullptr) {
         const auto t_l0 = std::chrono::steady_clock::now();
@@ -2414,6 +2602,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         _oc_write_controls(all, /*reload_sbus=*/false);
         t.t_oc_controls += TimingEntry{0., ms_since(t_c0)};
     }
+    enter_tail(n_live);   // fewer rows than slots: the queue is empty already
     NrIterBuffers buf = _bound_nr_buffers(_table_view(-1));
 
     std::vector<int> reenter, conv, loaded;
@@ -2422,20 +2611,23 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     while (n_live > 0) {
         std::visit([&](auto& policy) {
             run_nr_loop(
-                policy, linear_solver_, spmv_batch, buf,
+                policy, linear_solver_, _spmv(), buf,
                 base.n_bus, base.n_pvpq, base.n_pq, dim_J, nnz_Y, nnz_J,
-                /*batch_size=*/S, /*nb_iter=*/k, cs, timer, t);
+                /*batch_size=*/n_cur, /*nb_iter=*/k, cs, timer, t,
+                in_tail ? &tail : nullptr);
         }, policy_);
         ++rounds;
+        run += n_cur;
+        if (in_tail) ++t.n_tail_rounds;
 
         // Per-slot residual at the current V, slot order.
-        _residual_pass(buf, S, thrust::raw_pointer_cast(d_slot_res_.data()), /*c_start=*/0,
+        _residual_pass(buf, n_cur, thrust::raw_pointer_cast(d_slot_res_.data()), /*c_start=*/0,
                        /*d_result_map=*/nullptr, /*d_slot_active=*/nullptr, timer, t);
 
         // ---- host: decisions, eviction map, load list --------------------
         const auto t_sched0 = std::chrono::steady_clock::now();
         CHK_CUDA_BPF(cudaMemcpyAsync(h_slot_res_.ptr, thrust::raw_pointer_cast(d_slot_res_.data()),
-                                     static_cast<size_t>(S) * sizeof(cuda_real_type),
+                                     static_cast<size_t>(n_cur) * sizeof(cuda_real_type),
                                      cudaMemcpyDeviceToHost, cs));
         cs.synchronize();   // also retires the previous H->D of the staging block
         const auto t_sched1 = std::chrono::steady_clock::now();
@@ -2548,22 +2740,22 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         // the checks read them. (A re-entering row rewrote only its own Sbus
         // and controls: d_F, d_V of the leaving slots are untouched.)
         timer.start();
-        compute_residuals_kernel<<<S, BS, static_cast<size_t>(BS) * sizeof(cuda_real_type), cs>>>(
+        compute_residuals_kernel<<<n_cur, BS, static_cast<size_t>(BS) * sizeof(cuda_real_type), cs>>>(
             thrust::raw_pointer_cast(d_residuals.data()),
             thrust::raw_pointer_cast(d_F_batch.data()),
-            dim_J, S, /*c_start=*/0, d_result_map, d_evict());
+            dim_J, n_cur, /*c_start=*/0, d_result_map, d_evict());
         t.t_residual += timer.stop_ms();
-        _evict(buf, S, /*c_start=*/0, d_evict(), timer, t);
+        _evict(buf, n_cur, /*c_start=*/0, d_evict(), timer, t);
         // the transformers the leaving rows' loops moved: their slots' Ybus back to the
         // grid's blocks (a source that never reloads Ybus, an injection sweep, reuses it)
         if (hook != nullptr && base.n_bc > 0)
-            bc_restore_kernel<<<nr_grid_size(static_cast<long long>(S), BS), BS, 0, cs>>>(
+            bc_restore_kernel<<<nr_grid_size(static_cast<long long>(n_cur), BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
-                d_evict(), base.nnz_Y, S);
+                d_evict(), base.nnz_Y, n_cur);
         if (hook != nullptr && base.n_sc > 0)
-            sc_restore_kernel<<<nr_grid_size(static_cast<long long>(S) * base.n_sc, BS), BS, 0, cs>>>(
+            sc_restore_kernel<<<nr_grid_size(static_cast<long long>(n_cur) * base.n_sc, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.sc_static(), _sc_slots(),
-                d_evict(), base.nnz_Y, S);
+                d_evict(), base.nnz_Y, n_cur);
 
         // ---- refill the freed slots ---------------------------------------
         if (n_live == 0) break;   // everything left; no round follows
@@ -2580,8 +2772,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_c0).count()};
         }
+        enter_tail(n_live);
         buf = _bound_nr_buffers(_table_view(-1));
     }
+    spmv_live_ = nullptr;
 
     // every slot's Ybus back to the grid's blocks (the phantom slots' too)
     if (hook != nullptr && base.n_bc > 0) {
@@ -2598,8 +2792,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     }
 
     t.n_rounds  = rounds;
-    t.occupancy = rounds > 0
-        ? static_cast<double>(useful) / (static_cast<double>(rounds) * k * S) : 0.;
+    t.occupancy = run > 0
+        ? static_cast<double>(useful) / (static_cast<double>(run) * k) : 0.;
 }
 
 // =============================================================================

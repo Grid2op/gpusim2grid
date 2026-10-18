@@ -113,6 +113,55 @@ class SchedulingEngineMixin:
         self._s.nb_iter_per_round = value
 
     @property
+    def tail_max_groups(self):
+        """Continuous scheduling, the tail: once the queue is empty and the live
+        rows fit in this many groups of ``tail_group_size`` slots, they are
+        moved into the first slots and every later round runs on those groups
+        only, its linear solve on a cuDSS handle of ``tail_group_size``
+        matrices cycled over them (cuDSS 0.8.0's uniform batch costs over an
+        order of magnitude more from 16 matrices on, so the full batch only
+        pays while many rows are live). Default 16; 0 turns the tail off.
+        :meth:`calibrate_tail_max_groups` measures the value for a GPU and a
+        grid. Only with ``strategy='direct_refactor_every'``. A moved row's
+        result is its own up to cuDSS's rounding. Takes effect on the next
+        run()."""
+        return self._s.tail_max_groups
+
+    @tail_max_groups.setter
+    def tail_max_groups(self, value):
+        value = int(value)
+        if value < 0:
+            raise ValueError("tail_max_groups must be >= 0 (0 turns the tail off)")
+        self._s.tail_max_groups = value
+
+    @property
+    def tail_group_size(self):
+        """Continuous scheduling: matrices of the tail's cuDSS handle (see
+        :attr:`tail_max_groups`). Default 15, the largest uniform batch before
+        cuDSS 0.8.0's cost cliff. Takes effect on the next run()."""
+        return self._s.tail_group_size
+
+    @tail_group_size.setter
+    def tail_group_size(self, value):
+        value = int(value)
+        if value < 1:
+            raise ValueError("tail_group_size must be >= 1")
+        self._s.tail_group_size = value
+
+    def calibrate_tail_max_groups(self, n_repeat=5, batch_size=None):
+        """Measure a :attr:`tail_max_groups` for this grid on this GPU: the
+        base case's Jacobian refactorized and solved ``n_repeat`` times on a
+        cuDSS handle of ``batch_size`` matrices (None: :attr:`batch_size`) and
+        on one of :attr:`tail_group_size` matrices. Returns the
+        ``TailCalibration`` (``t_full_ms``, ``t_group_ms``, ``max_groups =
+        floor(t_full_ms / t_group_ms)``, what the tail's rule compares); sets
+        nothing. cuDSS only: the tail also runs the Newton kernels on fewer
+        slots, so ``max_groups`` is conservative. Allocates ``batch_size``
+        systems and their factors while it runs."""
+        return self._s.calibrate_tail_max_groups(
+            int(n_repeat), -1 if batch_size is None else int(batch_size))
+
+    @property
     def tol(self):
         """A row has converged when ``||F||inf < tol``, the residual in per unit
         (what ``residuals`` / ``last_residuals()`` report and ``violation_tol``
@@ -173,6 +222,28 @@ class SchedulingFacadeMixin:
     @nb_iter_per_round.setter
     def nb_iter_per_round(self, value):
         self._inner.nb_iter_per_round = value
+
+    @property
+    def tail_max_groups(self):
+        """See :attr:`SchedulingEngineMixin.tail_max_groups`."""
+        return self._inner.tail_max_groups
+
+    @tail_max_groups.setter
+    def tail_max_groups(self, value):
+        self._inner.tail_max_groups = value
+
+    @property
+    def tail_group_size(self):
+        """See :attr:`SchedulingEngineMixin.tail_group_size`."""
+        return self._inner.tail_group_size
+
+    @tail_group_size.setter
+    def tail_group_size(self, value):
+        self._inner.tail_group_size = value
+
+    def calibrate_tail_max_groups(self, n_repeat=5, batch_size=None):
+        """See :meth:`SchedulingEngineMixin.calibrate_tail_max_groups`."""
+        return self._inner.calibrate_tail_max_groups(n_repeat, batch_size)
 
     @property
     def tol(self):

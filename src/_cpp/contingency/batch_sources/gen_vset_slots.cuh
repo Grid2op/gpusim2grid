@@ -73,6 +73,13 @@ struct GenVsetSlots {
                 /*row_offset=*/0, k_active, S, n_grp);
     }
 
+    // The continuous tail's compaction: slot rows follow their moves.
+    void move_slots(const SlotMoveView& M, cudaStream_t cs)
+    {
+        if (!active || n_grp <= 0 || d_vset_batch.empty()) return;
+        launch_move_slot_rows(thrust::raw_pointer_cast(d_vset_batch.data()), n_grp, M, cs);
+    }
+
     void fill(NrIterBuffers& buf) const
     {
         if (!active || n_grp <= 0 || d_vset_batch.empty()) return;

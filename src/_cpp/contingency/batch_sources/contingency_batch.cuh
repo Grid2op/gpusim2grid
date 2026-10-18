@@ -302,6 +302,16 @@ struct ContingencyBatch {
         slack_.fill(buf);
     }
 
+    // The continuous tail's compaction (BatchPfDriver::_compact_tail): this
+    // source's per-slot rows follow their moves (the masks follow the slot
+    // table at the next bind_slots).
+    void move_slots(const SlotMoveView& M, int n_bus, cudaStream_t cs)
+    {
+        if (sbus_stride(n_bus) > 0 && !d_Sbus_batch.empty())
+            launch_move_slot_rows(thrust::raw_pointer_cast(d_Sbus_batch.data()), n_bus, M, cs);
+        slack_.move_slots(M, cs);
+    }
+
     // -------------------------------------------------------------------------
     // d_Sbus_ptr  — the base-case Sbus pointer (shared across all batch
     // elements), or this chunk's per-slot copy when some row was corrected.

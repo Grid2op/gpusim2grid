@@ -207,6 +207,7 @@ void InjectionSweepSession::run()
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
     if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+    check_tail_settings(tail_max_groups_, tail_group_size_);
     if (outer_) {
         auto refuse = [](const std::string& what) {
             throw std::runtime_error("InjectionSweepSession: the outer loops do not support " + what + " yet");
@@ -305,6 +306,8 @@ void InjectionSweepSession::run()
     solver_->nb_iter_           = nb_iter_;
     solver_->nb_iter_per_round_ = nb_iter_per_round_;
     solver_->tol_               = tol_;
+    solver_->tail_max_groups_   = tail_max_groups_;
+    solver_->tail_group_size_   = tail_group_size_;
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
     // violations); an injection sweep never disconnects a generator (nullptr mask).

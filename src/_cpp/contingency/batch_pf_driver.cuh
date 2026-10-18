@@ -84,6 +84,8 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+struct TailSolve;   // driver.cuh: the linear solve of a continuous run's tail
+
 // -----------------------------------------------------------------------------
 // BatchPfDriverContext — non-owning per-chunk view passed to the BatchSource
 // hooks.  Plain struct (no templates) to keep BatchSource types decoupled from
@@ -133,6 +135,19 @@ inline void check_continuous_scheduling(ContingencySolverType strategy,
         throw std::invalid_argument("scheduling='continuous': nb_iter_per_round must be >= 1");
     if (!(tol > 0.) || !std::isfinite(tol))
         throw std::invalid_argument("scheduling='continuous': tol must be a positive finite number");
+}
+
+// -----------------------------------------------------------------------------
+// check_tail_settings -- the continuous tail's knobs (BatchPfDriver::
+// tail_max_groups_ / tail_group_size_): tail_max_groups >= 0 (0 = off),
+// tail_group_size >= 1. Throws std::invalid_argument (ValueError in Python).
+// -----------------------------------------------------------------------------
+inline void check_tail_settings(int tail_max_groups, int tail_group_size)
+{
+    if (tail_max_groups < 0)
+        throw std::invalid_argument("tail_max_groups must be >= 0 (0 turns the tail off)");
+    if (tail_group_size < 1)
+        throw std::invalid_argument("tail_group_size must be >= 1");
 }
 
 // -----------------------------------------------------------------------------
@@ -575,6 +590,30 @@ struct BatchPfDriver {
                  PolicyIter0Only,
                  PolicyRefactorEveryN> policy_;
 
+    // -------------------------------------------------------------------------
+    // The tail of a continuous run (docs/dev_notes/outer_loops_performance.md,
+    // step 3). Once the queue is empty and the live rows fit in
+    // tail_max_groups_ groups of tail_group_size_ slots, they are moved into
+    // the first slots (_compact_tail) and the rounds run on those groups only:
+    // the Newton kernels and a prefix SpMV over n_groups * G slots, the linear
+    // solve on one more cuDSS handle analysed for G matrices, cycled over the
+    // groups (TailSolve). cuDSS 0.8.0's uniform batch costs over an order of
+    // magnitude more from 16 matrices on, so G <= 15 and the full S-slot solve
+    // only pays while many rows are live. tail_max_groups_ = 0: off. Only with
+    // PolicyRefactorEvery (the others keep factors across iterations). Public
+    // and set per run like nb_iter_per_round_ (the sessions patch them); the
+    // handle and the prefix SpMV are built on the first tail round that needs
+    // them and kept for the driver's life.
+    // -------------------------------------------------------------------------
+    int tail_max_groups_ = 16;
+    int tail_group_size_ = 15;
+    std::unique_ptr<CudssBatchSolver> tail_solver_;   // analysed for tail_solver_G_ matrices
+    int                               tail_solver_G_ = 0;
+    std::unique_ptr<CuSpMV>           spmv_tail_;     // over the first spmv_tail_n_ slots
+    int                               spmv_tail_n_ = 0;
+    CuSpMV*                           spmv_live_ = nullptr;   // the rounds' SpMV, null = spmv_batch
+    CuSpMV& _spmv() { return spmv_live_ != nullptr ? *spmv_live_ : spmv_batch; }
+
     // cuDSS analysis config, retained so the lazily built adjoint context
     // (BatchAdjoint) analyses Jᵀ with the same choices as the forward.
     ReorderingAlg   reordering_alg_    = ReorderingAlg::Default;
@@ -1006,6 +1045,10 @@ private:
     const int* d_evict()     const { return d_load_slot() + 2 * batch_size_; }
     const int* d_slot_row()  const { return d_load_slot() + 3 * batch_size_; }
 
+    // the tail compaction's moves: [from | to], S each, and their device twin
+    PinnedBuffer<int>                     h_move_;
+    thrust::device_vector<int>            d_move_;
+
     void _wait_sched_upload() { sched_done_.synchronize(); }
     void _upload_sched();
     SlotLoadView  _load_view(int n_load, int chunk, int n_real);
@@ -1015,6 +1058,14 @@ private:
     // The NR buffers of the current slot table (masks re-bound by the source).
     NrIterBuffers _bound_nr_buffers(const SlotTableView& T);
     void _solve_continuous(BatchTimings& t);
+    // The tail (tail_max_groups_): the block-diagonal SpMV over the first
+    // n_slots slots into `sp` (its handle kept, its descriptors replaced); the
+    // live rows of slots >= n_live moved into the phantom slots below n_live
+    // (every per-slot buffer, the source's, the outer model's, the host
+    // `iters`); the G-matrix handle, built on first use.
+    void _build_spmv(CuSpMV& sp, int n_slots);
+    void _compact_tail(int n_live, int n_cur, std::vector<int>& iters, BatchTimings& t);
+    TailSolve _tail_solve(int n_groups);
     // Host copy of the source's active -> original row map (empty = identity).
     std::vector<int> h_a2o_;
     int _orig_row(int a) const { return h_a2o_.empty() ? a : h_a2o_[static_cast<size_t>(a)]; }

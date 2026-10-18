@@ -145,6 +145,13 @@ struct ScenarioSweepSession {
     BatchScheduling scheduling_        = BatchScheduling::Chunked;
     int             nb_iter_per_round_ = 1;
     double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
+    // Continuous scheduling, the tail (BatchPfDriver::tail_max_groups_): once
+    // the queue is empty and the live rows fit in tail_max_groups_ groups of
+    // tail_group_size_ slots, the rounds run on those groups only, their
+    // linear solve on a cuDSS handle of tail_group_size_ matrices (0 = off).
+    // Mutable, taken by the next run().
+    int             tail_max_groups_   = 16;
+    int             tail_group_size_   = 15;
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;

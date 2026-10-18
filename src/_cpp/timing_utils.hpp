@@ -403,6 +403,11 @@ struct BatchTimings {
     // outer loops: the host model's own setup of the run and of every slot
     // (OuterHook::begin, _oc_setup, OuterHook::load on each (re)load), wall.
     TimingEntry t_oc_load;
+    // continuous batching, the tail (tail_max_groups): the moves of the live
+    // rows into the first slots (host bookkeeping, H->D of the move list, the
+    // row copies, OuterHook::move) and the prefix SpMV / G-matrix cuDSS
+    // handle set up on the way, wall.
+    TimingEntry t_tail_compact;
 
     // Whole-call wall clocks (ms), to find what no phase above covers:
     // BatchPfDriver::solve() from entry to return, and the session's run()
@@ -429,7 +434,11 @@ struct BatchTimings {
     int    scheduling        = 0;
     int    nb_iter_per_round = 0;   // k
     int    n_rounds          = 0;   // rounds of k iterations
-    double occupancy         = 0.;  // useful row-iterations / (S * iterations run)
+    double occupancy         = 0.;  // useful row-iterations / slot-iterations run (S per round, n_cur in the tail)
+    // the tail: rounds run on the compacted live rows with the G-matrix cuDSS
+    // handle (tail_max_groups), and the slot moves that compaction made
+    int    n_tail_rounds     = 0;
+    int    n_slot_moves      = 0;
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
@@ -464,7 +473,7 @@ struct BatchTimings {
               + t_store_V        + t_violation_check + t_bus_q_check
               + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
               + t_flow_computation + t_schedule + t_oc_controls
-              + t_oc_load).wall_ms;
+              + t_oc_load + t_tail_compact).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

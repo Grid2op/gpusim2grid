@@ -162,6 +162,14 @@ struct InjectionBatch {
         gv_vset_.fill(buf);
     }
 
+    // The continuous tail's compaction (BatchPfDriver::_compact_tail): this
+    // source's per-slot rows follow their moves.
+    void move_slots(const SlotMoveView& M, int n_bus, cudaStream_t cs)
+    {
+        launch_move_slot_rows(thrust::raw_pointer_cast(d_Sbus_batch.data()), n_bus, M, cs);
+        gv_vset_.move_slots(M, cs);
+    }
+
     // -------------------------------------------------------------------------
     // d_Sbus_ptr  — returns the per-batch Sbus pointer.
     // -------------------------------------------------------------------------

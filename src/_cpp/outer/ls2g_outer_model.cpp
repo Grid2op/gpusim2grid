@@ -241,6 +241,7 @@ public:
     const Layout& layout() const override { return layout_; }
     void begin(int n_slots, int n_rows) override;
     void load(int slot, int row) override;
+    void move(int from, int to) override;
     const SlotControls& controls(int slot) const override { return slots_[static_cast<size_t>(slot)].ctl; }
     void clear_vm_reset(int slot) override;
     Next on_solved(int slot, bool converged, int nr_iter, int inner_status,
@@ -1012,6 +1013,18 @@ void Ls2gOuterModel::set_active(SlotState& st) const
             const Kind k = loops_[static_cast<size_t>(st.active[i])].kind;
             if (k == Kind::ReactiveLimits || k == Kind::TransformerVoltageControl) st.last_fixing = static_cast<int>(i);
         }
+}
+
+// =============================================================================
+// The tail compaction moves a row to another slot: its whole state follows.
+// The row view points at the slot's own masked list, re-pointed here.
+// =============================================================================
+void Ls2gOuterModel::move(int from, int to)
+{
+    SlotState& dst = slots_[static_cast<size_t>(to)];
+    dst = std::move(slots_[static_cast<size_t>(from)]);
+    if (dst.rowv.masked != nullptr) dst.rowv.masked = &dst.masked;
+    slots_[static_cast<size_t>(from)] = SlotState();
 }
 
 void Ls2gOuterModel::clear_vm_reset(int slot)

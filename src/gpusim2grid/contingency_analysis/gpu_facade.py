@@ -762,6 +762,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         dst.strategy = src.strategy
         dst.refactor_period = src.refactor_period
         dst.nb_iter_per_round = src.nb_iter_per_round
+        dst.tail_max_groups = src.tail_max_groups
+        dst.tail_group_size = src.tail_group_size
         dst.tol = src.tol
         dst.scheduling = src.scheduling
         dst.ir_n_steps = src.ir_n_steps

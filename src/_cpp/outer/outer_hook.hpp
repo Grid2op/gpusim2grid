@@ -154,6 +154,10 @@ public:
     // start from the default control state.
     virtual void load(int slot, int row) = 0;
     virtual const SlotControls& controls(int slot) const = 0;
+    // The row in slot `from` now lives in slot `to` (the tail compaction of a
+    // continuous run moves the live rows into the first slots): everything the
+    // model keeps for it follows; `from` is left as an empty phantom slot.
+    virtual void move(int from, int to) = 0;
     // The driver applied the slot's one-shot edits (|V| resets, re-taps).
     virtual void clear_vm_reset(int slot) = 0;
     // The pi block of every transformer the row's loops moved off the grid's taps, at its

@@ -178,6 +178,14 @@ struct SlotSlackRedistribution {
         ssr_chk_cuda(cudaGetLastError(), "Sbus correction scatter");
     }
 
+    // The continuous tail's compaction: the slots' weights follow their moves
+    // (the Sbus correction is in the source's Sbus rows, moved with them).
+    void move_slots(const SlotMoveView& M, cudaStream_t cs)
+    {
+        if (!has_weights() || d_w_batch.empty()) return;
+        launch_move_slot_rows(thrust::raw_pointer_cast(d_w_batch.data()), n_slack, M, cs);
+    }
+
     void fill(NrIterBuffers& buf) const
     {
         if (!has_weights()) return;

@@ -904,6 +904,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_oc_load", &BatchTimings::t_oc_load,
                       "Outer loops: the host model's setup of the run and of each (re)loaded slot "
                       "(begin, load), wall")
+        .def_readonly("t_tail_compact", &BatchTimings::t_tail_compact,
+                      "Continuous scheduling, the tail: moves of the live rows into the first "
+                      "slots and the set-up of the prefix SpMV / small cuDSS handle, wall")
         .def_readonly("t_driver_solve_wall_ms", &BatchTimings::t_driver_solve_wall_ms,
                       "Wall clock of the batch driver's whole solve() (ms); not in any total")
         .def_readonly("t_session_run_wall_ms", &BatchTimings::t_session_run_wall_ms,
@@ -915,7 +918,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("n_rounds", &BatchTimings::n_rounds,
                       "Continuous scheduling: rounds of nb_iter_per_round iterations run")
         .def_readonly("occupancy", &BatchTimings::occupancy,
-                      "Continuous scheduling: useful row-iterations / (slots x iterations run)")
+                      "Continuous scheduling: useful row-iterations / slot-iterations run (all S slots "
+                      "per round, the compacted ones in the tail)")
+        .def_readonly("n_tail_rounds", &BatchTimings::n_tail_rounds,
+                      "Continuous scheduling: rounds run on the compacted live rows with the "
+                      "small cuDSS handle (tail_max_groups)")
+        .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,
+                      "Continuous scheduling: rows moved to another slot by the tail compaction")
         // --- metadata ---
         .def_readonly("n_contingencies", &BatchTimings::n_contingencies,
                       "Total number of contingencies")
@@ -1060,6 +1069,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["oc_decide"]         = entry_dict(t.t_oc_decide);
             gpu_compute["oc_controls"]       = entry_dict(t.t_oc_controls);
             gpu_compute["oc_load"]           = entry_dict(t.t_oc_load);
+            gpu_compute["tail_compact"]      = entry_dict(t.t_tail_compact);
 
             py::dict d2h;
             d2h["total"]                      = t.t_device_to_host_ms();
@@ -1738,6 +1748,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("nb_iter_per_round", &ContingencyAnalysisSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
+    .def_readwrite("tail_max_groups", &ContingencyAnalysisSession::tail_max_groups_,
+                   "Continuous scheduling: once the queue is empty and the live rows fit in "
+                   "this many groups of tail_group_size slots, the rounds run on those groups "
+                   "only, their linear solve on a cuDSS handle of tail_group_size matrices "
+                   "cycled over them (0 = off; calibrate_tail_max_groups() measures a value). "
+                   "Takes effect on the next run()")
+    .def_readwrite("tail_group_size", &ContingencyAnalysisSession::tail_group_size_,
+                   "Continuous scheduling: matrices of the tail's cuDSS handle (default 15: "
+                   "cuDSS 0.8.0's uniform batch costs over an order of magnitude more from 16 "
+                   "on). Takes effect on the next run()")
+    .def("calibrate_tail_max_groups",
+         [](const ContingencyAnalysisSession& s, int n_repeat, int batch_size) {
+             return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
+                                          s.tail_group_size_, n_repeat, s.reordering_alg_,
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+         },
+         pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
+         "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
+         "case's J on a cuDSS handle of batch_size matrices (-1: the session's) and on one "
+         "of tail_group_size matrices, n_repeat times each (TailCalibration). Does not set "
+         "anything. Allocates batch_size systems and their factors while it runs.")
     .def_readwrite("tol", &ContingencyAnalysisSession::tol_,
                    "A row has converged when ||F||inf < tol: decides when it leaves "
                    "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
@@ -2083,6 +2114,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("nb_iter_per_round", &InjectionSweepSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
+    .def_readwrite("tail_max_groups", &InjectionSweepSession::tail_max_groups_,
+                   "Continuous scheduling: once the queue is empty and the live rows fit in "
+                   "this many groups of tail_group_size slots, the rounds run on those groups "
+                   "only, their linear solve on a cuDSS handle of tail_group_size matrices "
+                   "cycled over them (0 = off; calibrate_tail_max_groups() measures a value). "
+                   "Takes effect on the next run()")
+    .def_readwrite("tail_group_size", &InjectionSweepSession::tail_group_size_,
+                   "Continuous scheduling: matrices of the tail's cuDSS handle (default 15: "
+                   "cuDSS 0.8.0's uniform batch costs over an order of magnitude more from 16 "
+                   "on). Takes effect on the next run()")
+    .def("calibrate_tail_max_groups",
+         [](const InjectionSweepSession& s, int n_repeat, int batch_size) {
+             return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
+                                          s.tail_group_size_, n_repeat, s.reordering_alg_,
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+         },
+         pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
+         "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
+         "case's J on a cuDSS handle of batch_size matrices (-1: the session's) and on one "
+         "of tail_group_size matrices, n_repeat times each (TailCalibration). Does not set "
+         "anything. Allocates batch_size systems and their factors while it runs.")
     .def_readwrite("tol", &InjectionSweepSession::tol_,
                    "A row has converged when ||F||inf < tol: decides when it leaves "
                    "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
@@ -2470,6 +2522,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("nb_iter_per_round", &ScenarioSweepSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
+    .def_readwrite("tail_max_groups", &ScenarioSweepSession::tail_max_groups_,
+                   "Continuous scheduling: once the queue is empty and the live rows fit in "
+                   "this many groups of tail_group_size slots, the rounds run on those groups "
+                   "only, their linear solve on a cuDSS handle of tail_group_size matrices "
+                   "cycled over them (0 = off; calibrate_tail_max_groups() measures a value). "
+                   "Takes effect on the next run()")
+    .def_readwrite("tail_group_size", &ScenarioSweepSession::tail_group_size_,
+                   "Continuous scheduling: matrices of the tail's cuDSS handle (default 15: "
+                   "cuDSS 0.8.0's uniform batch costs over an order of magnitude more from 16 "
+                   "on). Takes effect on the next run()")
+    .def("calibrate_tail_max_groups",
+         [](const ScenarioSweepSession& s, int n_repeat, int batch_size) {
+             return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
+                                          s.tail_group_size_, n_repeat, s.reordering_alg_,
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+         },
+         pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
+         "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
+         "case's J on a cuDSS handle of batch_size matrices (-1: the session's) and on one "
+         "of tail_group_size matrices, n_repeat times each (TailCalibration). Does not set "
+         "anything. Allocates batch_size systems and their factors while it runs.")
     .def_readwrite("tol", &ScenarioSweepSession::tol_,
                    "A row has converged when ||F||inf < tol: decides when it leaves "
                    "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
@@ -3411,7 +3484,40 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("mem_host_peak", &CudssBatchBenchResult::mem_host_peak)
         .def_readonly("max_rel_residual", &CudssBatchBenchResult::max_rel_residual,
                       "max over slots of ||A x - b||inf / ||b||inf (b = A*1)")
-        .def_readonly("n_nonfinite_slots", &CudssBatchBenchResult::n_nonfinite_slots);
+        .def_readonly("n_nonfinite_slots", &CudssBatchBenchResult::n_nonfinite_slots)
+        .def_readonly("n_groups", &CudssBatchBenchResult::n_groups)
+        .def_readonly("group_cycle_ms", &CudssBatchBenchResult::group_cycle_ms,
+                      "Mean wall ms per group of one cycle (rebind + REFACTORIZATION + "
+                      "SOLVE per group, one stream sync per cycle)")
+        .def_readonly("n_handles", &CudssBatchBenchResult::n_handles)
+        .def_readonly("handle_launch", &CudssBatchBenchResult::handle_launch)
+        .def_readonly("handle_setup_ms", &CudssBatchBenchResult::handle_setup_ms,
+                      "Wall ms to create, analyse and factorize handles 1..n_handles-1")
+        .def_readonly("handle_round_ms", &CudssBatchBenchResult::handle_round_ms,
+                      "Mean wall ms of one round over all the handles (rhs reset + "
+                      "REFACTORIZATION + SOLVE each)");
+
+    pybind11::class_<TailCalibration>(m, "TailCalibration",
+        "calibrate_tail_max_groups() output: mean wall ms of one REFACTORIZATION + SOLVE on "
+        "the full batch and on one group of the continuous tail, and the tail_max_groups "
+        "they imply.")
+        .def_readonly("batch_size", &TailCalibration::batch_size)
+        .def_readonly("group_size", &TailCalibration::group_size)
+        .def_readonly("n_repeat", &TailCalibration::n_repeat)
+        .def_readonly("t_full_ms", &TailCalibration::t_full_ms,
+                      "Mean wall ms of REFACTORIZATION + SOLVE on batch_size matrices")
+        .def_readonly("t_group_ms", &TailCalibration::t_group_ms,
+                      "Mean wall ms of REFACTORIZATION + SOLVE on group_size matrices")
+        .def_readonly("max_groups", &TailCalibration::max_groups,
+                      "floor(t_full_ms / t_group_ms): the tail's groups pay up to this many "
+                      "(0 when group_size >= batch_size)")
+        .def("__repr__", [](const TailCalibration& c) {
+            return "TailCalibration(batch_size=" + std::to_string(c.batch_size)
+                + ", group_size=" + std::to_string(c.group_size)
+                + ", t_full_ms=" + std::to_string(c.t_full_ms)
+                + ", t_group_ms=" + std::to_string(c.t_group_ms)
+                + ", max_groups=" + std::to_string(c.max_groups) + ")";
+        });
 
     m.def("benchmark_cudss_batch_raw", &benchmark_cudss_batch_raw,
         pybind11::arg("dim"),
@@ -3425,12 +3531,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
         pybind11::arg("ir_n_steps") = 0,
+        pybind11::arg("n_groups") = 1,
+        pybind11::arg("n_handles") = 1,
+        pybind11::arg("handle_launch") = "serial",
         "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
         "same batch-mode env variables and config knobs) on an arbitrary CSR "
         "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "
         "n_refactorize REFACTORIZATION + SOLVE pairs. rhs = A*1. Returns a "
         "CudssBatchBenchResult with per-phase wall ms, CUDSS_DATA_LU_NNZ and "
-        "CUDSS_DATA_MEMORY_ESTIMATES. For sizing a Jacobian no session builds yet.");
+        "CUDSS_DATA_MEMORY_ESTIMATES. For sizing a Jacobian no session builds yet. "
+        "n_groups > 1: one handle of batch_size matrices cycled over n_groups "
+        "slices (rebind, REFACTORIZATION, SOLVE per slice; group_cycle_ms), as "
+        "the continuous schedule's tail does. "
+        "n_handles > 1: that many independent handles of batch_size matrices "
+        "(handle_round_ms), launched from one stream ('serial'), one stream "
+        "each ('streams') or one stream and one host thread each ('threads').");
 
     m.def("warmup", &warmup,
         pybind11::arg("device") = -1,

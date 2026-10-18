@@ -430,6 +430,23 @@ struct CudssBatchSolver {
     }
 
     // =========================================================================
+    // bind_slice() — Uniform mode only: point A, x and b at another ubatch-
+    // matrix slice of larger buffers (same layout: ubatch × nnz_J values,
+    // ubatch × dim_J vectors). CPU calls only. Lets one handle analysed for a
+    // few matrices be cycled over consecutive groups of a batch; the factors
+    // in the data object are the last factorized slice's, so each slice is
+    // (re)factorized right before it is solved.
+    // =========================================================================
+    void bind_slice(cuda_real_type* d_J_values, cuda_real_type* d_F, cuda_real_type* d_dx)
+    {
+        if (mode_ != CudssBatchMode::Uniform)
+            throw std::runtime_error("[CudssBatchSolver::bind_slice] uniform batch mode only");
+        dss_A_.set_values(d_J_values);
+        dss_x_.set_values(d_dx);
+        dss_b_.set_values(d_F);
+    }
+
+    // =========================================================================
     // factor()   — CUDSS_PHASE_FACTORIZATION  (first numeric factorization)
     // refactor() — CUDSS_PHASE_REFACTORIZATION (subsequent refactorizations)
     // solve()    — CUDSS_PHASE_SOLVE
