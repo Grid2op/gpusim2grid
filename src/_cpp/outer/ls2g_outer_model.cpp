@@ -768,8 +768,9 @@ void Ls2gOuterModel::load(int slot, int row)
         st.sc_ctl.assign(static_cast<size_t>(n_sc_), -1);
     }
     // DistributedSlackLoop's collect_units: the grid's participants, unless the row
-    // disconnects units (their injection is the row's target in force: init_loops)
-    if (changes_units) {
+    // disconnects units (their injection is the row's target in force: init_loops) or
+    // strands buses (a unit on one takes no share)
+    if (changes_units || !st.masked.empty()) {
         collect_units(view(st), st.ds_units, st.ds_unit_bus);
     } else {
         st.ds_units = units0_;
@@ -877,7 +878,7 @@ void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
     const auto& to_me = v.id_solver_to_me();
     auto add = [&](ls2g::slack_redistribution::UnitKind kind, int el, int bus, double w,
                    double inj, double mn, double mx) {
-        if (!(w > 0.) || bus < 0) return;
+        if (!(w > 0.) || bus < 0 || v.is_masked(bus)) return;
         ls2g::slack_redistribution::Participant u;
         u.kind = kind; u.el_id = el; u.bus = to_me[bus].cast_int(); u.injection_mw = inj;
         u.weight = w; u.min_p_mw = mn; u.max_p_mw = mx; u.in_slack = false;

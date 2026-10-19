@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] ``outer_loops=True``: ``DistributedSlack`` gives no share to a unit on a bus the row strands
+  (``handle_disconnected_grid``), as lightsim2grid does.
 - [IMPROVED] ``scheduling="continuous"``: once the queue is empty, the last rows are moved into the
   first slots and solved in groups of 15 (``tail_max_groups``, ``tail_group_size``). cuDSS 0.8.0's batch
   costs over 10x more from 16 matrices. ``calibrate_tail_max_groups()`` measures the setting.
