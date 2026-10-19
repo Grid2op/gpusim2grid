@@ -416,6 +416,43 @@ def test_contingency_analysis_islanding_rows(init_from_n):
             np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=1e-8, err_msg=msg)
 
 
+def test_contingency_analysis_outer_failure_is_divergence():
+    """A row the outer loops reject (here UNREALISTIC: the realistic band just under the
+    base case's lowest voltage) solved its last inner powerflow, but get_violations gives
+    it one GRID/DIVERGENCE entry, value = limit = nan, as lightsim2grid's batch does"""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid.contingency_analysis import LimitViolationType, ViolationElementType
+    grid = _case14()
+    params = grid.get_outer_loop_driver_params()
+    params.min_realistic_voltage = float(np.abs(grid.get_V()).min()) - 0.005
+    grid.set_outer_loop_driver_params(params)
+    assert grid.ac_pf(np.asarray(grid.get_V(), dtype=complex), MAX_IT, TOL_MVA).size > 0
+    n_br = len(grid.get_lines()) + len(grid.get_trafos())
+    batch = ContingencyAnalysisCPP(grid, compute_limit_violations=True)
+    batch.change_algorithm(OUTER)
+    batch.handle_disconnected_grid = True
+    batch.add_all_n1()
+    batch.compute(_v_batch(grid, False), MAX_IT, TOL_MVA)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, handle_disconnected_grid=True,
+                                compute_limit_violations=True, tol=TOL_MVA / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_br)])
+    ca.compute(batch_size=4)
+    status = np.asarray(ca.get_row_status())
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    assert (status == UNREALISTIC).any()
+    v_ls, v_gpu = batch.get_violations(), ca.get_violations()
+    for i in range(n_br):
+        assert (status[i] == CONVERGED) == bool(conv[i]), i
+        if status[i] in (OUTER_FAILED, OUTER_UNSTABLE, UNREALISTIC):
+            assert len(v_ls[i]) == 1 and f"{v_ls[i][0].violation_type}".endswith("DIVERGENCE"), i
+            assert len(v_gpu[i]) == 1, i
+            el = v_gpu[i][0]
+            assert el.violation_type == LimitViolationType.DIVERGENCE, i
+            assert el.element_type == ViolationElementType.GRID, i
+            assert np.isnan(el.value) and np.isnan(el.limit), i
+
+
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_scenario_sweep_generator_contingencies(init_from_n):
     """Row i disconnects one generator (its bus loses its regulator: PQ on that row) and

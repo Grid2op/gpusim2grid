@@ -28,7 +28,7 @@ from ._limit_violations import (ViolationElementType, LimitViolationType, Violat
 from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
 from ._reactive_limits import ReactiveLimitsStatus
-from ._scheduling import RowStatus, SchedulingEngineMixin, SchedulingFacadeMixin
+from ._scheduling import RowStatus, OUTER_FAILURE_STATUSES, SchedulingEngineMixin, SchedulingFacadeMixin
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -590,7 +590,10 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         (disconnected / masked-skip) contingency gets a single GRID/
         NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
-        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol), and
+        one the outer loops gave up on (``RowStatus.OUTER_FAILED``,
+        ``OUTER_UNSTABLE``, ``UNREALISTIC``) a GRID/DIVERGENCE entry with
+        value=limit=nan, as lightsim2grid.
         Otherwise the records of a contingency come type after type -- CURRENT,
         then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
         violation_capacity) most severe violations, most severe first.
@@ -611,8 +614,14 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         # row c owns slots [c*stride, c*stride + count[c]) -- stride is
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
+        status = self._s.get_row_status()
         out = []
         for c, cnt in enumerate(counts):
+            if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.DIVERGENCE,
+                                            float('nan'), float('nan'))])
+                continue
             if cnt < 0:
                 # Pre-check (graph connectivity) dropped this contingency
                 # before it ever reached check_limit_violations_kernel -- the

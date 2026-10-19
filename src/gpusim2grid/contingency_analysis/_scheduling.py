@@ -52,6 +52,11 @@ class RowStatus(IntEnum):
     UNREALISTIC = 6
 
 
+# the rows the outer loops gave up on: their last inner solve converged, so the violation
+# kernel scanned a state no engine accepts (get_violations reports them as diverged)
+OUTER_FAILURE_STATUSES = frozenset((RowStatus.OUTER_FAILED, RowStatus.OUTER_UNSTABLE, RowStatus.UNREALISTIC))
+
+
 def default_tol():
     """Per unit: 1e-8 in double precision; 1e-3 in an FP32 build, whose
     residual floor is around 1e-4 already on case118 (with a tighter tol the
