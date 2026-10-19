@@ -3,6 +3,9 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] ``outer_loops=True``: the ``ReactiveLimits`` robust mode reads the realistic voltage band and
+  the robust flag off the outer-loop driver when the loop leaves them at their defaults, as lightsim2grid.
+  A remote controller whose own bus is unrealistic now stops regulating, at its target Q.
 - [ADDED] Contingencies that trip shunts, loads and generators, as in lightsim2grid:
   ``ContingencyAnalysisGPU.add_contingency(branches, shunts, loads, gens)`` and the
   ``add_contingency_shunt`` / ``_load`` / ``_gen`` shortcuts, ``ScenarioSweepGPU.set_contingency_shunts`` /

@@ -416,6 +416,77 @@ def test_contingency_analysis_islanding_rows(init_from_n):
             np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=1e-8, err_msg=msg)
 
 
+def _case14_remote_controller(max_realistic_voltage):
+    """case14 whose bus 8 generator (a wide reactive range) regulates bus 7 remotely, as a
+    unit behind its step-up transformer: its own bus sits at about 1.156 pu, above the robust
+    mode's band (max_realistic_voltage / 1.02) yet below max_realistic_voltage"""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    net = pn.case14()
+    net.gen["min_q_mvar"] = -15.
+    net.gen["max_q_mvar"] = 15.
+    net.gen.loc[net.gen.bus == 7, ["min_q_mvar", "max_q_mvar"]] = (-300., 300.)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(net)
+    nb_gen = len(grid.get_generators())
+    grid.set_gen_p_limits(np.zeros(nb_gen), np.full(nb_gen, 300.))
+    grid.set_gen_can_participate_slack([True] * nb_gen, np.full(nb_gen, 300.))
+    gen_id = next(g.id for g in grid.get_generators() if g.bus_id == 7)
+    grid.set_gen_regulated_bus(gen_id, 6)
+    params = grid.get_outer_loop_driver_params()
+    params.max_realistic_voltage = max_realistic_voltage
+    grid.set_outer_loop_driver_params(params)
+    grid.change_algorithm(OUTER)
+    V = grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    assert V.size > 0
+    return grid
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_contingency_analysis_robust_mode_releases_remote_controller(init_from_n):
+    """The ReactiveLimits loop's robust mode, its band read off the driver (the loop's own
+    parameters left at their defaults): a remote controller within its reactive limits but
+    whose own bus is unrealistic stops regulating (PV_TO_PQ_UNREALISTIC) on every row, as in
+    lightsim2grid's batch"""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _case14_remote_controller(1.16)
+    n_br = len(grid.get_lines()) + len(grid.get_trafos())
+    batch = ContingencyAnalysisCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = init_from_n
+    batch.handle_disconnected_grid = True
+    batch.add_all_n1()
+    batch.compute(_v_batch(grid, init_from_n), MAX_IT, TOL_MVA)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, keep_outer_trace=True,
+                                handle_disconnected_grid=True, init_from_n_powerflow=init_from_n,
+                                tol=TOL_MVA / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_br)])
+    ca.compute(batch_size=4)
+    n_bus = grid.get_Ybus_solver().shape[0]
+    V = ca.V_results.to_numpy().reshape(n_br, n_bus)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V_ls = np.asarray(batch.get_voltages())[:, buses]
+    status = np.asarray(ca.get_row_status())
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    res, res_ls = ca.get_outer_results(), batch.get_outer_results()
+    nb_released = 0
+    for i in range(n_br):
+        msg = f"branch {i}: " + "\n".join(res[i].decisions)
+        assert (status[i] == CONVERGED) == bool(conv[i]), msg
+        if not conv[i]:
+            continue
+        # resumed from the "n" solve, the controller is already released there
+        nb_released += init_from_n or any("PV_TO_PQ_UNREALISTIC" in d for d in res[i].decisions)
+        assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        fin = np.isfinite(V[i])
+        np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=1e-8, err_msg=msg)
+    assert nb_released > 0
+
+
 def test_contingency_analysis_outer_failure_is_divergence():
     """A row the outer loops reject (here UNREALISTIC: the realistic band just under the
     base case's lowest voltage) solved its last inner powerflow, but get_violations gives

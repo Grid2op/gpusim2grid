@@ -447,9 +447,10 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
             d.rl_max_switch = p.max_pq_pv_switch;
             d.rl_max_mismatch = p.max_reactive_power_mismatch;
             d.rl_base_mva = p.mismatch_base_mva;
-            d.rl_robust = p.robust_mode;
-            d.rl_vmin = p.min_realistic_voltage;
-            d.rl_vmax = p.max_realistic_voltage;
+            // -1 / NaN: the driver's (ReactiveLimitsLoop::_robust / _realistic_band)
+            d.rl_robust = p.robust_mode < 0 ? params_.voltage_remote_control_robust_mode : p.robust_mode != 0;
+            d.rl_vmin = std::isnan(p.min_realistic_voltage) ? params_.min_realistic_voltage : p.min_realistic_voltage;
+            d.rl_vmax = std::isnan(p.max_realistic_voltage) ? params_.max_realistic_voltage : p.max_realistic_voltage;
             d.rl_margin = p.realistic_voltage_margin;
             d.rl_restart = p.robust_restart_vm_pu;
         } else if (dynamic_cast<const ls2g::PhaseControlLoop*>(lp.get())) {
