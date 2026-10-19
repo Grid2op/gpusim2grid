@@ -1153,7 +1153,8 @@ def test_contingency_analysis_redistribute_slack(init_from_n):
     V = ca.V_results.to_numpy().reshape(n_ctg, n_bus)
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     # lightsim2grid orders its contingencies
-    key = lambda c: tuple(tuple(sorted(int(e) for e in el)) for el in c)
+    # (my_contingencies adds the branches opened at one end only, a fifth and sixth list)
+    key = lambda c: tuple(tuple(sorted(int(e) for e in el)) for el in (tuple(c) + ((), ()))[:6])
     row_ls = {key(c): k for k, c in enumerate(batch.my_contingencies())}
     V_ls = np.asarray(batch.get_voltages())[:, buses]
     conv = np.asarray(batch.converged_mask(), dtype=bool)

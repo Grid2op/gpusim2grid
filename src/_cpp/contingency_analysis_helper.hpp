@@ -195,6 +195,29 @@ Contingency build_contingency_from_branch_ids(
     Eigen::Ref<const CplxVect> ytt_eff);
 
 // ---------------------------------------------------------------------------
+// append_one_side_trips
+//   Opens `branch_ids` at side `open_side` (1: from, 2: to) only, appending to
+//   `ctg`: the branch's block leaves the row's Ybus and the end it keeps gets its
+//   Kron-reduced part back (lightsim2grid's BranchContainer stamp for a branch
+//   open at one end, and YbusPolicy::Contingency::_append_one_side_trips), so it
+//   still carries its charging from there. A branch already open at that end in
+//   the base grid (negative endpoint) changes nothing, one open at its other end
+//   goes entirely, one off (zero block) is left alone. Each branch is appended to
+//   ctg.tripped_branches: its flows read 0, its current is not checked and the
+//   outer loops see it as open, as for a branch opened at both ends.
+// ---------------------------------------------------------------------------
+void append_one_side_trips(
+    Contingency&              ctg,
+    const std::vector<int>&   branch_ids,
+    int                       open_side,
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff);
+
+// ---------------------------------------------------------------------------
 // csr_find_k
 //   Binary search for the flat CSR index of (row, col) in a RowMajor matrix.
 //   Precondition: the entry (row, col) must exist (non-zero by construction

@@ -319,14 +319,19 @@ struct ContingencyAnalysisSession {
     // build_contingencies_full
     // The same, each contingency tripping branches, shunts, loads and
     // generators together (lightsim2grid's ContingencyAnalysis::add_contingency):
-    // the four lists are aligned, one entry per contingency. Shunts, loads and
+    // the lists are aligned, one entry per contingency. Shunts, loads and
     // generators need set_element_trip_data() (generators also
     // set_gen_contingency_data()); the bridge factories set both.
+    // `branch_ids_side1_per_ctg` / `_side2_`: the branches each contingency opens
+    // at that end only (see append_one_side_trips); empty (no entry at all), or one
+    // entry per contingency.
     // =========================================================================
     void build_contingencies_full(const std::vector<std::vector<int>>& branch_ids_per_ctg,
                                   const std::vector<std::vector<int>>& shunt_ids_per_ctg,
                                   const std::vector<std::vector<int>>& load_ids_per_ctg,
-                                  const std::vector<std::vector<int>>& gen_ids_per_ctg);
+                                  const std::vector<std::vector<int>>& gen_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& branch_ids_side1_per_ctg = {},
+                                  const std::vector<std::vector<int>>& branch_ids_side2_per_ctg = {});
     void set_element_trip_data(const ElementTripData& data) { trip_data_ = data; has_trip_data_ = true; }
     bool has_element_trip_data() const { return has_trip_data_; }
     void set_gen_contingency_data(const GenContingencyData& data) { gen_data_ = data; has_gen_data_ = data.n_gen > 0; }

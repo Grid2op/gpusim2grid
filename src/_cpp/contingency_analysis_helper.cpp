@@ -74,6 +74,51 @@ Contingency build_contingency_from_branch_ids(
 }
 
 // ---------------------------------------------------------------------------
+// append_one_side_trips
+// ---------------------------------------------------------------------------
+void append_one_side_trips(
+    Contingency&              ctg,
+    const std::vector<int>&   branch_ids,
+    int                       open_side,
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff)
+{
+    if (open_side != 1 && open_side != 2)
+        throw std::runtime_error("append_one_side_trips: the side opened is 1 or 2");
+    const int n_branches = static_cast<int>(branch_from.size());
+    for (int l : branch_ids) {
+        if (l < 0 || l >= n_branches)
+            throw std::runtime_error("append_one_side_trips: branch index out of range");
+        ctg.tripped_branches.push_back(l);
+        const int b_open = open_side == 1 ? branch_from(l) : branch_to(l);
+        const int b_kept = open_side == 1 ? branch_to(l) : branch_from(l);
+        if (b_open < 0) continue;   // already open at that end
+        if (b_kept < 0) {
+            // open at its other end in the base grid: it goes entirely (its stamped
+            // block is the open end's Kron-reduced diagonal)
+            const auto y = open_side == 1 ? yff_eff(l) : ytt_eff(l);
+            ctg.triplets.push_back({b_open, b_open, y.real(), y.imag()});
+            continue;
+        }
+        // both ends closed: the stamped block is the raw one
+        const auto y_oo = open_side == 1 ? yff_eff(l) : ytt_eff(l);
+        const auto y_ok = open_side == 1 ? yft_eff(l) : ytf_eff(l);
+        const auto y_ko = open_side == 1 ? ytf_eff(l) : yft_eff(l);
+        if (std::abs(y_oo) == 0.) continue;   // off in the base grid: nothing stamped
+        // y_kk - (y_kk - y_ko * y_ok / y_oo): the kept end keeps its Kron-reduced part
+        const auto y_kept = y_ko * y_ok / y_oo;
+        ctg.triplets.push_back({b_open, b_open, y_oo.real(), y_oo.imag()});
+        ctg.triplets.push_back({b_kept, b_kept, y_kept.real(), y_kept.imag()});
+        ctg.triplets.push_back({b_open, b_kept, y_ok.real(), y_ok.imag()});
+        ctg.triplets.push_back({b_kept, b_open, y_ko.real(), y_ko.imag()});
+    }
+}
+
+// ---------------------------------------------------------------------------
 // csr_find_k
 // ---------------------------------------------------------------------------
 int csr_find_k(const int* row_ptr, const int* col_ind, int row, int col)

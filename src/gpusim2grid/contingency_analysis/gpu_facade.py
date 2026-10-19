@@ -576,7 +576,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         self._inner.build_contingencies(branch_ids_per_ctg)
         self._ctg_branch_ids = [list(map(int, ids)) for ids in branch_ids_per_ctg]
-        self._ctg_elements = [(list(ids), [], [], []) for ids in self._ctg_branch_ids]
+        self._ctg_elements = [(list(ids), [], [], [], [], []) for ids in self._ctg_branch_ids]
 
     # ------------------------------------- shunts, loads and generators tripped
     @staticmethod
@@ -588,8 +588,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         return sorted(set(int(el) for el in ids))
 
     def _push_contingencies(self):
-        b, s, l, g = ([list(c[k]) for c in self._ctg_elements] for k in range(4))
-        if any(s) or any(l) or any(g):
+        b, s, l, g, b1, b2 = ([list(c[k]) for c in self._ctg_elements] for k in range(6))
+        if any(b1) or any(b2):
+            self._inner.build_contingencies_full(b, s, l, g, b1, b2)
+        elif any(s) or any(l) or any(g):
             self._inner.build_contingencies_full(b, s, l, g)
         else:
             self._inner.build_contingencies(b)
@@ -598,8 +600,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def add_contingencies(self, contingencies):
         """Append contingencies, each a tuple ``(branch_ids, shunt_ids, load_ids,
         gen_ids)`` tripping those elements together (lightsim2grid's
-        ``ContingencyAnalysisCPP.add_contingency``). Any of the four may be empty, not
-        all. Appended to what :meth:`add_contingencies_by_branch_id` (which replaces
+        ``ContingencyAnalysisCPP.add_contingency``), optionally followed by
+        ``branch_ids_side1, branch_ids_side2``. Any of them may be empty, not all.
+        Appended to what :meth:`add_contingencies_by_branch_id` (which replaces
         the whole list) or a previous ``add_contingenc*`` registered.
 
         - a shunt leaves the contingency's admittance matrix (its diagonal
@@ -609,7 +612,12 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
           not regulate voltage), and the distributed slack is re-weighted without it;
           when it was the last one regulating its own bus, that bus turns PQ for the
           contingency. A generator regulating a remote bus, or on a bus a control group
-          holds, is refused by :meth:`compute`.
+          holds, is refused by :meth:`compute`;
+        - a branch of ``branch_ids_side1`` (``branch_ids_side2``) is opened at side 1 (2)
+          only: its other end stays connected and keeps the branch's charging, as
+          OpenLoadFlow models a branch whose breaker opens at one end. Its flows read 0,
+          its current is not checked and the outer loops see it as open. Named at both
+          sides, or also in ``branch_ids``, it is opened at both.
 
         With the outer loops, a shunt that regulates a voltage is refused (its sections
         are the ShuntVoltageControl loop's). Needs a grid-mode instance (the element
@@ -619,19 +627,27 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             self._ctg_elements = []
         new = []
         for cont in contingencies:
-            if len(cont) != 4:
-                raise ValueError("each contingency must be (branch_ids, shunt_ids, load_ids, gen_ids)")
-            cont = tuple(self._as_ids(el) for el in cont)
+            if len(cont) not in (4, 6):
+                raise ValueError("each contingency must be (branch_ids, shunt_ids, load_ids, gen_ids), "
+                                 "optionally followed by (branch_ids_side1, branch_ids_side2)")
+            cont = [self._as_ids(el) for el in cont] + [[], []] * (len(cont) == 4)
+            # opened at both ends one way or another: a trip (as lightsim2grid has it)
+            both = set(cont[0]) | (set(cont[4]) & set(cont[5]))
+            cont[0] = sorted(both)
+            cont[4] = [el for el in cont[4] if el not in both]
+            cont[5] = [el for el in cont[5] if el not in both]
+            cont = tuple(cont)
             if not any(cont):
                 raise ValueError("a contingency must trip something (every list is empty)")
             new.append(cont)
         self._ctg_elements = self._ctg_elements + new
         self._push_contingencies()
 
-    def add_contingency(self, branch_ids=(), shunt_ids=(), load_ids=(), gen_ids=()):
+    def add_contingency(self, branch_ids=(), shunt_ids=(), load_ids=(), gen_ids=(),
+                        branch_ids_side1=(), branch_ids_side2=()):
         """Append one contingency tripping these elements together; see
         :meth:`add_contingencies`."""
-        self.add_contingencies([(branch_ids, shunt_ids, load_ids, gen_ids)])
+        self.add_contingencies([(branch_ids, shunt_ids, load_ids, gen_ids, branch_ids_side1, branch_ids_side2)])
 
     def add_contingency_shunt(self, shunt_ids):
         """Append one contingency tripping these shunts only (one id, or several)."""
@@ -647,7 +663,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     def get_contingencies(self):
         """Every contingency registered, in row order: ``(branch_ids, shunt_ids,
-        load_ids, gen_ids)``."""
+        load_ids, gen_ids, branch_ids_side1, branch_ids_side2)``."""
         return [tuple(list(el) for el in c) for c in (getattr(self, "_ctg_elements", None) or [])]
 
     @property
@@ -866,9 +882,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._ctg_branch_ids is None:
             raise RuntimeError("reactive_limits_outer_loop: no contingency was added "
                                "through add_contingencies_by_branch_id().")
-        if any(c[1] or c[2] or c[3] for c in (getattr(self, "_ctg_elements", None) or [])):
+        if any(any(c[1:]) for c in (getattr(self, "_ctg_elements", None) or [])):
             raise RuntimeError("reactive_limits_outer_loop does not support contingencies tripping "
-                               "shunts, loads or generators: use outer_loops=True.")
+                               "shunts, loads or generators, or opening a branch at one end: use "
+                               "outer_loops=True.")
         sess = self._inner._s
         res = self.last_residuals()
         conv = np.isfinite(res) & (res <= self._inner.violation_tol)

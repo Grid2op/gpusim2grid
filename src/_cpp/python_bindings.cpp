@@ -1681,13 +1681,18 @@ PYBIND11_MODULE(_gpusim2grid, m)
          &ContingencyAnalysisSession::build_contingencies_full,
          pybind11::arg("branch_ids_per_ctg"), pybind11::arg("shunt_ids_per_ctg"),
          pybind11::arg("load_ids_per_ctg"), pybind11::arg("gen_ids_per_ctg"),
+         pybind11::arg("branch_ids_side1_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("branch_ids_side2_per_ctg") = std::vector<std::vector<int>>(),
          "Define the contingency set, each contingency tripping branches, shunts, "
-         "loads and generators together (four aligned lists, one entry per "
+         "loads and generators together (aligned lists, one entry per "
          "contingency; lightsim2grid's ContingencyAnalysis.add_contingency). A shunt "
          "leaves the row's Ybus (its diagonal coefficient), a load / generator its "
          "Sbus; a generator that was the last one regulating its bus turns that bus "
          "PQ for the row and leaves its distributed slack. Needs the element and "
-         "generator data of a session built from a lightsim2grid grid.")
+         "generator data of a session built from a lightsim2grid grid. "
+         "branch_ids_side1_per_ctg / branch_ids_side2_per_ctg (empty, or one entry "
+         "per contingency): the branches opened at that end only, their other end "
+         "keeping the branch's Kron-reduced part (its charging).")
     .def_property_readonly("has_element_trip_data", &ContingencyAnalysisSession::has_element_trip_data)
     .def_property_readonly("ctg_shunts", &ContingencyAnalysisSession::ctg_shunts)
     .def_property_readonly("ctg_loads", &ContingencyAnalysisSession::ctg_loads)

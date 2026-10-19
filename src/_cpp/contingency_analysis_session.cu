@@ -198,7 +198,9 @@ void ContingencyAnalysisSession::build_contingencies_full(
     const std::vector<std::vector<int>>& branch_ids_per_ctg,
     const std::vector<std::vector<int>>& shunt_ids_per_ctg,
     const std::vector<std::vector<int>>& load_ids_per_ctg,
-    const std::vector<std::vector<int>>& gen_ids_per_ctg)
+    const std::vector<std::vector<int>>& gen_ids_per_ctg,
+    const std::vector<std::vector<int>>& branch_ids_side1_per_ctg,
+    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg)
 {
     static const char* who = "ContingencyAnalysisSession::build_contingencies_full";
     if (!has_branch_data_)
@@ -209,6 +211,10 @@ void ContingencyAnalysisSession::build_contingencies_full(
         static_cast<int>(gen_ids_per_ctg.size()) != n_ctg)
         throw std::runtime_error(std::string(who) + ": the branch, shunt, load and generator lists must "
                                  "have one entry per contingency each");
+    for (const auto* sides : {&branch_ids_side1_per_ctg, &branch_ids_side2_per_ctg})
+        if (!sides->empty() && static_cast<int>(sides->size()) != n_ctg)
+            throw std::runtime_error(std::string(who) + ": the branches opened at one end must be given for "
+                                     "every contingency, or for none");
     bool any_shunt = false, any_load = false, any_gen = false;
     for (int c = 0; c < n_ctg; ++c) {
         any_shunt = any_shunt || !shunt_ids_per_ctg[c].empty();
@@ -243,6 +249,13 @@ void ContingencyAnalysisSession::build_contingencies_full(
             branch_ids_per_ctg[c],
             h_branch_from_, h_branch_to_,
             h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_);
+        // the branches opened at one end only: their kept end stays, Kron-reduced
+        if (!branch_ids_side1_per_ctg.empty())
+            append_one_side_trips(ctg, branch_ids_side1_per_ctg[c], 1, h_branch_from_, h_branch_to_,
+                                  h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_);
+        if (!branch_ids_side2_per_ctg.empty())
+            append_one_side_trips(ctg, branch_ids_side2_per_ctg[c], 2, h_branch_from_, h_branch_to_,
+                                  h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_);
         // a shunt: its diagonal coefficient leaves the row's Ybus (merged with a branch
         // end on the same diagonal by build_flat_patches)
         for (const auto& t : element_trips::shunt_triplets(trip_data_, shunt_ids_per_ctg[c]))
@@ -252,8 +265,9 @@ void ContingencyAnalysisSession::build_contingencies_full(
             ctg_sbus_ds_[static_cast<size_t>(c)] = element_trips::sbus_delta(
                 trip_data_, load_ids_per_ctg[c], gen_ids_per_ctg[c],
                 gen_data_.bus, gen_data_.vreg_on, gen_data_.target_q_mvar);
+        // every branch it opens, at one end or both: no flow reported
+        disconnected_per_ctg_.push_back(ctg.tripped_branches);
         contingencies_.push_back(std::move(ctg));
-        disconnected_per_ctg_.push_back(branch_ids_per_ctg[c]);
     }
     has_contingencies_ = true;
     auto_ref_valid_    = false;

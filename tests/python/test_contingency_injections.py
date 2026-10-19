@@ -87,7 +87,8 @@ def _ls_rows(ls, trips):
     my_contingencies())"""
     row = {tuple(tuple(el) for el in c): k for k, c in enumerate(ls.my_contingencies())}
     V = np.asarray(ls.get_voltages())
-    return V[[row[tuple(tuple(sorted(el)) for el in t)] for t in trips]]
+    # (my_contingencies adds the branches opened at one end only, as a fifth and sixth list)
+    return V[[row[tuple(tuple(sorted(el)) for el in (tuple(t) + ((), ()))[:6])] for t in trips]]
 
 
 # ------------------------------------------------------------ ContingencyAnalysisGPU
@@ -100,7 +101,7 @@ def test_ca_matches_one_off_powerflows_and_lightsim2grid(case, solver_atol):
     ca.compute(batch_size=4)
     assert np.all(ca.last_residuals() < 100 * solver_atol)
     V = ca.V_results.to_numpy().reshape(len(TRIPS), case["n_bus"])
-    assert ca.get_contingencies() == [tuple(sorted(el) for el in t) for t in TRIPS]
+    assert ca.get_contingencies() == [tuple(sorted(el) for el in t) + ([], []) for t in TRIPS]
 
     ls = ContingencyAnalysisCPP(case["grid"])
     for t in TRIPS:
@@ -124,8 +125,9 @@ def test_ca_shortcuts_append(case):
     ca.add_contingency_shunt(0)
     ca.add_contingency_load([3, 1])
     ca.add_contingency_gen(1)
-    assert ca.get_contingencies() == [([3], [], [], []), ([5], [], [], []), ([], [0], [], []),
-                                      ([], [], [1, 3], []), ([], [], [], [1])]
+    assert ca.get_contingencies() == [([3], [], [], [], [], []), ([5], [], [], [], [], []),
+                                      ([], [0], [], [], [], []), ([], [], [1, 3], [], [], []),
+                                      ([], [], [], [1], [], [])]
     ca.compute(batch_size=8)
     assert ca.V_results.to_numpy().shape[0] == 5 * case["n_bus"]
     with pytest.raises(Exception):
@@ -189,6 +191,75 @@ def test_ca_outer_loops_match_lightsim2grid(solver_atol):
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V = ca.V_results.to_numpy().reshape(len(trips), -1)
     np.testing.assert_allclose(V, _ls_rows(ls, trips)[:, buses], atol=1e3 * solver_atol)
+
+
+# branches opened at one end only (branch_ids_side1 / _side2): case14's line 3 at side 1 (it
+# has charging, which shows there), line 5 at side 2, a transformer at side 1 (no shunt
+# admittance: half-open or tripped is the same), and line 4 at both ends (a trip)
+ONE_SIDE_TRIPS = [((), (), (), (), (3,), ()), ((), (), (), (), (), (5,)),
+                  ((), (), (), (), (15,), ()), ((), (), (), (), (4,), (4,))]
+
+
+def _reference_one_side(trip):
+    grid, v_ref = _make_grid()
+    grid.set_synch_status_both_side(False)
+    n_line = len(grid.get_lines())
+    for side, ids in ((1, trip[4]), (2, trip[5])):
+        for b in ids:
+            if b < n_line:
+                getattr(grid, f"deactivate_powerline_side{side}")(int(b))
+            else:
+                getattr(grid, f"deactivate_trafo_side{side}")(int(b) - n_line)
+    grid.tell_solver_need_reset()
+    V = grid.ac_pf(v_ref.copy(), MAX_IT, TOL)
+    assert V.shape[0] > 0, "the reference powerflow itself diverged"
+    return V
+
+
+@pytest.mark.parametrize("outer_loops", [False, True])
+def test_ca_one_side_trips_match_lightsim2grid(outer_loops, solver_atol):
+    """A branch opened at one end keeps its other one, with its charging: as a
+    half-open branch of the grid, and as lightsim2grid's batch has it."""
+    from lightsim2grid.contingencyAnalysis import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid, v_ref = _make_grid("NROuter_KLU" if outer_loops else "NR_KLU")
+    assert len(grid.get_lines()) <= 15 < len(grid.get_lines()) + len(grid.get_trafos())
+    ls = ContingencyAnalysisCPP(grid)
+    ls.init_from_n_powerflow = outer_loops
+    for t in ONE_SIDE_TRIPS:
+        ls.add_contingency(*[list(el) for el in t])
+    ls.compute(1.0 * v_ref, MAX_IT, TOL)
+    assert all(ls.converged_mask())
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if outer_loops:
+            ca = ContingencyAnalysisGPU(grid, outer_loops=True, scheduling="continuous", nb_iter=30,
+                                        init_from_n_powerflow=True, tol=TOL, ir_n_steps=1)
+        else:
+            ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    ca.add_contingencies(ONE_SIDE_TRIPS)
+    # both ends: a trip
+    assert ca.get_contingencies()[3] == ([4], [], [], [], [], [])
+    ca.compute(batch_size=4)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = ca.V_results.to_numpy().reshape(len(ONE_SIDE_TRIPS), -1)
+    trips_ls = [((4,), (), (), (), (), ()) if k == 3 else t for k, t in enumerate(ONE_SIDE_TRIPS)]
+    V_ls = _ls_rows(ls, trips_ls)
+    atol = (1e3 if outer_loops else 10) * solver_atol
+    np.testing.assert_allclose(V, V_ls[:, buses], atol=atol)
+    if not outer_loops:
+        for r, t in enumerate(ONE_SIDE_TRIPS[:3]):
+            ref = _reference_one_side(t)[buses]
+            np.testing.assert_allclose(V[r], ref, atol=atol, err_msg=f"trip {t}")
+            if r == 0:
+                # not the same as tripping it at both ends
+                assert np.abs(ref - _reference_V((t[4], (), (), ()))[buses]).max() > 1e-4
+    # no flow reported on a branch opened at one end
+    ca.compute_flows()
+    amps = ca.or_amps.to_numpy().reshape(len(ONE_SIDE_TRIPS), -1)
+    assert amps[0, 3] == 0. and amps[1, 5] == 0.
 
 
 # ------------------------------------------------------------------ ScenarioSweepGPU
