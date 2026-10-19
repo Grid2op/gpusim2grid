@@ -346,6 +346,9 @@ struct ScenarioSweepSession {
     bool                    has_slack_rd_ = false;
     RealMatRM               gen_p_rows_;
     std::vector<slack_redistribution::RowResult> slack_rows_;
+    // with the outer loops: per row, what it loses (MW, NaN: nothing), which its
+    // DistributedSlack loop shares (outer::RowOverrides::lost_p_mw)
+    std::vector<double> row_lost_p_mw_;
     bool                    rd_applied_ = false;
     // The saturated units of every row, handed in by a caller that ran the
     // pre-pass itself (BatchPowerFlow, whose Sbus already carries the
@@ -934,7 +937,9 @@ private:
     int  _reference_bus() const;
     int  _wanted_reference_bus();
     void _check_redistribute_slack() const;
-    std::vector<slack_redistribution::RowResult> _slack_prepass() const;
+    // the pre-pass of every row; with the outer loops, only what each row loses, into
+    // row_lost_p_mw_ (an empty result: the DistributedSlack loop shares it)
+    std::vector<slack_redistribution::RowResult> _slack_prepass();
 };
 
 #endif // SCENARIO_SWEEP_SESSION_HPP

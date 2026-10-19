@@ -712,7 +712,8 @@ void ScenarioSweepSession::_check_redistribute_slack() const
             "ScenarioSweepSession: redistribute_slack needs the slack participants -- call "
             "set_slack_redistribution_data() first (the ScenarioSweepGPU facade does it from a "
             "lightsim2grid grid).");
-    if (base_state_->n_slack <= 0)
+    // with the outer loops, the DistributedSlack loop's participants share it, not the Newton's
+    if (!outer_ && base_state_->n_slack <= 0)
         throw std::runtime_error(
             "ScenarioSweepSession: redistribute_slack needs the distributed slack "
             "(use_distributed_slack=True): without it no participant takes a share.");
@@ -737,7 +738,7 @@ void ScenarioSweepSession::_check_redistribute_slack() const
             "n_gen) -- call it again after changing set_injections().");
 }
 
-std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepass() const
+std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepass()
 {
     const bool has_rows = gen_p_rows_.size() > 0;
     // each row's total active injection (MW): term (c), what its injections take
@@ -745,16 +746,29 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     std::vector<double> row_p_mw(static_cast<size_t>(n_scenarios_), 0.);
     for (int r = 0; r < n_scenarios_; ++r)
         row_p_mw[static_cast<size_t>(r)] = static_cast<double>(p_mw_.row(r).sum());
-    return slack_redistribution::prepass_all(
-        slack_rd_, n_scenarios_, base_state_->n_bus,
-        [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; },
-        [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; },
-        [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); },
-        [this, has_rows](int r, int g) {
-            return has_rows ? static_cast<double>(gen_p_rows_(r, g))
-                            : static_cast<double>(slack_rd_.gen_target_p_mw(g)); },
-        [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); },
-        [&row_p_mw](int r) { return row_p_mw[static_cast<size_t>(r)]; });
+    const auto skipped = [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; };
+    const auto masked = [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; };
+    const auto gen_off = [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); };
+    const auto gen_p_row = [this, has_rows](int r, int g) {
+        return has_rows ? static_cast<double>(gen_p_rows_(r, g))
+                        : static_cast<double>(slack_rd_.gen_target_p_mw(g)); };
+    const auto sbus_p_mw = [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); };
+    const auto row_p = [&row_p_mw](int r) { return row_p_mw[static_cast<size_t>(r)]; };
+    row_lost_p_mw_.clear();
+    if (outer_) {
+        // the Newton has a single slack: what each row loses goes to its DistributedSlack loop,
+        // which shares it before the row's first solve from the targets in force
+        // (outer::RowOverrides::lost_p_mw) -- lightsim2grid's batch does the same
+        row_lost_p_mw_.assign(static_cast<size_t>(n_scenarios_), std::numeric_limits<double>::quiet_NaN());
+        for (int r = 0; r < n_scenarios_; ++r) {
+            if (skipped(r)) continue;
+            const double lost = slack_redistribution::row_lost_mw(slack_rd_, r, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
+            if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+        }
+        return {};
+    }
+    return slack_redistribution::prepass_all(slack_rd_, n_scenarios_, base_state_->n_bus,
+                                             skipped, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
 }
 
 // =============================================================================
@@ -1141,7 +1155,6 @@ void ScenarioSweepSession::run()
         check_outer_loops_scheduling("ScenarioSweepSession", continuous, nb_iter_per_round_);
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
-        if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
         if (has_switches_ || has_vc_pins_ || has_vc_release_)
             refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
@@ -1510,8 +1523,10 @@ void ScenarioSweepSession::run()
             slack_rows_[r].saturated_units = ext_sat_units_[r];
     } else {
         slack_rows_.clear();
+        row_lost_p_mw_.clear();
     }
-    const bool rd_active = redistribute_slack_ || has_ext_sat_;
+    // with the outer loops, the pre-pass only measured what each row loses (row_lost_p_mw_)
+    const bool rd_active = (redistribute_slack_ && !outer_) || has_ext_sat_;
     if (cold || warm || rd_active || rd_applied_) {
         std::vector<cuda_real_type> w_rows;
         std::vector<std::vector<std::pair<int, double>>> dp_rows;
@@ -1679,6 +1694,8 @@ void ScenarioSweepSession::run()
                     }
             }
         }
+        // ... and what it loses, for its DistributedSlack loop to share (redistribute_slack)
+        ov.lost_p_mw = row_lost_p_mw_;
         outer_->set_row_overrides(std::move(ov));
     }
 

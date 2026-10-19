@@ -213,6 +213,9 @@ struct ContingencyAnalysisSession {
     bool                    has_slack_rd_ = false;
     CplxVect                h_Sbus_base_;
     std::vector<slack_redistribution::RowResult> slack_rows_;
+    // with the outer loops: per contingency, what it loses (MW, NaN: nothing), which its
+    // DistributedSlack loop shares (outer::RowOverrides::lost_p_mw)
+    std::vector<double> row_lost_p_mw_;
 
     // =========================================================================
     // Contingency data (populated by build_contingencies())

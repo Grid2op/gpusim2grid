@@ -186,8 +186,6 @@ def test_refusals(case14):
         setattr(sw, name, value)
         with pytest.raises(ValueError, match=match):
             sw.compute(batch_size=2)
-    with pytest.raises(ValueError, match="redistribute_slack"):
-        ScenarioSweepGPU(case14, outer_loops=True, redistribute_slack=True)
     sw = ScenarioSweepGPU(case14, outer_loops=True, init_from_n_powerflow=False)
     rows = _rows(case14, n_rows=2)
     sw.set_injections_from_elements(rows["load_p"], rows["load_q"], rows["gen_p"])
@@ -1117,3 +1115,115 @@ def test_transformer_voltage_control_parallel_group(target_kv, side2_tap):
     ca.compute(batch_size=2)
     res = _check_rows(ca, ls, grid, len(branches))
     assert any(len(r.ratio_tap) == 2 for r in res)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_contingency_analysis_redistribute_slack(init_from_n):
+    """redistribute_slack with the outer loops: the DistributedSlack loop shares what a
+    contingency loses before its first solve -- the island it cuts off (the load on bus 14), the
+    generator or the load it trips -- from the targets in force (a resumed row's lost generator
+    at the "n" solve's moved target), as lightsim2grid's batch. The generator islanded on bus 8
+    produces nothing and a line outage loses no injection: nothing to share there"""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _case14()
+    n_line = len(grid.get_lines())
+    leaf_trafo = [n_line + el.id for el in grid.get_trafos() if 7 in (el.bus1_id, el.bus2_id)]
+    leaf_lines = [el.id for el in grid.get_lines() if 13 in (el.bus1_id, el.bus2_id)]
+    gen_40mw = [el.id for el in grid.get_generators() if el.target_p_mw > 0. and not el.is_slack]
+    ctgs = [(leaf_trafo, [], [], []), (leaf_lines, [], [], []), ([], [], [], gen_40mw), ([], [], [3], []),
+            ([0], [], [], [])]
+    loses_p = [False, True, True, True, False]
+    batch = ContingencyAnalysisCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = init_from_n
+    batch.handle_disconnected_grid = True
+    batch.redistribute_slack = True
+    for branches, shunts, loads, gens in ctgs:
+        batch.add_contingency(branches, shunts, loads, gens)
+    batch.compute(_v_batch(grid, init_from_n), MAX_IT, TOL_MVA)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, keep_outer_trace=True,
+                                handle_disconnected_grid=True, init_from_n_powerflow=init_from_n,
+                                redistribute_slack=True, tol=TOL_MVA / grid.get_sn_mva())
+    ca.add_contingencies(ctgs)
+    ca.compute(batch_size=2)
+    n_ctg, n_bus = len(ctgs), grid.get_Ybus_solver().shape[0]
+    V = ca.V_results.to_numpy().reshape(n_ctg, n_bus)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    # lightsim2grid orders its contingencies
+    key = lambda c: tuple(tuple(sorted(int(e) for e in el)) for el in c)
+    row_ls = {key(c): k for k, c in enumerate(batch.my_contingencies())}
+    V_ls = np.asarray(batch.get_voltages())[:, buses]
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    status = np.asarray(ca.get_row_status())
+    res, res_ls = ca.get_outer_results(), batch.get_outer_results()
+    for i, ctg in enumerate(ctgs):
+        k = row_ls[key(ctg)]
+        msg = f"contingency {ctg}: " + "\n".join(res[i].decisions)
+        assert any("SHARE_LOST_P" in d for d in res[i].decisions) == loses_p[i], msg
+        assert (status[i] == CONVERGED) == bool(conv[k]), msg
+        assert res[i].nb_outer_iterations == res_ls[k].nb_outer_iterations, msg
+        if conv[k]:
+            fin = np.isfinite(V[i])
+            np.testing.assert_allclose(V[i][fin], V_ls[k][fin], rtol=0., atol=1e-8, err_msg=msg)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_scenario_sweep_redistribute_slack(init_from_n):
+    """ScenarioSweepGPU's redistribute_slack with the outer loops, against lightsim2grid's
+    ScenarioSweep: what a row loses -- its own load change, the load it islands on bus 14, the
+    generator it disconnects -- shared by its DistributedSlack loop before its first solve"""
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    from gpusim2grid import ScenarioSweepGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _case14()
+    n_rows = 4
+    rows = _rows(grid, n_rows=n_rows, trips=False)
+    # row 0 raises its loads by 5 %, the others keep the grid's
+    rows["load_p"][1:] = rows["load_p"][0]
+    rows["load_p"][0] *= 1.05
+    leaf_lines = [el.id for el in grid.get_lines() if 13 in (el.bus1_id, el.bus2_id)]
+    rows["lines"] = [[], leaf_lines, [], [0]]
+    gen_off = np.zeros((n_rows, len(grid.get_generators())), dtype=bool)
+    gen_off[2, [el.id for el in grid.get_generators() if el.target_p_mw > 0. and not el.is_slack]] = True
+    loses_p = [True, True, True, False]
+
+    batch = ScenarioSweepCPP(grid)
+    batch.change_algorithm(OUTER)
+    batch.init_from_n_powerflow = init_from_n
+    batch.handle_disconnected_grid = True
+    batch.redistribute_slack = True
+    batch.modify_gen_p(rows["gen_p"])
+    batch.modify_load_p(rows["load_p"])
+    batch.modify_load_q(rows["load_q"])
+    mask = np.zeros((n_rows, len(grid.get_lines())), dtype=bool)
+    for i, lines in enumerate(rows["lines"]):
+        mask[i, lines] = True
+    batch.set_contingency_lines(mask)
+    batch.set_contingency_gens(gen_off)
+    batch.compute(_v_batch(grid, init_from_n), MAX_IT, TOL_MVA)
+
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=init_from_n,
+                          keep_outer_trace=True, handle_disconnected_grid=True, redistribute_slack=True,
+                          tol=TOL_MVA / grid.get_sn_mva())
+    sw.set_injections_from_elements(rows["load_p"], rows["load_q"], rows["gen_p"])
+    sw.set_topology(rows["lines"])
+    sw.set_contingency_gens(gen_off)
+    sw.compute(batch_size=2)
+    V = _V(sw, grid, n_rows)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V_ls = np.asarray(batch.get_voltages())[:, buses]
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    status = np.asarray(sw.get_row_status())
+    res, res_ls = sw.get_outer_results(), batch.get_outer_results()
+    for i in range(n_rows):
+        msg = f"row {i}: " + "\n".join(res[i].decisions)
+        assert any("SHARE_LOST_P" in d for d in res[i].decisions) == loses_p[i], msg
+        assert (status[i] == CONVERGED) == bool(conv[i]), msg
+        assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        if conv[i]:
+            fin = np.isfinite(V[i])
+            np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=1e-8, err_msg=msg)

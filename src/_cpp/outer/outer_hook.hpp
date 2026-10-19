@@ -122,6 +122,10 @@ struct RowOverrides {
     // n_rows x n_load, row-major: 1 = the row disconnects the load (its contingency trips
     // it): out of what TransformerVoltageControl reads off the bus
     std::vector<char> load_off;
+    // per row, the active power its contingency loses (MW, generator convention, at the
+    // grid's targets) that DistributedSlack shares before its first solve (redistribute_slack,
+    // lightsim2grid's OuterRowView::lost_p_mw); NaN: nothing to share
+    std::vector<double> lost_p_mw;
 };
 
 // Mirrors lightsim2grid's OuterRowResult (BaseBatchSweep.hpp).

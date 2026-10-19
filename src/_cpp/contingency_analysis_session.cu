@@ -310,7 +310,6 @@ void ContingencyAnalysisSession::run()
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
-        if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
         // a regulating shunt's sections are the ShuntVoltageControl loop's, which does not
         // know of a row taking it out (lightsim2grid refuses it the same way)
         for (size_t c = 0; c < ctg_shunts_.size(); ++c)
@@ -437,10 +436,15 @@ void ContingencyAnalysisSession::run()
             if (mask_cfg_.is_reference_bus[static_cast<size_t>(b)]) { ref_bus = b; break; }
         std::vector<cuda_real_type> w_rows;
         std::vector<std::vector<std::pair<int, std::complex<double>>>> ds_rows = ctg_sbus_ds_;
+        // With the outer loops, the Newton has a single slack: the DistributedSlack loop shares
+        // what a row loses before its first solve (RowOverrides::lost_p_mw), from the targets in
+        // force -- lightsim2grid's batch does the same
+        row_lost_p_mw_.clear();
         if (redistribute_slack_) {
             _check_redistribute_slack();
             const double sn = slack_rd_.sn_mva;
             slack_rows_.assign(contingencies_.size(), slack_redistribution::RowResult{});
+            if (outer_) row_lost_p_mw_.assign(contingencies_.size(), std::numeric_limits<double>::quiet_NaN());
             std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
             std::vector<double> row_p(static_cast<size_t>(n_bus));
             for (int r = 0; r < n_ctg_all; ++r) {
@@ -460,9 +464,16 @@ void ContingencyAnalysisSession::run()
                     + (has_trip_data_ ? element_trips::trip_lost_mw(trip_data_, ctg_loads_[static_cast<size_t>(r)],
                                                                     ctg_shunts_[static_cast<size_t>(r)], bus_masked)
                                       : 0.);
-                slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(slack_rd_, lost, bus_masked, g_off, g_p);
+                if (outer_) {
+                    if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+                } else {
+                    slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(slack_rd_, lost, bus_masked, g_off, g_p);
+                }
                 for (int b : ctg.masked_buses) is_masked[static_cast<size_t>(b)] = 0;
             }
+            if (outer_) slack_rows_.clear();
+        }
+        if (redistribute_slack_ && !outer_) {
             w_rows = slack_redistribution::build_row_weights(
                 slack_rd_, slack_rows_, n_ctg_all, ctg_gen_off, n_bus,
                 base_state_->h_slack_bus, base_state_->h_slack_w, ref_bus);
@@ -624,6 +635,8 @@ void ContingencyAnalysisSession::run()
             for (size_t r = 0; r < ctg_loads_.size(); ++r)
                 for (int l : ctg_loads_[r]) ov.load_off[r * static_cast<size_t>(n_load) + static_cast<size_t>(l)] = 1;
         }
+        // ... and what it loses, for its DistributedSlack loop to share (redistribute_slack)
+        ov.lost_p_mw = row_lost_p_mw_;
         outer_->set_row_overrides(std::move(ov));
     }
     timings_ = solver_->solve();
@@ -1151,7 +1164,8 @@ void ContingencyAnalysisSession::_check_redistribute_slack() const
             "ContingencyAnalysisSession: redistribute_slack needs the slack participants -- call "
             "set_slack_redistribution_data() first (the ContingencyAnalysisGPU facade does it "
             "from a lightsim2grid grid).");
-    if (base_state_->n_slack <= 0)
+    // with the outer loops, the DistributedSlack loop's participants share it, not the Newton's
+    if (!outer_ && base_state_->n_slack <= 0)
         throw std::runtime_error(
             "ContingencyAnalysisSession: redistribute_slack needs the distributed slack "
             "(use_distributed_slack=True): without it no participant takes a share.");

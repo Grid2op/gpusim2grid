@@ -339,6 +339,8 @@ private:
     std::shared_ptr<const RlPlan> build_rl_plan(const ls2g::OuterGridView& v) const;
     std::shared_ptr<const RlPlan> rl_plan_masked(const std::vector<int>& masked) const;
     void take_resume_targets(SlotState& st) const;
+    // DistributedSlack, at initialize: the row's lost active power shared on its units
+    void share_lost_p(SlotState& st, const LoopDecl& L) const;
     void collect_units(const ls2g::OuterGridView& v, std::vector<ls2g::slack_redistribution::Participant>& units,
                        std::vector<int>& bus) const;
     void set_active(SlotState& st) const;
@@ -664,6 +666,7 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.vc_v_set.empty() || ov_.vc_v_set.size() == static_cast<size_t>(n_rows) * layout_.n_grp, "group set-points");
     check(ov_.branch_off.empty() || ov_.branch_off.size() == static_cast<size_t>(n_rows), "opened branches");
     check(ov_.load_off.empty() || ov_.load_off.size() == static_cast<size_t>(n_rows) * n_load_, "disconnected loads");
+    check(ov_.lost_p_mw.empty() || ov_.lost_p_mw.size() == static_cast<size_t>(n_rows), "lost active power");
     n_rows_ = n_rows;
     slots_.assign(static_cast<size_t>(n_slots), SlotState());
     results_.assign(static_cast<size_t>(n_rows), RowResult());
@@ -704,6 +707,7 @@ void Ls2gOuterModel::load(int slot, int row)
             st.rowv.loads.off.assign(ov_.load_off.begin() + static_cast<ptrdiff_t>(r * n_load_),
                                      ov_.load_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_load_));
         }
+        if (r < ov_.lost_p_mw.size()) st.rowv.lost_p_mw = ov_.lost_p_mw[r];
         if (r < ov_.masked.size() && !ov_.masked[r].empty()) {
             st.masked = ov_.masked[r];
             std::sort(st.masked.begin(), st.masked.end());
@@ -1062,6 +1066,7 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                         ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
                 st.ds_current_mw.resize(st.ds_units.size());
                 for (size_t k = 0; k < st.ds_units.size(); ++k) st.ds_current_mw[k] = st.ds_units[k].injection_mw;
+                share_lost_p(st, d);
                 break;
             }
             case Kind::HvdcLimits:
@@ -1122,6 +1127,27 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
             }
         }
     }
+}
+
+void Ls2gOuterModel::share_lost_p(SlotState& st, const LoopDecl& L) const
+{
+    // DistributedSlackLoop::_share_lost_p: the row's loss shared before its first solve, from
+    // the targets in force (a resumed row's lost units at the "n" solve's moved targets)
+    static const std::vector<ls2g::real_type> none;
+    const double lost = ls2g::DistributedSlackLoop::lost_p_to_share_mw(
+        view(st), resume_ ? resume_gen_p_ : none, resume_ ? resume_sto_p_ : none);
+    if (st.ds_units.empty() || !(std::abs(lost) > L.ds_eps_mw)) return;
+    std::vector<ls2g::real_type> new_mw;
+    std::vector<char> saturated;
+    ls2g::slack_redistribution::distribute(st.ds_units, lost, L.ds_eps_mw, new_mw, saturated);
+    for (size_t k = 0; k < st.ds_units.size(); ++k) {
+        auto& u = st.ds_units[k];
+        if (u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR) move_gen(st, u.el_id, st.ds_unit_bus[k], new_mw[k]);
+        else move_storage(st, u.el_id, st.ds_unit_bus[k], -new_mw[k]);
+        u.injection_mw = new_mw[k];
+        st.ds_current_mw[k] = new_mw[k];
+    }
+    record(st, L.name, "SHARE_LOST_P", true, -1, lost, L.ds_eps_mw);
 }
 
 void Ls2gOuterModel::resume_loops(SlotState& st) const

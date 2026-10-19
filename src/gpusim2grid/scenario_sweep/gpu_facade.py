@@ -151,8 +151,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         (:meth:`set_contingency_gens`, which may only release a bus the loops
         reserved -- ReactiveLimits reserves every bus its own machines hold) and
         its voltage set-points (:meth:`set_gen_v`) are seen by its loops as
-        lightsim2grid's batch shows them. Not supported yet:
-        ``redistribute_slack`` (the DistributedSlack loop does that job),
+        lightsim2grid's batch shows them. With ``redistribute_slack``, the
+        DistributedSlack loop shares what a row loses before its first solve, as
+        lightsim2grid's batch does. Not supported yet:
         ``compute_physical_violations``, gradients. See :meth:`get_outer_results`.
         Requires ``scheduling="continuous"`` (the default with it) and
         ``nb_iter_per_round=1``, by design -- neither ``"chunked"`` nor another
@@ -215,7 +216,6 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             scheduling = "continuous" if self._outer_loops else "chunked"
         if self._outer_loops:
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
-                                    redistribute_slack=redistribute_slack,
                                     compute_physical_violations=compute_physical_violations)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg

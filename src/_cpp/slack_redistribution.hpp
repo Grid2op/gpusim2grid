@@ -505,6 +505,18 @@ inline void row_slack_weights(const SlackRedistributionData& d, const std::vecto
                 "slack column entry in the base case.");
 }
 
+// What row r loses (MW, generator convention): terms (a) and (b) (lost_mw) and (c)
+// (injection_change_lost_mw), with prepass_all's accessors
+template <class Masked, class GenOff, class GenPRow, class SbusPMw, class RowPMw>
+double row_lost_mw(const SlackRedistributionData& d, int r, Masked masked, GenOff gen_off,
+                   GenPRow gen_p_row, SbusPMw sbus_p_mw, RowPMw row_p_mw)
+{
+    auto g_off = [&](int g) { return gen_off(r, g); };
+    auto g_p   = [&](int g) { return gen_p_row(r, g); };
+    return lost_mw(d, masked(r), g_off, g_p, [&](int b) { return sbus_p_mw(r, b); })
+         + injection_change_lost_mw(d, row_p_mw(r), g_off, g_p);
+}
+
 // The pre-pass of every row (ORIGINAL order): skipped(r) rows are left empty;
 // masked(r) the row's masked solver buses; gen_off(r, g) whether it
 // disconnects generator g; gen_p_row(r, g) its set-point of generator g (MW);
@@ -522,8 +534,7 @@ std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows,
         const std::vector<int>& m = masked(r);
         auto g_off = [&](int g) { return gen_off(r, g); };
         auto g_p   = [&](int g) { return gen_p_row(r, g); };
-        const double lost = lost_mw(d, m, g_off, g_p, [&](int b) { return sbus_p_mw(r, b); })
-                          + injection_change_lost_mw(d, row_p_mw(r), g_off, g_p);
+        const double lost = row_lost_mw(d, r, masked, gen_off, gen_p_row, sbus_p_mw, row_p_mw);
         for (int b : m) is_masked[static_cast<size_t>(b)] = 1;
         out[static_cast<size_t>(r)] = redistribute_row(
             d, lost, [&](int b) { return b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)] != 0; },

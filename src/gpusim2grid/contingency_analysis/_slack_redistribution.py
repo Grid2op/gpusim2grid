@@ -185,8 +185,11 @@ class SlackRedistributionFacadeMixin:
         (``ContingencyAnalysis`` / ``ScenarioSweep``). Needs the distributed
         slack (``use_distributed_slack=True``) and limits on the grid
         (``set_gen_p_limits`` / ``set_storage_p_limits``) to clamp anything;
-        turning it on reads them off the grid. Default False; takes effect on
-        the next ``compute()``."""
+        turning it on reads them off the grid. With ``outer_loops``, the
+        DistributedSlack loop shares the loss itself before the row's first
+        solve, from the targets in force, as lightsim2grid's batch and
+        OpenLoadFlow's security analysis do.
+        Default False; takes effect on the next ``compute()``."""
         return self._inner.redistribute_slack
 
     @redistribute_slack.setter

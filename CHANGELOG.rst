@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``redistribute_slack`` with ``outer_loops=True``, the
+  ``DistributedSlack`` loop sharing what a row loses before its first solve (lightsim2grid's).
 - [FIXED] ``outer_loops=True``: the ``ReactiveLimits`` robust mode reads the realistic voltage band and
   the robust flag off the outer-loop driver when the loop leaves them at their defaults, as lightsim2grid.
   A remote controller whose own bus is unrealistic now stops regulating, at its target Q.
