@@ -18,17 +18,20 @@
 //             every slot keeps base's weights (stride 0, bit-identical).
 //             Produced by a ScenarioSweep generator contingency and/or the
 //             redistribute_slack pre-pass (saturated units out).
-//   dP      : the redistribute_slack pre-pass' Sbus correction, (bus, dP pu)
-//             entries, one segment per ACTIVE row -- gathered for the loaded
-//             slots (segment_gather.cuh) and scatter-ADDED into their Sbus
-//             after it was filled (never into a buffer that outlives the run,
-//             so a re-run never adds it twice).
+//   dS      : the per-row Sbus correction, (bus, dP [+ j dQ] pu) entries, one
+//             segment per ACTIVE row -- the redistribute_slack pre-pass' (active
+//             only) and the element trips of a ContingencyAnalysis contingency
+//             (a tripped load / generator, see element_trip_data.hpp), merged by
+//             the caller; gathered for the loaded slots (segment_gather.cuh) and
+//             scatter-ADDED into their Sbus after it was filled (never into a
+//             buffer that outlives the run, so a re-run never adds it twice).
 //
 // Host setters take ORIGINAL-row-order data plus the source's active_to_orig
 // map; upload() pushes both on the driver's stream (re-callable on a live
 // source, the ScenarioSweep hot / warm paths).
 // =============================================================================
 
+#include <complex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -43,18 +46,22 @@
 #include "../segment_gather.cuh"                   // RowSegments, SegmentGather
 #include "../slot_schedule.cuh"                    // SlotLoadView
 
-// d_Sbus[slot * n_bus + bus].x += dp, one thread per entry (entries are unique
-// per (slot, bus): no two threads touch the same element).
+// d_Sbus[slot * n_bus + bus] += dp (+ j dq, when d_val_im is given), one
+// thread per entry (entries are unique per (slot, bus): no two threads touch
+// the same element).
 template <typename C, typename R>
 __global__ void add_sbus_delta_kernel(C* __restrict__ d_Sbus,
                                       const int* __restrict__ d_slot,
                                       const int* __restrict__ d_bus,
                                       const R*   __restrict__ d_val,
+                                      const R*   __restrict__ d_val_im,
                                       int n_bus, int n_entries)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_entries) return;
-    d_Sbus[static_cast<ptrdiff_t>(d_slot[tid]) * n_bus + d_bus[tid]].x += d_val[tid];
+    C& dst = d_Sbus[static_cast<ptrdiff_t>(d_slot[tid]) * n_bus + d_bus[tid]];
+    dst.x += d_val[tid];
+    if (d_val_im != nullptr) dst.y += d_val_im[tid];
 }
 
 inline void ssr_chk_cuda(cudaError_t e, const char* what)
@@ -74,12 +81,15 @@ struct SlotSlackRedistribution {
     // ---- Sbus correction, one segment per active row --------------------------
     std::vector<int>             h_dp_bus;          // solver bus
     std::vector<cuda_real_type>  h_dp_val;          // dP, pu
+    std::vector<cuda_real_type>  h_dp_val_im;       // dQ, pu; empty when every entry is active only
     RowSegments                  dp_seg;
     thrust::device_vector<int>            d_dp_bus;
     thrust::device_vector<cuda_real_type> d_dp_val;
+    thrust::device_vector<cuda_real_type> d_dp_val_im;
     SegmentGather                         dp_gather;   // the loaded slots' entries
     thrust::device_vector<int>            b_dp_bus;
     thrust::device_vector<cuda_real_type> b_dp_val;
+    thrust::device_vector<cuda_real_type> b_dp_val_im;
 
     bool has_weights() const { return !h_w_all.empty() && n_slack > 0; }
     bool has_dp()      const { return !h_dp_bus.empty(); }
@@ -109,10 +119,22 @@ struct SlotSlackRedistribution {
     void set_dp_host(const std::vector<std::vector<std::pair<int, double>>>& rows_orig,
                      const std::vector<int>& active_to_orig)
     {
-        h_dp_bus.clear(); h_dp_val.clear(); dp_seg.clear();
+        std::vector<std::vector<std::pair<int, std::complex<double>>>> cplx(rows_orig.size());
+        for (size_t r = 0; r < rows_orig.size(); ++r)
+            for (const auto& bd : rows_orig[r]) cplx[r].emplace_back(bd.first, std::complex<double>(bd.second, 0.));
+        set_dp_host_cplx(cplx, active_to_orig);
+    }
+    // ... with a reactive part (rows_orig[r]: sorted (bus, dS pu), one per bus)
+    void set_dp_host_cplx(const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows_orig,
+                          const std::vector<int>& active_to_orig)
+    {
+        h_dp_bus.clear(); h_dp_val.clear(); h_dp_val_im.clear(); dp_seg.clear();
         if (rows_orig.empty()) return;
-        bool any = false;
-        for (const auto& r : rows_orig) if (!r.empty()) { any = true; break; }
+        bool any = false, any_im = false;
+        for (const auto& r : rows_orig) {
+            if (!r.empty()) any = true;
+            for (const auto& bd : r) if (bd.second.imag() != 0.) any_im = true;
+        }
         if (!any) return;
         std::vector<ChunkPatchRange> ranges(active_to_orig.size(), ChunkPatchRange{0, 0});
         for (size_t a = 0; a < active_to_orig.size(); ++a) {
@@ -121,7 +143,8 @@ struct SlotSlackRedistribution {
             if (o >= 0 && o < static_cast<int>(rows_orig.size()))
                 for (const auto& bd : rows_orig[static_cast<size_t>(o)]) {
                     h_dp_bus.push_back(bd.first);
-                    h_dp_val.push_back(static_cast<cuda_real_type>(bd.second));
+                    h_dp_val.push_back(static_cast<cuda_real_type>(bd.second.real()));
+                    if (any_im) h_dp_val_im.push_back(static_cast<cuda_real_type>(bd.second.imag()));
                 }
             ranges[a] = {start, static_cast<int>(h_dp_bus.size()) - start};
         }
@@ -131,7 +154,7 @@ struct SlotSlackRedistribution {
     void clear()
     {
         h_w_all.clear(); n_slack = 0;
-        h_dp_bus.clear(); h_dp_val.clear(); dp_seg.clear();
+        h_dp_bus.clear(); h_dp_val.clear(); h_dp_val_im.clear(); dp_seg.clear();
     }
 
     // H→D of both, and the per-slot weight buffer sized for `batch_capacity`.
@@ -147,6 +170,8 @@ struct SlotSlackRedistribution {
         if (has_dp()) {
             upload_h2d(d_dp_bus, h_dp_bus.data(), h_dp_bus.size(), cs);
             upload_h2d(d_dp_val, h_dp_val.data(), h_dp_val.size(), cs);
+            if (!h_dp_val_im.empty()) upload_h2d(d_dp_val_im, h_dp_val_im.data(), h_dp_val_im.size(), cs);
+            else d_dp_val_im.clear();
         }
     }
 
@@ -170,10 +195,13 @@ struct SlotSlackRedistribution {
         if (dp_gather.total <= 0) return;
         dp_gather.gather(b_dp_bus, d_dp_bus, cs);
         dp_gather.gather(b_dp_val, d_dp_val, cs);
+        const bool with_im = !h_dp_val_im.empty();
+        if (with_im) dp_gather.gather(b_dp_val_im, d_dp_val_im, cs);
         add_sbus_delta_kernel<<<(dp_gather.total + BS - 1) / BS, BS, 0, cs>>>(
             d_Sbus_batch, dp_gather.out_slot(),
             thrust::raw_pointer_cast(b_dp_bus.data()),
             thrust::raw_pointer_cast(b_dp_val.data()),
+            with_im ? thrust::raw_pointer_cast(b_dp_val_im.data()) : static_cast<const cuda_real_type*>(nullptr),
             n_bus, dp_gather.total);
         ssr_chk_cuda(cudaGetLastError(), "Sbus correction scatter");
     }

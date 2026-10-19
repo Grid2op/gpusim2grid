@@ -119,6 +119,9 @@ struct RowOverrides {
     // per row, the branches its contingency opens (the lines, then the transformers:
     // n_lines + trafo id)
     std::vector<std::vector<int>> branch_off;
+    // n_rows x n_load, row-major: 1 = the row disconnects the load (its contingency trips
+    // it): out of what TransformerVoltageControl reads off the bus
+    std::vector<char> load_off;
 };
 
 // Mirrors lightsim2grid's OuterRowResult (BaseBatchSweep.hpp).

@@ -224,6 +224,7 @@ class BatchPowerFlow:
         self.n_line = len(grid.get_lines())
         self.n_trafo = len(grid.get_trafos())
         self.n_branch = self.n_line + self.n_trafo
+        self.n_shunt = len(grid.get_shunts())
 
         # Element -> bus assembly (mirrors _ls2g_utils.build_bus_injections):
         # Sbus_pu = const + Σ gen_p/sn − Σ (load_p + j load_q)/sn.
@@ -293,6 +294,12 @@ class BatchPowerFlow:
         self._pending_topology_mask = None  # _topology_mask once _pending_topology is set
         self._gen_v_in_session = False
         self._gen_off_mask = None       # (n_scen, n_gen) bool, True = disconnected
+        # the shunt mask, same contract as the generator one
+        self._shunt_off_mask = None
+        self._shunt_off_in_session = False
+        self._shunt_off_rows = None
+        self._pending_shunt_off = None
+        self._pending_shunt_off_mask = None
         self._gen_off_in_session = False
         self._gen_off_rows = None       # row count of the mask the session holds
         self._pending_gen_off = None    # mask to hand to the session on the next run
@@ -407,7 +414,8 @@ class BatchPowerFlow:
         return self.forward(*args, **kwargs)
 
     def forward(self, load_p=None, load_q=None, gen_p=None, gen_v=None,
-                line_status=None, trafo_status=None, gen_status=None):
+                line_status=None, trafo_status=None, gen_status=None,
+                shunt_status=None, load_status=None):
         """Solve one scenario per row; returns complex ``V`` ``(n_scen, n_bus)``
         on the GPU (per-unit, AC-solver bus numbering; NaN rows = scenarios the
         connectivity pre-check dropped).
@@ -422,18 +430,30 @@ class BatchPowerFlow:
                          contingencies, see the module docstring; needs the
                          lightsim2grid bridge, and only generators regulating
                          their own bus may be disconnected)
+        shunt_status   : (n_scen, n_shunt) bool, True = connected (a disconnected
+                         shunt leaves the row's admittance matrix)
+        load_status    : (n_scen, n_load)  bool, True = connected (a disconnected
+                         load leaves the row's injection: its load_p / load_q
+                         gradient there is 0)
         ``None`` = the grid's base-case value in every row. At least one
         input must be given (it fixes n_scen).
         """
         n_scen = self._infer_n_scen(load_p, load_q, gen_p, gen_v,
-                                    line_status, trafo_status, gen_status)
+                                    line_status, trafo_status, gen_status,
+                                    shunt_status, load_status)
         load_p = self._as_input(load_p, self.n_load, self._load_p_base, n_scen, "load_p")
         load_q = self._as_input(load_q, self.n_load, self._load_q_base, n_scen, "load_q")
         gen_p = self._as_input(gen_p, self.n_gen, self._gen_p_base, n_scen, "gen_p")
         gen_v = None if gen_v is None else self._as_input(gen_v, self.n_gen, None, n_scen, "gen_v")
 
         self._apply_topology(line_status, trafo_status, n_scen)
+        self._apply_shunt_status(shunt_status, n_scen)
         gen_off = self._apply_gen_status(gen_status, n_scen)
+        if load_status is not None:
+            # a disconnected load draws nothing in its row (and so carries no gradient there)
+            load_off = ~self._as_status(load_status, self.n_load, n_scen, "load_status")
+            load_p = torch.where(load_off, torch.zeros_like(load_p), load_p)
+            load_q = torch.where(load_off, torch.zeros_like(load_q), load_q)
         gen_p_in = gen_p   # a disconnected generator's set-point is what the others make up
 
         # Chunked: capacity == n_scen, one chunk whatever rows get islanded (the
@@ -633,7 +653,8 @@ class BatchPowerFlow:
         if n is None:
             raise ValueError(
                 "BatchPowerFlow needs at least one input (load_p, load_q, gen_p, gen_v, "
-                "line_status, trafo_status or gen_status) to know the number of scenarios")
+                "line_status, trafo_status, gen_status, shunt_status or load_status) to know "
+                "the number of scenarios")
         if n <= 0:
             raise ValueError("the number of scenarios must be > 0")
         return n
@@ -728,6 +749,22 @@ class BatchPowerFlow:
         elif self._skip_in_session:
             self._pending_skip = "clear"
 
+    def _apply_shunt_status(self, shunt_status, n_scen):
+        """Same contract as _apply_gen_status for the shunt mask (an admittance:
+        handed to the session, which edits the rows' Ybus)."""
+        self._pending_shunt_off = None
+        self._pending_shunt_off_mask = None
+        if shunt_status is None:
+            if self._shunt_off_mask is not None or (
+                    self._shunt_off_in_session and n_scen != self._shunt_off_rows):
+                self._pending_shunt_off = np.zeros((n_scen, self.n_shunt), dtype=bool)
+            return
+        shunt_off = ~self._as_status(shunt_status, self.n_shunt, n_scen, "shunt_status")
+        prev = self._shunt_off_mask
+        if prev is None or prev.shape != shunt_off.shape or not torch.equal(prev, shunt_off):
+            self._pending_shunt_off = np.ascontiguousarray(shunt_off.cpu().numpy(), dtype=bool)
+            self._pending_shunt_off_mask = shunt_off.clone()
+
     def _apply_gen_status(self, gen_status, n_scen):
         """Same contract as _apply_topology for the generator mask. Returns the
         (n_scen, n_gen) bool "disconnected" mask to apply to the injections
@@ -784,6 +821,14 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             pf._topology_in_session = True
             pf._pending_topology = None
             pf._pending_topology_mask = None
+        if pf._pending_shunt_off is not None:
+            # after the topology: the session rebuilds the rows' patches from both
+            pf._sweep.set_contingency_shunts(pf._pending_shunt_off)
+            pf._shunt_off_mask = pf._pending_shunt_off_mask
+            pf._shunt_off_rows = int(pf._pending_shunt_off.shape[0])
+            pf._shunt_off_in_session = True
+            pf._pending_shunt_off = None
+            pf._pending_shunt_off_mask = None
         if pf._pending_skip is not None:
             if isinstance(pf._pending_skip, str):
                 solver.clear_skipped_rows()

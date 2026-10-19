@@ -361,6 +361,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # disconnected generators taken out, whatever the call order.
         self._pending_elements = None
         self._gen_off = None
+        self._load_off = None   # set_contingency_loads(), applied the same way
         # per-row (rows, buses, MVAr) reactive changes added on top of the
         # assembled injections -- private, set by ContingencyAnalysisGPU's
         # reactive_limits_outer_loop second pass (None = none)
@@ -472,9 +473,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             # Row counts disagree: leave the check to the C++ session at
             # compute() (same rule as set_topology), assemble without the mask.
             gen_off = None
+        load_off = self._load_off
+        if load_off is not None and load_off.shape[0] != load_p.shape[0]:
+            load_off = None   # (same rule as gen_off above)
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p,
-                                            gen_off=gen_off)
+                                            gen_off=gen_off, load_off=load_off)
         if self._q_delta is not None:
             # ContingencyAnalysisGPU's reactive_limits_outer_loop second pass:
             # (row, bus, MVAr) changes of the switched / released machines
@@ -670,12 +674,65 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         """
         self._inner.set_topology(branch_ids_per_scenario)
 
+    def set_contingency_shunts(self, mask):
+        """Per-row shunt contingency mask, shape ``(n_scenarios, n_shunt)``,
+        dtype bool. ``True`` means "disconnect this shunt for this row".
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_contingency_shunts``: a shunt
+        is an admittance, so the row loses its diagonal coefficient of the
+        admittance matrix, as :meth:`set_topology` edits it for a branch (both
+        are kept together). With the outer loops, a shunt that regulates a
+        voltage is refused (its sections are the ShuntVoltageControl loop's).
+        Needs a lightsim2grid grid.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_contingency_shunts() needs a lightsim2grid grid; "
+                "explicit-array (tuple) mode has no shunts to read.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(f"'mask' must be 2-D (n_scenarios, n_shunt), got shape {mask.shape}.")
+        self._inner._s.set_contingency_shunts(np.ascontiguousarray(mask, dtype=bool))
+
+    def set_contingency_loads(self, mask):
+        """Per-row load contingency mask, shape ``(n_scenarios, n_load)``,
+        dtype bool. ``True`` means "disconnect this load for this row".
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_contingency_loads``: the
+        row's own load (:meth:`set_injections_from_elements`) leaves its
+        injection, whichever of the two is called first, and the distributed
+        slack makes up the balance. A caller giving per-bus injections
+        (:meth:`set_injections`) takes the loads out itself. Needs a lightsim2grid
+        grid.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_contingency_loads() needs a lightsim2grid grid; "
+                "explicit-array (tuple) mode has no loads to read.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(f"'mask' must be 2-D (n_scenarios, n_load), got shape {mask.shape}.")
+        if mask.shape[1] != self._elements.n_load:
+            raise ValueError(
+                f"The number of loads on the grid ({self._elements.n_load}) "
+                f"differs from the number of columns of the mask ({mask.shape[1]}).")
+        mask = np.ascontiguousarray(mask, dtype=bool)
+        self._inner._s.set_contingency_loads(mask)   # what the outer loops' view reads
+        self._load_off = mask
+        if self._pending_elements is not None:
+            self._assemble_injections()
+
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.
 
         The capsule aliases live GPU memory; clone before the next ``compute()``
         for a snapshot.  Residuals are cached for :meth:`last_residuals`.
         """
+        if self._load_off is not None and self._pending_elements is None:
+            raise RuntimeError(
+                "set_contingency_loads() takes the loads out of the injections given by "
+                "set_injections_from_elements(); with per-bus set_injections(), take them "
+                "out of the arrays yourself (and do not call set_contingency_loads).")
         self._inner.batch_size = int(batch_size)
         if self._skip_rows_stale:
             self._update_skipped_rows()

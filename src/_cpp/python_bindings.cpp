@@ -1677,6 +1677,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Define the contingency set from a list of branch-index lists; each "
          "inner list is the branches tripped in that contingency. Requires "
          "set_branch_data() first.")
+    .def("build_contingencies_full",
+         &ContingencyAnalysisSession::build_contingencies_full,
+         pybind11::arg("branch_ids_per_ctg"), pybind11::arg("shunt_ids_per_ctg"),
+         pybind11::arg("load_ids_per_ctg"), pybind11::arg("gen_ids_per_ctg"),
+         "Define the contingency set, each contingency tripping branches, shunts, "
+         "loads and generators together (four aligned lists, one entry per "
+         "contingency; lightsim2grid's ContingencyAnalysis.add_contingency). A shunt "
+         "leaves the row's Ybus (its diagonal coefficient), a load / generator its "
+         "Sbus; a generator that was the last one regulating its bus turns that bus "
+         "PQ for the row and leaves its distributed slack. Needs the element and "
+         "generator data of a session built from a lightsim2grid grid.")
+    .def_property_readonly("has_element_trip_data", &ContingencyAnalysisSession::has_element_trip_data)
+    .def_property_readonly("ctg_shunts", &ContingencyAnalysisSession::ctg_shunts)
+    .def_property_readonly("ctg_loads", &ContingencyAnalysisSession::ctg_loads)
+    .def_property_readonly("ctg_gens", &ContingencyAnalysisSession::ctg_gens)
     .def("run",   &ContingencyAnalysisSession::run,
          "Solve all contingencies. Fills the device-side voltage and residual "
          "buffers; contingencies that would disconnect the graph get NaN residuals "
@@ -2322,6 +2337,40 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("clear_skipped_rows", &ScenarioSweepSession::clear_skipped_rows,
          "Drop any set_skipped_rows() mask.")
     .def_property_readonly("has_skipped_rows", &ScenarioSweepSession::has_skipped_rows)
+    .def("set_contingency_shunts",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error("ScenarioSweepSession::set_contingency_shunts: mask must be 2-D (n_scenarios, n_shunt)");
+             ScenarioSweepSession::BoolMat m(static_cast<Eigen::Index>(mask.shape(0)), static_cast<Eigen::Index>(mask.shape(1)));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_contingency_shunts(m);
+         },
+         pybind11::arg("mask"),
+         "Per-row shunt contingency mask, shape (n_scenarios, n_shunt), dtype bool: True "
+         "disconnects that shunt for that row (lightsim2grid's "
+         "ScenarioSweep.set_contingency_shunts). Its diagonal Ybus coefficient joins the "
+         "row's patch; refused with the outer loops for a shunt regulating a voltage. "
+         "Needs a session built from a lightsim2grid grid.")
+    .def("set_contingency_loads",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error("ScenarioSweepSession::set_contingency_loads: mask must be 2-D (n_scenarios, n_load)");
+             ScenarioSweepSession::BoolMat m(static_cast<Eigen::Index>(mask.shape(0)), static_cast<Eigen::Index>(mask.shape(1)));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_contingency_loads(m);
+         },
+         pybind11::arg("mask"),
+         "Per-row load contingency mask, shape (n_scenarios, n_load), dtype bool. The "
+         "injection side (the load leaving Sbus) is the caller's job "
+         "(ScenarioSweepGPU.set_contingency_loads does it in set_injections_from_elements); "
+         "this is what the outer loops' view of the row reads.")
+    .def_property_readonly("has_element_trip_data", &ScenarioSweepSession::has_element_trip_data)
     .def("set_contingency_gens",
          [](ScenarioSweepSession& self,
             pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {

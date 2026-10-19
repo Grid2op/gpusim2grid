@@ -41,6 +41,8 @@
 #include "outer/outer_hook.hpp"                  // outer::OuterHook
 #include "ledger_data.hpp"                      // LedgerData (the stored base ledger)
 #include "slack_redistribution.hpp"              // SlackRedistributionData, slack_redistribution::RowResult
+#include "element_trip_data.hpp"                 // ElementTripData
+#include "gen_contingency_data.hpp"              // GenContingencyData
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
@@ -49,8 +51,10 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <complex>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 // Forward-declare CUDA-dependent types to avoid pulling CUDA headers
@@ -63,6 +67,7 @@
 struct AcPfNrState;
 struct LedgerData;
 struct ContingencyBatch;
+struct ContingencyAnalysisDeviceData;   // session-owned device buffers (defined in the .cu)
 template <typename BatchSource> struct BatchPfDriver;
 using ContingencyAnalysisSolver = BatchPfDriver<ContingencyBatch>;
 
@@ -77,6 +82,7 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     std::shared_ptr<AcPfNrState>               base_state_;   // shared: a v_base_dlpack() capsule co-owns it
     std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run(); then kept
+    std::unique_ptr<ContingencyAnalysisDeviceData> dev_;   // the generator mask of the physical checks
 
     // =========================================================================
     // Driver persistence (see BatchDriverConfig): run() keeps solver_ -- its
@@ -215,6 +221,24 @@ struct ContingencyAnalysisSession {
     std::vector<std::vector<int>> disconnected_per_ctg_;  // tripped branch IDs per ctg
     bool has_contingencies_ = false;
 
+    // The shunts, loads and generators each contingency trips (build_contingencies_full;
+    // empty lists otherwise): a shunt is one more diagonal triplet of the row's Ybus
+    // patch (in contingencies_), a load / generator a per-row Sbus correction
+    // (ctg_sbus_ds_, see element_trip_data.hpp), a generator also the PV -> PQ
+    // release of a bus it held alone and its distributed-slack share (the same
+    // machinery as ScenarioSweepSession::set_contingency_gens, gen_contingency_rows.hpp).
+    ElementTripData    trip_data_;
+    bool               has_trip_data_ = false;
+    GenContingencyData gen_data_;
+    bool               has_gen_data_ = false;
+    std::vector<std::vector<int>> ctg_shunts_, ctg_loads_, ctg_gens_;
+    std::vector<std::vector<std::pair<int, std::complex<double>>>> ctg_sbus_ds_;
+    bool has_gen_trips_ = false;
+    // the buses the base ledger was extended with (a generator trip releases them
+    // on some row), and the ones each row releases
+    std::vector<int>              reserved_buses_;
+    std::vector<std::vector<int>> row_pv_to_pq_;
+
     // Base-case NR time captured at construction (before run() is called).
     double t_base_case_ms_ = 0.;
 
@@ -287,6 +311,26 @@ struct ContingencyAnalysisSession {
     // Requires set_branch_data() to have been called.
     // =========================================================================
     void build_contingencies(const std::vector<std::vector<int>>& branch_ids_per_ctg);
+
+    // =========================================================================
+    // build_contingencies_full
+    // The same, each contingency tripping branches, shunts, loads and
+    // generators together (lightsim2grid's ContingencyAnalysis::add_contingency):
+    // the four lists are aligned, one entry per contingency. Shunts, loads and
+    // generators need set_element_trip_data() (generators also
+    // set_gen_contingency_data()); the bridge factories set both.
+    // =========================================================================
+    void build_contingencies_full(const std::vector<std::vector<int>>& branch_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& shunt_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& load_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& gen_ids_per_ctg);
+    void set_element_trip_data(const ElementTripData& data) { trip_data_ = data; has_trip_data_ = true; }
+    bool has_element_trip_data() const { return has_trip_data_; }
+    void set_gen_contingency_data(const GenContingencyData& data) { gen_data_ = data; has_gen_data_ = data.n_gen > 0; }
+    // what contingency c trips beyond its branches
+    const std::vector<std::vector<int>>& ctg_shunts() const { return ctg_shunts_; }
+    const std::vector<std::vector<int>>& ctg_loads()  const { return ctg_loads_; }
+    const std::vector<std::vector<int>>& ctg_gens()   const { return ctg_gens_; }
 
     // =========================================================================
     // run
@@ -477,8 +521,9 @@ private:
     // redistribute_slack's preconditions (run() refuses without them)
     void _check_redistribute_slack() const;
     // (Re)build base_state_ / mask_cfg_ on the stored inputs, the ledger's
-    // reference moved to ref_bus_; and the reference run() wants.
-    void _build_base_state();
+    // reference moved to ref_bus_ and extended with `switchable_buses` (a Vm
+    // column + Q row each, see ledger_extend.hpp); and the reference run() wants.
+    void _build_base_state(const std::vector<int>& switchable_buses = std::vector<int>());
     int  _wanted_reference_bus();
 };
 

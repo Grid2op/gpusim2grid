@@ -375,6 +375,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._rl_ctx = None
         self._rl_result = None
         self._ctg_branch_ids = None
+        self._ctg_elements = None
         if reactive_limits_outer_loop:
             _warn_reactive_limits_outer_loop_deprecated()
         self._reactive_limits_outer_loop = _check_reactive_limits_outer_loop(reactive_limits_outer_loop)
@@ -576,6 +577,79 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         self._inner.build_contingencies(branch_ids_per_ctg)
         self._ctg_branch_ids = [list(map(int, ids)) for ids in branch_ids_per_ctg]
+        self._ctg_elements = [(list(ids), [], [], []) for ids in self._ctg_branch_ids]
+
+    # ------------------------------------- shunts, loads and generators tripped
+    @staticmethod
+    def _as_ids(ids):
+        if ids is None:
+            return []
+        if isinstance(ids, (int, np.integer)):
+            return [int(ids)]
+        return sorted(set(int(el) for el in ids))
+
+    def _push_contingencies(self):
+        b, s, l, g = ([list(c[k]) for c in self._ctg_elements] for k in range(4))
+        if any(s) or any(l) or any(g):
+            self._inner.build_contingencies_full(b, s, l, g)
+        else:
+            self._inner.build_contingencies(b)
+        self._ctg_branch_ids = b
+
+    def add_contingencies(self, contingencies):
+        """Append contingencies, each a tuple ``(branch_ids, shunt_ids, load_ids,
+        gen_ids)`` tripping those elements together (lightsim2grid's
+        ``ContingencyAnalysisCPP.add_contingency``). Any of the four may be empty, not
+        all. Appended to what :meth:`add_contingencies_by_branch_id` (which replaces
+        the whole list) or a previous ``add_contingenc*`` registered.
+
+        - a shunt leaves the contingency's admittance matrix (its diagonal
+          coefficient);
+        - a load leaves its injection (its active and reactive power);
+        - a generator too (its active power, and the reactive setpoint of one that does
+          not regulate voltage), and the distributed slack is re-weighted without it;
+          when it was the last one regulating its own bus, that bus turns PQ for the
+          contingency. A generator regulating a remote bus, or on a bus a control group
+          holds, is refused by :meth:`compute`.
+
+        With the outer loops, a shunt that regulates a voltage is refused (its sections
+        are the ShuntVoltageControl loop's). Needs a grid-mode instance (the element
+        data comes from the lightsim2grid grid).
+        """
+        if getattr(self, "_ctg_elements", None) is None:
+            self._ctg_elements = []
+        new = []
+        for cont in contingencies:
+            if len(cont) != 4:
+                raise ValueError("each contingency must be (branch_ids, shunt_ids, load_ids, gen_ids)")
+            cont = tuple(self._as_ids(el) for el in cont)
+            if not any(cont):
+                raise ValueError("a contingency must trip something (every list is empty)")
+            new.append(cont)
+        self._ctg_elements = self._ctg_elements + new
+        self._push_contingencies()
+
+    def add_contingency(self, branch_ids=(), shunt_ids=(), load_ids=(), gen_ids=()):
+        """Append one contingency tripping these elements together; see
+        :meth:`add_contingencies`."""
+        self.add_contingencies([(branch_ids, shunt_ids, load_ids, gen_ids)])
+
+    def add_contingency_shunt(self, shunt_ids):
+        """Append one contingency tripping these shunts only (one id, or several)."""
+        self.add_contingencies([((), shunt_ids, (), ())])
+
+    def add_contingency_load(self, load_ids):
+        """Append one contingency tripping these loads only (one id, or several)."""
+        self.add_contingencies([((), (), load_ids, ())])
+
+    def add_contingency_gen(self, gen_ids):
+        """Append one contingency tripping these generators only (one id, or several)."""
+        self.add_contingencies([((), (), (), gen_ids)])
+
+    def get_contingencies(self):
+        """Every contingency registered, in row order: ``(branch_ids, shunt_ids,
+        load_ids, gen_ids)``."""
+        return [tuple(list(el) for el in c) for c in (getattr(self, "_ctg_elements", None) or [])]
 
     @property
     def outer_loops(self):
@@ -793,6 +867,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._ctg_branch_ids is None:
             raise RuntimeError("reactive_limits_outer_loop: no contingency was added "
                                "through add_contingencies_by_branch_id().")
+        if any(c[1] or c[2] or c[3] for c in (getattr(self, "_ctg_elements", None) or [])):
+            raise RuntimeError("reactive_limits_outer_loop does not support contingencies tripping "
+                               "shunts, loads or generators: use outer_loops=True.")
         sess = self._inner._s
         res = self.last_residuals()
         conv = np.isfinite(res) & (res <= self._inner.violation_tol)

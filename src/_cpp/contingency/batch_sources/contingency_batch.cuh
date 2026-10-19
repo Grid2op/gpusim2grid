@@ -17,9 +17,10 @@
 //     ③ apply_contingencies_kernel: subtract the loaded rows' Ybus deltas
 //        (their segments gathered into one slot-tagged stream, no atomicAdd
 //        by construction)
-//     ④ Sbus: nothing (the shared base — sbus_stride = 0), unless a
-//        redistribute_slack correction exists (then base Sbus per slot + the
-//        row's correction), and the row's slack weights when re-weighted.
+//     ④ Sbus: nothing (the shared base — sbus_stride = 0), unless some row
+//        corrects it -- the redistribute_slack pre-pass, a load or generator
+//        the contingency trips (then base Sbus per slot + the row's
+//        correction) -- and the row's slack weights when re-weighted.
 //
 // Per-row data (host preprocessing in ctor, GPU upload in initialize):
 //   d_flat_k, d_flat_delta_re, d_flat_delta_im — SoA flat patches, one
@@ -27,6 +28,7 @@
 // =============================================================================
 
 #include <chrono>
+#include <complex>
 #include <thrust/device_vector.h>
 #include <vector>
 
@@ -214,6 +216,15 @@ struct ContingencyBatch {
         slack_.set_weights_host(w_orig, n_slack, active_to_orig_, n_total_);
         slack_.set_dp_host(dp_orig, active_to_orig_);
     }
+    // ... with a reactive part in the correction (the element trips: a tripped
+    // load or generator gives back its p + jq), (bus, dS pu) per ORIGINAL row,
+    // sorted, one entry per bus
+    void set_row_sbus_host(const std::vector<cuda_real_type>& w_orig, int n_slack,
+                           const std::vector<std::vector<std::pair<int, std::complex<double>>>>& ds_orig)
+    {
+        slack_.set_weights_host(w_orig, n_slack, active_to_orig_, n_total_);
+        slack_.set_dp_host_cplx(ds_orig, active_to_orig_);
+    }
 
     ContingencyBatch(ContingencyBatch&&) noexcept = default;
     ContingencyBatch(const ContingencyBatch&) = delete;
@@ -291,8 +302,9 @@ struct ContingencyBatch {
     void load_slots(BatchPfDriverContext& ctx, const SlotLoadView& L,
                     cudaStream_t cs, CudaTimer& timer, BatchTimings& t);
 
-    // The listed slots' Sbus back to the base case's (the outer loops: a row re-solved
-    // in place, before its new correction). Needs slot_sbus_.
+    // The listed slots' Sbus back to the base case's plus their row's correction (the
+    // outer loops: a row re-solved in place, before its loops' new correction).
+    // Needs slot_sbus_.
     void reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView& L, cudaStream_t cs);
 
     void bind_slots(NrIterBuffers& buf, const SlotTableView& T, const int* d_J_outer,

@@ -278,7 +278,7 @@ private:
     std::vector<int> hvdc_id_, hvdc_bus1_, hvdc_bus2_, hvdc_status0_;
     std::vector<double> hvdc_p0_, hvdc_k_, hvdc_lf1_, hvdc_lf2_, hvdc_r_, hvdc_pmax12_, hvdc_pmax21_;
     // BranchControl, the ledger's order (LedgerData::bc_*)
-    int n_bc_ = 0, n_line_ = 0, n_trafo_ = 0;
+    int n_bc_ = 0, n_line_ = 0, n_trafo_ = 0, n_load_ = 0;
     std::vector<int> bc_trafo_, bc_b1_, bc_b2_, bc_phase_, bc_ratio_, bc_has_col_;
     std::vector<double> bc_sign_, bc_rexp_;
     std::vector<int> bc_of_trafo_;                 // trafo id -> entry (-1)
@@ -532,6 +532,7 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     n_bc_ = ledger.n_bc();
     n_line_ = g.get_lines().nb();
     n_trafo_ = g.get_trafos().nb();
+    n_load_ = g.get_loads().nb();
     bc_trafo_ = ledger.bc_trafo; bc_b1_ = ledger.bc_bus1; bc_b2_ = ledger.bc_bus2;
     bc_phase_ = ledger.bc_phase; bc_ratio_ = ledger.bc_ratio;
     bc_sign_ = ledger.bc_sign; bc_rexp_ = ledger.bc_rexp;
@@ -661,6 +662,7 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.pq_buses.empty() || ov_.pq_buses.size() == static_cast<size_t>(n_rows), "released buses");
     check(ov_.vc_v_set.empty() || ov_.vc_v_set.size() == static_cast<size_t>(n_rows) * layout_.n_grp, "group set-points");
     check(ov_.branch_off.empty() || ov_.branch_off.size() == static_cast<size_t>(n_rows), "opened branches");
+    check(ov_.load_off.empty() || ov_.load_off.size() == static_cast<size_t>(n_rows) * n_load_, "disconnected loads");
     n_rows_ = n_rows;
     slots_.assign(static_cast<size_t>(n_slots), SlotState());
     results_.assign(static_cast<size_t>(n_rows), RowResult());
@@ -696,6 +698,10 @@ void Ls2gOuterModel::load(int slot, int row)
             st.rowv.gens.off.assign(ov_.gen_off.begin() + static_cast<ptrdiff_t>(r * n_gen_),
                                     ov_.gen_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_gen_));
             for (char o : st.rowv.gens.off) changes_units = changes_units || o != 0;
+        }
+        if (!ov_.load_off.empty()) {
+            st.rowv.loads.off.assign(ov_.load_off.begin() + static_cast<ptrdiff_t>(r * n_load_),
+                                     ov_.load_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_load_));
         }
         if (r < ov_.masked.size() && !ov_.masked[r].empty()) {
             st.masked = ov_.masked[r];

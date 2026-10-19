@@ -580,6 +580,72 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     return d;
 }
 
+ElementTripData extract_element_trip_data(const ls2g::LSGrid& grid, int n_bus_solver)
+{
+    const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
+    auto to_solver = [&](int bus_me) -> int {
+        int b = bus_me;
+        if (!me_to_solver.empty())
+            b = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size())) ? me_to_solver[bus_me] : -1;
+        return (b >= 0 && b < n_bus_solver) ? b : -1;
+    };
+    ElementTripData d;
+    d.sn_mva = static_cast<double>(grid.get_sn_mva());
+    const double sn = d.sn_mva;
+
+    // shunts: the coefficient lightsim2grid's ShuntContainer::_fillYbus stamps
+    const ls2g::ShuntContainer& shunts = grid.get_shunts();
+    d.n_shunt = shunts.nb();
+    d.shunt_bus.assign(static_cast<size_t>(d.n_shunt), -1);
+    d.shunt_y_re.assign(static_cast<size_t>(d.n_shunt), 0.);
+    d.shunt_y_im.assign(static_cast<size_t>(d.n_shunt), 0.);
+    d.shunt_p_mw.assign(static_cast<size_t>(d.n_shunt), 0.);
+    d.shunt_regulating.assign(static_cast<size_t>(d.n_shunt), 0);
+    {
+        const std::vector<bool>& status = shunts.get_status();
+        const auto& bus = shunts.get_bus_id();
+        const auto p = shunts.get_target_p();
+        const auto q = shunts.get_target_q();
+        for (int k = 0; k < d.n_shunt; ++k) {
+            const size_t kk = static_cast<size_t>(k);
+            d.shunt_regulating[kk] = (shunts.has_sections(k) && shunts.get_section_regulating(k)) ? 1 : 0;
+            if (!status[kk]) continue;
+            d.shunt_bus[kk] = to_solver(bus(k).cast_int());
+            d.shunt_p_mw[kk] = static_cast<double>(p(k));
+            const bool sn_not_1 = std::abs(sn - 1.) > 1e-8;
+            d.shunt_y_re[kk] = static_cast<double>(p(k)) / (sn_not_1 ? sn : 1.);
+            d.shunt_y_im[kk] = -static_cast<double>(q(k)) / (sn_not_1 ? sn : 1.);
+        }
+    }
+
+    // loads
+    const auto& loads = grid.get_loads_as_data();
+    d.n_load = loads.nb();
+    d.load_bus.assign(static_cast<size_t>(d.n_load), -1);
+    d.load_p_mw.assign(static_cast<size_t>(d.n_load), 0.);
+    d.load_q_mvar.assign(static_cast<size_t>(d.n_load), 0.);
+    {
+        const std::vector<bool>& status = loads.get_status();
+        const auto& bus = loads.get_bus_id();
+        const auto p = loads.get_target_p();
+        const auto q = loads.get_target_q();
+        for (int k = 0; k < d.n_load; ++k) {
+            const size_t kk = static_cast<size_t>(k);
+            if (!status[kk]) continue;
+            d.load_bus[kk] = to_solver(bus(k).cast_int());
+            d.load_p_mw[kk] = static_cast<double>(p(k));
+            d.load_q_mvar[kk] = static_cast<double>(q(k));
+        }
+    }
+
+    // generators' active set-points
+    const auto gen_p = grid.get_gen_target_p();
+    d.n_gen = static_cast<int>(gen_p.size());
+    d.gen_target_p_mw.assign(static_cast<size_t>(d.n_gen), 0.);
+    for (int g = 0; g < d.n_gen; ++g) d.gen_target_p_mw[static_cast<size_t>(g)] = static_cast<double>(gen_p(g));
+    return d;
+}
+
 GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_bus_solver)
 {
     const ls2g::GeneratorContainer& gens = grid.get_generators();
@@ -1018,6 +1084,9 @@ make_ca_session_from_lsgrid(
     // The slack participants of the redistribute_slack pre-pass (cheap, always).
     session->set_slack_redistribution_data(
         extract_slack_redistribution_data(grid, static_cast<int>(Ybus.rows())));
+    // What a contingency tripping shunts / loads / generators changes (cheap, always)
+    session->set_element_trip_data(extract_element_trip_data(grid, static_cast<int>(Ybus.rows())));
+    session->set_gen_contingency_data(extract_gen_contingency_data(grid, static_cast<int>(Ybus.rows())));
     // A reference the caller forced on the grid is kept by the automatic
     // reference slack (lightsim2grid keeps it for the whole batch too).
     session->set_forced_reference_bus(forced_reference_bus_solver(grid, static_cast<int>(Ybus.rows())));
@@ -1420,6 +1489,7 @@ make_ss_session_from_lsgrid(
     // Per-generator snapshot for set_contingency_gens() (cheap, always).
     session->set_gen_contingency_data(
         extract_gen_contingency_data(grid, static_cast<int>(Ybus.rows())));
+    session->set_element_trip_data(extract_element_trip_data(grid, static_cast<int>(Ybus.rows())));
 
     // Always set — set_topology() needs branch admittances to build each
     // scenario's Ybus triplets, not just compute_flows().
@@ -1663,6 +1733,7 @@ make_ss_outer_session_from_lsgrid(
     session->scheduling_ = BatchScheduling::Continuous;
 
     session->set_gen_contingency_data(extract_gen_contingency_data(grid, n_bus));
+    session->set_element_trip_data(extract_element_trip_data(grid, n_bus));
     BranchData bd = extract_branch_data(grid, n_bus);
     session->set_branch_data(bd.branch_from, bd.branch_to,
                              bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
@@ -1712,6 +1783,8 @@ make_ca_outer_session_from_lsgrid(
                              bd.yff_eff, bd.yft_eff, bd.ytf_eff, bd.ytt_eff,
                              bd.bus_vn_kv, bd.sn_mva);
     session->set_slack_redistribution_data(extract_slack_redistribution_data(grid, n_bus));
+    session->set_element_trip_data(extract_element_trip_data(grid, n_bus));
+    session->set_gen_contingency_data(extract_gen_contingency_data(grid, n_bus));
     if (compute_limit_violations) {
         session->set_compute_limit_violations(true);
         LimitData ld = extract_limits(grid, n_bus);

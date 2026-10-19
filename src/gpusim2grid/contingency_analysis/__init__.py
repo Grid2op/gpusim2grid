@@ -542,6 +542,14 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         """
         self._s.build_contingencies(branch_ids_per_ctg)
 
+    def build_contingencies_full(self, branch_ids_per_ctg, shunt_ids_per_ctg,
+                                 load_ids_per_ctg, gen_ids_per_ctg):
+        """Build contingencies tripping branches, shunts, loads and generators
+        together: four aligned list-of-lists, one entry per contingency (see
+        ContingencyAnalysisSession.build_contingencies_full)."""
+        self._s.build_contingencies_full(branch_ids_per_ctg, shunt_ids_per_ctg,
+                                         load_ids_per_ctg, gen_ids_per_ctg)
+
     def run(self):
         """Run all contingencies.  Fills V_results and residuals on device.
 

@@ -3,6 +3,11 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] Contingencies that trip shunts, loads and generators, as in lightsim2grid:
+  ``ContingencyAnalysisGPU.add_contingency(branches, shunts, loads, gens)`` and the
+  ``add_contingency_shunt`` / ``_load`` / ``_gen`` shortcuts, ``ScenarioSweepGPU.set_contingency_shunts`` /
+  ``set_contingency_loads``, and ``BatchPowerFlow``'s ``shunt_status`` / ``load_status``. A regulating
+  shunt cannot be tripped with ``outer_loops=True`` yet.
 - [FIXED] ``outer_loops=True``: ``DistributedSlack`` gives no share to a unit on a bus the row strands
   (``handle_disconnected_grid``), as lightsim2grid does.
 - [FIXED] ``get_violations()``: a row the outer loops gave up on (``OUTER_FAILED``, ``OUTER_UNSTABLE``,

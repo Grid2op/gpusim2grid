@@ -44,6 +44,7 @@
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType, Contingency
 #include "gen_contingency_data.hpp"          // GenContingencyData
+#include "element_trip_data.hpp"             // ElementTripData
 #include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
@@ -282,6 +283,19 @@ struct ScenarioSweepSession {
     // differentiable wrapper: a released bus' voltage set-point is only an NR
     // start value there, so its gen_v gradient is 0 on that row.
     std::vector<std::vector<int>> row_pv_to_pq_;
+
+    // Shunt and load contingencies (lightsim2grid's set_contingency_shunts /
+    // set_contingency_loads): the shunts each row trips (one more diagonal triplet
+    // of its Ybus patch, appended by set_topology) and the loads each row trips --
+    // their injection side is the caller's, like a generator's (the Python facade
+    // zeroes them in set_injections_from_elements); kept here for the outer loops'
+    // view of the row only.
+    ElementTripData               trip_data_;
+    bool                          has_trip_data_ = false;
+    std::vector<std::vector<int>> shunt_off_;
+    bool                          has_shunt_off_ = false;
+    BoolMat                       load_off_;
+    bool                          has_load_off_ = false;
 
     // =========================================================================
     // Reactive-limit outer loop (the second pass ContingencyAnalysisGPU runs
@@ -567,6 +581,20 @@ struct ScenarioSweepSession {
     // if needed) by the next run().
     // =========================================================================
     void set_contingency_gens(Eigen::Ref<const BoolMat> mask);
+
+    // =========================================================================
+    // set_contingency_shunts / set_contingency_loads — row i, column j True:
+    // row i disconnects shunt / load j (n_scenarios x n_shunt / n_load). A shunt
+    // is an admittance: its diagonal Ybus coefficient joins the row's patch (needs
+    // set_element_trip_data, the bridge factory sets it); refused with the outer
+    // loops for a shunt that regulates a voltage. A load is an injection: the
+    // CALLER takes it out of the row's Sbus (set_injections*); the mask given here
+    // is what the outer loops' view of the row reads (TransformerVoltageControl).
+    // =========================================================================
+    void set_element_trip_data(const ElementTripData& data) { trip_data_ = data; has_trip_data_ = true; }
+    bool has_element_trip_data() const { return has_trip_data_; }
+    void set_contingency_shunts(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_loads(Eigen::Ref<const BoolMat> mask);
 
     // =========================================================================
     // set_pv_pq_switches — the labelling side of one reactive-limit outer-loop

@@ -109,4 +109,7 @@ void ContingencyBatch::reload_sbus(BatchPfDriverContext& ctx, const SlotLoadView
                                 thrust::raw_pointer_cast(ctx.base.d_Sbus.data()),
                                 L, ctx.n_bus, cs);
     cb_chk_cuda(cudaGetLastError(), "Sbus reload");
+    // the row's own correction (the loads / generators its contingency trips) is part
+    // of the system its loops solve
+    if (slack_.has_dp()) slack_.apply_dp(thrust::raw_pointer_cast(d_Sbus_batch.data()), L, ctx.n_bus, cs);
 }
