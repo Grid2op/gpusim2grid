@@ -196,6 +196,7 @@ __global__ void oc_gather_kernel(
 __global__ void oc_unrealistic_kernel(
           cuda_real_type*  __restrict__ d_out,
     const cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_slack_absorbed,
     const unsigned char*   __restrict__ d_pin,
     const int*             __restrict__ d_cand_bus,
     const int*             __restrict__ d_cand_pin,
@@ -214,6 +215,8 @@ __global__ void oc_unrealistic_kernel(
         if (vm < vmin || vm > vmax) { flag = cuda_real_type(1); break; }
     }
     d_out[static_cast<ptrdiff_t>(i) * stride + stride - 1] = flag;
+    d_out[static_cast<ptrdiff_t>(i) * stride + stride - 2] =
+        d_slack_absorbed != nullptr ? d_slack_absorbed[s] : cuda_real_type(0);
 }
 
 __global__ void oc_sbus_delta_kernel(

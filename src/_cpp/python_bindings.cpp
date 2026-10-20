@@ -3309,6 +3309,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_property_readonly("realistic_bus", [](const OuterModelHarness& h) { return h.model->layout().realistic_bus; })
         .def_property_readonly("vm_col_of_bus", [](const OuterModelHarness& h) { return h.in.ledger.vm_col_of_bus; })
         .def_property_readonly("n_ctrl", [](const OuterModelHarness& h) { return h.model->layout().n_ctrl; })
+        .def_property_readonly("slack_bus", [](const OuterModelHarness& h) { return h.model->layout().slack_bus; })
+        .def_property_readonly("slack_col", [](const OuterModelHarness& h) { return h.in.ledger.slack_col; })
         .def_property_readonly("ledger", [](const OuterModelHarness& h) {
                 const LedgerData& L = h.in.ledger;
                 pybind11::dict d;
@@ -3361,6 +3363,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 d["sc_set"] = c.sc_set;
                 d["sc_b_new"] = c.sc_b_new;
                 d["sc_ctl"] = std::vector<int>(c.sc_ctl.begin(), c.sc_ctl.end());
+                d["slack_w"] = c.slack_w;
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
@@ -3382,7 +3385,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def("on_solved", [](OuterModelHarness& h, int slot, bool converged, int nr_iter, int inner_status,
                              std::vector<std::complex<double>> V, std::vector<std::complex<double>> S,
                              std::vector<std::complex<double>> Sb, std::vector<double> vc_q, bool unrealistic,
-                             std::vector<double> bc_a, std::vector<double> bc_rho, std::vector<double> sc_b) {
+                             std::vector<double> bc_a, std::vector<double> bc_rho, std::vector<double> sc_b,
+                             double slack_absorbed) {
                 std::vector<double> vr, vi, sr, si, br, bi;
                 for (auto z : V)  { vr.push_back(z.real()); vi.push_back(z.imag()); }
                 for (auto z : S)  { sr.push_back(z.real()); si.push_back(z.imag()); }
@@ -3390,6 +3394,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 outer::SlotData d;
                 d.v_re = vr.data(); d.v_im = vi.data(); d.s_re = sr.data(); d.s_im = si.data();
                 d.sb_re = br.data(); d.sb_im = bi.data(); d.vc_q = vc_q.data(); d.unrealistic = unrealistic;
+                d.slack_absorbed = slack_absorbed;
                 const size_t n_bc = static_cast<size_t>(h.model->layout().n_bc);
                 if (converged && (bc_a.size() != n_bc || bc_rho.size() != n_bc))
                     throw std::invalid_argument("on_solved: bc_a / bc_rho must hold one value per BranchControl transformer");
@@ -3405,7 +3410,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             pybind11::arg("inner_status"), pybind11::arg("V"), pybind11::arg("S"), pybind11::arg("Sb"),
             pybind11::arg("vc_q"), pybind11::arg("unrealistic"),
             pybind11::arg("bc_a") = std::vector<double>(), pybind11::arg("bc_rho") = std::vector<double>(),
-            pybind11::arg("sc_b") = std::vector<double>())
+            pybind11::arg("sc_b") = std::vector<double>(), pybind11::arg("slack_absorbed") = 0.)
         .def("row_result", [](const OuterModelHarness& h, int row) { return h.model->row_result(row); });
 
     m.def("_make_ca_outer_session_from_lsgrid",

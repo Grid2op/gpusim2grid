@@ -1586,6 +1586,11 @@ void BatchPfDriver<BatchSource>::_oc_setup()
         throw std::runtime_error("[batch_pf] outer loops need the ledger of an NROuter_* solve (LedgerData::outer_loops)");
     if (Lo.n_bc != base.n_bc || Lo.n_sc != base.n_sc)
         throw std::runtime_error("[batch_pf] outer loops: the model's transformers / shunt controllers are not the base state's");
+    if (Lo.slack_bus != base.h_slack_bus && !(Lo.slack_bus.empty() && base.slack_col < 0))
+        throw std::runtime_error("[batch_pf] outer loops: the model's slack participants are not the base state's");
+    const int n_sw = static_cast<int>(Lo.slack_bus.size());
+    h_oc_slack_w_.assign(static_cast<size_t>(S) * n_sw, cuda_real_type(0));
+    d_oc_slack_w_.resize(std::max<size_t>(h_oc_slack_w_.size(), 1));
     h_oc_pin_.assign(static_cast<size_t>(S) * n_pin, 1);
     h_oc_held_q_.assign(static_cast<size_t>(S) * Lo.n_ctrl, std::numeric_limits<cuda_real_type>::quiet_NaN());
     h_oc_plan_held_.assign(static_cast<size_t>(S) * Lo.n_ctrl, 0);
@@ -1612,8 +1617,9 @@ void BatchPfDriver<BatchSource>::_oc_setup()
         d_sc_on_.assign(n, 0);
     }
     const int n_watch = static_cast<int>(Lo.watch_bus.size());
-    // ... then BranchControl's shifts and ratios, ShuntControl's susceptances, the unrealistic flag
-    oc_stride_ = 6 * n_watch + Lo.n_ctrl + 2 * base.n_bc + base.n_sc + 1;
+    // ... then BranchControl's shifts and ratios, ShuntControl's susceptances, slack_absorbed,
+    // the unrealistic flag
+    oc_stride_ = 6 * n_watch + Lo.n_ctrl + 2 * base.n_bc + base.n_sc + 2;
     std::vector<int> watch = Lo.watch_bus;
     if (watch.empty()) watch.push_back(0);
     upload_h2d(d_oc_watch_, watch.data(), watch.size(), cs);
@@ -1652,6 +1658,9 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
             h_oc_vset_[static_cast<size_t>(s) * Lo.n_grp + g] = static_cast<cuda_real_type>(c.v_set[static_cast<size_t>(g)]);
         for (int e = 0; e < Lo.n_hvdc; ++e)
             h_oc_hvdc_[static_cast<size_t>(s) * Lo.n_hvdc + e] = c.hvdc_status[static_cast<size_t>(e)];
+        const size_t n_sw = Lo.slack_bus.size();
+        for (size_t k = 0; k < n_sw && k < c.slack_w.size(); ++k)
+            h_oc_slack_w_[static_cast<size_t>(s) * n_sw + k] = static_cast<cuda_real_type>(c.slack_w[k]);
         for (size_t k = 0; k < c.sbus_bus.size(); ++k) {
             ds_slot.push_back(s); ds_bus.push_back(c.sbus_bus[k]);
             ds_p.push_back(static_cast<cuda_real_type>(c.sbus_dp[k]));
@@ -1668,6 +1677,7 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
     if (!h_oc_plan_held_.empty()) upload_h2d(d_oc_plan_held_, h_oc_plan_held_.data(), h_oc_plan_held_.size(), cs);
     if (!h_oc_vset_.empty())      upload_h2d(d_oc_vset_, h_oc_vset_.data(), h_oc_vset_.size(), cs);
     if (!h_oc_hvdc_.empty())      upload_h2d(d_oc_hvdc_, h_oc_hvdc_.data(), h_oc_hvdc_.size(), cs);
+    if (!h_oc_slack_w_.empty())   upload_h2d(d_oc_slack_w_, h_oc_slack_w_.data(), h_oc_slack_w_.size(), cs);
 
     // Sbus: the row's own (re-read on a re-entry), then its correction
     NrIterBuffers buf = _make_nr_buffers();
@@ -1819,6 +1829,7 @@ void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const
             n, n_watch, Lo.n_ctrl, base.n_bus, oc_stride_);
     oc_unrealistic_kernel<<<(n + BS - 1) / BS, BS, 0, cs>>>(
         thrust::raw_pointer_cast(d_oc_gather_.data()), buf.d_V,
+        base.slack_col >= 0 ? thrust::raw_pointer_cast(d_slack_absorbed_batch.data()) : nullptr,
         Lo.pin_bus.empty() ? nullptr : thrust::raw_pointer_cast(d_oc_pin_.data()),
         thrust::raw_pointer_cast(d_oc_cand_bus_.data()),
         thrust::raw_pointer_cast(d_oc_cand_pin_.data()),
@@ -1926,6 +1937,12 @@ NrIterBuffers BatchPfDriver<BatchSource>::_bound_nr_buffers(const SlotTableView&
     if (outer_hook_ != nullptr && oc_stride_ > 0 && base.n_vc_ctrl > 0 && base.vc_may_hold) {
         buf.d_vc_vset      = thrust::raw_pointer_cast(d_oc_vset_.data());
         buf.vc_vset_stride = base.n_vc_grp;
+    }
+    // ... and, around a distributed-slack Newton, each slot's slack weights (its parked units
+    // at 0): they win over the source's per-row ones
+    if (outer_hook_ != nullptr && oc_stride_ > 0 && base.n_slack > 0 && !outer_hook_->layout().slack_bus.empty()) {
+        buf.d_slack_w      = thrust::raw_pointer_cast(d_oc_slack_w_.data());
+        buf.slack_w_stride = base.n_slack;
     }
     return buf;
 }
@@ -2460,6 +2477,9 @@ void BatchPfDriver<BatchSource>::_compact_tail(int n_keep, int n_cur, std::vecto
         move_host(h_oc_plan_held_, Lo.n_ctrl);
         move_host(h_oc_vset_, Lo.n_grp);
         move_host(h_oc_hvdc_, Lo.n_hvdc);
+        const int n_sw = static_cast<int>(Lo.slack_bus.size());
+        move_host(h_oc_slack_w_, n_sw);
+        if (n_sw > 0)      launch_move_slot_rows(raw(d_oc_slack_w_), n_sw, M, cs);
         if (n_pin > 0)     launch_move_slot_rows(raw(d_oc_pin_), n_pin, M, cs);
         if (Lo.n_ctrl > 0) {
             launch_move_slot_rows(raw(d_oc_held_q_), Lo.n_ctrl, M, cs);
@@ -2682,6 +2702,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                     data.bc_a  = gbuf.data() + 6 * n_watch + Lo.n_ctrl;
                     data.bc_rho = data.bc_a + base.n_bc;
                     data.sc_b   = data.bc_rho + base.n_bc;
+                    data.slack_absorbed = gbuf[static_cast<size_t>(oc_stride_ - 2)];
                     data.unrealistic = gbuf[static_cast<size_t>(oc_stride_ - 1)] != 0.;
                 }
                 int final_status = static_cast<int>(st);

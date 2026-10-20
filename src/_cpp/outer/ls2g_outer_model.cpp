@@ -144,6 +144,18 @@ struct SlotState {
     std::vector<ls2g::slack_redistribution::Participant> ds_units;
     std::vector<int> ds_unit_bus;
     std::vector<double> ds_current_mw;
+    // around a distributed-slack Newton (DistributedSlackLoop's in-Newton state): whether the
+    // Newton shares the slack on the units (the loop runs on the row), the units at a bound
+    // and on which side, those the row's lost-power share put at a bound
+    bool ds_in_newton = false;
+    std::vector<char> ds_parked, ds_parked_high, ds_lost_sat;
+    bool ds_lost_high = false;
+    // the last solve's slack_absorbed, and whether its units took it (OuterLoopAlgo::
+    // _fold_slack_share: then the mismatch keeps `+ slack_absorbed * weight`); the target Q
+    // the share moved, which that solve did not see (OuterInjections::unsolved_q_mvar)
+    double sa = 0.;
+    bool sa_shared = false;
+    double unsolved_q_mvar = 0.;
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan;
     std::vector<std::pair<int, double>> vm_switched_on;
     std::vector<RlBus> rl_buses;
@@ -291,6 +303,13 @@ private:
     // rewritten from the row's targets in force: init_loops), and their buses
     std::vector<ls2g::slack_redistribution::Participant> units0_;
     std::vector<int> units0_bus_;
+    // NROuterDist_*: the Newton shares the slack itself (dist_), on the units of the
+    // DistributedSlack loop when the grid has one (ds_reserved_: OuterControls::
+    // slack_share); each Layout::slack_bus' index by solver bus, the reference's
+    bool dist_ = false;
+    bool ds_reserved_ = false;
+    std::vector<int> slack_idx_of_bus_;
+    int ref_slack_idx_ = -1;
     // plans
     std::shared_ptr<const RlPlan> rl0_;            // the grid's (a row without masks / units off)
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
@@ -304,6 +323,7 @@ private:
     std::map<int, int> resume_hvdc_;                    // hvdc id -> regime
     std::vector<std::pair<int, double>> resume_svc_on_;
     std::map<int, std::pair<int, bool>> resume_frozen_; // solver bus -> (state, realistic)
+    std::vector<ls2g::DistributedSlackLoop::ParkedUnit> resume_parked_;
     std::vector<int> resume_phase_tap_, resume_ratio_tap_;   // by trafo id, INT_MIN: not carried
     std::vector<int> resume_sections_;                       // by shunt id, INT_MIN: not carried
     // take_resume_targets on a row that sets no target and disconnects no unit
@@ -341,6 +361,14 @@ private:
     void take_resume_targets(SlotState& st) const;
     // DistributedSlack, at initialize: the row's lost active power shared on its units
     void share_lost_p(SlotState& st, const LoopDecl& L) const;
+    // ... around a distributed-slack Newton: unit k's bound (DistributedSlackLoop::_bound),
+    // the units a resumed solve parked parked again (_keep_parked), the units the Newton
+    // shares on and their total weight (_set_newton_weights + SlackShareControl::set_units:
+    // weight > 0, on a reserved bus), the share moved into their targets (_fold_slack_share)
+    double ds_bound(const SlotState& st, size_t k, bool high) const;
+    void ds_keep_parked(SlotState& st) const;
+    double ds_share(const SlotState& st, std::vector<size_t>* units) const;
+    void ds_fold(SlotState& st, double sa) const;
     void collect_units(const ls2g::OuterGridView& v, std::vector<ls2g::slack_redistribution::Participant>& units,
                        std::vector<int>& bus) const;
     void set_active(SlotState& st) const;
@@ -367,6 +395,7 @@ private:
     void resume_loops(SlotState& st) const;
     int check(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
     int check_ds(SlotState& st, const LoopDecl& L, const RowView& rv) const;
+    int check_ds_in_newton(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_hvdc(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_vm(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_rl(SlotState& st, const LoopDecl& L, const RowView& rv) const;
@@ -502,6 +531,8 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
             } else if (auto* r = dynamic_cast<const ls2g::ReactiveLimitsLoop*>(lp.get())) {
                 for (const auto& fb : r->frozen_buses())
                     resume_frozen_.emplace(fb.bus_solver, std::make_pair(fb.state, fb.realistic));  // the first per bus
+            } else if (auto* ds = dynamic_cast<const ls2g::DistributedSlackLoop*>(lp.get())) {
+                resume_parked_ = ds->parked_units();   // around a distributed-slack Newton only
             }
         }
         // the tap positions the solve settled on (OuterLoopAlgo::_apply_carried_positions)
@@ -589,6 +620,21 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     // DistributedSlack's participants: collected once here, they depend on a row only
     // through the units it disconnects (collecting them was most of a slot's load)
     collect_units(v, units0_, units0_bus_);
+
+    // ---- a distributed-slack Newton (NROuterDist_*) ----------------------------------------
+    // its slack_absorbed column has an entry on the reference and on every bus its
+    // DistributedSlack loop reserved; the loop shares in the Newton when the grid has one
+    dist_ = ledger.outer_loops && ledger.has_multislack();
+    if (dist_) {
+        layout_.slack_bus = ledger.slack_participant_buses;
+        slack_idx_of_bus_.assign(static_cast<size_t>(n_bus_), -1);
+        for (size_t k = 0; k < layout_.slack_bus.size(); ++k)
+            slack_idx_of_bus_[static_cast<size_t>(layout_.slack_bus[k])] = static_cast<int>(k);
+        ref_slack_idx_ = slack_idx_of_bus_[static_cast<size_t>(slack_bus_)];
+        if (ref_slack_idx_ < 0)
+            throw std::runtime_error("outer model: the reference bus has no entry in the slack_absorbed column");
+        for (const LoopDecl& d : loops_) ds_reserved_ = ds_reserved_ || d.kind == Kind::DistributedSlack;
+    }
 
     // ---- the layout ------------------------------------------------------------------------
     layout_.n_ctrl = nc;
@@ -1066,7 +1112,21 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                         ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
                 st.ds_current_mw.resize(st.ds_units.size());
                 for (size_t k = 0; k < st.ds_units.size(); ++k) st.ds_current_mw[k] = st.ds_units[k].injection_mw;
+                st.ds_lost_sat.clear();
                 share_lost_p(st, d);
+                // every unit takes its share in the Newton to start with, but those a resumed
+                // solve kept out, and those the row's lost power put at a bound
+                st.ds_parked.assign(st.ds_units.size(), 0);
+                st.ds_parked_high.assign(st.ds_units.size(), 0);
+                if (ds_reserved_) {
+                    st.ds_in_newton = true;
+                    if (resume_) ds_keep_parked(st);
+                    for (size_t k = 0; k < st.ds_units.size() && k < st.ds_lost_sat.size(); ++k) {
+                        if (!st.ds_lost_sat[k]) continue;
+                        st.ds_parked[k] = 1;
+                        st.ds_parked_high[k] = st.ds_lost_high ? 1 : 0;
+                    }
+                }
                 break;
             }
             case Kind::HvdcLimits:
@@ -1139,7 +1199,11 @@ void Ls2gOuterModel::share_lost_p(SlotState& st, const LoopDecl& L) const
     if (st.ds_units.empty() || !(std::abs(lost) > L.ds_eps_mw)) return;
     std::vector<ls2g::real_type> new_mw;
     std::vector<char> saturated;
-    ls2g::slack_redistribution::distribute(st.ds_units, lost, L.ds_eps_mw, new_mw, saturated);
+    const ls2g::slack_redistribution::Report report =
+        ls2g::slack_redistribution::distribute(st.ds_units, lost, L.ds_eps_mw, new_mw, saturated);
+    // every unit at a bound: distribute clears the flags, all are
+    st.ds_lost_sat = report.all_saturated ? std::vector<char>(st.ds_units.size(), 1) : saturated;
+    st.ds_lost_high = lost > 0.;
     for (size_t k = 0; k < st.ds_units.size(); ++k) {
         auto& u = st.ds_units[k];
         if (u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR) move_gen(st, u.el_id, st.ds_unit_bus[k], new_mw[k]);
@@ -1148,6 +1212,86 @@ void Ls2gOuterModel::share_lost_p(SlotState& st, const LoopDecl& L) const
         st.ds_current_mw[k] = new_mw[k];
     }
     record(st, L.name, "SHARE_LOST_P", true, -1, lost, L.ds_eps_mw);
+}
+
+double Ls2gOuterModel::ds_bound(const SlotState& st, size_t k, bool high) const
+{
+    // DistributedSlackLoop::_bound: as slack_redistribution::distribute has it, 0 MW on the
+    // side of 0 the unit's initial target is not on; NaN without one
+    const auto& u = st.ds_units[k];
+    if (high) {
+        double hi = u.max_p_mw;
+        if (u.injection_mw < 0.) hi = std::isnan(hi) ? 0. : std::min(hi, 0.);
+        return hi;
+    }
+    double lo = u.min_p_mw;
+    if (!(u.injection_mw < 0.)) lo = std::isnan(lo) ? 0. : std::max(lo, 0.);
+    return lo;
+}
+
+void Ls2gOuterModel::ds_keep_parked(SlotState& st) const
+{
+    // DistributedSlackLoop::_keep_parked: at the bound the solve resumed from parked it at
+    for (size_t k = 0; k < st.ds_units.size(); ++k) {
+        const auto& u = st.ds_units[k];
+        for (const auto& parked : resume_parked_) {
+            if (parked.kind != u.kind || parked.el_id != u.el_id) continue;
+            const double bound = ds_bound(st, k, parked.high);
+            if (std::isnan(bound)) break;
+            if (u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR) move_gen(st, u.el_id, st.ds_unit_bus[k], bound);
+            else move_storage(st, u.el_id, st.ds_unit_bus[k], -bound);
+            st.ds_current_mw[k] = bound;
+            st.ds_parked[k] = 1;
+            st.ds_parked_high[k] = parked.high ? 1 : 0;
+            break;
+        }
+    }
+}
+
+double Ls2gOuterModel::ds_share(const SlotState& st, std::vector<size_t>* units) const
+{
+    // the units the Newton shares on (DistributedSlackLoop::_set_newton_weights, filtered as
+    // SlackShareControl::set_units does) and their total weight
+    if (units != nullptr) units->clear();
+    if (!st.ds_in_newton) return 0.;
+    double total = 0.;
+    for (size_t k = 0; k < st.ds_units.size(); ++k) {
+        const double w = st.ds_parked[k] ? 0. : static_cast<double>(st.ds_units[k].weight);
+        const int b = st.ds_unit_bus[k];
+        if (!(w > 0.) || b < 0 || b >= n_bus_ || slack_idx_of_bus_[static_cast<size_t>(b)] < 0) continue;
+        total += w;
+        if (units != nullptr) units->push_back(k);
+    }
+    return total;
+}
+
+void Ls2gOuterModel::ds_fold(SlotState& st, double sa) const
+{
+    // OuterLoopAlgo::_fold_slack_share: each unit's share of the solve's slack_absorbed into
+    // its target, so that what reads the solve finds the units' outputs in their targets
+    st.sa = sa;
+    st.sa_shared = false;
+    if (sa == 0.) return;
+    std::vector<size_t> units;
+    const double total = ds_share(st, &units);
+    // the reference bus took it all (weight 1): what is left on it, as a single slack leaves
+    // it (mis_bus then leaves `slack_absorbed * weight` out)
+    if (!(total > 0.)) return;
+    st.sa_shared = true;
+    for (size_t k : units) {
+        const auto& u = st.ds_units[k];
+        const int bus = st.ds_unit_bus[k];
+        // the target Q of a unit that does not regulate follows its P: that, the solve did not see
+        auto it = st.target_delta.find(bus);
+        const double q_before = it != st.target_delta.end() ? it->second.imag() : 0.;
+        // generation convention; slack_absorbed < 0 when the units produce more
+        const double mw = -sa * sn_ * static_cast<double>(u.weight) / total;
+        if (u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR) move_gen(st, u.el_id, bus, gen_in_force(st, u.el_id) + mw);
+        else move_storage(st, u.el_id, bus, sto_in_force(st, u.el_id) - mw);   // load convention
+        it = st.target_delta.find(bus);
+        const double q_after = it != st.target_delta.end() ? it->second.imag() : 0.;
+        st.unsolved_q_mvar += std::abs(q_after - q_before) * sn_;
+    }
 }
 
 void Ls2gOuterModel::resume_loops(SlotState& st) const
@@ -1286,6 +1430,20 @@ void Ls2gOuterModel::materialize(SlotState& st) const
     for (int e = 0; e < n_sc_; ++e) if (st.sc_pending[static_cast<size_t>(e)]) c.sc_set.push_back(e);
     c.sc_b_new = st.sc_b_new;
     c.sc_ctl = st.sc_ctl;
+    // the distributed slack's weights (NROuterInner::apply_controls): each unit's normalised
+    // weight on its bus, the reference alone at 1 when none takes a share
+    if (dist_) {
+        c.slack_w.assign(layout_.slack_bus.size(), 0.);
+        std::vector<size_t> units;
+        const double total = ds_share(st, &units);
+        if (total > 0.) {
+            for (size_t k : units)
+                c.slack_w[static_cast<size_t>(slack_idx_of_bus_[static_cast<size_t>(st.ds_unit_bus[k])])] +=
+                    static_cast<double>(st.ds_units[k].weight) / total;
+        } else {
+            c.slack_w[static_cast<size_t>(ref_slack_idx_)] = 1.;
+        }
+    }
 }
 
 void Ls2gOuterModel::sc_set_sections(SlotState& st, int e, const std::vector<int>& counts) const
@@ -1377,6 +1535,12 @@ cplx Ls2gOuterModel::mis_bus(const SlotState& st, const RowView& rv, const SlotC
     // OuterLoopAlgo::_solve: published against the targets, not the frozen Q
     auto it = st.freeze_q.find(b);
     if (it != st.freeze_q.end()) mis += cplx(0., it->second);
+    // the distributed slack's share (MultiSlack::adjust_mismatch), which the fold moved into
+    // the targets after the solve and so left in the mismatch
+    if (st.sa_shared && b >= 0 && b < n_bus_) {
+        const int k = slack_idx_of_bus_[static_cast<size_t>(b)];
+        if (k >= 0 && static_cast<size_t>(k) < c.slack_w.size()) mis += cplx(st.sa * c.slack_w[static_cast<size_t>(k)], 0.);
+    }
     return mis;
 }
 
@@ -1410,6 +1574,7 @@ double Ls2gOuterModel::move_storage(SlotState& st, int s, int bus, double mw) co
 // =============================================================================
 int Ls2gOuterModel::check_ds(SlotState& st, const LoopDecl& L, const RowView& rv) const
 {
+    if (st.ds_in_newton) return check_ds_in_newton(st, L, rv);
     // single slack: slack_absorbed is 0, the whole residual of the slack bus
     const double mismatch = mis_bus(st, rv, st.ctl, slack_bus_).real() * sn_;
     const bool triggered = std::abs(mismatch) > L.ds_mismatch_mw && std::abs(mismatch) > L.ds_eps_mw;
@@ -1436,6 +1601,60 @@ int Ls2gOuterModel::check_ds(SlotState& st, const LoopDecl& L, const RowView& rv
     }
     const bool unstable = moved > L.ds_moved_fraction * L.ds_eps_mw;
     record(st, L.name, "UNITS_MOVED", unstable, -1, moved, L.ds_moved_fraction * L.ds_eps_mw);
+    return unstable ? UNSTABLE : STABLE;
+}
+
+// DistributedSlackLoop::_check_in_newton
+int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const RowView& rv) const
+{
+    // where the solve left the units: the fold moved their targets by their share
+    for (size_t k = 0; k < st.ds_units.size(); ++k) {
+        const auto& u = st.ds_units[k];
+        st.ds_current_mw[k] = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR
+            ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
+    }
+    // the same cumulative sharing from the initial targets as around a single-slack Newton;
+    // what the reference bus kept is not nothing only when every unit is parked
+    double mismatch = mis_bus(st, rv, st.ctl, slack_bus_).real() * sn_;
+    if (std::isnan(mismatch)) mismatch = 0.;
+    double remaining = mismatch;
+    for (size_t k = 0; k < st.ds_units.size(); ++k) remaining += st.ds_current_mw[k] - st.ds_units[k].injection_mw;
+    std::vector<ls2g::real_type> new_mw;
+    std::vector<char> saturated;
+    const ls2g::slack_redistribution::Report report =
+        ls2g::slack_redistribution::distribute(st.ds_units, remaining, L.ds_eps_mw, new_mw, saturated);
+    // every unit at a bound: none of them shares any more, the reference bus takes the rest
+    if (report.all_saturated) saturated.assign(st.ds_units.size(), 1);
+    const double residue = st.ds_units.empty() ? remaining : static_cast<double>(report.not_distributed_mw);
+    if (L.ds_fail && std::abs(residue) > L.ds_eps_mw) {
+        record(st, L.name, "FAIL_RESIDUE", true, -1, residue, L.ds_eps_mw);
+        return FAILED;
+    }
+    double moved = 0.;
+    for (size_t k = 0; k < st.ds_units.size(); ++k) {
+        const auto& u = st.ds_units[k];
+        const bool is_gen = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR;
+        // a unit at a bound leaves the Newton's share; one back inside its bounds rejoins it
+        if (saturated[k] != st.ds_parked[k])
+            record(st, L.name, saturated[k] ? "PARK" : "UNPARK", true, u.el_id, st.ds_current_mw[k], new_mw[k]);
+        moved += std::abs(is_gen ? move_gen(st, u.el_id, st.ds_unit_bus[k], new_mw[k])
+                                 : move_storage(st, u.el_id, st.ds_unit_bus[k], -new_mw[k]));
+        st.ds_current_mw[k] = new_mw[k];
+    }
+    st.ds_parked.assign(saturated.begin(), saturated.end());
+    st.ds_parked_high.assign(st.ds_units.size(), remaining > 0. ? 1 : 0);
+    // the units moved only when some unit was pushed past a bound, or came back
+    const double threshold = L.ds_moved_fraction * L.ds_eps_mw;
+    bool unstable = moved > threshold;
+    record(st, L.name, "UNITS_MOVED", unstable, -1, moved, threshold);
+    // ... or when the Newton's share, moved into the targets after the solve, took a unit's
+    // target Q with it: the solve has not seen that one
+    const double unsolved_q = st.unsolved_q_mvar;
+    st.unsolved_q_mvar = 0.;
+    if (unsolved_q > threshold) {
+        record(st, L.name, "TARGET_Q_FOLLOWED", true, -1, unsolved_q, threshold);
+        unstable = true;
+    }
     return unstable ? UNSTABLE : STABLE;
 }
 
@@ -2237,6 +2456,8 @@ Next Ls2gOuterModel::on_solved(int slot, bool converged, int nr_iter, int inner_
         ok = false;
     }
     st.solver_ok = ok;
+    // OuterLoopAlgo::_solve: a distributed-slack Newton's share into the units' targets
+    if (dist_ && converged && data != nullptr) ds_fold(st, data->slack_absorbed);
     RowView rv{data, &widx_};
     if (st.first) {
         st.first = false;

@@ -610,7 +610,8 @@ void ScenarioSweepSession::_prepare_gen_contingency(
 std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     const std::vector<std::vector<int>>& row_slack_off) const
 {
-    if (base_state_->n_slack <= 0) return {};
+    // with the outer loops, a distributed-slack Newton's weights are its model's, per slot
+    if (base_state_->n_slack <= 0 || outer_) return {};
     const int n_bus = base_state_->n_bus;
     int ref_bus = -1;
     for (int b = 0; b < n_bus; ++b)

@@ -1075,12 +1075,14 @@ private:
     // ---- outer loops: the per-slot control state on the device -------------
     // Dense per slot, mirrored on the host ([S * n] each, outer::SlotControls'
     // layout); the gather buffer of the converged slots ([S * oc_stride_]:
-    // V, V.conj(Ibus), Sbus at the watched buses, controller Q, unrealistic flag).
+    // V, V.conj(Ibus), Sbus at the watched buses, controller Q, BranchControl's
+    // and ShuntControl's unknowns, slack_absorbed, unrealistic flag).
+    // d_oc_slack_w_: the distributed slack's weights [S * n_slack] (NROuterDist_*).
     thrust::device_vector<unsigned char>  d_oc_pin_, d_oc_plan_held_;
-    thrust::device_vector<cuda_real_type> d_oc_held_q_, d_oc_vset_;
+    thrust::device_vector<cuda_real_type> d_oc_held_q_, d_oc_vset_, d_oc_slack_w_;
     thrust::device_vector<int>            d_oc_hvdc_;
     std::vector<unsigned char>            h_oc_pin_, h_oc_plan_held_;
-    std::vector<cuda_real_type>           h_oc_held_q_, h_oc_vset_;
+    std::vector<cuda_real_type>           h_oc_held_q_, h_oc_vset_, h_oc_slack_w_;
     std::vector<int>                      h_oc_hvdc_;
     thrust::device_vector<int>            d_oc_watch_, d_oc_cand_bus_, d_oc_cand_pin_, d_oc_list_;
     thrust::device_vector<cuda_real_type> d_oc_gather_;

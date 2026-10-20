@@ -130,7 +130,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         AcHvdcAcEmulationLimits, VoltageMonitoring, ReactiveLimits -- with
         their parameters and the driver's (``max_outer_iterations``, the
         robust mode, the realistic voltage band). The rows are solved on the
-        GPU by its single-slack inner Newton; their loops decide on the host
+        GPU by its single-slack inner Newton -- or, for a grid solved with an
+        ``NROuterDist_*`` algorithm, by its distributed-slack one: the Newton
+        shares the slack on the units DistributedSlack takes, by weights each
+        solve sets, and the loop only caps (parks) the units that sharing
+        pushes past a limit, as lightsim2grid; their loops decide on the host
         after each converged inner solve, and a row their loops change is
         re-solved in place from its voltages; ``nb_iter`` is the budget of
         each inner solve (pass ``ir_n_steps=1``, see there). Each row starts from
@@ -386,7 +390,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     # ------------------------------------------------------------ outer loops
     @property
     def outer_loops(self):
-        """bool: whether the grid's own outer loops (lightsim2grid's NROuter_*:
+        """bool: whether the grid's own outer loops (lightsim2grid's NROuter_* / NROuterDist_*:
         DistributedSlack, AcHvdcAcEmulationLimits, VoltageMonitoring,
         ReactiveLimits) run on every row (construction-time only)."""
         return self._outer_loops

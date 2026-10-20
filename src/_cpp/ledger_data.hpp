@@ -61,6 +61,12 @@ struct LedgerData {
     // Re(sum Sbus), computed by AcPfNrState from the per-system Sbus.
     int                 slack_col = -1;
     std::vector<double> slack_weights;   // size n_bus (empty when inactive)
+    // The buses with an entry in the slack_absorbed column whatever their weight, sorted:
+    // set for the ledger of an NROuterDist_* solve (outer loops around a distributed-slack
+    // Newton), where the reference and every bus a unit may share the slack from are
+    // reserved and a unit at a bound has weight 0 (MultiSlack::set_slack_participant_buses).
+    // Empty: the participants are the buses with a nonzero weight.
+    std::vector<int>    slack_participant_buses;
 
     bool has_multislack() const { return slack_col >= 0; }
     int  nnz_J()          const { return static_cast<int>(J_inner.size()); }
@@ -153,7 +159,9 @@ struct LedgerData {
     // hold a controller (VoltageControl::set_may_hold_controllers), each group's
     // (v_row, q_col_first) slot and every sharing row's entry on every controller.
     // The batch then fills VoltageControl in its may_hold_ formulation (outer/
-    // outer_kernels.cuh). Single slack: slack_col is -1.
+    // outer_kernels.cuh). Single slack (NROuter_*): slack_col is -1. Around a
+    // distributed-slack Newton (NROuterDist_*): slack_col >= 0, the reference's P row and
+    // slack_participant_buses' entries in its column, the weights per slot (the model's).
     bool                outer_loops = false;
 
     // ---- lightsim2grid's BranchControl (outer loops: PhaseControl, TransformerVoltageControl)

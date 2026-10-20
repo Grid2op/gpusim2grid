@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
+  the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at
   one end only keeps its charging from the other, as in lightsim2grid.
 - [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``redistribute_slack`` with ``outer_loops=True``, the

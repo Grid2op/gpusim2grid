@@ -45,6 +45,10 @@ struct Layout {
     std::vector<int> realistic_bus;
     double min_realistic_v = 0.5;
     double max_realistic_v = 2.;
+    // Around a distributed-slack Newton (NROuterDist_*): the buses with an entry in the
+    // slack_absorbed column (LedgerData::slack_participant_buses, the base state's order),
+    // whose weights each slot sets. Empty: a single-slack Newton (NROuter_*).
+    std::vector<int> slack_bus;
 };
 
 // The control state of one slot: what its loops changed in its equations,
@@ -81,6 +85,9 @@ struct SlotControls {
     std::vector<int>           sc_set;
     std::vector<double>        sc_b_new;
     std::vector<signed char>   sc_ctl;
+    // The distributed slack's weights of this solve, per Layout::slack_bus, normalised (the
+    // reference alone at 1 when no unit takes a share); empty with a single-slack Newton
+    std::vector<double>        slack_w;
 };
 
 // What the device gathered for one converged slot, as host doubles, indexed
@@ -96,6 +103,7 @@ struct SlotData {
     const double* bc_a  = nullptr;   // BranchControl's shift and ratio unknowns [n_bc]
     const double* bc_rho = nullptr;
     const double* sc_b  = nullptr;   // ShuntControl's susceptances [n_sc]
+    double slack_absorbed = 0.;      // the distributed slack's unknown, pu (0 with a single slack)
     bool unrealistic = false;        // some Layout::realistic_bus outside the band
 };
 

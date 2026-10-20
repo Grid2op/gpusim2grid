@@ -1530,7 +1530,7 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
                              "(NROuter_*, branch dev_outer_batch_perf)");
 #else
     if (!grid.get_algo().supports_outer_loops())
-        throw std::runtime_error("the outer loops need a grid whose algorithm is an NROuter_* one, "
+        throw std::runtime_error("the outer loops need a grid whose algorithm is an NROuter_* (or NROuterDist_*) one, "
                                  "solved (grid.change_algorithm('NROuter_KLU'); grid.ac_pf(...))");
     // the loops ported (outer/ls2g_outer_model.cpp)
     for (const auto& loop : grid.get_outer_loops()) {
@@ -1563,10 +1563,34 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
 
     // the inner Newton's ledger, as it is (the NROuter_* accessors forward to it)
     in.ledger = extract_ledger_data(grid, /*presolved_v=*/false, 0.);
-    if (in.ledger.slack_col >= 0)
-        throw std::runtime_error("extract_outer_inputs: the grid's ledger has a distributed slack: "
-                                 "solve it with its NROuter_* algorithm first");
     in.ledger.outer_loops = true;
+    // NROuterDist_*: its Newton shares the slack itself (MultiSlack with participant buses).
+    // Every bus its DistributedSlack loop reserved has an entry in the slack_absorbed column,
+    // the reference's P row included, whatever the weight the last solve gave it: they are
+    // the column's rows, mapped back to their buses
+    if (in.ledger.slack_col >= 0) {
+        LedgerData& L = in.ledger;
+        std::vector<int> bus_of_p_row(static_cast<size_t>(L.dim_J), -1);
+        for (size_t k = 0; k < L.p_rows.size(); ++k) bus_of_p_row[static_cast<size_t>(L.p_rows[k])] = L.p_buses[k];
+        for (int r = 0; r < L.dim_J; ++r) {
+            const auto s = L.J_inner.begin() + L.J_outer[static_cast<size_t>(r)];
+            const auto e = L.J_inner.begin() + L.J_outer[static_cast<size_t>(r) + 1];
+            if (!std::binary_search(s, e, L.slack_col)) continue;
+            const int b = bus_of_p_row[static_cast<size_t>(r)];
+            if (b < 0)
+                throw std::runtime_error("extract_outer_inputs: the slack_absorbed column has an entry on "
+                                         "a row that is no bus' P equation");
+            L.slack_participant_buses.push_back(b);
+        }
+        std::sort(L.slack_participant_buses.begin(), L.slack_participant_buses.end());
+        if (!std::binary_search(L.slack_participant_buses.begin(), L.slack_participant_buses.end(),
+                                static_cast<int>(slack(0))))
+            throw std::runtime_error("extract_outer_inputs: the reference bus has no entry in the "
+                                     "slack_absorbed column");
+        // the slots start their own (_init_slot_state): nothing to derive on the base system
+        L.slack_absorbed_gt = 0.;
+        L.has_ext_state_ground_truth = true;
+    }
     // BranchControl / ShuntControl, as the grid's solve reserved them; their custom rows come
     // after VoltageControl's, so these are no longer "the last rows of J": read off the system
     {

@@ -813,26 +813,34 @@ AcPfNrState::AcPfNrState(
             auto it = std::lower_bound(in + s, in + e, col);
             return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
         };
-        for (int bus = 0; bus < n_bus; ++bus) {
-            const double w = ledger->slack_weights[bus];
-            if (w == 0.0) continue;
+        // the participants: every reserved bus, whatever its weight (an NROuterDist_*
+        // ledger, the weights then per slot), else the buses with a weight
+        std::vector<int> buses;
+        if (!ledger->slack_participant_buses.empty()) {
+            buses = ledger->slack_participant_buses;
+        } else {
+            for (int bus = 0; bus < n_bus; ++bus)
+                if (ledger->slack_weights[bus] != 0.0 && ledger->p_row_of_bus[bus] >= 0) buses.push_back(bus);
+        }
+        h_slack_bus.clear();
+        for (int bus : buses) {
+            const double w = static_cast<size_t>(bus) < ledger->slack_weights.size() ? ledger->slack_weights[bus] : 0.0;
             const int prow = ledger->p_row_of_bus[bus];
             if (prow < 0) continue;   // defensive: a weighted bus must own a P row
+            const int pos = find_J_pos(prow, slack_col);
+            if (pos < 0)
+                throw std::runtime_error("AcPfNrState: slack participant bus " + std::to_string(bus) +
+                                         " has no entry in the slack_absorbed column of J");
             h_prow.push_back(prow);
             h_w.push_back(static_cast<cuda_real_type>(w));
-            h_feat_pos.push_back(find_J_pos(prow, slack_col));
+            h_feat_pos.push_back(pos);
+            h_slack_bus.push_back(bus);
         }
         n_slack = static_cast<int>(h_prow.size());
         upload_h2d(d_slack_prow,     h_prow.data(),     n_slack, cs);
         upload_h2d(d_slack_w,        h_w.data(),        n_slack, cs);
         upload_h2d(d_slack_feat_pos, h_feat_pos.data(), n_slack, cs);
         h_slack_w = h_w;
-        h_slack_bus.clear();
-        for (int bus = 0; bus < n_bus; ++bus) {
-            const double w = ledger->slack_weights[bus];
-            if (w == 0.0 || ledger->p_row_of_bus[bus] < 0) continue;
-            h_slack_bus.push_back(bus);
-        }
 
         // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
         cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
