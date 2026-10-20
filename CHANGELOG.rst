@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] the build takes the SuiteSparse headers lightsim2grid >= 1.3.0 ships with its core:
+  a lightsim2grid installed from a wheel no longer needs a SuiteSparse checkout on the side.
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.
