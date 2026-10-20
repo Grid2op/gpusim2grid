@@ -429,7 +429,10 @@ Scope of the first version, decided before planning:
 9. **Jacobian size.** Every switchable bus is reserved up front (the union pattern of B.5).
    This is accepted on the CPU, so it is accepted on the GPU.
 10. **No gradients** with the outer loops on in the first version: `BatchPowerFlow` and the
-    batched adjoint refuse them (an issue to open).
+    batched adjoint refuse them (an issue to open). *Since done (2026-10-20), after
+    lightsim2grid's own: the adjoint of each row's last inner solve, every decision of its
+    loops held; the per-slot state that J was built with is saved by row at eviction and put
+    back by the rebuilt adjoint (CLAUDE.md "Outer loops", Gradients).*
 
 Issues to open: the three remaining loops (1), the decisions as kernels (7), gradients
 through the outer loops (10).

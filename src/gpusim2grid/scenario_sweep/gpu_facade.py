@@ -157,8 +157,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         its voltage set-points (:meth:`set_gen_v`) are seen by its loops as
         lightsim2grid's batch shows them. With ``redistribute_slack``, the
         DistributedSlack loop shares what a row loses before its first solve, as
-        lightsim2grid's batch does. Not supported yet:
-        ``compute_physical_violations``, gradients. See :meth:`get_outer_results`.
+        lightsim2grid's batch does. Gradients: through
+        :class:`gpusim2grid.differentiable.BatchPowerFlow` (``outer_loops=True``),
+        lightsim2grid's -- each row's last inner solve, its loops' decisions held.
+        Not supported yet: ``compute_physical_violations``. See :meth:`get_outer_results`.
         Requires ``scheduling="continuous"`` (the default with it) and
         ``nb_iter_per_round=1``, by design -- neither ``"chunked"`` nor another
         ``nb_iter_per_round`` is supported, nor planned to be: a row the loops

@@ -156,6 +156,18 @@ struct RowResult {
     std::vector<int>    shunt_ids, shunt_sections;
     // the decision trace (OuterLoopStats::decisions), when the model keeps it
     std::vector<std::string> decisions;
+    // The adjoint of the row's last inner solve, every decision of its loops held (lightsim2grid's
+    // AdjointSolveInfo and BaseOuterLoop::adjoint_terms): the switchable buses PQ in that solve
+    // (no gen_v reaches them), the VoltageControl groups whose voltage row lost its set-point
+    // (every controller held), and what the gen_p gradient owes beyond lambda at the unit's P
+    // row / sn -- minus that for a generator DistributedSlack holds at a bound (gen_p_fixed),
+    // lambda at gen_p_slope_row times gen_p_slope_coeff (pu per MW) for a generator frozen at a
+    // limit of its capability curve, which its reactive output follows.
+    std::vector<int>    pq_buses;
+    std::vector<int>    vset_lost_groups;
+    std::vector<int>    gen_p_fixed;
+    std::vector<int>    gen_p_slope_gen, gen_p_slope_row;
+    std::vector<double> gen_p_slope_coeff;
 };
 
 class OuterHook {

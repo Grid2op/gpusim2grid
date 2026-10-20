@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``BatchPowerFlow.from_lsgrid(outer_loops=True)``: gradients through the outer loops, as lightsim2grid
+  -- each row's last inner solve, its loops' decisions held; ``compute_flows`` at the taps they settled on.
 - [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
   the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at

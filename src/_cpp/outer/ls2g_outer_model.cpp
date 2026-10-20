@@ -105,6 +105,10 @@ struct RlBus {
     int nb_pv_pq = 0;
     int monitor_svc = -1;    // svc id of a voltage monitor's bus
     int pin = -1;            // a local bus' switchable index
+    // frozen at a limit of a generator's capability curve: the slope its Q follows its target P
+    // with (ReactiveLimitsLoop::ControllerBus::slopes, OuterQSlope): gen, controller (-1: a
+    // local bus), pu per MW
+    std::vector<std::pair<std::pair<int, int>, double>> slopes;
 };
 
 // ReactiveLimits' plan for one kind of row -- the grid's, or a row that masks buses or
@@ -286,6 +290,9 @@ private:
     std::vector<double> vc_slope_, vc_q_plan_, vc_v_set_;
     std::vector<std::vector<int>> vc_at_bus_;      // controllers standing on each bus
     std::vector<int> grp_start_, grp_count_;
+    std::vector<int> vc_v_row_;                    // per group, its voltage row
+    std::vector<std::vector<int>> vc_share_row_;   // per group, its sharing rows
+    std::vector<int> q_row_of_bus_;
     // droop hvdc, ledger order
     std::vector<int> hvdc_id_, hvdc_bus1_, hvdc_bus2_, hvdc_status0_;
     std::vector<double> hvdc_p0_, hvdc_k_, hvdc_lf1_, hvdc_lf2_, hvdc_r_, hvdc_pmax12_, hvdc_pmax21_;
@@ -429,6 +436,15 @@ private:
     double rl_controller_limit(const SlotState& st, const RowView& rv, int c, bool max) const;
     std::vector<char> rl_groups_holding(const SlotState& st) const;
     void rl_freeze(SlotState& st, const RowView& rv, RlBus& bus, double q_mvar, int state) const;
+    // ReactiveLimitsLoop::_gen_limit_slope: the slope of generator g's limit (max or min) at
+    // the target P in force, MVar per MW (0 without a curve or a target a row or loop gave it)
+    double rl_gen_limit_slope(const SlotState& st, int g, bool max) const {
+        ls2g::real_type dlo = 0., dhi = 0.;
+        grid_->gen_limit_slopes_at_outer_target(g, gen_override(st, g), dlo, dhi);
+        return max ? dhi : dlo;
+    }
+    // the adjoint's view of the row's last solve (RowResult::pq_buses ... gen_p_slope_*)
+    void adjoint_info(const SlotState& st, RowResult& r) const;
     void rl_release(SlotState& st, RlBus& bus) const;
     // the driver
     // `recheck`: loop i acted and the row was re-solved: runOuterLoop's do-while
@@ -549,6 +565,8 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     vc_bus_ = ledger.vc_bus; vc_kind_ = ledger.vc_kind; vc_elem_ = ledger.vc_elem_id;
     vc_group_ = ledger.vc_group; vc_slope_ = ledger.vc_slope; vc_v_set_ = ledger.vc_v_set;
     grp_start_ = ledger.vc_grp_start; grp_count_ = ledger.vc_grp_count;
+    vc_v_row_ = ledger.vc_v_rows; vc_share_row_ = ledger.vc_share_rows;
+    q_row_of_bus_ = ledger.q_row_of_bus;
     vc_plan_held_.assign(static_cast<size_t>(nc), 0);
     vc_q_plan_.assign(static_cast<size_t>(nc), 0.);
     for (int c = 0; c < nc; ++c) {
@@ -1808,18 +1826,33 @@ std::vector<char> Ls2gOuterModel::rl_groups_holding(const SlotState& st) const
 
 void Ls2gOuterModel::rl_freeze(SlotState& st, const RowView& rv, RlBus& bus, double q_mvar, int state) const
 {
+    // a generator frozen at a limit of its curve follows it: what the adjoint adds to its gen_p
+    // gradient (the robust mode's target Q does not move with P)
+    bus.slopes.clear();
     if (!bus.local) {
         const auto& entry = st.rl->plan.buses[static_cast<size_t>(bus.entry)];
         for (int c : entry.ctrl_pos) {
             double q = rl_controller_limit(st, rv, c, state > 0);
-            if (bus.realistic && vc_kind_[static_cast<size_t>(c)] == ls2g::VoltageControlSolverData::GEN)
-                q = grid_->get_generators().get_target_q()(vc_elem_[static_cast<size_t>(c)]);   // the robust mode's
+            if (vc_kind_[static_cast<size_t>(c)] == ls2g::VoltageControlSolverData::GEN) {
+                const int g = vc_elem_[static_cast<size_t>(c)];
+                if (bus.realistic) {
+                    q = grid_->get_generators().get_target_q()(g);   // the robust mode's
+                } else {
+                    const double slope = rl_gen_limit_slope(st, g, state > 0);
+                    if (slope != 0.) bus.slopes.push_back({{g, c}, slope / sn_});
+                }
+            }
             st.held_q[static_cast<size_t>(c)] = q / sn_;
         }
         bus.state = state;
         bus.frozen_q = q_mvar;
         return;
     }
+    if (!bus.realistic)
+        for (int g : st.rl->plan.buses[static_cast<size_t>(bus.entry)].gen_ids) {
+            const double slope = rl_gen_limit_slope(st, g, state > 0);
+            if (slope != 0.) bus.slopes.push_back({{g, -1}, slope / sn_});
+        }
     if (bus.pin < 0)
         throw std::runtime_error("outer model: the controller bus " + std::to_string(bus.bus_solver) +
                                  " has no reserved Vm column (is the grid's algorithm an NROuter_* one, "
@@ -1839,8 +1872,10 @@ void Ls2gOuterModel::rl_release(SlotState& st, RlBus& bus) const
         bus.state = 0;
         bus.realistic = false;
         bus.frozen_q = 0.;
+        bus.slopes.clear();
         return;
     }
+    bus.slopes.clear();
     st.freeze_q.erase(bus.bus_solver);
     st.pq[static_cast<size_t>(bus.pin)] = 0;
     // a pinned row keeps the magnitude the bus has: back at its set-point
@@ -2589,8 +2624,64 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status)
             }
         }
         r.decisions = std::move(st.trace);
+        adjoint_info(st, r);
     }
     return Next::Done;
+}
+
+void Ls2gOuterModel::adjoint_info(const SlotState& st, RowResult& r) const
+{
+    // the controls of the row's last solve (materialized for it: a check that ends the row
+    // changes none)
+    const SlotControls& c = st.ctl;
+    for (size_t k = 0; k < c.pin.size(); ++k)
+        if (!c.pin[k]) r.pq_buses.push_back(layout_.pin_bus[k]);
+    // VoltageControl, may_hold_ formulation: a controller held by value or by the plan
+    auto held = [&](int j) {
+        return std::isfinite(c.held_q[static_cast<size_t>(j)]) || c.plan_held[static_cast<size_t>(j)] != 0;
+    };
+    auto ref_active = [&](int g) {
+        for (int off = 0; off < grp_count_[static_cast<size_t>(g)]; ++off)
+            if (!held(grp_start_[static_cast<size_t>(g)] + off)) return off;
+        return -1;
+    };
+    for (int g = 0; g < layout_.n_grp; ++g)
+        if (ref_active(g) < 0) r.vset_lost_groups.push_back(g);
+    // VoltageControl::hold_row: the row pinning a held controller at its output
+    auto hold_row = [&](int j) {
+        if (j < 0 || j >= layout_.n_ctrl || !held(j)) return -1;
+        const int g = vc_group_[static_cast<size_t>(j)];
+        if (static_cast<size_t>(g) >= vc_v_row_.size()) return -1;
+        const auto row_of = [&](int k) {
+            return k == 0 ? vc_v_row_[static_cast<size_t>(g)] : vc_share_row_[static_cast<size_t>(g)][static_cast<size_t>(k - 1)];
+        };
+        const int off = j - grp_start_[static_cast<size_t>(g)];
+        const int ref = ref_active(g);
+        return (ref >= 0 && off == 0) ? row_of(ref) : row_of(off);
+    };
+    // DistributedSlackLoop::_adjoint_terms: a generator parked at a bound sits there whatever
+    // its set-point -- unless that bound is its own set-point (one already beyond a limit)
+    if (st.ds_in_newton)
+        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_parked.size(); ++k) {
+            const auto& u = st.ds_units[k];
+            if (!st.ds_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
+            if (st.ds_current_mw[k] == static_cast<double>(u.injection_mw)) continue;
+            r.gen_p_fixed.push_back(u.el_id);
+        }
+    // ReactiveLimitsLoop::_adjoint_terms (OuterLoopAlgo::get_adjoint_solve_info: a unit whose P
+    // reaches nothing has no slope either)
+    for (const RlBus& bus : st.rl_buses) {
+        if (bus.state == 0) continue;
+        for (const auto& sl : bus.slopes) {
+            const int g = sl.first.first, ctrl = sl.first.second;
+            if (std::find(r.gen_p_fixed.begin(), r.gen_p_fixed.end(), g) != r.gen_p_fixed.end()) continue;
+            const int row = ctrl >= 0 ? hold_row(ctrl) : q_row_of_bus_[static_cast<size_t>(bus.bus_solver)];
+            if (row < 0) continue;
+            r.gen_p_slope_gen.push_back(g);
+            r.gen_p_slope_row.push_back(row);
+            r.gen_p_slope_coeff.push_back(sl.second);
+        }
+    }
 }
 
 void Ls2gOuterModel::row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const

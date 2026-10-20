@@ -1474,7 +1474,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
             return out;
         }, "(shunt id, section count) the same for the shunt sections")
       .def_readonly("decisions", &outer::RowResult::decisions,
-                    "the decision trace, when the session keeps it (keep_trace)");
+                    "the decision trace, when the session keeps it (keep_trace)")
+      .def_readonly("pq_buses", &outer::RowResult::pq_buses,
+                    "the adjoint of the last inner solve: the switchable solver buses PQ in it")
+      .def_readonly("vset_lost_groups", &outer::RowResult::vset_lost_groups,
+                    "... the VoltageControl groups whose voltage row lost its set-point")
+      .def_readonly("gen_p_fixed", &outer::RowResult::gen_p_fixed,
+                    "... the generators DistributedSlack holds at a bound (no gen_p gradient)")
+      .def_property_readonly("gen_p_slope", [](const outer::RowResult& r) {
+            std::vector<std::tuple<int, int, double>> out;
+            for (size_t k = 0; k < r.gen_p_slope_gen.size(); ++k)
+                out.emplace_back(r.gen_p_slope_gen[k], r.gen_p_slope_row[k], r.gen_p_slope_coeff[k]);
+            return out;
+        }, "... (generator, J row, pu per MW): a generator frozen at a limit of its capability "
+           "curve, whose reactive output follows its target P");
 
   pybind11::enum_<RowStatus>(m, "RowStatus")
       .value("Converged",    RowStatus::Converged,    "||F||inf < tol")
@@ -2562,6 +2575,29 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "BatchScheduling (takes effect on the next run())")
     .def_property_readonly("has_outer_model", &ScenarioSweepSession::has_outer_model,
                    "Whether the outer loops (lightsim2grid's NROuter_* ones) decide on every row.")
+    .def("get_outer_trafo_blocks", [](const ScenarioSweepSession& s) {
+            const outer::OuterHook* m = s.outer_model();
+            if (m == nullptr)
+                throw std::runtime_error("ScenarioSweepSession: no outer loops (build the session "
+                                         "with _make_ss_outer_session_from_lsgrid)");
+            std::vector<int> rows, trafos;
+            std::vector<std::complex<double>> blocks;
+            for (int r = 0; r < m->n_rows(); ++r) {
+                std::vector<int> t;
+                std::vector<double> b;
+                m->row_trafo_blocks(r, t, b);
+                for (size_t k = 0; k < t.size(); ++k) {
+                    rows.push_back(r);
+                    trafos.push_back(t[k]);
+                    for (int q = 0; q < 4; ++q) blocks.emplace_back(b[8 * k + 2 * q], b[8 * k + 2 * q + 1]);
+                }
+            }
+            return std::make_tuple(rows, trafos, blocks);
+        },
+        "(rows, trafo ids, blocks): the pi block (y11, y12, y21, y22, pu, 4 per entry, flat) of "
+        "every transformer the outer loops left off the grid's taps in a row of the last run(), "
+        "at its final taps (lightsim2grid's get_outer_trafo_admittances): what that row's flows "
+        "are computed with")
     .def("get_outer_results", [](const ScenarioSweepSession& s) {
             const outer::OuterHook* m = s.outer_model();
             if (m == nullptr)
