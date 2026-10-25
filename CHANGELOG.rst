@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``ci/modal/gpu_bench.py``: N-1 throughput on several Modal GPU types in parallel,
+  searching each GPU's best batch size.
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.
