@@ -28,6 +28,10 @@ Batch-size search (per GPU, per grid):
 2. refinement: the geometric midpoints between the best size and its
    neighbours.
 
+No new size is started past ``--budget-s`` seconds per grid (default 600),
+so a slow GPU on a large grid reports its best so far (``budget_hit``)
+instead of running into the container timeout.
+
 Each size is timed on ``--reps`` hot runs (same batch size and contingency
 list, so no new analysis); its score is the best of them. The study is tiled
 to at least ``--min-cont`` contingencies so a small grid does not cap the
@@ -169,8 +173,13 @@ class _Bench:
         }
 
 
-def _search(bench, n_cont, min_batch):
+def _search(bench, n_cont, min_batch, budget_s):
+    # Small batches are the slowest sizes to time (many chunks), and a slow GPU
+    # on a large grid could otherwise run past the container timeout: past
+    # budget_s, no new size is started and the best so far is kept.
     trials = {}
+    deadline = time.monotonic() + budget_s
+    over = lambda: time.monotonic() > deadline
 
     def run(bs):
         bs = int(max(1, min(bs, n_cont)))
@@ -194,14 +203,14 @@ def _search(bench, n_cont, min_batch):
             break
         b = best()
         below = below + 1 if r["throughput_ctg_s"] < 0.9 * b["throughput_ctg_s"] else 0
-        if below >= 2 or bs >= n_cont:
+        if below >= 2 or bs >= n_cont or over():
             break
         bs = min(2 * bs, n_cont)
 
     # 2. refinement around the best: geometric midpoints with its neighbours
     for _ in range(2):
         b = best()
-        if b is None:
+        if b is None or over():
             break
         sizes = sorted(k for k, r in trials.items() if r["ok"] or k > b["batch_size"])
         i = sizes.index(b["batch_size"])
@@ -214,13 +223,15 @@ def _search(bench, n_cont, min_batch):
         if not cands:
             break
         for c in cands:
+            if over():
+                break
             run(c)
 
-    return best(), sorted(trials.values(), key=lambda r: r["batch_size"])
+    return best(), sorted(trials.values(), key=lambda r: r["batch_size"]), over()
 
 
-@app.function(image=image, gpu="T4", timeout=45 * 60, cpu=4)
-def bench_gpu(grids, min_cont, min_batch, nb_iter, strategy, reps):
+@app.function(image=image, gpu="T4", timeout=60 * 60, cpu=4)
+def bench_gpu(grids, min_cont, min_batch, nb_iter, strategy, reps, budget_s):
     _install_wheels()
     info = _gpu_info()
     from gpusim2grid import _gpusim2grid as m, warmup
@@ -241,10 +252,12 @@ def bench_gpu(grids, min_cont, min_batch, nb_iter, strategy, reps):
         print(f"  {case}: {n_bus} buses, {n_branches} branches, "
               f"{len(conts)} contingencies (N-1 x{reps_n1})", flush=True)
         bench = _Bench(grid, conts, nb_iter, strategy, reps, info["precision"])
-        best, trials = _search(bench, len(conts), min_batch)
+        best, trials, cut = _search(bench, len(conts), min_batch, budget_s)
+        if cut:
+            print(f"    search stopped by the {budget_s:.0f} s budget", flush=True)
         out["grids"][case] = {"n_bus": n_bus, "n_branches": n_branches,
                               "n_contingencies": len(conts), "best": best,
-                              "trials": trials}
+                              "budget_hit": cut, "trials": trials}
         del bench
     return out
 
@@ -267,11 +280,11 @@ def _table(results, grids):
 
 @app.local_entrypoint()
 def main(gpus: str = DEFAULT_GPUS, grids: str = DEFAULT_GRIDS, min_cont: int = 20_000,
-         min_batch: int = 32, nb_iter: int = 4, strategy: str = "direct_refactor_every",
-         reps: int = 3, out: str = "gpu_bench.json"):
+         min_batch: int = 128, nb_iter: int = 4, strategy: str = "direct_refactor_every",
+         reps: int = 3, budget_s: float = 600, out: str = "gpu_bench.json"):
     gpu_list = [g.strip() for g in gpus.split(",") if g.strip()]
     grid_list = [g.strip() for g in grids.split(",") if g.strip()]
-    args = (grid_list, min_cont, min_batch, nb_iter, strategy, reps)
+    args = (grid_list, min_cont, min_batch, nb_iter, strategy, reps, budget_s)
     calls = {g: bench_gpu.with_options(gpu=g).spawn(*args) for g in gpu_list}
     results = []
     for g, call in calls.items():
@@ -282,7 +295,7 @@ def main(gpus: str = DEFAULT_GPUS, grids: str = DEFAULT_GRIDS, min_cont: int = 2
         r["requested_gpu"] = g
         results.append(r)
     meta = {"nb_iter": nb_iter, "strategy": strategy, "min_cont": min_cont,
-            "reps": reps, "cuda_image": CUDA}
+            "reps": reps, "budget_s": budget_s, "cuda_image": CUDA}
     Path(out).write_text(json.dumps({"config": meta, "results": results}, indent=1))
     table = _table(results, grid_list)
     Path(out).with_suffix(".md").write_text(table + "\n")
