@@ -64,7 +64,10 @@ image = (
     .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8,<1", "numpy", "scipy", "pandapower")
     .env({"G2G_CUDA": CUDA})
 )
-if modal.is_local():
+# The worker child of bench_gpu (this file run with --worker inside the
+# container) is "local" to Modal too, but has no repo around it.
+_IS_WORKER = __name__ == "__main__" and "--worker" in sys.argv
+if modal.is_local() and not _IS_WORKER:
     REPO = Path(__file__).resolve().parents[2]
     WHEELS = os.environ.get("G2G_WHEELS", str(REPO / "ci" / "modal" / "wheels"))
     image = image.add_local_dir(WHEELS, "/wheels")
