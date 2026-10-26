@@ -30,6 +30,11 @@ on:
         description: pandapower cases for the benchmark, comma-separated
         type: string
         default: case1354pegase,case2869pegase,case9241pegase
+      bench_precision:
+        description: Benchmark precision(s)
+        type: choice
+        options: [both, fp64, fp32]
+        default: both
       cuda_archs:
         description: CMAKE_CUDA_ARCHITECTURES of the wheels (e.g. "75;80;89;90" to benchmark newer GPUs)
         type: string
@@ -292,7 +297,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        precision: [fp64, fp32]
+        precision: >-
+          ${{ fromJSON(inputs.bench_precision == 'fp64' && '["fp64"]'
+                    || inputs.bench_precision == 'fp32' && '["fp32"]'
+                    || '["fp64", "fp32"]') }}
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
