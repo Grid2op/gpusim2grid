@@ -17,6 +17,23 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      gpu_tests:
+        description: Run the GPU test suite on Modal (T4)
+        type: boolean
+        default: true
+      bench_gpus:
+        description: "Modal GPUs for ci/modal/gpu_bench.py, comma-separated (empty = no benchmark)"
+        type: string
+        default: ""
+      bench_grids:
+        description: pandapower cases for the benchmark, comma-separated
+        type: string
+        default: case1354pegase,case2869pegase,case9241pegase
+      cuda_archs:
+        description: CMAKE_CUDA_ARCHITECTURES of the wheels (e.g. "75;80;89;90" to benchmark newer GPUs)
+        type: string
+        default: "75"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -161,18 +178,20 @@ jobs:
           # target for both CUDA 12 and 13).
           CMAKE_ARGS: >-
             -DGPUSIM2GRID_SUITESPARSE_DIR=/opt/ls2g-dist/SuiteSparse
-            -DCMAKE_CUDA_ARCHITECTURES=75
+            -DCMAKE_CUDA_ARCHITECTURES=${{ inputs.cuda_archs || '75' }}
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
         run: |
           export ${{ matrix.precision_env }}=1
           pip wheel -v --no-build-isolation --no-deps -w dist .
           pip install dist/gpusim2grid-*.whl
 
-      - name: Upload the wheel for the GPU tests
-        if: matrix.cuda == '13.4.2' && matrix.precision == 'fp64'
+      - name: Upload the wheel for the GPU tests / benchmark
+        if: >-
+          matrix.cuda == '13.4.2' &&
+          (matrix.precision == 'fp64' || inputs.bench_gpus != '')
         uses: actions/upload-artifact@v4
         with:
-          name: gpusim2grid-wheel-cu13-fp64
+          name: gpusim2grid-wheel-cu13-${{ matrix.precision }}
           path: dist/gpusim2grid-*.whl
           retention-days: 1
 
@@ -208,7 +227,7 @@ jobs:
     name: gpu tests (Modal, CUDA 13.4.2, fp64, T4)
     needs: build
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.gpu_tests) ||
       github.ref == 'refs/heads/main' ||
       contains(github.event.pull_request.labels.*.name, 'gpu-ci')
     runs-on: ubuntu-latest
@@ -256,3 +275,72 @@ jobs:
 
       - name: Run GPU tests on Modal
         run: modal run ci/modal/gpu_tests.py
+
+  # ---------------------------------------------------------------------------
+  # N-1 throughput on several Modal GPU types (ci/modal/gpu_bench.py), in both
+  # precisions, from the CUDA 13 wheels above. Manual dispatch only, with a
+  # non-empty `bench_gpus`; set `cuda_archs` so the newer GPUs run native code
+  # rather than sm_75 PTX JIT. Results: the job summary and the
+  # gpu-bench-<precision> artifact (JSON with every batch size tried).
+  # ---------------------------------------------------------------------------
+  gpu-bench:
+    name: gpu benchmark (Modal, ${{ matrix.precision }})
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.bench_gpus != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        precision: [fp64, fp32]
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      G2G_CUDA: "13.4.2"
+      G2G_WHEELS: ${{ github.workspace }}/wheels
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the gpusim2grid wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: gpusim2grid-wheel-cu13-${{ matrix.precision }}
+          path: wheels
+
+      - name: Download the lightsim2grid build
+        uses: actions/download-artifact@v4
+        with:
+          name: lightsim2grid-dist
+          path: ls2g-dist
+
+      - name: Collect the wheels
+        run: |
+          mv ls2g-dist/wheels/lightsim2grid-*.whl wheels/
+          ls -l wheels
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal
+        run: pip install -q modal
+
+      - name: Run the benchmark on Modal
+        env:
+          GPUS: ${{ inputs.bench_gpus }}
+          GRIDS: ${{ inputs.bench_grids }}
+        run: |
+          modal run ci/modal/gpu_bench.py --gpus "$GPUS" --grids "$GRIDS" \
+            --out "gpu_bench_${{ matrix.precision }}.json"
+          {
+            echo "### N-1 throughput, ${{ matrix.precision }} (wheels: sm ${{ inputs.cuda_archs }})"
+            echo
+            cat "gpu_bench_${{ matrix.precision }}.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-bench-${{ matrix.precision }}
+          path: gpu_bench_${{ matrix.precision }}.*
+          if-no-files-found: ignore
