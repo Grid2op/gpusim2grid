@@ -113,14 +113,16 @@ def _load_grid(case):
 class _Bench:
     """One grid on one GPU: rebuilds the solver after a failed size."""
 
-    def __init__(self, grid, conts, nb_iter, strategy, reps):
-        self.grid, self.conts = grid, conts
+    def __init__(self, grid, conts, nb_iter, strategy, reps, precision):
+        self.grid, self.conts, self.precision = grid, conts, precision
         self.nb_iter, self.strategy, self.reps = nb_iter, strategy, reps
         self.ca = None
 
     def _make(self):
         from gpusim2grid import ContingencyAnalysisGPU
-        self.ca = ContingencyAnalysisGPU(self.grid, nb_iter=self.nb_iter,
+        # The facade defaults to precision="fp64" and refuses an FP32 build.
+        self.ca = ContingencyAnalysisGPU(self.grid, precision=self.precision,
+                                         nb_iter=self.nb_iter,
                                          max_iter_base=10, tol_base=1e-8)
         self.ca.strategy = self.strategy
         self.ca.add_contingencies_by_branch_id(self.conts)
@@ -128,10 +130,10 @@ class _Bench:
     def measure(self, batch_size):
         import gc
         import numpy as np
-        if self.ca is None:
-            self._make()
         n = len(self.conts)
         try:
+            if self.ca is None:
+                self._make()
             t0 = time.perf_counter()
             self.ca.compute(batch_size=batch_size)       # cold: alloc + analysis
             res = self.ca.last_residuals()               # D->H, forces a sync
@@ -238,7 +240,7 @@ def bench_gpu(grids, min_cont, min_batch, nb_iter, strategy, reps):
         conts = n1 * reps_n1
         print(f"  {case}: {n_bus} buses, {n_branches} branches, "
               f"{len(conts)} contingencies (N-1 x{reps_n1})", flush=True)
-        bench = _Bench(grid, conts, nb_iter, strategy, reps)
+        bench = _Bench(grid, conts, nb_iter, strategy, reps, info["precision"])
         best, trials = _search(bench, len(conts), min_batch)
         out["grids"][case] = {"n_bus": n_bus, "n_branches": n_branches,
                               "n_contingencies": len(conts), "best": best,
@@ -286,3 +288,8 @@ def main(gpus: str = DEFAULT_GPUS, grids: str = DEFAULT_GRIDS, min_cont: int = 2
     Path(out).with_suffix(".md").write_text(table + "\n")
     print("\n" + table)
     print(f"\nwritten: {out}, {Path(out).with_suffix('.md')}")
+    # Fail the job when nothing was measured, rather than a green run with
+    # an all-"error" table.
+    measured = any(gr.get("best") for r in results for gr in r.get("grids", {}).values())
+    if not measured:
+        sys.exit("no GPU/grid produced a measurement; see the errors above")
