@@ -57,7 +57,7 @@ DEFAULT_GRIDS = "case1354pegase,case2869pegase,case9241pegase"
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{CUDA}-runtime-ubuntu22.04", add_python=PY)
-    .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8", "numpy", "scipy", "pandapower")
+    .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8,<1", "numpy", "scipy", "pandapower")
     .env({"G2G_CUDA": CUDA})
 )
 if modal.is_local():

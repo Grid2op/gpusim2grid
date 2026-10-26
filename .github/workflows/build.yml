@@ -163,7 +163,7 @@ jobs:
           # cuDSS wheel matching the image's CUDA major (CUDA_VERSION is set by
           # the nvidia/cuda image), installed under <site-packages>/nvidia/cuXX.
           cu="cu${CUDA_VERSION%%.*}"
-          pip install -q "nvidia-cudss-${cu}>=0.8" scikit-build-core pybind11 \
+          pip install -q "nvidia-cudss-${cu}>=0.8,<1" scikit-build-core pybind11 \
             numpy scipy pytest pandapower
           pip install /opt/ls2g-dist/wheels/lightsim2grid-*.whl
           echo "$VENV/bin" >> "$GITHUB_PATH"
