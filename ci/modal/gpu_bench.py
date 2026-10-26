@@ -76,6 +76,9 @@ def _install_wheels():
     wheels = sorted(str(p) for p in Path("/wheels").glob("*.whl"))
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", *wheels],
                    check=True)
+
+
+def _preload_cudss():
     # cuDSS ships as a pip wheel: make its lib dir visible before the
     # extension is first imported (the loader reads LD_LIBRARY_PATH at
     # dlopen time only for new processes, so preload it explicitly).
@@ -188,7 +191,7 @@ def _search(bench, n_cont, min_batch, budget_s):
             r = trials[bs]
             msg = (f"{r['throughput_ctg_s']:10.0f} ctg/s  ({r['wall_ms_best']:.1f} ms, "
                    f"{r['n_chunks']} chunks)") if r["ok"] else f"FAILED {r['error'][:120]}"
-            print(f"    batch {bs:6d}: {msg}", flush=True)
+            _log(f"    batch {bs:6d}: {msg}")
         return trials[bs]
 
     def best():
@@ -230,13 +233,40 @@ def _search(bench, n_cont, min_batch, budget_s):
     return best(), sorted(trials.values(), key=lambda r: r["batch_size"]), over()
 
 
+_LOG_PREFIX = ""
+
+
+def _log(msg):
+    # Five containers write into one log: tag every line with its GPU.
+    print(f"{_LOG_PREFIX}{msg}", flush=True)
+
+
 @app.function(image=image, gpu="T4", timeout=60 * 60, cpu=4)
 def bench_gpu(grids, min_cont, min_batch, nb_iter, strategy, reps, budget_s):
+    # The solver bindings hold the GIL for a whole run() (tens of seconds on
+    # a small batch), which starved Modal's heartbeat thread: containers were
+    # marked unhealthy and restarted from scratch. The GPU work therefore runs
+    # in a child process, and this one only waits for it.
+    import tempfile
     _install_wheels()
+    with tempfile.TemporaryDirectory() as tmp:
+        args_p, out_p = Path(tmp) / "args.json", Path(tmp) / "out.json"
+        args_p.write_text(json.dumps([grids, min_cont, min_batch, nb_iter,
+                                      strategy, reps, budget_s]))
+        proc = subprocess.run([sys.executable, __file__, "--worker", str(args_p), str(out_p)])
+        if not out_p.exists():
+            raise RuntimeError(f"benchmark worker exited with code {proc.returncode}")
+        return json.loads(out_p.read_text())
+
+
+def _worker(grids, min_cont, min_batch, nb_iter, strategy, reps, budget_s):
+    global _LOG_PREFIX
+    _preload_cudss()
     info = _gpu_info()
     from gpusim2grid import _gpusim2grid as m, warmup
     info["precision"] = "fp32" if m.is_fp32 else "fp64"
-    print(f"== {info['gpu_name']} ({info['gpu_memory']}), {info['precision']}", flush=True)
+    _LOG_PREFIX = f"[{info['gpu_name']}] "
+    _log(f"== {info['gpu_name']} ({info['gpu_memory']}), {info['precision']}")
     warmup()
 
     out = dict(info, grids={})
@@ -249,12 +279,12 @@ def bench_gpu(grids, min_cont, min_batch, nb_iter, strategy, reps, budget_s):
         n1 = [[b] for b in range(n_branches)]
         reps_n1 = max(1, math.ceil(min_cont / n_branches))
         conts = n1 * reps_n1
-        print(f"  {case}: {n_bus} buses, {n_branches} branches, "
-              f"{len(conts)} contingencies (N-1 x{reps_n1})", flush=True)
+        _log(f"  {case}: {n_bus} buses, {n_branches} branches, "
+             f"{len(conts)} contingencies (N-1 x{reps_n1})")
         bench = _Bench(grid, conts, nb_iter, strategy, reps, info["precision"])
         best, trials, cut = _search(bench, len(conts), min_batch, budget_s)
         if cut:
-            print(f"    search stopped by the {budget_s:.0f} s budget", flush=True)
+            _log(f"    search stopped by the {budget_s:.0f} s budget")
         out["grids"][case] = {"n_bus": n_bus, "n_branches": n_branches,
                               "n_contingencies": len(conts), "best": best,
                               "budget_hit": cut, "trials": trials}
@@ -280,7 +310,7 @@ def _table(results, grids):
 
 @app.local_entrypoint()
 def main(gpus: str = DEFAULT_GPUS, grids: str = DEFAULT_GRIDS, min_cont: int = 20_000,
-         min_batch: int = 128, nb_iter: int = 4, strategy: str = "direct_refactor_every",
+         min_batch: int = 256, nb_iter: int = 4, strategy: str = "direct_refactor_every",
          reps: int = 3, budget_s: float = 600, out: str = "gpu_bench.json"):
     gpu_list = [g.strip() for g in gpus.split(",") if g.strip()]
     grid_list = [g.strip() for g in grids.split(",") if g.strip()]
@@ -306,3 +336,9 @@ def main(gpus: str = DEFAULT_GPUS, grids: str = DEFAULT_GRIDS, min_cont: int = 2
     measured = any(gr.get("best") for r in results for gr in r.get("grids", {}).values())
     if not measured:
         sys.exit("no GPU/grid produced a measurement; see the errors above")
+
+
+if __name__ == "__main__" and len(sys.argv) == 4 and sys.argv[1] == "--worker":
+    # Child process of bench_gpu (inside the container).
+    _args = json.loads(Path(sys.argv[2]).read_text())
+    Path(sys.argv[3]).write_text(json.dumps(_worker(*_args)))
