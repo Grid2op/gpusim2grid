@@ -131,9 +131,16 @@ class _Bench:
     def _make(self):
         from gpusim2grid import ContingencyAnalysisGPU
         # The facade defaults to precision="fp64" and refuses an FP32 build.
+        # FP32 cannot reuse lightsim2grid's FP64 base case: rounded to
+        # float, it leaves a 1e-3 pu mismatch on the pegase grids, above the
+        # presolved check's floor. Re-solve it on the GPU, to what float can
+        # reach (the FP32 tests' 1e-4).
+        fp32 = self.precision == "fp32"
         self.ca = ContingencyAnalysisGPU(self.grid, precision=self.precision,
                                          nb_iter=self.nb_iter,
-                                         max_iter_base=10, tol_base=1e-8)
+                                         init_from_n_powerflow=not fp32,
+                                         max_iter_base=10,
+                                         tol_base=1e-4 if fp32 else 1e-8)
         self.ca.strategy = self.strategy
         self.ca.add_contingencies_by_branch_id(self.conts)
 
