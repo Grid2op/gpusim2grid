@@ -148,6 +148,9 @@ struct SlotState {
     std::vector<ls2g::slack_redistribution::Participant> ds_units;
     std::vector<int> ds_unit_bus;
     std::vector<double> ds_current_mw;
+    // each unit's target in force before the row's lost-power share moved it (its own set-point:
+    // the adjoint's "a unit beyond its bound keeps its own" test)
+    std::vector<double> ds_initial_mw;
     // around a distributed-slack Newton (DistributedSlackLoop's in-Newton state): whether the
     // Newton shares the slack on the units (the loop runs on the row), the units at a bound
     // and on which side, those the row's lost-power share put at a bound
@@ -1130,6 +1133,7 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                         ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
                 st.ds_current_mw.resize(st.ds_units.size());
                 for (size_t k = 0; k < st.ds_units.size(); ++k) st.ds_current_mw[k] = st.ds_units[k].injection_mw;
+                st.ds_initial_mw = st.ds_current_mw;
                 st.ds_lost_sat.clear();
                 share_lost_p(st, d);
                 // every unit takes its share in the Newton to start with, but those a resumed
@@ -2660,12 +2664,14 @@ void Ls2gOuterModel::adjoint_info(const SlotState& st, RowResult& r) const
         return (ref >= 0 && off == 0) ? row_of(ref) : row_of(off);
     };
     // DistributedSlackLoop::_adjoint_terms: a generator parked at a bound sits there whatever
-    // its set-point -- unless that bound is its own set-point (one already beyond a limit)
+    // its set-point -- unless that bound is its own set-point (one already beyond a limit). Its
+    // own: from before the row's lost-power share, which moves the initial targets the loop
+    // starts from (injection_mw) -- a unit that share put at its bound is held there too
     if (st.ds_in_newton)
-        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_parked.size(); ++k) {
+        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_parked.size() && k < st.ds_initial_mw.size(); ++k) {
             const auto& u = st.ds_units[k];
             if (!st.ds_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
-            if (st.ds_current_mw[k] == static_cast<double>(u.injection_mw)) continue;
+            if (st.ds_current_mw[k] == st.ds_initial_mw[k]) continue;
             r.gen_p_fixed.push_back(u.el_id);
         }
     // ReactiveLimitsLoop::_adjoint_terms (OuterLoopAlgo::get_adjoint_solve_info: a unit whose P

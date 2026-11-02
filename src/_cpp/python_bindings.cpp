@@ -2723,6 +2723,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "leave that row's distributed slack. The caller's Sbus already carries the "
          "correction. Exclusive with redistribute_slack.")
     .def("clear_external_slack_saturation", &ScenarioSweepSession::clear_external_slack_saturation)
+    .def("set_external_lost_p", &ScenarioSweepSession::set_external_lost_p,
+         pybind11::arg("lost_p_mw"),
+         "With the outer loops: what each row loses (MW, generator convention, NaN: nothing), "
+         "measured by the caller (BatchPowerFlow), for the rows' DistributedSlack loop to share "
+         "before their first solve. Exclusive with redistribute_slack.")
+    .def("clear_external_lost_p", &ScenarioSweepSession::clear_external_lost_p)
     .def("preview_row_masks", &ScenarioSweepSession::preview_row_masks,
          pybind11::arg("branch_ids_per_row"),
          "(disconnected, masked buses per row) that these per-row branch trips would give, "

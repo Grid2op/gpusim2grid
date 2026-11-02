@@ -177,7 +177,13 @@ the whole run wherever a small enough change flips no decision. With ``NROuter_*
 ``DistributedSlack``, the loop moves the targets between Newton solves: the gradient is
 then the single-slack one of the last solve (every change of the balance on the reference
 bus), as lightsim2grid's; ``NROuterDist_*`` carries the distributed slack in J, and its
-gradient with it. Not with ``redistribute_slack`` yet.
+gradient with it. With ``redistribute_slack``, what a row loses (measured here in torch, as
+above) is handed to its DistributedSlack loop, which shares it before the row's first solve
+(lightsim2grid's batch does the same), and the gradient takes that share as a constant.
+Around a distributed-slack Newton that is exact: the units that stay free take it by the
+Newton's own weights, so it moves nothing the slack would not; a unit the share puts at a
+bound is parked there and gets no ``gen_p`` gradient, as one the Newton's share parks. With
+``NROuter_*`` it is the single-slack convention above.
 
 Scheduling: ``scheduling="continuous"`` (``from_lsgrid``) solves the rows in
 ``batch_size`` slots (default ``n_scen``), each row leaving as soon as its
@@ -299,6 +305,8 @@ class BatchPowerFlow:
         self._rd_masks = None           # (masked, dropped, topology mask they were built from)
         self._pending_ext_sat = None    # per-row saturated units for the session, or "clear"
         self._ext_sat_in_session = False
+        self._pending_ext_lost = None   # outer loops: per-row lost MW for the session, or "clear"
+        self._ext_lost_in_session = False
 
         # Call-to-call state.
         self._last_n_scen = None
@@ -378,11 +386,8 @@ class BatchPowerFlow:
         solved with lightsim2grid's ``NROuter_*`` or ``NROuterDist_*``, see
         :class:`ScenarioSweepGPU`), and the gradient is lightsim2grid's through
         them: the one of each row's last inner solve, every decision of its loops
-        held (see the module docstring). Not with ``redistribute_slack`` yet.
+        held (see the module docstring), ``redistribute_slack`` included.
         """
-        if outer_loops and redistribute_slack:
-            raise ValueError("BatchPowerFlow: redistribute_slack with outer_loops is not supported "
-                             "yet (the DistributedSlack loop's lost-power share has no gradient)")
         sweep = ScenarioSweepGPU(
             grid, init_from_n_powerflow=init_from_n_powerflow, precision=precision,
             nb_iter=nb_iter, max_iter_base=max_iter_base, tol_base=tol_base,
@@ -417,12 +422,11 @@ class BatchPowerFlow:
         if bool(value) != value:
             raise ValueError("The `redistribute_slack` attribute must be a boolean.")
         value = bool(value)
-        if value and self._sweep.outer_loops:
-            raise ValueError("BatchPowerFlow: redistribute_slack with outer_loops is not supported yet")
         if value:
             grid = self._sweep._grid
             data = _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self.n_bus)
-            self._solver._s.set_slack_redistribution_data(data)
+            if not self._sweep.outer_loops:
+                self._solver._s.set_slack_redistribution_data(data)
             dev, rdt = self._dev, self._rdtype
             kind = np.asarray(data.kind, dtype=np.int64)
             self._rd = {
@@ -441,6 +445,8 @@ class BatchPowerFlow:
             }
         elif self._ext_sat_in_session:
             self._pending_ext_sat = "clear"
+        elif self._ext_lost_in_session:
+            self._pending_ext_lost = "clear"
         self._redistribute_slack = value
 
     # --------------------------------------------------------------- forward
@@ -586,6 +592,13 @@ class BatchPowerFlow:
             if gen_off is not None:
                 lost = lost - (gen_p_in * off.to(P.dtype)).sum(1)
         lost = torch.where(dropped, torch.zeros_like(lost), lost)
+        if self._sweep.outer_loops:
+            # the rows' DistributedSlack loop shares it before their first solve; for the
+            # gradient that share is a constant (see the module docstring)
+            lost_np = lost.detach().cpu().numpy().astype(np.float64)
+            lost_np[~(np.abs(lost_np) > 1e-6)] = np.nan
+            self._pending_ext_lost = lost_np.tolist()
+            return P
         if rd["n"] == 0:
             self._queue_ext_sat([[] for _ in range(n_scen)])
             return P
@@ -915,6 +928,14 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                 solver._s.set_external_slack_saturation(pf._pending_ext_sat)
                 pf._ext_sat_in_session = True
             pf._pending_ext_sat = None
+        if pf._pending_ext_lost is not None:
+            if isinstance(pf._pending_ext_lost, str):
+                solver._s.clear_external_lost_p()
+                pf._ext_lost_in_session = False
+            else:
+                solver._s.set_external_lost_p(pf._pending_ext_lost)
+                pf._ext_lost_in_session = True
+            pf._pending_ext_lost = None
 
         want_gen_v = gen_v is not None and ctx.needs_input_grad[2]
         needs_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or want_gen_v

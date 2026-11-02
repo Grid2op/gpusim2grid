@@ -1,6 +1,12 @@
 
 project(_gpusim2grid LANGUAGES CXX CUDA)
-find_package(cudss 0.8.0 REQUIRED)
+# No version in find_package: cuDSS's version file only accepts a request of its own
+# major version, so `find_package(cudss 0.8.0)` would reject 1.x. Check the floor here.
+find_package(cudss REQUIRED)
+if(cudss_VERSION AND cudss_VERSION VERSION_LESS 0.8.0)
+    message(FATAL_ERROR "cuDSS >= 0.8.0 required, found ${cudss_VERSION}")
+endif()
+message(STATUS "cuDSS ${cudss_VERSION} found in ${cudss_DIR}")
 find_package(CUDAToolkit REQUIRED COMPONENTS cublas cudart cusolver cusparse)
 # The zero-copy lightsim2grid bridge is compiled only when lightsim2grid_core
 # was found at configure time (see ../CMakeLists.txt). It is a CUDA-free .cpp.

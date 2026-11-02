@@ -61,11 +61,11 @@ def _grid(distributed=False, init_from_n=False):
     return grid
 
 
-def _pf(grid, init_from_n=False):
+def _pf(grid, init_from_n=False, **kwargs):
     from gpusim2grid.differentiable import BatchPowerFlow
     return BatchPowerFlow.from_lsgrid(grid, outer_loops=True, keep_outer_trace=True, nb_iter=30,
                                       tol=TOL_MVA / grid.get_sn_mva(), init_from_n_powerflow=init_from_n,
-                                      ir_n_steps=1)
+                                      ir_n_steps=1, **kwargs)
 
 
 def _inputs(grid, zero_gen_p_to=None):
@@ -179,10 +179,87 @@ def test_generator_contingency():
         assert grads[name][idx] == pytest.approx(fd, abs=tol), f"{name}{idx}"
 
 
-def test_refusals():
-    from gpusim2grid.differentiable import BatchPowerFlow
-    with pytest.raises(ValueError, match="redistribute_slack"):
-        BatchPowerFlow.from_lsgrid(_grid(), outer_loops=True, redistribute_slack=True)
+def _redistribute_rows(grid):
+    """_inputs' rows (their loads ~10 % up: each row loses that against the grid's set-points,
+    which the share of its DistributedSlack loop pushes the capped generator 0 to its bound),
+    row 1 also disconnecting generator 2, row 2 islanding the load on bus 14"""
+    inputs = _inputs(grid, zero_gen_p_to=5.)
+    gen_status = np.ones_like(inputs["gen_p"], dtype=bool)
+    gen_status[1, 2] = False
+    line_status = np.ones((N_SCEN, len(grid.get_lines())), dtype=bool)
+    line_status[2, [el.id for el in grid.get_lines() if 13 in (el.bus1_id, el.bus2_id)]] = False
+    return inputs, {"gen_status": torch.as_tensor(gen_status, device="cuda"),
+                    "line_status": torch.as_tensor(line_status, device="cuda")}
+
+
+def test_redistribute_slack_forward_is_the_sessions():
+    """BatchPowerFlow measures what each row loses in torch: the same rows as ScenarioSweepGPU's
+    own redistribute_slack, whose DistributedSlack loop shares it before the first solve"""
+    from gpusim2grid import ScenarioSweepGPU
+    grid = _grid(distributed=True)
+    pf = _pf(grid, handle_disconnected_grid=True, redistribute_slack=True)
+    inputs, status = _redistribute_rows(grid)
+    inputs.pop("gen_v")
+    with torch.no_grad():
+        V = pf(**{k: _t(v) for k, v in inputs.items()}, **status).cpu().numpy()
+    res = pf.sweep.get_outer_results()
+    assert all(any("SHARE_LOST_P" in d for d in r.decisions) for r in res), [r.decisions for r in res]
+
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=30, init_from_n_powerflow=False,
+                          handle_disconnected_grid=True, redistribute_slack=True, ir_n_steps=1,
+                          reference_slack="grid", tol=TOL_MVA / grid.get_sn_mva())
+    sw.set_injections_from_elements(inputs["load_p"], inputs["load_q"], inputs["gen_p"])
+    lines = status["line_status"].cpu().numpy()
+    sw.set_topology([np.flatnonzero(~row).tolist() for row in lines])
+    sw.set_contingency_gens(~status["gen_status"].cpu().numpy())
+    sw.compute()
+    V_sw = np.asarray(sw.V_results.to_numpy()).reshape(V.shape)
+    np.testing.assert_array_equal(np.isfinite(V), np.isfinite(V_sw))
+    fin = np.isfinite(V)
+    np.testing.assert_allclose(V[fin], V_sw[fin], rtol=0., atol=1e-10)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_redistribute_slack_distributed_in_the_newton(init_from_n):
+    """redistribute_slack around a distributed-slack Newton: the free units take what a row
+    loses by the Newton's own weights, so that share moves nothing (its derivative is the
+    Newton slack's); a generator the share puts at its bound sits there whatever its set-point
+    -- no gen_p gradient -- and one already beyond it keeps its own"""
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    grid = _grid(distributed=True)
+    pf = _pf(grid, init_from_n, handle_disconnected_grid=True, redistribute_slack=True)
+    inputs, status = _redistribute_rows(grid)
+    cap = float(grid.get_gen_target_p()[0]) + 1.
+    V, grads = _grads(pf, inputs, **status)
+    res = pf.sweep.get_outer_results()
+    assert all(any("SHARE_LOST_P" in d for d in r.decisions) for r in res), [r.decisions for r in res]
+    assert torch.isfinite(V[[0, 1, 3]]).all()
+    for r in range(N_SCEN):
+        if inputs["gen_p"][r, 0] < cap:
+            assert 0 in res[r].gen_p_fixed, res[r].decisions
+            assert grads["gen_p"][r, 0] == pytest.approx(0., abs=1e-12)
+        else:
+            assert abs(grads["gen_p"][r, 0]) > 1e-4
+    assert grads["gen_p"][1, 2] == 0. and grads["gen_v"][1, 2] == 0.
+    _check_all(pf, inputs, grads, **status)
+
+
+def test_redistribute_slack_turned_off():
+    """turning redistribute_slack off hands the session nothing to share any more: the next
+    forward is the one of a model built without it"""
+    grid = _grid(distributed=True)
+    inputs, status = _redistribute_rows(grid)
+    tensors = {k: _t(v) for k, v in inputs.items()}
+    pf = _pf(grid, handle_disconnected_grid=True, redistribute_slack=True)
+    with torch.no_grad():
+        pf(**tensors, **status)
+        pf.redistribute_slack = False
+        V = pf(**tensors, **status).cpu().numpy()
+        V_ref = _pf(grid, handle_disconnected_grid=True)(**tensors, **status).cpu().numpy()
+    assert not any(any("SHARE_LOST_P" in d for d in r.decisions) for r in pf.sweep.get_outer_results())
+    fin = np.isfinite(V_ref)
+    np.testing.assert_allclose(V[fin], V_ref[fin], rtol=0., atol=1e-10)
 
 
 def test_tap_changer_settled_taps():

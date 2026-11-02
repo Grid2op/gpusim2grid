@@ -3,6 +3,9 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``BatchPowerFlow``: ``redistribute_slack`` with ``outer_loops=True``, the lost power measured in
+  torch and shared by the rows' ``DistributedSlack`` loop; a unit that share puts at a bound gets no ``gen_p``
+  gradient.
 - [ADDED] ``BatchPowerFlow.from_lsgrid(outer_loops=True)``: gradients through the outer loops, as lightsim2grid
   -- each row's last inner solve, its loops' decisions held; ``compute_flows`` at the taps they settled on.
 - [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares

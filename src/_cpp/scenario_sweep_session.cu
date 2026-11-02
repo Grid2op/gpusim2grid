@@ -675,6 +675,16 @@ void ScenarioSweepSession::set_external_slack_saturation(
     has_ext_sat_ = true;
 }
 
+void ScenarioSweepSession::set_external_lost_p(const std::vector<double>& lost_p_mw)
+{
+    if (!outer_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_external_lost_p: only with the outer loops (without them, "
+            "set_external_slack_saturation and the caller's own Sbus correction).");
+    ext_lost_p_mw_ = lost_p_mw;
+    has_ext_lost_  = true;
+}
+
 std::pair<std::vector<int>, std::vector<std::vector<int>>>
 ScenarioSweepSession::preview_row_masks(const std::vector<std::vector<int>>& branch_ids_per_row) const
 {
@@ -1514,13 +1524,23 @@ void ScenarioSweepSession::run()
     // redistribute_slack, the pre-pass of what each row loses -- recomputed on
     // every run, since it reads the injections (a hot change) as well as the
     // masks and generator mask of the live source.
-    if (redistribute_slack_ && has_ext_sat_)
+    if (redistribute_slack_ && (has_ext_sat_ || has_ext_lost_))
         throw std::runtime_error(
-            "ScenarioSweepSession: redistribute_slack and set_external_slack_saturation "
-            "are exclusive (the pre-pass runs here, or the caller ran it).");
+            "ScenarioSweepSession: redistribute_slack and set_external_slack_saturation / "
+            "set_external_lost_p are exclusive (the pre-pass runs here, or the caller ran it).");
     if (redistribute_slack_) {
         _check_redistribute_slack();
         slack_rows_ = _slack_prepass();
+    } else if (has_ext_lost_) {
+        if (!outer_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_external_lost_p is only for the outer loops.");
+        if (static_cast<int>(ext_lost_p_mw_.size()) != n_scenarios_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_external_lost_p()'s row count no longer matches "
+                "set_injections()'s n_scenarios.");
+        slack_rows_.clear();
+        row_lost_p_mw_ = ext_lost_p_mw_;
     } else if (has_ext_sat_) {
         if (static_cast<int>(ext_sat_units_.size()) != n_scenarios_)
             throw std::runtime_error(
