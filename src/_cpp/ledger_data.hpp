@@ -219,6 +219,21 @@ struct LedgerData {
     double               slack_absorbed_gt = 0.0;   // valid iff has_ext_state_ground_truth && slack_col>=0
     std::vector<double>  vc_q_gt;                    // size vc_n_controllers(); valid iff has_ext_state_ground_truth
     double               t_ground_truth_check_ms = 0.0;  // check_solution() wall time
+
+    // ---- lightsim2grid's ordering constraints (prototype) --------------------
+    // NRSystem::ordering_constraints() of the grid's solver, read by
+    // extract_ledger_data (BaseAlgo::get_ordering_constraints), flattened:
+    // constraint c's follow indices are ord_follow[ord_follow_ptr[c] ..
+    // ord_follow_ptr[c+1]), its leads likewise, ord_in_order[c] its flag. J
+    // indices of THIS ledger: valid as long as no index moved -- extensions that
+    // only append (add_switchable_vm_buses) or swap theta/P indices
+    // (move_reference) keep them; drop_multislack_augmentation clears them
+    // (ord_constraints_read = false). Used by ReorderingAlg::Ls2gConstrained, see
+    // docs/dev_notes/batched_lu_and_constrained_ordering.md.
+    bool                 ord_constraints_read = false;
+    std::vector<int>     ord_follow_ptr, ord_follow, ord_lead_ptr, ord_lead;
+    std::vector<char>    ord_in_order;
+    int  ord_n_constraints() const { return static_cast<int>(ord_in_order.size()); }
 };
 
 #endif  // LEDGER_DATA_HPP

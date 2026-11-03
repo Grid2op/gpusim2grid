@@ -69,6 +69,7 @@
 #define CUDSS_BATCH_SOLVER_CUH
 
 #include <chrono>
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +97,11 @@ struct CudssFactorStats {
     long long mem_device_peak        = -1;  //                            [1]
     long long mem_host_permanent     = -1;  //                            [2]
     long long mem_host_peak          = -1;  //                            [3]
+    // prototype (docs/dev_notes/batched_lu_and_constrained_ordering.md)
+    int       user_perm_honoured     = -1;  // PERM_REORDER_ROW/COL == the user perm (1/0), -1 none
+    long long npivots_total          = -1;  // CUDSS_DATA_NPIVOTS summed (GPUSIM2GRID_COUNT_PIVOTS)
+    long long npivots_max            = -1;
+    long long npivots_reads          = 0;
 };
 
 inline const char* cudss_batch_mode_name(CudssBatchMode m)
@@ -157,6 +163,9 @@ struct CudssBatchSolver {
 
     // Deferred / per-chunk ANALYSIS bookkeeping (see the file header).
     bool   analysis_pending_          = false;
+    std::vector<int> user_perm_;               // prototype: CUDSS_DATA_USER_PERM handed over
+    bool   count_pivots_              = false; // GPUSIM2GRID_COUNT_PIVOTS
+    int    npivots_entries_           = -1;    // entries NPIVOTS returned (diagnostic)
     bool   factorized_since_analysis_ = false;
     int    n_analysis_                = 0;
     double t_analysis_total_ms_       = 0.;
@@ -222,7 +231,8 @@ struct CudssBatchSolver {
                     ReorderingAlg   reordering_alg = ReorderingAlg::Default,
                     MatchingAlg     matching_alg = MatchingAlg::None,
                     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
-                    int             ir_n_steps = 0)
+                    int             ir_n_steps = 0,
+                    const std::vector<int>* user_perm = nullptr)
     {
         auto chk = [](cudssStatus_t s, const char* msg) {
             if (s != CUDSS_STATUS_SUCCESS)
@@ -336,6 +346,16 @@ struct CudssBatchSolver {
         dss_.set_matching_alg(matching_alg);
         dss_.set_pivot_epsilon_alg(pivot_epsilon_alg);
         dss_.set_ir_n_steps(ir_n_steps);
+        user_perm_.clear();
+        if (user_perm && !user_perm->empty()) {
+            if (static_cast<int>(user_perm->size()) != dim_J || mode_ != CudssBatchMode::Uniform)
+                throw std::runtime_error(
+                    "[CudssBatchSolver::initialize] a user permutation needs the uniform batch "
+                    "and dim_J entries");
+            user_perm_ = *user_perm;
+            dss_.set_user_perm(user_perm_);
+        }
+        count_pivots_ = cudss_env_flag("GPUSIM2GRID_COUNT_PIVOTS");
 
         if (mode_ == CudssBatchMode::Uniform) {
             dss_.analyze(dss_A_, dss_x_, dss_b_);
@@ -396,7 +416,52 @@ struct CudssBatchSolver {
             factor_stats_.mem_host_permanent   = static_cast<long long>(mem[2]);
             factor_stats_.mem_host_peak        = static_cast<long long>(mem[3]);
         }
+        if (!user_perm_.empty()) {
+            std::vector<int> row(user_perm_.size(), -1), col(user_perm_.size(), -1);
+            const size_t bytes = row.size() * sizeof(int);
+            const bool ok =
+                cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_PERM_REORDER_ROW,
+                             row.data(), bytes, &written) == CUDSS_STATUS_SUCCESS
+                && cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_PERM_REORDER_COL,
+                                col.data(), bytes, &written) == CUDSS_STATUS_SUCCESS;
+            factor_stats_.user_perm_honoured = (ok && row == user_perm_ && col == user_perm_) ? 1 : 0;
+        }
     }
+
+    // GPUSIM2GRID_COUNT_PIVOTS: CUDSS_DATA_NPIVOTS after a factorization (host
+    // sync). Its size in a uniform batch is read off `written` (one count per
+    // matrix, or a single one): every entry returned is summed.
+    void _count_pivots()
+    {
+        if (!count_pivots_) return;
+        cudaStreamSynchronize(cs_);
+        std::vector<int> np(static_cast<size_t>(std::max(1, ubatch_)), 0);
+        size_t written = 0;
+        // one count per matrix, else a single one (what cuDSS accepts is read off its status)
+        cudssStatus_t st = cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_NPIVOTS, np.data(),
+                                        np.size() * sizeof(int), &written);
+        if (st != CUDSS_STATUS_SUCCESS)
+            st = cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_NPIVOTS, np.data(),
+                              sizeof(int), &written);
+        if (st != CUDSS_STATUS_SUCCESS) {
+            static bool warned = false;
+            if (!warned) {
+                std::fprintf(stderr, "[CudssBatchSolver] CUDSS_DATA_NPIVOTS query failed: status=%d\n",
+                             static_cast<int>(st));
+                warned = true;
+            }
+            return;
+        }
+        const size_t n = std::min(np.size(), written / sizeof(int));
+        long long sum = 0;
+        for (size_t i = 0; i < n; ++i) sum += np[i];
+        if (factor_stats_.npivots_total < 0) { factor_stats_.npivots_total = 0; factor_stats_.npivots_max = 0; }
+        factor_stats_.npivots_total += sum;
+        factor_stats_.npivots_max = std::max(factor_stats_.npivots_max, sum);
+        ++factor_stats_.npivots_reads;
+        npivots_entries_ = static_cast<int>(n);
+    }
+    int npivots_entries() const { return npivots_entries_; }
 
     const CudssFactorStats& factor_stats() const { return factor_stats_; }
 
@@ -466,6 +531,7 @@ struct CudssBatchSolver {
         prepare_factorization();
         dss_.factorize(dss_A_, dss_x_, dss_b_);
         factorized_since_analysis_ = true;
+        _count_pivots();
     }
     void refactor()
     {
@@ -475,6 +541,7 @@ struct CudssBatchSolver {
         else
             dss_.factorize(dss_A_, dss_x_, dss_b_);
         factorized_since_analysis_ = true;
+        _count_pivots();
     }
     void solve()    { dss_.solve      (dss_A_, dss_x_, dss_b_); }
     // CUDSS_CONFIG_IR_N_STEPS for the next solves (read at SOLVE, no new ANALYSIS)

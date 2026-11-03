@@ -957,6 +957,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Number of J^T REFACTORIZATION calls over the driver's life")
         .def_readonly("adjoint_n_solve", &BatchTimings::adjoint_n_solve,
                       "Number of J^T SOLVE calls over the driver's life")
+        .def_readonly("cudss_user_perm_honoured", &BatchTimings::cudss_user_perm_honoured,
+                      "Prototype: 1 if cuDSS's reordering equals the user permutation "
+                      "(reordering_alg='ls2g_constrained'), 0 if not, -1 without one")
+        .def_readonly("cudss_npivots_total", &BatchTimings::cudss_npivots_total,
+                      "Prototype: CUDSS_DATA_NPIVOTS summed over the forward factorizations "
+                      "(GPUSIM2GRID_COUNT_PIVOTS set; -1 otherwise)")
+        .def_readonly("cudss_npivots_max", &BatchTimings::cudss_npivots_max,
+                      "Prototype: the largest CUDSS_DATA_NPIVOTS of one factorization (-1 if not counted)")
+        .def_readonly("cudss_npivots_reads", &BatchTimings::cudss_npivots_reads,
+                      "Prototype: factorizations whose CUDSS_DATA_NPIVOTS was read")
         .def_readonly("cudss_lu_nnz", &BatchTimings::cudss_lu_nnz,
                       "cuDSS CUDSS_DATA_LU_NNZ after the forward solver's last ANALYSIS "
                       "(non-zeros of the L+U factors of ONE system, i.e. the fill-in; -1 = not "
@@ -1179,7 +1189,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .value("NestedDissection", ReorderingAlg::NestedDissection,
              "Nested dissection.")
       .value("NoReordering", ReorderingAlg::None,
-             "Natural (identity) ordering — no reordering applied.");
+             "Natural (identity) ordering — no reordering applied.")
+      .value("Ls2gConstrained", ReorderingAlg::Ls2gConstrained,
+             "Prototype: lightsim2grid's constrained order of the batch Jacobian "
+             "(AMD post-moved by the grid's OrderingConstraints), given to cuDSS as "
+             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid (bridge).")
+      .value("Ls2gConstrainedNd", ReorderingAlg::Ls2gConstrainedNd,
+             "Prototype: cuDSS's own (nested dissection) order of the batch Jacobian, "
+             "post-moved by the grid's OrderingConstraints, given to cuDSS as "
+             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid.");
 
   // -----------------------------------------------------------------
   // MatchingAlg enum — selects CUDSS_CONFIG_MATCHING_ALG ahead of

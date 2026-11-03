@@ -464,6 +464,19 @@ struct BatchTimings {
     long long cudss_mem_host_permanent_bytes   = -1;  // [2]
     long long cudss_mem_host_peak_bytes        = -1;  // [3]
 
+    // --- prototype (docs/dev_notes/batched_lu_and_constrained_ordering.md) ---
+    // Whether cuDSS's CUDSS_DATA_PERM_REORDER_ROW/COL after ANALYSIS equal the
+    // user permutation handed over (reordering_alg Ls2gConstrained): 1 yes,
+    // 0 no, -1 no user permutation.
+    int       cudss_user_perm_honoured         = -1;
+    // CUDSS_DATA_NPIVOTS (pivots cuDSS perturbed), read after every
+    // factorization of the forward batch when GPUSIM2GRID_COUNT_PIVOTS is set
+    // (host sync per factorization); -1 otherwise. Summed over the run, the
+    // largest single read, and the number of reads.
+    long long cudss_npivots_total              = -1;
+    long long cudss_npivots_max                = -1;
+    long long cudss_npivots_reads              = 0;
+
     // Total wall-clock time for all chunks (excludes one-time setup).
     double t_chunks_total_wall_ms() const {
         return (t_tile_V         + t_tile_Ybus      + t_patch_Ybus

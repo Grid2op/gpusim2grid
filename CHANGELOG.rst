@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
+  constrained order given to cuDSS. Removes its perturbed pivots but slows it 6-9x; see the dev note.
 - [ADDED] ``BatchPowerFlow``: ``redistribute_slack`` with ``outer_loops=True``, the lost power measured in
   torch and shared by the rows' ``DistributedSlack`` loop; a unit that share puts at a bound gets no ``gen_p``
   gradient.

@@ -24,7 +24,19 @@ enum class ReorderingAlg {
     Colamd,
     Amd,
     NestedDissection,
-    None
+    None,
+    // lightsim2grid's constrained order (prototype, docs/dev_notes/
+    // batched_lu_and_constrained_ordering.md): an AMD order of the final J
+    // skeleton post-moved by the grid's own OrderingConstraints
+    // (ls2g::constrained_order), handed to cuDSS as CUDSS_DATA_USER_PERM.
+    // Needs the lightsim2grid bridge; the batch solvers only (the single-system
+    // base case keeps cuDSS's default).
+    Ls2gConstrained,
+    // The same constraints post-moving cuDSS's OWN order of that skeleton (its
+    // default, nested dissection, read back from a throwaway ANALYSIS) instead
+    // of AMD: AMD's tree has too little parallelism for cuDSS (8.7x slower
+    // Newton rounds on a French snapshot, see the dev note).
+    Ls2gConstrainedNd
 };
 
 #endif  // REORDERING_ALG_HPP

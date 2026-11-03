@@ -292,7 +292,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         reordering_alg,
         matching_alg,
         pivot_epsilon_alg,
-        ir_n_steps);
+        ir_n_steps,
+        base.user_perm_or_null());  // prototype: ReorderingAlg::Ls2gConstrained
 
     std::visit([&](auto& policy) {
         policy.initialize_from_base(
@@ -1328,6 +1329,10 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.cudss_mem_device_peak_bytes      = fs.mem_device_peak;
     t.cudss_mem_host_permanent_bytes   = fs.mem_host_permanent;
     t.cudss_mem_host_peak_bytes        = fs.mem_host_peak;
+    t.cudss_user_perm_honoured         = fs.user_perm_honoured;
+    t.cudss_npivots_total              = fs.npivots_total;
+    t.cudss_npivots_max                = fs.npivots_max;
+    t.cudss_npivots_reads              = fs.npivots_reads;
 
     cs.synchronize();
 
@@ -2395,7 +2400,8 @@ TailSolve BatchPfDriver<BatchSource>::_tail_solve(int n_groups)
             thrust::raw_pointer_cast(d_J_values_batch.data()),
             thrust::raw_pointer_cast(d_F_batch.data()),
             thrust::raw_pointer_cast(d_dx_batch.data()),
-            cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_);
+            cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_,
+            base.user_perm_or_null());
         tail_solver_G_ = G;
     }
     TailSolve ts;
@@ -3177,7 +3183,8 @@ void BatchPfDriver<BatchSource>::_prepare_adjoint()
         thrust::raw_pointer_cast(A.d_JT_values.data()),
         thrust::raw_pointer_cast(A.d_rhs.data()),
         thrust::raw_pointer_cast(A.d_sol.data()),
-        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_);
+        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_,
+        base.user_perm_or_null());  // symmetric: valid for J^T too
     A.n_analysis = 1;
     cs.synchronize();
     A.t_build_ms = bpf_ms_since(t_build_start);

@@ -70,6 +70,9 @@ _REORDERING_ALG_MAP = {
     'amd':               _ReorderingAlg.Amd,
     'nested_dissection': _ReorderingAlg.NestedDissection,
     'none':              _ReorderingAlg.NoReordering,
+    # prototype, docs/dev_notes/batched_lu_and_constrained_ordering.md
+    'ls2g_constrained':  _ReorderingAlg.Ls2gConstrained,
+    'ls2g_constrained_nd': _ReorderingAlg.Ls2gConstrainedNd,
 }
 
 

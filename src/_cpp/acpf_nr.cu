@@ -41,6 +41,7 @@
 // See acpf_nr_state.cuh for the full class declaration and design notes.
 // =============================================================================
 
+#include "user_ordering.hpp"   // prototype: ls2g_constrained_perm
 #include "acpf_nr_state.cuh"
 #include "acpf_nr.hpp"
 #include "acpf_nr_kernels.cuh"
@@ -662,6 +663,10 @@ AcPfNrState::AcPfNrState(
     std::vector<int> theta_buses, theta_cols, vm_buses, vm_cols;
 
     if (ledger == nullptr) {
+        if (reordering_alg_ == ReorderingAlg::Ls2gConstrained
+            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd)
+            throw std::runtime_error("reordering_alg 'ls2g_constrained[_nd]' needs a lightsim2grid "
+                                     "grid (its ordering constraints), not array mode");
         build_J_structure(J_outer_h, J_inner_h,
                           h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                           Ybus_rm, pvpq_host, pq_in);
@@ -681,6 +686,8 @@ AcPfNrState::AcPfNrState(
         J_outer_h = ledger->J_outer;
         J_inner_h = ledger->J_inner;
         nnz_J     = static_cast<int>(J_inner_h.size());
+        if (reordering_alg_ == ReorderingAlg::Ls2gConstrained)
+            h_user_perm = ls2g_constrained_perm(*ledger);   // prototype, throws if unavailable
         build_scatter_maps_aug(h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                                J_outer_h, J_inner_h, Ybus_rm,
                                ledger->p_row_of_bus, ledger->q_row_of_bus,
@@ -1346,6 +1353,16 @@ AcPfNrState::AcPfNrState(
     // Jacobian skeleton (H→D) — augmented or trivial, both in J_outer_h/J_inner_h
     upload_h2d(d_J_outer, J_outer_h.data(), dim_J + 1, cs);
     upload_h2d(d_J_inner, J_inner_h.data(), nnz_J,     cs);
+    // prototype: cuDSS's own order of this skeleton, post-moved by lightsim2grid's
+    // constraints (ReorderingAlg::Ls2gConstrainedNd)
+    // (GPUSIM2GRID_ND_NO_POSTMOVE, diagnostic: hand cuDSS its own order back unchanged)
+    if (reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd && ledger != nullptr) {
+        std::vector<int> nd = cudss_reorder_perm(dim_J, nnz_J, thrust::raw_pointer_cast(d_J_outer.data()),
+                                                 thrust::raw_pointer_cast(d_J_inner.data()), cs,
+                                                 ReorderingAlg::Default);
+        const char* raw = std::getenv("GPUSIM2GRID_ND_NO_POSTMOVE");
+        h_user_perm = (raw && raw[0] && raw[0] != '0') ? nd : apply_ordering_constraints(std::move(nd), *ledger);
+    }
     d_J_values.resize(nnz_J);  zero_d(d_J_values, cs);
 
     timings.t_upload_ms = ms_since(t_upload_start);
