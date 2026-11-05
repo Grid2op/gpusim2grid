@@ -3,6 +3,9 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] (experimental) ``GPUSIM2GRID_OWN_LU=1``: a batched LU of our own replaces cuDSS's factorization and
+  solve in every batch solve; with ``reordering_alg='ls2g_constrained'``, no pivot to perturb. See the dev note.
+- [ADDED] (diagnostic) ``GPUSIM2GRID_DUMP_J=<dir>``: every batch solver dumps its Jacobians and orders.
 - [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
   constrained order given to cuDSS. Removes its perturbed pivots but slows it 6-9x; see the dev note.
 - [ADDED] ``BatchPowerFlow``: ``redistribute_slack`` with ``outer_loops=True``, the lost power measured in

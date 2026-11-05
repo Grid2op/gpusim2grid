@@ -214,3 +214,71 @@ agreeing with the GPU to 1.8e-12.
   Jacobians: the 246 956 above includes cuDSS's user-permutation penalty, not the order's own fill.
 - Find a case with perturbation trouble first (a grid with shared groups or the transformer loops, and
   the `ir_n_steps=0` divergence): without one, the ordering has nothing to fix on the GPU.
+
+## 6. A third LU: gpu-security-analysis' (2026-11-05), and the go / no-go
+
+A colleague's batched LU (github.com/RTE-AssistFlux/gpu-security-analysis, private, `engine/lu.py`,
+`engine/kernels/lu.cu`, its `docs/own_lu.md`) differs from olf-gpu's on the point that matters here: it
+**computes its own symbolic factorization for any order it is given** (Cholesky fill of the symmetrized
+permuted pattern, level schedules, CPU, once per pattern), instead of borrowing cuDSS's. Same engine
+otherwise: left-looking, one item per LU entry in pivot order, values interleaved by matrix, static
+diagonal pivots with a relative clamp, no fallback, plus "split" kernels sharing the long contribution
+chains of the narrow levels near the root over up to 32 warps (their largest gain). Measured there:
+France, batch 2048, Blackwell: refactorization 13.9 vs 94 ms, solve 5.35 vs 47.3 ms against cuDSS 1.0.0;
+MMD beats cuDSS's own order in it (fewer contributions despite more levels).
+
+### Go / no-go on our Jacobians
+
+`GPUSIM2GRID_DUMP_J` (section 7) on the snapshot of section 5 (300 N-1, outer loops, batch 128): 896 batch
+Jacobians (dim 14 082, nnz 98 024) from every factorization of the run, their LU run as is (CuPy),
+the orders read back from cuDSS. Laptop RTX A1000, cuDSS 1.0.0: timings are ratios only.
+
+| order | LU nnz | levels | contributions | pivots < 1e-8·max\|A\| (no clamp) | max residual |
+|---|---|---|---|---|---|
+| ls2g_constrained | 150 664 | 180 | 597k | 0 (smallest 6.6e-8) | 6.7e-16 |
+| MMD | 152 040 | 180 | 633k | 2 688 = 3 exact zeros per matrix | NaN |
+| cuDSS default | 176 018 | 116 | 923k | 2 688, the same | NaN |
+| ls2g_constrained_nd | 246 956 | 187 | 2 254k | 889 (none < 1e-12) | 6.3e-16 |
+
+- The 384 pivots cuDSS perturbs per batch are these 3 exact, structural zeros per matrix.
+- Clamp 1e-12·max|A| + 2 refinement steps brings MMD / cuDSS's order to 6e-16; a clamp of 1e-5 clamps
+  genuine small pivots of the constrained order (6.6e-8) and stalls at 3e-6: keep it tiny.
+- cuDSS's own solve on these matrices: residual 3.5e-7 (its perturbed pivots), 3e-15 with `ir_n_steps=1`.
+- Refactorization + solve, ms (own LU with the constrained order / cuDSS uniform batch): S = 15: 5.0 /
+  15.7 (3.1x); S = 128: 16.1 / 130 (8.1x); S = 512: 56 / 525 (9.4x). The ND + post-move order is 2.6x
+  slower than AMD + post-move in this LU.
+
+Go: with lightsim2grid's constrained order the static-pivot engine needs no fallback on this case.
+
+On "refactorization": cuDSS's REFACTORIZATION costs as much as a FACTORIZATION in uniform batch (measured,
+user, 2026-11-05): it redoes its local-block pivot search every time, and still perturbs those 3 zeros. The
+own LU has a single numeric phase with a fixed pivot sequence, i.e. a static-pivot refactorization every
+time. A fallback, if a case needs one, belongs there: refactor() counts the pivots it clamps per lane
+(done), a flagged lane then gets a real factorization with pivoting (inside supernodes, which keeps the
+shared pattern) or a slow path for that iteration (not done).
+
+## 7. Implementation, first increment (branch `dev_customLU`)
+
+- `src/_cpp/own_lu/lu_plan.{hpp,cpp}`: the symbolic plan, CUDA-free, a line-by-line port of their
+  `LuPlan` (Liu's Cholesky rows, levels, left-looking items, level slices).
+- `src/_cpp/own_lu/batched_lu.{cuh,cu}`: their kernels templated on `real_t` (FP32 builds), the U steps
+  counting the pivots they clamp per matrix, iterative refinement (`r = b − A x` on the slot's CSR, solve,
+  add) for `ir_n_steps`.
+- `CudssBatchMode::OwnLu` (`GPUSIM2GRID_OWN_LU=1`, `GPUSIM2GRID_OWN_LU_EPS`, default 1e-12): cuDSS's
+  uniform ANALYSIS still runs, for its order only (PERM_REORDER_ROW, i.e. the constrained order with
+  `reordering_alg='ls2g_constrained'`); factor / refactor / solve / bind_slice go to the own LU, so the
+  forward, the continuous tail, the Jᵀ adjoint and `benchmark_cudss_batch_raw` all use it. The single-system
+  base case stays on cuDSS. `cudss_lu_nnz` reports the own LU's, `cudss_npivots_*` (with
+  `GPUSIM2GRID_COUNT_PIVOTS`) its clamped pivots. `cudss_mode_is_uniform` covers both for the checks.
+- `GPUSIM2GRID_DUMP_J=<dir>` (`GPUSIM2GRID_DUMP_J_MAX`, default 8): every batch solver writes its skeleton,
+  orders and the J values of its first factorizations (raw files), for probes like section 6.
+- Section 5's case with the own LU (`benchmarks/outer_loops.py`, `ir_n_steps=0`): statuses and outer
+  iterations identical to cuDSS, max |dV| against lightsim2grid 1.7e-12 with cuDSS's order (2 688 clamped)
+  and 1.8e-12 with the constrained one (0 clamped); Newton rounds 1 960 → 630 ms (laptop).
+- Tests: `tests/python/test_own_lu.py` (raw solve, CA chunked / continuous with tail, injection sweep,
+  outer loops with both orders and the clamp count, BatchPowerFlow gradient by central differences).
+
+Next: the order without cuDSS's ANALYSIS (lightsim2grid's `constrained_order` is already computed by
+`AcPfNrState`; AMD for the array mode); a facade option instead of the variable; Jacobian kernels writing
+the interleaved layout (the transposes); a lane map for the tail instead of `_compact_tail` groups; the
+adjoint reusing J's factors (Jᵀ = UᵀLᵀ) instead of a second factorization; timings on the RTX 6000.

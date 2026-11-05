@@ -125,7 +125,7 @@ inline void check_continuous_scheduling(ContingencySolverType strategy,
         throw std::invalid_argument(
             "scheduling='continuous' does not support strategy 'direct_refactor_every_n' "
             "(its period counts the batch's iterations, not a row's)");
-    if (cudss_batch_mode_from_env() != CudssBatchMode::Uniform)
+    if (!cudss_mode_is_uniform(cudss_batch_mode_from_env()))
         throw std::invalid_argument(
             "scheduling='continuous' needs cuDSS's uniform batch mode (unset "
             "GPUSIM2GRID_USE_BLOCKDIAG / GPUSIM2GRID_USE_BATCH_MODE)");

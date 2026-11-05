@@ -36,6 +36,16 @@
 //              BatchDn: a "non-uniform" batch of ubatch independent matrices
 //              that happen to share one skeleton (every row-pointer and
 //              column-index entry aliases the single-system arrays).
+//   OwnLu      GPUSIM2GRID_OWN_LU=1  the batched LU of our own (own_lu/,
+//              docs/dev_notes/batched_lu_and_constrained_ordering.md): cuDSS's
+//              uniform ANALYSIS is still run, for its elimination order only
+//              (PERM_REORDER_ROW: lightsim2grid's constrained order with
+//              reordering_alg='ls2g_constrained', cuDSS's own otherwise); the
+//              factorization (static diagonal pivots, tiny ones clamped and
+//              counted), the solve and the iterative refinement (ir_n_steps)
+//              are own_lu::BatchedLu's. GPUSIM2GRID_OWN_LU_EPS: the relative
+//              pivot clamp (default 1e-12). Behaves as Uniform otherwise
+//              (bind_slice, continuous scheduling, the tail).
 //
 // The two variables are read on every initialize(), so they take effect on
 // the next driver build (every run() for contingency analysis / injection
@@ -84,8 +94,18 @@
 
 #include "../../cuda_utils.h"  // CudssContext, CudssDescriptor
 #include "../../dtypes.hpp"     // cuda_real_type, CUDSS_R_TYPE
+#include "../../own_lu/batched_lu.cuh"
+#include "../../own_lu/lu_plan.hpp"
 
-enum class CudssBatchMode { Uniform, BlockDiag, NonUniform };
+enum class CudssBatchMode { Uniform, BlockDiag, NonUniform, OwnLu };
+
+// One ANALYSIS of the shared pattern for the whole batch (cuDSS's uniform
+// batch, or the own LU that borrows its order): what continuous scheduling,
+// bind_slice and a user permutation need.
+inline bool cudss_mode_is_uniform(CudssBatchMode m)
+{
+    return m == CudssBatchMode::Uniform || m == CudssBatchMode::OwnLu;
+}
 
 // What cuDSS reports about the factors after an ANALYSIS (cudssDataGet).
 // -1 = not queried yet, or not reported by this cuDSS build/mode. In Uniform
@@ -109,6 +129,7 @@ inline const char* cudss_batch_mode_name(CudssBatchMode m)
     switch (m) {
         case CudssBatchMode::BlockDiag:  return "block_diag";
         case CudssBatchMode::NonUniform: return "non_uniform";
+        case CudssBatchMode::OwnLu:      return "own_lu";
         default:                         return "uniform";
     }
 }
@@ -126,12 +147,14 @@ inline CudssBatchMode cudss_batch_mode_from_env()
 {
     const bool blockdiag = cudss_env_flag("GPUSIM2GRID_USE_BLOCKDIAG");
     const bool batch     = cudss_env_flag("GPUSIM2GRID_USE_BATCH_MODE");
-    if (blockdiag && batch)
+    const bool own       = cudss_env_flag("GPUSIM2GRID_OWN_LU");
+    if (int(blockdiag) + int(batch) + int(own) > 1)
         throw std::runtime_error(
-            "[CudssBatchSolver] GPUSIM2GRID_USE_BLOCKDIAG and "
-            "GPUSIM2GRID_USE_BATCH_MODE are mutually exclusive");
+            "[CudssBatchSolver] GPUSIM2GRID_USE_BLOCKDIAG, GPUSIM2GRID_USE_BATCH_MODE and "
+            "GPUSIM2GRID_OWN_LU are mutually exclusive");
     if (blockdiag) return CudssBatchMode::BlockDiag;
     if (batch)     return CudssBatchMode::NonUniform;
+    if (own)       return CudssBatchMode::OwnLu;
     return CudssBatchMode::Uniform;
 }
 
@@ -196,6 +219,23 @@ struct CudssBatchSolver {
 
     CudssFactorStats factor_stats_;
 
+    // OwnLu: the batched LU, the buffers it works on (rebound by bind_slice)
+    // and the refinement steps (CudssContext keeps its own copy for cuDSS).
+    own_lu::BatchedLu own_;
+    cuda_real_type* d_F_cur_  = nullptr;
+    cuda_real_type* d_dx_cur_ = nullptr;
+    int ir_n_steps_ = 0;
+
+    // GPUSIM2GRID_DUMP_J=<dir> (diagnostic, the batched-LU go/no-go of
+    // docs/dev_notes/batched_lu_and_constrained_ordering.md): every handle writes
+    // its skeleton, its permutations (user, and cuDSS's own after ANALYSIS) and the
+    // J values of its first GPUSIM2GRID_DUMP_J_MAX (default 8) factorizations, as
+    // raw little-endian files <dir>/h<k>_*.{i32,f64} + h<k>_meta.txt.
+    std::string dump_dir_;
+    int dump_id_ = -1, dump_count_ = 0, dump_max_ = 8;
+    int* d_J_outer_ = nullptr; int* d_J_inner_ = nullptr;
+    cuda_real_type* d_values_cur_ = nullptr;
+
     // =========================================================================
     // initialize()
     //
@@ -243,6 +283,8 @@ struct CudssBatchSolver {
 
         mode_   = cudss_batch_mode_from_env();
         cs_     = cs;
+        d_J_outer_ = d_J_outer; d_J_inner_ = d_J_inner; d_values_cur_ = d_J_values_batch;
+        d_F_cur_ = d_F_batch; d_dx_cur_ = d_dx_batch;
         ubatch_ = ubatch_size;
         dim_J_  = dim_J;
         nnz_J_  = nnz_J;
@@ -251,7 +293,7 @@ struct CudssBatchSolver {
         // Both alternatives address the whole batch with 32-bit indices
         // (block-diagonal offsets; cuDSS caps a non-uniform batch's aggregate
         // rows/non-zeros at INT_MAX).
-        if (mode_ != CudssBatchMode::Uniform
+        if (!cudss_mode_is_uniform(mode_)
             && (static_cast<long long>(ubatch_size) * nnz_J > INT_MAX
                 || static_cast<long long>(ubatch_size) * dim_J >= INT_MAX))
             throw std::runtime_error(
@@ -276,6 +318,7 @@ struct CudssBatchSolver {
 
         switch (mode_) {
         case CudssBatchMode::Uniform:
+        case CudssBatchMode::OwnLu:
             dss_A_.create_csr(dim_J, nnz_J, d_J_outer, d_J_inner, d_J_values_batch);
             dss_x_.create_dn(dim_J, d_dx_batch);
             dss_b_.create_dn(dim_J, d_F_batch);
@@ -346,9 +389,10 @@ struct CudssBatchSolver {
         dss_.set_matching_alg(matching_alg);
         dss_.set_pivot_epsilon_alg(pivot_epsilon_alg);
         dss_.set_ir_n_steps(ir_n_steps);
+        ir_n_steps_ = ir_n_steps;
         user_perm_.clear();
         if (user_perm && !user_perm->empty()) {
-            if (static_cast<int>(user_perm->size()) != dim_J || mode_ != CudssBatchMode::Uniform)
+            if (static_cast<int>(user_perm->size()) != dim_J || !cudss_mode_is_uniform(mode_))
                 throw std::runtime_error(
                     "[CudssBatchSolver::initialize] a user permutation needs the uniform batch "
                     "and dim_J entries");
@@ -357,9 +401,11 @@ struct CudssBatchSolver {
         }
         count_pivots_ = cudss_env_flag("GPUSIM2GRID_COUNT_PIVOTS");
 
-        if (mode_ == CudssBatchMode::Uniform) {
+        if (cudss_mode_is_uniform(mode_)) {
             dss_.analyze(dss_A_, dss_x_, dss_b_);
             n_analysis_ = 1;
+            if (mode_ == CudssBatchMode::OwnLu) _own_init();
+            _dump_init();
         } else {
             analysis_pending_ = true;
         }
@@ -372,7 +418,7 @@ struct CudssBatchSolver {
     // =========================================================================
     void begin_chunk()
     {
-        if (mode_ != CudssBatchMode::Uniform) analysis_pending_ = true;
+        if (!cudss_mode_is_uniform(mode_)) analysis_pending_ = true;
     }
 
     void prepare_factorization()
@@ -426,6 +472,8 @@ struct CudssBatchSolver {
                                 col.data(), bytes, &written) == CUDSS_STATUS_SUCCESS;
             factor_stats_.user_perm_honoured = (ok && row == user_perm_ && col == user_perm_) ? 1 : 0;
         }
+        if (mode_ == CudssBatchMode::OwnLu && own_.initialized())
+            factor_stats_.lu_nnz = own_.n_ent();
     }
 
     // GPUSIM2GRID_COUNT_PIVOTS: CUDSS_DATA_NPIVOTS after a factorization (host
@@ -434,6 +482,17 @@ struct CudssBatchSolver {
     void _count_pivots()
     {
         if (!count_pivots_) return;
+        if (mode_ == CudssBatchMode::OwnLu) {   // the pivots the own LU clamped
+            const std::vector<int> c = own_.clamped_counts();
+            long long sum = 0;
+            for (int v : c) sum += v;
+            if (factor_stats_.npivots_total < 0) { factor_stats_.npivots_total = 0; factor_stats_.npivots_max = 0; }
+            factor_stats_.npivots_total += sum;
+            factor_stats_.npivots_max = std::max(factor_stats_.npivots_max, sum);
+            ++factor_stats_.npivots_reads;
+            npivots_entries_ = static_cast<int>(c.size());
+            return;
+        }
         cudaStreamSynchronize(cs_);
         std::vector<int> np(static_cast<size_t>(std::max(1, ubatch_)), 0);
         size_t written = 0;
@@ -481,6 +540,7 @@ struct CudssBatchSolver {
     // =========================================================================
     void set_values(cuda_real_type* d_J_values_batch)
     {
+        d_values_cur_ = d_J_values_batch;
         if (mode_ != CudssBatchMode::NonUniform) {
             dss_A_.set_values(d_J_values_batch);
             return;
@@ -504,8 +564,11 @@ struct CudssBatchSolver {
     // =========================================================================
     void bind_slice(cuda_real_type* d_J_values, cuda_real_type* d_F, cuda_real_type* d_dx)
     {
-        if (mode_ != CudssBatchMode::Uniform)
+        if (!cudss_mode_is_uniform(mode_))
             throw std::runtime_error("[CudssBatchSolver::bind_slice] uniform batch mode only");
+        d_values_cur_ = d_J_values;
+        d_F_cur_ = d_F;
+        d_dx_cur_ = d_dx;
         dss_A_.set_values(d_J_values);
         dss_x_.set_values(d_dx);
         dss_b_.set_values(d_F);
@@ -529,23 +592,33 @@ struct CudssBatchSolver {
     void factor()
     {
         prepare_factorization();
-        dss_.factorize(dss_A_, dss_x_, dss_b_);
+        _dump_values();
+        if (mode_ == CudssBatchMode::OwnLu) own_.factorize(d_values_cur_);
+        else dss_.factorize(dss_A_, dss_x_, dss_b_);
         factorized_since_analysis_ = true;
         _count_pivots();
     }
     void refactor()
     {
         prepare_factorization();
-        if (factorized_since_analysis_)
+        _dump_values();
+        if (mode_ == CudssBatchMode::OwnLu)
+            own_.factorize(d_values_cur_);   // no pivot sequence to keep: one numeric phase
+        else if (factorized_since_analysis_)
             dss_.refactorize(dss_A_, dss_x_, dss_b_);
         else
             dss_.factorize(dss_A_, dss_x_, dss_b_);
         factorized_since_analysis_ = true;
         _count_pivots();
     }
-    void solve()    { dss_.solve      (dss_A_, dss_x_, dss_b_); }
+    void solve()
+    {
+        if (mode_ != CudssBatchMode::OwnLu) { dss_.solve(dss_A_, dss_x_, dss_b_); return; }
+        own_.solve(d_F_cur_, d_dx_cur_);
+        own_.refine(d_values_cur_, d_J_outer_, d_J_inner_, d_F_cur_, d_dx_cur_, ir_n_steps_);
+    }
     // CUDSS_CONFIG_IR_N_STEPS for the next solves (read at SOLVE, no new ANALYSIS)
-    void set_ir_n_steps(int n) { dss_.set_ir_n_steps(n); }
+    void set_ir_n_steps(int n) { dss_.set_ir_n_steps(n); ir_n_steps_ = n; }
 
     // Non-copyable, non-movable (cuDSS descriptors hold raw device pointers).
     CudssBatchSolver() = default;
@@ -555,6 +628,79 @@ struct CudssBatchSolver {
     CudssBatchSolver& operator=(CudssBatchSolver&&)      = delete;
 
 private:
+    // OwnLu: the elimination order cuDSS's ANALYSIS chose (or was handed),
+    // read back, and the plan built on it. Host-synchronizes the stream.
+    void _own_init()
+    {
+        cudaStreamSynchronize(cs_);
+        std::vector<int> row(dim_J_, -1), col(dim_J_, -1);
+        size_t written = 0;
+        const size_t bytes = row.size() * sizeof(int);
+        if (cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_PERM_REORDER_ROW, row.data(), bytes, &written)
+                != CUDSS_STATUS_SUCCESS
+            || cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_PERM_REORDER_COL, col.data(), bytes, &written)
+                != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error("[CudssBatchSolver] GPUSIM2GRID_OWN_LU: cannot read cuDSS's reordering");
+        if (row != col)
+            throw std::runtime_error(
+                "[CudssBatchSolver] GPUSIM2GRID_OWN_LU needs a symmetric order (row and column "
+                "permutations of cuDSS's ANALYSIS differ: matching on?)");
+        std::vector<int> ip(dim_J_ + 1), ix(nnz_J_);
+        cudaMemcpy(ip.data(), d_J_outer_, ip.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(ix.data(), d_J_inner_, ix.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        double eps = 1e-12;
+        if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_EPS")) eps = std::atof(e);
+        own_.init(own_lu::build_lu_plan(dim_J_, ip, ix, row), ubatch_, cs_, eps);
+    }
+
+    template <class T>
+    void _dump_raw(const std::string& name, const T* h, size_t n) const
+    {
+        FILE* f = std::fopen((dump_dir_ + "/h" + std::to_string(dump_id_) + "_" + name).c_str(), "wb");
+        if (!f) return;
+        std::fwrite(h, sizeof(T), n, f);
+        std::fclose(f);
+    }
+
+    void _dump_init()
+    {
+        const char* d = std::getenv("GPUSIM2GRID_DUMP_J");
+        if (!d || !*d) return;
+        static int next_id = 0;
+        dump_dir_ = d;
+        dump_id_  = next_id++;
+        if (const char* m = std::getenv("GPUSIM2GRID_DUMP_J_MAX")) dump_max_ = std::atoi(m);
+        cudaStreamSynchronize(cs_);
+        std::vector<int> ip(dim_J_ + 1), ix(nnz_J_);
+        cudaMemcpy(ip.data(), d_J_outer_, ip.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(ix.data(), d_J_inner_, ix.size() * sizeof(int), cudaMemcpyDeviceToHost);
+        _dump_raw("indptr.i32", ip.data(), ip.size());
+        _dump_raw("indices.i32", ix.data(), ix.size());
+        if (!user_perm_.empty()) _dump_raw("perm_user.i32", user_perm_.data(), user_perm_.size());
+        std::vector<int> row(dim_J_, -1);
+        size_t written = 0;
+        if (cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_PERM_REORDER_ROW, row.data(),
+                         row.size() * sizeof(int), &written) == CUDSS_STATUS_SUCCESS)
+            _dump_raw("perm_cudss.i32", row.data(), row.size());
+        int64_t lu_nnz = -1;
+        cudssDataGet(dss_.handle, dss_.data, CUDSS_DATA_LU_NNZ, &lu_nnz, sizeof(lu_nnz), &written);
+        FILE* f = std::fopen((dump_dir_ + "/h" + std::to_string(dump_id_) + "_meta.txt").c_str(), "w");
+        if (f) {
+            std::fprintf(f, "dim %d\nnnz %d\nubatch %d\nlu_nnz %lld\nreal_bytes %d\n", dim_J_, nnz_J_,
+                         ubatch_, static_cast<long long>(lu_nnz), static_cast<int>(sizeof(cuda_real_type)));
+            std::fclose(f);
+        }
+    }
+
+    void _dump_values()
+    {
+        if (dump_id_ < 0 || dump_count_ >= dump_max_ || !d_values_cur_) return;
+        cudaStreamSynchronize(cs_);
+        std::vector<cuda_real_type> h(static_cast<size_t>(ubatch_) * nnz_J_);
+        cudaMemcpy(h.data(), d_values_cur_, h.size() * sizeof(cuda_real_type), cudaMemcpyDeviceToHost);
+        _dump_raw("vals_" + std::to_string(dump_count_++) + ".f64", h.data(), h.size());
+    }
+
     static const void* const* raw_ptrs(thrust::device_vector<void*>& v)
     {
         return static_cast<const void* const*>(
@@ -573,7 +719,7 @@ private:
     void announce_mode() const
     {
         if (mode_ == CudssBatchMode::Uniform) return;
-        static bool announced[3] = {false, false, false};
+        static bool announced[4] = {false, false, false, false};
         bool& done = announced[static_cast<int>(mode_)];
         if (done) return;
         done = true;
