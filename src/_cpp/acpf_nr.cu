@@ -665,8 +665,9 @@ AcPfNrState::AcPfNrState(
 
     if (ledger == nullptr) {
         if (reordering_alg_ == ReorderingAlg::Ls2gConstrained
-            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd)
-            throw std::runtime_error("reordering_alg 'ls2g_constrained[_nd]' needs a lightsim2grid "
+            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd
+            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedMinFill)
+            throw std::runtime_error("reordering_alg 'ls2g_constrained[_nd|_minfill]' needs a lightsim2grid "
                                      "grid (its ordering constraints), not array mode");
         build_J_structure(J_outer_h, J_inner_h,
                           h_map_j11, h_map_j12, h_map_j21, h_map_j22,
@@ -689,6 +690,8 @@ AcPfNrState::AcPfNrState(
         nnz_J     = static_cast<int>(J_inner_h.size());
         if (reordering_alg_ == ReorderingAlg::Ls2gConstrained)
             h_user_perm = ls2g_constrained_perm(*ledger);   // prototype, throws if unavailable
+        else if (reordering_alg_ == ReorderingAlg::Ls2gConstrainedMinFill)
+            h_user_perm = ls2g_constrained_perm(*ledger, Ls2gFillReducing::MinFill);
         build_scatter_maps_aug(h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                                J_outer_h, J_inner_h, Ybus_rm,
                                ledger->p_row_of_bus, ledger->q_row_of_bus,
@@ -1367,6 +1370,7 @@ AcPfNrState::AcPfNrState(
         h_ord_ledger->ord_lead_ptr   = ledger->ord_lead_ptr;
         h_ord_ledger->ord_lead       = ledger->ord_lead;
         h_ord_ledger->ord_in_order   = ledger->ord_in_order;
+        h_ord_ledger->ord_fill_reducing = ledger->ord_fill_reducing;
     }
     // prototype: cuDSS's own order of this skeleton, post-moved by lightsim2grid's
     // constraints (ReorderingAlg::Ls2gConstrainedNd)

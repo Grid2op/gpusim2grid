@@ -21,16 +21,23 @@
 
 struct LedgerData;
 
+// Which fill-reducing order lightsim2grid's constrained_order starts from
+// (its FillReducingOrdering): AMD or minimum fill (Tinney-Walker scheme 3).
+enum class Ls2gFillReducing : int { Amd = 0, MinFill = 1 };
+
 // perm[k] = the J index eliminated k-th (AMD's P, new -> old). False on failure.
 using ConstrainedOrderFn = bool (*)(int n, const int* row_ptr, const int* col_idx,
-                                    const LedgerData& ledger, std::vector<int>& perm);
+                                    const LedgerData& ledger, Ls2gFillReducing fill,
+                                    std::vector<int>& perm);
 
 // Null when gpusim2grid was built without the lightsim2grid bridge.
 ConstrainedOrderFn& constrained_order_hook();
 
 // The order for this ledger's J skeleton, or throws (no bridge, constraints not
-// read / invalidated, lightsim2grid failure).
+// read / invalidated, lightsim2grid failure). fill: the base order; by default
+// the one the grid's own Newton uses (LedgerData::ord_fill_reducing).
 std::vector<int> ls2g_constrained_perm(const LedgerData& ledger);
+std::vector<int> ls2g_constrained_perm(const LedgerData& ledger, Ls2gFillReducing fill);
 
 // The ledger's ordering constraints applied to a GIVEN base order (new -> old):
 // lightsim2grid's post-move (the second half of ls2g::constrained_order,

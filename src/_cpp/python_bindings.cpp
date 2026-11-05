@@ -1201,12 +1201,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
              "Natural (identity) ordering — no reordering applied.")
       .value("Ls2gConstrained", ReorderingAlg::Ls2gConstrained,
              "Prototype: lightsim2grid's constrained order of the batch Jacobian "
-             "(AMD post-moved by the grid's OrderingConstraints), given to cuDSS as "
+             "(the grid's fill-reducing order, AMD or MinFill, post-moved by its "
+             "OrderingConstraints), given to cuDSS as "
              "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid (bridge).")
       .value("Ls2gConstrainedNd", ReorderingAlg::Ls2gConstrainedNd,
              "Prototype: cuDSS's own (nested dissection) order of the batch Jacobian, "
              "post-moved by the grid's OrderingConstraints, given to cuDSS as "
-             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid.");
+             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid.")
+      .value("Ls2gConstrainedMinFill", ReorderingAlg::Ls2gConstrainedMinFill,
+             "Prototype: lightsim2grid's constrained order started from its minimum-fill "
+             "order (FillReducingOrdering.MinFill) whatever the grid's own setting; "
+             "Ls2gConstrained follows the grid's. Needs a lightsim2grid grid (bridge).");
 
   // -----------------------------------------------------------------
   // MatchingAlg enum — selects CUDSS_CONFIG_MATCHING_ALG ahead of

@@ -952,6 +952,11 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             ld.ord_in_order.push_back(c.in_order ? 1 : 0);
         }
         ld.ord_constraints_read = true;
+        // the fill-reducing order the grid's Newton starts from: bit 1 of its
+        // config's ordering flags (int_params[4], NRAlgo::_ordering_flags; an
+        // outer-loop algorithm forwards its inner Newton's config first)
+        const ls2g::AlgoConfig cfg = grid.get_algo().get_config();
+        ld.ord_fill_reducing = (cfg.int_params.size() > 4 && (cfg.int_params[4] & 2) != 0) ? 1 : 0;
     }
     return ld;
 }
@@ -1888,7 +1893,8 @@ make_is_outer_session_from_lsgrid(
 // (user_ordering.hpp). Installed when the module loads: the CUDA side only sees the hook.
 namespace {
 bool g2g_ls2g_constrained_order(int n, const int* row_ptr, const int* col_idx,
-                                const LedgerData& ledger, std::vector<int>& perm)
+                                const LedgerData& ledger, Ls2gFillReducing fill,
+                                std::vector<int>& perm)
 {
     ls2g::OrderingConstraints cons(static_cast<size_t>(ledger.ord_n_constraints()));
     for (int c = 0; c < ledger.ord_n_constraints(); ++c) {
@@ -1901,7 +1907,10 @@ bool g2g_ls2g_constrained_order(int n, const int* row_ptr, const int* col_idx,
     // J is CSR here, CSC in lightsim2grid: the order is computed on A + A^T,
     // which is the same pattern either way.
     return ls2g::constrained_order(n, row_ptr, col_idx, cons,
-                                   ls2g::FillReducingOrdering::AMD, perm);
+                                   fill == Ls2gFillReducing::MinFill
+                                       ? ls2g::FillReducingOrdering::MinFill
+                                       : ls2g::FillReducingOrdering::AMD,
+                                   perm);
 }
 struct InstallConstrainedOrderHook {
     InstallConstrainedOrderHook() { constrained_order_hook() = &g2g_ls2g_constrained_order; }

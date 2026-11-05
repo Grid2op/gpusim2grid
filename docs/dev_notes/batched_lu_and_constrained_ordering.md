@@ -396,3 +396,43 @@ the whole suite with `own_lu` forced on every engine (a local pytest plugin over
 726 passed at e2190ec, the failures all cuDSS-specific), the gradient tests (central differences),
 `benchmarks/outer_loops.py --linear_solver own_lu` against lightsim2grid (max |dV| ≤ 1.8e-12 on the
 French snapshot of section 5).
+
+
+## 10. AMD or minimum fill under the constraints (2026-11-05)
+
+lightsim2grid has two fill-reducing orders its constrained order can start from
+(`FillReducingOrdering`): AMD (default) and MinFill (Tinney-Walker scheme 3, a costlier analysis).
+The bridge used to ask for AMD unconditionally. Now:
+
+- `extract_ledger_data` reads the grid's choice (bit 1 of `get_algo().get_config().int_params[4]`,
+  forwarded by `OuterLoopAlgo` from its inner Newton) into `LedgerData::ord_fill_reducing`, and the hook
+  (`ConstrainedOrderFn`, `user_ordering.hpp`) takes the base order explicitly. `default` (own LU) and
+  `ls2g_constrained` (both solvers) follow the grid: the order lightsim2grid itself uses on that grid.
+- `reordering_alg='ls2g_constrained_minfill'` forces MinFill whatever the grid's setting.
+
+Pinned in `test_own_lu.py::test_constrained_order_follows_the_grids_fill_reducing_ordering` (pypowsybl's
+ieee118, whose two fills differ).
+
+### Measured (laptop RTX A1000, ratios only)
+
+French snapshot of section 5, 300 random N-1, outer loops, batch 256, `ir_n_steps=1`, 30 Newton rounds,
+second run of each config (`scratchpad/minfill_compare.py`, not committed). "linear" = first
+factorization + refactorizations + solves (wall).
+
+| solver / order | LU nnz | pivots clamped / perturbed | linear | Newton rounds |
+|---|---|---|---|---|
+| own LU, constraints on AMD (default) | 150 664 | 0 | 583 ms | 775 ms |
+| own LU, constraints on MinFill (grid set to MinFill, or `_minfill`) | 149 992 | 0 | 650 ms | 842 ms |
+| own LU, AMD without constraints | 150 516 | 3 210 | 576 ms | 772 ms |
+| cuDSS default (ND) | 176 018 | 3 210 | 2 367 ms | 2 561 ms |
+| cuDSS, constraints on AMD | 150 664 | 0 | 18 937 ms | 19 120 ms |
+| cuDSS, constraints on MinFill | 149 992 | 0 | 6 365 ms | 6 550 ms |
+
+Statuses and outer iteration counts are identical on every row; max |dV| between configs ≤ 1.9e-12.
+
+- MinFill saves 0.4 % of the fill but the own LU's linear phase is ~11 % slower with it. The
+  parallelism of the elimination is the most likely reason; unverified: the plan's level counts
+  (`LuPlan::factor_steps`) were not compared.
+- Its host analysis costs ~75 ms more than AMD's on that J (cold driver build, once).
+- cuDSS gains 3x from MinFill over AMD but stays ~2.7x slower than with its own ND order.
+- The own LU's default stays AMD-based unless the grid asks for MinFill. To re-check on the RTX 6000.

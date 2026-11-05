@@ -5,6 +5,8 @@ Change Log
 --------------------
 - [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU
   of our own instead of cuDSS, ordered on the host (lightsim2grid's constrained order by default): no pivot to perturb.
+- [ADDED] lightsim2grid's constrained order now starts from the grid's own fill-reducing order (AMD or
+  ``MinFill``); ``reordering_alg='ls2g_constrained_minfill'`` forces minimum fill.
 - [ADDED] (diagnostic) ``GPUSIM2GRID_DUMP_J=<dir>``: every batch solver dumps its Jacobians and orders.
 - [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
   constrained order given to cuDSS. Removes its perturbed pivots but slows it 6-9x; see the dev note.

@@ -233,6 +233,51 @@ def test_outer_loops_orders(dummy, monkeypatch, solver_atol):
     assert t["amd"].cudss_npivots_total > 0
 
 
+def _ieee118_outer(min_fill):
+    """pypowsybl's ieee118 on NROuter_KLU (it declares ordering constraints),
+    its Newton set to lightsim2grid's minimum-fill order or not, solved. AMD
+    and MinFill give it different fills."""
+    pp = pytest.importorskip("pypowsybl")
+    from lightsim2grid.network.from_pypowsybl import init as init_from_pypowsybl
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pypowsybl(pp.network.create_ieee118(), sort_index=False, buses_for_sub=False)
+    grid.change_algorithm("NROuter_KLU")
+    if min_fill:
+        cfg = grid.get_ac_algo_config()
+        ip = list(cfg.int_params)
+        ip[4] |= 2   # bit 1 of the ordering flags: FillReducingOrdering.MinFill
+        cfg.int_params = ip
+        grid.set_ac_algo_config(cfg)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), 30, 1e-6).size
+    return grid
+
+
+@pytest.mark.parametrize("min_fill", [False, True], ids=["grid_amd", "grid_minfill"])
+def test_constrained_order_follows_the_grids_fill_reducing_ordering(min_fill, monkeypatch, solver_atol):
+    """'default' / 'ls2g_constrained' start lightsim2grid's constrained order
+    from the fill-reducing order the grid's own Newton uses;
+    'ls2g_constrained_minfill' forces minimum fill. Read through the LU fill,
+    which differs between the two on this grid; nothing clamped, same V."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    monkeypatch.setenv("GPUSIM2GRID_COUNT_PIVOTS", "1")
+    grid = _ieee118_outer(min_fill)
+    sn = grid.get_sn_mva()
+    t, V = {}, {}
+    for alg in ("default", "ls2g_constrained", "ls2g_constrained_minfill"):
+        ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=30, tol=1e-6 / sn,
+                                    reordering_alg=alg, linear_solver="own_lu")
+        ca.add_contingencies_by_branch_id([[0], [1], [2]])
+        ca.compute(batch_size=3)
+        assert (np.asarray(ca.get_row_status()) == CONVERGED).all(), alg
+        t[alg], V[alg] = ca.timings, ca.V_results.to_numpy()
+        assert t[alg].cudss_npivots_total == 0, alg
+        np.testing.assert_allclose(V[alg], V["default"], atol=solver_atol, rtol=0, err_msg=alg)
+    assert t["default"].cudss_lu_nnz == t["ls2g_constrained"].cudss_lu_nnz
+    same = t["default"].cudss_lu_nnz == t["ls2g_constrained_minfill"].cudss_lu_nnz
+    assert same == min_fill
+
+
 # =============================================================================
 # The adjoint (a second batch solver, over J^T)
 # =============================================================================

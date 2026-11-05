@@ -181,9 +181,11 @@ class SchedulingEngineMixin:
           pivots: its elimination order is chosen on the host from
           :attr:`reordering_alg` -- ``'default'`` is lightsim2grid's constrained
           order when the grid declares ordering constraints (a row the outer
-          loops switch by value keeps a valid pivot), AMD otherwise; ``'amd'``,
-          ``'none'``, ``'ls2g_constrained'`` and ``'ls2g_constrained_nd'`` are
-          taken too. A pivot below ``1e-12 * max|J|`` is clamped (counted by
+          loops switch by value keeps a valid pivot), started from the grid's
+          own fill-reducing order (AMD or MinFill), AMD otherwise; ``'amd'``,
+          ``'none'``, ``'ls2g_constrained'`` (same as the default),
+          ``'ls2g_constrained_nd'`` and ``'ls2g_constrained_minfill'`` (MinFill
+          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` is clamped (counted by
           ``timings.cudss_npivots_*`` with ``GPUSIM2GRID_COUNT_PIVOTS=1``);
           ``ir_n_steps`` refines. ``matching_alg`` must stay ``'none'``.
 

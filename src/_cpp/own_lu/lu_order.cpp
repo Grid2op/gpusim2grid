@@ -23,7 +23,8 @@ std::vector<int> amd_order(int n, const std::vector<int>& indptr, const std::vec
     if (constrained_order_hook()) {   // lightsim2grid's AMD: its constrained order, no constraint
         LedgerData none;
         std::vector<int> perm;
-        if (constrained_order_hook()(n, indptr.data(), indices.data(), none, perm)
+        if (constrained_order_hook()(n, indptr.data(), indices.data(), none,
+                                     Ls2gFillReducing::Amd, perm)
             && static_cast<int>(perm.size()) == n)
             return perm;
     }
@@ -59,6 +60,7 @@ std::vector<int> choose_order(ReorderingAlg alg, int n, const std::vector<int>& 
     }
     case ReorderingAlg::Ls2gConstrained:
     case ReorderingAlg::Ls2gConstrainedNd:
+    case ReorderingAlg::Ls2gConstrainedMinFill:
         if (static_cast<int>(user_perm.size()) != n)
             throw std::invalid_argument("linear_solver='own_lu': no lightsim2grid order computed "
                                         "for this reordering_alg");
@@ -66,7 +68,7 @@ std::vector<int> choose_order(ReorderingAlg alg, int n, const std::vector<int>& 
     default:
         throw std::invalid_argument(
             "linear_solver='own_lu' takes reordering_alg 'default', 'amd', 'none', "
-            "'ls2g_constrained' or 'ls2g_constrained_nd' (it never pivots: a symmetric order "
+            "'ls2g_constrained', 'ls2g_constrained_nd' or 'ls2g_constrained_minfill' (it never pivots: a symmetric order "
             "computed on the host; cuDSS's 'nested_dissection' / 'colamd' / 'btf_colamd' are not)");
     }
 }
