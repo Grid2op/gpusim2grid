@@ -297,23 +297,102 @@ shared pattern) or a slow path for that iteration (not done).
   clamped; `amd` = 150 516 (cuDSS's AMD fill), 2 688 clamped. Statuses, outer iterations identical,
   max |dV| against lightsim2grid ≤ 1.8e-12; Newton rounds 1 952 (cuDSS) → 609 ms (laptop).
 
-### Item 3, the Jacobian written in the LU's layout: measured first, not done
+Writing J in the LU's own layout was measured and deferred: section 9.
 
-Their LU (CuPy) on our Jacobians (laptop A1000): the value transpose is 15–17 % of a factorization and
-the right-hand-side transposes 10–15 % of a solve at S ≥ 128 (6 % / 3 % at S = 15). But the tiled
-transpose already runs at copy bandwidth: a coalesced permuted copy (`dst[a_ent[p]·B + b] = src[p·B +
-b]`, what is left when J is written entry-major) costs exactly as much (111 GB/s both, S = 128 …
-1024). A copy has to stay as long as the factorization is in place and the refinement / the adjoint
-read J afterwards. So writing J entry-major gains nothing by itself; the gain needs both:
-
-1. J entry-major (`J[pos·S + slot]`) in the ~20 kernels that write it (`fill_J`, the feature, mask,
-   override, outer and BranchControl kernels, the adjoint gather, the DLPack export), their threads
-   remapped slot-fastest so that the writes stay coalesced, cuDSS keeping the slot-major layout;
-2. the factorization reading each item's A value straight from that buffer (an item per A entry of
-   the U part too) instead of a pre-copied one.
-
-At most the 15–17 % / 10–15 % above, for a refactor of every J writer.
-
-Next: the item above if worth it; a lane map for the tail instead of `_compact_tail` groups; the
+Next: section 9 if worth it; a lane map for the tail instead of `_compact_tail` groups; the
 adjoint reusing J's factors (Jᵀ = UᵀLᵀ) instead of a second factorization; the plan built faster
 (45 ms cold on the French J, in `t_analysis_ms`); timings on the RTX 6000.
+
+
+## 9. Deferred: the Jacobian written in the own LU's layout (pick up here)
+
+**Status (2026-11-05): measured, not implemented, on purpose.** Done alone it gains nothing; done
+fully it is a refactor of every kernel that writes J for at most ~15 % of the own LU's time. Worth
+it only if a profile on the target GPU (RTX 6000 / Blackwell) shows the own LU's layout changes as a
+real share of a Newton round.
+
+### What it would remove
+
+`own_lu::BatchedLu` (`src/_cpp/own_lu/batched_lu.cu`) works on factor values interleaved by matrix
+(`v[entry·S + slot]`) while the driver keeps J slot-major (`d_J_values_batch[slot·nnz_J + pos]`,
+the layout cuDSS's uniform batch requires). Every factorization starts with `lu_tr_in` (values,
+`nnz_J` columns through the `a_ent` map), every solve with `lu_tr_in` / `lu_tr_out` on the
+right-hand side and the solution (`dim_J` columns through `inv_order`); `refine()` adds one pair per
+step.
+
+### Measured (laptop RTX A1000, French J dim 14 082 / nnz 98 024 / LU nnz 150 664, their CuPy LU)
+
+| S | factorization | of which J transpose | solve | of which rhs in + out |
+|---|---|---|---|---|
+| 15 | 3.5 ms | 0.22 ms (6 %) | 2.7 ms | 0.08 ms (3 %) |
+| 128 | 12.1 ms | 1.81 ms (15 %) | 5.0 ms | 0.53 ms (11 %) |
+| 512 | 43.1 ms | 7.22 ms (17 %) | 14.5 ms | 2.07 ms (14 %) |
+| 1024 | 84.7 ms | 14.4 ms (17 %) | 27.9 ms | 4.15 ms (15 %) |
+
+And the decisive one: the tiled transpose already runs at copy bandwidth. A coalesced permuted copy
+`dst[a_ent[p]·S + s] = src[p·S + s]` -- all that would be left with J stored entry-major -- costs
+exactly the same (1.81 / 7.18 / 14.31 ms at S = 128 / 512 / 1024, 111-112 GB/s both).
+
+### Why a copy stays unless the factorization reads J directly
+
+The factorization is in place in its own buffer, and J is still needed afterwards: the refinement
+residual `r = b − J x` (`BatchedLu::refine`), the adjoint (`transpose_gather_values_kernel` builds Jᵀ
+from the forward's J), `keep_final_jacobian` / `j_values_dlpack()` / the J snapshots of
+`BatchPowerFlow`. So J cannot be factorized in place, and "J entry-major + a copy" only trades the
+transpose for an equally expensive copy.
+
+### The design that would pay
+
+1. **J entry-major when `linear_solver='own_lu'`** (`J[pos·S + slot]`), slot-major for cuDSS. Replace
+   every `slot·nnz_J + pos` by a stride pair (`pos·jp + slot·js`: cuDSS `(1, nnz_J)`, own LU
+   `(S, 1)`) carried in `NrIterBuffers` or the launch arguments, and remap each kernel's threads
+   slot-fastest so its writes stay coalesced (today most are row/entry-fastest within a slot).
+2. **The factorization reads A from that buffer at each item's start**, instead of from a
+   pre-copied `v`: `LU_START` takes `J[a_pos[item]·S + slot]` (−1 for a fill entry: start at 0).
+   Today a U entry of A with no contribution has no item (its value is the copied one): give every
+   A entry an item. J stays intact for the refinement and the adjoint.
+3. The right-hand side the same way only if `d_F` / `d_dx` are also made entry-major (every residual
+   and update kernel): the rhs transposes are ~1/4 of the J one, a later step.
+
+Expected gain: the J transpose (15-17 % of a factorization at S ≥ 128), minus whatever the remapped
+J kernels lose. Nothing on the solve without step 3.
+
+### What writes or reads J (inventory at e2190ec; re-check with `grep -rn "nnz_J\|d_J_values\|d_J\b" src/_cpp`)
+
+- Writers, `src/_cpp/acpf_nr_kernels.cu`: `fill_J_kernel` (dS scatter, `J_base = b·nnz_J`),
+  `fill_slack_feature_kernel`, `hvdc_fill_feature_kernel` (atomic adds), `apply_J_overrides_kernel`
+  (`jov` stream: stranded groups, pinned controllers), `apply_bus_mask_kernel` (identity rows);
+  the composites in `nr_iter_step.cuh` (`nr_fill_J_at_current_V`, `nr_feature_zero_J`: a memset,
+  layout-free, `nr_apply_J_masks`).
+- Writers, outer loops: `outer/outer_kernels.cu` `oc_pin_rows_kernel`, `vc_hold_fill_J_kernel`;
+  `outer/branch_control_kernels.cu` `bc_fill_J_kernel`, `ctl_group_fill_J_kernel`, `sc_fill_J_kernel`.
+- Readers / copiers: `contingency/batch_pf_driver.cu` (`transpose_gather_values_kernel` for the
+  adjoint, the J snapshot overlay of `_solve_JT_rebuilt`, `d_J_values_batch` in 9 places),
+  `contingency/strategies/policy_base_case_factors.cuh` (base J tiled per slot),
+  `dlpack_export.cu` (`j_values_dlpack()`, shape `[S, nnz_J]`), `CudssBatchSolver` (cuDSS needs
+  slot-major; the own LU's `lu_tr_in` and `refine()`), `contingency/driver.cuh` (`TailSolve`
+  slices `d_J + s0·nnz_J`: with entry-major J a tail group is no longer a contiguous slice -- the
+  tail would need the lane map of the own LU instead, which is on the list anyway).
+
+### How to measure again, with gpusim2grid's own LU
+
+```
+nsys profile -o own_lu --trace=cuda python benchmarks/outer_loops.py --network <snapshot> \
+    --n_ctg 300 --batch_size 128 --linear_solver own_lu --skip_cpu
+nsys stats --report cuda_gpu_kern_sum own_lu.nsys-rep
+```
+
+Compare `lu_tr_in` + `lu_tr_out` against `lu_left_u` / `lu_left_l` / `lu_left_split` / `lu_fwd*` /
+`lu_bwd*` and against the whole Newton round (`fill_J_kernel` & co.). The decision rule above holds
+if the `lu_tr_*` share is still ~15 % of the own LU and the own LU a large share of a round.
+
+### How to validate it if done
+
+Bit-identical results are not expected (the HVDC slopes are atomic adds, whose order follows the
+thread mapping), so compare to rounding:
+`tests/python/test_own_lu.py` (both solvers, same statuses / iterations / V to `solver_atol`),
+the whole suite with `own_lu` forced on every engine (a local pytest plugin overriding
+`SchedulingEngineMixin._init_scheduling` to set `self._s.linear_solver = LinearSolver.OwnLu`;
+726 passed at e2190ec, the failures all cuDSS-specific), the gradient tests (central differences),
+`benchmarks/outer_loops.py --linear_solver own_lu` against lightsim2grid (max |dV| ≤ 1.8e-12 on the
+French snapshot of section 5).
