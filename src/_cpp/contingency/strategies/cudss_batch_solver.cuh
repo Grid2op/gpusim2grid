@@ -48,7 +48,9 @@
 //              own_lu::BatchedLu's. matching_alg / pivot_epsilon_alg do not
 //              apply; GPUSIM2GRID_OWN_LU_EPS: the relative pivot clamp (default
 //              1e-12). Behaves as Uniform otherwise (bind_slice, continuous
-//              scheduling, the tail). Refused with the two variables above.
+//              scheduling); the continuous tail runs on its active prefix
+//              (set_active_count), not on a second handle. Refused with the
+//              two variables above.
 //
 // The two variables are read on every initialize(), so they take effect on
 // the next driver build (every run() for contingency analysis / injection
@@ -601,6 +603,23 @@ struct CudssBatchSolver {
         dss_x_.set_values(d_dx);
         dss_b_.set_values(d_F);
     }
+
+    // =========================================================================
+    // set_active_count() — OwnLu mode only: the next factor / refactor / solve
+    // work on the first n matrices of the bound buffers (1 <= n <= ubatch),
+    // the others' factors and solutions untouched (own_lu::BatchedLu::
+    // set_active). The continuous tail runs on it instead of a second handle
+    // (TailSolve). cuDSS has no equivalent that holds in 0.8.0
+    // (CUDSS_DATA_UBATCH_MASK, docs/dev_notes/cudss_ubatch_mask.md).
+    // =========================================================================
+    bool has_active_prefix() const { return mode_ == CudssBatchMode::OwnLu; }
+    void set_active_count(int n)
+    {
+        if (mode_ != CudssBatchMode::OwnLu)
+            throw std::runtime_error("[CudssBatchSolver::set_active_count] own LU only");
+        own_.set_active(n);
+    }
+    int active_count() const { return mode_ == CudssBatchMode::OwnLu ? own_.active() : ubatch_; }
 
     // =========================================================================
     // factor()   — CUDSS_PHASE_FACTORIZATION  (first numeric factorization)

@@ -4,7 +4,8 @@
 
 // own_lu/batched_lu.cu -- see batched_lu.cuh. The kernels are
 // gpu-security-analysis' engine/kernels/lu.cu, templated on the real type; the
-// U steps also count the pivots they clamp, and refine() is new.
+// U steps also count the pivots they clamp, every kernel runs on the active
+// prefix (set_active), and refine() is new.
 
 #include "batched_lu.cuh"
 
@@ -26,12 +27,13 @@ constexpr int kThreads = 256;
             throw std::runtime_error(std::string("[own_lu] ") + #call + ": " + cudaGetErrorString(e_)); \
     } while (0)
 
-// thread = (item, matrix), matrix fastest
+// thread = (item, matrix), matrix fastest, over the first nb matrices (the
+// active prefix) of a batch of stride B
 #define LU_ITEM_AND_MATRIX                                                  \
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; \
-    if (idx >= (long long)n_items * B) return;                             \
-    const int it = (int)(idx / B);                                         \
-    const int b = (int)(idx - (long long)it * B);
+    if (idx >= (long long)n_items * nb) return;                            \
+    const int it = (int)(idx / nb);                                        \
+    const int b = (int)(idx - (long long)it * nb);
 
 // Item targets: entry t, or ~t for a fill entry (its sum starts at 0).
 #define LU_TARGET(raw) ((raw) < 0 ? ~(raw) : (raw))
@@ -51,7 +53,7 @@ __device__ __forceinline__ T clamp_pivot(T s, T e, int* clamped, int b)
 template <class T>
 __global__ void lu_left_u(const int* __restrict__ tgt, const int* __restrict__ cptr,
                           const int* __restrict__ cl, const int* __restrict__ cu,
-                          const int* __restrict__ dg, const int n_items, const int B,
+                          const int* __restrict__ dg, const int n_items, const int B, const int nb,
                           const T* __restrict__ tol, int* __restrict__ clamped, T* __restrict__ v)
 {
     LU_ITEM_AND_MATRIX
@@ -67,7 +69,7 @@ __global__ void lu_left_u(const int* __restrict__ tgt, const int* __restrict__ c
 template <class T>
 __global__ void lu_left_l(const int* __restrict__ tgt, const int* __restrict__ cptr,
                           const int* __restrict__ cl, const int* __restrict__ cu,
-                          const int* __restrict__ dg, const int n_items, const int B,
+                          const int* __restrict__ dg, const int n_items, const int B, const int nb,
                           T* __restrict__ v)
 {
     LU_ITEM_AND_MATRIX
@@ -82,7 +84,7 @@ __global__ void lu_left_l(const int* __restrict__ tgt, const int* __restrict__ c
 template <class T>
 __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
-                       const int B, const T* __restrict__ v, T* __restrict__ x)
+                       const int B, const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
     LU_ITEM_AND_MATRIX
     const int i = rows[it];
@@ -94,7 +96,7 @@ __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
 template <class T>
 __global__ void lu_bwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
-                       const int B, const T* __restrict__ v, T* __restrict__ x)
+                       const int B, const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
     LU_ITEM_AND_MATRIX
     const int i = rows[it];
@@ -103,39 +105,39 @@ __global__ void lu_bwd(const int* __restrict__ rows, const int* __restrict__ rp,
     x[(size_t)i * B + b] = s / v[(size_t)dp[i] * B + b];
 }
 
-// Layout changes, 32 x 32 tiles (block 32 x 8).
+// Layout changes, 32 x 32 tiles (block 32 x 8), matrices b < nb only.
 // in:  dst[map[j] * B + b] = src[b * ncols + j]; out: dst[b * ncols + j] = src[map[j] * B + b]
 template <class T>
 __global__ void lu_tr_in(const T* __restrict__ src, const int* __restrict__ map, const int ncols,
-                         const int B, T* __restrict__ dst)
+                         const int B, const int nb, T* __restrict__ dst)
 {
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int b = b0 + r, j = j0 + threadIdx.x;
-        if (b < B && j < ncols) t[r][threadIdx.x] = src[(size_t)b * ncols + j];
+        if (b < nb && j < ncols) t[r][threadIdx.x] = src[(size_t)b * ncols + j];
     }
     __syncthreads();
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int j = j0 + r, b = b0 + threadIdx.x;
-        if (b < B && j < ncols) dst[(size_t)map[j] * B + b] = t[threadIdx.x][r];
+        if (b < nb && j < ncols) dst[(size_t)map[j] * B + b] = t[threadIdx.x][r];
     }
 }
 
 template <class T>
 __global__ void lu_tr_out(const T* __restrict__ src, const int* __restrict__ map, const int ncols,
-                          const int B, T* __restrict__ dst)
+                          const int B, const int nb, T* __restrict__ dst)
 {
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int j = j0 + r, b = b0 + threadIdx.x;
-        if (b < B && j < ncols) t[r][threadIdx.x] = src[(size_t)map[j] * B + b];
+        if (b < nb && j < ncols) t[r][threadIdx.x] = src[(size_t)map[j] * B + b];
     }
     __syncthreads();
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int b = b0 + r, j = j0 + threadIdx.x;
-        if (b < B && j < ncols) dst[(size_t)b * ncols + j] = t[threadIdx.x][r];
+        if (b < nb && j < ncols) dst[(size_t)b * ncols + j] = t[threadIdx.x][r];
     }
 }
 
@@ -163,7 +165,7 @@ __global__ void lu_scaled_tol(const T* __restrict__ values, const int nnz, const
     const int lane = threadIdx.x & 31, part = threadIdx.x >> 5; \
     const int K = blockDim.x >> 5;                              \
     const int it = blockIdx.x;                                  \
-    const int b = blockIdx.y * 32 + lane;                       \
+    const int b = blockIdx.y * 32 + lane;   /* b < nb: active */ \
     __shared__ T red[32][33];
 
 template <class T>
@@ -180,16 +182,16 @@ __device__ __forceinline__ T lu_split_sum(T acc, const int lane, const int part,
 template <class T>
 __global__ void lu_left_split(const int* __restrict__ tgt, const int* __restrict__ cptr,
                               const int* __restrict__ cl, const int* __restrict__ cu,
-                              const int* __restrict__ dg, const int B, const int is_u,
+                              const int* __restrict__ dg, const int B, const int nb, const int is_u,
                               const T* __restrict__ tol, int* __restrict__ clamped, T* __restrict__ v)
 {
     LU_SPLIT_THREAD
     T acc = T(0);
-    if (b < B)
+    if (b < nb)
         for (int c = cptr[it] + part; c < cptr[it + 1]; c += K)
             acc = fma(v[(size_t)cl[c] * B + b], v[(size_t)cu[c] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
-    if (part != 0 || b >= B) return;
+    if (part != 0 || b >= nb) return;
     const int t = LU_TARGET(tgt[it]), d = dg[it];
     T s = LU_START(tgt[it], v, t, B, b) - sum;
     if (is_u) {
@@ -203,31 +205,31 @@ __global__ void lu_left_split(const int* __restrict__ tgt, const int* __restrict
 template <class T>
 __global__ void lu_fwd_split(const int* __restrict__ rows, const int* __restrict__ rp,
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
-                             const T* __restrict__ v, T* __restrict__ x)
+                             const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
     LU_SPLIT_THREAD
     const int i = rows[it];
     T acc = T(0);
-    if (b < B)
+    if (b < nb)
         for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
-    if (part != 0 || b >= B) return;
+    if (part != 0 || b >= nb) return;
     x[(size_t)i * B + b] -= sum;
 }
 
 template <class T>
 __global__ void lu_bwd_split(const int* __restrict__ rows, const int* __restrict__ rp,
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
-                             const T* __restrict__ v, T* __restrict__ x)
+                             const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
     LU_SPLIT_THREAD
     const int i = rows[it];
     T acc = T(0);
-    if (b < B)
+    if (b < nb)
         for (int e = dp[i] + 1 + part; e < rp[i + 1]; e += K)
             acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
-    if (part != 0 || b >= B) return;
+    if (part != 0 || b >= nb) return;
     x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[(size_t)dp[i] * B + b];
 }
 
@@ -271,6 +273,7 @@ void BatchedLu::init(const LuPlan& plan, int batch, cudaStream_t stream, double 
     nnz_ = plan.nnz;
     n_ent_ = plan.n_ent;
     B_ = batch;
+    nb_ = batch;
     levels_ = plan.levels;
     contributions_ = plan.contributions;
     eps_ = eps;
@@ -313,33 +316,41 @@ void BatchedLu::init(const LuPlan& plan, int batch, cudaStream_t stream, double 
     OWN_LU_CHECK(cudaDeviceSynchronize());
 }
 
+void BatchedLu::set_active(int nb)
+{
+    if (nb < 1 || nb > B_)
+        throw std::invalid_argument("[own_lu::BatchedLu::set_active] need 1 <= nb <= batch, got "
+                                    + std::to_string(nb) + " for batch " + std::to_string(B_));
+    nb_ = nb;
+}
+
 void BatchedLu::factorize(const cuda_real_type* values)
 {
     using T = cuda_real_type;
-    const int B = B_;
+    const int B = B_, nb = nb_;
     T* v = rawm(d_v_);
     T* tol = rawm(d_tol_);
     int* clamped = rawm(d_clamped_);
-    OWN_LU_CHECK(cudaMemsetAsync(clamped, 0, sizeof(int) * B, stream_));
+    OWN_LU_CHECK(cudaMemsetAsync(clamped, 0, sizeof(int) * nb, stream_));
     if (eps_ > 0.)
-        lu_scaled_tol<T><<<B, 256, 0, stream_>>>(values, nnz_, static_cast<T>(eps_), tol);
+        lu_scaled_tol<T><<<nb, 256, 0, stream_>>>(values, nnz_, static_cast<T>(eps_), tol);
     {
-        dim3 grid((nnz_ + 31) / 32, (B + 31) / 32), block(32, 8);
-        lu_tr_in<T><<<grid, block, 0, stream_>>>(values, raw(d_a_ent_), nnz_, B, v);
+        dim3 grid((nnz_ + 31) / 32, (nb + 31) / 32), block(32, 8);
+        lu_tr_in<T><<<grid, block, 0, stream_>>>(values, raw(d_a_ent_), nnz_, B, nb, v);
     }
     const int* tgt = raw(d_tgt_); const int* cptr = raw(d_cptr_); const int* dg = raw(d_dg_);
     const int* cl = raw(d_cl_);   const int* cu = raw(d_cu_);
     for (const Launch& L : f_launch_) {
         if (L.k > 1) {
-            dim3 grid(L.count, (B + 31) / 32);
+            dim3 grid(L.count, (nb + 31) / 32);
             lu_left_split<T><<<grid, 32 * L.k, 0, stream_>>>(tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset,
-                                                             B, L.is_u ? 1 : 0, tol, clamped, v);
+                                                             B, nb, L.is_u ? 1 : 0, tol, clamped, v);
         } else if (L.is_u) {
-            lu_left_u<T><<<blocks_for((long long)L.count * B), kThreads, 0, stream_>>>(
-                tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, tol, clamped, v);
+            lu_left_u<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(
+                tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, nb, tol, clamped, v);
         } else {
-            lu_left_l<T><<<blocks_for((long long)L.count * B), kThreads, 0, stream_>>>(
-                tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, v);
+            lu_left_l<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(
+                tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, nb, v);
         }
     }
     OWN_LU_CHECK(cudaGetLastError());
@@ -348,27 +359,29 @@ void BatchedLu::factorize(const cuda_real_type* values)
 void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x)
 {
     using T = cuda_real_type;
-    const int B = B_;
+    const int B = B_, nb = nb_;
     const T* v = raw(d_v_);
     T* xi = rawm(d_xi_);
-    dim3 tgrid((n_ + 31) / 32, (B + 31) / 32), tblock(32, 8);
-    lu_tr_in<T><<<tgrid, tblock, 0, stream_>>>(b, raw(d_inv_), n_, B, xi);
+    dim3 tgrid((n_ + 31) / 32, (nb + 31) / 32), tblock(32, 8);
+    lu_tr_in<T><<<tgrid, tblock, 0, stream_>>>(b, raw(d_inv_), n_, B, nb, xi);
     const int* rp = raw(d_rp_); const int* dp = raw(d_dp_); const int* ci = raw(d_ci_);
     for (const Launch& L : fw_launch_) {
         const int* rows = raw(d_fw_rows_) + L.offset;
         if (L.k > 1)
-            lu_fwd_split<T><<<dim3(L.count, (B + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, v, xi);
+            lu_fwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
         else
-            lu_fwd<T><<<blocks_for((long long)L.count * B), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, v, xi);
+            lu_fwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb,
+                                                                                      v, xi);
     }
     for (const Launch& L : bw_launch_) {
         const int* rows = raw(d_bw_rows_) + L.offset;
         if (L.k > 1)
-            lu_bwd_split<T><<<dim3(L.count, (B + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, v, xi);
+            lu_bwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
         else
-            lu_bwd<T><<<blocks_for((long long)L.count * B), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, v, xi);
+            lu_bwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb,
+                                                                                      v, xi);
     }
-    lu_tr_out<T><<<tgrid, tblock, 0, stream_>>>(xi, raw(d_inv_), n_, B, x);
+    lu_tr_out<T><<<tgrid, tblock, 0, stream_>>>(xi, raw(d_inv_), n_, B, nb, x);
     OWN_LU_CHECK(cudaGetLastError());
 }
 
@@ -377,13 +390,13 @@ void BatchedLu::refine(const cuda_real_type* values, const int* indptr, const in
 {
     using T = cuda_real_type;
     if (steps <= 0) return;
-    const long long m = static_cast<long long>(n_) * B_;
-    if (d_r_.size() != static_cast<size_t>(m)) {
-        d_r_.resize(m);
-        d_d_.resize(m);
+    if (d_r_.size() != static_cast<size_t>(n_) * B_) {   // sized for the whole batch, once
+        d_r_.resize(static_cast<size_t>(n_) * B_);
+        d_d_.resize(static_cast<size_t>(n_) * B_);
     }
+    const long long m = static_cast<long long>(n_) * nb_;   // slot-major: the prefix is contiguous
     for (int s = 0; s < steps; ++s) {
-        lu_residual<T><<<blocks_for(m), kThreads, 0, stream_>>>(values, indptr, indices, n_, nnz_, B_, b, x,
+        lu_residual<T><<<blocks_for(m), kThreads, 0, stream_>>>(values, indptr, indices, n_, nnz_, nb_, b, x,
                                                                 rawm(d_r_));
         solve(rawm(d_r_), rawm(d_d_));
         lu_axpy<T><<<blocks_for(m), kThreads, 0, stream_>>>(m, raw(d_d_), x);
@@ -393,9 +406,9 @@ void BatchedLu::refine(const cuda_real_type* values, const int* indptr, const in
 
 std::vector<int> BatchedLu::clamped_counts() const
 {
-    std::vector<int> h(B_, 0);
+    std::vector<int> h(nb_, 0);
     OWN_LU_CHECK(cudaStreamSynchronize(stream_));
-    OWN_LU_CHECK(cudaMemcpy(h.data(), raw(d_clamped_), sizeof(int) * B_, cudaMemcpyDeviceToHost));
+    OWN_LU_CHECK(cudaMemcpy(h.data(), raw(d_clamped_), sizeof(int) * nb_, cudaMemcpyDeviceToHost));
     return h;
 }
 

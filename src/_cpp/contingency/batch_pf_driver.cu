@@ -2387,12 +2387,23 @@ void BatchPfDriver<BatchSource>::_build_spmv(CuSpMV& sp, int n_slots)
 // _tail_solve — the continuous tail's linear solve over n_groups groups: the
 // handle analysed for tail_group_size_ matrices (built on first use, rebuilt
 // when the group size changed), on the driver's own J / F / dx buffers and
-// with the forward's cuDSS configuration.
+// with the forward's cuDSS configuration. The own LU builds nothing: the
+// forward's solver runs on its first n_groups * G matrices (TailSolve::prefix).
 // =============================================================================
 template <typename BatchSource>
 TailSolve BatchPfDriver<BatchSource>::_tail_solve(int n_groups)
 {
     const int G = tail_group_size_;
+    if (linear_solver_.has_active_prefix()) {
+        TailSolve ts;
+        ts.solver   = &linear_solver_;
+        ts.G        = G;
+        ts.n_groups = n_groups;
+        ts.dim_J    = base.dim_J;
+        ts.nnz_J    = base.nnz_J;
+        ts.prefix   = true;
+        return ts;
+    }
     if (!tail_solver_ || tail_solver_G_ != G) {
         tail_solver_.reset();
         tail_solver_ = std::make_unique<CudssBatchSolver>();
@@ -2642,9 +2653,11 @@ void BatchPfDriver<BatchSource>::_oa_load(const SlotLoadView& L)
 // tail_group_size_ slots, they are moved into the first n_cur = G * groups
 // slots (_compact_tail) and every later round runs on those slots only (the
 // Newton kernels, the prefix SpMV, the residual pass, the evictions), its
-// linear solve on the G-matrix handle cycled over the groups (TailSolve).
-// n_cur only shrinks: the live rows only leave. A moved row's trajectory is
-// its own up to cuDSS's rounding (another handle factorizes it).
+// linear solve on the G-matrix handle cycled over the groups (TailSolve) --
+// with the own LU, on the forward's solver restricted to its first n_cur
+// matrices. n_cur only shrinks: the live rows only leave. A moved row's
+// trajectory is its own up to rounding (another handle factorizes it; with
+// the own LU, ~1e-14 on case118 from the prefix SpMV).
 // =============================================================================
 template <typename BatchSource>
 void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)

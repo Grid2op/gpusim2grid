@@ -3643,7 +3643,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall ms to create, analyse and factorize handles 1..n_handles-1")
         .def_readonly("handle_round_ms", &CudssBatchBenchResult::handle_round_ms,
                       "Mean wall ms of one round over all the handles (rhs reset + "
-                      "REFACTORIZATION + SOLVE each)");
+                      "REFACTORIZATION + SOLVE each)")
+        .def_readonly("n_active", &CudssBatchBenchResult::n_active)
+        .def_readonly("active_max_rel_residual", &CudssBatchBenchResult::active_max_rel_residual,
+                      "Own LU active prefix: residual of its first n_active matrices, "
+                      "refactorized and solved alone (-1 = not run)")
+        .def_readonly("n_inactive_touched", &CudssBatchBenchResult::n_inactive_touched,
+                      "Solution entries past the prefix that call changed (0 expected; -1 = not run)")
+        .def_readonly("inactive_max_rel_residual", &CudssBatchBenchResult::inactive_max_rel_residual,
+                      "Past the prefix, the solve on the factors held from before (their "
+                      "values were doubled meanwhile; -1 = not run)");
 
     pybind11::class_<TailCalibration>(m, "TailCalibration",
         "calibrate_tail_max_groups() output: mean wall ms of one REFACTORIZATION + SOLVE on "
@@ -3683,6 +3692,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("n_handles") = 1,
         pybind11::arg("handle_launch") = "serial",
         pybind11::arg("linear_solver") = LinearSolver::Cudss,
+        pybind11::arg("n_active") = 0,
         "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
         "same batch-mode env variables and config knobs) on an arbitrary CSR "
         "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "
@@ -3694,7 +3704,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "the continuous schedule's tail does. "
         "n_handles > 1: that many independent handles of batch_size matrices "
         "(handle_round_ms), launched from one stream ('serial'), one stream "
-        "each ('streams') or one stream and one host thread each ('threads').");
+        "each ('streams') or one stream and one host thread each ('threads'). "
+        "n_active > 0 (own LU): the active-prefix check (active_max_rel_residual, "
+        "n_inactive_touched, inactive_max_rel_residual).");
 
     m.def("warmup", &warmup,
         pybind11::arg("device") = -1,

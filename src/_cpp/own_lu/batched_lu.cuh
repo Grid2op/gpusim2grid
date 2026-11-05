@@ -20,6 +20,12 @@
 // the structurally zero pivots of the rows the outer loops switch by value are
 // clamped, and iterative refinement (refine()) recovers the solution.
 //
+// Active prefix (set_active(nb)): every call then works on the first nb
+// matrices only -- the slots past it are neither read nor written, their
+// factors and solutions stay as they were -- with the buffers' layout (stride
+// B) unchanged. The continuous tail (BatchPfDriver::_compact_tail moves the
+// live rows to the front) runs on it instead of a second, smaller solver.
+//
 // Kernels: gpu-security-analysis' engine/kernels/lu.cu (RTE-AssistFlux),
 // templated on the real type, plus the clamp counter and the refinement.
 // Not thread-safe; every launch on the stream given at init().
@@ -46,7 +52,8 @@ public:
     void init(const LuPlan& plan, int batch, cudaStream_t stream, double eps = 1e-12,
               int split_chain = 16, int split_items = 256);
 
-    // values: [B × nnz] slot-major, the pattern of the plan's A (CSR order).
+    // values: [B × nnz] slot-major, the pattern of the plan's A (CSR order);
+    // the first active() matrices are read.
     void factorize(const cuda_real_type* values);
     // b, x: [B × n] slot-major. x may alias b.
     void solve(const cuda_real_type* b, cuda_real_type* x);
@@ -55,7 +62,12 @@ public:
     void refine(const cuda_real_type* values, const int* indptr, const int* indices,
                 const cuda_real_type* b, cuda_real_type* x, int steps);
 
-    // Pivots clamped per matrix by the last factorize() (host sync).
+    // Matrices [0, nb) only for the next calls (1 <= nb <= batch(); init()
+    // sets batch()). The others' factors and solutions are left untouched.
+    void set_active(int nb);
+    int active() const { return nb_; }
+
+    // Pivots clamped per active matrix by the last factorize() (host sync).
     std::vector<int> clamped_counts() const;
 
     int n() const { return n_; }
@@ -68,7 +80,7 @@ public:
 private:
     struct Launch { int offset, count, k; bool is_u; };
 
-    int n_ = 0, nnz_ = 0, n_ent_ = 0, B_ = 0, levels_ = 0;
+    int n_ = 0, nnz_ = 0, n_ent_ = 0, B_ = 0, nb_ = 0, levels_ = 0;
     long long contributions_ = 0;
     double eps_ = 0.;
     cudaStream_t stream_ = nullptr;
@@ -82,7 +94,7 @@ private:
     thrust::device_vector<cuda_real_type> d_xi_;   // solve work, interleaved [n × B]
     thrust::device_vector<cuda_real_type> d_tol_;  // per matrix clamp
     thrust::device_vector<int>            d_clamped_;
-    thrust::device_vector<cuda_real_type> d_r_, d_d_;  // refinement scratch [B × n]
+    thrust::device_vector<cuda_real_type> d_r_, d_d_;  // refinement scratch [B × n] (the prefix used)
 };
 
 }  // namespace own_lu

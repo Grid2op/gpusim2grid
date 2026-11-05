@@ -71,6 +71,10 @@ struct CudssBatchBenchResult {
     std::string handle_launch   = "serial";
     double      handle_setup_ms = 0.;     // creation + ANALYSIS + FACTORIZATION of handles 1..n-1
     double      handle_round_ms = 0.;     // mean wall ms of one round over all the handles
+    int         n_active        = 0;      // own LU active-prefix check (0 = not run)
+    double      active_max_rel_residual   = -1.;  // the prefix, refactorized + solved alone
+    long long   n_inactive_touched        = -1;   // solution entries past the prefix it changed
+    double      inactive_max_rel_residual = -1.;  // past the prefix, solved on its earlier factors
 };
 
 // Time gpusim2grid's own CudssBatchSolver (same code path, same batch-mode
@@ -91,6 +95,13 @@ struct CudssBatchBenchResult {
 // (one stream per handle, one host thread, one sync over all of them per
 // round) or "threads" (one stream and one host thread per handle, each running
 // its own rounds with its own sync, the wall clock spanning all of them).
+// n_active > 0 (own LU, n_groups = n_handles = 1): after the above, the active
+// prefix check. Every solution is set to a sentinel and the matrices past
+// n_active get doubled values; the first n_active are refactorized + solved
+// alone (active_max_rel_residual), the solution entries changed past them are
+// counted (n_inactive_touched, 0 expected), then the whole batch is solved on
+// the factors it holds (no refinement): past the prefix, those are still the
+// earlier ones of the original values (inactive_max_rel_residual).
 CudssBatchBenchResult benchmark_cudss_batch_raw(
     int dim,
     const std::vector<int>& indptr,
@@ -106,7 +117,8 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     int n_groups = 1,
     int n_handles = 1,
     const std::string& handle_launch = "serial",
-    LinearSolver linear_solver = LinearSolver::Cudss);
+    LinearSolver linear_solver = LinearSolver::Cudss,
+    int n_active = 0);
 
 // Result of calibrate_tail_groups(): what one Newton round's linear solve
 // costs on the full batch and on one group of the continuous tail.
@@ -125,8 +137,10 @@ struct AcPfNrState;
 // REFACTORIZATION + SOLVE on a uniform handle of batch_size matrices and on
 // one of group_size matrices, each stream-synchronized; the tail's groups pay
 // as long as ceil(n_live / G) * t_group < t_full, i.e. up to max_groups
-// groups. cuDSS only: the tail also runs the Newton kernels on fewer slots,
-// so the value is conservative. Allocates batch_size systems (values,
+// groups. The own LU's tail runs on an active prefix of the forward's solver
+// rather than a second handle, so its t_group is measured that way (and k
+// groups cost less than k · t_group there: one launch sequence). The tail also
+// runs the Newton kernels on fewer slots, so the value is conservative. Allocates batch_size systems (values,
 // right-hand sides, solutions) and their factors for the duration of the call.
 TailCalibration calibrate_tail_groups(
     const AcPfNrState& base, int batch_size, int group_size, int n_repeat,

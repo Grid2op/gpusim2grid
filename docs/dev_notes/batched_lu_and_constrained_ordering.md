@@ -299,7 +299,8 @@ shared pattern) or a slow path for that iteration (not done).
 
 Writing J in the LU's own layout was measured and deferred: section 9.
 
-Next: section 9 if worth it; a lane map for the tail instead of `_compact_tail` groups; the
+Next: section 9 if worth it; a lane map for the tail instead of `_compact_tail` (section 11 does the
+prefix half); the
 adjoint reusing J's factors (Jᵀ = UᵀLᵀ) instead of a second factorization; the plan built faster
 (45 ms cold on the French J, in `t_analysis_ms`); timings on the RTX 6000.
 
@@ -436,3 +437,31 @@ Statuses and outer iteration counts are identical on every row; max |dV| between
 - Its host analysis costs ~75 ms more than AMD's on that J (cold driver build, once).
 - cuDSS gains 3x from MinFill over AMD but stays ~2.7x slower than with its own ND order.
 - The own LU's default stays AMD-based unless the grid asks for MinFill. To re-check on the RTX 6000.
+
+
+## 11. The tail on an active prefix (2026-11-05)
+
+The question was whether the own LU can solve some rows of the batch only. It can, at no cost to
+the others: a thread is one (item, matrix) pair and a matrix's factors are its own interleaved
+column, so a launch over a subset never reads or writes the rest -- the guarantee cuDSS 0.8.0's
+`UBATCH_MASK` breaks (`cudss_ubatch_mask.md`).
+
+Done: the **prefix** form. `own_lu::BatchedLu::set_active(nb)` runs every kernel (factor, solve,
+transposes, clamp tolerance, refinement) on the first `nb` matrices with the stride `B` unchanged, so
+the loads stay coalesced; `CudssBatchSolver::set_active_count` forwards it (own LU only,
+`has_active_prefix()`). The continuous tail uses it: `_tail_solve` builds no second solver for the own
+LU, `TailSolve::prefix` refactorizes and solves the forward's solver on its first `n_groups · G`
+matrices in one call and restores the full batch. `_compact_tail` still moves the live rows to the
+front; `tail_group_size` is now only the compaction's granularity there. `calibrate_tail_groups` times
+the group as such a prefix.
+
+- `benchmark_cudss_batch_raw(..., n_active=k)` checks it in isolation: the prefix alone is solved, no
+  solution entry past it is written, and the factors past it are still those of values that were
+  doubled meanwhile (`test_raw_active_prefix_leaves_the_other_matrices_alone`).
+- `test_continuous_tail_on_the_active_prefix`: the own LU with and without the tail, same statuses and
+  iterations, V to rounding.
+- Not done: the **lane map** (any subset, no slot moves). Costs coalescing on scattered lanes and
+  gathers in the transposes; it would let `_compact_tail` go for the own LU.
+- The floor: a factor + solve is ~4 launches per level (~180 levels on the French J) whatever `nb`, so
+  a small tail pays launch latency; a CUDA graph of the sequence is the fix if it shows. Not timed yet
+  (laptop timings are ratios only).

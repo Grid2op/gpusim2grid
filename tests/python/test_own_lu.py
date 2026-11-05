@@ -107,13 +107,37 @@ def test_raw_benchmark_solves_the_jacobian(case118, residual_atol):
     assert ref.lu_nnz > 0
 
 
+@pytest.mark.parametrize("n_active", [1, 7, 20])
+def test_raw_active_prefix_leaves_the_other_matrices_alone(case118, residual_atol, n_active):
+    """BatchedLu's active prefix (what the continuous tail runs on): the first
+    n_active matrices are refactorized and solved alone; past them, no
+    solution entry is written and the factors stay those of the earlier values
+    (the benchmark doubles those values before the prefix call)."""
+    from gpusim2grid import AcPfGPU
+    pf = AcPfGPU(case118, precision=PREC)
+    indptr, indices, data = (np.asarray(a) for a in pf._s.get_J())
+    n = len(indptr) - 1
+    r = _cpp.benchmark_cudss_batch_raw(n, indptr.tolist(), indices.tolist(), data.astype(float).tolist(), 20,
+                                       n_refactorize=1, linear_solver=_cpp.LinearSolver.OwnLu,
+                                       n_active=n_active)
+    assert r.n_active == n_active
+    assert r.active_max_rel_residual < residual_atol
+    assert r.n_inactive_touched == 0
+    if n_active < 20:
+        assert r.inactive_max_rel_residual < residual_atol
+    with pytest.raises(RuntimeError, match="n_active"):
+        _cpp.benchmark_cudss_batch_raw(n, indptr.tolist(), indices.tolist(), data.astype(float).tolist(), 20,
+                                       n_active=3)   # cuDSS: no active prefix
+
+
 # =============================================================================
 # The batch facades, own LU against cuDSS
 # =============================================================================
 @pytest.mark.parametrize("scheduling", ["chunked", "continuous"])
 def test_contingency_analysis(case118, scheduling, solver_atol):
     """N-1 of case118 with handle_disconnected_grid (masked islands); the
-    continuous run with a tail of groups of 3 (bind_slice on its own handle)."""
+    continuous run with a tail of groups of 3 (cuDSS: a second handle cycled
+    over them; own LU: the forward solver's active prefix)."""
     runs = {}
     for ls in SOLVERS:
         ca, nbr = _n1(case118, ls, scheduling)
@@ -126,6 +150,22 @@ def test_contingency_analysis(case118, scheduling, solver_atol):
             assert ca.timings.n_tail_rounds > 0
     assert np.any(np.isnan(runs["cudss"][2]))
     _same_rows(runs["own_lu"], runs["cudss"], solver_atol)
+
+
+@pytest.mark.parametrize("G", [1, 3, 15])
+def test_continuous_tail_on_the_active_prefix(case118, G, solver_atol):
+    """The own LU's continuous tail runs on its forward solver's active prefix
+    (no second solver): every row ends as without the tail, statuses and
+    iterations equal, V to rounding (~1e-14 in FP64: the prefix SpMV)."""
+    runs, timings = {}, {}
+    for mg in (0, 10 ** 6):
+        ca, nbr = _n1(case118, "own_lu", "continuous")
+        ca.tail_max_groups, ca.tail_group_size = mg, G
+        ca.compute(batch_size=64)
+        runs[mg], timings[mg] = _outcome(ca, nbr), ca.timings
+    assert timings[0].n_tail_rounds == 0
+    assert timings[10 ** 6].n_tail_rounds > 0 and timings[10 ** 6].n_slot_moves > 0
+    _same_rows(runs[10 ** 6], runs[0], solver_atol)
 
 
 def test_injection_sweep(case118, solver_atol):

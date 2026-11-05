@@ -599,7 +599,10 @@ struct BatchPfDriver {
     // solve on one more cuDSS handle analysed for G matrices, cycled over the
     // groups (TailSolve). cuDSS 0.8.0's uniform batch costs over an order of
     // magnitude more from 16 matrices on, so G <= 15 and the full S-slot solve
-    // only pays while many rows are live. tail_max_groups_ = 0: off. Only with
+    // only pays while many rows are live. The own LU (linear_solver OwnLu)
+    // builds no second solver: its forward solver runs on the first
+    // n_groups * G matrices (active prefix), G only sets how finely the live
+    // rows are compacted. tail_max_groups_ = 0: off. Only with
     // PolicyRefactorEvery (the others keep factors across iterations). Public
     // and set per run like nb_iter_per_round_ (the sessions patch them); the
     // handle and the prefix SpMV are built on the first tail round that needs
@@ -607,7 +610,7 @@ struct BatchPfDriver {
     // -------------------------------------------------------------------------
     int tail_max_groups_ = 16;
     int tail_group_size_ = 15;
-    std::unique_ptr<CudssBatchSolver> tail_solver_;   // analysed for tail_solver_G_ matrices
+    std::unique_ptr<CudssBatchSolver> tail_solver_;   // analysed for tail_solver_G_ matrices (cuDSS only)
     int                               tail_solver_G_ = 0;
     std::unique_ptr<CuSpMV>           spmv_tail_;     // over the first spmv_tail_n_ slots
     int                               spmv_tail_n_ = 0;
