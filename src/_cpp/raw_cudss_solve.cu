@@ -7,6 +7,7 @@
 #include "dtypes.hpp"
 #include "contingency/strategies/cudss_batch_solver.cuh"
 #include "acpf_nr_state.cuh"
+#include "own_lu/lu_order.hpp"
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -132,8 +133,15 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     int ir_n_steps,
     int n_groups,
     int n_handles,
-    const std::string& handle_launch)
+    const std::string& handle_launch,
+    LinearSolver linear_solver)
 {
+    // the own LU's order: what reordering_alg names, chosen on the host (no grid:
+    // no constraints, so 'default' is AMD)
+    std::vector<int> own_perm;
+    if (linear_solver == LinearSolver::OwnLu)
+        own_perm = own_lu::choose_order(reordering_alg, dim, indptr, indices, nullptr, {});
+    const std::vector<int>* perm = own_perm.empty() ? nullptr : &own_perm;
     if (dim <= 0 || batch_size <= 0 || n_refactorize < 0 || n_groups <= 0 || n_handles <= 0)
         throw std::runtime_error(
             "benchmark_cudss_batch_raw: dim, batch_size, n_groups and n_handles must be > 0, "
@@ -201,7 +209,7 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
                       thrust::raw_pointer_cast(d_outer.data()),
                       thrust::raw_pointer_cast(d_inner.data()),
                       vals, rhs, x,
-                      cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps);
+                      cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, perm, linear_solver);
     solver.set_values(vals);
     solver.prepare_factorization();   // non-uniform modes: the deferred ANALYSIS
     cs.synchronize();
@@ -291,7 +299,8 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
                               thrust::raw_pointer_cast(d_outer.data()),
                               thrust::raw_pointer_cast(d_inner.data()),
                               vals + h * B * m, rhs + h * B * n, x + h * B * n,
-                              st[h], reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps);
+                              st[h], reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, perm,
+                              linear_solver);
             hs[h]->set_values(vals + h * B * m);
             hs[h]->prepare_factorization();
             hs[h]->factor();
@@ -379,8 +388,10 @@ __global__ static void tile_values_kernel(cuda_real_type* __restrict__ dst,
 TailCalibration calibrate_tail_groups(
     const AcPfNrState& base, int batch_size, int group_size, int n_repeat,
     ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps)
+    PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, LinearSolver linear_solver)
 {
+    const std::vector<int>* perm = linear_solver == LinearSolver::OwnLu
+        ? &base.own_lu_perm(reordering_alg) : base.user_perm_or_null();
     if (batch_size < 1 || group_size < 1 || n_repeat < 1)
         throw std::invalid_argument(
             "calibrate_tail_groups: batch_size, group_size and n_repeat must be >= 1");
@@ -415,7 +426,8 @@ TailCalibration calibrate_tail_groups(
                           thrust::raw_pointer_cast(d_vals.data()),
                           thrust::raw_pointer_cast(d_rhs.data()),
                           thrust::raw_pointer_cast(d_x.data()),
-                          cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps);
+                          cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, perm,
+                          linear_solver);
         thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)), d_rhs.begin(), d_rhs.end(), cuda_real_type(1));
         solver.factor();
         solver.solve();

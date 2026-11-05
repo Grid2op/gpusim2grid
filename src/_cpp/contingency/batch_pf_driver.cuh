@@ -620,6 +620,14 @@ struct BatchPfDriver {
     MatchingAlg     matching_alg_      = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
     int             ir_n_steps_        = 0;   // CUDSS_CONFIG_IR_N_STEPS, forward and adjoint
+    LinearSolver    linear_solver_kind_ = LinearSolver::Cudss;   // forward, tail and adjoint
+    // The order every batch solver gets: the own LU's (AcPfNrState::own_lu_perm,
+    // chosen on the host from reordering_alg), else cuDSS's user permutation.
+    const std::vector<int>* _solver_perm() const
+    {
+        return linear_solver_kind_ == LinearSolver::OwnLu ? &base.own_lu_perm(reordering_alg_)
+                                                           : base.user_perm_or_null();
+    }
 
     // -------------------------------------------------------------------------
     // Persistence / adjoint state
@@ -722,7 +730,9 @@ struct BatchPfDriver {
         // Scheduling -- see the members' own doc. Chunked by default.
         BatchScheduling           scheduling = BatchScheduling::Chunked,
         int                       nb_iter_per_round = 1,
-        double                    tol = 1e-8);
+        double                    tol = 1e-8,
+        // Who factorizes and solves the batch Jacobians (linear_solver.hpp).
+        LinearSolver              linear_solver = LinearSolver::Cudss);
 
     ~BatchPfDriver() = default;
 

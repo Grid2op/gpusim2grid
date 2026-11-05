@@ -11,6 +11,7 @@
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
+#include "linear_solver.hpp"
 
 // Solve J*dx = rhs with gpusim2grid's own cuDSS wrapper (analyze -> factorize
 // -> solve, CudssContext/CudssDescriptor from cuda_utils.h), completely
@@ -104,7 +105,8 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     int ir_n_steps = 0,
     int n_groups = 1,
     int n_handles = 1,
-    const std::string& handle_launch = "serial");
+    const std::string& handle_launch = "serial",
+    LinearSolver linear_solver = LinearSolver::Cudss);
 
 // Result of calibrate_tail_groups(): what one Newton round's linear solve
 // costs on the full batch and on one group of the continuous tail.
@@ -129,6 +131,7 @@ struct AcPfNrState;
 TailCalibration calibrate_tail_groups(
     const AcPfNrState& base, int batch_size, int group_size, int n_repeat,
     ReorderingAlg reordering_alg, MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps);
+    PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
+    LinearSolver linear_solver = LinearSolver::Cudss);
 
 #endif  // RAW_CUDSS_SOLVE_H

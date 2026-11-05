@@ -9,6 +9,7 @@
 #include "../reordering_alg.hpp"
 #include "../matching_alg.hpp"
 #include "../pivot_epsilon_alg.hpp"
+#include "../linear_solver.hpp"
 #include "row_status.hpp"                   // BatchScheduling
 
 // =============================================================================
@@ -31,6 +32,7 @@ struct BatchDriverConfig {
     MatchingAlg     matching_alg      = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default;
     int    ir_n_steps = 0;
+    LinearSolver linear_solver = LinearSolver::Cudss;
     bool   scaling_max_voltage_change = false;
     double max_dVa = 0.5, max_dVm = 0.1;
     bool   mask_mode            = false;   // handle_disconnected_grid
@@ -47,6 +49,7 @@ struct BatchDriverConfig {
             && refactor_period == o.refactor_period && strategy == o.strategy
             && reordering_alg == o.reordering_alg && matching_alg == o.matching_alg
             && pivot_epsilon_alg == o.pivot_epsilon_alg && ir_n_steps == o.ir_n_steps
+            && linear_solver == o.linear_solver
             && scaling_max_voltage_change == o.scaling_max_voltage_change
             && max_dVa == o.max_dVa && max_dVm == o.max_dVm
             && mask_mode == o.mask_mode && fixed_batch_capacity == o.fixed_batch_capacity

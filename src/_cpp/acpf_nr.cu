@@ -42,6 +42,7 @@
 // =============================================================================
 
 #include "user_ordering.hpp"   // prototype: ls2g_constrained_perm
+#include "own_lu/lu_order.hpp"
 #include "acpf_nr_state.cuh"
 #include "acpf_nr.hpp"
 #include "acpf_nr_kernels.cuh"
@@ -1353,6 +1354,20 @@ AcPfNrState::AcPfNrState(
     // Jacobian skeleton (H→D) — augmented or trivial, both in J_outer_h/J_inner_h
     upload_h2d(d_J_outer, J_outer_h.data(), dim_J + 1, cs);
     upload_h2d(d_J_inner, J_inner_h.data(), nnz_J,     cs);
+    // own LU (linear_solver OwnLu): the skeleton and the grid's ordering
+    // constraints, for own_lu_perm() (orders computed on first use only)
+    h_ord_ledger = std::make_shared<LedgerData>();
+    h_ord_ledger->dim_J   = dim_J;
+    h_ord_ledger->J_outer = J_outer_h;
+    h_ord_ledger->J_inner = J_inner_h;
+    if (ledger != nullptr && ledger->ord_constraints_read) {
+        h_ord_ledger->ord_constraints_read = true;
+        h_ord_ledger->ord_follow_ptr = ledger->ord_follow_ptr;
+        h_ord_ledger->ord_follow     = ledger->ord_follow;
+        h_ord_ledger->ord_lead_ptr   = ledger->ord_lead_ptr;
+        h_ord_ledger->ord_lead       = ledger->ord_lead;
+        h_ord_ledger->ord_in_order   = ledger->ord_in_order;
+    }
     // prototype: cuDSS's own order of this skeleton, post-moved by lightsim2grid's
     // constraints (ReorderingAlg::Ls2gConstrainedNd)
     // (GPUSIM2GRID_ND_NO_POSTMOVE, diagnostic: hand cuDSS its own order back unchanged)
@@ -2036,4 +2051,15 @@ std::tuple<std::vector<int>, std::vector<int>, std::vector<double>> AcPfNrSessio
         std::vector<int>(h_inner.begin(), h_inner.end()),
         std::vector<double>(h_vals.begin(), h_vals.end())
     };
+}
+// own LU: its elimination order (acpf_nr_state.cuh, own_lu/lu_order.hpp)
+const std::vector<int>& AcPfNrState::own_lu_perm(ReorderingAlg alg) const
+{
+    auto it = own_lu_perms_.find(static_cast<int>(alg));
+    if (it != own_lu_perms_.end()) return it->second;
+    if (!h_ord_ledger)
+        throw std::logic_error("AcPfNrState::own_lu_perm: no J skeleton kept");
+    std::vector<int> perm = own_lu::choose_order(alg, h_ord_ledger->dim_J, h_ord_ledger->J_outer,
+                                                 h_ord_ledger->J_inner, h_ord_ledger.get(), h_user_perm);
+    return own_lu_perms_.emplace(static_cast<int>(alg), std::move(perm)).first->second;
 }

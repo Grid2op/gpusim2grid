@@ -89,6 +89,7 @@ ScenarioSweepDriverConfig ScenarioSweepSession::_current_config() const
     c.refactor_period            = refactor_period_;
     c.strategy                   = strategy_type_;
     c.reordering_alg             = reordering_alg_;
+    c.linear_solver              = linear_solver_;
     c.matching_alg               = matching_alg_;
     c.pivot_epsilon_alg          = pivot_epsilon_alg_;
     c.ir_n_steps                 = ir_n_steps_;
@@ -1483,7 +1484,8 @@ void ScenarioSweepSession::run()
             max_dVm_,
             scheduling_,
             nb_iter_per_round_,
-            tol_);
+            tol_,
+            linear_solver_);
         driver_cfg_ = cfg;
         ++driver_build_counter_;
         ++source_build_counter_;

@@ -43,6 +43,8 @@
 #include <thrust/host_vector.h>
 
 #include <chrono>
+#include <map>
+#include <memory>
 
 #include "dtypes.hpp"
 #include "cuda_utils.h"       // CudaStream, CudssContext, CudssDescriptor,
@@ -50,6 +52,7 @@
 #include "cu_complex_utils.h" // cudaComplexType, CudaFunHelper, CUDA_C_TYPE …
 #include "timing_utils.hpp"   // AcPfTimings, TimingEntry
 #include "outer/branch_control_kernels.cuh"  // BcStatic, BcSlots
+#include "reordering_alg.hpp"
 
 struct LedgerData;            // ledger_data.hpp (host); optional augmented-J input
 
@@ -441,6 +444,14 @@ struct AcPfNrState {
     const std::vector<int>* user_perm_or_null() const {
         return h_user_perm.empty() ? nullptr : &h_user_perm;
     }
+    // The batched LU of our own (linear_solver OwnLu) never pivots: its order
+    // is chosen on the host by own_lu::choose_order (own_lu/lu_order.hpp) from
+    // this state's J skeleton and, with a lightsim2grid grid, its ordering
+    // constraints (both kept here: dim_J, J_outer, J_inner, ord_*; set by the
+    // ctor). Computed on first use, once per reordering_alg.
+    std::shared_ptr<LedgerData> h_ord_ledger;
+    const std::vector<int>& own_lu_perm(ReorderingAlg alg) const;
+    mutable std::map<int, std::vector<int>> own_lu_perms_;   // own_lu_perm()'s cache
     thrust::device_vector<int>            d_J_outer;   // size dim_J+1
     thrust::device_vector<int>            d_J_inner;   // size nnz_J
     thrust::device_vector<cuda_real_type> d_J_values;  // current numeric values

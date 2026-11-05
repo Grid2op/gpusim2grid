@@ -278,7 +278,42 @@ shared pattern) or a slow path for that iteration (not done).
 - Tests: `tests/python/test_own_lu.py` (raw solve, CA chunked / continuous with tail, injection sweep,
   outer loops with both orders and the clamp count, BatchPowerFlow gradient by central differences).
 
-Next: the order without cuDSS's ANALYSIS (lightsim2grid's `constrained_order` is already computed by
-`AcPfNrState`; AMD for the array mode); a facade option instead of the variable; Jacobian kernels writing
-the interleaved layout (the transposes); a lane map for the tail instead of `_compact_tail` groups; the
-adjoint reusing J's factors (Jᵀ = UᵀLᵀ) instead of a second factorization; timings on the RTX 6000.
+## 8. Second increment: an option, the order on the host
+
+- `linear_solver='cudss' | 'own_lu'` (`LinearSolver`, `linear_solver.hpp`) on the three batch facades,
+  their engines (`SchedulingEngineMixin` / `SchedulingFacadeMixin`), the sessions (`def_readwrite`,
+  in `BatchDriverConfig`: a change builds a new driver), `BatchPowerFlow.from_lsgrid`,
+  `benchmark_cudss_batch_raw` and the tail calibration. The environment variable is gone.
+  `CudssBatchSolver::initialize(..., LinearSolver::OwnLu)` creates no cuDSS object at all.
+- The order (`own_lu/lu_order.{hpp,cpp}`, `AcPfNrState::own_lu_perm`, computed on first use per
+  `reordering_alg` from the J skeleton and ordering constraints the state now keeps,
+  `h_ord_ledger`): `default` = lightsim2grid's constrained order when the grid declares
+  constraints, else AMD; `amd`; `none`; `ls2g_constrained[_nd]` (the order the state already has).
+  AMD is lightsim2grid's SuiteSparse AMD through the constrained-order hook with no constraint,
+  Eigen's without the bridge (its `indices()` are new → old: the inverse explodes the fill).
+  Refused: `nested_dissection` / `colamd` / `btf_colamd`, `matching_alg` other than `none`, the
+  two non-uniform cuDSS variables.
+- Section 5's case, `ir_n_steps=0`: own LU `default` = LU nnz 150 664 (the constrained order), 0
+  clamped; `amd` = 150 516 (cuDSS's AMD fill), 2 688 clamped. Statuses, outer iterations identical,
+  max |dV| against lightsim2grid ≤ 1.8e-12; Newton rounds 1 952 (cuDSS) → 609 ms (laptop).
+
+### Item 3, the Jacobian written in the LU's layout: measured first, not done
+
+Their LU (CuPy) on our Jacobians (laptop A1000): the value transpose is 15–17 % of a factorization and
+the right-hand-side transposes 10–15 % of a solve at S ≥ 128 (6 % / 3 % at S = 15). But the tiled
+transpose already runs at copy bandwidth: a coalesced permuted copy (`dst[a_ent[p]·B + b] = src[p·B +
+b]`, what is left when J is written entry-major) costs exactly as much (111 GB/s both, S = 128 …
+1024). A copy has to stay as long as the factorization is in place and the refinement / the adjoint
+read J afterwards. So writing J entry-major gains nothing by itself; the gain needs both:
+
+1. J entry-major (`J[pos·S + slot]`) in the ~20 kernels that write it (`fill_J`, the feature, mask,
+   override, outer and BranchControl kernels, the adjoint gather, the DLPack export), their threads
+   remapped slot-fastest so that the writes stay coalesced, cuDSS keeping the slot-major layout;
+2. the factorization reading each item's A value straight from that buffer (an item per A entry of
+   the U part too) instead of a pre-copied one.
+
+At most the 15–17 % / 10–15 % above, for a refactor of every J writer.
+
+Next: the item above if worth it; a lane map for the tail instead of `_compact_tail` groups; the
+adjoint reusing J's factors (Jᵀ = UᵀLᵀ) instead of a second factorization; the plan built faster
+(45 ms cold on the French J, in `t_analysis_ms`); timings on the RTX 6000.

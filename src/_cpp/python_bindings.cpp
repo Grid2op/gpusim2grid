@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#include "linear_solver.hpp"
 #include "timing_utils.hpp"
 #include "acpf_nr.hpp"
 #include "contingency_analysis_helper.hpp"   // Contingency, Triplet
@@ -1177,6 +1178,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // default argument (e.g. AcPfNrSession's reordering_alg kwarg just below),
   // same rationale as ContingencySolverType further down.
   // -----------------------------------------------------------------
+  // LinearSolver -- who factorizes / solves the batch Jacobians (linear_solver.hpp);
+  // registered before any binding that takes it as a default argument.
+  pybind11::enum_<LinearSolver>(m, "LinearSolver")
+      .value("Cudss", LinearSolver::Cudss, "cuDSS's uniform batch.")
+      .value("OwnLu", LinearSolver::OwnLu,
+             "The batched LU of our own: static diagonal pivots along an order chosen on the "
+             "host (lightsim2grid's constrained order, AMD, ...), no cuDSS call.");
+
   pybind11::enum_<ReorderingAlg>(m, "ReorderingAlg")
       .value("Default", ReorderingAlg::Default,
              "cuDSS's own default reordering heuristic.")
@@ -1813,7 +1822,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          [](const ContingencyAnalysisSession& s, int n_repeat, int batch_size) {
              return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
                                           s.tail_group_size_, n_repeat, s.reordering_alg_,
-                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_,
+                                          s.linear_solver_);
          },
          pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
          "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
@@ -1844,6 +1854,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "default) works here. The other values only work on "
                    "AcPfNrSession's single-system solve, and even there "
                    "MaxDiagProduct/Auto have been observed to silently produce NaN.")
+    .def_readwrite("linear_solver", &ContingencyAnalysisSession::linear_solver_,
+                   "LinearSolver: who factorizes and solves the batch Jacobians (Cudss, or OwnLu: "
+                   "the batched LU of our own, its order chosen on the host from reordering_alg). "
+                   "The base case stays on cuDSS. Takes effect on the next run() (a new driver)")
     .def_readwrite("ir_n_steps", &ContingencyAnalysisSession::ir_n_steps_,
                    "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
                    "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
@@ -2179,7 +2193,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          [](const InjectionSweepSession& s, int n_repeat, int batch_size) {
              return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
                                           s.tail_group_size_, n_repeat, s.reordering_alg_,
-                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_,
+                                          s.linear_solver_);
          },
          pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
          "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
@@ -2210,6 +2225,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "default) works here. The other values only work on "
                    "AcPfNrSession's single-system solve, and even there "
                    "MaxDiagProduct/Auto have been observed to silently produce NaN.")
+    .def_readwrite("linear_solver", &InjectionSweepSession::linear_solver_,
+                   "LinearSolver: who factorizes and solves the batch Jacobians (Cudss, or OwnLu: "
+                   "the batched LU of our own, its order chosen on the host from reordering_alg). "
+                   "The base case stays on cuDSS. Takes effect on the next run() (a new driver)")
     .def_readwrite("ir_n_steps", &InjectionSweepSession::ir_n_steps_,
                    "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
                    "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
@@ -2644,7 +2663,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          [](const ScenarioSweepSession& s, int n_repeat, int batch_size) {
              return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
                                           s.tail_group_size_, n_repeat, s.reordering_alg_,
-                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_,
+                                          s.linear_solver_);
          },
          pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
          "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
@@ -2669,6 +2689,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "(MatchingAlg enum; takes effect on the next run(), which always "
                    "reruns ANALYSIS). Only NoMatching (the default) works in this "
                    "session's batch mode.")
+    .def_readwrite("linear_solver", &ScenarioSweepSession::linear_solver_,
+                   "LinearSolver: who factorizes and solves the batch Jacobians (Cudss, or OwnLu: "
+                   "the batched LU of our own, its order chosen on the host from reordering_alg). "
+                   "The base case stays on cuDSS. Takes effect on the next run() (a new driver)")
     .def_readwrite("ir_n_steps", &ScenarioSweepSession::ir_n_steps_,
                    "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
                    "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
@@ -3653,6 +3677,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("n_groups") = 1,
         pybind11::arg("n_handles") = 1,
         pybind11::arg("handle_launch") = "serial",
+        pybind11::arg("linear_solver") = LinearSolver::Cudss,
         "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
         "same batch-mode env variables and config knobs) on an arbitrary CSR "
         "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "

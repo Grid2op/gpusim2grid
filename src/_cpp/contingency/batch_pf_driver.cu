@@ -136,7 +136,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     double                max_dVm,
     BatchScheduling       scheduling,
     int                   nb_iter_per_round,
-    double                tol)
+    double                tol,
+    LinearSolver          linear_solver)
     : base(base_state)
     , source_(std::move(source))
     , n_contingencies(n_contingencies_in)
@@ -153,6 +154,7 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     , matching_alg_(matching_alg)
     , pivot_epsilon_alg_(pivot_epsilon_alg)
     , ir_n_steps_(ir_n_steps)
+    , linear_solver_kind_(linear_solver)
     , scheduling_(scheduling)
     , nb_iter_per_round_(nb_iter_per_round)
     , tol_(tol)
@@ -293,7 +295,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         matching_alg,
         pivot_epsilon_alg,
         ir_n_steps,
-        base.user_perm_or_null());  // prototype: ReorderingAlg::Ls2gConstrained
+        _solver_perm(),             // prototype: ReorderingAlg::Ls2gConstrained; own LU's order
+        linear_solver_kind_);
 
     std::visit([&](auto& policy) {
         policy.initialize_from_base(
@@ -2401,7 +2404,7 @@ TailSolve BatchPfDriver<BatchSource>::_tail_solve(int n_groups)
             thrust::raw_pointer_cast(d_F_batch.data()),
             thrust::raw_pointer_cast(d_dx_batch.data()),
             cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_,
-            base.user_perm_or_null());
+            _solver_perm(), linear_solver_kind_);
         tail_solver_G_ = G;
     }
     TailSolve ts;
@@ -3184,7 +3187,7 @@ void BatchPfDriver<BatchSource>::_prepare_adjoint()
         thrust::raw_pointer_cast(A.d_rhs.data()),
         thrust::raw_pointer_cast(A.d_sol.data()),
         cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_,
-        base.user_perm_or_null());  // symmetric: valid for J^T too
+        _solver_perm(), linear_solver_kind_);  // symmetric: valid for J^T too
     A.n_analysis = 1;
     cs.synchronize();
     A.t_build_ms = bpf_ms_since(t_build_start);
