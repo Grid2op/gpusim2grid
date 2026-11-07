@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``gpusim2grid_core``: the solvers as a C++ shared library without Python (headers, CMake package
+  ``gpusim2grid::core``, ``gpusim2grid.get_cmake_dir()``), for C++ / JNI callers; the Python module links it.
 - [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU
   of our own instead of cuDSS, ordered on the host (lightsim2grid's constrained order by default): no pivot to perturb.
 - [IMPROVED] ``linear_solver='own_lu'``: the continuous tail runs on the forward solver's first slots (active

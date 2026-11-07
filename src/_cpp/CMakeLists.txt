@@ -15,9 +15,12 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
     list(APPEND _gpusim2grid_ls2g_sources ls2g_bridge.cpp outer/ls2g_outer_model.cpp)
 endif()
 
-pybind11_add_module(
-    _gpusim2grid
-    python_bindings.cpp
+# gpusim2grid_core: the solvers as a plain C++/CUDA shared library, with no Python in it,
+# so that a C++ program (or a JNI library) can use them directly. Its public headers
+# (installed under gpusim2grid/include) do not include any CUDA header. The Python module
+# below is only the bindings and the DLPack export, linked against it.
+add_library(
+    gpusim2grid_core SHARED
     cuda_utils.cu
     acpf_nr.cu
     contingency_analysis_helper.cpp
@@ -34,22 +37,44 @@ pybind11_add_module(
     injection_sweep.cu
     injection_sweep_session.cu
     scenario_sweep_session.cu
-    dlpack_export.cu
     raw_cudss_solve.cu
     warmup.cu
     own_lu/lu_plan.cpp
     own_lu/lu_order.cpp
     own_lu/batched_lu.cu
     ${_gpusim2grid_ls2g_sources})
-target_link_libraries(_gpusim2grid PRIVATE CUDA::cusparse cudss)
+add_library(gpusim2grid::core ALIAS gpusim2grid_core)
+set_target_properties(gpusim2grid_core PROPERTIES POSITION_INDEPENDENT_CODE ON EXPORT_NAME core)
+target_include_directories(gpusim2grid_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${SKBUILD_PROJECT_NAME}/include>)
+# the CUDA runtime is linked statically (CMake's default for CUDA targets), as before the split:
+# a shared libcudart from the toolkit would clash with the one torch loads
+target_link_libraries(gpusim2grid_core PUBLIC CUDA::cusparse cudss)
+if(USE_FLOAT_PRECISION)
+    target_compile_definitions(gpusim2grid_core PUBLIC GPUSIM2GRID_REAL_FLOAT)
+endif()
+
+pybind11_add_module(
+    _gpusim2grid
+    python_bindings.cpp
+    dlpack_export.cu)
+target_link_libraries(_gpusim2grid PRIVATE gpusim2grid_core)
+# _gpusim2grid.so NEEDs libgpusim2grid_core.so, installed next to it (and, with the bridge,
+# liblightsim2grid_core.so: its rpath is set below).
+if(NOT APPLE)
+    set_property(TARGET _gpusim2grid APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+else()
+    set_property(TARGET _gpusim2grid APPEND PROPERTY INSTALL_RPATH "@loader_path")
+endif()
 
 if(GPUSIM2GRID_LS2G_CORE_FOUND)
-    target_link_libraries(_gpusim2grid PRIVATE lightsim2grid::core)
-    target_compile_definitions(_gpusim2grid PRIVATE GPUSIM2GRID_HAVE_LS2G)
+    target_link_libraries(gpusim2grid_core PUBLIC lightsim2grid::core)
+    target_compile_definitions(gpusim2grid_core PUBLIC GPUSIM2GRID_HAVE_LS2G)
 
-    # Mirror lightsim2grid_core's -march=native / -O3 onto _gpusim2grid.
+    # Mirror lightsim2grid_core's -march=native / -O3 onto gpusim2grid_core (PUBLIC: the module and any C++ consumer inherit it).
     #
-    # lightsim2grid_core and _gpusim2grid.so are two *separate* shared
+    # lightsim2grid_core and libgpusim2grid_core.so are two *separate* shared
     # libraries, and ls2g_bridge.cpp exchanges dynamic-size Eigen objects with
     # it by value (grid.get_J_solver() -> Eigen::SparseMatrix<...>,
     # grid.get_bus_vn_kv()/get_limit_a1_ka()/etc. -> RealVect/CplxVect).
@@ -67,32 +92,36 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
     if(NOT MSVC)
         if(lightsim2grid_core_MARCH_NATIVE)
             message(STATUS "[gpusim2grid] lightsim2grid_core was built with "
-                           "-march=native -- matching it on _gpusim2grid "
+                           "-march=native -- matching it on gpusim2grid_core "
                            "(required, see lightsim2grid's docs/solver_plugin.rst)")
-            target_compile_options(_gpusim2grid PRIVATE
+            target_compile_options(gpusim2grid_core PUBLIC
                 $<$<COMPILE_LANGUAGE:CXX>:-march=native>
                 $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-march=native>)
         endif()
         if(lightsim2grid_core_O3_OPTIM)
             message(STATUS "[gpusim2grid] lightsim2grid_core was built with "
-                           "-O3 -- matching it on _gpusim2grid")
-            target_compile_options(_gpusim2grid PRIVATE
+                           "-O3 -- matching it on gpusim2grid_core")
+            target_compile_options(gpusim2grid_core PUBLIC
                 $<$<COMPILE_LANGUAGE:CXX>:-O3>
                 $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>)
         endif()
     endif()
 
-    # _gpusim2grid.so NEEDs liblightsim2grid_core.so. Both packages install
+    # libgpusim2grid_core.so NEEDs liblightsim2grid_core.so. Both packages install
     # side by side under site-packages, so a relocatable $ORIGIN-relative rpath
     # to the lightsim2grid package dir lets the loader find it without relying
     # on import order or LD_LIBRARY_PATH.
     if(NOT APPLE)
+        set_property(TARGET gpusim2grid_core APPEND PROPERTY
+            INSTALL_RPATH "$ORIGIN/../lightsim2grid")
+        set_property(TARGET gpusim2grid_core APPEND PROPERTY
+            BUILD_RPATH "$ORIGIN/../lightsim2grid")
         set_property(TARGET _gpusim2grid APPEND PROPERTY
             INSTALL_RPATH "$ORIGIN/../lightsim2grid")
-        set_property(TARGET _gpusim2grid APPEND PROPERTY
-            BUILD_RPATH "$ORIGIN/../lightsim2grid")
     else()
         set_property(TARGET _gpusim2grid APPEND PROPERTY
+            INSTALL_RPATH "@loader_path/../lightsim2grid")
+        set_property(TARGET gpusim2grid_core APPEND PROPERTY
             INSTALL_RPATH "@loader_path/../lightsim2grid")
     endif()
 
@@ -126,7 +155,8 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
 
     # 1. Explicit flat override.
     if(SUITESPARSE_INCLUDE_DIR AND EXISTS "${SUITESPARSE_INCLUDE_DIR}/klu.h")
-        target_include_directories(_gpusim2grid PRIVATE "${SUITESPARSE_INCLUDE_DIR}")
+        target_include_directories(gpusim2grid_core PUBLIC
+            $<BUILD_INTERFACE:${SUITESPARSE_INCLUDE_DIR}>)
         message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
                        "(SUITESPARSE_INCLUDE_DIR): ${SUITESPARSE_INCLUDE_DIR}")
         set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
@@ -154,13 +184,13 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
     endif()
 
     if(NOT GPUSIM2GRID_SUITESPARSE_FOUND AND EXISTS "${GPUSIM2GRID_SUITESPARSE_DIR}/KLU/Include/klu.h")
-        target_include_directories(_gpusim2grid PRIVATE
-            "${GPUSIM2GRID_SUITESPARSE_DIR}/CXSparse/Include"
-            "${GPUSIM2GRID_SUITESPARSE_DIR}/KLU/Include"
-            "${GPUSIM2GRID_SUITESPARSE_DIR}/AMD/Include"
-            "${GPUSIM2GRID_SUITESPARSE_DIR}/COLAMD/Include"
-            "${GPUSIM2GRID_SUITESPARSE_DIR}/BTF/Include"
-            "${GPUSIM2GRID_SUITESPARSE_DIR}/SuiteSparse_config")
+        target_include_directories(gpusim2grid_core PUBLIC
+            $<BUILD_INTERFACE:${GPUSIM2GRID_SUITESPARSE_DIR}/CXSparse/Include>
+            $<BUILD_INTERFACE:${GPUSIM2GRID_SUITESPARSE_DIR}/KLU/Include>
+            $<BUILD_INTERFACE:${GPUSIM2GRID_SUITESPARSE_DIR}/AMD/Include>
+            $<BUILD_INTERFACE:${GPUSIM2GRID_SUITESPARSE_DIR}/COLAMD/Include>
+            $<BUILD_INTERFACE:${GPUSIM2GRID_SUITESPARSE_DIR}/BTF/Include>
+            $<BUILD_INTERFACE:${GPUSIM2GRID_SUITESPARSE_DIR}/SuiteSparse_config>)
         message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
                        "(lightsim2grid source checkout): ${GPUSIM2GRID_SUITESPARSE_DIR}")
         set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
@@ -172,8 +202,8 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
             NAMES klu.h
             PATH_SUFFIXES suitesparse)
         if(GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR)
-            target_include_directories(_gpusim2grid PRIVATE
-                "${GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR}")
+            target_include_directories(gpusim2grid_core PUBLIC
+                $<BUILD_INTERFACE:${GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR}>)
             message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
                            "(system install): ${GPUSIM2GRID_SYSTEM_SUITESPARSE_INCLUDE_DIR}")
             set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
@@ -195,3 +225,30 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
 endif()
 
 install(TARGETS _gpusim2grid DESTINATION ${SKBUILD_PROJECT_NAME})
+
+# gpusim2grid_core for C++ consumers: the library next to the module, its headers under
+# gpusim2grid/include, and a CMake package (gpusim2grid.get_cmake_dir()) giving the
+# imported target gpusim2grid::core. A consumer that also links lightsim2grid::core must
+# match its -march / -O3 flags (they are part of the target's interface, see above).
+include(CMakePackageConfigHelpers)
+set(GPUSIM2GRID_CORE_CMAKEDIR ${SKBUILD_PROJECT_NAME}/share/cmake/gpusim2grid_core)
+install(TARGETS gpusim2grid_core EXPORT gpusim2grid_coreTargets
+    LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME}
+    RUNTIME DESTINATION ${SKBUILD_PROJECT_NAME}
+    ARCHIVE DESTINATION ${SKBUILD_PROJECT_NAME})
+# The headers and the CMake package only with the lightsim2grid bridge: without it the
+# headers would need the vendored Eigen, which is not installed.
+if(GPUSIM2GRID_LS2G_CORE_FOUND)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
+        DESTINATION ${SKBUILD_PROJECT_NAME}/include
+        FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h"
+        PATTERN "dlpack" EXCLUDE PATTERN "dlpack_export.hpp" EXCLUDE)
+    install(EXPORT gpusim2grid_coreTargets NAMESPACE gpusim2grid::
+        DESTINATION ${GPUSIM2GRID_CORE_CMAKEDIR})
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gpusim2grid_coreConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/gpusim2grid_coreConfig.cmake
+        INSTALL_DESTINATION ${GPUSIM2GRID_CORE_CMAKEDIR})
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gpusim2grid_coreConfig.cmake
+        DESTINATION ${GPUSIM2GRID_CORE_CMAKEDIR})
+endif()
