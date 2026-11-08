@@ -2685,6 +2685,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     int       n_cur   = S;
     bool      in_tail = false;
     TailSolve tail;
+    std::chrono::steady_clock::time_point t_tail_start;   // its first compaction
     spmv_live_ = nullptr;
     // Once the queue is empty: shrink the rounds to the groups the live rows
     // fit in, when there are few enough of them and that is fewer slots.
@@ -2693,6 +2694,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         const int groups = (n_live + G - 1) / G;
         if (groups > tail_max_groups_ || groups * G >= n_cur) return;
         const auto t_c0 = std::chrono::steady_clock::now();
+        if (!in_tail) t_tail_start = t_c0;
         _compact_tail(groups * G, n_cur, iters, t);
         n_cur = groups * G;
         if (!spmv_tail_) spmv_tail_ = std::make_unique<CuSpMV>();
@@ -2716,6 +2718,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     }
 
     // Initial load: every slot (the queue's first rows, phantoms past its end).
+    const auto t_rounds_start = std::chrono::steady_clock::now();
     _wait_sched_upload();
     int n_live = 0;
     for (int s = 0; s < S; ++s) {
@@ -2759,6 +2762,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         ++rounds;
         run += n_cur;
         if (in_tail) ++t.n_tail_rounds;
+        (in_tail ? t.n_tail_row_rounds : t.n_main_row_rounds) += n_live;
 
         // Per-slot residual at the current V, slot order.
         _residual_pass(buf, n_cur, thrust::raw_pointer_cast(d_slot_res_.data()), /*c_start=*/0,
@@ -2917,6 +2921,12 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         }
         enter_tail(n_live);
         buf = _bound_nr_buffers(_table_view(-1));
+    }
+    {
+        const auto t_rounds_end = std::chrono::steady_clock::now();
+        const auto span_ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+        t.t_main_phase_wall_ms = span_ms(t_rounds_start, in_tail ? t_tail_start : t_rounds_end);
+        t.t_tail_phase_wall_ms = in_tail ? span_ms(t_tail_start, t_rounds_end) : 0.;
     }
     spmv_live_ = nullptr;
 

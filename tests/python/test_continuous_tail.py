@@ -92,10 +92,17 @@ def test_contingency_analysis(case118, solver_atol):
     _same_rows(runs, ref, solver_atol)
     t_off = timings[(0, 15)]
     assert t_off.n_tail_rounds == 0 and t_off.n_slot_moves == 0
+    assert t_off.t_main_phase_wall_ms > 0. and t_off.t_tail_phase_wall_ms == 0.
+    assert t_off.n_main_row_rounds > 0 and t_off.n_tail_row_rounds == 0
     for key in runs:
         t = timings[key]
         assert t.n_rounds == t_off.n_rounds, key
         assert 0 < t.n_tail_rounds <= t.n_rounds and t.n_slot_moves > 0, key
+        assert t.t_tail_phase_wall_ms > 0., key
+        # the same rows, the same rounds: only where the tail starts differs
+        assert t.n_tail_row_rounds > 0, key
+        assert t.n_main_row_rounds + t.n_tail_row_rounds == t_off.n_main_row_rounds, key
+        assert t.t_main_phase_wall_ms + t.t_tail_phase_wall_ms <= t.t_driver_solve_wall_ms, key
         assert t.occupancy > t_off.occupancy, key
         assert "tail_compact" in t.to_dict()["gpu_compute"]
 

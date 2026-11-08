@@ -912,6 +912,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall clock of the batch driver's whole solve() (ms); not in any total")
         .def_readonly("t_session_run_wall_ms", &BatchTimings::t_session_run_wall_ms,
                       "Wall clock of the session's whole run() (ms), solve() included; not in any total")
+        .def_readonly("t_main_phase_wall_ms", &BatchTimings::t_main_phase_wall_ms,
+                      "Continuous scheduling: wall clock (ms) of the rounds on all the slots, from the "
+                      "initial load to the tail's first compaction; not in any total")
+        .def_readonly("t_tail_phase_wall_ms", &BatchTimings::t_tail_phase_wall_ms,
+                      "Continuous scheduling: wall clock (ms) of the tail, from its first compaction to "
+                      "the end of the rounds (0 without a tail); not in any total")
         .def_readonly("scheduling", &BatchTimings::scheduling,
                       "BatchScheduling of the run: 0 = chunked, 1 = continuous")
         .def_readonly("nb_iter_per_round", &BatchTimings::nb_iter_per_round,
@@ -924,6 +930,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("n_tail_rounds", &BatchTimings::n_tail_rounds,
                       "Continuous scheduling: rounds run on the compacted live rows with the "
                       "small cuDSS handle (tail_max_groups)")
+        .def_readonly("n_main_row_rounds", &BatchTimings::n_main_row_rounds,
+                      "Continuous scheduling: live rows summed over the rounds before the tail")
+        .def_readonly("n_tail_row_rounds", &BatchTimings::n_tail_row_rounds,
+                      "Continuous scheduling: live rows summed over the rounds of the tail")
         .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,
                       "Continuous scheduling: rows moved to another slot by the tail compaction")
         // --- metadata ---
@@ -1114,6 +1124,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
             py::dict wall;
             wall["driver_solve_ms"] = t.t_driver_solve_wall_ms;
             wall["session_run_ms"]  = t.t_session_run_wall_ms;
+            wall["main_phase_ms"]   = t.t_main_phase_wall_ms;
+            wall["tail_phase_ms"]   = t.t_tail_phase_wall_ms;
             result["wall"]         = wall;
             return result;
         }, "Nested dict view of the coarse timing buckets: "

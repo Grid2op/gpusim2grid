@@ -5,6 +5,8 @@ Change Log
 --------------------
 - [IMPROVED] ``outer_loops=True``: the host model's row load is ~3x and its decisions ~2x cheaper (shared
   ReactiveLimits plans, base limit sums, flat per-row state); results unchanged.
+- [ADDED] Continuous scheduling timings: ``t_main_phase_wall_ms`` (every slot in use) and ``t_tail_phase_wall_ms``,
+  with the live rows solved in each (``n_main_row_rounds``, ``n_tail_row_rounds``).
 - [ADDED] (diagnostic) ``GPUSIM2GRID_OC_PROFILE=1``: wall time per part of the outer model, on stderr.
 - [BREAKING] ``SlackRedistributionData.gen_target_p_mw`` is now ``gens_target_p_mw``. In C++, ``RowResult``
   has a dense ``gens_target_p_mw`` and ``gen_target_p_mw(gen_id)``; ``gen_ids`` is gone.

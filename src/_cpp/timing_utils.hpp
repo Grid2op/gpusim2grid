@@ -416,6 +416,11 @@ struct BatchTimings {
     // total.
     double t_driver_solve_wall_ms = 0.;
     double t_session_run_wall_ms  = 0.;
+    // Continuous scheduling, how the rounds split (ms, not added to any total): every slot
+    // in use, from the initial load to the tail's first compaction (to the end of the rounds
+    // without a tail), and the tail, from that compaction to the end of the rounds.
+    double t_main_phase_wall_ms = 0.;
+    double t_tail_phase_wall_ms = 0.;
 
     // --- metadata ---
     //
@@ -439,6 +444,10 @@ struct BatchTimings {
     // handle (tail_max_groups), and the slot moves that compaction made
     int    n_tail_rounds     = 0;
     int    n_slot_moves      = 0;
+    // the live rows summed over the rounds, before the tail and in it (phantom slots not
+    // counted): what t_main_phase_wall_ms / t_tail_phase_wall_ms solved
+    long long n_main_row_rounds = 0;
+    long long n_tail_row_rounds = 0;
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
