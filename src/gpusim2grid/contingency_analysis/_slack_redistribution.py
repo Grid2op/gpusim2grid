@@ -63,7 +63,7 @@ class SlackRedistributionEngineMixin:
         redistribution_data_from_lsgrid``; the facades do it from the grid) or,
         in array mode, the tuple of its constructor arguments ``(kind, el_id,
         bus_solver, weight, min_p_mw, max_p_mw, target_p_mw, gen_bus_solver,
-        gen_target_p_mw, n_sto, shunt_p_mw, sn_mva[, in_slack[, base_p_mw[, overshoot_mw]]])``: one entry per
+        gens_target_p_mw, n_sto, shunt_p_mw, sn_mva[, in_slack[, base_p_mw[, overshoot_mw]]])``: one entry per
         unit of the distributed slack (generators then storage units, by id;
         kind 5 / 6, container id, solver bus, raw weight, limits with NaN =
         none, set-point in the GENERATOR convention), then every generator's

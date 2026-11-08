@@ -466,7 +466,7 @@ void ContingencyAnalysisSession::run()
                 const Contingency& ctg = contingencies_[static_cast<size_t>(r)];
                 if (ctg.disconnected) continue;
                 const auto g_off = [&](int g) { return ctg_gen_off(r, g); };
-                const auto g_p   = [this](int g) { return static_cast<double>(slack_rd_.gen_target_p_mw(g)); };
+                const auto g_p   = [this](int g) { return static_cast<double>(slack_rd_.gens_target_p_mw(g)); };
                 // the island read off the row's own Sbus: a tripped load / generator on it nets to 0
                 for (int b : ctg.masked_buses) row_p[static_cast<size_t>(b)] = static_cast<double>(h_Sbus_base_(b).real()) * sn;
                 for (const auto& bd : ctg_sbus_ds_[static_cast<size_t>(r)])

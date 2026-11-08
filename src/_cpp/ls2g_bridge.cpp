@@ -507,12 +507,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     SlackRedistributionData d;
     d.n_gen = gens.nb();
     d.gen_bus_solver.resize(d.n_gen);
-    d.gen_target_p_mw.resize(d.n_gen);
+    d.gens_target_p_mw.resize(d.n_gen);
     for (int g = 0; g < d.n_gen; ++g) {
         const ls2g::GenInfo gi(gens, g);
         const int b = gi.connected ? to_solver(gi.bus_id) : -1;
         d.gen_bus_solver(g)  = b;
-        d.gen_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
+        d.gens_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
         if (b < 0) continue;
         const bool g_in_slack = gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12;
         const double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)

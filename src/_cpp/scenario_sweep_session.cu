@@ -763,7 +763,7 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     const auto gen_off = [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); };
     const auto gen_p_row = [this, has_rows](int r, int g) {
         return has_rows ? static_cast<double>(gen_p_rows_(r, g))
-                        : static_cast<double>(slack_rd_.gen_target_p_mw(g)); };
+                        : static_cast<double>(slack_rd_.gens_target_p_mw(g)); };
     const auto sbus_p_mw = [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); };
     const auto row_p = [&row_p_mw](int r) { return row_p_mw[static_cast<size_t>(r)]; };
     row_lost_p_mw_.clear();

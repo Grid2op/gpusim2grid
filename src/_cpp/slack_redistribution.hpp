@@ -102,7 +102,7 @@ struct SlackRedistributionData {
     // loses when the row gives no set-point of its own
     int             n_gen = 0;
     Eigen::VectorXi gen_bus_solver;   // [n_gen]
-    RealVect        gen_target_p_mw;  // [n_gen]
+    RealVect        gens_target_p_mw;  // [n_gen]
     int             n_sto = 0;        // storage container size (masks are sized on it)
     // ---- per solver bus, the active power of its shunts at 1 pu (MW, load
     // convention): not in the AC Sbus, lost with the bus all the same
@@ -144,7 +144,7 @@ struct SlackRedistributionData {
             }
         }
         need(gen_bus_solver.size(),  n_gen, "gen_bus_solver");
-        need(gen_target_p_mw.size(), n_gen, "gen_target_p_mw");
+        need(gens_target_p_mw.size(), n_gen, "gens_target_p_mw");
         need(shunt_p_mw.size(),  n_bus, "shunt_p_mw");
         for (int k = 0; k < n_units; ++k) {
             std::ostringstream m;

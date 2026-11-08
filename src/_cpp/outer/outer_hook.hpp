@@ -20,7 +20,10 @@
 #ifndef GPUSIM2GRID_OUTER_HOOK_HPP
 #define GPUSIM2GRID_OUTER_HOOK_HPP
 
+#include <cmath>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace outer {
@@ -143,9 +146,23 @@ struct RowResult {
     std::string failed_loop;     // the loop's name when status == FAILED
     int  nb_outer_iterations = 0;
     int  nb_nr_iterations = 0;   // summed over every inner solve, at least 1 per solve
-    // what the loops moved, sparse: only what differs from the row's own values
-    std::vector<int>    gen_ids;
-    std::vector<double> gen_target_p_mw;
+    // what the loops moved: the generators' targets by generator id, dense (MW, NaN: not
+    // moved; empty: none moved). gens_target_p_mw is every generator, gen_target_p_mw(gen_id)
+    // one of them, gen_targets() the moved ones as (id, MW) pairs.
+    // Dense because a row resumed from the "n" solve carries a target for most generators:
+    // the slot's vector is handed over as it is, instead of being re-packed per row.
+    std::vector<double> gens_target_p_mw;
+    double gen_target_p_mw(int gen_id) const {
+        return static_cast<size_t>(gen_id) < gens_target_p_mw.size()
+            ? gens_target_p_mw[static_cast<size_t>(gen_id)]
+            : std::numeric_limits<double>::quiet_NaN();
+    }
+    std::vector<std::pair<int, double>> gen_targets() const {
+        std::vector<std::pair<int, double>> out;
+        for (size_t g = 0; g < gens_target_p_mw.size(); ++g)
+            if (!std::isnan(gens_target_p_mw[g])) out.emplace_back(static_cast<int>(g), gens_target_p_mw[g]);
+        return out;
+    }
     std::vector<int>    storage_ids;
     std::vector<double> storage_target_p_mw;   // load convention, as the container
     std::vector<int>    hvdc_ids;

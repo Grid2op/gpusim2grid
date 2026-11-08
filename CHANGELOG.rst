@@ -3,6 +3,11 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] ``outer_loops=True``: the host model's row load is ~3x and its decisions ~2x cheaper (shared
+  ReactiveLimits plans, base limit sums, flat per-row state); results unchanged.
+- [ADDED] (diagnostic) ``GPUSIM2GRID_OC_PROFILE=1``: wall time per part of the outer model, on stderr.
+- [BREAKING] ``SlackRedistributionData.gen_target_p_mw`` is now ``gens_target_p_mw``. In C++, ``RowResult``
+  has a dense ``gens_target_p_mw`` and ``gen_target_p_mw(gen_id)``; ``gen_ids`` is gone.
 - [ADDED] ``gpusim2grid_core``: the solvers as a C++ shared library without Python (headers, CMake package
   ``gpusim2grid::core``, ``gpusim2grid.get_cmake_dir()``), for C++ / JNI callers; the Python module links it.
 - [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU

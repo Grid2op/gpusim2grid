@@ -294,7 +294,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const RealVect> max_p_mw,
                                Eigen::Ref<const RealVect> target_p_mw,
                                Eigen::Ref<const Eigen::VectorXi> gen_bus_solver,
-                               Eigen::Ref<const RealVect> gen_target_p_mw,
+                               Eigen::Ref<const RealVect> gens_target_p_mw,
                                int n_sto,
                                Eigen::Ref<const RealVect> shunt_p_mw,
                                double sn_mva,
@@ -307,7 +307,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  d.weight = weight; d.min_p_mw = min_p_mw; d.max_p_mw = max_p_mw;
                  d.target_p_mw = target_p_mw;
                  d.n_gen = static_cast<int>(gen_bus_solver.size());
-                 d.gen_bus_solver = gen_bus_solver; d.gen_target_p_mw = gen_target_p_mw;
+                 d.gen_bus_solver = gen_bus_solver; d.gens_target_p_mw = gens_target_p_mw;
                  d.n_sto = n_sto; d.shunt_p_mw = shunt_p_mw; d.sn_mva = sn_mva;
                  d.in_slack = in_slack;
                  d.base_p_mw = base_p_mw;
@@ -317,7 +317,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
              pybind11::arg("kind"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
              pybind11::arg("weight"), pybind11::arg("min_p_mw"), pybind11::arg("max_p_mw"),
              pybind11::arg("target_p_mw"), pybind11::arg("gen_bus_solver"),
-             pybind11::arg("gen_target_p_mw"), pybind11::arg("n_sto"),
+             pybind11::arg("gens_target_p_mw"), pybind11::arg("n_sto"),
              pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"),
              pybind11::arg("in_slack") = Eigen::VectorXi(),
              pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN(),
@@ -334,7 +334,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("in_slack",        &SlackRedistributionData::in_slack)
         .def_readonly("n_gen",           &SlackRedistributionData::n_gen)
         .def_readonly("gen_bus_solver",  &SlackRedistributionData::gen_bus_solver)
-        .def_readonly("gen_target_p_mw", &SlackRedistributionData::gen_target_p_mw)
+        .def_readonly("gens_target_p_mw", &SlackRedistributionData::gens_target_p_mw)
         .def_readonly("n_sto",           &SlackRedistributionData::n_sto)
         .def_readonly("shunt_p_mw",      &SlackRedistributionData::shunt_p_mw)
         .def_readonly("sn_mva",          &SlackRedistributionData::sn_mva)
@@ -1475,11 +1475,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .def_readonly("nb_outer_iterations", &outer::RowResult::nb_outer_iterations)
       .def_readonly("nb_nr_iterations", &outer::RowResult::nb_nr_iterations,
                     "Newton iterations summed over every inner solve, at least 1 per solve")
-      .def_property_readonly("gen_target_p", [](const outer::RowResult& r) {
-            std::vector<std::pair<int, double>> out;
-            for (size_t k = 0; k < r.gen_ids.size(); ++k) out.emplace_back(r.gen_ids[k], r.gen_target_p_mw[k]);
-            return out;
-        }, "(generator id, MW): the target a loop (DistributedSlack) moved it to")
+      .def_property_readonly("gen_target_p", [](const outer::RowResult& r) { return r.gen_targets(); }, "(generator id, MW): the target a loop (DistributedSlack) moved it to")
       .def_property_readonly("storage_target_p", [](const outer::RowResult& r) {
             std::vector<std::pair<int, double>> out;
             for (size_t k = 0; k < r.storage_ids.size(); ++k) out.emplace_back(r.storage_ids[k], r.storage_target_p_mw[k]);
