@@ -45,6 +45,7 @@
 #include "../slot_schedule.cuh"           // SlotLoadView, SlotTableView
 #include "../segment_gather.cuh"          // RowSegments, SegmentGather
 #include "slot_hvdc_status.cuh"           // SlotHvdcStatus
+#include "slot_vc_hold.cuh"               // SlotVcHold
 #include "slot_slack_redistribution.cuh"  // SlotSlackRedistribution
 
 // Forward declaration to avoid circular include.
@@ -133,6 +134,7 @@ struct ContingencyBatch {
     // handed to its driver, uploaded by initialize().
     // -------------------------------------------------------------------------
     SlotHvdcStatus                         hvdc_;
+    SlotVcHold                             vc_hold_;
     SlotSlackRedistribution                slack_;
     thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus, only with a correction
 
@@ -234,6 +236,12 @@ struct ContingencyBatch {
         hvdc_.set_host(base_status, off_orig, active_to_orig_);
     }
 
+    // the controllers each row has lost (see SlotVcHold), before initialize()
+    void set_vc_hold_host(int n_ctrl, const std::vector<std::vector<int>>& held_orig)
+    {
+        vc_hold_.set_host(n_ctrl, held_orig, active_to_orig_);
+    }
+
     ContingencyBatch(ContingencyBatch&&) noexcept = default;
     ContingencyBatch(const ContingencyBatch&) = delete;
     ContingencyBatch& operator=(const ContingencyBatch&) = delete;
@@ -321,6 +329,7 @@ struct ContingencyBatch {
         if (mask_.any()) mask_.bind(T, buf, d_J_outer, cs);
         slack_.fill(buf);
         hvdc_.fill(buf);
+        vc_hold_.fill(buf);
     }
 
     // The continuous tail's compaction (BatchPfDriver::_compact_tail): this
@@ -332,6 +341,7 @@ struct ContingencyBatch {
             launch_move_slot_rows(thrust::raw_pointer_cast(d_Sbus_batch.data()), n_bus, M, cs);
         slack_.move_slots(M, cs);
         hvdc_.move_slots(M, cs);
+        vc_hold_.move_slots(M, cs);
     }
 
     // -------------------------------------------------------------------------

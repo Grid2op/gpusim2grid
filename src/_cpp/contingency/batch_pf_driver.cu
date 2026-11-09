@@ -1465,6 +1465,17 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
     if (base.has_vc_held)
         buf.d_vc_qoff = thrust::raw_pointer_cast(base.d_vc_qoff.data());
 
+    // a batch whose rows trip controllers of a group: the holding formulation's positions,
+    // its per-slot state being the source's (SlotVcHold)
+    if (outer_hook_ == nullptr && base.n_vc_ctrl > 0 && base.vc_may_hold) {
+        buf.d_vc_weight      = thrust::raw_pointer_cast(base.d_vc_weight.data());
+        buf.d_vch_slope_pos  = thrust::raw_pointer_cast(base.d_vch_slope_pos.data());
+        buf.d_vch_vm_pos     = thrust::raw_pointer_cast(base.d_vch_vm_pos.data());
+        buf.d_vch_sh_row     = thrust::raw_pointer_cast(base.d_vch_sh_row.data());
+        buf.d_vch_rowpos_off = thrust::raw_pointer_cast(base.d_vch_rowpos_off.data());
+        buf.d_vch_rowpos     = thrust::raw_pointer_cast(base.d_vch_rowpos.data());
+    }
+
     // The outer loops: every slot's own control state (see _oc_setup).
     if (outer_hook_ != nullptr && oc_stride_ > 0) {   // _oc_setup ran
         const outer::Layout& Lo = outer_hook_->layout();

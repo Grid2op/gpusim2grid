@@ -49,7 +49,7 @@ void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, StoO
     struct BusControllers { std::vector<int> gens, stos, hvdcs; };
     std::map<int, BusControllers> controllers;
     for (int g = 0; g < n_gen; ++g) {
-        if (!gd.status[g] || !gd.local_vreg[g]) continue;
+        if (!gd.status[g] || !gd.local_vreg[g] || gd.on_group_bus[g]) continue;   // (a group holds its bus)
         const int b = gd.bus[g];
         if (b < 0) continue;
         controllers[b].gens.push_back(g);
@@ -94,17 +94,74 @@ void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, StoO
     std::sort(required.begin(), required.end());
 }
 
-// Why the batch cannot take this generator out of a row (empty: it can): a remote
-// controller, or a bus a control group holds -- remote generator, SVC, HVDC station --
-// lives in the VoltageControl extension, whose own Jacobian rows and columns nothing here
-// reserves or releases.
-inline std::string gen_unsupported(const GenContingencyData& gd, int g)
+// Why the batch cannot take this generator out of a row (empty: it can): a controller
+// of a voltage-control group (a remote one, or on a bus a group holds) leaves its group
+// by value, what neither the physical checks nor the gradients know how to read yet.
+inline std::string gen_unsupported(const GenContingencyData& gd, int g, bool physical, bool adjoint)
 {
-    if (gd.remote_vreg[g])
-        return "disconnects generator " + std::to_string(g) + ", which regulates the voltage of a remote bus";
-    if (gd.on_group_bus[g])
-        return "disconnects generator " + std::to_string(g) + ", which stands on a bus a control group holds";
+    if (!gd.remote_vreg[g] && !gd.on_group_bus[g]) return std::string();
+    if (physical)
+        return "disconnects generator " + std::to_string(g) + ", a controller of a voltage-control group: "
+               "the physical checks cannot leave it out of a row yet";
+    if (adjoint)
+        return "disconnects generator " + std::to_string(g) + ", a controller of a voltage-control group: "
+               "the gradients do not support it yet";
     return std::string();
+}
+
+// The controllers of the voltage-control groups these elements are (positions in the ledger's
+// controller list, sorted).
+inline std::vector<int> tripped_controllers(const LedgerData& ld, const std::vector<int>& gens,
+                                            const std::vector<int>& svcs, const std::vector<int>& hvdcs)
+{
+    std::vector<int> out;
+    const auto named = [](const std::vector<int>& ids, int id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); };
+    for (size_t c = 0; c < ld.vc_kind.size() && c < ld.vc_elem_id.size(); ++c) {
+        const int kind = ld.vc_kind[c], id = ld.vc_elem_id[c];
+        // VoltageControlSolverData::Kind: GEN, SVC, HVDC_SIDE_1, HVDC_SIDE_2, STORAGE
+        if ((kind == 0 && named(gens, id)) || (kind == 1 && named(svcs, id)) || ((kind == 2 || kind == 3) && named(hvdcs, id)))
+            out.push_back(static_cast<int>(c));
+    }
+    return out;
+}
+
+// Why a row cannot lose these controllers (empty: it can): a frozen one holds its output in
+// Sbus, and a group left with nobody regulating frees its regulated bus -- not a slack bus,
+// whose magnitude nothing would hold any more.
+inline std::string tripped_controllers_unsupported(const LedgerData& ld, const std::vector<int>& tripped)
+{
+    if (tripped.empty()) return std::string();
+    const auto is_tripped = [&](int c) { return std::binary_search(tripped.begin(), tripped.end(), c); };
+    for (int c : tripped)
+        if (static_cast<size_t>(c) < ld.vc_held.size() && ld.vc_held[static_cast<size_t>(c)])
+            return "disconnects controller " + std::to_string(c) + " of a voltage-control group, held at a reactive limit";
+    for (int g = 0; g < ld.vc_n_groups(); ++g) {
+        const int bus = ld.vc_reg_bus[static_cast<size_t>(g)];
+        if (std::find(ld.vc_free_vm_slack_buses.begin(), ld.vc_free_vm_slack_buses.end(), bus) == ld.vc_free_vm_slack_buses.end())
+            continue;
+        const int first = ld.vc_grp_start[static_cast<size_t>(g)], cnt = ld.vc_grp_count[static_cast<size_t>(g)];
+        bool one_tripped = false, someone_left = false;
+        for (int c = first; c < first + cnt; ++c) {
+            if (is_tripped(c)) one_tripped = true;
+            else if (static_cast<size_t>(c) >= ld.vc_held.size() || !ld.vc_held[static_cast<size_t>(c)]) someone_left = true;
+        }
+        if (one_tripped && !someone_left)
+            return "disconnects every controller of the group regulating a slack bus (solver bus " + std::to_string(bus) + ")";
+    }
+    return std::string();
+}
+
+// What a row has lost among the controllers: those it trips and those on a bus it masks.
+inline std::vector<int> lost_controllers(const LedgerData& ld, const std::vector<int>& tripped,
+                                         const std::vector<int>& masked_buses)
+{
+    std::vector<int> out = tripped;
+    for (size_t c = 0; c < ld.vc_bus.size(); ++c)
+        if (std::find(masked_buses.begin(), masked_buses.end(), ld.vc_bus[c]) != masked_buses.end())
+            out.push_back(static_cast<int>(c));
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 // Per-row normalised slack weights ([n_rows * n_slack], ORIGINAL order) without

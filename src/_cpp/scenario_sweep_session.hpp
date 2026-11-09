@@ -302,6 +302,10 @@ struct ScenarioSweepSession {
     std::vector<MoreTrips>        more_off_;
     bool                          has_more_off_ = false;
     std::vector<std::string>      row_unsupported_;
+    // the controllers of the voltage-control groups each row trips, and whether the base
+    // ledger carries the entries that takes (reserve_tripped_controller_slots)
+    std::vector<std::vector<int>> row_vc_tripped_;
+    bool                          reserved_vc_trip_ = false;
     void _set_more_off(Eigen::Ref<const BoolMat> mask, int n_el, std::vector<int> MoreTrips::*member, const char* who);
     std::vector<std::string> _row_unsupported_reasons() const;
     bool _row_trips(int r, std::vector<int> MoreTrips::*member, int el) const {

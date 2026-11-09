@@ -173,6 +173,7 @@ void ScenarioSweepBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadVie
     const int S     = ctx.batch_size;
 
     hvdc_.load(L, thrust::raw_pointer_cast(ctx.base.d_hvdc_status.data()), cs);
+    vc_hold_.load(L, cs);
 
     // ①  V: the row's own starting point (set_v_init_from_orig) when given,
     //     else the base-case V; a phantom slot always the base case.

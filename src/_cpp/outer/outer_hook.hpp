@@ -133,6 +133,8 @@ struct RowOverrides {
     // n_rows x n_load, row-major: 1 = the row disconnects the load (its contingency trips
     // it): out of what TransformerVoltageControl reads off the bus
     std::vector<char> load_off;
+    // per row, the controllers of the voltage-control groups it trips (ledger positions)
+    std::vector<std::vector<int>> vc_tripped;
     // per row, the hvdc lines it trips (grid ids)
     std::vector<std::vector<int>> hvdc_off;
     // n_rows x n_storage, row-major: 1 = the row disconnects the storage unit

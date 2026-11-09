@@ -1022,6 +1022,9 @@ void Ls2gOuterModel::load(int slot, int row)
                                      ov_.load_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_load_));
         }
         if (r < ov_.lost_p_mw.size()) st.rowv.lost_p_mw = ov_.lost_p_mw[r];
+        // a controller the row trips is gone, as one on a masked bus (below)
+        if (r < ov_.vc_tripped.size())
+            for (int c : ov_.vc_tripped[r]) st.held_q[static_cast<size_t>(c)] = 0.;
         if (r < ov_.hvdc_off.size() && !ov_.hvdc_off[r].empty()) {
             st.hvdc_tripped.assign(hvdc_id_.size(), 0);
             for (int h : ov_.hvdc_off[r]) {

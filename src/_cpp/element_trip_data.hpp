@@ -82,7 +82,6 @@ struct ElementTripData {
     std::vector<char>   hvdc_on;            // [n_hvdc]
     std::vector<char>   hvdc_droop;         // [n_hvdc] in AC emulation: its active power is in the Newton
     std::vector<char>   hvdc_regulating;    // [n_hvdc] one of its stations regulates a voltage
-    std::vector<char>   hvdc_on_group;      // [n_hvdc] one of its stations regulates a bus a control group holds
     std::vector<int>    hvdc_station_bus;   // solver bus, -1 when off or outside the solved grid
     std::vector<double> hvdc_station_p_mw;  // generator convention
     std::vector<double> hvdc_station_q_mvar;// 0 for one regulating its bus
@@ -171,14 +170,14 @@ inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t
         if (d.svc_bus[k] < 0) continue;
         if (d.svc_standby[k]) return "disconnects static var compensator " + std::to_string(s) + ", which carries a standby automaton";
         if (d.svc_frozen[k]) return "disconnects static var compensator " + std::to_string(s) + ", which an outer loop froze at a reactive limit";
-        if (d.svc_voltage[k]) return "disconnects static var compensator " + std::to_string(s) + ", which regulates a voltage";
+        if (physical && d.svc_voltage[k])
+            return "disconnects static var compensator " + std::to_string(s) + ", which regulates a voltage: the physical checks cannot leave it out of a row yet";
     }
     for (int h : t.hvdcs) {
         const size_t k = static_cast<size_t>(h);
         if (!d.hvdc_on[k]) continue;
         if (physical && d.hvdc_droop[k])
             return "disconnects hvdc line " + std::to_string(h) + ", which runs in AC emulation: the physical checks cannot leave it out of a row yet";
-        if (d.hvdc_on_group[k]) return "disconnects hvdc line " + std::to_string(h) + ", a station of which stands in a control group";
         if (outer && d.hvdc_regulating[k])
             return "disconnects hvdc line " + std::to_string(h) + ", a station of which regulates a voltage: the outer loops cannot leave it out yet";
         if (physical && d.hvdc_regulating[k])

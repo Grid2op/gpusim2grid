@@ -145,6 +145,8 @@ struct Contingency {
     // not listed here is pinned whatever vc_pinned_ctrl says, so a row built
     // without pins (a preview of its masks) still sees it pinned.
     std::vector<int> vc_released;
+    // The controllers of the voltage-control groups this row trips: gone (lightsim2grid PR #292)
+    std::vector<int> vc_tripped;
 
     // Branch ids (lines-then-trafos) tripped by this contingency, populated
     // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.

@@ -246,6 +246,7 @@ struct ContingencyAnalysisSession {
     bool has_gen_trips_ = false;
     // the buses the base ledger was extended with (a generator trip releases them
     // on some row), and the ones each row releases
+    bool                          reserved_vc_trip_ = false;   // the base ledger carries reserve_tripped_controller_slots
     std::vector<int>              reserved_buses_;
     std::vector<std::vector<int>> row_pv_to_pq_;
 

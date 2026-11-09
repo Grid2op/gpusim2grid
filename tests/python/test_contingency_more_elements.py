@@ -244,9 +244,16 @@ def _grid_hvdc_station_in_group():
     return _finish(grid)
 
 
+def _grid_standby_svc():
+    grid = _base()
+    grid.init_svcs([2], np.ones(1), np.array([5.]), np.zeros(1), np.full(1, -0.5), np.full(1, 0.5),
+                   np.array([4], dtype=np.int32), np.array([4], dtype=np.int32))
+    grid.set_svc_standby([True], np.full(1, 0.9), np.full(1, 1.1))
+    return _finish(grid)
+
+
 UNSUPPORTED = [
-    (SVC, _grid_svc, [VOLTAGE], "voltage"),
-    (HVDC, _grid_hvdc_station_in_group, [0], "group"),
+    (SVC, _grid_standby_svc, [0], "standby"),
     (STORAGE, lambda: _grid_storage_on_group_bus()[0], [REGULATING], "group"),
 ]
 
@@ -257,7 +264,7 @@ def test_what_the_batch_cannot_do_is_reported_per_row(runner, kind, make, bad, w
     from gpusim2grid.contingency_analysis import LimitViolationType
     grid = make()
     # (an element the batch can take out, or nothing: the second row opens a line anyway)
-    ok = {SVC: [FIXED_Q], STORAGE: [PQ]}.get(kind, [])
+    ok = {STORAGE: [PQ]}.get(kind, [])
     trips = [(bad, []), (ok, [5])]
     session, V = runner(grid, trips, kind, compute_limit_violations=True)
     reasons = session.get_batch_unsupported_reasons()
@@ -268,32 +275,211 @@ def test_what_the_batch_cannot_do_is_reported_per_row(runner, kind, make, bad, w
     assert [el.violation_type for el in v0] == [LimitViolationType.BATCH_UNSUPPORTED]
 
 
-@pytest.mark.parametrize("runner", ["analysis", "sweep"])
-def test_a_remote_generator_is_reported_not_raised(runner):
-    from gpusim2grid import ContingencyAnalysisGPU, ScenarioSweepGPU
-    grid, remote = _grid_storage_on_group_bus()
-    other = next(g.id for g in grid.get_generators() if not g.is_slack and g.id != remote)
-    n_bus = grid.get_Ybus_solver().shape[0]
-    if runner == "analysis":
-        s = ContingencyAnalysisGPU(grid, nb_iter=15, tol_base=TOL)
-        s.add_contingencies([([], [], [], [remote]), ([], [], [], [other])])
-        s.compute(batch_size=2)
-        V = s.V_results.to_numpy().reshape(2, n_bus)
-    else:
-        s = ScenarioSweepGPU(grid, nb_iter=15, tol_base=TOL)
-        load_p = np.asarray(grid.get_load_target_p(), dtype=float)
-        load_q = np.array([el.target_q_mvar for el in grid.get_loads()], dtype=float)
-        gen_p = np.asarray(grid.get_gen_target_p(), dtype=float)
-        s.set_injections_from_elements(np.tile(load_p, (2, 1)), np.tile(load_q, (2, 1)), np.tile(gen_p, (2, 1)))
-        mask = np.zeros((2, gen_p.shape[0]), dtype=bool)
-        mask[0, remote] = mask[1, other] = True
-        s.set_contingency_gens(mask)
-        s.compute(batch_size=2)
-        V = s.solver.V_results.to_numpy().reshape(2, n_bus)
-    reasons = s.get_batch_unsupported_reasons()
-    assert "remote" in reasons[0] and reasons[1] == ""
-    assert np.isnan(V[0]).all()
-    np.testing.assert_allclose(V[1], _reference(grid, gens=[other]), rtol=0., atol=1e-7)
+# ----- controllers of a voltage-control group ---------------------------------------------
+GROUP = (1, 2, 3)
+GROUP_TRIPS = ([1], [2], [3], [1, 2], [1, 3], [2, 3], [1, 2, 3])
+REG_BUS = 9
+
+
+def _grid_group(group=GROUP, reg_bus=REG_BUS, algo="NR_KLU", q_limits=None):
+    from lightsim2grid.network import init_from_pandapower
+    net = _net()
+    for gen_pos, (min_q, max_q) in (q_limits or {}).items():
+        net.gen.loc[net.gen.index[gen_pos - 1], ["min_q_mvar", "max_q_mvar"]] = [min_q, max_q]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(net)
+    for gen_id in group:
+        grid.set_gen_regulated_bus(gen_id, reg_bus)
+        grid.change_v_gen(gen_id, 1.04)
+    return _finish(grid, algo)
+
+
+def _gens_in_analysis(grid, trips, **kwargs):
+    from gpusim2grid import ContingencyAnalysisGPU
+    kwargs.setdefault("nb_iter", 15)
+    kwargs.setdefault("tol_base", TOL)
+    ca = ContingencyAnalysisGPU(grid, **kwargs)
+    ca.add_contingencies([([], [], [], list(g)) for g in trips])
+    ca.compute(batch_size=4)
+    return ca, ca.V_results.to_numpy().reshape(len(trips), grid.get_Ybus_solver().shape[0])
+
+
+def _gens_in_sweep(grid, trips, **kwargs):
+    from gpusim2grid import ScenarioSweepGPU
+    kwargs.setdefault("nb_iter", 15)
+    kwargs.setdefault("tol_base", TOL)
+    n = len(trips)
+    sw = ScenarioSweepGPU(grid, **kwargs)
+    load_p = np.asarray(grid.get_load_target_p(), dtype=float)
+    load_q = np.array([el.target_q_mvar for el in grid.get_loads()], dtype=float)
+    gen_p = np.asarray(grid.get_gen_target_p(), dtype=float)
+    sw.set_injections_from_elements(np.tile(load_p, (n, 1)), np.tile(load_q, (n, 1)), np.tile(gen_p, (n, 1)))
+    mask = np.zeros((n, gen_p.shape[0]), dtype=bool)
+    for r, g in enumerate(trips):
+        mask[r, list(g)] = True
+    sw.set_contingency_gens(mask)
+    sw.compute(batch_size=4)
+    return sw, sw.solver.V_results.to_numpy().reshape(n, grid.get_Ybus_solver().shape[0])
+
+
+@pytest.mark.parametrize("runner", [_gens_in_analysis, _gens_in_sweep], ids=["analysis", "sweep"])
+@pytest.mark.parametrize("kwargs", [{}, {"handle_disconnected_grid": True}], ids=["plain", "islands"])
+def test_generators_of_a_group_match_a_one_off_powerflow(runner, kwargs):
+    grid = _grid_group()
+    session, V = runner(grid, GROUP_TRIPS, **kwargs)
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    for r, gens in enumerate(GROUP_TRIPS):
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-7, err_msg=f"row {r}: {gens}")
+
+
+def test_a_group_of_one():
+    grid = _grid_group(group=(3,))
+    session, V = _gens_in_analysis(grid, [[3]])
+    np.testing.assert_allclose(V[0], _reference(grid, gens=[3]), rtol=0., atol=1e-7)
+
+
+def test_the_regulated_bus_goes_free_when_nobody_is_left():
+    grid = _grid_group()
+    session, V = _gens_in_analysis(grid, [GROUP, [1]])
+    buses = list(np.asarray(grid.id_ac_solver_to_me(), dtype=int))
+    assert abs(abs(V[0][buses.index(REG_BUS)]) - 1.04) > 1e-3
+    assert abs(V[1][buses.index(REG_BUS)]) == pytest.approx(1.04, abs=1e-8)
+
+
+def test_a_local_generator_of_a_group():
+    """generator 1 stands on the bus generator 3 regulates remotely: both are of the group"""
+    bus_of_1 = _base().get_generators()[1].bus_id
+    grid = _grid_group(group=(1, 3), reg_bus=bus_of_1)
+    trips = [[1], [3], [1, 3]]
+    session, V = _gens_in_analysis(grid, trips)
+    assert not any(session.get_batch_unsupported_reasons())
+    for r, gens in enumerate(trips):
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-7, err_msg=f"{gens}")
+
+
+def test_a_row_that_trips_no_controller_next_to_one_that_does():
+    grid = _grid_group()
+    from gpusim2grid import ContingencyAnalysisGPU
+    ca = ContingencyAnalysisGPU(grid, nb_iter=15, tol_base=TOL)
+    ca.add_contingencies([([], [], [], [1]), ([5], [], [], [])])
+    ca.compute(batch_size=2)
+    V = ca.V_results.to_numpy().reshape(2, -1)
+    np.testing.assert_allclose(V[0], _reference(grid, gens=[1]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=1e-7)
+
+
+def test_an_islanded_controller_next_to_a_tripped_one():
+    """the islanded one is gone too: the row trips the live controller, nobody is left"""
+    n_line = len(_base().get_lines())
+    grid = _grid_group(group=(2, 3), reg_bus=8)
+    trafo = [n_line + t.id for t in grid.get_trafos() if 7 in (t.bus1_id, t.bus2_id)][0]
+    from gpusim2grid import ContingencyAnalysisGPU
+    ca = ContingencyAnalysisGPU(grid, nb_iter=15, tol_base=TOL, handle_disconnected_grid=True)
+    ca.add_contingencies([([trafo], [], [], [2])])
+    ca.compute(batch_size=1)
+    V = ca.V_results.to_numpy().reshape(1, -1)[0]
+    assert not any(ca.get_batch_unsupported_reasons())
+    ref = copy.deepcopy(grid)
+    ref.deactivate_trafo(trafo - n_line)
+    ref.deactivate_gen(2)
+    ref.consider_only_main_component(False)
+    ref.tell_solver_need_reset()
+    V_ref = ref.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, TOL)
+    assert V_ref.size > 0
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    live = np.isfinite(V)
+    assert not live[list(buses).index(7)]
+    np.testing.assert_allclose(V[live], V_ref[buses][live], rtol=0., atol=1e-7)
+
+
+def test_a_voltage_mode_svc():
+    grid = _grid_svc()
+    trips = [([VOLTAGE], []), ([VOLTAGE, FIXED_Q], []), ([VOLTAGE], [5])]
+    for runner in (_analysis, _sweep):
+        session, V = runner(grid, trips, SVC)
+        assert not any(session.get_batch_unsupported_reasons())
+        for r, (ids, branches) in enumerate(trips):
+            np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=1e-7, err_msg=f"{ids}")
+
+
+def test_stations_of_a_control_group():
+    grid = _grid_hvdc_station_in_group()
+    other_gen_trips = [([0], []), ([0, 1], [])]
+    session, V = _analysis(grid, other_gen_trips, HVDC)
+    assert not any(session.get_batch_unsupported_reasons())
+    for r, (ids, _) in enumerate(other_gen_trips):
+        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=1e-7, err_msg=f"{ids}")
+
+
+def test_with_the_outer_loops_a_generator_of_a_group():
+    from lightsim2grid.algorithm import ReactiveLimits
+    grid = _grid_group(algo=OUTER)
+    grid.clear_outer_loops()
+    grid.add_outer_loop(ReactiveLimits())
+    _finish(grid, OUTER)
+    session, V = _gens_in_analysis(grid, GROUP_TRIPS, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT,
+                                   ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    for r, gens in enumerate(GROUP_TRIPS):
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-6, err_msg=f"row {r}: {gens}")
+
+
+def test_controllers_follow_their_row_through_the_continuous_tail():
+    from gpusim2grid import ContingencyAnalysisGPU
+    grid = _grid_group()
+    conts = [([b], [], [], [1 + (b % 3)]) for b in range(7)] * 2
+    ca = ContingencyAnalysisGPU(grid, scheduling="continuous", nb_iter=MAX_IT, tol=1e-9 / grid.get_sn_mva(), tol_base=TOL)
+    ca.tail_max_groups = 1
+    ca.tail_group_size = 4
+    ca.add_contingencies(conts)
+    ca.compute(batch_size=12)
+    assert ca.timings.n_slot_moves > 0
+    V = ca.V_results.to_numpy().reshape(len(conts), grid.get_Ybus_solver().shape[0])
+    for r, c in enumerate(conts):
+        np.testing.assert_allclose(V[r], _reference(grid, gens=c[3], branches=c[0]), rtol=0., atol=1e-7, err_msg=f"{c}")
+
+
+def test_a_sweep_can_drop_and_regain_its_controller_trips():
+    """the entries a tripped controller needs are reserved from the masks, on every run: the same
+    session then matches a one-off powerflow with the trips gone and back"""
+    from gpusim2grid import ScenarioSweepGPU
+    grid = _grid_group()
+    load_p = np.asarray(grid.get_load_target_p(), dtype=float)[None, :]
+    load_q = np.array([el.target_q_mvar for el in grid.get_loads()], dtype=float)[None, :]
+    gen_p = np.asarray(grid.get_gen_target_p(), dtype=float)[None, :]
+    sw = ScenarioSweepGPU(grid, nb_iter=15, tol_base=TOL)
+    sw.set_injections_from_elements(load_p, load_q, gen_p)
+    mask = np.zeros_like(gen_p, dtype=bool)
+    for trip in (True, False, True):
+        mask[0, 1] = trip
+        sw.set_contingency_gens(mask)
+        sw.compute(batch_size=1)
+        V = sw.solver.V_results.to_numpy().reshape(1, -1)[0]
+        np.testing.assert_allclose(V, _reference(grid, gens=[1] if trip else []), rtol=0., atol=1e-7, err_msg=f"{trip}")
+
+
+def test_a_controller_with_physical_checks_is_reported():
+    grid = _grid_group()
+    session, V = _gens_in_analysis(grid, [[1]], compute_physical_violations=True)
+    assert "physical" in session.get_batch_unsupported_reasons()[0]
+
+
+def test_a_controller_with_gradients_is_reported():
+    """BatchPowerFlow's rows, backward included, do not know how to read such a row yet"""
+    from gpusim2grid import ScenarioSweepGPU
+    grid = _grid_group()
+    gen_p = np.asarray(grid.get_gen_target_p(), dtype=float)[None, :]
+    load_p = np.asarray(grid.get_load_target_p(), dtype=float)[None, :]
+    load_q = np.array([el.target_q_mvar for el in grid.get_loads()], dtype=float)[None, :]
+    sw = ScenarioSweepGPU(grid, nb_iter=15, tol_base=TOL)
+    sw.set_injections_from_elements(load_p, load_q, gen_p)
+    mask = np.zeros_like(gen_p, dtype=bool)
+    mask[0, 1] = True
+    sw.set_contingency_gens(mask)
+    sw.solver.keep_final_jacobian = True
+    sw.compute(batch_size=1)
+    assert "gradient" in sw.get_batch_unsupported_reasons()[0]
 
 
 @pytest.mark.parametrize("kind, make, ids, lost", [

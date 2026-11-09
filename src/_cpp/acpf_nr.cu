@@ -1080,7 +1080,7 @@ AcPfNrState::AcPfNrState(
 
         // the outer loops' may_hold_ formulation: every position it writes per slot
         // (see vc_hold_fill_J_kernel), read off lightsim2grid's union pattern
-        vc_may_hold = ledger->outer_loops;
+        vc_may_hold = ledger->outer_loops || ledger->vc_may_trip;
         if (vc_may_hold) {
             std::vector<cuda_real_type> w(n_vc_ctrl);
             std::vector<int> sh_row_c(n_vc_ctrl, -1);

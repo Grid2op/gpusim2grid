@@ -715,7 +715,6 @@ ElementTripData extract_element_trip_data(const ls2g::LSGrid& grid, int n_bus_so
     d.hvdc_on.assign(static_cast<size_t>(d.n_hvdc), 0);
     d.hvdc_droop.assign(static_cast<size_t>(d.n_hvdc), 0);
     d.hvdc_regulating.assign(static_cast<size_t>(d.n_hvdc), 0);
-    d.hvdc_on_group.assign(static_cast<size_t>(d.n_hvdc), 0);
     d.hvdc_station_bus.assign(2 * static_cast<size_t>(d.n_hvdc), -1);
     d.hvdc_station_p_mw.assign(2 * static_cast<size_t>(d.n_hvdc), 0.);
     d.hvdc_station_q_mvar.assign(2 * static_cast<size_t>(d.n_hvdc), 0.);
@@ -731,7 +730,6 @@ ElementTripData extract_element_trip_data(const ls2g::LSGrid& grid, int n_bus_so
             const int bus_me = hvdc_lines.get_station_bus(h, side).cast_int();
             const bool regulates = hvdc_lines.station_is_voltage_controller(h, side);
             if (regulates) d.hvdc_regulating[hh] = 1;
-            if (regulates && on_group(bus_me)) d.hvdc_on_group[hh] = 1;
             if (!st.get_status()[hh]) continue;
             d.hvdc_station_bus[k] = to_solver(bus_me);
             d.hvdc_station_p_mw[k] = static_cast<double>(st.get_target_p(h));
@@ -827,7 +825,9 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
     for (int h = 0; h < d.n_hvdc; ++h) {
         if (!hvdc_lines.get_status_global()[static_cast<size_t>(h)]) continue;
         for (int side = 1; side <= 2; ++side)
-            if (hvdc_lines.station_is_voltage_controller(h, side))
+            // (a station on a bus a group holds is a controller of that group, not of the PV path)
+            if (hvdc_lines.station_is_voltage_controller(h, side) &&
+                group_buses.count(hvdc_lines.get_station_bus(h, side).cast_int()) == 0)
                 d.station_vreg_bus[static_cast<size_t>(2 * h + side - 1)] = bus_of(hvdc_lines.get_station_bus(h, side).cast_int());
     }
     return d;
@@ -836,6 +836,10 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
 LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, double tol)
 {
     LedgerData ld;
+    {
+        const std::set<int> free_vm = grid.get_free_vm_slack_solver_buses();
+        ld.vc_free_vm_slack_buses.assign(free_vm.begin(), free_vm.end());
+    }
 
     // Augmented J sparsity skeleton in RowMajor CSR (structure only). get_J_solver
     // hands back lightsim2grid's compressed ColMajor J; its index arrays are

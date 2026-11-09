@@ -196,6 +196,7 @@ void ScenarioSweepSession::_build_base_state(const std::vector<int>& switchable_
             move_reference(ext, ref_bus_, Ybus_rm_);
         if (!switchable_buses.empty())
             add_switchable_vm_buses(ext, switchable_buses, Ybus_rm_);
+        if (reserved_vc_trip_) reserve_tripped_controller_slots(ext);
         ledger_ptr = &ext;
     }
 
@@ -1082,7 +1083,7 @@ std::vector<std::string> ScenarioSweepSession::_row_unsupported_reasons() const
         std::string why;
         if (has_gen_off_ && r < gen_off_.rows())
             for (int g = 0; g < gen_data_.n_gen && why.empty(); ++g)
-                if (gen_off_(r, g)) why = gen_contingency::gen_unsupported(gen_data_, g);
+                if (gen_off_(r, g)) why = gen_contingency::gen_unsupported(gen_data_, g, phys_.compute_physical_violations, keep_final_jacobian_);
         if (why.empty() && has_more_off_ && static_cast<size_t>(r) < more_off_.size())
             why = element_trips::more_unsupported(trip_data_, more_off_[static_cast<size_t>(r)], outer_ != nullptr,
                                                   phys_.compute_physical_violations);
@@ -1093,6 +1094,16 @@ std::vector<std::string> ScenarioSweepSession::_row_unsupported_reasons() const
                           "ShuntVoltageControl loop owns its sections";
                     break;
                 }
+        if (why.empty() && base_ledger_) {
+            std::vector<int> gens;
+            if (has_gen_off_ && r < gen_off_.rows())
+                for (int g = 0; g < gen_data_.n_gen; ++g) if (gen_off_(r, g)) gens.push_back(g);
+            static const std::vector<int> none;
+            const bool have_more = has_more_off_ && static_cast<size_t>(r) < more_off_.size();
+            why = gen_contingency::tripped_controllers_unsupported(*base_ledger_, gen_contingency::tripped_controllers(
+                *base_ledger_, gens, have_more ? more_off_[static_cast<size_t>(r)].svcs : none,
+                have_more ? more_off_[static_cast<size_t>(r)].hvdcs : none));
+        }
         out[static_cast<size_t>(r)] = why;
     }
     return out;
@@ -1353,7 +1364,28 @@ void ScenarioSweepSession::run()
     }
     // a row's status is settled with its masks: a change means a new source
     if (row_unsupported_ != prev_unsupported) topology_dirty_ = true;
-    if (!outer_ && (required != reserved_buses_ || want_ref != ref_bus_)) {
+    // the controllers each row trips; a change is a new source as well
+    bool want_vc_trip = false;
+    {
+        std::vector<std::vector<int>> vc_trips(static_cast<size_t>(n_scenarios_));
+        if (base_ledger_ && (has_gen_off_ || has_more_off_)) {
+            static const std::vector<int> none;
+            for (int r = 0; r < n_scenarios_; ++r) {
+                if (!row_unsupported_[static_cast<size_t>(r)].empty()) continue;
+                std::vector<int> gens;
+                if (has_gen_off_ && r < gen_off_.rows())
+                    for (int g = 0; g < gen_data_.n_gen; ++g) if (gen_off_(r, g)) gens.push_back(g);
+                const bool have_more = has_more_off_ && static_cast<size_t>(r) < more_off_.size();
+                vc_trips[static_cast<size_t>(r)] = gen_contingency::tripped_controllers(
+                    *base_ledger_, gens, have_more ? more_off_[static_cast<size_t>(r)].svcs : none,
+                    have_more ? more_off_[static_cast<size_t>(r)].hvdcs : none);
+                want_vc_trip = want_vc_trip || !vc_trips[static_cast<size_t>(r)].empty();
+            }
+        }
+        if (vc_trips != row_vc_tripped_) { row_vc_tripped_ = std::move(vc_trips); topology_dirty_ = true; }
+    }
+    if (!outer_ && (required != reserved_buses_ || want_ref != ref_bus_ || want_vc_trip != reserved_vc_trip_)) {
+        reserved_vc_trip_ = want_vc_trip;
         ref_bus_ = want_ref;
         _build_base_state(required);
     }
@@ -1419,6 +1451,7 @@ void ScenarioSweepSession::run()
             ctg.vc_released.clear();
             if (has_vc_release_) ctg.vc_released = sw_vc_release_[r];
             ctg.skip = (has_skip_ && skip_rows_[r] != 0) || !row_unsupported_[r].empty();
+            ctg.vc_tripped = row_vc_tripped_[r];
         }
         // (the outer loops pin the switchable buses per slot themselves)
         if (!reserved_buses_.empty() && !outer_) {
@@ -1664,6 +1697,14 @@ void ScenarioSweepSession::run()
         rd_applied_ = rd_active;
     }
 
+    // the controllers each row has lost: tripped, or on a bus it masks
+    if (!outer_ && reserved_vc_trip_) {
+        std::vector<std::vector<int>> lost(static_cast<size_t>(n_scenarios_));
+        for (int r = 0; r < n_scenarios_; ++r)
+            lost[static_cast<size_t>(r)] = gen_contingency::lost_controllers(
+                *base_ledger_, row_vc_tripped_[static_cast<size_t>(r)], contingencies_[static_cast<size_t>(r)].masked_buses);
+        solver_->source_.set_vc_hold(base_state_->n_vc_ctrl, lost, solver_->batch_size_, scs);
+    }
     // the lines in AC emulation each row trips (the outer loops own the slots' regimes)
     if (!outer_ && base_state_->n_hvdc > 0) {
         std::vector<std::vector<int>> droop_off(static_cast<size_t>(n_scenarios_));
@@ -1793,6 +1834,7 @@ void ScenarioSweepSession::run()
             for (int r = 0; r < n_scenarios_; ++r)
                 ov.branch_off[static_cast<size_t>(r)] = contingencies_[static_cast<size_t>(r)].tripped_branches;
         }
+        ov.vc_tripped = row_vc_tripped_;
         if (has_gen_off_ && gen_off_.rows() == n_scenarios_) {
             ov.gen_off.assign(static_cast<size_t>(n_scenarios_) * gen_off_.cols(), 0);
             for (int r = 0; r < n_scenarios_; ++r)

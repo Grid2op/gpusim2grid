@@ -27,6 +27,7 @@ void ContingencyBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
             "case's participant count");
     slack_.upload(ctx.batch_size, cs);
     hvdc_.upload(ctx.batch_size, cs);
+    vc_hold_.upload(ctx.batch_size, cs);
     if (slack_.has_dp() || slot_sbus_)
         d_Sbus_batch.resize(static_cast<size_t>(ctx.batch_size) * ctx.n_bus);
 }
@@ -82,6 +83,7 @@ void ContingencyBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadView&
     //     exists (base Sbus per slot, then the row's correction); the row's
     //     slack weights when some row was re-weighted.
     hvdc_.load(L, thrust::raw_pointer_cast(ctx.base.d_hvdc_status.data()), cs);
+    vc_hold_.load(L, cs);
     if (!slack_.has_dp() && !slack_.has_weights() && !slot_sbus_) return;
     timer.start();
     if (slack_.has_dp() || slot_sbus_) {

@@ -113,12 +113,13 @@ void ContingencyAnalysisSession::_build_base_state(const std::vector<int>& switc
     LedgerData moved;
     if (base_ledger_) {
         ledger_ptr = base_ledger_.get();
-        if ((ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) || !switchable_buses.empty()) {
+        if ((ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) || !switchable_buses.empty() || reserved_vc_trip_) {
             moved = *base_ledger_;
             if (ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) move_reference(moved, ref_bus_, Ybus_rm_);
             // a generator trip releasing a bus it held alone: a Vm column + Q row for it,
             // pinned on the rows that keep it PV (see run())
             if (!switchable_buses.empty()) add_switchable_vm_buses(moved, switchable_buses, Ybus_rm_);
+            if (reserved_vc_trip_) reserve_tripped_controller_slots(moved);
             ledger_ptr = &moved;
         }
     }
@@ -358,7 +359,7 @@ void ContingencyAnalysisSession::run()
     for (size_t c = 0; c < contingencies_.size(); ++c) {
         std::string why;
         for (int g : ctg_gens_[c]) {
-            why = gen_contingency::gen_unsupported(gen_data_, g);
+            why = gen_contingency::gen_unsupported(gen_data_, g, phys_.compute_physical_violations, false);
             if (!why.empty()) break;
         }
         if (why.empty() && ctg_more_[c].any())
@@ -372,6 +373,13 @@ void ContingencyAnalysisSession::run()
                           "ShuntVoltageControl loop owns its sections";
                     break;
                 }
+        std::vector<int> vc_tripped;
+        if (why.empty() && base_ledger_) {
+            vc_tripped = gen_contingency::tripped_controllers(*base_ledger_, ctg_gens_[c], ctg_more_[c].svcs, ctg_more_[c].hvdcs);
+            why = gen_contingency::tripped_controllers_unsupported(*base_ledger_, vc_tripped);
+        }
+        if (!why.empty()) vc_tripped.clear();
+        contingencies_[c].vc_tripped = vc_tripped;
         unsupported[c] = why;
     }
 
@@ -395,7 +403,7 @@ void ContingencyAnalysisSession::run()
         return std::find(ids.begin(), ids.end(), h) != ids.end();
     };
     bool any_controller_trip = has_gen_trips_;
-    for (const MoreTrips& t : ctg_more_) any_controller_trip = any_controller_trip || !t.storages.empty() || !t.hvdcs.empty();
+    for (const MoreTrips& t : ctg_more_) any_controller_trip = any_controller_trip || !t.storages.empty() || !t.hvdcs.empty() || !t.svcs.empty();
     std::vector<int>              required;
     std::vector<std::vector<int>> row_slack_off;
     row_pv_to_pq_.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
@@ -433,7 +441,11 @@ void ContingencyAnalysisSession::run()
     // as does a change of the buses the generator trips release (the outer loops'
     // ledger carries its own)
     const int want_ref = _wanted_reference_bus();
-    if (want_ref != ref_bus_ || (!outer_ && required != reserved_buses_)) {
+    bool want_vc_trip = false;
+    for (size_t c = 0; c < contingencies_.size(); ++c)
+        want_vc_trip = want_vc_trip || (!contingencies_[c].vc_tripped.empty() && row_unsupported_[c].empty());
+    if (want_ref != ref_bus_ || (!outer_ && (required != reserved_buses_ || want_vc_trip != reserved_vc_trip_))) {
+        reserved_vc_trip_ = want_vc_trip;
         ref_bus_ = want_ref;
         _build_base_state(outer_ ? std::vector<int>() : required);
     }
@@ -591,6 +603,14 @@ void ContingencyAnalysisSession::run()
                 if (row_unsupported_[r].empty() && !ctg_more_[r].hvdcs.empty())
                     droop_off[r] = element_trips::droop_entries(base_state_->h_hvdc_id, ctg_more_[r].hvdcs);
             source.set_hvdc_off_host(base_state_->h_hvdc_status, droop_off);
+            // ... and the controllers each has lost: tripped, or on a bus it masks
+            if (reserved_vc_trip_) {
+                std::vector<std::vector<int>> lost(contingencies_.size());
+                for (size_t r = 0; r < contingencies_.size(); ++r)
+                    lost[r] = gen_contingency::lost_controllers(*base_ledger_, contingencies_[r].vc_tripped,
+                                                                contingencies_[r].masked_buses);
+                source.set_vc_hold_host(base_state_->n_vc_ctrl, lost);
+            }
         }
         if (!w_rows.empty() || any_ds)
             source.set_row_sbus_host(w_rows, base_state_->n_slack,
@@ -722,6 +742,9 @@ void ContingencyAnalysisSession::run()
                 for (int g : ctg_gens_[r]) ov.gen_off[r * static_cast<size_t>(n_gen) + static_cast<size_t>(g)] = 1;
         }
         if (any_controller_trip) ov.pq_buses = row_pv_to_pq_;
+        // ... and the controllers of the voltage-control groups it trips
+        ov.vc_tripped.resize(contingencies_.size());
+        for (size_t r = 0; r < contingencies_.size(); ++r) ov.vc_tripped[r] = contingencies_[r].vc_tripped;
         // ... and the lines in AC emulation it trips
         ov.hvdc_off.resize(contingencies_.size());
         for (size_t r = 0; r < ctg_more_.size(); ++r) ov.hvdc_off[r] = ctg_more_[r].hvdcs;
