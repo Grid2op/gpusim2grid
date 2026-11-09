@@ -448,6 +448,10 @@ struct BatchTimings {
     // counted): what t_main_phase_wall_ms / t_tail_phase_wall_ms solved
     long long n_main_row_rounds = 0;
     long long n_tail_row_rounds = 0;
+    // base-case loads of freed slots once the queue is empty, and those the tail made
+    // unnecessary (the slot overwritten by a moved row, or out of the rounds)
+    long long n_base_loads = 0;
+    long long n_base_loads_skipped = 0;
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero

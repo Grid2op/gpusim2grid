@@ -932,6 +932,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "small cuDSS handle (tail_max_groups)")
         .def_readonly("n_main_row_rounds", &BatchTimings::n_main_row_rounds,
                       "Continuous scheduling: live rows summed over the rounds before the tail")
+        .def_readonly("n_base_loads", &BatchTimings::n_base_loads,
+                      "continuous: base-case loads of freed slots once the queue is empty")
+        .def_readonly("n_base_loads_skipped", &BatchTimings::n_base_loads_skipped,
+                      "continuous: base-case loads the tail made unnecessary (slot overwritten or out of the rounds)")
         .def_readonly("n_tail_row_rounds", &BatchTimings::n_tail_row_rounds,
                       "Continuous scheduling: live rows summed over the rounds of the tail")
         .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,

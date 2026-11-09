@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] Continuous scheduling: no base-case load of a freed slot the tail overwrites or drops
+  (``n_base_loads`` / ``n_base_loads_skipped``); results unchanged.
 - [FIXED] ``outer_loops=True``: ``scaling_max_voltage_change`` / ``max_dVa`` / ``max_dVm`` were silently ignored at
   construction (the grid's own setting was always used).
 - [IMPROVED] MaxVoltageChange step scaling: one block per slot instead of one thread per entry (about 4x cheaper),

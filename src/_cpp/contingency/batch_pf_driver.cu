@@ -2644,7 +2644,9 @@ void BatchPfDriver<BatchSource>::_oa_load(const SlotLoadView& L)
 // A leaving row gets its residual, its NaN mask, its checks, its V and its
 // flows written at its original row (_evict through the eviction map), and
 // its slot is reloaded at once: with the next queued row, else with the base
-// case (required: the slot holds the old row's NaN mask / divergent state).
+// case (required: the slot holds the old row's NaN mask / divergent state) --
+// unless the tail is about to overwrite it with a moved row or drop it from
+// the rounds, in which case the slot is never read again as it stands.
 // Rows are loaded in active order into the freed slots in increasing slot
 // order, so a row's trajectory depends on that row alone. A loaded row always
 // runs at least k iterations (it is first checked after its first round).
@@ -2689,10 +2691,15 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     spmv_live_ = nullptr;
     // Once the queue is empty: shrink the rounds to the groups the live rows
     // fit in, when there are few enough of them and that is fewer slots.
-    auto enter_tail = [&](int n_live) {
-        if (!tail_ok || q < n_active_ || n_live <= 0) return;
+    // (the groups to shrink to, 0 = no shrink)
+    auto tail_groups = [&](int n_live) {
+        if (!tail_ok || q < n_active_ || n_live <= 0) return 0;
         const int groups = (n_live + G - 1) / G;
-        if (groups > tail_max_groups_ || groups * G >= n_cur) return;
+        return (groups > tail_max_groups_ || groups * G >= n_cur) ? 0 : groups;
+    };
+    auto enter_tail = [&](int n_live) {
+        const int groups = tail_groups(n_live);
+        if (groups == 0) return;
         const auto t_c0 = std::chrono::steady_clock::now();
         if (!in_tail) t_tail_start = t_c0;
         _compact_tail(groups * G, n_cur, iters, t);
@@ -2858,15 +2865,42 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             for (int s = 0; s < S; ++s) {
                 if (h_evict()[s] < 0) continue;
                 const int row = q < n_active_ ? q++ : -1;
+                h_slot_row()[s] = row;
+                iters[static_cast<size_t>(s)] = 0;
+                if (row < 0) continue;
                 h_load_slot()[n_load] = s;
                 h_load_row()[n_load]  = row;
                 ++n_load;
-                h_slot_row()[s] = row;
-                iters[static_cast<size_t>(s)] = 0;
-                if (row >= 0) ++n_load_real;
+                ++n_load_real;
                 loaded.push_back(s);
             }
             n_live += n_load_real - n_leave;
+            // The freed slots the queue did not fill. enter_tail, right after the load,
+            // moves the rows of [n_keep, n_cur) into the lowest empty slots below n_keep
+            // and stops running the others: only an empty slot it leaves below n_keep
+            // is iterated as it stands and needs the base case.
+            if (n_live > 0) {
+                const int groups = tail_groups(n_live);
+                const int n_keep = groups > 0 ? groups * G : n_cur;
+                int n_moved_in = 0;
+                for (int s = n_keep; s < n_cur; ++s) n_moved_in += h_slot_row()[s] >= 0;
+                for (int s = 0; s < n_cur; ++s) {
+                    if (h_slot_row()[s] >= 0) continue;
+                    const bool freed = h_evict()[s] >= 0;
+                    if (s < n_keep && n_moved_in > 0) {
+                        --n_moved_in;
+                        t.n_base_loads_skipped += freed;
+                    } else if (s >= n_keep) {
+                        t.n_base_loads_skipped += freed;
+                    } else if (freed) {
+                        h_load_slot()[n_load] = s;
+                        h_load_row()[n_load]  = -1;
+                        ++n_load;
+                        ++t.n_base_loads;
+                        loaded.push_back(s);
+                    }
+                }
+            }
             _upload_sched();
         }
         t.t_schedule += TimingEntry{0., std::chrono::duration<double, std::milli>(
@@ -2906,8 +2940,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
 
         // ---- refill the freed slots ---------------------------------------
         if (n_live == 0) break;   // everything left; no round follows
-        _load(_load_view(n_load, -1, n_load_real), timer, t);
-        if (hook != nullptr) {
+        if (n_load > 0) _load(_load_view(n_load, -1, n_load_real), timer, t);
+        if (hook != nullptr && n_load > 0) {
             const auto t_l0 = std::chrono::steady_clock::now();
             for (int s : loaded) {
                 const int a = h_slot_row()[s];
