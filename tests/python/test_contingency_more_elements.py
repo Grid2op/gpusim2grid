@@ -425,6 +425,46 @@ def test_with_the_outer_loops_a_generator_of_a_group():
         np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-6, err_msg=f"row {r}: {gens}")
 
 
+def _grid_two_controllers_on_a_bus(algo):
+    """two generators on one bus regulating a remote one, with a third elsewhere, the group short of
+    reactive power: ReactiveLimits freezes the bus the row keeps a unit on"""
+    import pandapower as pp
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.algorithm import ReactiveLimits
+    net = _net()
+    bus = int(net.gen.bus.iloc[1])
+    pp.create_gen(net, bus, p_mw=5., vm_pu=float(net.gen.vm_pu.iloc[1]), min_q_mvar=-5., max_q_mvar=5.)
+    net.gen.loc[net.gen.index[1], ["min_q_mvar", "max_q_mvar"]] = [-5., 5.]
+    net.gen.loc[net.gen.index[2], ["min_q_mvar", "max_q_mvar"]] = [-5., 5.]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(net)
+    on_bus = [g.id for g in grid.get_generators() if g.bus_id == bus]
+    other = next(g.id for g in grid.get_generators() if not g.is_slack and g.bus_id != bus)
+    assert len(on_bus) == 2
+    group = on_bus + [other]
+    for g in group:
+        grid.set_gen_regulated_bus(g, REG_BUS)
+        grid.change_v_gen(g, 1.06)
+    grid.clear_outer_loops()
+    grid.add_outer_loop(ReactiveLimits())
+    return _finish(grid, algo), on_bus
+
+
+def test_a_tripped_controller_stays_out_when_its_bus_is_frozen():
+    """found on a real grid: ReactiveLimits freezing the bus also wrote its limit over the
+    controller the row had tripped, which came back to life at that limit"""
+    grid, on_bus = _grid_two_controllers_on_a_bus(OUTER)
+    trips = [[on_bus[0]], [on_bus[1]]]
+    session, V = _gens_in_analysis(grid, trips, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, ir_n_steps=1,
+                                   init_from_n_powerflow=False, keep_outer_trace=True, tol=1e-8 / grid.get_sn_mva())
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    res = session.get_outer_results()
+    for r, gens in enumerate(trips):
+        assert any("PV_TO_PQ" in d and "not taken" not in d for d in res[r].decisions), res[r].decisions
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-6, err_msg=f"{gens}")
+
+
 def test_controllers_follow_their_row_through_the_continuous_tail():
     from gpusim2grid import ContingencyAnalysisGPU
     grid = _grid_group()
