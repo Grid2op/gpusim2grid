@@ -110,14 +110,24 @@ enum ProfSec : int {
     P_ON_SOLVED_RESOLVE, P_ON_SOLVED_DONE, P_DS_FOLD, P_CHECK_DS, P_CHECK_HVDC, P_CHECK_VM, P_CHECK_RL,
     P_CHECK_PC, P_CHECK_TVC, P_CHECK_SVC, P_MATERIALIZE, P_FINISH, P_ADJOINT,
     P_LOAD, P_LOAD_PHANTOM, P_LOAD_RL_PLAN, P_LOAD_BC, P_LOAD_SC, P_LOAD_UNITS, P_LOAD_SET_ACTIVE,
-    P_LOAD_RESUME_TARGETS, P_LOAD_INIT_LOOPS, P_LOAD_RESUME_LOOPS, P_LOAD_RESET, P_LOAD_INIT_DS, P_LOAD_INIT_RL, P_LOAD_MASKED_ROWS, P_LOAD_DS_NUNITS, P_RL_BASE, P_RL_RECOMPUTE, P_RL_NO_BASE, P_N_SEC
+    P_LOAD_RESUME_TARGETS, P_LOAD_INIT_LOOPS, P_LOAD_RESUME_LOOPS, P_LOAD_RESET, P_LOAD_INIT_DS, P_LOAD_INIT_RL, P_LOAD_MASKED_ROWS, P_LOAD_DS_NUNITS,
+    P_DONE_NO_RESOLVE, P_DNR_FAILED, P_DNR_OK_MASKED, P_DNR_OK_MOVED, P_DNR_OK_BASE,
+    P_ACT_FIRST, P_ACT_FIRST_LAST = P_ACT_FIRST + 6, P_ACT_ALL, P_ACT_ALL_LAST = P_ACT_ALL + 6,
+    P_DS_STABLE_MOVED, P_RL_RESUME_FROZEN, P_RL_BASE, P_RL_RECOMPUTE, P_RL_NO_BASE, P_N_SEC
 };
 const char* const kProfName[P_N_SEC] = {
     "on_solved (Resolve)", "on_solved (Done)", "  ds_fold", "  check DistributedSlack", "  check HvdcLimits",
     "  check VoltageMonitoring", "  check ReactiveLimits", "  check PhaseControl", "  check TVC",
     "  check ShuntVoltageControl", "  materialize", "  finish", "    adjoint_info",
     "load (row)", "load (phantom)", "  rl plan", "  BranchControl reset", "  ShuntControl reset",
-    "  DistributedSlack units", "  set_active", "  resume targets", "  init_loops", "  resume_loops", "  reset the slot", "    init DistributedSlack", "    init ReactiveLimits", "rows that mask buses", "DS units copied", "rl bus: base sums", "rl bus: moved, recomputed", "rl bus: no base"};
+    "  DistributedSlack units", "  set_active", "  resume targets", "  init_loops", "  resume_loops", "  reset the slot", "    init DistributedSlack", "    init ReactiveLimits", "rows that mask buses", "DS units copied",
+    "on_solved (Done, no re-solve)", "  no re-solve: failed", "  no re-solve: ok, masks buses",
+    "  no re-solve: ok, limits moved", "  no re-solve: ok, base limits",
+    "first act: DistributedSlack", "first act: HvdcLimits", "first act: VoltageMonitoring", "first act: ReactiveLimits",
+    "first act: PhaseControl", "first act: TVC", "first act: ShuntVoltageControl",
+    "acts: DistributedSlack", "acts: HvdcLimits", "acts: VoltageMonitoring", "acts: ReactiveLimits",
+    "acts: PhaseControl", "acts: TVC", "acts: ShuntVoltageControl",
+    "DS STABLE but moved", "rl buses resumed frozen", "rl bus: base sums", "rl bus: moved, recomputed", "rl bus: no base"};
 
 struct OcProfile {
     bool on = false;
@@ -1596,6 +1606,7 @@ void Ls2gOuterModel::resume_loops(SlotState& st) const
                     const RlBus& bus = st.rl->buses[k];
                     auto it = resume_frozen_.find(bus.bus_solver);
                     if (it == resume_frozen_.end() || it->second.first == 0) continue;
+                    if (prof_.on) ++prof_.n[P_RL_RESUME_FROZEN];
                     st.rl_state[k].realistic = it->second.second;
                     double q_min, q_max;
                     rl_limits(st, &rv, bus, q_min, q_max);
@@ -1881,6 +1892,7 @@ int Ls2gOuterModel::check_ds(SlotState& st, const LoopDecl& L, const RowView& rv
     }
     const bool unstable = moved > L.ds_moved_fraction * L.ds_eps_mw;
     record(st, L.name, "UNITS_MOVED", unstable, -1, moved, L.ds_moved_fraction * L.ds_eps_mw);
+    if (prof_.on && !unstable && moved > 0.) ++prof_.n[P_DS_STABLE_MOVED];
     return unstable ? UNSTABLE : STABLE;
 }
 
@@ -2778,7 +2790,17 @@ Next Ls2gOuterModel::on_solved(int slot, bool converged, int nr_iter, int inner_
 {
     ProfScope ps(prof_, P_ON_SOLVED_RESOLVE);
     const Next next = on_solved_impl(slot, converged, nr_iter, inner_status, data, row_status);
-    if (next == Next::Done) ps.relabel(P_ON_SOLVED_DONE);
+    if (next == Next::Done) {
+        const SlotState& st = slots_[static_cast<size_t>(slot)];
+        ps.relabel(st.nb_outer == 0 ? P_DONE_NO_RESOLVE : P_ON_SOLVED_DONE);
+        if (prof_.on && st.nb_outer == 0) {   // what a device filter could have judged
+            if (!st.solver_ok || st.last_status == FAILED) ++prof_.n[P_DNR_FAILED];
+            else {
+                if (!st.masked.empty()) ++prof_.n[P_DNR_OK_MASKED];
+                ++prof_.n[st.lim_dirty.empty() ? P_DNR_OK_BASE : P_DNR_OK_MOVED];
+            }
+        }
+    }
     return next;
 }
 
@@ -2847,6 +2869,11 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
         st.last_status = status;
         st.last_name = L.name;
         if (status == UNSTABLE) {
+            if (prof_.on) {
+                const int kk = static_cast<int>(L.kind);
+                ++prof_.n[P_ACT_ALL + kk];
+                if (st.nb_outer == 0) ++prof_.n[P_ACT_FIRST + kk];
+            }
             ++st.loop_iter[static_cast<size_t>(st.i)];
             st.last_unstable = st.i;
             st.check_unrealistic = st.pass_check_unrealistic;

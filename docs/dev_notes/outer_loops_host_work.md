@@ -5,7 +5,7 @@
 slack mismatch 1 MW) on an RTX 6000. It ran `linear_solver='own_lu'`, batch 2048 and a tail of
 4 x 64, with the outer loops on, against lightsim2grid on one core (KLU, static pivot + min-fill).
 It follows `outer_loops_performance.md`, whose steps 1-3 are done, and Part B of
-`continuous_batching.md`. Nothing here is implemented yet. The two snapshots are called A and B
+`continuous_batching.md`. 4.1 is implemented (two passes), nothing else is. The two snapshots are called A and B
 below; real-grid data stays outside the repository.
 
 **Constraint (2026-11-08): no extra host threads.** Spreading the host model's per-slot calls over
@@ -14,8 +14,8 @@ remove host work, not to spread it, so every idea below runs on the one host thr
 
 **Order agreed (2026-11-08).** Make each component cheaper first (4.1, starting with
 `on_solved`), before anything asynchronous or on the device. The lazy state with its device filter
-and the device decisions (4.2, 4.3, 4.5, 4.6) come later. The overlap (4.4) comes last, if ever:
-the tail works against it (see there).
+and the device decisions (4.2, 4.3, 4.5, 4.6) come later. The overlap (4.4) was put last because
+the tail seemed to work against it; the measured split (3.6) no longer supports that on B.
 
 ## 1. What a run spends
 
@@ -108,6 +108,26 @@ Without these, the gains below are guesses.
    the 41 rounds are tail rounds on few rows, and the tail may hold most of the run. This split
    decides whether 4.4 can work at all. Add a per-round record (live rows, GPU ms, `oc_decide`,
    `oc_load`) next to the totals.
+
+   *Measured on B, RTX 6000, after 4.1* (`t_main_phase_wall_ms` / `t_tail_phase_wall_ms`, printed
+   by `bench_n1.sh`): the large batch takes 1.06 s (12 rounds, 88.2 ms/round, 0.052 ms per row and
+   round), the tail 0.15 s (26 rounds, 5.8 ms/round, 0.255 ms per row and round). **The tail is
+   68 % of the rounds and 12 % of the driver's time.** A tail row-round costs 5x a large-batch one,
+   but there are only ~590 of them out of ~21000. Per-round host and GPU times are still not
+   recorded separately.
+
+   *Starting the tail earlier* (`tail_max_groups`, G = 4, so 64 groups start it at 256 of the 2048
+   slots and 128 at 512; own LU only, the tail being a prefix of the same solver). The tail already
+   re-compacts at every group boundary, for ~1 ms in total, so a coarser ladder only leaves slots
+   empty; what can move is where it starts. On B, from 256 to 512 slots: occupancy 0.83 -> 0.90,
+   the GPU phases ~0.71 -> ~0.67 s, the driver 1.23 -> 1.18 s, compute 1.32 -> 1.28 s, the host
+   unchanged. A at 512 slots (no run at 256 after 4.1 to compare with): occupancy 0.91, large batch
+   0.86 s, tail 0.20 s, compute 1.16 s against 1.98 s before 4.1, host 0.40 s against 1.16 s.
+   Starting at all 2048 slots (`tail_max_groups` 512), the tail begins as soon as the queue is
+   empty: occupancy 1.00 on both, GPU phases ~0.63 s (A) and ~0.62 s (B), compact 2 ms, compute
+   1.13 s (A) and 1.24 s (B), the host unchanged. Nothing is left to gain from occupancy. The "tail"
+   then covers every round after the queue empties (A 0.29 s, B 0.26 s of the driver), so its share
+   is not comparable with the 256-slot runs above.
 
 ## 4. Ideas, in order
 
@@ -226,7 +246,7 @@ For each loop, what the device must prove on a converged solve of a fresh row (r
 | DistributedSlack | slack mismatch below the threshold under which the loop does not move units | the "STABLE but moved" case (B.2 table) must go to the host |
 | AcHvdcAcEmulationLimits | no droop line past its pmax in its regime | already a device check (HVDC P) |
 | VoltageMonitoring | no standby SVC's bus outside its thresholds | already a device check (standby) |
-| ReactiveLimits | every PV bus inside its capability by a margin, no frozen bus whose release test triggers, no frozen bus whose limit moved | capability at the row's target P: a piecewise-linear curve per machine, tabulated on the device; a resumed row with frozen buses goes to the host until this is proven exact |
+| ReactiveLimits | every PV bus inside its capability by a margin, no frozen bus whose release test triggers, no frozen bus whose limit moved | capability at the row's target P: a piecewise-linear curve per machine, tabulated on the device; every resumed row has frozen buses (see below), so the release test must be on the device |
 | PhaseControl | no regulating phase shifter visible to the row | it acts at count 0 whenever one exists, so such grids always go to the host on the first solve |
 | TransformerVoltageControl | INITIAL stage with nothing outside half a deadband | that case is a quiet INITIAL->COMPLETE switch: one per-slot stage flag on the device |
 | ShuntVoltageControl | no visible handled controller | acts at count 0 otherwise |
@@ -236,6 +256,43 @@ The routing subtleties of B.2 (first-visit loops, `last_unstable`, passes) only 
 loop has acted, and by then the row is on the slow path. The fast path only covers "first solve,
 nothing anywhere would act". It is a single, easy-to-state condition, and it is the case that
 dominates if most rows never act.
+
+*Measured, 2026-11-08* (counters of `GPUSIM2GRID_OC_PROFILE=1`, the loose settings, on two laptop
+snapshots L1 and L2, not A and B):
+
+| | L1 | L2 |
+|---|---|---|
+| rows simulated | 10233 | 8618 |
+| rows never re-solved (`nb_outer == 0`) | 6701 (65 %) | 5117 (59 %) |
+| ... of which limits still at the base targets | 5832 (57 % of rows) | 4124 (48 %) |
+| ... of which limits moved by the row's lost-power share | 869 | 993 |
+| ... of which mask buses | 1356 | 1446 |
+| rows that act, first loop acting: DistributedSlack | 1138 | 755 |
+| rows that act, first loop acting: ReactiveLimits | 2394 | 2746 |
+| HvdcLimits, VoltageMonitoring acting | never | never |
+| frozen buses resumed from the "n" solve, per row | 6.0 | 10.0 |
+| `on_solved` calls: total, of which on never-re-solved rows | 15074, 44 % | 13039, 39 % |
+| `on_solved` time: total, of which on never-re-solved rows | 200 ms, 35 % | 166 ms, 32 % |
+
+On B, 2850 outer iterations over 9455 rows mean at least 6605 rows (70 %) never re-solve. What
+this says for the filter:
+
+- **The ceiling is lower than the row share suggests.** The rows that act do the expensive calls:
+  never-re-solved rows are 59-65 % of the rows but a third of `on_solved`. Scaled to B, the filter
+  alone removes at most ~0.1 s of 1.23 s (~0.08 of `oc_decide`, part of the 0.07 of `oc_gather`).
+  It pays through 4.2, the lazy state: `oc_load` is what those rows would then skip, up to ~0.14 s.
+- **Scalar per-bus limits cover most of it.** 80-87 % of the never-re-solved rows have every
+  ReactiveLimits limit at its base value (`RlBus::base_*_q`), so the device needs one (min, max)
+  per bus instead of the capability curves. Rows whose lost-power share moved a generator can go
+  to the host.
+- **Frozen buses cannot be left to the host**: every resumed row has them, so the release test and
+  the moved-limit test have to be device-side from the start.
+- **Masks are required**: a fifth to a quarter of the never-re-solved rows mask buses.
+- DistributedSlack and ReactiveLimits are the only loops that acted on these snapshots, and no
+  DistributedSlack check came back STABLE with units moved.
+
+These are ceilings: the filter's margins will send some of these rows to the host, and its own
+device cost is not counted.
 
 ### 4.4 Overlap on one thread: decide one round late
 
@@ -256,14 +313,16 @@ re-entry path already exists (`set_v_init_from_ptr`-style warm V).
 A round then costs max(GPU, host) instead of their sum. On its own this caps at the host time
 (~1.1 s today), so **it only pays after 4.1-4.2 have brought the host below the GPU time**.
 
-**The tail works against it.** Hiding the host under the GPU needs two disjoint sets of rows at
+**Does the tail work against it?** Hiding the host under the GPU needs two disjoint sets of rows at
 every moment: one on the GPU, one being decided on the host. That means at least twice as many
 rows in flight as either side handles at once. The steady state has them, since the queue refills
-every freed slot. The tail does not: 29 of 41 rounds there run few rows, which often all leave
-together and are all decided before the next round can start. In those rounds the row that is
-being decided is the round's only work, so nothing can overlap it. If, as suspected, the tail
-holds most of the run time (3.6), overlap hides only the steady-state share of the host time.
-Removing host work (4.1-4.3) helps both phases. Hence the order at the top.
+every freed slot. The tail does not: its few rows often all leave together and are all decided
+before the next round can start. That objection assumed the tail held most of the run. On B it
+does not (3.6): the tail is 12 % of the driver's time and the large batch 86 %, so overlap applies
+to most of the host time. An upper bound on B after 4.1 is ~0.4-0.45 s, min(host, GPU) over the
+large batch; it is not measured per round, and it still needs the doubled rows in flight and the
+parking above.
+Overlap hides host work where removing it (4.1-4.3) gets rid of it, which is why it still comes after them.
 
 ### 4.5 Device `load` for the slow path too
 
@@ -300,19 +359,20 @@ so it only matters if tight mode or a smaller S multiplies the rounds.
 
 ## 5. What to expect
 
-These are rough estimates for snapshot A from the counts above, not measurements:
+Snapshot B, RTX 6000. The first two lines are measured, the others are estimates:
 
 | state | host model | run (compute) |
 |---|---|---|
-| today | ~1.16 s | 1.98 s |
-| + 4.1 trimming | ~0.9 s | ~1.7 s |
-| + 4.2/4.3 lazy state + filter (most rows never act) | ~0.3-0.4 s | ~1.1-1.2 s |
-| + 4.4 overlap (host < GPU per round) | hidden in the steady state only | ~0.85 s at best |
+| before 4.1 (measured) | 1.23 s | 2.05 s |
+| after 4.1 (measured) | 0.51 s | 1.32 s |
+| + 4.2/4.3 lazy state + filter, at their ceiling (see 4.3) | ~0.25-0.3 s | ~1.05-1.1 s |
+| + 4.4 overlap | hidden under the GPU in the large batch | ~0.85 s at best |
 | floor: GPU phases + transfers + session | 0 | ~0.8 s |
 
-The 4.4 line is optimistic: it hides only the host time of steady-state rounds (see the tail in
-4.4). The floor is reached only by removing host work, not by hiding it. That is about 40x lightsim2grid's single core, against ~17x today. Below that floor the only lever
-is the GPU itself: its rounds (41, of which 29 are tail rounds) and its per-round cost.
+The floor is reached only by removing host work, not by hiding it. It is about 50x lightsim2grid's
+single core, against ~30x after 4.1. Below that floor the only lever is the GPU itself: its rounds
+(38 on B, of which 26 in the tail, which cost little) and the large batch's per-round cost.
+`occupancy` is 0.83 on B: about 17 % of the slot-rounds hold no row.
 
 ## 6. Not to pursue
 
