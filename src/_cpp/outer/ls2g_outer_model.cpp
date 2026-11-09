@@ -965,6 +965,7 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.pq_buses.empty() || ov_.pq_buses.size() == static_cast<size_t>(n_rows), "released buses");
     check(ov_.vc_v_set.empty() || ov_.vc_v_set.size() == static_cast<size_t>(n_rows) * layout_.n_grp, "group set-points");
     check(ov_.branch_off.empty() || ov_.branch_off.size() == static_cast<size_t>(n_rows), "opened branches");
+    check(ov_.storage_off.empty() || ov_.storage_off.size() == static_cast<size_t>(n_rows) * n_sto_, "disconnected storage units");
     check(ov_.load_off.empty() || ov_.load_off.size() == static_cast<size_t>(n_rows) * n_load_, "disconnected loads");
     check(ov_.lost_p_mw.empty() || ov_.lost_p_mw.size() == static_cast<size_t>(n_rows), "lost active power");
     n_rows_ = n_rows;
@@ -1003,6 +1004,11 @@ void Ls2gOuterModel::load(int slot, int row)
             st.rowv.gens.off.assign(ov_.gen_off.begin() + static_cast<ptrdiff_t>(r * n_gen_),
                                     ov_.gen_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_gen_));
             for (char o : st.rowv.gens.off) changes_units = changes_units || o != 0;
+        }
+        if (!ov_.storage_off.empty()) {
+            st.rowv.storages.off.assign(ov_.storage_off.begin() + static_cast<ptrdiff_t>(r * n_sto_),
+                                        ov_.storage_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_sto_));
+            for (char o : st.rowv.storages.off) changes_units = changes_units || o != 0;
         }
         if (!ov_.load_off.empty()) {
             st.rowv.loads.off.assign(ov_.load_off.begin() + static_cast<ptrdiff_t>(r * n_load_),

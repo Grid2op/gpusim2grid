@@ -537,7 +537,8 @@ def test_with_handle_disconnected_grid(solver_atol):
 
 @requires_gpu
 @needs_bridge
-def test_remote_controller_is_refused():
+def test_remote_controller_is_accepted_by_the_mask():
+    """its row is reported at compute(), see test_contingency_more_elements.py"""
     pp = pytest.importorskip("pandapower")  # noqa: F841
     import pandapower.networks as pn
     from lightsim2grid.gridmodel import init_from_pandapower
@@ -557,9 +558,8 @@ def test_remote_controller_is_refused():
     sw = ScenarioSweepGPU(model, nb_iter=8, tol_base=1e-10)
     mask = np.zeros((1, n_gen), dtype=bool)
     mask[0, 3] = True
-    with pytest.raises(RuntimeError, match="remote"):
-        sw.set_contingency_gens(mask)
-    # a generator that is NOT a remote controller is still fine on this grid
+    sw.set_contingency_gens(mask)
+    # a generator that is NOT a remote controller is fine on this grid too
     mask[:] = False
     mask[0, 0] = True
     sw.set_contingency_gens(mask)

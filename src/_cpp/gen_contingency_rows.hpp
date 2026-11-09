@@ -32,8 +32,9 @@ namespace gen_contingency {
 // reserved pair, see ledger_extend.hpp's add_switchable_vm_buses), sorted;
 // `row_pv_to_pq`: per row, the buses it releases (sorted); `row_slack_off`: per
 // row, the participating generators it takes out of the distributed slack.
-template <class GenOff>
-void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, const LedgerData* base_ledger,
+template <class GenOff, class StoOff, class HvdcOff>
+void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, StoOff sto_off, HvdcOff hvdc_off,
+                  const LedgerData* base_ledger,
                   std::vector<int>& required,
                   std::vector<std::vector<int>>& row_pv_to_pq,
                   std::vector<std::vector<int>>& row_slack_off)
@@ -43,24 +44,33 @@ void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, cons
     row_slack_off.assign(static_cast<size_t>(std::max(n_rows, 0)), std::vector<int>());
     const int n_gen = gd.n_gen;
 
-    // Which bus does each LOCAL voltage controller pin? (-1: none)
-    std::map<int, std::vector<int>> gens_of_bus;
+    // Which bus does each LOCAL voltage controller pin? (generators, storage units and
+    // the converter stations holding their own bus)
+    struct BusControllers { std::vector<int> gens, stos, hvdcs; };
+    std::map<int, BusControllers> controllers;
     for (int g = 0; g < n_gen; ++g) {
         if (!gd.status[g] || !gd.local_vreg[g]) continue;
         const int b = gd.bus[g];
         if (b < 0) continue;
-        // something a row cannot take out holds this bus too: it stays PV whatever the
-        // generators do
-        if (!gd.bus_other_vreg.empty() && gd.bus_other_vreg[static_cast<size_t>(b)]) continue;
-        gens_of_bus[b].push_back(g);
+        controllers[b].gens.push_back(g);
     }
+    for (int s = 0; s < gd.n_storage; ++s) {
+        const int b = gd.storage_vreg_bus[static_cast<size_t>(s)];
+        if (b >= 0) controllers[b].stos.push_back(s);
+    }
+    for (int h = 0; h < gd.n_hvdc; ++h)
+        for (int side = 0; side < 2; ++side) {
+            const int b = gd.station_vreg_bus[static_cast<size_t>(2 * h + side)];
+            if (b >= 0) controllers[b].hvdcs.push_back(h);
+        }
 
     std::set<int> req;
     for (int r = 0; r < n_rows; ++r) {
-        for (const auto& kv : gens_of_bus) {
+        for (const auto& kv : controllers) {
             bool all_off = true;
-            for (int g : kv.second)
-                if (!gen_off(r, g)) { all_off = false; break; }
+            for (int g : kv.second.gens) if (!gen_off(r, g)) { all_off = false; break; }
+            if (all_off) for (int s : kv.second.stos) if (!sto_off(r, s)) { all_off = false; break; }
+            if (all_off) for (int h : kv.second.hvdcs) if (!hvdc_off(r, h)) { all_off = false; break; }
             if (all_off) {
                 row_pv_to_pq[static_cast<size_t>(r)].push_back(kv.first);
                 req.insert(kv.first);
@@ -84,30 +94,17 @@ void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, cons
     std::sort(required.begin(), required.end());
 }
 
-// The generators a row may take out: only those pinning their OWN bus are in
-// scope (a remote controller, or a bus a control group holds -- remote
-// generator, SVC, HVDC station -- lives in the VoltageControl extension, whose
-// own Jacobian rows and columns nothing here reserves or releases; same rule
-// as lightsim2grid). Throws, naming `who`, for the first one out of scope.
-template <class GenOff>
-void check_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, const std::string& who)
+// Why the batch cannot take this generator out of a row (empty: it can): a remote
+// controller, or a bus a control group holds -- remote generator, SVC, HVDC station --
+// lives in the VoltageControl extension, whose own Jacobian rows and columns nothing here
+// reserves or releases.
+inline std::string gen_unsupported(const GenContingencyData& gd, int g)
 {
-    for (int g = 0; g < gd.n_gen; ++g) {
-        bool ever_off = false;
-        for (int r = 0; r < n_rows && !ever_off; ++r)
-            if (gen_off(r, g)) ever_off = true;
-        if (!ever_off) continue;
-        if (gd.remote_vreg[g])
-            throw std::runtime_error(
-                who + ": generator " + std::to_string(g) + " regulates the voltage of a remote bus. "
-                "Only generators regulating their own bus can be disconnected for now: remote "
-                "voltage control is not supported by this feature yet.");
-        if (gd.on_group_bus[g])
-            throw std::runtime_error(
-                who + ": generator " + std::to_string(g) + " stands on a bus whose voltage a control "
-                "group holds (a remote generator, an SVC or an HVDC converter station). Only "
-                "generators regulating their own bus can be disconnected for now.");
-    }
+    if (gd.remote_vreg[g])
+        return "disconnects generator " + std::to_string(g) + ", which regulates the voltage of a remote bus";
+    if (gd.on_group_bus[g])
+        return "disconnects generator " + std::to_string(g) + ", which stands on a bus a control group holds";
+    return std::string();
 }
 
 // Per-row normalised slack weights ([n_rows * n_slack], ORIGINAL order) without
@@ -116,18 +113,26 @@ void check_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, const 
 // units taking part in the slack keep their share on every row (no row
 // disconnects one). Empty when no row takes anything out. `ref_bus` takes the
 // whole share of a row that leaves no participant.
-inline std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
+template <class StoOff>
+std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
                                                      const std::vector<std::vector<int>>& row_slack_off,
                                                      int n_rows, int n_bus,
                                                      const std::vector<int>& slack_bus,
                                                      const std::vector<cuda_real_type>& base_w,
-                                                     int ref_bus, const std::string& who)
+                                                     int ref_bus, const std::string& who, StoOff sto_off)
 {
     std::vector<cuda_real_type> out;
     const int n_slack = static_cast<int>(slack_bus.size());
     if (n_slack <= 0) return out;
+    // whether the row takes a storage unit of the slack out
+    const auto row_sto_off = [&](int r) {
+        for (int s = 0; s < gd.n_storage; ++s)
+            if (gd.storage_bus[static_cast<size_t>(s)] >= 0 && sto_off(r, s)) return true;
+        return false;
+    };
     bool any = false;
     for (const auto& v : row_slack_off) if (!v.empty()) { any = true; break; }
+    for (int r = 0; r < n_rows && !any; ++r) any = row_sto_off(r);
     if (!any) return out;
 
     out.assign(static_cast<size_t>(n_rows) * n_slack, static_cast<cuda_real_type>(0.));
@@ -135,7 +140,8 @@ inline std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& g
     std::vector<char>   off(static_cast<size_t>(gd.n_gen));
     for (int r = 0; r < n_rows; ++r) {
         cuda_real_type* row = out.data() + static_cast<ptrdiff_t>(r) * n_slack;
-        if (row_slack_off[static_cast<size_t>(r)].empty()) {
+        const bool sto_out = row_sto_off(r);
+        if (row_slack_off[static_cast<size_t>(r)].empty() && !sto_out) {
             std::copy(base_w.begin(), base_w.end(), row);
             continue;
         }
@@ -144,9 +150,18 @@ inline std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& g
         std::fill(w.begin(), w.end(), 0.0);
         double sum = 0.0;
         const std::vector<double>& sto_w = gd.storage_slack_weight_bus;
-        for (int b = 0; b < n_bus && b < static_cast<int>(sto_w.size()); ++b) {
-            w[static_cast<size_t>(b)] = sto_w[static_cast<size_t>(b)];
-            sum += sto_w[static_cast<size_t>(b)];
+        if (!sto_out) {
+            for (int b = 0; b < n_bus && b < static_cast<int>(sto_w.size()); ++b) {
+                w[static_cast<size_t>(b)] = sto_w[static_cast<size_t>(b)];
+                sum += sto_w[static_cast<size_t>(b)];
+            }
+        } else {
+            for (int s = 0; s < gd.n_storage; ++s) {
+                const int b = gd.storage_bus[static_cast<size_t>(s)];
+                if (b < 0 || sto_off(r, s)) continue;
+                w[static_cast<size_t>(b)] += gd.storage_slack_weight[static_cast<size_t>(s)];
+                sum += gd.storage_slack_weight[static_cast<size_t>(s)];
+            }
         }
         for (int g = 0; g < gd.n_gen; ++g) {
             if (!gd.status[g] || !gd.slack_participant[g] || off[static_cast<size_t>(g)]) continue;

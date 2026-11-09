@@ -489,6 +489,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
         status = self._s.get_row_status()
+        unsupported = self._s.get_batch_unsupported_reasons()
         out = []
         for c, cnt in enumerate(counts):
             if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
@@ -502,7 +503,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
                 # was never invoked (BatchPfDriver's d_violation_count -1
                 # sentinel). Never written by the kernel itself.
                 out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
-                                            LimitViolationType.NOT_SIMULATED,
+                                            LimitViolationType.BATCH_UNSUPPORTED
+                                            if c < len(unsupported) and unsupported[c]
+                                            else LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
             base = c * stride
@@ -593,6 +596,11 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     def timings(self):
         """BatchTimings from the most recent run() / compute_flows()."""
         return self._s.get_timings()
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per row: why the batch left it out (``""``: it did not). Such a row
+        has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return list(self._s.get_batch_unsupported_reasons())
 
     def get_disconnected(self):
         """Per-scenario disconnected flag: (n_scenarios,) int array, 1 == the

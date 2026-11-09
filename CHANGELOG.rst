@@ -3,6 +3,11 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: a contingency can trip static generators, storage units,
+  SVCs and HVDC lines (lightsim2grid #292): ``add_contingency(sgen_ids=, ...)``, ``set_contingency_sgens`` etc.
+- [BREAKING] What the batch cannot do (a remote generator, an SVC in voltage mode, ...) is reported per row
+  (``get_batch_unsupported_reasons``, a ``BATCH_UNSUPPORTED`` violation) instead of raising for the whole batch.
+- [BREAKING] ``ContingencyAnalysisGPU.get_contingencies()`` returns 10 lists, as lightsim2grid's ``my_contingencies()``.
 - [FIXED] Tripping a generator next to a storage unit or HVDC station still regulating its bus turned that bus PQ.
 - [FIXED] ``outer_loops=True``: a voltage-control group losing a controller to an island, the others held at a
   reactive limit, failed: the islanded controller is now gone and the regulated bus free.

@@ -200,7 +200,11 @@ void ContingencyAnalysisSession::build_contingencies_full(
     const std::vector<std::vector<int>>& load_ids_per_ctg,
     const std::vector<std::vector<int>>& gen_ids_per_ctg,
     const std::vector<std::vector<int>>& branch_ids_side1_per_ctg,
-    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg)
+    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg,
+    const std::vector<std::vector<int>>& sgen_ids_per_ctg,
+    const std::vector<std::vector<int>>& storage_ids_per_ctg,
+    const std::vector<std::vector<int>>& svc_ids_per_ctg,
+    const std::vector<std::vector<int>>& hvdc_ids_per_ctg)
 {
     static const char* who = "ContingencyAnalysisSession::build_contingencies_full";
     if (!has_branch_data_)
@@ -234,6 +238,23 @@ void ContingencyAnalysisSession::build_contingencies_full(
         element_trips::check_ids(gen_ids_per_ctg[c], std::min(trip_data_.n_gen, gen_data_.n_gen), "generator", who);
     }
 
+    for (const auto* more : {&sgen_ids_per_ctg, &storage_ids_per_ctg, &svc_ids_per_ctg, &hvdc_ids_per_ctg})
+        if (!more->empty() && static_cast<int>(more->size()) != n_ctg)
+            throw std::runtime_error(std::string(who) + ": the static generators, storage units, SVCs and hvdc "
+                                     "lines must be given for every contingency, or for none");
+    std::vector<MoreTrips> more_trips(static_cast<size_t>(n_ctg));
+    for (int c = 0; c < n_ctg; ++c) {
+        MoreTrips& t = more_trips[static_cast<size_t>(c)];
+        if (!sgen_ids_per_ctg.empty())    t.sgens    = sgen_ids_per_ctg[c];
+        if (!storage_ids_per_ctg.empty()) t.storages = storage_ids_per_ctg[c];
+        if (!svc_ids_per_ctg.empty())     t.svcs     = svc_ids_per_ctg[c];
+        if (!hvdc_ids_per_ctg.empty())    t.hvdcs    = hvdc_ids_per_ctg[c];
+        if (t.any() && !has_trip_data_)
+            throw std::runtime_error(std::string(who) + ": tripping these elements needs the element data of a "
+                                     "session built from a lightsim2grid grid");
+        if (t.any()) element_trips::check_ids(t, trip_data_, who);
+    }
+
     contingencies_.clear();
     contingencies_.reserve(n_ctg);
     disconnected_per_ctg_.clear();
@@ -241,6 +262,7 @@ void ContingencyAnalysisSession::build_contingencies_full(
     ctg_shunts_ = shunt_ids_per_ctg;
     ctg_loads_  = load_ids_per_ctg;
     ctg_gens_   = gen_ids_per_ctg;
+    ctg_more_   = more_trips;
     ctg_sbus_ds_.assign(static_cast<size_t>(n_ctg), {});
     has_gen_trips_ = any_gen;
 
@@ -260,11 +282,15 @@ void ContingencyAnalysisSession::build_contingencies_full(
         // end on the same diagonal by build_flat_patches)
         for (const auto& t : element_trips::shunt_triplets(trip_data_, shunt_ids_per_ctg[c]))
             ctg.triplets.push_back({t.bus, t.bus, t.re, t.im});
-        // a load / generator: its injection leaves the row's Sbus
-        if (!load_ids_per_ctg[c].empty() || !gen_ids_per_ctg[c].empty())
+        const MoreTrips& more = more_trips[static_cast<size_t>(c)];
+        if (more.any())   // an SVC's b0 leaves the row's Ybus
+            for (const auto& t : element_trips::svc_triplets(trip_data_, more.svcs))
+                ctg.triplets.push_back({t.bus, t.bus, t.re, t.im});
+        // a load / generator / ...: its injection leaves the row's Sbus
+        if (!load_ids_per_ctg[c].empty() || !gen_ids_per_ctg[c].empty() || more.any())
             ctg_sbus_ds_[static_cast<size_t>(c)] = element_trips::sbus_delta(
                 trip_data_, load_ids_per_ctg[c], gen_ids_per_ctg[c],
-                gen_data_.bus, gen_data_.vreg_on, gen_data_.target_q_mvar);
+                gen_data_.bus, gen_data_.vreg_on, gen_data_.target_q_mvar, &more);
         // every branch it opens, at one end or both: no flow reported
         disconnected_per_ctg_.push_back(ctg.tripped_branches);
         contingencies_.push_back(std::move(ctg));
@@ -325,38 +351,71 @@ void ContingencyAnalysisSession::run()
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
+    }
+
+    // What the batch cannot do yet leaves the row out (NaN, BATCH_UNSUPPORTED), not the whole batch
+    std::vector<std::string> unsupported(contingencies_.size());
+    for (size_t c = 0; c < contingencies_.size(); ++c) {
+        std::string why;
+        for (int g : ctg_gens_[c]) {
+            why = gen_contingency::gen_unsupported(gen_data_, g);
+            if (!why.empty()) break;
+        }
+        if (why.empty() && ctg_more_[c].any())
+            why = element_trips::more_unsupported(trip_data_, ctg_more_[c], outer_ != nullptr, phys_.compute_physical_violations);
         // a regulating shunt's sections are the ShuntVoltageControl loop's, which does not
-        // know of a row taking it out (lightsim2grid refuses it the same way)
-        for (size_t c = 0; c < ctg_shunts_.size(); ++c)
+        // know of a row taking it out
+        if (why.empty() && outer_)
             for (int sh : ctg_shunts_[c])
-                if (trip_data_.shunt_regulating[static_cast<size_t>(sh)] && trip_data_.shunt_bus[static_cast<size_t>(sh)] >= 0)
-                    throw std::runtime_error(
-                        "ContingencyAnalysisSession: contingency " + std::to_string(c) + " trips shunt " +
-                        std::to_string(sh) + ", which regulates a voltage, with the outer loops: the "
-                        "ShuntVoltageControl loop owns its sections and does not support a row taking it out yet");
+                if (trip_data_.shunt_regulating[static_cast<size_t>(sh)] && trip_data_.shunt_bus[static_cast<size_t>(sh)] >= 0) {
+                    why = "disconnects shunt " + std::to_string(sh) + ", which regulates a voltage: the "
+                          "ShuntVoltageControl loop owns its sections";
+                    break;
+                }
+        unsupported[c] = why;
     }
 
     // Generator trips: the buses some contingency releases (they need a reserved
     // Vm column + Q equation), each contingency's releases and the slack
     // participants it takes out (lightsim2grid's _maybe_prepare_gen_contingency)
     const int n_ctg_all = static_cast<int>(contingencies_.size());
-    const auto ctg_gen_off = [this](int r, int g) {
+    const auto ctg_gen_off = [this, &unsupported](int r, int g) {
+        if (!unsupported[static_cast<size_t>(r)].empty()) return false;
         const std::vector<int>& gens = ctg_gens_[static_cast<size_t>(r)];
         return std::find(gens.begin(), gens.end(), g) != gens.end();
     };
+    const auto ctg_sto_off = [this, &unsupported](int r, int s) {
+        if (!unsupported[static_cast<size_t>(r)].empty()) return false;
+        const std::vector<int>& ids = ctg_more_[static_cast<size_t>(r)].storages;
+        return std::find(ids.begin(), ids.end(), s) != ids.end();
+    };
+    const auto ctg_hvdc_off = [this, &unsupported](int r, int h) {
+        if (!unsupported[static_cast<size_t>(r)].empty()) return false;
+        const std::vector<int>& ids = ctg_more_[static_cast<size_t>(r)].hvdcs;
+        return std::find(ids.begin(), ids.end(), h) != ids.end();
+    };
+    bool any_controller_trip = has_gen_trips_;
+    for (const MoreTrips& t : ctg_more_) any_controller_trip = any_controller_trip || !t.storages.empty() || !t.hvdcs.empty();
     std::vector<int>              required;
     std::vector<std::vector<int>> row_slack_off;
     row_pv_to_pq_.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
     row_slack_off.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
-    if (has_gen_trips_) {
-        gen_contingency::check_rows(gen_data_, n_ctg_all, ctg_gen_off, "ContingencyAnalysisSession");
-        gen_contingency::prepare_rows(gen_data_, n_ctg_all, ctg_gen_off, base_ledger_.get(),
+    if (any_controller_trip) {
+        gen_contingency::prepare_rows(gen_data_, n_ctg_all, ctg_gen_off, ctg_sto_off, ctg_hvdc_off, base_ledger_.get(),
                                       required, row_pv_to_pq_, row_slack_off);
-        if (outer_ && !required.empty())
-            throw std::runtime_error(
-                "ContingencyAnalysisSession: a generator trip releases bus " + std::to_string(required.front()) +
-                ", which the outer loops' ledger has not reserved (ReactiveLimits reserves every bus "
-                "its own machines hold)");
+        if (outer_ && !required.empty()) {
+            // a row releasing a bus the outer loops' ledger did not reserve (ReactiveLimits
+            // reserves every bus its own machines hold)
+            for (size_t r = 0; r < row_pv_to_pq_.size(); ++r) {
+                for (int b : row_pv_to_pq_[r])
+                    if (std::binary_search(required.begin(), required.end(), b)) {
+                        unsupported[r] = "releases bus " + std::to_string(b) + ", which the outer loops' ledger has not reserved";
+                        break;
+                    }
+                if (!unsupported[r].empty()) { row_pv_to_pq_[r].clear(); row_slack_off[r].clear(); }
+            }
+            required.clear();
+        }
         if (strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
             throw std::runtime_error(
                 "ContingencyAnalysisSession: tripping generators is incompatible with the "
@@ -364,6 +423,10 @@ void ContingencyAnalysisSession::run()
                 "release a bus' voltage pinning per row). Use 'direct_refactor_every' (default), "
                 "'direct_iter0_only', or 'direct_refactor_every_n'.");
     }
+
+    // a row's status is settled with its masks: a change means a new source
+    if (unsupported != row_unsupported_) { row_unsupported_ = unsupported; ++contingencies_generation_; }
+    for (size_t c = 0; c < contingencies_.size(); ++c) contingencies_[c].skip = !row_unsupported_[c].empty();
 
     // Automatic reference slack: the participant the fewest contingencies
     // strand; a change moves it in the ledger and rebuilds the base state --
@@ -467,6 +530,7 @@ void ContingencyAnalysisSession::run()
                 if (ctg.disconnected) continue;
                 const auto g_off = [&](int g) { return ctg_gen_off(r, g); };
                 const auto g_p   = [this](int g) { return static_cast<double>(slack_rd_.gens_target_p_mw(g)); };
+                const auto s_off = [&](int s) { return ctg_sto_off(r, s); };
                 // the island read off the row's own Sbus: a tripped load / generator on it nets to 0
                 for (int b : ctg.masked_buses) row_p[static_cast<size_t>(b)] = static_cast<double>(h_Sbus_base_(b).real()) * sn;
                 for (const auto& bd : ctg_sbus_ds_[static_cast<size_t>(r)])
@@ -478,6 +542,7 @@ void ContingencyAnalysisSession::run()
                                                   [&](int b) { return row_p[static_cast<size_t>(b)]; })
                     + (has_trip_data_ ? element_trips::trip_lost_mw(trip_data_, ctg_loads_[static_cast<size_t>(r)],
                                                                     ctg_shunts_[static_cast<size_t>(r)], bus_masked)
+                                        + element_trips::more_lost_mw(trip_data_, ctg_more_[static_cast<size_t>(r)])
                                       : 0.);
                 if (outer_) {
                     // the loop gets the row's loss even when it is nothing at the grid's targets: it counts
@@ -485,7 +550,8 @@ void ContingencyAnalysisSession::run()
                     // the "n" solve takes from that solve, and decides itself what is left to share
                     row_lost_p_mw_[static_cast<size_t>(r)] = lost;
                 } else {
-                    slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(slack_rd_, lost, bus_masked, g_off, g_p);
+                    slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(
+                        slack_rd_, lost, bus_masked, g_off, g_p, slack_redistribution::DEFAULT_EPS_MW, s_off);
                 }
                 for (int b : ctg.masked_buses) is_masked[static_cast<size_t>(b)] = 0;
             }
@@ -494,7 +560,7 @@ void ContingencyAnalysisSession::run()
         if (redistribute_slack_ && !outer_) {
             w_rows = slack_redistribution::build_row_weights(
                 slack_rd_, slack_rows_, n_ctg_all, ctg_gen_off, n_bus,
-                base_state_->h_slack_bus, base_state_->h_slack_w, ref_bus);
+                base_state_->h_slack_bus, base_state_->h_slack_w, ref_bus, ctg_sto_off);
             for (size_t r = 0; r < slack_rows_.size(); ++r) {
                 // one entry per bus: the pre-pass' dP joins the trips' dS
                 std::vector<std::pair<int, std::complex<double>>>& ds = ds_rows[r];
@@ -514,7 +580,7 @@ void ContingencyAnalysisSession::run()
             if (!outer_)
                 w_rows = gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_ctg_all, n_bus,
                                                             base_state_->h_slack_bus, base_state_->h_slack_w,
-                                                            ref_bus, "ContingencyAnalysisSession");
+                                                            ref_bus, "ContingencyAnalysisSession", ctg_sto_off);
         }
         bool any_ds = false;
         for (const auto& ds : ds_rows) if (!ds.empty()) { any_ds = true; break; }
@@ -646,7 +712,16 @@ void ContingencyAnalysisSession::run()
             ov.gen_off.assign(contingencies_.size() * static_cast<size_t>(n_gen), 0);
             for (size_t r = 0; r < ctg_gens_.size(); ++r)
                 for (int g : ctg_gens_[r]) ov.gen_off[r * static_cast<size_t>(n_gen) + static_cast<size_t>(g)] = 1;
-            ov.pq_buses = row_pv_to_pq_;
+        }
+        if (any_controller_trip) ov.pq_buses = row_pv_to_pq_;
+        // ... and the storage units it trips
+        bool any_storage = false;
+        for (const MoreTrips& t : ctg_more_) any_storage = any_storage || !t.storages.empty();
+        if (any_storage) {
+            const size_t n_sto = static_cast<size_t>(trip_data_.n_storage);
+            ov.storage_off.assign(contingencies_.size() * n_sto, 0);
+            for (size_t r = 0; r < ctg_more_.size(); ++r)
+                for (int st : ctg_more_[r].storages) ov.storage_off[r * n_sto + static_cast<size_t>(st)] = 1;
         }
         bool any_load = false;
         for (const auto& l : ctg_loads_) if (!l.empty()) { any_load = true; break; }

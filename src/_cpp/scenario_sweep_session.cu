@@ -250,30 +250,6 @@ void ScenarioSweepSession::set_contingency_gens(Eigen::Ref<const BoolMat> mask)
             "ScenarioSweepSession::set_contingency_gens: row count must match "
             "set_injections()'s n_scenarios");
 
-    // Only a generator pinning its OWN bus is in scope. A remote controller,
-    // or a bus a control group holds (remote generator, SVC, HVDC station),
-    // lives in the VoltageControl extension, whose own Jacobian rows and
-    // columns nothing here reserves or releases (same rule as lightsim2grid).
-    for (int g = 0; g < gen_data_.n_gen; ++g) {
-        bool ever_off = false;
-        for (Eigen::Index r = 0; r < mask.rows() && !ever_off; ++r)
-            if (mask(r, g)) ever_off = true;
-        if (!ever_off) continue;
-        if (gen_data_.remote_vreg[g])
-            throw std::runtime_error(
-                "ScenarioSweepSession::set_contingency_gens: generator " +
-                std::to_string(g) + " regulates the voltage of a remote bus. Only "
-                "generators regulating their own bus can be disconnected for now: "
-                "remote voltage control is not supported by this feature yet.");
-        if (gen_data_.on_group_bus[g])
-            throw std::runtime_error(
-                "ScenarioSweepSession::set_contingency_gens: generator " +
-                std::to_string(g) + " stands on a bus whose voltage a control group "
-                "holds (a remote generator, an SVC or an HVDC converter station). "
-                "Only generators regulating their own bus can be disconnected for "
-                "now: remote voltage control is not supported by this feature yet.");
-    }
-
     gen_off_       = mask;
     has_gen_off_   = true;
     gen_off_dirty_ = true;
@@ -590,15 +566,18 @@ void ScenarioSweepSession::_prepare_gen_contingency(
     std::vector<std::vector<int>>& row_pv_to_pq,
     std::vector<std::vector<int>>& row_slack_off) const
 {
-    if (!has_gen_off_) {
+    if (!has_gen_off_ && !has_more_off_) {
         required.clear();
         row_pv_to_pq.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
         row_slack_off.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
         return;
     }
-    const int n_rows = std::min(n_scenarios_, static_cast<int>(gen_off_.rows()));
+    const int n_rows = has_gen_off_ ? std::min(n_scenarios_, static_cast<int>(gen_off_.rows())) : n_scenarios_;
+    const auto row_ok = [this](int r) { return row_unsupported_[static_cast<size_t>(r)].empty(); };
     gen_contingency::prepare_rows(gen_data_, n_rows,
-                                  [this](int r, int g) { return gen_off_(r, g); },
+                                  [this, row_ok](int r, int g) { return has_gen_off_ && row_ok(r) && gen_off_(r, g); },
+                                  [this, row_ok](int r, int s) { return row_ok(r) && _row_trips(r, &MoreTrips::storages, s); },
+                                  [this, row_ok](int r, int h) { return row_ok(r) && _row_trips(r, &MoreTrips::hvdcs, h); },
                                   base_ledger_.get(), required, row_pv_to_pq, row_slack_off);
     row_pv_to_pq.resize(static_cast<size_t>(n_scenarios_));
     row_slack_off.resize(static_cast<size_t>(n_scenarios_));
@@ -620,7 +599,8 @@ std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     if (ref_bus < 0 && slack_ids_.size() > 0) ref_bus = slack_ids_(0);
     return gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_scenarios_, n_bus,
                                               base_state_->h_slack_bus, base_state_->h_slack_w,
-                                              ref_bus, "ScenarioSweepSession");
+                                              ref_bus, "ScenarioSweepSession",
+                                              [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
 }
 
 // =============================================================================
@@ -781,7 +761,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
         return {};
     }
     return slack_redistribution::prepass_all(slack_rd_, n_scenarios_, base_state_->n_bus,
-                                             skipped, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
+                                             skipped, masked, gen_off, gen_p_row, sbus_p_mw, row_p,
+                                             [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
 }
 
 // =============================================================================
@@ -1020,11 +1001,101 @@ void ScenarioSweepSession::set_topology(
         if (has_shunt_off_ && r < shunt_off_.size())
             for (const auto& t : element_trips::shunt_triplets(trip_data_, shunt_off_[r]))
                 contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
+        // the SVCs it trips (set_contingency_svcs): their b0
+        if (has_more_off_ && r < more_off_.size())
+            for (const auto& t : element_trips::svc_triplets(trip_data_, more_off_[r].svcs))
+                contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
     has_topology_   = true;
     topology_dirty_ = true;
     auto_ref_valid_ = false;
+}
+
+// =============================================================================
+// set_contingency_sgens / _storages / _svcs / _hvdcs (lightsim2grid PR #292)
+// =============================================================================
+void ScenarioSweepSession::_set_more_off(Eigen::Ref<const BoolMat> mask, int n_el,
+                                         std::vector<int> MoreTrips::*member, const char* who)
+{
+    const std::string name = std::string("ScenarioSweepSession::") + who;
+    if (!has_trip_data_)
+        throw std::runtime_error(name + ": this session has no element data (explicit-array/tuple mode, or a "
+                                 "build without the lightsim2grid bridge)");
+    if (mask.cols() != n_el)
+        throw std::runtime_error(name + ": the mask has " + std::to_string(mask.cols()) + " columns, the grid " +
+                                 std::to_string(n_el) + " such elements");
+    if (mask.rows() <= 0) throw std::runtime_error(name + ": n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(mask.rows()) != n_scenarios_)
+        throw std::runtime_error(name + ": row count must match set_injections()'s n_scenarios");
+    more_off_.resize(static_cast<size_t>(mask.rows()));
+    for (Eigen::Index r = 0; r < mask.rows(); ++r) {
+        std::vector<int>& ids = more_off_[static_cast<size_t>(r)].*member;
+        ids.clear();
+        for (Eigen::Index c = 0; c < mask.cols(); ++c)
+            if (mask(r, c)) ids.push_back(static_cast<int>(c));
+    }
+    has_more_off_ = false;
+    for (const MoreTrips& t : more_off_) has_more_off_ = has_more_off_ || t.any();
+    gen_off_dirty_ = true;
+    // the rows' Ybus patches, rebuilt with them (branch trips kept)
+    const std::vector<std::vector<int>> trips = has_topology_
+        ? tripped_branches_per_scenario_
+        : std::vector<std::vector<int>>(static_cast<size_t>(mask.rows()));
+    if (has_branch_data_) set_topology(trips);
+}
+void ScenarioSweepSession::set_contingency_sgens(Eigen::Ref<const BoolMat> mask)
+{ _set_more_off(mask, trip_data_.n_sgen, &MoreTrips::sgens, "set_contingency_sgens"); }
+void ScenarioSweepSession::set_contingency_storages(Eigen::Ref<const BoolMat> mask)
+{ _set_more_off(mask, trip_data_.n_storage, &MoreTrips::storages, "set_contingency_storages"); }
+void ScenarioSweepSession::set_contingency_svcs(Eigen::Ref<const BoolMat> mask)
+{ _set_more_off(mask, trip_data_.n_svc, &MoreTrips::svcs, "set_contingency_svcs"); }
+void ScenarioSweepSession::set_contingency_hvdcs(Eigen::Ref<const BoolMat> mask)
+{ _set_more_off(mask, trip_data_.n_hvdc, &MoreTrips::hvdcs, "set_contingency_hvdcs"); }
+
+std::pair<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
+          Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+ScenarioSweepSession::more_trips_injection_delta() const
+{
+    using Mat = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    const Eigen::Index n_rows = static_cast<Eigen::Index>(more_off_.size());
+    const Eigen::Index n_bus = static_cast<Eigen::Index>(base_state_->n_bus);
+    Mat dp = Mat::Zero(n_rows, n_bus), dq = Mat::Zero(n_rows, n_bus);
+    const std::vector<int> none;
+    for (Eigen::Index r = 0; r < n_rows; ++r) {
+        const MoreTrips& t = more_off_[static_cast<size_t>(r)];
+        if (!t.any()) continue;
+        for (const auto& bd : element_trips::sbus_delta(trip_data_, none, none, gen_data_.bus, gen_data_.vreg_on,
+                                                        gen_data_.target_q_mvar, &t)) {
+            dp(r, bd.first) = bd.second.real() * trip_data_.sn_mva;
+            dq(r, bd.first) = bd.second.imag() * trip_data_.sn_mva;
+        }
+    }
+    return {dp, dq};
+}
+
+// What the batch cannot do yet leaves the row out (NaN, BATCH_UNSUPPORTED), not the whole batch
+std::vector<std::string> ScenarioSweepSession::_row_unsupported_reasons() const
+{
+    std::vector<std::string> out(static_cast<size_t>(n_scenarios_));
+    for (int r = 0; r < n_scenarios_; ++r) {
+        std::string why;
+        if (has_gen_off_ && r < gen_off_.rows())
+            for (int g = 0; g < gen_data_.n_gen && why.empty(); ++g)
+                if (gen_off_(r, g)) why = gen_contingency::gen_unsupported(gen_data_, g);
+        if (why.empty() && has_more_off_ && static_cast<size_t>(r) < more_off_.size())
+            why = element_trips::more_unsupported(trip_data_, more_off_[static_cast<size_t>(r)], outer_ != nullptr,
+                                                  phys_.compute_physical_violations);
+        if (why.empty() && outer_ && has_shunt_off_ && static_cast<size_t>(r) < shunt_off_.size())
+            for (int sh : shunt_off_[static_cast<size_t>(r)])
+                if (trip_data_.shunt_regulating[static_cast<size_t>(sh)] && trip_data_.shunt_bus[static_cast<size_t>(sh)] >= 0) {
+                    why = "disconnects shunt " + std::to_string(sh) + ", which regulates a voltage: the "
+                          "ShuntVoltageControl loop owns its sections";
+                    break;
+                }
+        out[static_cast<size_t>(r)] = why;
+    }
+    return out;
 }
 
 // =============================================================================
@@ -1182,20 +1253,16 @@ void ScenarioSweepSession::run()
         if (has_switches_ || has_vc_pins_ || has_vc_release_)
             refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
-        // a regulating shunt's sections are the ShuntVoltageControl loop's
-        if (has_shunt_off_)
-            for (size_t r = 0; r < shunt_off_.size(); ++r)
-                for (int sh : shunt_off_[r])
-                    if (trip_data_.shunt_regulating[static_cast<size_t>(sh)] && trip_data_.shunt_bus[static_cast<size_t>(sh)] >= 0)
-                        throw std::runtime_error(
-                            "ScenarioSweepSession: row " + std::to_string(r) + " trips shunt " + std::to_string(sh) +
-                            ", which regulates a voltage, with the outer loops: the ShuntVoltageControl loop owns "
-                            "its sections and does not support a row taking it out yet");
     }
     if (has_shunt_off_ && static_cast<int>(shunt_off_.size()) != n_scenarios_)
         throw std::runtime_error(
             "ScenarioSweepSession: set_contingency_shunts()'s row count no longer matches "
             "set_injections()'s n_scenarios -- call it again after changing set_injections()");
+
+    if (has_more_off_ && static_cast<int>(more_off_.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: the row count of set_contingency_sgens / _storages / _svcs / _hvdcs no "
+            "longer matches set_injections()'s n_scenarios -- call them again after changing set_injections()");
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
         throw std::runtime_error(
@@ -1217,6 +1284,8 @@ void ScenarioSweepSession::run()
     // whose "n" warm-up solve rebuilds the sparsity each compute()).
     std::vector<int>              required;
     std::vector<std::vector<int>> row_pv_to_pq, row_slack_off;
+    const std::vector<std::string> prev_unsupported = row_unsupported_;
+    row_unsupported_ = _row_unsupported_reasons();
     _prepare_gen_contingency(required, row_pv_to_pq, row_slack_off);
     // Reactive-limit outer loop: the Vm-fixed buses a row solves as PQ join
     // the reserved switchable set, exactly like a generator contingency's.
@@ -1266,11 +1335,24 @@ void ScenarioSweepSession::run()
     const int want_ref = _wanted_reference_bus();
     // the outer loops' ledger carries its own switchable buses: nothing to rebuild, and a
     // generator contingency may only release one of them
-    if (outer_ && !required.empty())
-        throw std::runtime_error(
-            "ScenarioSweepSession: a generator contingency releases bus " + std::to_string(required.front()) +
-            ", which the outer loops' ledger has not reserved (ReactiveLimits reserves every bus "
-            "its own machines hold)");
+    if (outer_ && !required.empty()) {
+        for (int r = 0; r < n_scenarios_; ++r) {
+            auto& to_pq = row_pv_to_pq[static_cast<size_t>(r)];
+            for (int b : to_pq)
+                if (std::binary_search(required.begin(), required.end(), b)) {
+                    row_unsupported_[static_cast<size_t>(r)] =
+                        "releases bus " + std::to_string(b) + ", which the outer loops' ledger has not reserved";
+                    break;
+                }
+            if (!row_unsupported_[static_cast<size_t>(r)].empty()) {
+                to_pq.clear();
+                row_slack_off[static_cast<size_t>(r)].clear();
+            }
+        }
+        required.clear();
+    }
+    // a row's status is settled with its masks: a change means a new source
+    if (row_unsupported_ != prev_unsupported) topology_dirty_ = true;
     if (!outer_ && (required != reserved_buses_ || want_ref != ref_bus_)) {
         ref_bus_ = want_ref;
         _build_base_state(required);
@@ -1283,7 +1365,7 @@ void ScenarioSweepSession::run()
             "incompatible with the 'direct_base_case_factors' strategy (it reuses the base-case factors, which "
             "cannot switch a bus between PV and PQ per row). Use 'direct_refactor_every' "
             "(default), 'direct_iter0_only', or 'direct_refactor_every_n'.");
-    if (has_gen_off_ &&
+    if ((has_gen_off_ || has_more_off_) &&
         strategy_type_ == ContingencySolverType::DirectBaseCaseFactors) {
         bool any_effect = !reserved_buses_.empty();
         for (const auto& v : row_slack_off) if (!v.empty()) { any_effect = true; break; }
@@ -1336,7 +1418,7 @@ void ScenarioSweepSession::run()
             ctg.vc_pinned_ctrl.clear();
             ctg.vc_released.clear();
             if (has_vc_release_) ctg.vc_released = sw_vc_release_[r];
-            ctg.skip = has_skip_ && skip_rows_[r] != 0;
+            ctg.skip = (has_skip_ && skip_rows_[r] != 0) || !row_unsupported_[r].empty();
         }
         // (the outer loops pin the switchable buses per slot themselves)
         if (!reserved_buses_.empty() && !outer_) {
@@ -1706,6 +1788,17 @@ void ScenarioSweepSession::run()
                 for (Eigen::Index g = 0; g < gen_off_.cols(); ++g)
                     ov.gen_off[static_cast<size_t>(r) * gen_off_.cols() + g] = gen_off_(r, g) ? 1 : 0;
             ov.pq_buses = row_pv_to_pq_;
+        }
+        if (has_more_off_) {
+            ov.pq_buses = row_pv_to_pq_;
+            bool any_storage = false;
+            for (const MoreTrips& t : more_off_) any_storage = any_storage || !t.storages.empty();
+            if (any_storage) {
+                const size_t n_sto = static_cast<size_t>(trip_data_.n_storage);
+                ov.storage_off.assign(static_cast<size_t>(n_scenarios_) * n_sto, 0);
+                for (size_t r = 0; r < more_off_.size(); ++r)
+                    for (int st : more_off_[r].storages) ov.storage_off[r * n_sto + static_cast<size_t>(st)] = 1;
+            }
         }
         if (has_load_off_ && load_off_.rows() == n_scenarios_) {
             ov.load_off.assign(static_cast<size_t>(n_scenarios_) * load_off_.cols(), 0);

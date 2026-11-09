@@ -228,6 +228,9 @@ struct ContingencyAnalysisSession {
     std::vector<std::vector<int>> disconnected_per_ctg_;  // tripped branch IDs per ctg
     bool has_contingencies_ = false;
 
+    // What each contingency trips beyond branches, shunts, loads and generators
+    std::vector<MoreTrips> ctg_more_;
+    std::vector<std::string> row_unsupported_;
     // The shunts, loads and generators each contingency trips (build_contingencies_full;
     // empty lists otherwise): a shunt is one more diagonal triplet of the row's Ybus
     // patch (in contingencies_), a load / generator a per-row Sbus correction
@@ -335,7 +338,13 @@ struct ContingencyAnalysisSession {
                                   const std::vector<std::vector<int>>& load_ids_per_ctg,
                                   const std::vector<std::vector<int>>& gen_ids_per_ctg,
                                   const std::vector<std::vector<int>>& branch_ids_side1_per_ctg = {},
-                                  const std::vector<std::vector<int>>& branch_ids_side2_per_ctg = {});
+                                  const std::vector<std::vector<int>>& branch_ids_side2_per_ctg = {},
+                                  const std::vector<std::vector<int>>& sgen_ids_per_ctg = {},
+                                  const std::vector<std::vector<int>>& storage_ids_per_ctg = {},
+                                  const std::vector<std::vector<int>>& svc_ids_per_ctg = {},
+                                  const std::vector<std::vector<int>>& hvdc_ids_per_ctg = {});
+    // per contingency, why the batch left it out ("": it did not), set by run()
+    const std::vector<std::string>& get_batch_unsupported_reasons() const { return row_unsupported_; }
     void set_element_trip_data(const ElementTripData& data) { trip_data_ = data; has_trip_data_ = true; }
     bool has_element_trip_data() const { return has_trip_data_; }
     void set_gen_contingency_data(const GenContingencyData& data) { gen_data_ = data; has_gen_data_ = data.n_gen > 0; }

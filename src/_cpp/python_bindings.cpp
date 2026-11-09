@@ -1740,6 +1740,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("load_ids_per_ctg"), pybind11::arg("gen_ids_per_ctg"),
          pybind11::arg("branch_ids_side1_per_ctg") = std::vector<std::vector<int>>(),
          pybind11::arg("branch_ids_side2_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("sgen_ids_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("storage_ids_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("svc_ids_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("hvdc_ids_per_ctg") = std::vector<std::vector<int>>(),
          "Define the contingency set, each contingency tripping branches, shunts, "
          "loads and generators together (aligned lists, one entry per "
          "contingency; lightsim2grid's ContingencyAnalysis.add_contingency). A shunt "
@@ -1780,6 +1784,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         },
         "Per row (original order), the outcome of its outer loops after the last run() "
         "(lightsim2grid's OuterRowResult).")
+    .def("get_batch_unsupported_reasons", &ContingencyAnalysisSession::get_batch_unsupported_reasons,
+         "Per contingency, why the batch left it out (\"\": it did not), after run().")
     .def("get_row_status", &ContingencyAnalysisSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("overwrite_row_outcomes", &ContingencyAnalysisSession::overwrite_row_outcomes,
@@ -2442,6 +2448,23 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "injection side (the load leaving Sbus) is the caller's job "
          "(ScenarioSweepGPU.set_contingency_loads does it in set_injections_from_elements); "
          "this is what the outer loops' view of the row reads.")
+#define G2G_BIND_MORE_TRIP(NAME)                                                                          \
+    .def("set_contingency_" #NAME,                                                                        \
+         [](ScenarioSweepSession& self, pybind11::array_t<bool, pybind11::array::c_style> mask) {         \
+             if (mask.ndim() != 2)                                                                        \
+                 throw std::runtime_error("set_contingency_" #NAME ": the mask must be 2-D");             \
+             ScenarioSweepSession::BoolMat m(static_cast<Eigen::Index>(mask.shape(0)),                    \
+                                             static_cast<Eigen::Index>(mask.shape(1)));                   \
+             auto r = mask.unchecked<2>();                                                                \
+             for (Eigen::Index i = 0; i < m.rows(); ++i)                                                  \
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);                           \
+             self.set_contingency_##NAME(m);                                                              \
+         }, pybind11::arg("mask"), "Per-row mask (n_scenarios, n_element), True = the row disconnects it.")
+    G2G_BIND_MORE_TRIP(sgens)
+    G2G_BIND_MORE_TRIP(storages)
+    G2G_BIND_MORE_TRIP(svcs)
+    G2G_BIND_MORE_TRIP(hvdcs)
+#undef G2G_BIND_MORE_TRIP
     .def_property_readonly("has_element_trip_data", &ScenarioSweepSession::has_element_trip_data)
     .def("set_contingency_gens",
          [](ScenarioSweepSession& self,
@@ -2598,6 +2621,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
     .def("get_row_iterations", &ScenarioSweepSession::get_row_iterations,
          "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def("get_batch_unsupported_reasons", &ScenarioSweepSession::get_batch_unsupported_reasons,
+         "Per row, why the batch left it out (\"\": it did not), after run().")
+    .def("more_trips_injection_delta", &ScenarioSweepSession::more_trips_injection_delta,
+         "(dp_mw, dq_mvar), each (n_scenarios, n_bus): what the rows' tripped static generators, "
+         "storage units, SVCs and hvdc stations add to their injection.")
+    .def_property_readonly("has_more_trips", &ScenarioSweepSession::has_more_trips)
     .def("get_row_status", &ScenarioSweepSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,

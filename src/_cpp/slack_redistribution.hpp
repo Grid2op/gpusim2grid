@@ -177,6 +177,12 @@ struct SlackRedistributionData {
 namespace slack_redistribution {
 
 // A unit taking part in the redistribution (generator convention, MW).
+// the default "no row disconnects it", for callers with no storage unit to take out
+struct NoUnitOff {
+    bool operator()(int) const { return false; }
+    bool operator()(int, int) const { return false; }
+};
+
 struct Participant {
     int    unit;       // index into SlackRedistributionData's units
     double injection_mw;
@@ -411,10 +417,10 @@ double injection_change_lost_mw(const SlackRedistributionData& d, double row_p_m
 // (gen_off(g) false for a generator), at their row set-point (gen_p_row(g) for
 // a generator, the grid's own for a storage unit), and turn the result into
 // the row's Sbus correction and saturated units.
-template <class BusMasked, class GenOff, class GenPRow>
+template <class BusMasked, class GenOff, class GenPRow, class StoOff = NoUnitOff>
 RowResult redistribute_row(const SlackRedistributionData& d, double lost,
                            BusMasked bus_masked, GenOff gen_off, GenPRow gen_p_row,
-                           double eps_mw = DEFAULT_EPS_MW)
+                           double eps_mw = DEFAULT_EPS_MW, StoOff sto_off = StoOff())
 {
     RowResult out;
     out.report.mismatch_mw = lost;
@@ -426,7 +432,7 @@ RowResult redistribute_row(const SlackRedistributionData& d, double lost,
         if (!(static_cast<double>(d.weight(k)) > POOL_MIN_WEIGHT)) continue;
         if (bus_masked(d.bus_solver(k))) continue;
         const bool is_gen = d.kind(k) == SLACK_UNIT_GENERATOR;
-        if (is_gen && gen_off(d.el_id(k))) continue;
+        if (is_gen ? gen_off(d.el_id(k)) : sto_off(d.el_id(k))) continue;
         Participant p;
         p.unit         = k;
         p.injection_mw = is_gen ? gen_p_row(d.el_id(k)) : static_cast<double>(d.target_p_mw(k));
@@ -522,10 +528,11 @@ double row_lost_mw(const SlackRedistributionData& d, int r, Masked masked, GenOf
 // disconnects generator g; gen_p_row(r, g) its set-point of generator g (MW);
 // sbus_p_mw(r, b) the real part of its Sbus at bus b, in MW; row_p_mw(r) its
 // total active injection (MW, NaN: no term (c), see injection_change_lost_mw).
-template <class Skipped, class Masked, class GenOff, class GenPRow, class SbusPMw, class RowPMw>
+template <class Skipped, class Masked, class GenOff, class GenPRow, class SbusPMw, class RowPMw, class StoOff = NoUnitOff>
 std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows, int n_bus,
                                    Skipped skipped, Masked masked, GenOff gen_off,
-                                   GenPRow gen_p_row, SbusPMw sbus_p_mw, RowPMw row_p_mw)
+                                   GenPRow gen_p_row, SbusPMw sbus_p_mw, RowPMw row_p_mw,
+                                   StoOff sto_off = StoOff())
 {
     std::vector<RowResult> out(static_cast<size_t>(std::max(n_rows, 0)));
     std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
@@ -538,7 +545,7 @@ std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows,
         for (int b : m) is_masked[static_cast<size_t>(b)] = 1;
         out[static_cast<size_t>(r)] = redistribute_row(
             d, lost, [&](int b) { return b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)] != 0; },
-            g_off, g_p);
+            g_off, g_p, DEFAULT_EPS_MW, [&](int s) { return sto_off(r, s); });
         for (int b : m) is_masked[static_cast<size_t>(b)] = 0;
     }
     return out;
@@ -559,13 +566,13 @@ std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows,
 // the generators a row disconnects (gen_off(r, g)) and the units its pre-pass
 // saturated (rows[r].saturated_units; `rows` may be empty). Empty when no row
 // takes anything out: every slot then keeps the base weights.
-template <class GenOff>
+template <class GenOff, class StoOff = NoUnitOff>
 std::vector<cuda_real_type> build_row_weights(const SlackRedistributionData& d,
                                               const std::vector<RowResult>& rows,
                                               int n_rows, GenOff gen_off, int n_bus,
                                               const std::vector<int>& slack_bus,
                                               const std::vector<cuda_real_type>& base_w,
-                                              int ref_bus)
+                                              int ref_bus, StoOff sto_off = StoOff())
 {
     std::vector<cuda_real_type> out;
     const int n_slack = static_cast<int>(slack_bus.size());
@@ -577,7 +584,7 @@ std::vector<cuda_real_type> build_row_weights(const SlackRedistributionData& d,
         std::fill(excluded.begin(), excluded.end(), 0);
         bool row_any = false;
         for (int k = 0; k < d.n_units; ++k)
-            if (d.unit_in_slack(k) && d.kind(k) == SLACK_UNIT_GENERATOR && gen_off(r, d.el_id(k))) {
+            if (d.unit_in_slack(k) && (d.kind(k) == SLACK_UNIT_GENERATOR ? gen_off(r, d.el_id(k)) : sto_off(r, d.el_id(k)))) {
                 excluded[static_cast<size_t>(k)] = 1;
                 row_any = true;
             }

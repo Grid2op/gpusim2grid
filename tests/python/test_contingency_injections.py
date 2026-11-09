@@ -101,7 +101,7 @@ def test_ca_matches_one_off_powerflows_and_lightsim2grid(case, solver_atol):
     ca.compute(batch_size=4)
     assert np.all(ca.last_residuals() < 100 * solver_atol)
     V = ca.V_results.to_numpy().reshape(len(TRIPS), case["n_bus"])
-    assert ca.get_contingencies() == [tuple(sorted(el) for el in t) + ([], []) for t in TRIPS]
+    assert ca.get_contingencies() == [tuple(sorted(el) for el in t) + ([], [], [], [], [], []) for t in TRIPS]
 
     ls = ContingencyAnalysisCPP(case["grid"])
     for t in TRIPS:
@@ -125,9 +125,10 @@ def test_ca_shortcuts_append(case):
     ca.add_contingency_shunt(0)
     ca.add_contingency_load([3, 1])
     ca.add_contingency_gen(1)
-    assert ca.get_contingencies() == [([3], [], [], [], [], []), ([5], [], [], [], [], []),
-                                      ([], [0], [], [], [], []), ([], [], [1, 3], [], [], []),
-                                      ([], [], [], [1], [], [])]
+    nothing = ([], [], [], [])     # static generators, storage units, SVCs, hvdc lines
+    assert ca.get_contingencies() == [([3], [], [], [], [], []) + nothing, ([5], [], [], [], [], []) + nothing,
+                                      ([], [0], [], [], [], []) + nothing, ([], [], [1, 3], [], [], []) + nothing,
+                                      ([], [], [], [1], [], []) + nothing]
     ca.compute(batch_size=8)
     assert ca.V_results.to_numpy().shape[0] == 5 * case["n_bus"]
     with pytest.raises(Exception):
@@ -241,7 +242,7 @@ def test_ca_one_side_trips_match_lightsim2grid(outer_loops, solver_atol):
             ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
     ca.add_contingencies(ONE_SIDE_TRIPS)
     # both ends: a trip
-    assert ca.get_contingencies()[3] == ([4], [], [], [], [], [])
+    assert ca.get_contingencies()[3] == ([4], [], [], [], [], [], [], [], [], [])
     ca.compute(batch_size=4)
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V = ca.V_results.to_numpy().reshape(len(ONE_SIDE_TRIPS), -1)
