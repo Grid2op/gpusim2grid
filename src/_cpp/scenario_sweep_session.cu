@@ -775,7 +775,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
         for (int r = 0; r < n_scenarios_; ++r) {
             if (skipped(r)) continue;
             const double lost = slack_redistribution::row_lost_mw(slack_rd_, r, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
-            if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+            // (even nothing at the grid's targets: see ContingencyAnalysisSession::run)
+            row_lost_p_mw_[static_cast<size_t>(r)] = lost;
         }
         return {};
     }

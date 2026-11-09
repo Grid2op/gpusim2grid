@@ -841,8 +841,18 @@ def _pst_grid(mode, target, load_scale=1., line_off=None, pst_off=False, regulat
     """lightsim2grid's PhaseControl test grid (IEEE 14, a phase tap changer on T5-6-1, -10 ..
     10 degrees) with its default loops and PhaseControl"""
     P = _pst_module()
-    from lightsim2grid.algorithm import PhaseControl
+    from lightsim2grid.algorithm import DistributedSlack, PhaseControl
     grid = P._grid(P._net(mode, target, regulating=regulating))
+    # olf_outer_loops runs DistributedSlack without a participant (#269): a shifter moving the
+    # losses by more than its threshold would fail the solve, and this grid is about the shifter
+    loops = list(grid.get_outer_loops())
+    grid.clear_outer_loops()
+    for lp in loops:
+        if isinstance(lp, DistributedSlack):
+            lp = DistributedSlack(slack_bus_p_max_mismatch_mw=lp.slack_bus_p_max_mismatch_mw,
+                                  fail_on_residue=lp.fail_on_residue, p_residue_eps_mw=lp.p_residue_eps_mw,
+                                  moved_fraction=lp.moved_fraction)
+        grid.add_outer_loop(lp)
     grid.add_outer_loop(PhaseControl())
     grid.change_algorithm(OUTER)
     if load_scale != 1.:
@@ -1227,3 +1237,44 @@ def test_dist_rows_resume_with_the_parked_units(only_ds):
         assert dict(res.gen_target_p)[CAPPED_GEN] == pytest.approx(CAPPED_MAX_P, abs=1e-9)
     if only_ds:
         assert all(r.nb_outer_iterations == 0 for r in res_ls)
+
+
+@pytest.mark.parametrize("algo", [OUTER, DIST])
+@pytest.mark.parametrize("run, fail", [(False, True), (True, False), (True, True)])
+def test_distributed_slack_run_without_participant(run, fail, algo):
+    """lightsim2grid #269: with run_without_participant the loop runs without a unit off the
+    slack bus and, with fail_on_residue, fails at its first check when the slack bus' mismatch
+    is above the threshold; without it the single slack is kept."""
+    from lightsim2grid.algorithm import DistributedSlack
+    def make():
+        grid = _case14(distributed=False, load_scale=1.2, algo=algo)
+        nb_gen = len(grid.get_generators())
+        grid.set_gen_can_participate_slack([False] * nb_gen, np.ones(nb_gen))
+        grid.clear_outer_loops()
+        grid.add_outer_loop(DistributedSlack(slack_bus_p_max_mismatch_mw=1., fail_on_residue=fail,
+                                             run_without_participant=run))
+        return grid
+    # the "n" solve of a failing loop has no solved state to build the model on: from a clean one
+    if run and fail:
+        base = _case14(distributed=False, load_scale=1.2, algo=algo)
+        base.clear_outer_loops()
+        base.add_outer_loop(DistributedSlack(slack_bus_p_max_mismatch_mw=1e6))
+        assert base.ac_pf(np.full(base.total_bus(), 1. + 0j), MAX_IT, TOL_MVA).size > 0
+        nb_gen = len(base.get_generators())
+        base.set_gen_can_participate_slack([False] * nb_gen, np.ones(nb_gen))
+        base.clear_outer_loops()
+        base.add_outer_loop(DistributedSlack(slack_bus_p_max_mismatch_mw=1., fail_on_residue=True,
+                                             run_without_participant=True))
+        h = _cpp._OuterModelHarness(base, keep_trace=True)
+        h.begin(1, 1)
+        row = make()
+        assert row.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, TOL_MVA).size == 0
+        stats = row.get_algo().get_outer_loop_stats()
+        _run_row_full(h, 0, row.get_Ybus_solver().toarray(), np.asarray(row.get_Sbus_solver()),
+                      TOL_MVA / row.get_sn_mva())
+        res = h.row_result(0)
+        assert int(res.status) == int(stats.status) == 2, "\n".join(res.decisions)   # FAILED
+        assert res.nb_outer_iterations == stats.nb_outer_iterations == 0
+    else:
+        res, stats = _compare_single_solve(make)
+        assert int(stats.status) == 0

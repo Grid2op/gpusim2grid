@@ -168,6 +168,7 @@ struct LoopDecl {
     std::string name;
     // DistributedSlack
     double ds_mismatch_mw = 1., ds_eps_mw = 1e-3, ds_moved_fraction = 0.9;
+    bool ds_run_without_participant = false;
     bool   ds_fail = true;
     // ReactiveLimits
     int    rl_max_switch = 3;
@@ -282,6 +283,12 @@ struct SlotState {
     // and on which side, those the row's lost-power share put at a bound
     bool ds_in_newton = false;
     std::vector<char> ds_parked, ds_parked_high, ds_lost_sat;
+    // ds_parked and ds_current_mw as the last Newton solve had them, what its Jacobian (and so
+    // the adjoint) holds: a check parking a unit with too small a move to re-solve changes
+    // ds_parked for no solve
+    std::vector<char> ds_solved_parked;
+    std::vector<double> ds_solved_mw;
+    void ds_mark_solved() { ds_solved_parked = ds_parked; ds_solved_mw = ds_current_mw; }
     bool ds_lost_high = false;
     // the last solve's slack_absorbed, and whether its units took it (OuterLoopAlgo::
     // _fold_slack_share: then the mismatch keeps `+ slack_absorbed * weight`); the target Q
@@ -570,6 +577,10 @@ private:
     double move_storage(SlotState& st, int s, int bus, double mw) const;
     void record(SlotState& st, const std::string& loop, const std::string& action, bool taken,
                 int element, double value, double limit) const;
+    // whether a participant stands off the slack bus (DistributedSlackLoop::_off_slack_bus)
+    bool ds_off_slack_bus(const SlotState& st) const {
+        return std::any_of(st.ds_unit_bus.begin(), st.ds_unit_bus.end(), [&](int b) { return b != slack_bus_; });
+    }
     void reset_vm(SlotState& st, int bus, double vm) const {
         st.vm_reset_bus.push_back(bus);
         st.vm_reset_vm.push_back(vm);
@@ -678,6 +689,7 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
             d.ds_fail = p.fail_on_residue;
             d.ds_eps_mw = p.p_residue_eps_mw;
             d.ds_moved_fraction = p.moved_fraction;
+            d.ds_run_without_participant = p.run_without_participant;
         } else if (dynamic_cast<const ls2g::HvdcAcEmulationLimitsLoop*>(lp.get())) {
             d.kind = Kind::HvdcLimits;
         } else if (dynamic_cast<const ls2g::VoltageMonitoringLoop*>(lp.get())) {
@@ -1001,6 +1013,11 @@ void Ls2gOuterModel::load(int slot, int row)
             st.masked = ov_.masked[r];
             std::sort(st.masked.begin(), st.masked.end());
             st.rowv.masked = &st.masked;
+            // a controller on a masked bus is gone (lightsim2grid's ctrl_masked_): never its
+            // group's reference, pinned at 0, so the group regulates through its live ones only
+            for (int c = 0; c < layout_.n_ctrl; ++c)
+                if (std::binary_search(st.masked.begin(), st.masked.end(), vc_bus_[static_cast<size_t>(c)]))
+                    st.held_q[static_cast<size_t>(c)] = 0.;
         }
         // the branches its contingency opens (BaseBatchSweep::_fill_outer_row_view)
         if (r < ov_.branch_off.size() && !ov_.branch_off[r].empty()) {
@@ -1300,8 +1317,8 @@ void Ls2gOuterModel::set_active(SlotState& st) const
             case Kind::DistributedSlack:
                 // a unit off the slack bus to take the mismatch: the slack bus' own units would
                 // only take what it already absorbs (DistributedSlackLoop::_has_participant)
-                needed = std::any_of(st.ds_unit_bus.begin(), st.ds_unit_bus.end(),
-                                     [&](int b) { return b != slack_bus_; });
+                // Unless asked to run anyway (Params::run_without_participant).
+                needed = d.ds_run_without_participant || ds_off_slack_bus(st);
                 break;
             case Kind::HvdcLimits:        needed = !hvdc_plan0_.empty(); break;
             case Kind::VoltageMonitoring: {
@@ -1370,6 +1387,9 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
             case Kind::DistributedSlack: {
                 ProfScope p_ds(prof_, P_LOAD_INIT_DS);
                 if (prof_.on) prof_.n[P_LOAD_DS_NUNITS] += static_cast<long long>(st.ds_units.size());
+                // run without a unit off the slack bus: no participant, its own units would
+                // only take what it already absorbs (DistributedSlackLoop::_initialize)
+                if (!ds_off_slack_bus(st)) { st.ds_units.clear(); st.ds_unit_bus.clear(); }
                 // DistributedSlackLoop::_initialize: each unit (collected by load) from its
                 // target in force
                 for (auto& u : st.ds_units)
@@ -1393,6 +1413,7 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                         st.ds_parked_high[k] = st.ds_lost_high ? 1 : 0;
                     }
                 }
+                st.ds_mark_solved();   // the first solve runs with these
                 break;
             }
             case Kind::HvdcLimits:
@@ -1480,7 +1501,8 @@ void Ls2gOuterModel::share_lost_p(SlotState& st, const LoopDecl& L) const
         auto& u = st.ds_units[k];
         if (u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR) move_gen(st, u.el_id, st.ds_unit_bus[k], new_mw[k]);
         else move_storage(st, u.el_id, st.ds_unit_bus[k], -new_mw[k]);
-        u.injection_mw = new_mw[k];
+        // the base (u.injection_mw) stays the targets the row started from: the checks share
+        // the cumulative mismatch from there, as OpenLoadFlow resets to initialTargetP
         st.ds_current_mw[k] = new_mw[k];
     }
     record(st, L.name, "SHARE_LOST_P", true, -1, lost, L.ds_eps_mw);
@@ -1865,7 +1887,9 @@ double Ls2gOuterModel::move_storage(SlotState& st, int s, int bus, double mw) co
 // =============================================================================
 int Ls2gOuterModel::check_ds(SlotState& st, const LoopDecl& L, const RowView& rv) const
 {
-    if (st.ds_in_newton) return check_ds_in_newton(st, L, rv);
+    // with no unit at all, the Newton shares nothing: the reference bus' mismatch is checked
+    // against the threshold as around a single-slack Newton
+    if (st.ds_in_newton && !st.ds_units.empty()) return check_ds_in_newton(st, L, rv);
     // single slack: slack_absorbed is 0, the whole residual of the slack bus
     const double mismatch = mis_bus(st, rv, st.ctl, slack_bus_).real() * sn_;
     const bool triggered = std::abs(mismatch) > L.ds_mismatch_mw && std::abs(mismatch) > L.ds_eps_mw;
@@ -1905,6 +1929,9 @@ int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const R
         st.ds_current_mw[k] = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR
             ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
     }
+    // the solve just checked ran with the units parked as the last check left them: this loop
+    // is checked again only after a solve
+    st.ds_mark_solved();
     // the same cumulative sharing from the initial targets as around a single-slack Newton;
     // what the reference bus kept is not nothing only when every unit is parked
     double mismatch = mis_bus(st, rv, st.ctl, slack_bus_).real() * sn_;
@@ -1947,6 +1974,9 @@ int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const R
         record(st, L.name, "TARGET_Q_FOLLOWED", true, -1, unsolved_q, threshold);
         unstable = true;
     }
+    // re-solved with the new weights; a STABLE check's change is not (unless another loop's
+    // re-solve comes after, and this loop is then checked again)
+    if (unstable) st.ds_mark_solved();
     return unstable ? UNSTABLE : STABLE;
 }
 
@@ -2993,13 +3023,14 @@ void Ls2gOuterModel::adjoint_info(const SlotState& st, RowResult& r) const
     };
     // DistributedSlackLoop::_adjoint_terms: a generator parked at a bound sits there whatever
     // its set-point -- unless that bound is its own set-point (one already beyond a limit). Its
-    // own: from before the row's lost-power share, which moves the initial targets the loop
-    // starts from (injection_mw) -- a unit that share put at its bound is held there too
+    // own: from before the row's lost-power share (ds_initial_mw) -- a unit that share put at
+    // its bound is held there too. As the last Newton solve had them: a unit parked by a check
+    // that did not re-solve still shared the slack in that solve
     if (st.ds_in_newton)
-        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_parked.size() && k < st.ds_initial_mw.size(); ++k) {
+        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_solved_parked.size() && k < st.ds_initial_mw.size(); ++k) {
             const auto& u = st.ds_units[k];
-            if (!st.ds_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
-            if (st.ds_current_mw[k] == st.ds_initial_mw[k]) continue;
+            if (!st.ds_solved_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
+            if (st.ds_solved_mw[k] == st.ds_initial_mw[k]) continue;
             r.gen_p_fixed.push_back(u.el_id);
         }
     // ReactiveLimitsLoop::_adjoint_terms (OuterLoopAlgo::get_adjoint_solve_info: a unit whose P

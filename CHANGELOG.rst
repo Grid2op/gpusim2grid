@@ -3,6 +3,17 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [FIXED] Tripping a generator next to a storage unit or HVDC station still regulating its bus turned that bus PQ.
+- [FIXED] ``outer_loops=True``: a voltage-control group losing a controller to an island, the others held at a
+  reactive limit, failed: the islanded controller is now gone and the regulated bus free.
+- [FIXED] ``outer_loops=True`` with ``redistribute_slack``: after a contingency's lost-power share, ``DistributedSlack``
+  shares the rest from the row's own targets (lightsim2grid 1.3.1, OpenLoadFlow): a unit put at a bound stays there.
+- [FIXED] ``outer_loops=True`` with ``redistribute_slack`` and ``init_from_n_powerflow``: a row losing a unit the "n"
+  solve moved shares that power, even when it loses nothing at the grid's targets.
+- [FIXED] ``outer_loops=True``: ``DistributedSlack(run_without_participant=True)`` is honoured (lightsim2grid #269).
+- [FIXED] Gradients with ``NROuterDist_*``: a unit parked at a check that did not re-solve keeps its ``gen_p`` gradient.
+- [FIXED] ``BatchPowerFlow.compute_flows`` refuses a ``V`` of another row count when the outer loops moved taps,
+  instead of silently using the grid's taps.
 - [IMPROVED] Continuous scheduling: no base-case load of a freed slot the tail overwrites or drops
   (``n_base_loads`` / ``n_base_loads_skipped``); results unchanged.
 - [FIXED] ``outer_loops=True``: ``scaling_max_voltage_change`` / ``max_dVa`` / ``max_dVm`` were silently ignored at

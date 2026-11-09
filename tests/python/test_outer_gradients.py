@@ -306,3 +306,43 @@ def test_capability_curve_slope():
     res = pf.sweep.get_outer_results()
     assert any(r.gen_p_slope for r in res), [r.decisions for r in res]
     _check_all(pf, inputs, grads, names=("gen_p", "load_q"))
+
+
+def test_distributed_slack_parked_at_a_check_that_does_not_resolve():
+    """NROuterDist_*: a unit DistributedSlack parks at a check whose move is too small to
+    re-solve still shared the slack in the Newton whose Jacobian the backward reads: its
+    set-point reaches the voltages (lightsim2grid 46897582)"""
+    from lightsim2grid.algorithm import DistributedSlack
+    grid = _grid(distributed=True)
+    grid.clear_outer_loops()
+    grid.add_outer_loop(DistributedSlack(moved_fraction=1e9))     # no move ever re-solves
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), 30, TOL_MVA).size > 0
+    pf = _pf(grid)
+    inputs = _inputs(grid)
+    V, grads = _grads(pf, inputs)
+    assert torch.isfinite(V).all()
+    res = pf.sweep.get_outer_results()
+    assert any("PARK" in d for r in res for d in r.decisions), [r.decisions for r in res]
+    assert all(r.nb_outer_iterations == 0 for r in res), [r.decisions for r in res]
+    assert not any(r.gen_p_fixed for r in res), [r.gen_p_fixed for r in res]
+    assert (grads["gen_p"][:, 0] != 0.).all()
+    _check_all(pf, inputs, grads, names=("gen_p",))
+
+
+def test_compute_flows_refuses_rows_it_cannot_match_to_their_taps():
+    """Another row count than the forward's: nothing says which row is which, the taps the
+    loops moved would be silently lost (lightsim2grid d2a80040)"""
+    from test_outer_model_cpu import _tvc_grid
+    from gpusim2grid.differentiable import BatchPowerFlow
+    grid = _tvc_grid("T4-9-1", 12.4, 0.05)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), 30, TOL_MVA).size > 0
+    pf = BatchPowerFlow.from_lsgrid(grid, outer_loops=True, nb_iter=30, tol=TOL_MVA / grid.get_sn_mva(),
+                                    init_from_n_powerflow=False, ir_n_steps=1)
+    base_lp = np.asarray(grid.get_load_target_p(), dtype=float)
+    with torch.no_grad():
+        V = pf(load_p=_t(np.outer(np.array([1., 1.03, 1.06]), base_lp)))
+    assert pf._trafo_moved is not None and len(pf._trafo_moved[1]) > 0
+    full = pf.compute_flows(V)["i_or_a"]
+    with pytest.raises(ValueError, match="taps"):
+        pf.compute_flows(V[1:])
+    assert full.shape[0] == 3

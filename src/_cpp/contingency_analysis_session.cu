@@ -480,7 +480,10 @@ void ContingencyAnalysisSession::run()
                                                                     ctg_shunts_[static_cast<size_t>(r)], bus_masked)
                                       : 0.);
                 if (outer_) {
-                    if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+                    // the loop gets the row's loss even when it is nothing at the grid's targets: it counts
+                    // the units the row loses at the targets in force, which a row resumed from
+                    // the "n" solve takes from that solve, and decides itself what is left to share
+                    row_lost_p_mw_[static_cast<size_t>(r)] = lost;
                 } else {
                     slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(slack_rd_, lost, bus_masked, g_off, g_p);
                 }

@@ -681,10 +681,17 @@ class BatchPowerFlow:
         """Branch flows (``p_or_mw``, ``q_or_mvar``, ``p_ex_mw``, ``q_ex_mvar``,
         ``i_or_a``, ``i_ex_a``) of shape ``(n_scen, n_branch)`` from ``V``
         ``(n_scen, n_bus)``; pure torch, differentiable. Branches a row tripped
-        are NOT zeroed here (mask them with the status inputs if needed)."""
+        are NOT zeroed here (mask them with the status inputs if needed). With taps
+        the outer loops moved, ``V`` must hold every row of the last forward, in its
+        order (index the flows afterwards)."""
         yff, yft, ytf, ytt = self._yff, self._yft, self._ytf, self._ytt
         moved = self._trafo_moved
-        if moved is not None and V.dim() == 2 and V.shape[0] == moved[0]:
+        if moved is not None and len(moved[1]) > 0:
+            if V.dim() != 2 or V.shape[0] != moved[0]:
+                raise ValueError(
+                    f"`V` has shape {tuple(V.shape)}, the last forward {moved[0]} rows, whose outer "
+                    f"loops moved transformer taps in some rows: the flows would be taken at the "
+                    f"wrong taps. Pass the forward's whole `V` and index the flows afterwards.")
             # the transformers the outer loops left off the grid's taps, at the row's final
             # taps (as lightsim2grid's compute_flows, get_outer_trafo_admittances)
             n_scen, rows, cols, blocks = moved
