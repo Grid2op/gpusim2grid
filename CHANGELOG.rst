@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [ADDED] A contingency or a row can trip an HVDC line in AC emulation: no flow, no slope, still one analysis.
+- [FIXED] ``ScenarioSweepGPU`` with ``redistribute_slack``: a tripped storage unit kept its share of the row's slack.
 - [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: a contingency can trip static generators, storage units,
   SVCs and HVDC lines (lightsim2grid #292): ``add_contingency(sgen_ids=, ...)``, ``set_contingency_sgens`` etc.
 - [BREAKING] What the batch cannot do (a remote generator, an SVC in voltage mode, ...) is reported per row

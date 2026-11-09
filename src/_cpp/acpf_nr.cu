@@ -924,6 +924,8 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_id,     hid.data(),    n_hvdc, cs);
+        h_hvdc_id = hid;
+        h_hvdc_status = status;
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);

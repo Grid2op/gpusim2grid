@@ -181,7 +181,8 @@ CASES = [
     (SGEN, _grid_sgen, [([0], []), ([1], []), ([0, 1], []), ([0], [5])]),
     (STORAGE, _grid_storage, [([REGULATING], []), ([PQ], []), ([REGULATING, PQ], []), ([PQ], [5])]),
     (SVC, _grid_svc, [([FIXED_Q], []), ([OFF_B0], []), ([FIXED_Q, OFF_B0], []), ([FIXED_Q], [5])]),
-    (HVDC, _grid_hvdc, [([FIXED], []), ([HV_REGULATING], []), ([FIXED, HV_REGULATING], []), ([FIXED], [5])]),
+    (HVDC, _grid_hvdc, [([FIXED], []), ([HV_REGULATING], []), ([FIXED, HV_REGULATING], []), ([FIXED], [5]),
+                        ([DROOP], []), ([DROOP, FIXED], []), ([DROOP], [5])]),
 ]
 
 
@@ -234,9 +235,18 @@ def _grid_storage_on_group_bus():
     return _finish(grid), remote
 
 
+def _grid_hvdc_station_in_group():
+    """two stations on a bus a remote generator regulates too: they are all of its group"""
+    grid, gen_id, bus, vm = _grid_two_stations_on_a_gen_bus()
+    other = next(g.id for g in grid.get_generators() if not g.is_slack and g.id != gen_id)
+    grid.set_gen_regulated_bus(other, bus)
+    grid.change_v_gen(other, vm)
+    return _finish(grid)
+
+
 UNSUPPORTED = [
     (SVC, _grid_svc, [VOLTAGE], "voltage"),
-    (HVDC, _grid_hvdc, [DROOP], "emulation"),
+    (HVDC, _grid_hvdc_station_in_group, [0], "group"),
     (STORAGE, lambda: _grid_storage_on_group_bus()[0], [REGULATING], "group"),
 ]
 
@@ -246,13 +256,14 @@ UNSUPPORTED = [
 def test_what_the_batch_cannot_do_is_reported_per_row(runner, kind, make, bad, word):
     from gpusim2grid.contingency_analysis import LimitViolationType
     grid = make()
-    ok = {SVC: [FIXED_Q], HVDC: [FIXED], STORAGE: [PQ]}[kind]
-    trips = [(bad, []), (ok, [])]
+    # (an element the batch can take out, or nothing: the second row opens a line anyway)
+    ok = {SVC: [FIXED_Q], STORAGE: [PQ]}.get(kind, [])
+    trips = [(bad, []), (ok, [5])]
     session, V = runner(grid, trips, kind, compute_limit_violations=True)
     reasons = session.get_batch_unsupported_reasons()
     assert word in reasons[0] and reasons[1] == ""
     assert np.isnan(V[0]).all()
-    np.testing.assert_allclose(V[1], _reference(grid, kind, ok), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[1], _reference(grid, kind, ok, [5]), rtol=0., atol=1e-7)
     v0 = session.get_violations()[0]
     assert [el.violation_type for el in v0] == [LimitViolationType.BATCH_UNSUPPORTED]
 
@@ -318,6 +329,19 @@ def test_redistribute_slack_counts_what_the_element_loses(kind, make, ids, lost)
     np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=1e-6)
 
 
+def test_redistribute_slack_a_storage_unit_of_the_slack_leaves_it_on_a_sweep():
+    """the pre-pass' weights too: a tripped storage unit keeps no share of the row's slack"""
+    grid = _grid_storage()
+    for gen in grid.get_generators():
+        grid.add_gen_slackbus(gen.id, 1.)
+    grid.add_storage_slackbus(PQ, 1.)
+    nb_gen = len(grid.get_generators())
+    grid.set_gen_p_limits(np.zeros(nb_gen), np.full(nb_gen, 1e3))
+    _finish(grid)
+    session, V = _sweep(grid, [([PQ], [])], STORAGE, redistribute_slack=True)
+    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=1e-6)
+
+
 def test_the_ten_tuple_and_the_shortcuts():
     from gpusim2grid import ContingencyAnalysisGPU
     grid = _grid_sgen()
@@ -353,6 +377,48 @@ def test_with_the_outer_loops(kind, make, ids):
     np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=1e-6)
 
 
+def _grid_droop_only(algo="NR_KLU", p_max=100., limits=True):
+    """one line in AC emulation between buses 9 and 3, no station regulating a voltage"""
+    grid = _base()
+    big = np.full(1, 1e3)
+    grid.init_hvdc_lines(np.array([9], dtype=np.int32), np.array([3], dtype=np.int32), [0], [0], np.ones(1), np.ones(1),
+                         [False], [False], np.ones(1), np.ones(1), np.zeros(1), np.zeros(1), -big, big, -big, big,
+                         np.ones(1), np.ones(1), [0], np.array([10.]), np.ones(1), np.full(1, 12.),
+                         [True], np.array([5.]), np.array([2.]), np.full(1, p_max), np.full(1, p_max))
+    if limits:
+        from lightsim2grid.algorithm import HvdcAcEmulationLimits, ReactiveLimits
+        grid.clear_outer_loops()
+        grid.add_outer_loop(HvdcAcEmulationLimits())
+        grid.add_outer_loop(ReactiveLimits())
+    return _finish(grid, algo)
+
+
+def test_a_line_in_ac_emulation_with_the_outer_loops():
+    """the row is a one-off NROuter solve of the grid without the line; its limits loop skips it
+    (the second row, keeping the line, is the one-off solve of the grid itself)"""
+    grid = _grid_droop_only(OUTER)
+    session, V = _analysis(grid, [([0], []), ([], [5])], HVDC, outer_loops=True, scheduling="continuous",
+                           nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
+    assert not any(session.get_batch_unsupported_reasons())
+    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=1e-6)
+
+
+def test_a_saturated_line_can_be_tripped():
+    """at its limit, the line injects pmax: the trip takes that out too"""
+    grid = _grid_droop_only(p_max=1., limits=False)
+    grid.set_status_droop_hvdc(0, 1)
+    _finish(grid)
+    session, V = _analysis(grid, [([0], [])], HVDC)
+    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=1e-7)
+
+
+def test_physical_checks_report_a_line_in_ac_emulation():
+    grid = _grid_droop_only(limits=False)
+    session, V = _analysis(grid, [([0], [])], HVDC, compute_physical_violations=True)
+    assert "physical" in session.get_batch_unsupported_reasons()[0]
+
+
 def test_a_regulating_station_with_the_outer_loops_is_reported():
     """OuterRowView has no way to say a line is out before lightsim2grid #292"""
     from lightsim2grid.algorithm import ReactiveLimits
@@ -372,3 +438,22 @@ def test_physical_checks_report_the_rows_they_cannot_check(kind, make, ids):
     grid = make()
     session, V = _analysis(grid, [(ids, [])], kind, compute_physical_violations=True)
     assert "physical" in session.get_batch_unsupported_reasons()[0]
+
+
+def test_a_tripped_line_follows_its_row_through_the_continuous_tail():
+    """the per-slot status moves with its row when the tail compacts the slots"""
+    from gpusim2grid import ContingencyAnalysisGPU
+    grid = _grid_droop_only(limits=False)
+    branches = list(range(7))
+    conts = [_ctg(HVDC, [0], [b]) for b in branches] + [_ctg(HVDC, [], [b]) for b in branches]
+    ca = ContingencyAnalysisGPU(grid, scheduling="continuous", nb_iter=MAX_IT, tol=1e-9 / grid.get_sn_mva(),
+                                tol_base=TOL)
+    ca.tail_max_groups = 1
+    ca.tail_group_size = 4
+    ca.add_contingencies(conts)
+    ca.compute(batch_size=12)
+    assert ca.timings.n_slot_moves > 0
+    V = ca.V_results.to_numpy().reshape(len(conts), grid.get_Ybus_solver().shape[0])
+    for r, c in enumerate(conts):
+        ids, br = c[TUPLE_POS[HVDC]], c[0]
+        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids, br), rtol=0., atol=1e-7, err_msg=f"row {r}")

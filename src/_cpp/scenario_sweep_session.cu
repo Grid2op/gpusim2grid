@@ -1652,7 +1652,8 @@ void ScenarioSweepSession::run()
             };
             w_rows = slack_redistribution::build_row_weights(
                 slack_rd_, slack_rows_, n_scenarios_, gen_off, n_bus,
-                base_state_->h_slack_bus, base_state_->h_slack_w, _reference_bus());
+                base_state_->h_slack_bus, base_state_->h_slack_w, _reference_bus(),
+                [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
             dp_rows.resize(slack_rows_.size());
             for (size_t r = 0; r < slack_rows_.size(); ++r) dp_rows[r] = slack_rows_[r].dp_pu;
         } else {
@@ -1661,6 +1662,16 @@ void ScenarioSweepSession::run()
         solver_->source_.set_slack_redistribution(w_rows, base_state_->n_slack, dp_rows,
                                                   base_state_->n_slack, solver_->batch_size_, scs);
         rd_applied_ = rd_active;
+    }
+
+    // the lines in AC emulation each row trips (the outer loops own the slots' regimes)
+    if (!outer_ && base_state_->n_hvdc > 0) {
+        std::vector<std::vector<int>> droop_off(static_cast<size_t>(n_scenarios_));
+        if (has_more_off_)
+            for (size_t r = 0; r < more_off_.size(); ++r)
+                if (row_unsupported_[r].empty() && !more_off_[r].hvdcs.empty())
+                    droop_off[r] = element_trips::droop_entries(base_state_->h_hvdc_id, more_off_[r].hvdcs);
+        solver_->source_.set_hvdc_off(base_state_->h_hvdc_status, droop_off, solver_->batch_size_, scs);
     }
 
     // Per-run knobs that need no rebuild.
@@ -1791,6 +1802,8 @@ void ScenarioSweepSession::run()
         }
         if (has_more_off_) {
             ov.pq_buses = row_pv_to_pq_;
+            ov.hvdc_off.resize(more_off_.size());
+            for (size_t r = 0; r < more_off_.size(); ++r) ov.hvdc_off[r] = more_off_[r].hvdcs;
             bool any_storage = false;
             for (const MoreTrips& t : more_off_) any_storage = any_storage || !t.storages.empty();
             if (any_storage) {

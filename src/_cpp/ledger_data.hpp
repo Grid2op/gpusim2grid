@@ -22,6 +22,10 @@
 
 #include <vector>
 
+// A line in AC emulation a batch row trips: no flow, no slope. Next to its regimes
+// (0 linear, 1 / -1 saturated either way) in the per-slot status arrays.
+constexpr int HVDC_STATUS_TRIPPED = 2;
+
 struct LedgerData {
     int n_bus = 0;
     int dim_J = 0;   // augmented Jacobian dimension (== NRLedger size)

@@ -584,6 +584,14 @@ void ContingencyAnalysisSession::run()
         }
         bool any_ds = false;
         for (const auto& ds : ds_rows) if (!ds.empty()) { any_ds = true; break; }
+        // the lines in AC emulation each contingency trips (the outer loops own the slots' regimes)
+        if (!outer_) {
+            std::vector<std::vector<int>> droop_off(contingencies_.size());
+            for (size_t r = 0; r < contingencies_.size(); ++r)
+                if (row_unsupported_[r].empty() && !ctg_more_[r].hvdcs.empty())
+                    droop_off[r] = element_trips::droop_entries(base_state_->h_hvdc_id, ctg_more_[r].hvdcs);
+            source.set_hvdc_off_host(base_state_->h_hvdc_status, droop_off);
+        }
         if (!w_rows.empty() || any_ds)
             source.set_row_sbus_host(w_rows, base_state_->n_slack,
                                      any_ds ? ds_rows : std::vector<std::vector<std::pair<int, std::complex<double>>>>());
@@ -714,6 +722,9 @@ void ContingencyAnalysisSession::run()
                 for (int g : ctg_gens_[r]) ov.gen_off[r * static_cast<size_t>(n_gen) + static_cast<size_t>(g)] = 1;
         }
         if (any_controller_trip) ov.pq_buses = row_pv_to_pq_;
+        // ... and the lines in AC emulation it trips
+        ov.hvdc_off.resize(contingencies_.size());
+        for (size_t r = 0; r < ctg_more_.size(); ++r) ov.hvdc_off[r] = ctg_more_[r].hvdcs;
         // ... and the storage units it trips
         bool any_storage = false;
         for (const MoreTrips& t : ctg_more_) any_storage = any_storage || !t.storages.empty();

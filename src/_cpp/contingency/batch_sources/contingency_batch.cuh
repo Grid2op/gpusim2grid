@@ -44,6 +44,7 @@
 #include "../mask_streams.cuh"            // MaskStreams
 #include "../slot_schedule.cuh"           // SlotLoadView, SlotTableView
 #include "../segment_gather.cuh"          // RowSegments, SegmentGather
+#include "slot_hvdc_status.cuh"           // SlotHvdcStatus
 #include "slot_slack_redistribution.cuh"  // SlotSlackRedistribution
 
 // Forward declaration to avoid circular include.
@@ -131,6 +132,7 @@ struct ContingencyBatch {
     // Set on the host (set_slack_redistribution_host) BEFORE the source is
     // handed to its driver, uploaded by initialize().
     // -------------------------------------------------------------------------
+    SlotHvdcStatus                         hvdc_;
     SlotSlackRedistribution                slack_;
     thrust::device_vector<cudaComplexType> d_Sbus_batch;   // batch_size × n_bus, only with a correction
 
@@ -226,6 +228,12 @@ struct ContingencyBatch {
         slack_.set_dp_host_cplx(ds_orig, active_to_orig_);
     }
 
+    // the lines in AC emulation each row trips (see SlotHvdcStatus), before initialize()
+    void set_hvdc_off_host(const std::vector<int>& base_status, const std::vector<std::vector<int>>& off_orig)
+    {
+        hvdc_.set_host(base_status, off_orig, active_to_orig_);
+    }
+
     ContingencyBatch(ContingencyBatch&&) noexcept = default;
     ContingencyBatch(const ContingencyBatch&) = delete;
     ContingencyBatch& operator=(const ContingencyBatch&) = delete;
@@ -312,6 +320,7 @@ struct ContingencyBatch {
     {
         if (mask_.any()) mask_.bind(T, buf, d_J_outer, cs);
         slack_.fill(buf);
+        hvdc_.fill(buf);
     }
 
     // The continuous tail's compaction (BatchPfDriver::_compact_tail): this
@@ -322,6 +331,7 @@ struct ContingencyBatch {
         if (sbus_stride(n_bus) > 0 && !d_Sbus_batch.empty())
             launch_move_slot_rows(thrust::raw_pointer_cast(d_Sbus_batch.data()), n_bus, M, cs);
         slack_.move_slots(M, cs);
+        hvdc_.move_slots(M, cs);
     }
 
     // -------------------------------------------------------------------------

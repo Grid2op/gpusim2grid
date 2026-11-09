@@ -260,6 +260,12 @@ struct SlotState {
     std::vector<double> held_q;           // per controller, pu, NaN not held by value
     std::vector<double> svc_on;           // per controller, the standby target, NaN idle
     std::vector<int> hvdc_regime;         // per ledger hvdc entry, 2 = KEEP
+    std::vector<char> hvdc_tripped;       // per ledger hvdc entry: the row trips it (empty: none)
+    bool hvdc_line_tripped(int hvdc_id, const std::vector<int>& ids) const {
+        if (hvdc_tripped.empty()) return false;
+        const auto it = std::find(ids.begin(), ids.end(), hvdc_id);
+        return it != ids.end() && hvdc_tripped[static_cast<size_t>(it - ids.begin())] != 0;
+    }
     FlatMap<int, cplx> target_delta;      // Sbus_target - the row's Sbus, pu
     FlatMap<int, double> freeze_q;        // Sbus - Sbus_target (imaginary), pu
     std::vector<char> frozen_at;          // per solver bus, 1 when in freeze_q (empty: none yet)
@@ -385,6 +391,7 @@ double hvdc_recv(double p_ctrl_abs, bool side1_ctrl, double lf1, double lf2, dou
 void hvdc_flows(int st, double raw, double lf1, double lf2, double r, double pmax12, double pmax21,
                 double& p1, double& p2)
 {
+    if (st == HVDC_STATUS_TRIPPED) { p1 = 0.; p2 = 0.; return; }
     if (st == 0) {
         if (raw >= 0.) { p1 = raw; p2 = -hvdc_recv(raw, true, lf1, lf2, r); }
         else           { p1 = -hvdc_recv(-raw, false, lf1, lf2, r); p2 = -raw; }
@@ -1015,6 +1022,13 @@ void Ls2gOuterModel::load(int slot, int row)
                                      ov_.load_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_load_));
         }
         if (r < ov_.lost_p_mw.size()) st.rowv.lost_p_mw = ov_.lost_p_mw[r];
+        if (r < ov_.hvdc_off.size() && !ov_.hvdc_off[r].empty()) {
+            st.hvdc_tripped.assign(hvdc_id_.size(), 0);
+            for (int h : ov_.hvdc_off[r]) {
+                const auto it = std::find(hvdc_id_.begin(), hvdc_id_.end(), h);
+                if (it != hvdc_id_.end()) st.hvdc_tripped[static_cast<size_t>(it - hvdc_id_.begin())] = 1;
+            }
+        }
         if (r < ov_.masked.size() && !ov_.masked[r].empty()) {
             st.masked = ov_.masked[r];
             std::sort(st.masked.begin(), st.masked.end());
@@ -1326,7 +1340,11 @@ void Ls2gOuterModel::set_active(SlotState& st) const
                 // Unless asked to run anyway (Params::run_without_participant).
                 needed = d.ds_run_without_participant || ds_off_slack_bus(st);
                 break;
-            case Kind::HvdcLimits:        needed = !hvdc_plan0_.empty(); break;
+            case Kind::HvdcLimits:
+                // (without the lines the row takes out: nothing to saturate, nothing to release)
+                needed = std::any_of(hvdc_plan0_.lines.begin(), hvdc_plan0_.lines.end(), [&](const auto& line) {
+                    return !st.hvdc_line_tripped(line.hvdc_id, hvdc_id_); });
+                break;
             case Kind::VoltageMonitoring: {
                 const auto& svcs = grid_->get_svcs();
                 for (int id : held_svcs_)
@@ -1424,6 +1442,10 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
             }
             case Kind::HvdcLimits:
                 st.hvdc_plan = hvdc_plan0_;   // every line linear
+                if (!st.hvdc_tripped.empty())
+                    st.hvdc_plan.lines.erase(std::remove_if(st.hvdc_plan.lines.begin(), st.hvdc_plan.lines.end(),
+                                                            [&](const auto& line) { return st.hvdc_line_tripped(line.hvdc_id, hvdc_id_); }),
+                                             st.hvdc_plan.lines.end());
                 break;
             case Kind::VoltageMonitoring:
                 st.vm_switched_on.clear();
@@ -1688,6 +1710,8 @@ void Ls2gOuterModel::materialize(SlotState& st) const
     for (int e = 0; e < layout_.n_hvdc; ++e)
         c.hvdc_status[static_cast<size_t>(e)] = st.hvdc_regime[static_cast<size_t>(e)] == 2
             ? hvdc_status0_[static_cast<size_t>(e)] : st.hvdc_regime[static_cast<size_t>(e)];
+    for (size_t e = 0; e < st.hvdc_tripped.size(); ++e)
+        if (st.hvdc_tripped[e]) c.hvdc_status[e] = HVDC_STATUS_TRIPPED;
     // target_delta + i.freeze_q, per bus: both sorted by bus, merged without a copy (the
     // same sums as adding freeze_q into a copy of target_delta)
     c.sbus_bus.clear(); c.sbus_dp.clear(); c.sbus_dq.clear();

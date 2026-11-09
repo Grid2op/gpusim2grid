@@ -144,6 +144,17 @@ inline void check_ids(const MoreTrips& t, const ElementTripData& d, const char* 
     check_ids(t.hvdcs, d.n_hvdc, "hvdc line", who);
 }
 
+// The entries (positions in `hvdc_id`, the droop lines of the Newton) these lines are.
+inline std::vector<int> droop_entries(const std::vector<int>& hvdc_id, const std::vector<int>& hvdcs)
+{
+    std::vector<int> out;
+    for (int h : hvdcs) {
+        const auto it = std::find(hvdc_id.begin(), hvdc_id.end(), h);
+        if (it != hvdc_id.end()) out.push_back(static_cast<int>(it - hvdc_id.begin()));
+    }
+    return out;
+}
+
 // Why the batch cannot take these elements out of a row (empty: it can).
 inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t, bool outer, bool physical)
 {
@@ -165,7 +176,8 @@ inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t
     for (int h : t.hvdcs) {
         const size_t k = static_cast<size_t>(h);
         if (!d.hvdc_on[k]) continue;
-        if (d.hvdc_droop[k]) return "disconnects hvdc line " + std::to_string(h) + ", which runs in AC emulation";
+        if (physical && d.hvdc_droop[k])
+            return "disconnects hvdc line " + std::to_string(h) + ", which runs in AC emulation: the physical checks cannot leave it out of a row yet";
         if (d.hvdc_on_group[k]) return "disconnects hvdc line " + std::to_string(h) + ", a station of which stands in a control group";
         if (outer && d.hvdc_regulating[k])
             return "disconnects hvdc line " + std::to_string(h) + ", a station of which regulates a voltage: the outer loops cannot leave it out yet";
@@ -214,10 +226,13 @@ inline std::vector<std::pair<int, std::complex<double>>> sbus_delta(
         }
         for (int h : more->hvdcs) {
             if (!d.hvdc_on[static_cast<size_t>(h)]) continue;
+            // in AC emulation the line's active power is the Newton's, not in Sbus
+            const bool p_in_sbus = !d.hvdc_droop[static_cast<size_t>(h)];
             for (size_t k = 2 * static_cast<size_t>(h); k < 2 * static_cast<size_t>(h) + 2; ++k)
                 if (d.hvdc_station_bus[k] >= 0)
                     out.emplace_back(d.hvdc_station_bus[k],
-                                     -std::complex<double>(d.hvdc_station_p_mw[k], d.hvdc_station_q_mvar[k]) / d.sn_mva);
+                                     -std::complex<double>(p_in_sbus ? d.hvdc_station_p_mw[k] : 0.,
+                                                           d.hvdc_station_q_mvar[k]) / d.sn_mva);
         }
     }
     std::sort(out.begin(), out.end(),
