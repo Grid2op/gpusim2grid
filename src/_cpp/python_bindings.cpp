@@ -3513,11 +3513,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.def("_make_ca_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
-           bool keep_trace, bool resume_from_n) {
+           bool keep_trace, bool resume_from_n,
+           int scaling_override, double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ca_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
-                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
+                scaling_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3530,16 +3532,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "A ContingencyAnalysisSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_is_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
-           bool keep_trace, bool resume_from_n) {
+           bool keep_trace, bool resume_from_n,
+           int scaling_override, double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_is_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
-                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
+                scaling_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3552,17 +3559,22 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "An InjectionSweepSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_ss_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device,
            bool compute_limit_violations, ReorderingAlg reordering_alg,
            MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool keep_trace,
-           bool resume_from_n) {
+           bool resume_from_n,
+           int scaling_override, double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ss_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, compute_limit_violations,
-                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
+                scaling_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3575,6 +3587,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "A ScenarioSweepSession running the grid's outer loops (its algorithm an "
         "NROuter_* one, solved): continuous scheduling; each row starts from the grid's "
         "voltages, its generators' buses at their set-points, and default controls. "

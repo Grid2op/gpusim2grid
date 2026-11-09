@@ -1769,12 +1769,16 @@ make_ss_outer_session_from_lsgrid(
     PivotEpsilonAlg pivot_epsilon_alg,
     int ir_n_steps,
     bool   keep_trace,
-    bool   resume_from_n)
+    bool   resume_from_n,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
-    // the step scaling of the grid's own (inner) Newton
-    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
+    // the step scaling of the inner Newton: the grid's own unless the caller forces it
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     // the base state trusts V0 as it is (no residual check: the grid's own state was
     // solved with its loops' controls, which the base state does not carry)
     auto session = std::make_shared<ScenarioSweepSession>(
@@ -1818,12 +1822,16 @@ make_ca_outer_session_from_lsgrid(
     PivotEpsilonAlg pivot_epsilon_alg,
     int ir_n_steps,
     bool   keep_trace,
-    bool   resume_from_n)
+    bool   resume_from_n,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
-    // the step scaling of the grid's own (inner) Newton
-    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
+    // the step scaling of the inner Newton: the grid's own unless the caller forces it
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
@@ -1863,12 +1871,16 @@ make_is_outer_session_from_lsgrid(
     PivotEpsilonAlg pivot_epsilon_alg,
     int ir_n_steps,
     bool   keep_trace,
-    bool   resume_from_n)
+    bool   resume_from_n,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
-    // the step scaling of the grid's own (inner) Newton
-    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
+    // the step scaling of the inner Newton: the grid's own unless the caller forces it
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<InjectionSweepSession>(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),

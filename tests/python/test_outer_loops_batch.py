@@ -197,6 +197,35 @@ def test_refusals(case14):
         ScenarioSweepGPU(case14, init_from_n_powerflow=False).get_outer_results()
 
 
+def _outer_facade(kind, grid, **kwargs):
+    from gpusim2grid import ContingencyAnalysisGPU, InjectionSweepGPU, ScenarioSweepGPU
+    cls = {"ca": ContingencyAnalysisGPU, "ss": ScenarioSweepGPU, "is": InjectionSweepGPU}[kind]
+    return cls(grid, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, **kwargs)
+
+
+@pytest.mark.parametrize("kind", ["ca", "ss", "is"])
+def test_step_scaling_arguments_reach_the_outer_session(case14, kind):
+    """they force the grid's own setting, as without the outer loops; None inherits it"""
+    cfg = case14.get_ac_algo_config()
+    s = _outer_facade(kind, case14)._inner._s
+    assert s.scaling_max_voltage_change == (list(cfg.int_params)[0] == 1)
+    for forced in (True, False):
+        s = _outer_facade(kind, case14, scaling_max_voltage_change=forced, max_dVa=0.25, max_dVm=0.05)._inner._s
+        assert s.scaling_max_voltage_change is forced
+        assert s.max_dVa == pytest.approx(0.25)
+        assert s.max_dVm == pytest.approx(0.05)
+
+
+def test_step_scaling_arguments_change_the_outer_newton(case14):
+    """tight limits damp every inner Newton: more iterations than with the scaling off"""
+    def newton(**kwargs):
+        ca = _outer_facade("ca", case14, tol=TOL_MVA / case14.get_sn_mva(), ir_n_steps=1, **kwargs)
+        ca.add_contingencies_by_branch_id([[1], [2], [3]])
+        ca.compute(batch_size=3)
+        return sum(r.nb_nr_iterations for r in ca.get_outer_results())
+    assert newton(scaling_max_voltage_change=True, max_dVa=0.01, max_dVm=0.002) > newton(scaling_max_voltage_change=False)
+
+
 def test_grid_without_nrouter_is_refused():
     import pandapower.networks as pn
     from lightsim2grid.network import init_from_pandapower

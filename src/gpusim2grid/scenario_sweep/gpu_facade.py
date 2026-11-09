@@ -281,7 +281,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
                     ir_n_steps=_ir_n_steps,
                     keep_trace=bool(keep_outer_trace),
-                    resume_from_n=bool(init_from_n_powerflow))
+                    resume_from_n=bool(init_from_n_powerflow),
+                    # None => the grid's own step scaling, as without the outer loops
+                    scaling_max_voltage_change_override=(
+                        -1 if scaling_max_voltage_change is None
+                        else int(bool(scaling_max_voltage_change))),
+                    max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
                 self._inner = _ScenarioSweepSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
