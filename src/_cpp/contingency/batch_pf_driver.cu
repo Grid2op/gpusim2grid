@@ -2735,6 +2735,50 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         t.t_oc_load += TimingEntry{0., ms_since(t_l0)};
     }
 
+    // One record per round, from the differences of the cumulative timers.
+    t.round_records.clear();
+    auto cumulative = [&]() {
+        RoundRecord c;
+        const TimingEntry nr = t.t_spmv + t.t_fill_F + t.t_fill_J + t.t_first_factorize
+                               + t.t_refactorize + t.t_solve + t.t_update_V;
+        c.t_newton_wall_ms = nr.wall_ms;
+        c.t_newton_gpu_ms  = nr.gpu_ms;
+        c.t_residual_ms    = t.t_residual.wall_ms;
+        c.t_res_sync_ms    = t.t_sched_res_sync.wall_ms;
+        c.t_gather_ms      = t.t_oc_gather.wall_ms;
+        c.t_decide_ms      = t.t_oc_decide.wall_ms;
+        c.t_load_ms        = t.t_oc_load.wall_ms;
+        c.t_controls_ms    = t.t_oc_controls.wall_ms;
+        c.t_compact_ms     = t.t_tail_compact.wall_ms;
+        c.n_moves          = t.n_slot_moves;
+        c.n_load_base      = static_cast<int>(t.n_base_loads);
+        return c;
+    };
+    RoundRecord rec_prev = cumulative();
+    auto t_round0 = std::chrono::steady_clock::now();
+    int rec_n_cur = 0, rec_n_live = 0;
+    auto push_round = [&](int n_leave, int n_resolve, int n_load_real) {
+        const RoundRecord now = cumulative();
+        RoundRecord r;
+        r.n_cur = rec_n_cur;  r.n_live = rec_n_live;  r.n_leave = n_leave;
+        r.n_resolve = n_resolve;  r.n_load_real = n_load_real;
+        r.n_load_base = now.n_load_base - rec_prev.n_load_base;
+        r.n_moves = now.n_moves - rec_prev.n_moves;
+        r.t_round_ms = ms_since(t_round0);
+        r.t_newton_wall_ms = now.t_newton_wall_ms - rec_prev.t_newton_wall_ms;
+        r.t_newton_gpu_ms = now.t_newton_gpu_ms - rec_prev.t_newton_gpu_ms;
+        r.t_residual_ms = now.t_residual_ms - rec_prev.t_residual_ms;
+        r.t_res_sync_ms = now.t_res_sync_ms - rec_prev.t_res_sync_ms;
+        r.t_gather_ms = now.t_gather_ms - rec_prev.t_gather_ms;
+        r.t_decide_ms = now.t_decide_ms - rec_prev.t_decide_ms;
+        r.t_load_ms = now.t_load_ms - rec_prev.t_load_ms;
+        r.t_controls_ms = now.t_controls_ms - rec_prev.t_controls_ms;
+        r.t_compact_ms = now.t_compact_ms - rec_prev.t_compact_ms;
+        t.round_records.push_back(r);
+        rec_prev = now;
+        t_round0 = std::chrono::steady_clock::now();
+    };
+
     // Initial load: every slot (the queue's first rows, phantoms past its end).
     const auto t_rounds_start = std::chrono::steady_clock::now();
     _wait_sched_upload();
@@ -2770,6 +2814,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     std::vector<RowStatus> leave_st(static_cast<size_t>(S));
     std::vector<double> gbuf;
     while (n_live > 0) {
+        rec_n_cur  = n_cur;
+        rec_n_live = n_live;
         std::visit([&](auto& policy) {
             run_nr_loop(
                 policy, linear_solver_, _spmv(), buf,
@@ -2922,7 +2968,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_c0).count()};
         }
-        if (n_leave == 0) continue;
+        if (n_leave == 0) {
+            push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
+            continue;
+        }
 
         // ---- eviction of the leaving slots -------------------------------
         // Their residuals into d_residuals at their original rows (d_F is
@@ -2950,7 +2999,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 d_evict(), base.nnz_Y, n_cur);
 
         // ---- refill the freed slots ---------------------------------------
-        if (n_live == 0) break;   // everything left; no round follows
+        if (n_live == 0) {        // everything left; no round follows
+            push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
+            break;
+        }
         if (n_load > 0) _load(_load_view(n_load, -1, n_load_real), timer, t);
         if (hook != nullptr && n_load > 0) {
             const auto t_l0 = std::chrono::steady_clock::now();
@@ -2966,6 +3018,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         }
         enter_tail(n_live);
         buf = _bound_nr_buffers(_table_view(-1));
+        push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
     }
     {
         const auto t_rounds_end = std::chrono::steady_clock::now();

@@ -459,6 +459,8 @@ void ContingencyAnalysisSession::run()
     // A.6).
     const BatchDriverConfig cfg = _current_config();
     const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
+    const double t_sess_ref_ms = ms_since(t_run0);
+    double t_sess_source_ms = 0., t_sess_prepass_ms = 0., t_sess_driver_ctor_ms = 0.;
 
     if (cold) {
         // Reset any masking flags set on a previous run() (the contingency
@@ -499,6 +501,7 @@ void ContingencyAnalysisSession::run()
         // below for the disconnected count. The source rebalances the chunk
         // size over the ACTIVE (simulated) count; we read it back so the
         // driver chunks consistently with the source.
+        const auto t_source0 = std::chrono::steady_clock::now();
         ContingencyBatch source(
             contingencies_,
             Ybus_rm_.outerIndexPtr(),
@@ -507,6 +510,8 @@ void ContingencyAnalysisSession::run()
             batch_size_,
             (handle_disconnected_grid_ || !held_pins.empty() || any_gen_pin) ? &mask_cfg_ : nullptr,
             handle_disconnected_grid_);
+        t_sess_source_ms = ms_since(t_source0);
+        const auto t_prepass0 = std::chrono::steady_clock::now();
         // Continuous: batch_size_ slots, never more than the simulated rows.
         used_batch_size_ = continuous ? std::max(1, std::min(batch_size_, source.n_active()))
                                       : source.used_batch_size();
@@ -616,8 +621,10 @@ void ContingencyAnalysisSession::run()
             source.set_row_sbus_host(w_rows, base_state_->n_slack,
                                      any_ds ? ds_rows : std::vector<std::vector<std::pair<int, std::complex<double>>>>());
 
+        t_sess_prepass_ms = ms_since(t_prepass0);
         // New driver: allocation, block-diagonal structure, cuDSS ANALYSIS.
         // Free the old one first so the two never coexist on the device.
+        const auto t_ctor0 = std::chrono::steady_clock::now();
         solver_.reset();
         solver_ = std::make_unique<ContingencyAnalysisSolver>(
             *base_state_,
@@ -638,6 +645,7 @@ void ContingencyAnalysisSession::run()
             nb_iter_per_round_,
             tol_,
             linear_solver_);
+        t_sess_driver_ctor_ms = ms_since(t_ctor0);
         driver_cfg_ = cfg;
         ++driver_build_counter_;
     } else {
@@ -645,6 +653,7 @@ void ContingencyAnalysisSession::run()
         // not paid again: report them as 0 for this run.
         solver_->mark_reused(/*hot=*/true);
     }
+    const auto t_overrides0 = std::chrono::steady_clock::now();
     // per-run knobs, no rebuild needed
     solver_->nb_iter_           = nb_iter_;
     solver_->nb_iter_per_round_ = nb_iter_per_round_;
@@ -769,7 +778,9 @@ void ContingencyAnalysisSession::run()
         ov.lost_p_mw = row_lost_p_mw_;
         outer_->set_row_overrides(std::move(ov));
     }
+    const double t_sess_overrides_ms = ms_since(t_overrides0);
     timings_ = solver_->solve();
+    const auto t_after0 = std::chrono::steady_clock::now();
 
     // Wire in base-case and one-time setup timings captured before/during
     // solver construction.
@@ -818,6 +829,12 @@ void ContingencyAnalysisSession::run()
     timings_.n_disconnected = n_disconnected;
     has_violations_result_ = compute_limit_violations_;
     physical_checks::after_solve(phys_, timings_, t_phys);
+    timings_.t_sess_ref_ms         = t_sess_ref_ms;
+    timings_.t_sess_source_ms      = t_sess_source_ms;
+    timings_.t_sess_prepass_ms     = t_sess_prepass_ms;
+    timings_.t_sess_driver_ctor_ms = t_sess_driver_ctor_ms;
+    timings_.t_sess_overrides_ms   = t_sess_overrides_ms;
+    timings_.t_sess_after_ms       = ms_since(t_after0);
     timings_.t_session_run_wall_ms = ms_since(t_run0);
 }
 

@@ -106,6 +106,14 @@ def test_contingency_analysis(case118, solver_atol):
         # a freed slot the compaction overwrites or drops gets no base-case load
         assert t.n_base_loads_skipped > 0, key
         assert t.n_base_loads + t.n_base_loads_skipped == t_off.n_base_loads, key
+        rr = t.round_records
+        assert len(rr["n_live"]) == t.n_rounds, key
+        assert sum(rr["n_live"]) == t.n_main_row_rounds + t.n_tail_row_rounds, key
+        assert sum(rr["n_moves"]) == t.n_slot_moves and sum(rr["n_load_base"]) == t.n_base_loads, key
+        assert sum(rr["t_round_ms"]) <= t.t_driver_solve_wall_ms, key
+        around = (t.t_sess_ref_ms + t.t_sess_source_ms + t.t_sess_prepass_ms + t.t_sess_driver_ctor_ms
+                  + t.t_sess_overrides_ms + t.t_sess_after_ms)
+        assert 0. < around <= t.t_session_run_wall_ms - t.t_driver_solve_wall_ms, key
         assert t.t_main_phase_wall_ms + t.t_tail_phase_wall_ms <= t.t_driver_solve_wall_ms, key
         assert t.occupancy > t_off.occupancy, key
         assert "tail_compact" in t.to_dict()["gpu_compute"]

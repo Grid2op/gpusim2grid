@@ -932,6 +932,38 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "small cuDSS handle (tail_max_groups)")
         .def_readonly("n_main_row_rounds", &BatchTimings::n_main_row_rounds,
                       "Continuous scheduling: live rows summed over the rounds before the tail")
+        .def_property_readonly("round_records", [](const BatchTimings& t) {
+            auto col = [&](auto m) {
+                pybind11::list l;
+                for (const RoundRecord& r : t.round_records) l.append(r.*m);
+                return l;
+            };
+            pybind11::dict d;
+            d["n_cur"] = col(&RoundRecord::n_cur);
+            d["n_live"] = col(&RoundRecord::n_live);
+            d["n_leave"] = col(&RoundRecord::n_leave);
+            d["n_resolve"] = col(&RoundRecord::n_resolve);
+            d["n_load_real"] = col(&RoundRecord::n_load_real);
+            d["n_load_base"] = col(&RoundRecord::n_load_base);
+            d["n_moves"] = col(&RoundRecord::n_moves);
+            d["t_round_ms"] = col(&RoundRecord::t_round_ms);
+            d["t_newton_wall_ms"] = col(&RoundRecord::t_newton_wall_ms);
+            d["t_newton_gpu_ms"] = col(&RoundRecord::t_newton_gpu_ms);
+            d["t_residual_ms"] = col(&RoundRecord::t_residual_ms);
+            d["t_res_sync_ms"] = col(&RoundRecord::t_res_sync_ms);
+            d["t_gather_ms"] = col(&RoundRecord::t_gather_ms);
+            d["t_decide_ms"] = col(&RoundRecord::t_decide_ms);
+            d["t_load_ms"] = col(&RoundRecord::t_load_ms);
+            d["t_controls_ms"] = col(&RoundRecord::t_controls_ms);
+            d["t_compact_ms"] = col(&RoundRecord::t_compact_ms);
+            return d;
+        }, "continuous: one list per field, one entry per round (the first includes the initial load)")
+        .def_readonly("t_sess_ref_ms", &BatchTimings::t_sess_ref_ms)
+        .def_readonly("t_sess_source_ms", &BatchTimings::t_sess_source_ms)
+        .def_readonly("t_sess_prepass_ms", &BatchTimings::t_sess_prepass_ms)
+        .def_readonly("t_sess_driver_ctor_ms", &BatchTimings::t_sess_driver_ctor_ms)
+        .def_readonly("t_sess_overrides_ms", &BatchTimings::t_sess_overrides_ms)
+        .def_readonly("t_sess_after_ms", &BatchTimings::t_sess_after_ms)
         .def_readonly("n_base_loads", &BatchTimings::n_base_loads,
                       "continuous: base-case loads of freed slots once the queue is empty")
         .def_readonly("n_base_loads_skipped", &BatchTimings::n_base_loads_skipped,
@@ -1128,6 +1160,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
             py::dict wall;
             wall["driver_solve_ms"] = t.t_driver_solve_wall_ms;
             wall["session_run_ms"]  = t.t_session_run_wall_ms;
+            wall["session_ref_ms"] = t.t_sess_ref_ms;
+            wall["session_source_ms"] = t.t_sess_source_ms;
+            wall["session_prepass_ms"] = t.t_sess_prepass_ms;
+            wall["session_driver_ctor_ms"] = t.t_sess_driver_ctor_ms;
+            wall["session_overrides_ms"] = t.t_sess_overrides_ms;
+            wall["session_after_ms"] = t.t_sess_after_ms;
             wall["main_phase_ms"]   = t.t_main_phase_wall_ms;
             wall["tail_phase_ms"]   = t.t_tail_phase_wall_ms;
             result["wall"]         = wall;

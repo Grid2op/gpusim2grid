@@ -6,6 +6,7 @@
 #define TIMING_UTILS_H
 
 #include <chrono>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Helper: duration between two steady_clock time points, in milliseconds.
@@ -213,6 +214,17 @@ struct AcPfTimings {
 // =============================================================================
 // Add this struct to timing_utils.hpp after AcPfTimings
 // =============================================================================
+
+// One round of the continuous schedule, its times in wall ms: the Newton phases (and their
+// GPU time), the residual pass, its D->H, the gather of the rows that converged, the outer
+// model's decisions, its loads and the controls written, the compaction. t_round_ms is the
+// whole round; what it has beyond those parts is the eviction and the launches.
+struct RoundRecord {
+    int n_cur = 0, n_live = 0, n_leave = 0, n_resolve = 0, n_load_real = 0, n_load_base = 0, n_moves = 0;
+    double t_round_ms = 0., t_newton_wall_ms = 0., t_newton_gpu_ms = 0., t_residual_ms = 0.;
+    double t_res_sync_ms = 0., t_gather_ms = 0., t_decide_ms = 0., t_load_ms = 0.;
+    double t_controls_ms = 0., t_compact_ms = 0.;
+};
 
 // ---------------------------------------------------------------------------
 // ContingencyTimings
@@ -452,6 +464,18 @@ struct BatchTimings {
     // unnecessary (the slot overwritten by a moved row, or out of the rounds)
     long long n_base_loads = 0;
     long long n_base_loads_skipped = 0;
+    // continuous: one record per round (the first one includes the initial load)
+    std::vector<RoundRecord> round_records;
+    // what ContingencyAnalysisSession::run does around the driver's solve (wall, ms): the
+    // reference choice and checks, the source (connectivity, masks, patches), the
+    // redistribute_slack pre-pass, the driver's construction (allocations, ANALYSIS), the
+    // outer model's row overrides, and what follows the solve
+    double t_sess_ref_ms = 0.;
+    double t_sess_source_ms = 0.;
+    double t_sess_prepass_ms = 0.;
+    double t_sess_driver_ctor_ms = 0.;
+    double t_sess_overrides_ms = 0.;
+    double t_sess_after_ms = 0.;
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero

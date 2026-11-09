@@ -23,6 +23,8 @@ Change Log
 - [FIXED] Gradients with ``NROuterDist_*``: a unit parked at a check that did not re-solve keeps its ``gen_p`` gradient.
 - [FIXED] ``BatchPowerFlow.compute_flows`` refuses a ``V`` of another row count when the outer loops moved taps,
   instead of silently using the grid's taps.
+- [ADDED] Continuous scheduling: ``round_records`` (rows and times of each round), and ``t_sess_*_ms`` for what
+  a contingency analysis does around the driver's solve.
 - [IMPROVED] Continuous scheduling: no base-case load of a freed slot the tail overwrites or drops
   (``n_base_loads`` / ``n_base_loads_skipped``); results unchanged.
 - [FIXED] ``outer_loops=True``: ``scaling_max_voltage_change`` / ``max_dVa`` / ``max_dVm`` were silently ignored at
