@@ -217,22 +217,21 @@ inline void run_nr_loop(
         //     apply_step(coeff*F). Computed PER SLOT (own max|dtheta|/max|dvm|,
         //     own alpha) -- a "hard" contingency in the batch gets damped on
         //     its own terms, not by whatever the worst slot in the batch needs.
-        //     Folded into the same t.t_solve bucket (no new timing field).
+        //     Timed with the update of V (no new timing field).
+        timer.start();
         if (buf.scaling_max_voltage_change) {
             cudaMemsetAsync(buf.d_scale_max_dtheta, 0, batch_size * sizeof(cuda_real_type), cs);
             cudaMemsetAsync(buf.d_scale_max_dvm,    0, batch_size * sizeof(cuda_real_type), cs);
-            const int total = buf.n_theta + buf.n_vm;
-            reduce_step_norms_kernel<<<nr_grid_size((long long)batch_size * total, BS), BS, 0, cs>>>(
+            reduce_step_norms_kernel<<<nr_grid_size((long long)batch_size * BS, BS), BS, 0, cs>>>(
                 buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
                 dim_J, batch_size, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
-            apply_step_scale_kernel<<<nr_grid_size((long long)batch_size * dim_J, BS), BS, 0, cs>>>(
+            apply_step_scale_kernel<<<nr_grid_size((long long)batch_size * BS, BS), BS, 0, cs>>>(
                 buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
                 buf.max_dVa, buf.max_dVm, dim_J, batch_size);
         }
 
         // ⑤  Update V: Va (pvpq) then Vm (pq) — both on cs, CUDA stream ordering
         //     serialises them without an explicit CPU event.
-        timer.start();
         update_Va_kernel<<<nr_grid_size((long long)batch_size * buf.n_theta, BS), BS, 0, cs>>>(
             buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
             buf.n_theta, n_bus, dim_J, batch_size);

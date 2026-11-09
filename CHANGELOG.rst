@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] MaxVoltageChange step scaling: one block per slot instead of one thread per entry (about 4x cheaper),
+  now timed in ``t_update_V``; results unchanged.
 - [IMPROVED] ``outer_loops=True``: the host model's row load is ~3x and its decisions ~2x cheaper (shared
   ReactiveLimits plans, base limit sums, flat per-row state); results unchanged.
 - [ADDED] Continuous scheduling timings: ``t_main_phase_wall_ms`` (every slot in use) and ``t_tail_phase_wall_ms``,

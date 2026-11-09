@@ -294,7 +294,7 @@ struct AcPfTimings {
 //   t_first_factorize — cuDSS FACTORIZATION, single call at chunk 0 / iter 0
 //   t_refactorize     — cuDSS REFACTORIZATION, all subsequent calls (accumulated)
 //   t_solve          — cuDSS SOLVE
-//   t_update_V       — update_Va_kernel + update_Vm_kernel
+//   t_update_V       — step scaling (MaxVoltageChange) + update_Va_kernel + update_Vm_kernel
 //   t_residual       — final SpMV + fill_F + compute_residuals_kernel (post-loop)
 //   t_store_V        — cudaMemcpyAsync: chunk d_V_batch → d_V_results
 //   t_flow_computation — compute_branch_flows_kernel (+ a small incidental H→D

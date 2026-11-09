@@ -867,7 +867,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_solve",       &BatchTimings::t_solve,
                       "cuDSS SOLVE — total across all chunks × nb_iter")
         .def_readonly("t_update_V",    &BatchTimings::t_update_V,
-                      "update_Va_kernel + update_Vm_kernel — total across all chunks × nb_iter")
+                      "step scaling + update_Va_kernel + update_Vm_kernel — total across all chunks × nb_iter")
         .def_readonly("t_residual",    &BatchTimings::t_residual,
                       "Post-loop SpMV + fill_F + compute_residuals_kernel — total across all chunks")
         .def_readonly("t_store_V",     &BatchTimings::t_store_V,
