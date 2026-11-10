@@ -74,7 +74,7 @@ struct ElementTripData {
     std::vector<double> svc_b0_pu;          // [n_svc] the diagonal susceptance it stamps, whatever its mode
     std::vector<double> svc_q_mvar;         // [n_svc] the reactive injection of one in REACTIVE_POWER mode, else 0
     std::vector<char>   svc_voltage;        // [n_svc] in voltage mode: a controller of its control group
-    std::vector<char>   svc_standby;        // [n_svc] carries a standby automaton
+    std::vector<char>   svc_standby;        // [n_svc] carries a standby automaton (informative: a row may trip it)
     std::vector<char>   svc_frozen;         // [n_svc] an outer loop froze it at a reactive limit
 
     // HVDC lines: both converter stations, per line [2 * n_hvdc], side 1 then side 2
@@ -168,7 +168,8 @@ inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t
     for (int s : t.svcs) {
         const size_t k = static_cast<size_t>(s);
         if (d.svc_bus[k] < 0) continue;
-        if (d.svc_standby[k]) return "disconnects static var compensator " + std::to_string(s) + ", which carries a standby automaton";
+        // (one carrying a standby automaton is taken out: its entries of the release plan are
+        // skipped for the row, release_skip_with_svc_trips, and VoltageMonitoring leaves it alone)
         if (d.svc_frozen[k]) return "disconnects static var compensator " + std::to_string(s) + ", which an outer loop froze at a reactive limit";
         if (physical && d.svc_voltage[k])
             return "disconnects static var compensator " + std::to_string(s) + ", which regulates a voltage: the physical checks cannot leave it out of a row yet";

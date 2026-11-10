@@ -717,11 +717,25 @@ void ContingencyAnalysisSession::run()
         }
         d_gen_off_ptr = thrust::raw_pointer_cast(dev_->d_gen_off.data());
     }
+    // the release plan's entries of the SVCs a contingency trips (a standby one's automaton) leave it
+    int gr_skip_cols = 0;
+    std::vector<unsigned char> gr_skip;
+    if (phys_.compute_physical_violations)
+        gr_skip = release_skip_with_svc_trips(
+            phys_.gen_pv_release_plan, static_cast<int>(contingencies_.size()), std::vector<unsigned char>(), 0,
+            [this](int r, int s) {
+                if (static_cast<size_t>(r) >= ctg_more_.size()) return false;
+                const std::vector<int>& ids = ctg_more_[static_cast<size_t>(r)].svcs;
+                return std::find(ids.begin(), ids.end(), s) != ids.end(); },
+            gr_skip_cols);
+    physical_checks::RowTargets row_targets{(rd_gp && rd_targets.size() > 0) ? &rd_targets : nullptr, true,
+                                            nullptr, false};
+    row_targets.gen_pv_release_skip = &gr_skip;
+    row_targets.gen_pv_release_skip_cols = gr_skip_cols;
+    row_targets.gen_pv_release_skip_dirty = true;
     const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
         phys_, *solver_, "ContingencyAnalysisSession", violation_tol_, sn_mva_,
-        base_state_->timings.converged, d_gen_off_ptr, n_gen_off,
-        physical_checks::RowTargets{(rd_gp && rd_targets.size() > 0) ? &rd_targets : nullptr, true,
-                                    nullptr, false});
+        base_state_->timings.converged, d_gen_off_ptr, n_gen_off, row_targets);
     if (rd_gp)
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
 

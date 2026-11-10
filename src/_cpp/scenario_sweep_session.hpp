@@ -348,6 +348,8 @@ struct ScenarioSweepSession {
     std::vector<unsigned char> bus_q_row_skip_, gen_pv_release_row_skip_;
     int  bus_q_row_skip_cols_ = 0, gen_pv_release_row_skip_cols_ = 0;
     bool bus_q_row_skip_dirty_ = false, gen_pv_release_row_skip_dirty_ = false;
+    // the release skip mask the driver got last (the caller's plus the SVCs the rows trip)
+    std::vector<unsigned char> gr_skip_last_;
 
     // =========================================================================
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):

@@ -774,8 +774,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
 
     def set_contingency_svcs(self, mask):
         """Per-row static var compensator mask ``(n_scenarios, n_svc)``: its fixed reactive
-        injection and its b0 leave the row. One in voltage mode, with a standby automaton or
-        frozen at a reactive limit is reported BATCH_UNSUPPORTED."""
+        injection and its b0 leave the row. One in voltage mode leaves its control group, one
+        with a standby automaton its automaton's check and the VoltageMonitoring loop
+        (lightsim2grid leaves that row out). One frozen at a reactive limit is reported
+        BATCH_UNSUPPORTED."""
         self._set_more_trip("set_contingency_svcs", mask)
 
     def set_contingency_hvdcs(self, mask):

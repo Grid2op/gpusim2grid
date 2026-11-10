@@ -626,6 +626,17 @@ private:
     int check_ds_in_newton(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_hvdc(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_vm(SlotState& st, const LoopDecl& L, const RowView& rv) const;
+    // whether the slot's row trips controller c (RowOverrides::vc_tripped, sorted)
+    bool row_trips_ctrl(const SlotState& st, int c) const {
+        if (st.row < 0 || static_cast<size_t>(st.row) >= ov_.vc_tripped.size()) return false;
+        const std::vector<int>& t = ov_.vc_tripped[static_cast<size_t>(st.row)];
+        return std::binary_search(t.begin(), t.end(), c);
+    }
+    // ... and the standby SVC svc_id (a held SVC controller of the plan)
+    bool row_trips_svc(const SlotState& st, int svc_id) const {
+        const int c = (svc_id >= 0 && static_cast<size_t>(svc_id) < svc_ctrl_.size()) ? svc_ctrl_[static_cast<size_t>(svc_id)] : -1;
+        return c >= 0 && row_trips_ctrl(st, c);
+    }
     int check_rl(SlotState& st, const LoopDecl& L, const RowView& rv) const;
     int check_pc(SlotState& st, const LoopDecl& L, const RowView& rv, int iteration) const;
     int check_tvc(SlotState& st, const LoopDecl& L, const RowView& rv) const;
@@ -1342,6 +1353,7 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
     const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();
     for (int c = 0; c < ctrl.n_controllers(); ++c) {
         if (!ctrl.is_held(c) || ctrl.kind(c) != ls2g::VoltageControlSolverData::SVC) continue;
+        if (any_gone && std::binary_search(gone->begin(), gone->end(), c)) continue;   // tripped
         rl->has_monitor = true;
         ls2g::bus_q_check::BusQEntry entry;
         entry.bus_solver = ctrl.bus(c);
@@ -1430,7 +1442,8 @@ void Ls2gOuterModel::set_active(SlotState& st) const
             case Kind::VoltageMonitoring: {
                 const auto& svcs = grid_->get_svcs();
                 for (int id : held_svcs_)
-                    if (svcs.get_regulated_bus_id(id) == svcs.get_bus_id()(id).cast_int()) needed = true;
+                    if (!row_trips_svc(st, id) && svcs.get_regulated_bus_id(id) == svcs.get_bus_id()(id).cast_int())
+                        needed = true;
                 break;
             }
             case Kind::ReactiveLimits:    needed = !st.rl->buses.empty() || st.rl->has_monitor; break;
@@ -1723,9 +1736,11 @@ void Ls2gOuterModel::resume_loops(SlotState& st) const
                 }
                 break;
             case Kind::VoltageMonitoring:
-                // a switched-on SVC stays on for good
-                st.vm_switched_on = resume_svc_on_;
+                // a switched-on SVC stays on for good -- unless the row trips it
+                st.vm_switched_on.clear();
                 for (const auto& on : resume_svc_on_) {
+                    if (row_trips_svc(st, on.first)) continue;
+                    st.vm_switched_on.push_back(on);
                     if (on.first < 0 || static_cast<size_t>(on.first) >= svc_ctrl_.size()) continue;
                     const int c = svc_ctrl_[static_cast<size_t>(on.first)];
                     if (c >= 0) st.svc_on[static_cast<size_t>(c)] = on.second;
@@ -2140,6 +2155,7 @@ int Ls2gOuterModel::check_vm(SlotState& st, const LoopDecl& L, const RowView& rv
     for (const auto& e : monitors_.svcs) {
         const int c = svc_ctrl_[static_cast<size_t>(e.svc_id)];
         if (c >= 0 && std::isfinite(st.svc_on[static_cast<size_t>(c)])) continue;   // switched on
+        if (c >= 0 && row_trips_ctrl(st, c)) continue;   // the row trips it: no automaton left
         idle.svcs.push_back(e);
     }
     ls2g::CplxVect& V = vm_v_scratch_;   // all 0 between calls

@@ -1787,6 +1787,15 @@ void ScenarioSweepSession::run()
         gen_p_check_inputs(slack_rd_, slack_rows_, phys_.gen_p_plan.el_type, phys_.gen_p_plan.el_id,
                            gen_p_targets_, rd_targets, rd_ns_gen, rd_ns_sto);
     const RealMatRM* gp_targets = (rd_gp && rd_targets.size() > 0) ? &rd_targets : &gen_p_targets_;
+    // the release plan's entries of the SVCs a row trips (a standby one's automaton) leave it
+    int gr_skip_cols = gen_pv_release_row_skip_cols_;
+    std::vector<unsigned char> gr_skip;
+    if (phys_.compute_physical_violations)
+        gr_skip = release_skip_with_svc_trips(phys_.gen_pv_release_plan, n_scenarios_, gen_pv_release_row_skip_,
+                                              gen_pv_release_row_skip_cols_,
+                                              [this](int r, int s) { return _row_trips(r, &MoreTrips::svcs, s); },
+                                              gr_skip_cols);
+    const bool gr_skip_dirty = gen_pv_release_row_skip_dirty_ || cold || gr_skip != gr_skip_last_;
     const physical_checks::SetupTimes t_phys = physical_checks::before_solve(
         phys_, *solver_, "ScenarioSweepSession", violation_tol_, sn_mva_,
         base_state_->timings.converged, d_gen_off_ptr, n_gen_off,
@@ -1794,8 +1803,7 @@ void ScenarioSweepSession::run()
                                     &gen_pv_release_targets_, gen_pv_release_targets_dirty_,
                                     &bus_q_row_skip_, bus_q_row_skip_cols_,
                                     bus_q_row_skip_dirty_ || cold,
-                                    &gen_pv_release_row_skip_, gen_pv_release_row_skip_cols_,
-                                    gen_pv_release_row_skip_dirty_ || cold});
+                                    &gr_skip, gr_skip_cols, gr_skip_dirty});
     // The targets (and skip masks) reached the driver only if the checks ran
     // their setup: with them off, keep the flags so turning them back on on
     // this same driver uploads what changed meanwhile.
@@ -1806,6 +1814,7 @@ void ScenarioSweepSession::run()
         gen_pv_release_targets_dirty_ = false;
         bus_q_row_skip_dirty_ = false;
         gen_pv_release_row_skip_dirty_ = false;
+        gr_skip_last_ = std::move(gr_skip);
     }
 
     // The outer loops: the model decides on every row; it starts the rows' loops

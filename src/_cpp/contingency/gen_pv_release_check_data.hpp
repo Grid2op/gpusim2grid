@@ -100,6 +100,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <Eigen/Core>
 
 #include "../dtypes.hpp"
@@ -197,5 +198,38 @@ struct GenPvReleasePlanData {
         }
     }
 };
+
+
+// The release plan's per-row skip mask (uint8, (n_rows x n_entries) row-major,
+// ORIGINAL row order) with every entry of an SVC a row trips set: a tripped SVC
+// has no automaton to switch on nor a frozen output to release. On top of
+// `user` (the caller's own mask, set_gen_pv_release_row_skip; empty = none).
+// `trips(r, svc_id)`: whether row r trips that SVC. Returns `user` as it is
+// when no row trips a planned SVC, or when its shape is not the plan's (the
+// driver's upload then reports it). `cols` is the mask's column count.
+template <class RowTripsSvc>
+std::vector<unsigned char> release_skip_with_svc_trips(const GenPvReleasePlanData& plan, int n_rows,
+                                                       const std::vector<unsigned char>& user,
+                                                       int user_cols, RowTripsSvc trips, int& cols)
+{
+    const int n = plan.n_entries;
+    cols = user_cols;
+    if (n == 0 || n_rows <= 0) return user;
+    if (!user.empty() && (user_cols != n || user.size() != static_cast<size_t>(n_rows) * static_cast<size_t>(n)))
+        return user;
+    std::vector<unsigned char> out;
+    for (int r = 0; r < n_rows; ++r)
+        for (int k = 0; k < n; ++k) {
+            if (!plan.is_svc(k) || !trips(r, plan.gen_id(k))) continue;
+            if (out.empty()) {
+                out = user;
+                out.resize(static_cast<size_t>(n_rows) * static_cast<size_t>(n), 0);
+            }
+            out[static_cast<size_t>(r) * static_cast<size_t>(n) + static_cast<size_t>(k)] = 1;
+        }
+    if (out.empty()) return user;
+    cols = n;
+    return out;
+}
 
 #endif  // GEN_PV_RELEASE_CHECK_DATA_HPP

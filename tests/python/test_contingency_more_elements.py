@@ -244,16 +244,7 @@ def _grid_hvdc_station_in_group():
     return _finish(grid)
 
 
-def _grid_standby_svc():
-    grid = _base()
-    grid.init_svcs([2], np.ones(1), np.array([5.]), np.zeros(1), np.full(1, -0.5), np.full(1, 0.5),
-                   np.array([4], dtype=np.int32), np.array([4], dtype=np.int32))
-    grid.set_svc_standby([True], np.full(1, 0.9), np.full(1, 1.1))
-    return _finish(grid)
-
-
 UNSUPPORTED = [
-    (SVC, _grid_standby_svc, [0], "standby"),
     (STORAGE, lambda: _grid_storage_on_group_bus()[0], [REGULATING], "group"),
 ]
 
@@ -273,6 +264,78 @@ def test_what_the_batch_cannot_do_is_reported_per_row(runner, kind, make, bad, w
     np.testing.assert_allclose(V[1], _reference(grid, kind, ok, [5]), rtol=0., atol=1e-7)
     v0 = session.get_violations()[0]
     assert [el.violation_type for el in v0] == [LimitViolationType.BATCH_UNSUPPORTED]
+
+
+# ----- static var compensators carrying a standby automaton -----------------------------
+# lightsim2grid leaves such a row out of its batches (BATCH_UNSUPPORTED); gpusim2grid takes the
+# SVC out: its b0 and fixed injection leave the row, its automaton's check and VoltageMonitoring
+# loop leave it alone.
+
+def _grid_standby_svc_b0(low=0.9, high=1.1):
+    grid = _base()
+    grid.init_svcs([2], np.ones(1), np.array([5.]), np.zeros(1), np.full(1, -0.5), np.full(1, 0.5),
+                   np.array([4], dtype=np.int32), np.array([4], dtype=np.int32))
+    grid.set_svc_b0(np.array([0.02]))
+    grid.set_svc_standby([True], np.full(1, low), np.full(1, high))
+    return _finish(grid)
+
+
+@pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
+def test_a_standby_svc_matches_a_one_off_powerflow(runner):
+    grid = _grid_standby_svc_b0()
+    trips = [([0], []), ([0], [5]), ([], [5])]
+    session, V = runner(grid, trips, SVC)
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    for r, (ids, branches) in enumerate(trips):
+        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=1e-7,
+                                   err_msg=f"row {r}: {ids}, branches {branches}")
+
+
+def _standby_records(session):
+    from gpusim2grid.contingency_analysis import ViolationElementType, LimitViolationType
+    kinds = (LimitViolationType.LOW_VOLTAGE_SVC_STANDBY, LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY)
+    return [[(int(v.element_id), int(v.violation_type)) for v in row
+             if v.element_type == ViolationElementType.SVC and v.violation_type in kinds]
+            for row in session.get_physical_violations()]
+
+
+@pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
+def test_a_tripped_standby_svc_leaves_its_physical_check(runner):
+    """thresholds below the voltage of its bus: the automaton would switch it on in every row
+    keeping it, in none tripping it -- what a one-off check of the grid without it reports"""
+    grid = _grid_standby_svc_b0()
+    vm = abs(grid.get_V()[4])
+    grid.set_svc_standby([True], np.full(1, vm - 0.05), np.full(1, vm - 0.01))
+    _finish(grid)
+    trips = [([0], []), ([], [5]), ([0], [5])]
+    session, V = runner(grid, trips, SVC, compute_physical_violations=True)
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    records = _standby_records(session)
+    assert records[0] == [] and records[2] == [], records
+    assert len(records[1]) == 1 and records[1][0][0] == 0, records
+    for r, (ids, branches) in enumerate(trips):
+        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=1e-7)
+
+
+@pytest.mark.parametrize("init_from_n_powerflow", [False, True], ids=["cold", "resumed"])
+@pytest.mark.parametrize("low_pu, high_pu", [(0.90, 1.00), (0.90, 1.20)], ids=["switched_on", "idle"])
+def test_a_standby_svc_with_the_outer_loops(low_pu, high_pu, init_from_n_powerflow):
+    """the row is lightsim2grid's one-off NROuter solve of the grid without the SVC: VoltageMonitoring
+    never switches it on, and a row resuming the grid's loops does not keep it switched on"""
+    pytest.importorskip("pypowsybl")
+    from test_outer_model_cpu import _ieee14_standby_svc
+    grid = _ieee14_standby_svc(low_pu, high_pu, b0=0.01)
+    assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, 1e-10).size > 0
+    session, V = _analysis(grid, [([0], []), ([0], [5]), ([], [5])], SVC, outer_loops=True, scheduling="continuous",
+                           nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=init_from_n_powerflow,
+                           keep_outer_trace=True, tol=1e-10 / grid.get_sn_mva())
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    res = session.get_outer_results()
+    for r in (0, 1):
+        assert not any("SWITCH_ON" in d for d in res[r].decisions), res[r].decisions
+    np.testing.assert_allclose(V[0], _reference(grid, SVC, [0]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[1], _reference(grid, SVC, [0], [5]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[2], _reference(grid, branches=[5]), rtol=0., atol=1e-6)
 
 
 # ----- controllers of a voltage-control group ---------------------------------------------

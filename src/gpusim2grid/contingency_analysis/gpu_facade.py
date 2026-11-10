@@ -640,7 +640,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         - a storage unit too, and its share of the distributed slack, the last controller
           of a bus turning it PQ; one on a bus a control group holds is BATCH_UNSUPPORTED;
         - a static var compensator: its fixed reactive injection and its b0; one in voltage
-          mode, with a standby automaton or frozen at a limit is BATCH_UNSUPPORTED;
+          mode leaves its control group; one with a standby automaton leaves its automaton's
+          check and the VoltageMonitoring loop (lightsim2grid leaves that row out); one
+          frozen at a limit is BATCH_UNSUPPORTED;
         - an HVDC line stops transmitting, both converter stations leaving the injection,
           the bus a regulating one was the last to hold turning PQ; one in AC emulation or
           with a station in a control group is BATCH_UNSUPPORTED.

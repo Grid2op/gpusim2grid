@@ -132,9 +132,16 @@ inline std::string tripped_controllers_unsupported(const LedgerData& ld, const s
 {
     if (tripped.empty()) return std::string();
     const auto is_tripped = [&](int c) { return std::binary_search(tripped.begin(), tripped.end(), c); };
-    for (int c : tripped)
-        if (static_cast<size_t>(c) < ld.vc_held.size() && ld.vc_held[static_cast<size_t>(c)])
+    for (int c : tripped) {
+        const size_t cc = static_cast<size_t>(c);
+        if (cc >= ld.vc_held.size() || !ld.vc_held[cc]) continue;
+        // a held SVC is an idle voltage monitor of the outer loops, held at 0: tripped, it is
+        // pinned at 0 all the same (and VoltageMonitoring never switches it on)
+        const bool idle_svc = cc < ld.vc_kind.size() && ld.vc_kind[cc] == 1 &&
+                              (cc >= ld.vc_q_held.size() || ld.vc_q_held[cc] == 0.);
+        if (!idle_svc)
             return "disconnects controller " + std::to_string(c) + " of a voltage-control group, held at a reactive limit";
+    }
     for (int g = 0; g < ld.vc_n_groups(); ++g) {
         const int bus = ld.vc_reg_bus[static_cast<size_t>(g)];
         if (std::find(ld.vc_free_vm_slack_buses.begin(), ld.vc_free_vm_slack_buses.end(), bus) == ld.vc_free_vm_slack_buses.end())
@@ -142,8 +149,9 @@ inline std::string tripped_controllers_unsupported(const LedgerData& ld, const s
         const int first = ld.vc_grp_start[static_cast<size_t>(g)], cnt = ld.vc_grp_count[static_cast<size_t>(g)];
         bool one_tripped = false, someone_left = false;
         for (int c = first; c < first + cnt; ++c) {
-            if (is_tripped(c)) one_tripped = true;
-            else if (static_cast<size_t>(c) >= ld.vc_held.size() || !ld.vc_held[static_cast<size_t>(c)]) someone_left = true;
+            const bool held = static_cast<size_t>(c) < ld.vc_held.size() && ld.vc_held[static_cast<size_t>(c)];
+            if (is_tripped(c)) one_tripped = one_tripped || !held;   // a held one regulated nothing
+            else if (!held) someone_left = true;
         }
         if (one_tripped && !someone_left)
             return "disconnects every controller of the group regulating a slack bus (solver bus " + std::to_string(bus) + ")";
