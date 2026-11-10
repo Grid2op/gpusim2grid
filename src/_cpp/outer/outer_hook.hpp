@@ -186,6 +186,7 @@ struct RowResult {
     // row / sn -- minus that for a generator DistributedSlack holds at a bound (gen_p_fixed),
     // lambda at gen_p_slope_row times gen_p_slope_coeff (pu per MW) for a generator frozen at a
     // limit of its capability curve, which its reactive output follows.
+    // Filled only when the adjoint is wanted (OuterHook::set_keep_adjoint), empty otherwise.
     std::vector<int>    pq_buses;
     std::vector<int>    vset_lost_groups;
     std::vector<int>    gen_p_fixed;
@@ -198,6 +199,9 @@ public:
     virtual ~OuterHook() = default;
 
     virtual const Layout& layout() const = 0;
+    // Whether the next runs need each row's adjoint terms (RowResult::pq_buses ...
+    // gen_p_slope_*): without, the model neither records nor computes them. Set before begin().
+    virtual void set_keep_adjoint(bool keep) = 0;
     // A new run of `n_slots` slots over rows [0, n_rows) (original numbering).
     virtual void begin(int n_slots, int n_rows) = 0;
     // A row (original index, -1 for a phantom slot) enters slot `slot`: its loops

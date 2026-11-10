@@ -2731,6 +2731,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         const auto t_l0 = std::chrono::steady_clock::now();
         _oc_setup();
         if (keep_outer_adjoint_) _oa_alloc();
+        hook->set_keep_adjoint(keep_outer_adjoint_);
         hook->begin(S, n_contingencies);
         t.t_oc_load += TimingEntry{0., ms_since(t_l0)};
     }

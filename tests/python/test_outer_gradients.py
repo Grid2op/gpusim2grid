@@ -137,6 +137,9 @@ def test_reactive_limits(init_from_n):
     res = pf.sweep.get_outer_results()
     assert any(r.pq_buses for r in res), [r.decisions for r in res]
     assert (grads["gen_v"] == 0.).any() and (grads["gen_v"] != 0.).any()
+    # a forward without gradients leaves the adjoint terms out
+    pf(**{k: _t(v) for k, v in inputs.items()})
+    assert not any(r.pq_buses for r in pf.sweep.get_outer_results())
     _check_all(pf, inputs, grads)
 
 

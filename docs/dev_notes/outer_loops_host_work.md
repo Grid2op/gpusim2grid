@@ -196,7 +196,11 @@ No single item stands out any more.
 
 - **`adjoint_info` runs on every row that finishes** (`finish()`, `ls2g_outer_model.cpp`), even
   without gradients. Gate it on the adjoint being requested (`keep_outer_adjoint_`). The model
-  needs an option for this.
+  needs an option for this. *Done (2026-11-10)*: `OuterHook::set_keep_adjoint`, set by the driver
+  before `begin()`; without it the model also skips what only the adjoint reads, the capability
+  slopes recorded at freeze time and the last solve's parked units (`ds_mark_solved`). Same
+  snapshot as the passes above (with `redistribute_slack`, own LU, batch 512): `oc_decide`
+  ~247 -> ~217 ms, `oc_load` ~307 -> ~276 ms; `adjoint_info` itself was only 8 ms of it.
 - **`finish()` builds the user-facing `RowResult` eagerly.** It walks every controlled transformer
   (with a `pi_block_at` for each moved one) and every shunt controller. Instead, keep the row's
   final positions as flat arrays and build the result in `get_outer_results()` /

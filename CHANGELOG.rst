@@ -3,6 +3,8 @@ Change Log
 
 [0.2.0] 2026-xx-yy
 --------------------
+- [IMPROVED] ``outer_loops=True``: the rows' adjoint terms (``pq_buses``, ``gen_p_fixed``, ...) are only computed
+  with gradients; ``get_outer_results()`` leaves them empty otherwise.
 - [ADDED] A row can trip a controller of a voltage-control group (a remote or group generator, an SVC in voltage
   mode, a converter station): it leaves its group by value, still one analysis, the regulated bus free when none is left.
 - [ADDED] A contingency or a row can trip an HVDC line in AC emulation: no flow, no slope, still one analysis.

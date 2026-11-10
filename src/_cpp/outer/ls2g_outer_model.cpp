@@ -404,6 +404,7 @@ public:
     Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledger, const Ls2gModelOptions& opt);
 
     const Layout& layout() const override { return layout_; }
+    void set_keep_adjoint(bool keep) override { keep_adjoint_ = keep; }
     void begin(int n_slots, int n_rows) override;
     void load(int slot, int row) override;
     void move(int from, int to) override;
@@ -428,6 +429,9 @@ private:
     ls2g::SolverBusLayout sbl_;          // the caller's grid's AC labelling (a copy has none)
     ls2g::OuterGridView view(const SlotState& st) const { return ls2g::OuterGridView(*grid_, &st.rowv); }
     Ls2gModelOptions opt_;
+    // the rows' adjoint terms are wanted (set_keep_adjoint): only then are the slopes of the frozen
+    // generators and the last solve's parked units recorded, and adjoint_info run
+    bool keep_adjoint_ = false;
     mutable OcProfile prof_;              // GPUSIM2GRID_OC_PROFILE
     Layout layout_;
     double sn_ = 1.;
@@ -1459,7 +1463,7 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                         st.ds_parked_high[k] = st.ds_lost_high ? 1 : 0;
                     }
                 }
-                st.ds_mark_solved();   // the first solve runs with these
+                if (keep_adjoint_) st.ds_mark_solved();   // the first solve runs with these
                 break;
             }
             case Kind::HvdcLimits:
@@ -1983,7 +1987,7 @@ int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const R
     }
     // the solve just checked ran with the units parked as the last check left them: this loop
     // is checked again only after a solve
-    st.ds_mark_solved();
+    if (keep_adjoint_) st.ds_mark_solved();
     // the same cumulative sharing from the initial targets as around a single-slack Newton;
     // what the reference bus kept is not nothing only when every unit is parked
     double mismatch = mis_bus(st, rv, st.ctl, slack_bus_).real() * sn_;
@@ -2028,7 +2032,7 @@ int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const R
     }
     // re-solved with the new weights; a STABLE check's change is not (unless another loop's
     // re-solve comes after, and this loop is then checked again)
-    if (unstable) st.ds_mark_solved();
+    if (unstable && keep_adjoint_) st.ds_mark_solved();
     return unstable ? UNSTABLE : STABLE;
 }
 
@@ -2215,7 +2219,7 @@ void Ls2gOuterModel::rl_freeze(SlotState& st, const RowView& rv, size_t k, doubl
                 const int g = vc_elem_[static_cast<size_t>(c)];
                 if (rs.realistic) {
                     q = grid_->get_generators().get_target_q()(g);   // the robust mode's
-                } else {
+                } else if (keep_adjoint_) {
                     const double slope = rl_gen_limit_slope(st, g, state > 0);
                     if (slope != 0.) st.rl_slopes[ki].push_back({{g, c}, slope / sn_});
                 }
@@ -2226,7 +2230,7 @@ void Ls2gOuterModel::rl_freeze(SlotState& st, const RowView& rv, size_t k, doubl
         rs.frozen_q = q_mvar;
         return;
     }
-    if (!rs.realistic)
+    if (!rs.realistic && keep_adjoint_)
         for (int g : st.rl->plan->buses[static_cast<size_t>(bus.entry)].gen_ids) {
             const double slope = rl_gen_limit_slope(st, g, state > 0);
             if (slope != 0.) st.rl_slopes[ki].push_back({{g, -1}, slope / sn_});
@@ -3035,7 +3039,7 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status)
             }
         }
         r.decisions = std::move(st.trace);
-        adjoint_info(st, r);
+        if (keep_adjoint_) adjoint_info(st, r);
         // the row is over: its slot's targets (reset at its next load) become the result's
         r.gens_target_p_mw = std::move(st.gen_target_p);
     }

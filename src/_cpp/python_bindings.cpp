@@ -1558,7 +1558,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .def_readonly("decisions", &outer::RowResult::decisions,
                     "the decision trace, when the session keeps it (keep_trace)")
       .def_readonly("pq_buses", &outer::RowResult::pq_buses,
-                    "the adjoint of the last inner solve: the switchable solver buses PQ in it")
+                    "the adjoint of the last inner solve (only with gradients, keep_final_jacobian; empty otherwise): the switchable solver buses PQ in it")
       .def_readonly("vset_lost_groups", &outer::RowResult::vset_lost_groups,
                     "... the VoltageControl groups whose voltage row lost its set-point")
       .def_readonly("gen_p_fixed", &outer::RowResult::gen_p_fixed,
