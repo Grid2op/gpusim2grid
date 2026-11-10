@@ -109,7 +109,7 @@ private:
 enum ProfSec : int {
     P_ON_SOLVED_RESOLVE, P_ON_SOLVED_DONE, P_DS_FOLD, P_CHECK_DS, P_CHECK_HVDC, P_CHECK_VM, P_CHECK_RL,
     P_CHECK_PC, P_CHECK_TVC, P_CHECK_SVC, P_MATERIALIZE, P_FINISH, P_ADJOINT,
-    P_LOAD, P_LOAD_PHANTOM, P_LOAD_RL_PLAN, P_LOAD_BC, P_LOAD_SC, P_LOAD_UNITS, P_LOAD_SET_ACTIVE,
+    P_LOAD, P_LOAD_PHANTOM, P_LOAD_RL_PLAN, P_LOAD_BC, P_LOAD_UNITS, P_LOAD_SET_ACTIVE,
     P_LOAD_RESUME_TARGETS, P_LOAD_INIT_LOOPS, P_LOAD_RESUME_LOOPS, P_LOAD_RESET, P_LOAD_INIT_DS, P_LOAD_INIT_RL, P_LOAD_MASKED_ROWS, P_LOAD_DS_NUNITS,
     P_DONE_NO_RESOLVE, P_DNR_FAILED, P_DNR_OK_MASKED, P_DNR_OK_MOVED, P_DNR_OK_BASE,
     P_ACT_FIRST, P_ACT_FIRST_LAST = P_ACT_FIRST + 6, P_ACT_ALL, P_ACT_ALL_LAST = P_ACT_ALL + 6,
@@ -119,7 +119,7 @@ const char* const kProfName[P_N_SEC] = {
     "on_solved (Resolve)", "on_solved (Done)", "  ds_fold", "  check DistributedSlack", "  check HvdcLimits",
     "  check VoltageMonitoring", "  check ReactiveLimits", "  check PhaseControl", "  check TVC",
     "  check ShuntVoltageControl", "  materialize", "  finish", "    adjoint_info",
-    "load (row)", "load (phantom)", "  rl plan", "  BranchControl reset", "  ShuntControl reset",
+    "load (row)", "load (phantom)", "  rl plan", "  BranchControl: opened trafos",
     "  DistributedSlack units", "  set_active", "  resume targets", "  init_loops", "  resume_loops", "  reset the slot", "    init DistributedSlack", "    init ReactiveLimits", "rows that mask buses", "DS units copied",
     "on_solved (Done, no re-solve)", "  no re-solve: failed", "  no re-solve: ok, masks buses",
     "  no re-solve: ok, limits moved", "  no re-solve: ok, base limits",
@@ -536,6 +536,10 @@ private:
     std::vector<double> row_gen_p_, row_sto_p_;    // [n_rows * n_gen], [n_rows * n_sto]
     RowOverrides ov_;                              // the rows' masks, units off, set-points
     std::vector<SlotState> slots_;
+    // what every load starts from (built by begin()): the default controls, the grid's taps and
+    // sections; copy-assigned, so a slot keeps the capacity of its vectors from row to row
+    SlotState slot0_;
+    void build_slot0();
     // the finished rows' results: finish() fills what it has at hand and copies the final
     // positions below; their (id, value) lists are built by row_result() at the first read,
     // outside the run (results_ and fin_built_ are a cache)
@@ -1005,6 +1009,58 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     fin_bc_pos_.assign(nr * static_cast<size_t>(n_bc_), 0);
     fin_bc_rpos_.assign(nr * static_cast<size_t>(n_bc_), 0);
     fin_sc_.assign(nr * n_sc_sh_, 0);
+    build_slot0();
+}
+
+// The slot every load starts from: the default control state (OuterControls::reset_states),
+// BranchControl at the grid's taps (BranchControl::_reset) with every transformer the grid has
+// closed, ShuntControl at the grid's sections (ShuntControl::_reset). A load then applies the
+// row's own changes.
+void Ls2gOuterModel::build_slot0()
+{
+    SlotState& st = slot0_;
+    st = SlotState();
+    st.pq.assign(layout_.pin_bus.size(), 0);
+    st.held_q.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
+    st.svc_on.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
+    st.hvdc_regime.assign(static_cast<size_t>(layout_.n_hvdc), 2);
+    st.rowv.layout = &sbl_;
+    {
+        const size_t nb = static_cast<size_t>(n_bc_);
+        const auto& trafos = grid_->get_trafos();
+        const auto& ptc = trafos.get_tap_changers(true);
+        const auto& rtc = trafos.get_tap_changers(false);
+        const ls2g::OuterGridView v = view(st);
+        st.bc_out.assign(nb, 0);
+        st.bc_pos.assign(nb, 0); st.bc_rpos.assign(nb, 0);
+        st.bc_a_tap.assign(nb, 0.); st.bc_rho_tap.assign(nb, 1.);
+        st.bc_tap.assign(4 * nb, cplx(0., 0.));
+        st.bc_moved.assign(nb, 0); st.bc_req_tap.assign(nb, 0);
+        st.bc_req_rtap.assign(nb, std::numeric_limits<int>::min());
+        st.bc_ctl.assign(nb, -1); st.bc_rctl.assign(nb, -1);
+        for (size_t e = 0; e < nb; ++e) {
+            const int t = bc_trafo_[e];
+            int b1 = -1, b2 = -1;
+            st.bc_out[e] = !(v.trafo_closed(t, b1, b2) && b1 == bc_b1_[e] && b2 == bc_b2_[e]);
+            const ls2g::TrafoInfo info = trafos[t];
+            st.bc_pos[e] = ptc.has(t) ? ptc.position(t) : 0;
+            st.bc_rpos[e] = rtc.has(t) ? rtc.position(t) : 0;
+            st.bc_a_tap[e] = info.shift_rad;
+            st.bc_rho_tap[e] = (ptc.has(t) || rtc.has(t)) ? trafos.ratio_at(t, st.bc_rpos[e], st.bc_pos[e]) : info.ratio;
+            const auto tap = trafos.pi_block_at(t, st.bc_rpos[e], st.bc_pos[e], info.shift_rad);
+            for (int k = 0; k < 4; ++k) st.bc_tap[4 * e + static_cast<size_t>(k)] = cplx(tap[static_cast<size_t>(k)].real(), tap[static_cast<size_t>(k)].imag());
+        }
+    }
+    {
+        const auto& shunts = grid_->get_shunts();
+        st.sc_counts.assign(static_cast<size_t>(n_sc_), {});
+        for (int e = 0; e < n_sc_; ++e)
+            for (int sh : sc_shunts_[static_cast<size_t>(e)])
+                st.sc_counts[static_cast<size_t>(e)].push_back(shunts.get_section_count(sh));
+        st.sc_pending.assign(static_cast<size_t>(n_sc_), 0);
+        st.sc_b_new.assign(static_cast<size_t>(n_sc_), 0.);
+        st.sc_ctl.assign(static_cast<size_t>(n_sc_), -1);
+    }
 }
 
 // =============================================================================
@@ -1014,14 +1070,10 @@ void Ls2gOuterModel::load(int slot, int row)
 {
     ProfScope ps_(prof_, row >= 0 ? P_LOAD : P_LOAD_PHANTOM);
     SlotState& st = slots_[static_cast<size_t>(slot)];
-    { ProfScope p(prof_, P_LOAD_RESET); st = SlotState(); }
+    // the default controls, the grid's taps and sections (build_slot0)
+    { ProfScope p(prof_, P_LOAD_RESET); st = slot0_; }
     st.row = row;
-    st.pq.assign(layout_.pin_bus.size(), 0);
-    st.held_q.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
-    st.svc_on.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
-    st.hvdc_regime.assign(static_cast<size_t>(layout_.n_hvdc), 2);
     // the row as its loops see it (BaseBatchSweep::_fill_outer_row_view)
-    st.rowv.layout = &sbl_;
     bool changes_units = false;
     const std::vector<int>* vc_gone = nullptr;
     if (row >= 0) {
@@ -1100,48 +1152,17 @@ void Ls2gOuterModel::load(int slot, int row)
         else if (!st.masked.empty())                          st.rl = rl_plan_masked(st.masked);
         else                                                  st.rl = rl0_;
     }
-    // BranchControl: what the slot's system holds at the grid's taps (BranchControl::_reset),
-    // without the transformers the row opens (drop_out_of_row); no control requested yet
-    // (OuterControls::reset_states)
-    {
+    // BranchControl: the slot starts at the grid's taps (build_slot0), without the transformers
+    // the row opens (drop_out_of_row); no control requested yet (OuterControls::reset_states)
+    if (!st.rowv.trafos.off.empty()) {
         ProfScope p(prof_, P_LOAD_BC);
-        const size_t nb = static_cast<size_t>(n_bc_);
-        const auto& trafos = grid_->get_trafos();
-        const auto& ptc = trafos.get_tap_changers(true);
-        const auto& rtc = trafos.get_tap_changers(false);
         const ls2g::OuterGridView v = view(st);
-        st.bc_out.assign(nb, 0);
-        st.bc_pos.assign(nb, 0); st.bc_rpos.assign(nb, 0);
-        st.bc_a_tap.assign(nb, 0.); st.bc_rho_tap.assign(nb, 1.);
-        st.bc_tap.assign(4 * nb, cplx(0., 0.));
-        st.bc_moved.assign(nb, 0); st.bc_req_tap.assign(nb, 0);
-        st.bc_req_rtap.assign(nb, std::numeric_limits<int>::min());
-        st.bc_ctl.assign(nb, -1); st.bc_rctl.assign(nb, -1);
-        for (size_t e = 0; e < nb; ++e) {
-            const int t = bc_trafo_[e];
+        for (size_t e = 0; e < static_cast<size_t>(n_bc_); ++e) {
             int b1 = -1, b2 = -1;
-            st.bc_out[e] = !(v.trafo_closed(t, b1, b2) && b1 == bc_b1_[e] && b2 == bc_b2_[e]);
-            const ls2g::TrafoInfo info = trafos[t];
-            st.bc_pos[e] = ptc.has(t) ? ptc.position(t) : 0;
-            st.bc_rpos[e] = rtc.has(t) ? rtc.position(t) : 0;
-            st.bc_a_tap[e] = info.shift_rad;
-            st.bc_rho_tap[e] = (ptc.has(t) || rtc.has(t)) ? trafos.ratio_at(t, st.bc_rpos[e], st.bc_pos[e]) : info.ratio;
-            const auto tap = trafos.pi_block_at(t, st.bc_rpos[e], st.bc_pos[e], info.shift_rad);
-            for (int k = 0; k < 4; ++k) st.bc_tap[4 * e + static_cast<size_t>(k)] = cplx(tap[static_cast<size_t>(k)].real(), tap[static_cast<size_t>(k)].imag());
+            st.bc_out[e] = !(v.trafo_closed(bc_trafo_[e], b1, b2) && b1 == bc_b1_[e] && b2 == bc_b2_[e]);
         }
     }
-    // ShuntControl: the grid's sections (ShuntControl::_reset), no control requested yet
-    {
-        ProfScope p(prof_, P_LOAD_SC);
-        const auto& shunts = grid_->get_shunts();
-        st.sc_counts.assign(static_cast<size_t>(n_sc_), {});
-        for (int e = 0; e < n_sc_; ++e)
-            for (int sh : sc_shunts_[static_cast<size_t>(e)])
-                st.sc_counts[static_cast<size_t>(e)].push_back(shunts.get_section_count(sh));
-        st.sc_pending.assign(static_cast<size_t>(n_sc_), 0);
-        st.sc_b_new.assign(static_cast<size_t>(n_sc_), 0.);
-        st.sc_ctl.assign(static_cast<size_t>(n_sc_), -1);
-    }
+    // ShuntControl: the grid's sections, no control requested yet (build_slot0)
     // DistributedSlackLoop's collect_units: the grid's participants, unless the row
     // disconnects units (their injection is the row's target in force: init_loops) or
     // strands buses (a unit on one takes no share)

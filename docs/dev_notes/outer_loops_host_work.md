@@ -214,6 +214,12 @@ No single item stands out any more.
   never change them.
 - **`load` resets a dozen per-slot vectors with `assign`.** Copy-assign one `SlotState` template
   prepared once per run (grid defaults, resumed state) and then apply the row's deltas.
+  *Done (2026-11-10)*: `build_slot0()` in `begin()` (default controls, BranchControl at the grid's
+  taps, ShuntControl at its sections); `load` copy-assigns it, so a slot keeps its vectors'
+  capacity from row to row, and only a row opening branches recomputes `bc_out`. The resumed
+  targets stay copied by `load` (into the kept capacity): a phantom and a row that takes its own
+  must start without them. "reset the slot" 29.5 -> 7.8 ms, `init_loops` 126 -> 110 ms (the same
+  capacity reuse), `load` ~29 -> ~23 µs per row, `oc_load` ~276 -> ~240 ms.
 - **The gather conversion loop** (`gbuf`, float -> double per converged slot) is small; fold it
   into `RowView`.
 
