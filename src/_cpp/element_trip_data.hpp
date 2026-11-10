@@ -155,7 +155,7 @@ inline std::vector<int> droop_entries(const std::vector<int>& hvdc_id, const std
 }
 
 // Why the batch cannot take these elements out of a row (empty: it can).
-inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t, bool outer, bool physical)
+inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t, bool physical)
 {
     for (int s : t.storages) {
         const size_t k = static_cast<size_t>(s);
@@ -178,8 +178,6 @@ inline std::string more_unsupported(const ElementTripData& d, const MoreTrips& t
         if (!d.hvdc_on[k]) continue;
         if (physical && d.hvdc_droop[k])
             return "disconnects hvdc line " + std::to_string(h) + ", which runs in AC emulation: the physical checks cannot leave it out of a row yet";
-        if (outer && d.hvdc_regulating[k])
-            return "disconnects hvdc line " + std::to_string(h) + ", a station of which regulates a voltage: the outer loops cannot leave it out yet";
         if (physical && d.hvdc_regulating[k])
             return "disconnects hvdc line " + std::to_string(h) + ", a station of which regulates a voltage: the physical checks cannot leave it out of a row yet";
     }

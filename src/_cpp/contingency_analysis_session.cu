@@ -363,7 +363,7 @@ void ContingencyAnalysisSession::run()
             if (!why.empty()) break;
         }
         if (why.empty() && ctg_more_[c].any())
-            why = element_trips::more_unsupported(trip_data_, ctg_more_[c], outer_ != nullptr, phys_.compute_physical_violations);
+            why = element_trips::more_unsupported(trip_data_, ctg_more_[c], phys_.compute_physical_violations);
         // a regulating shunt's sections are the ShuntVoltageControl loop's, which does not
         // know of a row taking it out
         if (why.empty() && outer_)

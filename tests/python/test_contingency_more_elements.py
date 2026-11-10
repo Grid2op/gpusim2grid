@@ -645,17 +645,53 @@ def test_physical_checks_report_a_line_in_ac_emulation():
     assert "physical" in session.get_batch_unsupported_reasons()[0]
 
 
-def test_a_regulating_station_with_the_outer_loops_is_reported():
-    """OuterRowView has no way to say a line is out before lightsim2grid #292"""
+def test_a_regulating_station_with_the_outer_loops():
+    """the row is a one-off NROuter solve of the grid without the line"""
     from lightsim2grid.algorithm import ReactiveLimits
     grid = _grid_hvdc()
     grid.clear_outer_loops()
     grid.add_outer_loop(ReactiveLimits())
     _finish(grid, OUTER)
     session, V = _analysis(grid, [([HV_REGULATING], [])], HVDC, outer_loops=True, scheduling="continuous",
-                           nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False)
-    assert "outer" in session.get_batch_unsupported_reasons()[0]
-    assert np.isnan(V[0]).all()
+                           nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [HV_REGULATING]), rtol=0., atol=1e-6)
+
+
+def _grid_stations_short_of_reactive_power():
+    """two regulating stations on the bus of a generator, every machine short of reactive power:
+    ReactiveLimits freezes that bus, its limit the sum of what the row keeps there"""
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.algorithm import ReactiveLimits
+    net = _net()
+    net.gen["min_q_mvar"] = -5.
+    net.gen["max_q_mvar"] = 5.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(net)
+    gen = next(g for g in grid.get_generators() if not g.is_slack)
+    big, small = np.full(2, 1e3), np.full(2, 3.)
+    grid.init_hvdc_lines(np.array([gen.bus_id, gen.bus_id], dtype=np.int32), np.array([13, 12], dtype=np.int32),
+                         [0, 0], [0, 0], np.ones(2), np.ones(2), [True, True], [False, False],
+                         np.full(2, gen.target_vm_pu), np.ones(2), np.zeros(2), np.zeros(2), -small, small, -big, big,
+                         np.ones(2), np.ones(2), [0, 0], np.array([1., 2.]), np.ones(2), np.full(2, 12.),
+                         [False, False], np.zeros(2), np.zeros(2), np.full(2, 100.), np.full(2, 100.))
+    grid.clear_outer_loops()
+    grid.add_outer_loop(ReactiveLimits())
+    return _finish(grid, OUTER), gen.id
+
+
+def test_a_tripped_station_stays_out_when_its_bus_is_frozen():
+    """the ReactiveLimits plan of the row leaves the tripped line's stations out of its bus' limit"""
+    grid, gen_id = _grid_stations_short_of_reactive_power()
+    trips = [([0], []), ([1], []), ([0, 1], [])]
+    session, V = _analysis(grid, trips, HVDC, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, ir_n_steps=1,
+                           init_from_n_powerflow=False, keep_outer_trace=True, tol=1e-8 / grid.get_sn_mva())
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    res = session.get_outer_results()
+    for r, (ids, _) in enumerate(trips):
+        assert any("PV_TO_PQ" in d and "not taken" not in d for d in res[r].decisions), res[r].decisions
+        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=1e-6, err_msg=f"{ids}")
 
 
 @pytest.mark.parametrize("kind, make, ids", [(STORAGE, _grid_storage, [REGULATING]),

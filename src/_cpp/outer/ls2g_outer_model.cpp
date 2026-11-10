@@ -579,7 +579,8 @@ private:
         return NaN;
     }
     // the plan, units and active loops of the row a slot holds (its view set already)
-    std::shared_ptr<const RlPlan> build_rl_plan(const ls2g::OuterGridView& v, const std::vector<int>* gone = nullptr) const;
+    std::shared_ptr<const RlPlan> build_rl_plan(const ls2g::OuterGridView& v, const std::vector<int>* gone = nullptr,
+                                                const std::vector<int>* hvdc_gone = nullptr) const;
     std::shared_ptr<const RlPlan> rl_plan_masked(const std::vector<int>& masked) const;
     void take_resume_targets(SlotState& st) const;
     // DistributedSlack, at initialize: the row's lost active power shared on its units
@@ -1076,6 +1077,7 @@ void Ls2gOuterModel::load(int slot, int row)
     // the row as its loops see it (BaseBatchSweep::_fill_outer_row_view)
     bool changes_units = false;
     const std::vector<int>* vc_gone = nullptr;
+    const std::vector<int>* hvdc_gone = nullptr;
     if (row >= 0) {
         const size_t r = static_cast<size_t>(row);
         auto row_of = [&](const std::vector<double>& m, int n, std::vector<ls2g::real_type>& out) {
@@ -1107,6 +1109,8 @@ void Ls2gOuterModel::load(int slot, int row)
             changes_units = true;     // its own ReactiveLimits plan, without them
         }
         if (r < ov_.hvdc_off.size() && !ov_.hvdc_off[r].empty()) {
+            hvdc_gone = &ov_.hvdc_off[r];
+            changes_units = true;     // its own ReactiveLimits plan, without the line's stations
             st.hvdc_tripped.assign(hvdc_id_.size(), 0);
             for (int h : ov_.hvdc_off[r]) {
                 const auto it = std::find(hvdc_id_.begin(), hvdc_id_.end(), h);
@@ -1148,7 +1152,7 @@ void Ls2gOuterModel::load(int slot, int row)
     {
         ProfScope p(prof_, P_LOAD_RL_PLAN);
         st.lim_base = st.rowv.gens.target_p.empty();
-    if (changes_units || !st.rowv.gens.target_vm.empty()) st.rl = build_rl_plan(view(st), vc_gone);
+    if (changes_units || !st.rowv.gens.target_vm.empty()) st.rl = build_rl_plan(view(st), vc_gone, hvdc_gone);
         else if (!st.masked.empty())                          st.rl = rl_plan_masked(st.masked);
         else                                                  st.rl = rl0_;
     }
@@ -1300,7 +1304,8 @@ void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
             stos.get_can_participate_slack_weight(el), -v.storage_target_p(el), stos.get_min_p(el), stos.get_max_p(el));
 }
 
-std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGridView& v, const std::vector<int>* gone) const
+std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGridView& v, const std::vector<int>* gone,
+                                                            const std::vector<int>* hvdc_gone) const
 {
     auto rl = std::make_shared<RlPlan>();
     // ReactiveLimitsLoop::_initialize: bus_q_check's plan on this view, plus one entry per
@@ -1311,7 +1316,16 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
     // The controllers the row trips (`gone`, sorted) hold nothing: the plan keeps every
     // controller standing on a bus (a generator it only drops from the machines), and a
     // freeze of that bus would write a limit over their Q = 0.
-    if (gone != nullptr && !gone->empty()) {
+    // The hvdc lines it trips (`hvdc_gone`, grid ids): their stations hold nothing either,
+    // what lightsim2grid #292's OuterRowView::hvdc_off tells its own plan.
+    const bool any_gone = gone != nullptr && !gone->empty();
+    const bool any_hvdc_gone = hvdc_gone != nullptr && !hvdc_gone->empty();
+    if (any_hvdc_gone)
+        for (auto& entry : plan->buses)
+            entry.station_ids.erase(std::remove_if(entry.station_ids.begin(), entry.station_ids.end(), [&](const auto& station) {
+                return std::find(hvdc_gone->begin(), hvdc_gone->end(), station.first) != hvdc_gone->end(); }),
+                entry.station_ids.end());
+    if (any_gone)
         for (auto& entry : plan->buses) {
             entry.ctrl_pos.erase(std::remove_if(entry.ctrl_pos.begin(), entry.ctrl_pos.end(), [&](int c) {
                 return std::binary_search(gone->begin(), gone->end(), c); }), entry.ctrl_pos.end());
@@ -1320,9 +1334,9 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
                     entry.svc_ids.erase(std::remove(entry.svc_ids.begin(), entry.svc_ids.end(), vc_elem_[static_cast<size_t>(c)]),
                                         entry.svc_ids.end());
         }
+    if (any_gone || any_hvdc_gone)
         plan->buses.erase(std::remove_if(plan->buses.begin(), plan->buses.end(), [](const ls2g::bus_q_check::BusQEntry& e) {
             return e.gen_ids.empty() && e.storage_ids.empty() && e.station_ids.empty() && e.svc_ids.empty(); }), plan->buses.end());
-    }
     rl->n_bus_q = plan->buses.size();
     std::vector<int> monitor_of_entry(plan->buses.size(), -1);
     const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();

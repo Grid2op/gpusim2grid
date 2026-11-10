@@ -1085,8 +1085,7 @@ std::vector<std::string> ScenarioSweepSession::_row_unsupported_reasons() const
             for (int g = 0; g < gen_data_.n_gen && why.empty(); ++g)
                 if (gen_off_(r, g)) why = gen_contingency::gen_unsupported(gen_data_, g, phys_.compute_physical_violations, keep_final_jacobian_);
         if (why.empty() && has_more_off_ && static_cast<size_t>(r) < more_off_.size())
-            why = element_trips::more_unsupported(trip_data_, more_off_[static_cast<size_t>(r)], outer_ != nullptr,
-                                                  phys_.compute_physical_violations);
+            why = element_trips::more_unsupported(trip_data_, more_off_[static_cast<size_t>(r)], phys_.compute_physical_violations);
         if (why.empty() && outer_ && has_shunt_off_ && static_cast<size_t>(r) < shunt_off_.size())
             for (int sh : shunt_off_[static_cast<size_t>(r)])
                 if (trip_data_.shunt_regulating[static_cast<size_t>(sh)] && trip_data_.shunt_bus[static_cast<size_t>(sh)] >= 0) {
