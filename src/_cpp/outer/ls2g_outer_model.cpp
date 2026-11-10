@@ -414,7 +414,7 @@ public:
                    const SlotData* data, int& row_status) override;
     Next on_solved_impl(int slot, bool converged, int nr_iter, int inner_status,
                         const SlotData* data, int& row_status);
-    const RowResult& row_result(int row) const override { return results_.at(static_cast<size_t>(row)); }
+    const RowResult& row_result(int row) const override;
     void row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const override;
     int n_rows() const override { return n_rows_; }
     void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) override;
@@ -536,9 +536,20 @@ private:
     std::vector<double> row_gen_p_, row_sto_p_;    // [n_rows * n_gen], [n_rows * n_sto]
     RowOverrides ov_;                              // the rows' masks, units off, set-points
     std::vector<SlotState> slots_;
-    std::vector<RowResult> results_;
-    std::vector<std::vector<int>>    row_blk_trafo_;   // row_trafo_blocks, per row
-    std::vector<std::vector<double>> row_blk_;
+    // the finished rows' results: finish() fills what it has at hand and copies the final
+    // positions below; their (id, value) lists are built by row_result() at the first read,
+    // outside the run (results_ and fin_built_ are a cache)
+    mutable std::vector<RowResult> results_;
+    mutable std::vector<char> fin_built_;          // [n_rows] results_ holds the lists
+    std::vector<char>   fin_done_;                 // [n_rows] the row finished
+    std::vector<double> fin_sto_p_;                // [n_rows * n_sto] storage targets (NaN: not moved)
+    std::vector<int>    fin_hvdc_;                 // [n_rows * n_hvdc] hvdc regimes (2: KEEP)
+    std::vector<int>    fin_bc_pos_, fin_bc_rpos_; // [n_rows * n_bc] phase / ratio taps
+    std::vector<int>    fin_sc_;                   // [n_rows * n_sc_sh_] section counts
+    std::vector<size_t> sc_off_;                   // [n_sc + 1] first shunt of a controller in fin_sc_
+    size_t n_sc_sh_ = 0;
+    // the pi block of each transformer the row's loops moved off the grid's taps (row_trafo_blocks)
+    void row_blocks(size_t row, std::vector<int>& trafo, std::vector<double>& block) const;
 
     // ---- helpers ------------------------------------------------------------------
     // OuterInjections::gen_target_p_in_force / storage_target_p_in_force
@@ -981,9 +992,19 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.lost_p_mw.empty() || ov_.lost_p_mw.size() == static_cast<size_t>(n_rows), "lost active power");
     n_rows_ = n_rows;
     slots_.assign(static_cast<size_t>(n_slots), SlotState());
-    results_.assign(static_cast<size_t>(n_rows), RowResult());
-    row_blk_trafo_.assign(static_cast<size_t>(n_rows), {});
-    row_blk_.assign(static_cast<size_t>(n_rows), {});
+    const size_t nr = static_cast<size_t>(n_rows);
+    results_.assign(nr, RowResult());
+    fin_built_.assign(nr, 0);
+    fin_done_.assign(nr, 0);
+    sc_off_.assign(static_cast<size_t>(n_sc_) + 1, 0);
+    for (int e = 0; e < n_sc_; ++e)
+        sc_off_[static_cast<size_t>(e) + 1] = sc_off_[static_cast<size_t>(e)] + sc_shunts_[static_cast<size_t>(e)].size();
+    n_sc_sh_ = sc_off_.back();
+    fin_sto_p_.assign(nr * static_cast<size_t>(n_sto_), NaN);
+    fin_hvdc_.assign(nr * static_cast<size_t>(layout_.n_hvdc), 2);
+    fin_bc_pos_.assign(nr * static_cast<size_t>(n_bc_), 0);
+    fin_bc_rpos_.assign(nr * static_cast<size_t>(n_bc_), 0);
+    fin_sc_.assign(nr * n_sc_sh_, 0);
 }
 
 // =============================================================================
@@ -2995,49 +3016,23 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status)
         if (status == FAILED) r.failed_loop = st.last_name;
         r.nb_outer_iterations = st.nb_outer;
         r.nb_nr_iterations = st.total_nr;
-        for (size_t s = 0; s < st.storage_target_p.size(); ++s)
-            if (!std::isnan(st.storage_target_p[s])) { r.storage_ids.push_back(static_cast<int>(s)); r.storage_target_p_mw.push_back(st.storage_target_p[s]); }
-        for (size_t e = 0; e < st.hvdc_regime.size(); ++e)
-            if (st.hvdc_regime[e] != 2) { r.hvdc_ids.push_back(hvdc_id_[e]); r.hvdc_regime.push_back(st.hvdc_regime[e]); }
-        // the section counts the loops left, where they differ from the grid's
-        {
-            const auto& shunts = grid_->get_shunts();
-            for (int e = 0; e < n_sc_; ++e)
-                for (size_t i = 0; i < sc_shunts_[static_cast<size_t>(e)].size(); ++i) {
-                    const int sh = sc_shunts_[static_cast<size_t>(e)][i];
-                    const int c = st.sc_counts[static_cast<size_t>(e)][i];
-                    if (shunts.has_sections(sh) && shunts.get_section_count(sh) == c) continue;
-                    r.shunt_ids.push_back(sh);
-                    r.shunt_sections.push_back(c);
-                }
+        // the final positions; row_result() lists where they differ from the grid's
+        const size_t row = static_cast<size_t>(st.row);
+        if (!st.storage_target_p.empty())
+            std::copy(st.storage_target_p.begin(), st.storage_target_p.end(), fin_sto_p_.begin() + static_cast<ptrdiff_t>(row * n_sto_));
+        std::copy(st.hvdc_regime.begin(), st.hvdc_regime.end(), fin_hvdc_.begin() + static_cast<ptrdiff_t>(row * layout_.n_hvdc));
+        if (n_bc_ > 0) {
+            std::copy(st.bc_pos.begin(), st.bc_pos.end(), fin_bc_pos_.begin() + static_cast<ptrdiff_t>(row * n_bc_));
+            std::copy(st.bc_rpos.begin(), st.bc_rpos.end(), fin_bc_rpos_.begin() + static_cast<ptrdiff_t>(row * n_bc_));
         }
-        // the positions the loops handled, where they differ from the grid's
-        // (BaseBatchSweep::_record_row_outer), and the blocks the row's flows use
-        // (_record_row_trafo_blocks)
-        {
-            const auto& trafos = grid_->get_trafos();
-            const auto& ptc = trafos.get_tap_changers(true);
-            const auto& rtc = trafos.get_tap_changers(false);
-            auto& bt = row_blk_trafo_[static_cast<size_t>(st.row)];
-            auto& bb = row_blk_[static_cast<size_t>(st.row)];
-            bt.clear();
-            bb.clear();
-            for (int e = 0; e < n_bc_; ++e) {
-                const size_t ee = static_cast<size_t>(e);
-                const int t = bc_trafo_[ee];
-                const bool ph = bc_phase_[ee] && !(ptc.has(t) && ptc.position(t) == st.bc_pos[ee]);
-                const bool ra = bc_ratio_[ee] && !(rtc.has(t) && rtc.position(t) == st.bc_rpos[ee]);
-                if (ph) { r.phase_tap_ids.push_back(t); r.phase_tap.push_back(st.bc_pos[ee]); }
-                if (ra) { r.ratio_tap_ids.push_back(t); r.ratio_tap.push_back(st.bc_rpos[ee]); }
-                if (!ph && !ra) continue;
-                const int rpos = ra ? st.bc_rpos[ee] : (rtc.has(t) ? rtc.position(t) : 0);
-                const int ppos = ph ? st.bc_pos[ee] : (ptc.has(t) ? ptc.position(t) : 0);
-                const double shift = ptc.has(t) ? ptc.alpha_at(t, ppos) : trafos[t].shift_rad;
-                const auto blk = trafos.pi_block_at(t, rpos, ppos, shift);
-                bt.push_back(t);
-                for (int k = 0; k < 4; ++k) { bb.push_back(blk[static_cast<size_t>(k)].real()); bb.push_back(blk[static_cast<size_t>(k)].imag()); }
-            }
+        for (int e = 0; e < n_sc_; ++e) {
+            const size_t ee = static_cast<size_t>(e);
+            const auto& c = st.sc_counts[ee];
+            const size_t n = std::min(c.size(), sc_off_[ee + 1] - sc_off_[ee]);
+            std::copy(c.begin(), c.begin() + static_cast<ptrdiff_t>(n), fin_sc_.begin() + static_cast<ptrdiff_t>(row * n_sc_sh_ + sc_off_[ee]));
         }
+        fin_done_[row] = 1;
+        fin_built_[row] = 0;
         r.decisions = std::move(st.trace);
         if (keep_adjoint_) adjoint_info(st, r);
         // the row is over: its slot's targets (reset at its next load) become the result's
@@ -3107,10 +3102,76 @@ void Ls2gOuterModel::adjoint_info(const SlotState& st, RowResult& r) const
     }
 }
 
+// A finished row's positions where they differ from the grid's (BaseBatchSweep::_record_row_outer)
+const RowResult& Ls2gOuterModel::row_result(int row) const
+{
+    const size_t rr = static_cast<size_t>(row);
+    RowResult& r = results_.at(rr);
+    if (!fin_done_[rr] || fin_built_[rr]) return r;
+    fin_built_[rr] = 1;
+    for (int s = 0; s < n_sto_; ++s) {
+        const double p = fin_sto_p_[rr * static_cast<size_t>(n_sto_) + static_cast<size_t>(s)];
+        if (!std::isnan(p)) { r.storage_ids.push_back(s); r.storage_target_p_mw.push_back(p); }
+    }
+    for (int e = 0; e < layout_.n_hvdc; ++e) {
+        const int reg = fin_hvdc_[rr * static_cast<size_t>(layout_.n_hvdc) + static_cast<size_t>(e)];
+        if (reg != 2) { r.hvdc_ids.push_back(hvdc_id_[static_cast<size_t>(e)]); r.hvdc_regime.push_back(reg); }
+    }
+    // the section counts the loops left
+    const auto& shunts = grid_->get_shunts();
+    for (int e = 0; e < n_sc_; ++e)
+        for (size_t i = 0; i < sc_shunts_[static_cast<size_t>(e)].size(); ++i) {
+            const int sh = sc_shunts_[static_cast<size_t>(e)][i];
+            const int c = fin_sc_[rr * n_sc_sh_ + sc_off_[static_cast<size_t>(e)] + i];
+            if (shunts.has_sections(sh) && shunts.get_section_count(sh) == c) continue;
+            r.shunt_ids.push_back(sh);
+            r.shunt_sections.push_back(c);
+        }
+    // the tap positions the loops handled
+    const auto& trafos = grid_->get_trafos();
+    const auto& ptc = trafos.get_tap_changers(true);
+    const auto& rtc = trafos.get_tap_changers(false);
+    for (int e = 0; e < n_bc_; ++e) {
+        const size_t ee = static_cast<size_t>(e);
+        const int t = bc_trafo_[ee];
+        const int pos = fin_bc_pos_[rr * static_cast<size_t>(n_bc_) + ee];
+        const int rpos = fin_bc_rpos_[rr * static_cast<size_t>(n_bc_) + ee];
+        if (bc_phase_[ee] && !(ptc.has(t) && ptc.position(t) == pos)) { r.phase_tap_ids.push_back(t); r.phase_tap.push_back(pos); }
+        if (bc_ratio_[ee] && !(rtc.has(t) && rtc.position(t) == rpos)) { r.ratio_tap_ids.push_back(t); r.ratio_tap.push_back(rpos); }
+    }
+    return r;
+}
+
+// the blocks a finished row's flows use (BaseBatchSweep::_record_row_trafo_blocks)
+void Ls2gOuterModel::row_blocks(size_t row, std::vector<int>& trafo, std::vector<double>& block) const
+{
+    trafo.clear();
+    block.clear();
+    if (!fin_done_[row]) return;
+    const auto& trafos = grid_->get_trafos();
+    const auto& ptc = trafos.get_tap_changers(true);
+    const auto& rtc = trafos.get_tap_changers(false);
+    for (int e = 0; e < n_bc_; ++e) {
+        const size_t ee = static_cast<size_t>(e);
+        const int t = bc_trafo_[ee];
+        const int pos = fin_bc_pos_[row * static_cast<size_t>(n_bc_) + ee];
+        const int rpos0 = fin_bc_rpos_[row * static_cast<size_t>(n_bc_) + ee];
+        const bool ph = bc_phase_[ee] && !(ptc.has(t) && ptc.position(t) == pos);
+        const bool ra = bc_ratio_[ee] && !(rtc.has(t) && rtc.position(t) == rpos0);
+        if (!ph && !ra) continue;
+        const int rpos = ra ? rpos0 : (rtc.has(t) ? rtc.position(t) : 0);
+        const int ppos = ph ? pos : (ptc.has(t) ? ptc.position(t) : 0);
+        const double shift = ptc.has(t) ? ptc.alpha_at(t, ppos) : trafos[t].shift_rad;
+        const auto blk = trafos.pi_block_at(t, rpos, ppos, shift);
+        trafo.push_back(t);
+        for (int k = 0; k < 4; ++k) { block.push_back(blk[static_cast<size_t>(k)].real()); block.push_back(blk[static_cast<size_t>(k)].imag()); }
+    }
+}
+
 void Ls2gOuterModel::row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const
 {
-    trafo = row_blk_trafo_.at(static_cast<size_t>(row));
-    block = row_blk_.at(static_cast<size_t>(row));
+    if (row < 0 || row >= n_rows_) throw std::out_of_range("outer model: row_trafo_blocks: no such row");
+    row_blocks(static_cast<size_t>(row), trafo, block);
 }
 
 }  // namespace
