@@ -1,6 +1,11 @@
 Change Log
 ===========
 
+[0.3.0] 2026-xx-yy
+--------------------
+- [FIXED] CI: cap the cuDSS pip wheel below 1.0, whose ``libcudss.so.1`` the CMake shim does not find
+  (and whose API is untested here).
+
 [0.2.0] 2026-xx-yy
 --------------------
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
