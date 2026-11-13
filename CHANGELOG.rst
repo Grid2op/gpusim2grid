@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] ``benchmark_cudss_batch_raw(n_handles=, handle_launch=)`` and ``benchmarks/cudss_small_handles.py``:
+  several independent cuDSS handles per round, timed against one large one.
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at
   one end only keeps its charging from the other, as in lightsim2grid.
 - [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``redistribute_slack`` with ``outer_loops=True``, the
