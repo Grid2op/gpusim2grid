@@ -85,6 +85,13 @@ Change Log
 - [IMPROVED] ``reactive_limits_outer_loop``: the second pass starts each contingency from its
   first-pass voltages (``outer_loop_warm_start``, default on); ``outer_loop_nb_iter`` sets its
   Newton iterations.
+- [IMPROVED] the build takes the SuiteSparse headers lightsim2grid >= 1.3.0 ships with its core:
+  a lightsim2grid installed from a wheel no longer needs a SuiteSparse checkout on the side.
+- [BREAKING] lightsim2grid >= 1.3.1 is required, to build and to run: its PyPI wheel is all the bridge needs.
+- [ADDED] ``cuda12`` / ``cuda13`` extras: the CUDA libraries and cuDSS (``nvidia-cudss-cu12/-cu13>=1.0.0.35,<2``) from PyPI.
+- [IMPROVED] the build finds a CUDA toolkit installed from PyPI (``cuda-toolkit``, libraries named by soname only)
+  and cuDSS 1.x's wheel (``libcudss.so.1``); the docs install everything from PyPI.
+- [IMPROVED] CI: CUDA 12.4 and the latest CUDA 13 on PyPI, each with cuDSS 1.x, and lightsim2grid, all from PyPI.
 
 [0.2.0] 2026-xx-yy
 --------------------
