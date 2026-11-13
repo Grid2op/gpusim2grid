@@ -198,6 +198,22 @@ def test_refusals(case14):
         ScenarioSweepGPU(case14, init_from_n_powerflow=False).get_outer_results()
 
 
+def test_scheduling_enum_is_accepted(case14):
+    """scheduling=BatchScheduling.Continuous is scheduling='continuous': every
+    facade takes the enum, the outer-loop check too, and the rows are the same."""
+    from gpusim2grid import ScenarioSweepGPU, ContingencyAnalysisGPU, InjectionSweepGPU
+    from gpusim2grid._gpusim2grid import BatchScheduling
+    for cls in (ContingencyAnalysisGPU, InjectionSweepGPU):
+        cls(case14, outer_loops=True, init_from_n_powerflow=False,
+            scheduling=BatchScheduling.Continuous)
+    rows = _rows(case14, n_rows=3)
+    V = [_V(_gpu(case14, rows, 2, scheduling=sched), case14, 3)
+         for sched in ("continuous", BatchScheduling.Continuous)]
+    np.testing.assert_allclose(V[0], V[1], rtol=0., atol=1e-12)   # two sessions: to rounding
+    with pytest.raises(ValueError, match="continuous.*not planned"):
+        ScenarioSweepGPU(case14, outer_loops=True, scheduling=BatchScheduling.Chunked)
+
+
 def test_grid_without_nrouter_is_refused():
     import pandapower.networks as pn
     from lightsim2grid.network import init_from_pandapower

@@ -3,6 +3,13 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] ``ContingencyAnalysisSession.overwrite_rows`` / ``ScenarioSweepSession.set_v_init_from`` (was
+  ``set_v_init_from_ptr``) take the source session, not raw pointers: a source row past its rows is refused.
+- [FIXED] ``reactive_limits_outer_loop``: the second pass checks the limits given to the analysis
+  (``set_limits``), not the grid's own.
+- [FIXED] ``outer_loops=True`` accepts ``scheduling=BatchScheduling.Continuous``, not only the string.
+- [FIXED] ``compute_flows`` / ``get_V_results`` on the three batch sessions: rows × branches (or buses) past
+  ``INT32_MAX`` overflowed (large grids, many rows); sizes and offsets are now 64-bit.
 - [FIXED] ``outer_loops=True``: parallel transformers of ``PhaseControl`` / ``TransformerVoltageControl`` lost
   Ybus patches (racing threads), leaving rows at their iteration budget or on wrong blocks.
 - [ADDED] ``benchmark_cudss_batch_raw`` and ``solve_cudss_raw`` take ``ir_n_steps``.

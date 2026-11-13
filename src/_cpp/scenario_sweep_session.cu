@@ -483,7 +483,13 @@ std::uintptr_t ScenarioSweepSession::v_results_ptr() const
     return solver_ ? reinterpret_cast<std::uintptr_t>(solver_->d_V_results_ptr()) : 0;
 }
 
-void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows)
+int ScenarioSweepSession::result_rows() const
+{
+    return solver_ ? solver_->n_contingencies : 0;
+}
+
+void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows,
+                                               int n_src_rows, int n_bus_src)
 {
     if (d_V_src == 0)
         throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: null source buffer");
@@ -492,9 +498,15 @@ void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std
     if (has_injections_ && static_cast<int>(src_rows.size()) != n_scenarios_)
         throw std::runtime_error(
             "ScenarioSweepSession::set_v_init_from_ptr: row count must match set_injections()'s n_scenarios");
+    if (n_bus_src != base_state_->n_bus)
+        throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: the source has " +
+                                 std::to_string(n_bus_src) + " buses, this session " +
+                                 std::to_string(base_state_->n_bus));
     for (int r : src_rows)
-        if (r < 0)
-            throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: negative source row");
+        if (r < 0 || r >= n_src_rows)
+            throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: source row " +
+                                     std::to_string(r) + " outside [0, " +
+                                     std::to_string(n_src_rows) + ")");
     const int n = static_cast<int>(src_rows.size());
     const int n_bus = base_state_->n_bus;
     const cudaStream_t cs = static_cast<cudaStream_t>(base_state_->cs);
@@ -1876,13 +1888,14 @@ void ScenarioSweepSession::compute_flows()
     const int n_scen = solver_->n_contingencies;
     const int n_bra  = solver_->n_branches_;
     const int n_bus  = base_state_->n_bus;
-    const int total  = n_scen * n_bra;
+    // 64-bit: n_rows * n_branches passes INT32_MAX on large grids (70k buses, ~20k rows)
+    const long long total = static_cast<long long>(n_scen) * n_bra;
     const cudaStream_t cs = solver_->cs;
 
     CudaTimer flow_timer(cs);
     flow_timer.start();
 
-    compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+    compute_branch_flows_kernel<<<static_cast<unsigned>((total + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
         thrust::raw_pointer_cast(solver_->d_branch_from.data()),
         thrust::raw_pointer_cast(solver_->d_branch_to.data()),
@@ -1900,16 +1913,16 @@ void ScenarioSweepSession::compute_flows()
 
     // Zero flows for each scenario's own tripped branches (they carry no
     // current by definition) — same pattern as ContingencyAnalysisSession.
-    std::vector<int> h_zero;
+    std::vector<long long> h_zero;   // flat row * n_bra + l: 64-bit
     for (int s = 0; s < n_scen; ++s)
         for (int l : tripped_branches_per_scenario_[static_cast<size_t>(s)])
-            h_zero.push_back(s * n_bra + l);
+            h_zero.push_back(static_cast<long long>(s) * n_bra + l);
 
-    thrust::device_vector<int> d_zero;   // kept alive until after sync
+    thrust::device_vector<long long> d_zero;   // kept alive until after sync
     if (!h_zero.empty()) {
-        const int n_z = static_cast<int>(h_zero.size());
+        const long long n_z = static_cast<long long>(h_zero.size());
         upload_h2d(d_zero, h_zero.data(), static_cast<size_t>(n_z), cs);
-        zero_branch_flows_kernel<<<(n_z + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+        zero_branch_flows_kernel<<<static_cast<unsigned>((n_z + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
             thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
             thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
             thrust::raw_pointer_cast(d_zero.data()),
@@ -1919,7 +1932,7 @@ void ScenarioSweepSession::compute_flows()
     timings_.t_flow_computation += flow_timer.stop_ms();
     // d_zero destroyed here, after sync (stop_ms() synchronizes)
 
-    const int n = n_scen * n_bra;
+    const Eigen::Index n = static_cast<Eigen::Index>(n_scen) * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
         // Through the driver's pinned staging buffer (download_into).
@@ -1959,7 +1972,8 @@ CplxVect ScenarioSweepSession::get_V_results() const
         throw std::runtime_error("ScenarioSweepSession: call run() first");
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
-    const int n = solver_->n_contingencies * base_state_->n_bus;
+    // 64-bit: n_rows * n_bus passes INT32_MAX on large grids (70k buses x 30k rows)
+    const Eigen::Index n = static_cast<Eigen::Index>(solver_->n_contingencies) * base_state_->n_bus;
     CplxVect out(n);
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);

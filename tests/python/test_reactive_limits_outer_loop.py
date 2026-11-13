@@ -336,7 +336,7 @@ def test_warm_start(runs, solver_atol):
 
 
 def test_session_v_init_rows(solver_atol):
-    """ScenarioSweepSession.set_v_init_from_ptr: row i starts from row
+    """ScenarioSweepSession.set_v_init_from: row i starts from row
     src_rows[i] of another session's voltages, through the active-slot order
     (a skipped row in between) and with a masked bus (NaN there) started from
     the base case. One iteration from a converged row stays on it."""
@@ -364,7 +364,7 @@ def test_session_v_init_rows(solver_atol):
     perm = [3, 2, 0, 4, 1]
     b = sweep([topo[i] for i in perm], 1)
     b.solver._s.set_skipped_rows(np.array([False, False, False, True, False]))
-    b.solver._s.set_v_init_from_ptr(a.solver._s.v_results_ptr(), perm)
+    b.solver._s.set_v_init_from(a.solver._s, perm)
     assert b.solver._s.has_v_init
     b.compute(batch_size=8)
     V_b = b.V_results.to_numpy().reshape(len(topo), -1)
@@ -378,6 +378,58 @@ def test_session_v_init_rows(solver_atol):
     b.compute(batch_size=8)
     V_c = b.V_results.to_numpy().reshape(len(topo), -1)
     assert np.nanmax(np.abs(V_c[0] - V_a[3])) > 100 * solver_atol
+
+
+def test_second_pass_uses_the_analysis_limits():
+    """The second pass checks the limits the analysis was given (set_limits),
+    not the grid's own: a RECOMPUTED contingency's records replace the first
+    pass', so with other limits it would lose (or gain) violations. Every bus
+    is set above its vmax here: every simulated row reports all its buses."""
+    grid, _ = _build()
+    ca = _ca(grid, True)
+    n_bus = ca._inner._s.n_bus
+    vmax = np.full(n_bus, 0.9 * VN_KV)   # every bus above it
+    lim = np.full(len(LINES), np.nan)
+    ca.set_limits(np.full(n_bus, np.nan), vmax, lim, lim, len(LINES))
+    ca.compute_limit_violations = True
+    ca.compute(batch_size=16)
+    from gpusim2grid.contingency_analysis._reactive_limits import ReactiveLimitsStatus as S
+    assert set(np.flatnonzero(ca.get_outer_loop_status() == S.RECOMPUTED)) == SWITCHED
+    viols = ca.get_violations()
+    res = ca.last_residuals()
+    for r, v in enumerate(viols):
+        if not np.isfinite(res[r]):
+            continue
+        n_masked = int(np.isnan(ca.V_results.to_numpy().reshape(len(LINES), -1)[r]).sum())
+        high = [x for x in v if int(x.violation_type) == 1]   # HIGH_VOLTAGE
+        assert len(high) == n_bus - n_masked, (r, r in SWITCHED, len(high))
+
+
+def test_overwrite_rows_checks_the_source_rows():
+    """overwrite_rows copies rows of ANOTHER session's results: a source row
+    past that session's row count is refused, never read out of bounds."""
+    from gpusim2grid import ScenarioSweepGPU
+    grid, _ = _build()
+    ca = _ca(grid, False)
+    ss = ScenarioSweepGPU(grid, nb_iter=10)
+    loads, gens = grid.get_loads(), grid.get_generators()
+    ss.set_injections_from_elements(np.tile([l.target_p_mw for l in loads], (2, 1)),
+                                    np.tile([l.target_q_mvar for l in loads], (2, 1)),
+                                    np.tile([g.target_p_mw for g in gens], (2, 1)))
+    ss.compute(batch_size=4)
+    with pytest.raises((RuntimeError, ValueError), match="source row"):
+        ca._inner._s.overwrite_rows([0], [2], ss.solver._s)
+
+
+def test_v_init_checks_the_source_rows():
+    """set_v_init_from: a source row past the source session's row count is
+    refused, never read out of bounds."""
+    from gpusim2grid import ScenarioSweepGPU
+    grid, _ = _build()
+    ca = _ca(grid, False)   # 12 rows
+    ss = ScenarioSweepGPU(grid, nb_iter=10)
+    with pytest.raises((RuntimeError, ValueError), match="source row"):
+        ss.solver._s.set_v_init_from(ca._inner._s, [len(LINES)])
 
 
 def test_needs_the_physical_checks():

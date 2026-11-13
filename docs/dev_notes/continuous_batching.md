@@ -778,7 +778,7 @@ grid with one slack bus. So:
    released controllers, Sbus deltas, `v_set`, HVDC regimes, `vm_reseed`. Its default is derived
    from the inputs. The load path reads both. In Part A the control state is always the default.
 2. **Let the load path take an optional warm V and warm unknowns** (`slack_absorbed`,
-   controller Q) per row. Part A only uses the warm V, for `set_v_init_from_ptr`.
+   controller Q) per row. Part A only uses the warm V, for `set_v_init_from`.
 3. **Leave the eviction checks' records on the device in a per-row form the scheduler can read,**
    not only in the user-facing result buffers.
 4. **Keep the status enum and the per-row iteration counter extensible:** the counter becomes

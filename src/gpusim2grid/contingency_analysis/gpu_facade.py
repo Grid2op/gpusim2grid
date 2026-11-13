@@ -372,6 +372,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             scaling_max_voltage_change=scaling_max_voltage_change,
             max_dVa=max_dVa, max_dVm=max_dVm, use_distributed_slack=use_distributed_slack)
         self._rl_sweep = None
+        # the last limits given (_set_limits; None = the bridge's, off the grid)
+        # and the generation of the ones the second pass has (_sync_second_pass)
+        self._limits_args = None
+        self._limits_gen = 0
+        self._limits_synced = -1
         self._rl_ctx = None
         self._rl_result = None
         self._ctg_branch_ids = None
@@ -561,8 +566,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                   branch_limit_a2_ka, n_lines):
         """Configure bus voltage / branch current limits (explicit-array mode
         only). Grid mode should use :meth:`set_limits_from_grid` instead."""
-        self._inner.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
-                               branch_limit_a2_ka, int(n_lines))
+        self._set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
+                         branch_limit_a2_ka, int(n_lines))
+
+    def _set_limits(self, *args):
+        """Every limit given to this analysis goes through here: the second pass
+        of reactive_limits_outer_loop is given the same ones (_sync_second_pass)."""
+        self._inner.set_limits(*args)
+        self._limits_args = args
+        self._limits_gen += 1
 
     def add_contingencies_by_branch_id(self, branch_ids_per_ctg):
         """Define contingencies as branch removals.
@@ -766,8 +778,14 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         dst.scheduling = src.scheduling
         dst.ir_n_steps = src.ir_n_steps
         dst.handle_disconnected_grid = src.handle_disconnected_grid
-        if src.compute_limit_violations and not dst.compute_limit_violations:
-            sweep.set_limits_from_grid()
+        # the limits this analysis checks, not the (copied) grid's: the second
+        # pass' records replace the first pass' of the rows it re-solves
+        if src.compute_limit_violations and self._limits_synced != self._limits_gen:
+            if self._limits_args is None:   # set by the bridge, off the grid
+                sweep.set_limits_from_grid()
+            else:
+                dst.set_limits(*self._limits_args)
+            self._limits_synced = self._limits_gen
         dst.compute_limit_violations = src.compute_limit_violations
         dst.violation_tol = src.violation_tol
         dst.violation_rel_tol = src.violation_rel_tol
@@ -809,7 +827,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                "viol": {}, "viol_trunc": {}, "viol_counts": {}, "phys": {}, "phys_trunc": {}}
         if run_rows:
             self._sync_second_pass(sweep)
-            v_init = (sess.v_results_ptr(), list(map(int, run_rows))) if self._outer_loop_warm_start else None
+            v_init = (sess, list(map(int, run_rows))) if self._outer_loop_warm_start else None
             run_second_pass(sweep, ctx, [self._ctg_branch_ids[r] for r in run_rows],
                             [switches[r] for r in run_rows], batch_size, v_init=v_init)
             out["timings"] = sweep.timings
@@ -820,7 +838,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             dst = [int(run_rows[i]) for i in ok]
             status[dst] = int(ReactiveLimitsStatus.RECOMPUTED)
             s2 = sweep.solver._s
-            sess.overwrite_rows(dst, [int(i) for i in ok], s2.v_results_ptr(), s2.residuals_ptr())
+            sess.overwrite_rows(dst, [int(i) for i in ok], s2)
             # ... and their outcome: the second pass' iterations and status
             sess.overwrite_row_outcomes(dst, [int(v) for v in np.asarray(s2.get_row_iterations())[ok]],
                                         [int(v) for v in np.asarray(s2.get_row_status())[ok]])
@@ -901,7 +919,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines = \
             self._extract_limits_arrays()
-        self._inner.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        self._set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
 
     @property
     def compute_limit_violations(self):
