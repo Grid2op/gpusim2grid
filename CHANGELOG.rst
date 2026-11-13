@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] ``gpusim2grid_core``: the solvers as a C++ shared library without Python (headers, CMake package
+  ``gpusim2grid::core``, ``gpusim2grid.get_cmake_dir()``), for C++ / JNI callers; the Python module links it.
 - [ADDED] ``benchmark_cudss_batch_raw(n_active=)``: with ``linear_solver='own_lu'``, only the first
   ``n_active`` matrices are factorized and solved, the others left untouched.
 - [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU
