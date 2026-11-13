@@ -818,8 +818,8 @@ __global__ void compute_branch_flows_kernel(
 __global__ void zero_branch_flows_kernel(
           cuda_real_type* __restrict__ d_or_amps,
           cuda_real_type* __restrict__ d_ex_amps,
-    const int*           __restrict__ d_zero_indices,
-    int n_entries);
+    const long long*     __restrict__ d_zero_indices,
+    long long n_entries);
 
 // =============================================================================
 // tile_kernel / launch_tile

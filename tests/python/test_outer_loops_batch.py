@@ -145,8 +145,8 @@ def test_rows_match_lightsim2grid_batch(case14, batch_size):
 
 def test_a_row_the_loops_act_on_is_resolved(case14):
     """The base grid itself as one row: its loops act (case14's PV buses are
-    short of reactive power), and the row ends where lightsim2grid's single
-    NROuter solve ends."""
+    short of reactive power), and the row ends where lightsim2grid's NROuter
+    batch (ScenarioSweepCPP) ends."""
     grid = case14
     rows = _rows(grid, n_rows=1, trips=False)
     rows["load_p"] = rows["load_p"] / 1.   # the grid's own loads
@@ -168,6 +168,7 @@ def test_ample_reactive_limits_only_the_slack_is_shared():
     sw = _gpu(grid, rows, 4, keep_outer_trace=True)
     res = sw.get_outer_results()
     assert not any("ReactiveLimits" in d and "not taken" not in d for r in res for d in r.decisions)
+    assert not any(d.startswith("DistributedSlack") and "not taken" not in d for r in res for d in r.decisions)
     ls = _lightsim2grid(grid, rows)
     _compare_with_batch(_V(sw, grid, N_ROWS), np.asarray(sw.get_row_status()), res, ls, grid, N_ROWS)
 
@@ -224,6 +225,22 @@ def test_step_scaling_arguments_change_the_outer_newton(case14):
         ca.compute(batch_size=3)
         return sum(r.nb_nr_iterations for r in ca.get_outer_results())
     assert newton(scaling_max_voltage_change=True, max_dVa=0.01, max_dVm=0.002) > newton(scaling_max_voltage_change=False)
+
+
+def test_scheduling_enum_is_accepted(case14):
+    """scheduling=BatchScheduling.Continuous is scheduling='continuous': every
+    facade takes the enum, the outer-loop check too, and the rows are the same."""
+    from gpusim2grid import ScenarioSweepGPU, ContingencyAnalysisGPU, InjectionSweepGPU
+    from gpusim2grid._gpusim2grid import BatchScheduling
+    for cls in (ContingencyAnalysisGPU, InjectionSweepGPU):
+        cls(case14, outer_loops=True, init_from_n_powerflow=False,
+            scheduling=BatchScheduling.Continuous)
+    rows = _rows(case14, n_rows=3)
+    V = [_V(_gpu(case14, rows, 2, scheduling=sched), case14, 3)
+         for sched in ("continuous", BatchScheduling.Continuous)]
+    np.testing.assert_allclose(V[0], V[1], rtol=0., atol=1e-12)   # two sessions: to rounding
+    with pytest.raises(ValueError, match="continuous.*not planned"):
+        ScenarioSweepGPU(case14, outer_loops=True, scheduling=BatchScheduling.Chunked)
 
 
 def test_grid_without_nrouter_is_refused():
@@ -1076,6 +1093,7 @@ def test_all_seven_loops_together():
     grid.change_algorithm(OUTER)
     assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), MAX_IT, 1e-10).size > 0
     names = [l.name() for l in grid.get_outer_loops()]
+    assert len(names) == 7, names
     assert names[-3:] == ["PhaseControl", "TransformerVoltageControl", "ShuntVoltageControl"], names
     branches = [0, 1, 2, 3]
     ls = ContingencyAnalysisCPP(grid)
