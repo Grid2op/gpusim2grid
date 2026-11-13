@@ -85,10 +85,15 @@ def case():
 def _ls_rows(ls, trips):
     """lightsim2grid's voltages of `trips`, in their order (its rows follow
     my_contingencies())"""
-    row = {tuple(tuple(el) for el in c): k for k, c in enumerate(ls.my_contingencies())}
+    conts = ls.my_contingencies()
+    row = {tuple(tuple(el) for el in c): k for k, c in enumerate(conts)}
     V = np.asarray(ls.get_voltages())
-    # (my_contingencies adds the branches opened at one end only, as a fifth and sixth list)
-    return V[[row[tuple(tuple(sorted(el)) for el in (tuple(t) + ((), ()))[:6])] for t in trips]]
+    # my_contingencies' tuples grew with lightsim2grid: 6 lists (the branches opened at one end
+    # only as the fifth and sixth), 10 in 1.3.1 (+ static generators, storage units, SVCs, hvdc
+    # lines). Pad each trip to the length this version returns.
+    n = len(conts[0])
+    assert all(len(t) <= n for t in trips)
+    return V[[row[tuple(tuple(sorted(el)) for el in (tuple(t) + ((),) * n)[:n])] for t in trips]]
 
 
 # ------------------------------------------------------------ ContingencyAnalysisGPU
