@@ -507,12 +507,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
     SlackRedistributionData d;
     d.n_gen = gens.nb();
     d.gen_bus_solver.resize(d.n_gen);
-    d.gen_target_p_mw.resize(d.n_gen);
+    d.gens_target_p_mw.resize(d.n_gen);
     for (int g = 0; g < d.n_gen; ++g) {
         const ls2g::GenInfo gi(gens, g);
         const int b = gi.connected ? to_solver(gi.bus_id) : -1;
         d.gen_bus_solver(g)  = b;
-        d.gen_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
+        d.gens_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
         if (b < 0) continue;
         const bool g_in_slack = gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12;
         const double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)
@@ -650,6 +650,92 @@ ElementTripData extract_element_trip_data(const ls2g::LSGrid& grid, int n_bus_so
     d.n_gen = static_cast<int>(gen_p.size());
     d.gen_target_p_mw.assign(static_cast<size_t>(d.n_gen), 0.);
     for (int g = 0; g < d.n_gen; ++g) d.gen_target_p_mw[static_cast<size_t>(g)] = static_cast<double>(gen_p(g));
+
+    const std::set<int> group_buses = grid.get_group_controlled_buses();  // GRID bus ids
+    const auto on_group = [&](int bus_me) { return bus_me >= 0 && group_buses.count(bus_me) > 0; };
+
+    // static generators
+    const auto& sgens = grid.get_static_generators();
+    d.n_sgen = sgens.nb();
+    d.sgen_bus.assign(static_cast<size_t>(d.n_sgen), -1);
+    d.sgen_p_mw.assign(static_cast<size_t>(d.n_sgen), 0.);
+    d.sgen_q_mvar.assign(static_cast<size_t>(d.n_sgen), 0.);
+    for (int k = 0; k < d.n_sgen; ++k) {
+        if (!sgens.get_status()[static_cast<size_t>(k)]) continue;
+        d.sgen_bus[static_cast<size_t>(k)] = to_solver(sgens.get_bus_id()(k).cast_int());
+        d.sgen_p_mw[static_cast<size_t>(k)] = static_cast<double>(sgens.get_target_p()(k));
+        d.sgen_q_mvar[static_cast<size_t>(k)] = static_cast<double>(sgens.get_target_q()(k));
+    }
+
+    // storage units
+    const auto& storages = grid.get_storages();
+    d.n_storage = storages.nb();
+    d.storage_bus.assign(static_cast<size_t>(d.n_storage), -1);
+    d.storage_p_mw.assign(static_cast<size_t>(d.n_storage), 0.);
+    d.storage_q_mvar.assign(static_cast<size_t>(d.n_storage), 0.);
+    d.storage_on_group.assign(static_cast<size_t>(d.n_storage), 0);
+    d.storage_checked.assign(static_cast<size_t>(d.n_storage), 0);
+    for (int k = 0; k < d.n_storage; ++k) {
+        const size_t kk = static_cast<size_t>(k);
+        if (!storages.get_status()[kk]) continue;
+        const int bus_me = storages.get_bus_id()(k).cast_int();
+        const bool regulates = storages.is_local_voltage_controller(k);
+        d.storage_bus[kk] = to_solver(bus_me);
+        d.storage_p_mw[kk] = static_cast<double>(storages.get_target_p()(k));
+        if (!storages.get_voltage_regulator_on(k)) d.storage_q_mvar[kk] = static_cast<double>(storages.get_target_q()(k));
+        d.storage_on_group[kk] = (regulates && on_group(bus_me)) ? 1 : 0;
+        d.storage_checked[kk] = (regulates || std::abs(static_cast<double>(storages.get_slack_weight(k))) > 1e-12 ||
+                                 storages.get_can_participate_slack_weight(k) > 0.) ? 1 : 0;
+    }
+
+    // static var compensators
+    const auto& svcs = grid.get_svcs();
+    d.n_svc = svcs.nb();
+    d.svc_bus.assign(static_cast<size_t>(d.n_svc), -1);
+    d.svc_b0_pu.assign(static_cast<size_t>(d.n_svc), 0.);
+    d.svc_q_mvar.assign(static_cast<size_t>(d.n_svc), 0.);
+    d.svc_voltage.assign(static_cast<size_t>(d.n_svc), 0);
+    d.svc_standby.assign(static_cast<size_t>(d.n_svc), 0);
+    d.svc_frozen.assign(static_cast<size_t>(d.n_svc), 0);
+    for (int k = 0; k < d.n_svc; ++k) {
+        const size_t kk = static_cast<size_t>(k);
+        if (!svcs.get_status(k)) continue;
+        d.svc_bus[kk] = to_solver(svcs.get_bus_id()(k).cast_int());
+        d.svc_b0_pu[kk] = static_cast<double>(svcs.get_b0_pu(k));
+        if (svcs.get_regulation_mode(k) == ls2g::SvcContainer::RegulationMode::REACTIVE_POWER)
+            d.svc_q_mvar[kk] = static_cast<double>(svcs.get_target_q()(k));
+        d.svc_voltage[kk] = svcs.get_regulation_mode(k) == ls2g::SvcContainer::RegulationMode::VOLTAGE ? 1 : 0;
+        d.svc_standby[kk] = svcs.get_standby(k) ? 1 : 0;
+        d.svc_frozen[kk] = svcs.get_can_be_pv(k) ? 1 : 0;
+    }
+
+    // HVDC lines
+    const auto& hvdc_lines = grid.get_dclines();
+    d.n_hvdc = static_cast<int>(hvdc_lines.nb());
+    d.hvdc_on.assign(static_cast<size_t>(d.n_hvdc), 0);
+    d.hvdc_droop.assign(static_cast<size_t>(d.n_hvdc), 0);
+    d.hvdc_regulating.assign(static_cast<size_t>(d.n_hvdc), 0);
+    d.hvdc_station_bus.assign(2 * static_cast<size_t>(d.n_hvdc), -1);
+    d.hvdc_station_p_mw.assign(2 * static_cast<size_t>(d.n_hvdc), 0.);
+    d.hvdc_station_q_mvar.assign(2 * static_cast<size_t>(d.n_hvdc), 0.);
+    for (int h = 0; h < d.n_hvdc; ++h) {
+        const size_t hh = static_cast<size_t>(h);
+        if (!hvdc_lines.get_status_global()[hh]) continue;
+        d.hvdc_on[hh] = 1;
+        d.hvdc_droop[hh] = hvdc_lines.is_droop_active(h) ? 1 : 0;
+        for (int side = 1; side <= 2; ++side) {
+            const ls2g::ConverterStationContainer& st = side == 1 ? hvdc_lines.get_stations_side_1()
+                                                                  : hvdc_lines.get_stations_side_2();
+            const size_t k = 2 * hh + static_cast<size_t>(side - 1);
+            const int bus_me = hvdc_lines.get_station_bus(h, side).cast_int();
+            const bool regulates = hvdc_lines.station_is_voltage_controller(h, side);
+            if (regulates) d.hvdc_regulating[hh] = 1;
+            if (!st.get_status()[hh]) continue;
+            d.hvdc_station_bus[k] = to_solver(bus_me);
+            d.hvdc_station_p_mw[k] = static_cast<double>(st.get_target_p(h));
+            if (!st.get_voltage_regulator_on(h)) d.hvdc_station_q_mvar[k] = static_cast<double>(st.get_target_q()(h));
+        }
+    }
     return d;
 }
 
@@ -710,12 +796,50 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
         if (bus_solver < 0 || bus_solver >= n_bus_solver) continue;
         d.storage_slack_weight_bus[static_cast<size_t>(bus_solver)] += static_cast<double>(si.slack_weight);
     }
+
+    // the other local regulators of a bus (BaseBatchSweep::_maybe_prepare_gen_contingency's
+    // storages_of_bus / stations_of_bus), and the storage units of the slack by id
+    const auto bus_of = [&](int bus_me) {
+        int bus_solver = bus_me;
+        if (!me_to_solver.empty())
+            bus_solver = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size())) ? me_to_solver[bus_me] : -1;
+        return (bus_solver >= 0 && bus_solver < n_bus_solver) ? bus_solver : -1;
+    };
+    d.n_storage = storages.nb();
+    d.storage_vreg_bus.assign(static_cast<size_t>(d.n_storage), -1);
+    d.storage_bus.assign(static_cast<size_t>(d.n_storage), -1);
+    d.storage_slack_weight.assign(static_cast<size_t>(d.n_storage), 0.);
+    for (int s = 0; s < d.n_storage; ++s) {
+        const ls2g::StorageInfo si(storages, s);
+        if (!si.connected) continue;
+        const int b = bus_of(si.bus_id);
+        if (storages.is_local_voltage_controller(s)) d.storage_vreg_bus[static_cast<size_t>(s)] = b;
+        if (si.is_slack && std::abs(static_cast<double>(si.slack_weight)) > 1e-12) {
+            d.storage_bus[static_cast<size_t>(s)] = b;
+            d.storage_slack_weight[static_cast<size_t>(s)] = static_cast<double>(si.slack_weight);
+        }
+    }
+    const auto& hvdc_lines = grid.get_dclines();
+    d.n_hvdc = static_cast<int>(hvdc_lines.nb());
+    d.station_vreg_bus.assign(2 * static_cast<size_t>(d.n_hvdc), -1);
+    for (int h = 0; h < d.n_hvdc; ++h) {
+        if (!hvdc_lines.get_status_global()[static_cast<size_t>(h)]) continue;
+        for (int side = 1; side <= 2; ++side)
+            // (a station on a bus a group holds is a controller of that group, not of the PV path)
+            if (hvdc_lines.station_is_voltage_controller(h, side) &&
+                group_buses.count(hvdc_lines.get_station_bus(h, side).cast_int()) == 0)
+                d.station_vreg_bus[static_cast<size_t>(2 * h + side - 1)] = bus_of(hvdc_lines.get_station_bus(h, side).cast_int());
+    }
     return d;
 }
 
 LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, double tol)
 {
     LedgerData ld;
+    {
+        const std::set<int> free_vm = grid.get_free_vm_slack_solver_buses();
+        ld.vc_free_vm_slack_buses.assign(free_vm.begin(), free_vm.end());
+    }
 
     // Augmented J sparsity skeleton in RowMajor CSR (structure only). get_J_solver
     // hands back lightsim2grid's compressed ColMajor J; its index arrays are
@@ -1769,12 +1893,16 @@ make_ss_outer_session_from_lsgrid(
     PivotEpsilonAlg pivot_epsilon_alg,
     int ir_n_steps,
     bool   keep_trace,
-    bool   resume_from_n)
+    bool   resume_from_n,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
-    // the step scaling of the grid's own (inner) Newton
-    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
+    // the step scaling of the inner Newton: the grid's own unless the caller forces it
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     // the base state trusts V0 as it is (no residual check: the grid's own state was
     // solved with its loops' controls, which the base state does not carry)
     auto session = std::make_shared<ScenarioSweepSession>(
@@ -1818,12 +1946,16 @@ make_ca_outer_session_from_lsgrid(
     PivotEpsilonAlg pivot_epsilon_alg,
     int ir_n_steps,
     bool   keep_trace,
-    bool   resume_from_n)
+    bool   resume_from_n,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
-    // the step scaling of the grid's own (inner) Newton
-    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
+    // the step scaling of the inner Newton: the grid's own unless the caller forces it
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<ContingencyAnalysisSession>(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),
@@ -1863,12 +1995,16 @@ make_is_outer_session_from_lsgrid(
     PivotEpsilonAlg pivot_epsilon_alg,
     int ir_n_steps,
     bool   keep_trace,
-    bool   resume_from_n)
+    bool   resume_from_n,
+    int    scaling_max_voltage_change_override,
+    double max_dVa_override,
+    double max_dVm_override)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
-    // the step scaling of the grid's own (inner) Newton
-    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(grid, -1, -1.0, -1.0);
+    // the step scaling of the inner Newton: the grid's own unless the caller forces it
+    const auto [scaling, max_dVa, max_dVm] = resolve_scaling_policy(
+        grid, scaling_max_voltage_change_override, max_dVa_override, max_dVm_override);
     auto session = std::make_shared<InjectionSweepSession>(
         in.Ybus, in.V0, in.Sbus, in.slack, in.slack_weights, in.pv, in.pq,
         batch_size, nb_iter, /*max_iter_base=*/1, /*tol_base=*/std::numeric_limits<double>::infinity(),

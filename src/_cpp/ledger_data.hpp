@@ -22,6 +22,10 @@
 
 #include <vector>
 
+// A line in AC emulation a batch row trips: no flow, no slope. Next to its regimes
+// (0 linear, 1 / -1 saturated either way) in the per-slot status arrays.
+constexpr int HVDC_STATUS_TRIPPED = 2;
+
 struct LedgerData {
     int n_bus = 0;
     int dim_J = 0;   // augmented Jacobian dimension (== NRLedger size)
@@ -134,6 +138,11 @@ struct LedgerData {
     // Q-balance equation per bus.
     std::vector<int>    vc_q_col;                        // per controller
     std::vector<int>    vc_reg_bus, vc_grp_start, vc_grp_count;  // per group
+    // a batch row may trip controllers: the sharing rows carry an entry on every controller of
+    // their group, filled by value (reserve_tripped_controller_slots)
+    bool                vc_may_trip = false;
+    // the slack buses nothing pins locally: a group regulating one cannot lose all its controllers
+    std::vector<int>    vc_free_vm_slack_buses;
     std::vector<double> vc_v_set;                        // per group
     // Explicit custom-row indices (per group: the voltage row, then its
     // count-1 sharing rows). EMPTY means "reconstruct as the last

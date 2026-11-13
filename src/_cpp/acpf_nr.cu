@@ -924,6 +924,8 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_id,     hid.data(),    n_hvdc, cs);
+        h_hvdc_id = hid;
+        h_hvdc_status = status;
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
@@ -1078,7 +1080,7 @@ AcPfNrState::AcPfNrState(
 
         // the outer loops' may_hold_ formulation: every position it writes per slot
         // (see vc_hold_fill_J_kernel), read off lightsim2grid's union pattern
-        vc_may_hold = ledger->outer_loops;
+        vc_may_hold = ledger->outer_loops || ledger->vc_may_trip;
         if (vc_may_hold) {
             std::vector<cuda_real_type> w(n_vc_ctrl);
             std::vector<int> sh_row_c(n_vc_ctrl, -1);

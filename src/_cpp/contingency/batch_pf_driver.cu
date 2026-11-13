@@ -1465,6 +1465,17 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
     if (base.has_vc_held)
         buf.d_vc_qoff = thrust::raw_pointer_cast(base.d_vc_qoff.data());
 
+    // a batch whose rows trip controllers of a group: the holding formulation's positions,
+    // its per-slot state being the source's (SlotVcHold)
+    if (outer_hook_ == nullptr && base.n_vc_ctrl > 0 && base.vc_may_hold) {
+        buf.d_vc_weight      = thrust::raw_pointer_cast(base.d_vc_weight.data());
+        buf.d_vch_slope_pos  = thrust::raw_pointer_cast(base.d_vch_slope_pos.data());
+        buf.d_vch_vm_pos     = thrust::raw_pointer_cast(base.d_vch_vm_pos.data());
+        buf.d_vch_sh_row     = thrust::raw_pointer_cast(base.d_vch_sh_row.data());
+        buf.d_vch_rowpos_off = thrust::raw_pointer_cast(base.d_vch_rowpos_off.data());
+        buf.d_vch_rowpos     = thrust::raw_pointer_cast(base.d_vch_rowpos.data());
+    }
+
     // The outer loops: every slot's own control state (see _oc_setup).
     if (outer_hook_ != nullptr && oc_stride_ > 0) {   // _oc_setup ran
         const outer::Layout& Lo = outer_hook_->layout();
@@ -2644,7 +2655,9 @@ void BatchPfDriver<BatchSource>::_oa_load(const SlotLoadView& L)
 // A leaving row gets its residual, its NaN mask, its checks, its V and its
 // flows written at its original row (_evict through the eviction map), and
 // its slot is reloaded at once: with the next queued row, else with the base
-// case (required: the slot holds the old row's NaN mask / divergent state).
+// case (required: the slot holds the old row's NaN mask / divergent state) --
+// unless the tail is about to overwrite it with a moved row or drop it from
+// the rounds, in which case the slot is never read again as it stands.
 // Rows are loaded in active order into the freed slots in increasing slot
 // order, so a row's trajectory depends on that row alone. A loaded row always
 // runs at least k iterations (it is first checked after its first round).
@@ -2685,14 +2698,21 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     int       n_cur   = S;
     bool      in_tail = false;
     TailSolve tail;
+    std::chrono::steady_clock::time_point t_tail_start;   // its first compaction
     spmv_live_ = nullptr;
     // Once the queue is empty: shrink the rounds to the groups the live rows
     // fit in, when there are few enough of them and that is fewer slots.
-    auto enter_tail = [&](int n_live) {
-        if (!tail_ok || q < n_active_ || n_live <= 0) return;
+    // (the groups to shrink to, 0 = no shrink)
+    auto tail_groups = [&](int n_live) {
+        if (!tail_ok || q < n_active_ || n_live <= 0) return 0;
         const int groups = (n_live + G - 1) / G;
-        if (groups > tail_max_groups_ || groups * G >= n_cur) return;
+        return (groups > tail_max_groups_ || groups * G >= n_cur) ? 0 : groups;
+    };
+    auto enter_tail = [&](int n_live) {
+        const int groups = tail_groups(n_live);
+        if (groups == 0) return;
         const auto t_c0 = std::chrono::steady_clock::now();
+        if (!in_tail) t_tail_start = t_c0;
         _compact_tail(groups * G, n_cur, iters, t);
         n_cur = groups * G;
         if (!spmv_tail_) spmv_tail_ = std::make_unique<CuSpMV>();
@@ -2711,11 +2731,57 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         const auto t_l0 = std::chrono::steady_clock::now();
         _oc_setup();
         if (keep_outer_adjoint_) _oa_alloc();
+        hook->set_keep_adjoint(keep_outer_adjoint_);
         hook->begin(S, n_contingencies);
         t.t_oc_load += TimingEntry{0., ms_since(t_l0)};
     }
 
+    // One record per round, from the differences of the cumulative timers.
+    t.round_records.clear();
+    auto cumulative = [&]() {
+        RoundRecord c;
+        const TimingEntry nr = t.t_spmv + t.t_fill_F + t.t_fill_J + t.t_first_factorize
+                               + t.t_refactorize + t.t_solve + t.t_update_V;
+        c.t_newton_wall_ms = nr.wall_ms;
+        c.t_newton_gpu_ms  = nr.gpu_ms;
+        c.t_residual_ms    = t.t_residual.wall_ms;
+        c.t_res_sync_ms    = t.t_sched_res_sync.wall_ms;
+        c.t_gather_ms      = t.t_oc_gather.wall_ms;
+        c.t_decide_ms      = t.t_oc_decide.wall_ms;
+        c.t_load_ms        = t.t_oc_load.wall_ms;
+        c.t_controls_ms    = t.t_oc_controls.wall_ms;
+        c.t_compact_ms     = t.t_tail_compact.wall_ms;
+        c.n_moves          = t.n_slot_moves;
+        c.n_load_base      = static_cast<int>(t.n_base_loads);
+        return c;
+    };
+    RoundRecord rec_prev = cumulative();
+    auto t_round0 = std::chrono::steady_clock::now();
+    int rec_n_cur = 0, rec_n_live = 0;
+    auto push_round = [&](int n_leave, int n_resolve, int n_load_real) {
+        const RoundRecord now = cumulative();
+        RoundRecord r;
+        r.n_cur = rec_n_cur;  r.n_live = rec_n_live;  r.n_leave = n_leave;
+        r.n_resolve = n_resolve;  r.n_load_real = n_load_real;
+        r.n_load_base = now.n_load_base - rec_prev.n_load_base;
+        r.n_moves = now.n_moves - rec_prev.n_moves;
+        r.t_round_ms = ms_since(t_round0);
+        r.t_newton_wall_ms = now.t_newton_wall_ms - rec_prev.t_newton_wall_ms;
+        r.t_newton_gpu_ms = now.t_newton_gpu_ms - rec_prev.t_newton_gpu_ms;
+        r.t_residual_ms = now.t_residual_ms - rec_prev.t_residual_ms;
+        r.t_res_sync_ms = now.t_res_sync_ms - rec_prev.t_res_sync_ms;
+        r.t_gather_ms = now.t_gather_ms - rec_prev.t_gather_ms;
+        r.t_decide_ms = now.t_decide_ms - rec_prev.t_decide_ms;
+        r.t_load_ms = now.t_load_ms - rec_prev.t_load_ms;
+        r.t_controls_ms = now.t_controls_ms - rec_prev.t_controls_ms;
+        r.t_compact_ms = now.t_compact_ms - rec_prev.t_compact_ms;
+        t.round_records.push_back(r);
+        rec_prev = now;
+        t_round0 = std::chrono::steady_clock::now();
+    };
+
     // Initial load: every slot (the queue's first rows, phantoms past its end).
+    const auto t_rounds_start = std::chrono::steady_clock::now();
     _wait_sched_upload();
     int n_live = 0;
     for (int s = 0; s < S; ++s) {
@@ -2749,6 +2815,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     std::vector<RowStatus> leave_st(static_cast<size_t>(S));
     std::vector<double> gbuf;
     while (n_live > 0) {
+        rec_n_cur  = n_cur;
+        rec_n_live = n_live;
         std::visit([&](auto& policy) {
             run_nr_loop(
                 policy, linear_solver_, _spmv(), buf,
@@ -2759,6 +2827,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         ++rounds;
         run += n_cur;
         if (in_tail) ++t.n_tail_rounds;
+        (in_tail ? t.n_tail_row_rounds : t.n_main_row_rounds) += n_live;
 
         // Per-slot residual at the current V, slot order.
         _residual_pass(buf, n_cur, thrust::raw_pointer_cast(d_slot_res_.data()), /*c_start=*/0,
@@ -2854,15 +2923,42 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             for (int s = 0; s < S; ++s) {
                 if (h_evict()[s] < 0) continue;
                 const int row = q < n_active_ ? q++ : -1;
+                h_slot_row()[s] = row;
+                iters[static_cast<size_t>(s)] = 0;
+                if (row < 0) continue;
                 h_load_slot()[n_load] = s;
                 h_load_row()[n_load]  = row;
                 ++n_load;
-                h_slot_row()[s] = row;
-                iters[static_cast<size_t>(s)] = 0;
-                if (row >= 0) ++n_load_real;
+                ++n_load_real;
                 loaded.push_back(s);
             }
             n_live += n_load_real - n_leave;
+            // The freed slots the queue did not fill. enter_tail, right after the load,
+            // moves the rows of [n_keep, n_cur) into the lowest empty slots below n_keep
+            // and stops running the others: only an empty slot it leaves below n_keep
+            // is iterated as it stands and needs the base case.
+            if (n_live > 0) {
+                const int groups = tail_groups(n_live);
+                const int n_keep = groups > 0 ? groups * G : n_cur;
+                int n_moved_in = 0;
+                for (int s = n_keep; s < n_cur; ++s) n_moved_in += h_slot_row()[s] >= 0;
+                for (int s = 0; s < n_cur; ++s) {
+                    if (h_slot_row()[s] >= 0) continue;
+                    const bool freed = h_evict()[s] >= 0;
+                    if (s < n_keep && n_moved_in > 0) {
+                        --n_moved_in;
+                        t.n_base_loads_skipped += freed;
+                    } else if (s >= n_keep) {
+                        t.n_base_loads_skipped += freed;
+                    } else if (freed) {
+                        h_load_slot()[n_load] = s;
+                        h_load_row()[n_load]  = -1;
+                        ++n_load;
+                        ++t.n_base_loads;
+                        loaded.push_back(s);
+                    }
+                }
+            }
             _upload_sched();
         }
         t.t_schedule += TimingEntry{0., std::chrono::duration<double, std::milli>(
@@ -2873,7 +2969,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_c0).count()};
         }
-        if (n_leave == 0) continue;
+        if (n_leave == 0) {
+            push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
+            continue;
+        }
 
         // ---- eviction of the leaving slots -------------------------------
         // Their residuals into d_residuals at their original rows (d_F is
@@ -2901,9 +3000,12 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 d_evict(), base.nnz_Y, n_cur);
 
         // ---- refill the freed slots ---------------------------------------
-        if (n_live == 0) break;   // everything left; no round follows
-        _load(_load_view(n_load, -1, n_load_real), timer, t);
-        if (hook != nullptr) {
+        if (n_live == 0) {        // everything left; no round follows
+            push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
+            break;
+        }
+        if (n_load > 0) _load(_load_view(n_load, -1, n_load_real), timer, t);
+        if (hook != nullptr && n_load > 0) {
             const auto t_l0 = std::chrono::steady_clock::now();
             for (int s : loaded) {
                 const int a = h_slot_row()[s];
@@ -2917,6 +3019,13 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         }
         enter_tail(n_live);
         buf = _bound_nr_buffers(_table_view(-1));
+        push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
+    }
+    {
+        const auto t_rounds_end = std::chrono::steady_clock::now();
+        const auto span_ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+        t.t_main_phase_wall_ms = span_ms(t_rounds_start, in_tail ? t_tail_start : t_rounds_end);
+        t.t_tail_phase_wall_ms = in_tail ? span_ms(t_tail_start, t_rounds_end) : 0.;
     }
     spmv_live_ = nullptr;
 

@@ -167,6 +167,26 @@ void reserve_stranded_controller_slots(LedgerData& ld)
     }
 }
 
+void reserve_tripped_controller_slots(LedgerData& ld)
+{
+    if (!ld.has_voltage_control()) return;
+    reserve_stranded_controller_slots(ld);
+    const int ng = ld.vc_n_groups();
+    for (int g = 0; g < ng; ++g) {
+        const int first = ld.vc_grp_start[static_cast<size_t>(g)];
+        const int cnt   = ld.vc_grp_count[static_cast<size_t>(g)];
+        const std::vector<int>& share = ld.vc_share_rows[static_cast<size_t>(g)];
+        for (int row : share) {
+            if (row < 0) continue;
+            for (int o = 0; o < cnt; ++o) {
+                const int q_col = ld.vc_q_col[static_cast<size_t>(first + o)];
+                if (q_col >= 0) csr_insert_sorted(ld.J_outer, ld.J_inner, row, q_col);
+            }
+        }
+    }
+    ld.vc_may_trip = true;
+}
+
 void add_switchable_vm_buses(
     LedgerData&                                                     ld,
     const std::vector<int>&                                         buses,

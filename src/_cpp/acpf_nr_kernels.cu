@@ -667,6 +667,12 @@ __global__ void fill_J_kernel(
 //                              bit-pattern comparison in atomic_max_nonneg is
 //                              safe).
 //   apply_step_scale_kernel  : rescales dx in place from those two maxima.
+// Both run ONE BLOCK PER SLOT (grid = actual_batch blocks of BS threads), the
+// threads of a block sharing the slot's entries cyclically: a Newton step is
+// almost never scaled, and one thread per entry cost a CAS per entry and a
+// rewrite of every dx (~40 ms of a 2.3 s run on a 7k-bus grid). Each thread
+// keeps its own maxima and publishes them once; apply leaves at once when the
+// slot's alpha is 1.
 // =============================================================================
 __global__ void reduce_step_norms_kernel(
     const cuda_real_type* __restrict__ d_dx,
@@ -677,19 +683,22 @@ __global__ void reduce_step_norms_kernel(
     cuda_real_type* __restrict__ d_max_dtheta,   // [actual_batch], zeroed before launch
     cuda_real_type* __restrict__ d_max_dvm)      // [actual_batch], zeroed before launch
 {
-    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
-    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int total = n_theta + n_vm;
-    const ptrdiff_t b = tid / total;
+    const ptrdiff_t b = blockIdx.x;  // widened; see fill_J_kernel's own note
     if (b >= actual_batch) return;
-    const int k = static_cast<int>(tid % total);
-    if (k < n_theta) {
-        const cuda_real_type v = d_dx[b * dim_J + theta_cols[k]];
-        atomic_max_nonneg(&d_max_dtheta[b], v < 0 ? -v : v);
-    } else {
-        const cuda_real_type v = d_dx[b * dim_J + vm_cols[k - n_theta]];
-        atomic_max_nonneg(&d_max_dvm[b], v < 0 ? -v : v);
+    const cuda_real_type* dx = d_dx + b * dim_J;
+    cuda_real_type max_dtheta = 0, max_dvm = 0;
+    for (int k = threadIdx.x; k < n_theta; k += blockDim.x) {
+        const cuda_real_type v = dx[theta_cols[k]];
+        const cuda_real_type a = v < 0 ? -v : v;
+        if (!(max_dtheta >= a)) max_dtheta = a;  // atomic_max_nonneg's own test
     }
+    for (int k = threadIdx.x; k < n_vm; k += blockDim.x) {
+        const cuda_real_type v = dx[vm_cols[k]];
+        const cuda_real_type a = v < 0 ? -v : v;
+        if (!(max_dvm >= a)) max_dvm = a;
+    }
+    atomic_max_nonneg(&d_max_dtheta[b], max_dtheta);
+    atomic_max_nonneg(&d_max_dvm[b], max_dvm);
 }
 
 __global__ void apply_step_scale_kernel(
@@ -699,19 +708,18 @@ __global__ void apply_step_scale_kernel(
     cuda_real_type max_dVa, cuda_real_type max_dVm,
     int dim_J, int actual_batch)
 {
-    // tid/b widened to ptrdiff_t; see fill_J_kernel's own note.
-    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const ptrdiff_t b   = tid / dim_J;
+    const ptrdiff_t b = blockIdx.x;  // widened; see fill_J_kernel's own note
     if (b >= actual_batch) return;
-    const int j = static_cast<int>(tid % dim_J);
 
     cuda_real_type alpha = static_cast<cuda_real_type>(1.);
     const cuda_real_type mdt = d_max_dtheta[b];
     if (mdt > max_dVa) alpha = alpha < (max_dVa / mdt) ? alpha : (max_dVa / mdt);
     const cuda_real_type mdv = d_max_dvm[b];
     if (mdv > max_dVm) alpha = alpha < (max_dVm / mdv) ? alpha : (max_dVm / mdv);
+    if (alpha == static_cast<cuda_real_type>(1.)) return;  // the usual case
 
-    d_dx[b * dim_J + j] *= alpha;
+    cuda_real_type* dx = d_dx + b * dim_J;
+    for (int j = threadIdx.x; j < dim_J; j += blockDim.x) dx[j] *= alpha;
 }
 
 // =============================================================================

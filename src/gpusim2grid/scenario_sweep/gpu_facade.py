@@ -281,7 +281,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
                     ir_n_steps=_ir_n_steps,
                     keep_trace=bool(keep_outer_trace),
-                    resume_from_n=bool(init_from_n_powerflow))
+                    resume_from_n=bool(init_from_n_powerflow),
+                    # None => the grid's own step scaling, as without the outer loops
+                    scaling_max_voltage_change_override=(
+                        -1 if scaling_max_voltage_change is None
+                        else int(bool(scaling_max_voltage_change))),
+                    max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
                 self._inner = _ScenarioSweepSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
@@ -493,6 +499,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p,
                                             gen_off=gen_off, load_off=load_off)
+        if self._inner._s.has_more_trips:
+            # what the rows' static generators, storage units, SVCs and hvdc stations stamped
+            dp, dq = self._inner._s.more_trips_injection_delta()
+            if dp.shape[0] == p_mw.shape[0]:   # (else the C++ session refuses it at compute())
+                p_mw = p_mw + dp
+                q_mvar = q_mvar + dq
         if self._q_delta is not None:
             # ContingencyAnalysisGPU's reactive_limits_outer_loop second pass:
             # (row, bus, MVAr) changes of the switched / released machines
@@ -736,6 +748,49 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         if self._pending_elements is not None:
             self._assemble_injections()
 
+    def _set_more_trip(self, name, mask):
+        if self._elements is None:
+            raise RuntimeError(f"{name}() needs a lightsim2grid grid; explicit-array (tuple) mode has no such element.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(f"'mask' must be 2-D (n_scenarios, n_element), got shape {mask.shape}.")
+        getattr(self._inner._s, name)(np.ascontiguousarray(mask, dtype=bool))
+        if self._pending_elements is not None:
+            self._assemble_injections()
+
+    def set_contingency_sgens(self, mask):
+        """Per-row static generator mask ``(n_scenarios, n_sgen)``, ``True`` = disconnected:
+        its power leaves the row's injection (lightsim2grid's ``set_contingency_sgens``).
+        Whichever of it and :meth:`set_injections_from_elements` comes first; with per-bus
+        :meth:`set_injections`, take it out of the arrays yourself."""
+        self._set_more_trip("set_contingency_sgens", mask)
+
+    def set_contingency_storages(self, mask):
+        """Per-row storage unit mask ``(n_scenarios, n_storage)``: the unit leaves the row's
+        injection and distributed slack; the last controller of a bus turns it PQ. A unit on
+        a bus a control group holds is reported BATCH_UNSUPPORTED, see
+        :meth:`get_batch_unsupported_reasons`."""
+        self._set_more_trip("set_contingency_storages", mask)
+
+    def set_contingency_svcs(self, mask):
+        """Per-row static var compensator mask ``(n_scenarios, n_svc)``: its fixed reactive
+        injection and its b0 leave the row. One in voltage mode leaves its control group, one
+        with a standby automaton its automaton's check and the VoltageMonitoring loop
+        (lightsim2grid leaves that row out). One frozen at a reactive limit is reported
+        BATCH_UNSUPPORTED."""
+        self._set_more_trip("set_contingency_svcs", mask)
+
+    def set_contingency_hvdcs(self, mask):
+        """Per-row HVDC line mask ``(n_scenarios, n_hvdc)``: both converter stations leave the
+        row; the bus a regulating one was the last to hold turns PQ. A line in AC emulation or
+        with a station in a control group is reported BATCH_UNSUPPORTED."""
+        self._set_more_trip("set_contingency_hvdcs", mask)
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per row: why the batch left it out (``""``: it did not), after
+        :meth:`compute`. Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return self._inner.get_batch_unsupported_reasons()
+
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.
 
@@ -747,6 +802,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                 "set_contingency_loads() takes the loads out of the injections given by "
                 "set_injections_from_elements(); with per-bus set_injections(), take them "
                 "out of the arrays yourself (and do not call set_contingency_loads).")
+        if self._inner._s.has_more_trips and self._pending_elements is None:
+            raise RuntimeError(
+                "set_contingency_sgens / _storages / _svcs / _hvdcs take the elements out of the injections "
+                "given by set_injections_from_elements(); with per-bus set_injections(), take them out of "
+                "the arrays yourself (and do not call them).")
         self._inner.batch_size = int(batch_size)
         if self._skip_rows_stale:
             self._update_skipped_rows()

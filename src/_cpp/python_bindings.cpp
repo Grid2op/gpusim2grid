@@ -294,7 +294,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                                Eigen::Ref<const RealVect> max_p_mw,
                                Eigen::Ref<const RealVect> target_p_mw,
                                Eigen::Ref<const Eigen::VectorXi> gen_bus_solver,
-                               Eigen::Ref<const RealVect> gen_target_p_mw,
+                               Eigen::Ref<const RealVect> gens_target_p_mw,
                                int n_sto,
                                Eigen::Ref<const RealVect> shunt_p_mw,
                                double sn_mva,
@@ -307,7 +307,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
                  d.weight = weight; d.min_p_mw = min_p_mw; d.max_p_mw = max_p_mw;
                  d.target_p_mw = target_p_mw;
                  d.n_gen = static_cast<int>(gen_bus_solver.size());
-                 d.gen_bus_solver = gen_bus_solver; d.gen_target_p_mw = gen_target_p_mw;
+                 d.gen_bus_solver = gen_bus_solver; d.gens_target_p_mw = gens_target_p_mw;
                  d.n_sto = n_sto; d.shunt_p_mw = shunt_p_mw; d.sn_mva = sn_mva;
                  d.in_slack = in_slack;
                  d.base_p_mw = base_p_mw;
@@ -317,7 +317,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
              pybind11::arg("kind"), pybind11::arg("el_id"), pybind11::arg("bus_solver"),
              pybind11::arg("weight"), pybind11::arg("min_p_mw"), pybind11::arg("max_p_mw"),
              pybind11::arg("target_p_mw"), pybind11::arg("gen_bus_solver"),
-             pybind11::arg("gen_target_p_mw"), pybind11::arg("n_sto"),
+             pybind11::arg("gens_target_p_mw"), pybind11::arg("n_sto"),
              pybind11::arg("shunt_p_mw"), pybind11::arg("sn_mva"),
              pybind11::arg("in_slack") = Eigen::VectorXi(),
              pybind11::arg("base_p_mw") = std::numeric_limits<double>::quiet_NaN(),
@@ -334,7 +334,7 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("in_slack",        &SlackRedistributionData::in_slack)
         .def_readonly("n_gen",           &SlackRedistributionData::n_gen)
         .def_readonly("gen_bus_solver",  &SlackRedistributionData::gen_bus_solver)
-        .def_readonly("gen_target_p_mw", &SlackRedistributionData::gen_target_p_mw)
+        .def_readonly("gens_target_p_mw", &SlackRedistributionData::gens_target_p_mw)
         .def_readonly("n_sto",           &SlackRedistributionData::n_sto)
         .def_readonly("shunt_p_mw",      &SlackRedistributionData::shunt_p_mw)
         .def_readonly("sn_mva",          &SlackRedistributionData::sn_mva)
@@ -867,7 +867,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_solve",       &BatchTimings::t_solve,
                       "cuDSS SOLVE — total across all chunks × nb_iter")
         .def_readonly("t_update_V",    &BatchTimings::t_update_V,
-                      "update_Va_kernel + update_Vm_kernel — total across all chunks × nb_iter")
+                      "step scaling + update_Va_kernel + update_Vm_kernel — total across all chunks × nb_iter")
         .def_readonly("t_residual",    &BatchTimings::t_residual,
                       "Post-loop SpMV + fill_F + compute_residuals_kernel — total across all chunks")
         .def_readonly("t_store_V",     &BatchTimings::t_store_V,
@@ -912,6 +912,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall clock of the batch driver's whole solve() (ms); not in any total")
         .def_readonly("t_session_run_wall_ms", &BatchTimings::t_session_run_wall_ms,
                       "Wall clock of the session's whole run() (ms), solve() included; not in any total")
+        .def_readonly("t_main_phase_wall_ms", &BatchTimings::t_main_phase_wall_ms,
+                      "Continuous scheduling: wall clock (ms) of the rounds on all the slots, from the "
+                      "initial load to the tail's first compaction; not in any total")
+        .def_readonly("t_tail_phase_wall_ms", &BatchTimings::t_tail_phase_wall_ms,
+                      "Continuous scheduling: wall clock (ms) of the tail, from its first compaction to "
+                      "the end of the rounds (0 without a tail); not in any total")
         .def_readonly("scheduling", &BatchTimings::scheduling,
                       "BatchScheduling of the run: 0 = chunked, 1 = continuous")
         .def_readonly("nb_iter_per_round", &BatchTimings::nb_iter_per_round,
@@ -924,6 +930,46 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("n_tail_rounds", &BatchTimings::n_tail_rounds,
                       "Continuous scheduling: rounds run on the compacted live rows with the "
                       "small cuDSS handle (tail_max_groups)")
+        .def_readonly("n_main_row_rounds", &BatchTimings::n_main_row_rounds,
+                      "Continuous scheduling: live rows summed over the rounds before the tail")
+        .def_property_readonly("round_records", [](const BatchTimings& t) {
+            auto col = [&](auto m) {
+                pybind11::list l;
+                for (const RoundRecord& r : t.round_records) l.append(r.*m);
+                return l;
+            };
+            pybind11::dict d;
+            d["n_cur"] = col(&RoundRecord::n_cur);
+            d["n_live"] = col(&RoundRecord::n_live);
+            d["n_leave"] = col(&RoundRecord::n_leave);
+            d["n_resolve"] = col(&RoundRecord::n_resolve);
+            d["n_load_real"] = col(&RoundRecord::n_load_real);
+            d["n_load_base"] = col(&RoundRecord::n_load_base);
+            d["n_moves"] = col(&RoundRecord::n_moves);
+            d["t_round_ms"] = col(&RoundRecord::t_round_ms);
+            d["t_newton_wall_ms"] = col(&RoundRecord::t_newton_wall_ms);
+            d["t_newton_gpu_ms"] = col(&RoundRecord::t_newton_gpu_ms);
+            d["t_residual_ms"] = col(&RoundRecord::t_residual_ms);
+            d["t_res_sync_ms"] = col(&RoundRecord::t_res_sync_ms);
+            d["t_gather_ms"] = col(&RoundRecord::t_gather_ms);
+            d["t_decide_ms"] = col(&RoundRecord::t_decide_ms);
+            d["t_load_ms"] = col(&RoundRecord::t_load_ms);
+            d["t_controls_ms"] = col(&RoundRecord::t_controls_ms);
+            d["t_compact_ms"] = col(&RoundRecord::t_compact_ms);
+            return d;
+        }, "continuous: one list per field, one entry per round (the first includes the initial load)")
+        .def_readonly("t_sess_ref_ms", &BatchTimings::t_sess_ref_ms)
+        .def_readonly("t_sess_source_ms", &BatchTimings::t_sess_source_ms)
+        .def_readonly("t_sess_prepass_ms", &BatchTimings::t_sess_prepass_ms)
+        .def_readonly("t_sess_driver_ctor_ms", &BatchTimings::t_sess_driver_ctor_ms)
+        .def_readonly("t_sess_overrides_ms", &BatchTimings::t_sess_overrides_ms)
+        .def_readonly("t_sess_after_ms", &BatchTimings::t_sess_after_ms)
+        .def_readonly("n_base_loads", &BatchTimings::n_base_loads,
+                      "continuous: base-case loads of freed slots once the queue is empty")
+        .def_readonly("n_base_loads_skipped", &BatchTimings::n_base_loads_skipped,
+                      "continuous: base-case loads the tail made unnecessary (slot overwritten or out of the rounds)")
+        .def_readonly("n_tail_row_rounds", &BatchTimings::n_tail_row_rounds,
+                      "Continuous scheduling: live rows summed over the rounds of the tail")
         .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,
                       "Continuous scheduling: rows moved to another slot by the tail compaction")
         // --- metadata ---
@@ -1114,6 +1160,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
             py::dict wall;
             wall["driver_solve_ms"] = t.t_driver_solve_wall_ms;
             wall["session_run_ms"]  = t.t_session_run_wall_ms;
+            wall["session_ref_ms"] = t.t_sess_ref_ms;
+            wall["session_source_ms"] = t.t_sess_source_ms;
+            wall["session_prepass_ms"] = t.t_sess_prepass_ms;
+            wall["session_driver_ctor_ms"] = t.t_sess_driver_ctor_ms;
+            wall["session_overrides_ms"] = t.t_sess_overrides_ms;
+            wall["session_after_ms"] = t.t_sess_after_ms;
+            wall["main_phase_ms"]   = t.t_main_phase_wall_ms;
+            wall["tail_phase_ms"]   = t.t_tail_phase_wall_ms;
             result["wall"]         = wall;
             return result;
         }, "Nested dict view of the coarse timing buckets: "
@@ -1475,11 +1529,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .def_readonly("nb_outer_iterations", &outer::RowResult::nb_outer_iterations)
       .def_readonly("nb_nr_iterations", &outer::RowResult::nb_nr_iterations,
                     "Newton iterations summed over every inner solve, at least 1 per solve")
-      .def_property_readonly("gen_target_p", [](const outer::RowResult& r) {
-            std::vector<std::pair<int, double>> out;
-            for (size_t k = 0; k < r.gen_ids.size(); ++k) out.emplace_back(r.gen_ids[k], r.gen_target_p_mw[k]);
-            return out;
-        }, "(generator id, MW): the target a loop (DistributedSlack) moved it to")
+      .def_property_readonly("gen_target_p", [](const outer::RowResult& r) { return r.gen_targets(); }, "(generator id, MW): the target a loop (DistributedSlack) moved it to")
       .def_property_readonly("storage_target_p", [](const outer::RowResult& r) {
             std::vector<std::pair<int, double>> out;
             for (size_t k = 0; k < r.storage_ids.size(); ++k) out.emplace_back(r.storage_ids[k], r.storage_target_p_mw[k]);
@@ -1508,7 +1558,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .def_readonly("decisions", &outer::RowResult::decisions,
                     "the decision trace, when the session keeps it (keep_trace)")
       .def_readonly("pq_buses", &outer::RowResult::pq_buses,
-                    "the adjoint of the last inner solve: the switchable solver buses PQ in it")
+                    "the adjoint of the last inner solve (only with gradients, keep_final_jacobian; empty otherwise): the switchable solver buses PQ in it")
       .def_readonly("vset_lost_groups", &outer::RowResult::vset_lost_groups,
                     "... the VoltageControl groups whose voltage row lost its set-point")
       .def_readonly("gen_p_fixed", &outer::RowResult::gen_p_fixed,
@@ -1728,6 +1778,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("load_ids_per_ctg"), pybind11::arg("gen_ids_per_ctg"),
          pybind11::arg("branch_ids_side1_per_ctg") = std::vector<std::vector<int>>(),
          pybind11::arg("branch_ids_side2_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("sgen_ids_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("storage_ids_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("svc_ids_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("hvdc_ids_per_ctg") = std::vector<std::vector<int>>(),
          "Define the contingency set, each contingency tripping branches, shunts, "
          "loads and generators together (aligned lists, one entry per "
          "contingency; lightsim2grid's ContingencyAnalysis.add_contingency). A shunt "
@@ -1768,6 +1822,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         },
         "Per row (original order), the outcome of its outer loops after the last run() "
         "(lightsim2grid's OuterRowResult).")
+    .def("get_batch_unsupported_reasons", &ContingencyAnalysisSession::get_batch_unsupported_reasons,
+         "Per contingency, why the batch left it out (\"\": it did not), after run().")
     .def("get_row_status", &ContingencyAnalysisSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("overwrite_row_outcomes", &ContingencyAnalysisSession::overwrite_row_outcomes,
@@ -2430,6 +2486,23 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "injection side (the load leaving Sbus) is the caller's job "
          "(ScenarioSweepGPU.set_contingency_loads does it in set_injections_from_elements); "
          "this is what the outer loops' view of the row reads.")
+#define G2G_BIND_MORE_TRIP(NAME)                                                                          \
+    .def("set_contingency_" #NAME,                                                                        \
+         [](ScenarioSweepSession& self, pybind11::array_t<bool, pybind11::array::c_style> mask) {         \
+             if (mask.ndim() != 2)                                                                        \
+                 throw std::runtime_error("set_contingency_" #NAME ": the mask must be 2-D");             \
+             ScenarioSweepSession::BoolMat m(static_cast<Eigen::Index>(mask.shape(0)),                    \
+                                             static_cast<Eigen::Index>(mask.shape(1)));                   \
+             auto r = mask.unchecked<2>();                                                                \
+             for (Eigen::Index i = 0; i < m.rows(); ++i)                                                  \
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);                           \
+             self.set_contingency_##NAME(m);                                                              \
+         }, pybind11::arg("mask"), "Per-row mask (n_scenarios, n_element), True = the row disconnects it.")
+    G2G_BIND_MORE_TRIP(sgens)
+    G2G_BIND_MORE_TRIP(storages)
+    G2G_BIND_MORE_TRIP(svcs)
+    G2G_BIND_MORE_TRIP(hvdcs)
+#undef G2G_BIND_MORE_TRIP
     .def_property_readonly("has_element_trip_data", &ScenarioSweepSession::has_element_trip_data)
     .def("set_contingency_gens",
          [](ScenarioSweepSession& self,
@@ -2586,6 +2659,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Copy per-scenario ||F||inf residuals to host: (n_scenarios,) float64.")
     .def("get_row_iterations", &ScenarioSweepSession::get_row_iterations,
          "(n_rows,) int: Newton iterations each row ran in the last run().")
+    .def("get_batch_unsupported_reasons", &ScenarioSweepSession::get_batch_unsupported_reasons,
+         "Per row, why the batch left it out (\"\": it did not), after run().")
+    .def("more_trips_injection_delta", &ScenarioSweepSession::more_trips_injection_delta,
+         "(dp_mw, dq_mvar), each (n_scenarios, n_bus): what the rows' tripped static generators, "
+         "storage units, SVCs and hvdc stations add to their injection.")
+    .def_property_readonly("has_more_trips", &ScenarioSweepSession::has_more_trips)
     .def("get_row_status", &ScenarioSweepSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,
@@ -3505,11 +3584,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.def("_make_ca_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
-           bool keep_trace, bool resume_from_n) {
+           bool keep_trace, bool resume_from_n,
+           int scaling_override, double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ca_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
-                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
+                scaling_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3522,16 +3603,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "A ContingencyAnalysisSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_is_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
-           bool keep_trace, bool resume_from_n) {
+           bool keep_trace, bool resume_from_n,
+           int scaling_override, double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_is_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
-                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
+                scaling_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3544,17 +3630,22 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "An InjectionSweepSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_ss_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device,
            bool compute_limit_violations, ReorderingAlg reordering_alg,
            MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool keep_trace,
-           bool resume_from_n) {
+           bool resume_from_n,
+           int scaling_override, double max_dVa_override, double max_dVm_override) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             return make_ss_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, compute_limit_violations,
-                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n);
+                reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
+                scaling_override, max_dVa_override, max_dVm_override);
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3567,6 +3658,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("ir_n_steps") = 0,
         pybind11::arg("keep_trace") = false,
         pybind11::arg("resume_from_n") = false,
+        pybind11::arg("scaling_max_voltage_change_override") = -1,
+        pybind11::arg("max_dVa_override") = -1.0,
+        pybind11::arg("max_dVm_override") = -1.0,
         "A ScenarioSweepSession running the grid's outer loops (its algorithm an "
         "NROuter_* one, solved): continuous scheduling; each row starts from the grid's "
         "voltages, its generators' buses at their set-points, and default controls. "

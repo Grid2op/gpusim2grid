@@ -724,6 +724,8 @@ void compute_component_masks(
             }
             for (const auto& pc : ctg.vc_pinned_ctrl)
                 if (pc.first >= 0 && pc.first < n_ctrl) pinned_ctrl[static_cast<size_t>(pc.first)] = 1;
+            for (int j : ctg.vc_tripped)
+                if (j >= 0 && j < n_ctrl) pinned_ctrl[static_cast<size_t>(j)] = 1;
             for (int j = 0; j < n_ctrl; ++j) {
                 if (pinned_ctrl[static_cast<size_t>(j)]) continue;
                 const int grp = cfg.vc_group[static_cast<size_t>(j)];

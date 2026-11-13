@@ -92,10 +92,29 @@ def test_contingency_analysis(case118, solver_atol):
     _same_rows(runs, ref, solver_atol)
     t_off = timings[(0, 15)]
     assert t_off.n_tail_rounds == 0 and t_off.n_slot_moves == 0
+    assert t_off.t_main_phase_wall_ms > 0. and t_off.t_tail_phase_wall_ms == 0.
+    assert t_off.n_main_row_rounds > 0 and t_off.n_tail_row_rounds == 0
+    assert t_off.n_base_loads > 0 and t_off.n_base_loads_skipped == 0
     for key in runs:
         t = timings[key]
         assert t.n_rounds == t_off.n_rounds, key
         assert 0 < t.n_tail_rounds <= t.n_rounds and t.n_slot_moves > 0, key
+        assert t.t_tail_phase_wall_ms > 0., key
+        # the same rows, the same rounds: only where the tail starts differs
+        assert t.n_tail_row_rounds > 0, key
+        assert t.n_main_row_rounds + t.n_tail_row_rounds == t_off.n_main_row_rounds, key
+        # a freed slot the compaction overwrites or drops gets no base-case load
+        assert t.n_base_loads_skipped > 0, key
+        assert t.n_base_loads + t.n_base_loads_skipped == t_off.n_base_loads, key
+        rr = t.round_records
+        assert len(rr["n_live"]) == t.n_rounds, key
+        assert sum(rr["n_live"]) == t.n_main_row_rounds + t.n_tail_row_rounds, key
+        assert sum(rr["n_moves"]) == t.n_slot_moves and sum(rr["n_load_base"]) == t.n_base_loads, key
+        assert sum(rr["t_round_ms"]) <= t.t_driver_solve_wall_ms, key
+        around = (t.t_sess_ref_ms + t.t_sess_source_ms + t.t_sess_prepass_ms + t.t_sess_driver_ctor_ms
+                  + t.t_sess_overrides_ms + t.t_sess_after_ms)
+        assert 0. < around <= t.t_session_run_wall_ms - t.t_driver_solve_wall_ms, key
+        assert t.t_main_phase_wall_ms + t.t_tail_phase_wall_ms <= t.t_driver_solve_wall_ms, key
         assert t.occupancy > t_off.occupancy, key
         assert "tail_compact" in t.to_dict()["gpu_compute"]
 
@@ -189,7 +208,7 @@ def test_outer_loops(solver_atol):
     rows = _rows(grid, n_rows=3 * N_ROWS)
     rows["lines"] = [[1 + i % 8] for i in range(3 * N_ROWS)]
     n = 3 * N_ROWS
-    runs, res = {}, {}
+    runs, res, loads = {}, {}, {}
     for mg, G in ((0, 15), (10 ** 6, 3), (10 ** 6, 1)):
         from gpusim2grid import ScenarioSweepGPU
         sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=T.MAX_IT, init_from_n_powerflow=False,
@@ -201,7 +220,10 @@ def test_outer_loops(solver_atol):
         runs[(mg, G)] = _outcome(sw, n)
         res[(mg, G)] = sw.get_outer_results()
         assert (sw.timings.n_slot_moves > 0) == (mg > 0)
+        loads[(mg, G)] = sw.timings.n_base_loads + sw.timings.n_base_loads_skipped
+        assert (sw.timings.n_base_loads_skipped > 0) == (mg > 0)
     assert any(r.nb_outer_iterations > 0 for r in res[(0, 15)])
+    assert len(set(loads.values())) == 1
     _same_rows(runs, runs.pop((0, 15)), solver_atol)
     for key in runs:
         for i in range(n):

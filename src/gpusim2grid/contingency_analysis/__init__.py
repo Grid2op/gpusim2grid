@@ -548,14 +548,23 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     def build_contingencies_full(self, branch_ids_per_ctg, shunt_ids_per_ctg,
                                  load_ids_per_ctg, gen_ids_per_ctg,
-                                 branch_ids_side1_per_ctg=(), branch_ids_side2_per_ctg=()):
+                                 branch_ids_side1_per_ctg=(), branch_ids_side2_per_ctg=(),
+                                 sgen_ids_per_ctg=(), storage_ids_per_ctg=(),
+                                 svc_ids_per_ctg=(), hvdc_ids_per_ctg=()):
         """Build contingencies tripping branches, shunts, loads and generators
         together: aligned list-of-lists, one entry per contingency (see
         ContingencyAnalysisSession.build_contingencies_full). The last two (empty,
         or one entry per contingency): the branches opened at that end only."""
         self._s.build_contingencies_full(branch_ids_per_ctg, shunt_ids_per_ctg,
                                          load_ids_per_ctg, gen_ids_per_ctg,
-                                         list(branch_ids_side1_per_ctg), list(branch_ids_side2_per_ctg))
+                                         list(branch_ids_side1_per_ctg), list(branch_ids_side2_per_ctg),
+                                         list(sgen_ids_per_ctg), list(storage_ids_per_ctg),
+                                         list(svc_ids_per_ctg), list(hvdc_ids_per_ctg))
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per contingency: why the batch left it out (``""``: it did not).
+        Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return list(self._s.get_batch_unsupported_reasons())
 
     def run(self):
         """Run all contingencies.  Fills V_results and residuals on device.
@@ -630,6 +639,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
         status = self._s.get_row_status()
+        unsupported = self._s.get_batch_unsupported_reasons()
         out = []
         for c, cnt in enumerate(counts):
             if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
@@ -643,7 +653,9 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
                 # solver was never invoked (BatchPfDriver's d_violation_count
                 # -1 sentinel). Never written by the kernel itself.
                 out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
-                                            LimitViolationType.NOT_SIMULATED,
+                                            LimitViolationType.BATCH_UNSUPPORTED
+                                            if c < len(unsupported) and unsupported[c]
+                                            else LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
             base = c * stride

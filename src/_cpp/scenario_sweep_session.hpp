@@ -298,6 +298,21 @@ struct ScenarioSweepSession {
     bool                          has_trip_data_ = false;
     std::vector<std::vector<int>> shunt_off_;
     bool                          has_shunt_off_ = false;
+    // lightsim2grid PR #292: what each row trips beyond those, and why a row is left out
+    std::vector<MoreTrips>        more_off_;
+    bool                          has_more_off_ = false;
+    std::vector<std::string>      row_unsupported_;
+    // the controllers of the voltage-control groups each row trips, and whether the base
+    // ledger carries the entries that takes (reserve_tripped_controller_slots)
+    std::vector<std::vector<int>> row_vc_tripped_;
+    bool                          reserved_vc_trip_ = false;
+    void _set_more_off(Eigen::Ref<const BoolMat> mask, int n_el, std::vector<int> MoreTrips::*member, const char* who);
+    std::vector<std::string> _row_unsupported_reasons() const;
+    bool _row_trips(int r, std::vector<int> MoreTrips::*member, int el) const {
+        if (!has_more_off_ || static_cast<size_t>(r) >= more_off_.size()) return false;
+        const std::vector<int>& ids = more_off_[static_cast<size_t>(r)].*member;
+        return std::binary_search(ids.begin(), ids.end(), el);
+    }
     BoolMat                       load_off_;
     bool                          has_load_off_ = false;
 
@@ -333,6 +348,8 @@ struct ScenarioSweepSession {
     std::vector<unsigned char> bus_q_row_skip_, gen_pv_release_row_skip_;
     int  bus_q_row_skip_cols_ = 0, gen_pv_release_row_skip_cols_ = 0;
     bool bus_q_row_skip_dirty_ = false, gen_pv_release_row_skip_dirty_ = false;
+    // the release skip mask the driver got last (the caller's plus the SVCs the rows trip)
+    std::vector<unsigned char> gr_skip_last_;
 
     // =========================================================================
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
@@ -613,6 +630,19 @@ struct ScenarioSweepSession {
     bool has_element_trip_data() const { return has_trip_data_; }
     void set_contingency_shunts(Eigen::Ref<const BoolMat> mask);
     void set_contingency_loads(Eigen::Ref<const BoolMat> mask);
+    // lightsim2grid PR #292: (n_scenarios x n_element) bool, True = the row disconnects it
+    void set_contingency_sgens(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_storages(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_svcs(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_hvdcs(Eigen::Ref<const BoolMat> mask);
+    bool has_more_trips() const { return has_more_off_; }
+    // (n_scenarios x n_bus) MW and MVAr each row's tripped static generators, storage units,
+    // SVCs and hvdc stations add to its injection (the facade adds it to set_injections')
+    std::pair<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
+              Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+    more_trips_injection_delta() const;
+    // per row, why the batch left it out ("": it did not), set by run()
+    const std::vector<std::string>& get_batch_unsupported_reasons() const { return row_unsupported_; }
 
     // =========================================================================
     // set_pv_pq_switches — the labelling side of one reactive-limit outer-loop

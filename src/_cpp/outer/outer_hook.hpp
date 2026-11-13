@@ -20,7 +20,10 @@
 #ifndef GPUSIM2GRID_OUTER_HOOK_HPP
 #define GPUSIM2GRID_OUTER_HOOK_HPP
 
+#include <cmath>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace outer {
@@ -130,6 +133,12 @@ struct RowOverrides {
     // n_rows x n_load, row-major: 1 = the row disconnects the load (its contingency trips
     // it): out of what TransformerVoltageControl reads off the bus
     std::vector<char> load_off;
+    // per row, the controllers of the voltage-control groups it trips (ledger positions)
+    std::vector<std::vector<int>> vc_tripped;
+    // per row, the hvdc lines it trips (grid ids)
+    std::vector<std::vector<int>> hvdc_off;
+    // n_rows x n_storage, row-major: 1 = the row disconnects the storage unit
+    std::vector<char> storage_off;
     // per row, the active power its contingency loses (MW, generator convention, at the
     // grid's targets) that DistributedSlack shares before its first solve (redistribute_slack,
     // lightsim2grid's OuterRowView::lost_p_mw); NaN: nothing to share
@@ -143,9 +152,23 @@ struct RowResult {
     std::string failed_loop;     // the loop's name when status == FAILED
     int  nb_outer_iterations = 0;
     int  nb_nr_iterations = 0;   // summed over every inner solve, at least 1 per solve
-    // what the loops moved, sparse: only what differs from the row's own values
-    std::vector<int>    gen_ids;
-    std::vector<double> gen_target_p_mw;
+    // what the loops moved: the generators' targets by generator id, dense (MW, NaN: not
+    // moved; empty: none moved). gens_target_p_mw is every generator, gen_target_p_mw(gen_id)
+    // one of them, gen_targets() the moved ones as (id, MW) pairs.
+    // Dense because a row resumed from the "n" solve carries a target for most generators:
+    // the slot's vector is handed over as it is, instead of being re-packed per row.
+    std::vector<double> gens_target_p_mw;
+    double gen_target_p_mw(int gen_id) const {
+        return static_cast<size_t>(gen_id) < gens_target_p_mw.size()
+            ? gens_target_p_mw[static_cast<size_t>(gen_id)]
+            : std::numeric_limits<double>::quiet_NaN();
+    }
+    std::vector<std::pair<int, double>> gen_targets() const {
+        std::vector<std::pair<int, double>> out;
+        for (size_t g = 0; g < gens_target_p_mw.size(); ++g)
+            if (!std::isnan(gens_target_p_mw[g])) out.emplace_back(static_cast<int>(g), gens_target_p_mw[g]);
+        return out;
+    }
     std::vector<int>    storage_ids;
     std::vector<double> storage_target_p_mw;   // load convention, as the container
     std::vector<int>    hvdc_ids;
@@ -163,6 +186,7 @@ struct RowResult {
     // row / sn -- minus that for a generator DistributedSlack holds at a bound (gen_p_fixed),
     // lambda at gen_p_slope_row times gen_p_slope_coeff (pu per MW) for a generator frozen at a
     // limit of its capability curve, which its reactive output follows.
+    // Filled only when the adjoint is wanted (OuterHook::set_keep_adjoint), empty otherwise.
     std::vector<int>    pq_buses;
     std::vector<int>    vset_lost_groups;
     std::vector<int>    gen_p_fixed;
@@ -175,6 +199,9 @@ public:
     virtual ~OuterHook() = default;
 
     virtual const Layout& layout() const = 0;
+    // Whether the next runs need each row's adjoint terms (RowResult::pq_buses ...
+    // gen_p_slope_*): without, the model neither records nor computes them. Set before begin().
+    virtual void set_keep_adjoint(bool keep) = 0;
     // A new run of `n_slots` slots over rows [0, n_rows) (original numbering).
     virtual void begin(int n_slots, int n_rows) = 0;
     // A row (original index, -1 for a phantom slot) enters slot `slot`: its loops

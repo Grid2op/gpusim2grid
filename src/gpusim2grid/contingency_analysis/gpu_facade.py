@@ -445,7 +445,13 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
                     ir_n_steps=_ir_n_steps,
                     keep_trace=bool(keep_outer_trace),
-                    resume_from_n=bool(init_from_n_powerflow))
+                    resume_from_n=bool(init_from_n_powerflow),
+                    # None => the grid's own step scaling, as without the outer loops
+                    scaling_max_voltage_change_override=(
+                        -1 if scaling_max_voltage_change is None
+                        else int(bool(scaling_max_voltage_change))),
+                    max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
                 self._inner = _ContingencyAnalysisSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
@@ -584,7 +590,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         self._inner.build_contingencies(branch_ids_per_ctg)
         self._ctg_branch_ids = [list(map(int, ids)) for ids in branch_ids_per_ctg]
-        self._ctg_elements = [(list(ids), [], [], [], [], []) for ids in self._ctg_branch_ids]
+        self._ctg_elements = [(list(ids),) + tuple([] for _ in range(9)) for ids in self._ctg_branch_ids]
 
     # ------------------------------------- shunts, loads and generators tripped
     @staticmethod
@@ -596,8 +602,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         return sorted(set(int(el) for el in ids))
 
     def _push_contingencies(self):
-        b, s, l, g, b1, b2 = ([list(c[k]) for c in self._ctg_elements] for k in range(6))
-        if any(b1) or any(b2):
+        b, s, l, g, b1, b2, sg, st, sv, hv = ([list(c[k]) for c in self._ctg_elements] for k in range(10))
+        if any(sg) or any(st) or any(sv) or any(hv):
+            self._inner.build_contingencies_full(b, s, l, g, b1, b2, sg, st, sv, hv)
+        elif any(b1) or any(b2):
             self._inner.build_contingencies_full(b, s, l, g, b1, b2)
         elif any(s) or any(l) or any(g):
             self._inner.build_contingencies_full(b, s, l, g)
@@ -609,7 +617,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """Append contingencies, each a tuple ``(branch_ids, shunt_ids, load_ids,
         gen_ids)`` tripping those elements together (lightsim2grid's
         ``ContingencyAnalysisCPP.add_contingency``), optionally followed by
-        ``branch_ids_side1, branch_ids_side2``. Any of them may be empty, not all.
+        ``branch_ids_side1, branch_ids_side2``, then by ``sgen_ids, storage_ids, svc_ids,
+        hvdc_ids`` (the ten lists of lightsim2grid's ``my_contingencies()``). Any of them
+        may be empty, not all.
         Appended to what :meth:`add_contingencies_by_branch_id` (which replaces
         the whole list) or a previous ``add_contingenc*`` registered.
 
@@ -620,25 +630,37 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
           not regulate voltage), and the distributed slack is re-weighted without it;
           when it was the last one regulating its own bus, that bus turns PQ for the
           contingency. A generator regulating a remote bus, or on a bus a control group
-          holds, is refused by :meth:`compute`;
+          holds, is reported BATCH_UNSUPPORTED (see :meth:`get_batch_unsupported_reasons`);
         - a branch of ``branch_ids_side1`` (``branch_ids_side2``) is opened at side 1 (2)
           only: its other end stays connected and keeps the branch's charging, as
           OpenLoadFlow models a branch whose breaker opens at one end. Its flows read 0,
           its current is not checked and the outer loops see it as open. Named at both
-          sides, or also in ``branch_ids``, it is opened at both.
+          sides, or also in ``branch_ids``, it is opened at both;
+        - a static generator leaves its injection;
+        - a storage unit too, and its share of the distributed slack, the last controller
+          of a bus turning it PQ; one on a bus a control group holds is BATCH_UNSUPPORTED;
+        - a static var compensator: its fixed reactive injection and its b0; one in voltage
+          mode leaves its control group; one with a standby automaton leaves its automaton's
+          check and the VoltageMonitoring loop (lightsim2grid leaves that row out); one
+          frozen at a limit is BATCH_UNSUPPORTED;
+        - an HVDC line stops transmitting, both converter stations leaving the injection,
+          the bus a regulating one was the last to hold turning PQ; one in AC emulation or
+          with a station in a control group is BATCH_UNSUPPORTED.
 
-        With the outer loops, a shunt that regulates a voltage is refused (its sections
-        are the ShuntVoltageControl loop's). Needs a grid-mode instance (the element
+        With the outer loops, a shunt that regulates a voltage is BATCH_UNSUPPORTED (its
+        sections are the ShuntVoltageControl loop's), and so is an HVDC line with a
+        regulating station. Needs a grid-mode instance (the element
         data comes from the lightsim2grid grid).
         """
         if getattr(self, "_ctg_elements", None) is None:
             self._ctg_elements = []
         new = []
         for cont in contingencies:
-            if len(cont) not in (4, 6):
+            if len(cont) not in (4, 6, 10):
                 raise ValueError("each contingency must be (branch_ids, shunt_ids, load_ids, gen_ids), "
-                                 "optionally followed by (branch_ids_side1, branch_ids_side2)")
-            cont = [self._as_ids(el) for el in cont] + [[], []] * (len(cont) == 4)
+                                 "optionally followed by (branch_ids_side1, branch_ids_side2), then "
+                                 "(sgen_ids, storage_ids, svc_ids, hvdc_ids)")
+            cont = [self._as_ids(el) for el in cont] + [[] for _ in range(10 - len(cont))]
             # opened at both ends one way or another: a trip (as lightsim2grid has it)
             both = set(cont[0]) | (set(cont[4]) & set(cont[5]))
             cont[0] = sorted(both)
@@ -652,10 +674,12 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._push_contingencies()
 
     def add_contingency(self, branch_ids=(), shunt_ids=(), load_ids=(), gen_ids=(),
-                        branch_ids_side1=(), branch_ids_side2=()):
+                        branch_ids_side1=(), branch_ids_side2=(), sgen_ids=(), storage_ids=(),
+                        svc_ids=(), hvdc_ids=()):
         """Append one contingency tripping these elements together; see
         :meth:`add_contingencies`."""
-        self.add_contingencies([(branch_ids, shunt_ids, load_ids, gen_ids, branch_ids_side1, branch_ids_side2)])
+        self.add_contingencies([(branch_ids, shunt_ids, load_ids, gen_ids, branch_ids_side1, branch_ids_side2,
+                                 sgen_ids, storage_ids, svc_ids, hvdc_ids)])
 
     def add_contingency_shunt(self, shunt_ids):
         """Append one contingency tripping these shunts only (one id, or several)."""
@@ -669,9 +693,31 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """Append one contingency tripping these generators only (one id, or several)."""
         self.add_contingencies([((), (), (), gen_ids)])
 
+    def add_contingency_sgen(self, sgen_ids):
+        """Append one contingency tripping these static generators only (one id, or several)."""
+        self.add_contingency(sgen_ids=sgen_ids)
+
+    def add_contingency_storage(self, storage_ids):
+        """Append one contingency tripping these storage units only (one id, or several)."""
+        self.add_contingency(storage_ids=storage_ids)
+
+    def add_contingency_svc(self, svc_ids):
+        """Append one contingency tripping these static var compensators only (one id, or several)."""
+        self.add_contingency(svc_ids=svc_ids)
+
+    def add_contingency_hvdc(self, hvdc_ids):
+        """Append one contingency tripping these HVDC lines only (one id, or several)."""
+        self.add_contingency(hvdc_ids=hvdc_ids)
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per contingency: why the batch left it out (``""``: it did not), after
+        :meth:`compute`. Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return self._inner.get_batch_unsupported_reasons()
+
     def get_contingencies(self):
         """Every contingency registered, in row order: ``(branch_ids, shunt_ids,
-        load_ids, gen_ids, branch_ids_side1, branch_ids_side2)``."""
+        load_ids, gen_ids, branch_ids_side1, branch_ids_side2, sgen_ids, storage_ids,
+        svc_ids, hvdc_ids)``."""
         return [tuple(list(el) for el in c) for c in (getattr(self, "_ctg_elements", None) or [])]
 
     @property

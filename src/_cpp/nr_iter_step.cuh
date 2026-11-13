@@ -661,15 +661,15 @@ inline void nr_iter_step_correct(
     // ⑤b Step-scaling (MaxVoltageChange), if enabled -- rescale the WHOLE dx
     //     vector BEFORE applying it anywhere, so Va/Vm and any extension state
     //     move together, exactly like lightsim2grid's own apply_step(coeff*F).
-    //     Folded into the same t.t_solve bucket (no new timing field).
+    //     Timed with the update of V (no new timing field).
+    timer.start();
     if (buf.scaling_max_voltage_change) {
         cudaMemsetAsync(buf.d_scale_max_dtheta, 0, actual_batch * sizeof(cuda_real_type), cs);
         cudaMemsetAsync(buf.d_scale_max_dvm,    0, actual_batch * sizeof(cuda_real_type), cs);
-        const int total = buf.n_theta + buf.n_vm;
-        reduce_step_norms_kernel<<<nr_grid_size((long long)actual_batch * total, BS), BS, 0, cs>>>(
+        reduce_step_norms_kernel<<<nr_grid_size((long long)actual_batch * BS, BS), BS, 0, cs>>>(
             buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
             dim_J, actual_batch, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
-        apply_step_scale_kernel<<<nr_grid_size((long long)actual_batch * dim_J, BS), BS, 0, cs>>>(
+        apply_step_scale_kernel<<<nr_grid_size((long long)actual_batch * BS, BS), BS, 0, cs>>>(
             buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
             buf.max_dVa, buf.max_dVm, dim_J, actual_batch);
     }
@@ -677,7 +677,6 @@ inline void nr_iter_step_correct(
     // ⑥  Update V in-place: Va first, then Vm.
     //     Both kernels run on cs — CUDA stream ordering serialises them without
     //     an explicit CPU-side event.
-    timer.start();
     update_Va_kernel<<<nr_grid_size((long long)actual_batch * buf.n_theta, BS), BS, 0, cs>>>(
         buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
         buf.n_theta, n_bus, dim_J, actual_batch);

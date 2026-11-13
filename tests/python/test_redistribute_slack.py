@@ -372,7 +372,7 @@ def test_ca_refuses_participants_on_another_sn_mva():
     data = _cpp._extract_slack_redistribution_data_from_lsgrid(case.grid, ca._inner._s.n_bus)
     ca.set_slack_redistribution_data((
         data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
-        data.target_p_mw, data.gen_bus_solver, data.gen_target_p_mw, data.n_sto,
+        data.target_p_mw, data.gen_bus_solver, data.gens_target_p_mw, data.n_sto,
         data.shunt_p_mw, 1.0, data.in_slack))
     with pytest.raises(RuntimeError, match="another sn_mva"):
         ca.compute(batch_size=8)
@@ -613,13 +613,13 @@ def test_ss_injection_change_needs_base_p_mw():
     sw.set_injections_from_elements(load_p, load_q, gen_p)
     sw.set_slack_redistribution_data((
         data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
-        data.target_p_mw, data.gen_bus_solver, data.gen_target_p_mw, data.n_sto,
+        data.target_p_mw, data.gen_bus_solver, data.gens_target_p_mw, data.n_sto,
         data.shunt_p_mw, data.sn_mva, data.in_slack))
     sw.compute(batch_size=2)
     assert list(sw.get_slack_redistribution_report()["nb_rounds"]) == [0, 0]
     sw.set_slack_redistribution_data((
         data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
-        data.target_p_mw, data.gen_bus_solver, data.gen_target_p_mw, data.n_sto,
+        data.target_p_mw, data.gen_bus_solver, data.gens_target_p_mw, data.n_sto,
         data.shunt_p_mw, data.sn_mva, data.in_slack, data.base_p_mw))
     sw.compute(batch_size=2)
     assert sw.get_slack_redistribution_report()["mismatch_mw"][1] == pytest.approx(15., abs=1e-8)
