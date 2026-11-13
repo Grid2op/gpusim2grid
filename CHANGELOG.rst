@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] ``benchmarks/contingency_analysis.py`` stopped on a ``NameError`` on grids with more branches
+  than ``nb_max_cont_cpu``, and ran some contingencies twice.
 - [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
   remote regulators added or changed since it was built.
 - [IMPROVED] ``outer_loops=True``: a row can trip an HVDC line with a station regulating a voltage
