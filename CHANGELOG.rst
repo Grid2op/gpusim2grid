@@ -1,7 +1,7 @@
 Change Log
 ===========
 
-[0.2.0] 2026-xx-yy
+[0.3.0] 2026-xx-yy
 --------------------
 - [ADDED] A contingency or a row can trip an SVC with a standby automaton (lightsim2grid leaves it out): its
   release-check entries and the ``VoltageMonitoring`` loop skip it for that row.
@@ -46,6 +46,8 @@ Change Log
   has a dense ``gens_target_p_mw`` and ``gen_target_p_mw(gen_id)``; ``gen_ids`` is gone.
 - [ADDED] ``gpusim2grid_core``: the solvers as a C++ shared library without Python (headers, CMake package
   ``gpusim2grid::core``, ``gpusim2grid.get_cmake_dir()``), for C++ / JNI callers; the Python module links it.
+- [ADDED] ``benchmark_cudss_batch_raw(n_active=)``: with ``linear_solver='own_lu'``, only the first
+  ``n_active`` matrices are factorized and solved, the others left untouched.
 - [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU
   of our own instead of cuDSS, ordered on the host (lightsim2grid's constrained order by default): no pivot to perturb.
 - [IMPROVED] ``linear_solver='own_lu'``: the continuous tail runs on the forward solver's first slots (active
@@ -53,6 +55,8 @@ Change Log
 - [ADDED] lightsim2grid's constrained order now starts from the grid's own fill-reducing order (AMD or
   ``MinFill``); ``reordering_alg='ls2g_constrained_minfill'`` forces minimum fill.
 - [ADDED] (diagnostic) ``GPUSIM2GRID_DUMP_J=<dir>``: every batch solver dumps its Jacobians and orders.
+- [ADDED] ``BatchTimings.cudss_user_perm_honoured`` and, with ``GPUSIM2GRID_COUNT_PIVOTS=1``,
+  ``cudss_npivots_*``: whether cuDSS used the order given, and how many pivots it perturbed.
 - [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
   constrained order given to cuDSS. Removes its perturbed pivots but slows it 6-9x; see the dev note.
 - [ADDED] ``BatchPowerFlow``: ``redistribute_slack`` with ``outer_loops=True``, the lost power measured in
@@ -62,6 +66,8 @@ Change Log
   -- each row's last inner solve, its loops' decisions held; ``compute_flows`` at the taps they settled on.
 - [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
   the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
+- [ADDED] ``benchmark_cudss_batch_raw(n_handles=, handle_launch=)`` and ``benchmarks/cudss_small_handles.py``:
+  several independent cuDSS handles per round, timed against one large one.
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at
   one end only keeps its charging from the other, as in lightsim2grid.
 - [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``redistribute_slack`` with ``outer_loops=True``, the
@@ -88,6 +94,11 @@ Change Log
   participants, resumed targets and reactive-limits plan are built once per grid, not per row.
 - [IMPROVED] ``compute_limit_violations``: the operational check runs one GPU block per row, not one thread,
   same records; it cost tens of ms per call on a real grid, every continuous round.
+- [FIXED] ``outer_loops=True``: parallel transformers of ``PhaseControl`` / ``TransformerVoltageControl`` lost
+  Ybus patches (racing threads), leaving rows at their iteration budget or on wrong blocks.
+- [ADDED] ``benchmark_cudss_batch_raw`` and ``solve_cudss_raw`` take ``ir_n_steps``.
+- [ADDED] ``benchmarks/outer_loops.py`` (the outer loops against lightsim2grid's ``NROuter_KLU``),
+  ``benchmarks/continuous_batching.py`` and ``continuous_batching_potential.py`` (chunked vs continuous).
 - [ADDED] ``BatchTimings.t_sched_res_sync`` / ``t_oc_gather`` / ``t_oc_decide`` / ``t_oc_controls`` /
   ``t_oc_load``: where a continuous run's per-round host time goes, outer loops included.
 - [ADDED] ``BatchTimings.t_driver_solve_wall_ms`` / ``t_session_run_wall_ms``: whole-call wall clocks,
@@ -137,6 +148,9 @@ Change Log
 - [IMPROVED] ``reactive_limits_outer_loop``: the second pass starts each contingency from its
   first-pass voltages (``outer_loop_warm_start``, default on); ``outer_loop_nb_iter`` sets its
   Newton iterations.
+
+[0.2.0] 2026-xx-yy
+--------------------
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.
@@ -145,6 +159,8 @@ Change Log
   (``SlackRedistributionData.base_p_mw``), as lightsim2grid.
 - [ADDED] ``reference_slack="auto"`` (default with ``handle_disconnected_grid``): the angle
   reference is the slack unit stranded by the fewest rows.
+- [ADDED] ``LimitViolationType`` mirrors lightsim2grid 1.2's ``LOW_VOLTAGE_REMOTE_CONTROL`` /
+  ``HIGH_VOLTAGE_REMOTE_CONTROL`` / ``HVDC_AC_EMULATION_RELEASE`` (category PHYSICAL, not computed yet).
 - [ADDED] PQ -> PV release check (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``) and
   ``physical_violation_tol_vm_pu``.
 - [ADDED] ``violation_rel_tol`` (default ``1e-9``): a value on its operational limit up to
