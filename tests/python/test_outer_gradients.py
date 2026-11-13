@@ -16,7 +16,8 @@ import warnings
 
 import numpy as np
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")  # CI's GPU-less legs have no torch
 
 from conftest import requires_gpu
 import gpusim2grid._gpusim2grid as _cpp
