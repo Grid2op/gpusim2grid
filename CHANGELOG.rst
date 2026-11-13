@@ -57,6 +57,8 @@ Change Log
 - [IMPROVED] ``reactive_limits_outer_loop``: the second pass starts each contingency from its
   first-pass voltages (``outer_loop_warm_start``, default on); ``outer_loop_nb_iter`` sets its
   Newton iterations.
+- [IMPROVED] the build takes the SuiteSparse headers lightsim2grid >= 1.3.0 ships with its core:
+  a lightsim2grid installed from a wheel no longer needs a SuiteSparse checkout on the side.
 - [FIXED] CI: cap the cuDSS pip wheel below 1.0, whose ``libcudss.so.1`` the CMake shim does not find
   (and whose API is untested here).
 
