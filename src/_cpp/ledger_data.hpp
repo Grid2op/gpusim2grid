@@ -233,6 +233,10 @@ struct LedgerData {
     bool                 ord_constraints_read = false;
     std::vector<int>     ord_follow_ptr, ord_follow, ord_lead_ptr, ord_lead;
     std::vector<char>    ord_in_order;
+    // The fill-reducing ordering the grid's Newton is set to (lightsim2grid's
+    // FillReducingOrdering, bit 1 of its config's ordering flags): 0 AMD, 1 MinFill.
+    // What ReorderingAlg::Default / Ls2gConstrained post-move with the constraints.
+    int                  ord_fill_reducing = 0;
     int  ord_n_constraints() const { return static_cast<int>(ord_in_order.size()); }
 };
 

@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#include "linear_solver.hpp"
 #include "timing_utils.hpp"
 #include "acpf_nr.hpp"
 #include "contingency_analysis_helper.hpp"   // Contingency, Triplet
@@ -1177,6 +1178,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
   // default argument (e.g. AcPfNrSession's reordering_alg kwarg just below),
   // same rationale as ContingencySolverType further down.
   // -----------------------------------------------------------------
+  // LinearSolver -- who factorizes / solves the batch Jacobians (linear_solver.hpp);
+  // registered before any binding that takes it as a default argument.
+  pybind11::enum_<LinearSolver>(m, "LinearSolver")
+      .value("Cudss", LinearSolver::Cudss, "cuDSS's uniform batch.")
+      .value("OwnLu", LinearSolver::OwnLu,
+             "The batched LU of our own: static diagonal pivots along an order chosen on the "
+             "host (lightsim2grid's constrained order, AMD, ...), no cuDSS call.");
+
   pybind11::enum_<ReorderingAlg>(m, "ReorderingAlg")
       .value("Default", ReorderingAlg::Default,
              "cuDSS's own default reordering heuristic.")
@@ -1192,12 +1201,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
              "Natural (identity) ordering — no reordering applied.")
       .value("Ls2gConstrained", ReorderingAlg::Ls2gConstrained,
              "Prototype: lightsim2grid's constrained order of the batch Jacobian "
-             "(AMD post-moved by the grid's OrderingConstraints), given to cuDSS as "
+             "(the grid's fill-reducing order, AMD or MinFill, post-moved by its "
+             "OrderingConstraints), given to cuDSS as "
              "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid (bridge).")
       .value("Ls2gConstrainedNd", ReorderingAlg::Ls2gConstrainedNd,
              "Prototype: cuDSS's own (nested dissection) order of the batch Jacobian, "
              "post-moved by the grid's OrderingConstraints, given to cuDSS as "
-             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid.");
+             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid.")
+      .value("Ls2gConstrainedMinFill", ReorderingAlg::Ls2gConstrainedMinFill,
+             "Prototype: lightsim2grid's constrained order started from its minimum-fill "
+             "order (FillReducingOrdering.MinFill) whatever the grid's own setting; "
+             "Ls2gConstrained follows the grid's. Needs a lightsim2grid grid (bridge).");
 
   // -----------------------------------------------------------------
   // MatchingAlg enum — selects CUDSS_CONFIG_MATCHING_ALG ahead of
@@ -1813,7 +1827,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          [](const ContingencyAnalysisSession& s, int n_repeat, int batch_size) {
              return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
                                           s.tail_group_size_, n_repeat, s.reordering_alg_,
-                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_,
+                                          s.linear_solver_);
          },
          pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
          "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
@@ -1844,6 +1859,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "default) works here. The other values only work on "
                    "AcPfNrSession's single-system solve, and even there "
                    "MaxDiagProduct/Auto have been observed to silently produce NaN.")
+    .def_readwrite("linear_solver", &ContingencyAnalysisSession::linear_solver_,
+                   "LinearSolver: who factorizes and solves the batch Jacobians (Cudss, or OwnLu: "
+                   "the batched LU of our own, its order chosen on the host from reordering_alg). "
+                   "The base case stays on cuDSS. Takes effect on the next run() (a new driver)")
     .def_readwrite("ir_n_steps", &ContingencyAnalysisSession::ir_n_steps_,
                    "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
                    "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
@@ -2179,7 +2198,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          [](const InjectionSweepSession& s, int n_repeat, int batch_size) {
              return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
                                           s.tail_group_size_, n_repeat, s.reordering_alg_,
-                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_,
+                                          s.linear_solver_);
          },
          pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
          "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
@@ -2210,6 +2230,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "default) works here. The other values only work on "
                    "AcPfNrSession's single-system solve, and even there "
                    "MaxDiagProduct/Auto have been observed to silently produce NaN.")
+    .def_readwrite("linear_solver", &InjectionSweepSession::linear_solver_,
+                   "LinearSolver: who factorizes and solves the batch Jacobians (Cudss, or OwnLu: "
+                   "the batched LU of our own, its order chosen on the host from reordering_alg). "
+                   "The base case stays on cuDSS. Takes effect on the next run() (a new driver)")
     .def_readwrite("ir_n_steps", &InjectionSweepSession::ir_n_steps_,
                    "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
                    "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
@@ -2644,7 +2668,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
          [](const ScenarioSweepSession& s, int n_repeat, int batch_size) {
              return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
                                           s.tail_group_size_, n_repeat, s.reordering_alg_,
-                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_,
+                                          s.linear_solver_);
          },
          pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
          "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
@@ -2669,6 +2694,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "(MatchingAlg enum; takes effect on the next run(), which always "
                    "reruns ANALYSIS). Only NoMatching (the default) works in this "
                    "session's batch mode.")
+    .def_readwrite("linear_solver", &ScenarioSweepSession::linear_solver_,
+                   "LinearSolver: who factorizes and solves the batch Jacobians (Cudss, or OwnLu: "
+                   "the batched LU of our own, its order chosen on the host from reordering_alg). "
+                   "The base case stays on cuDSS. Takes effect on the next run() (a new driver)")
     .def_readwrite("ir_n_steps", &ScenarioSweepSession::ir_n_steps_,
                    "CUDSS_CONFIG_IR_N_STEPS: steps of cuDSS iterative refinement per "
                    "batch SOLVE (int >= 0, 0 = none; forward and adjoint). Takes effect on "
@@ -3614,7 +3643,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Wall ms to create, analyse and factorize handles 1..n_handles-1")
         .def_readonly("handle_round_ms", &CudssBatchBenchResult::handle_round_ms,
                       "Mean wall ms of one round over all the handles (rhs reset + "
-                      "REFACTORIZATION + SOLVE each)");
+                      "REFACTORIZATION + SOLVE each)")
+        .def_readonly("n_active", &CudssBatchBenchResult::n_active)
+        .def_readonly("active_max_rel_residual", &CudssBatchBenchResult::active_max_rel_residual,
+                      "Own LU active prefix: residual of its first n_active matrices, "
+                      "refactorized and solved alone (-1 = not run)")
+        .def_readonly("n_inactive_touched", &CudssBatchBenchResult::n_inactive_touched,
+                      "Solution entries past the prefix that call changed (0 expected; -1 = not run)")
+        .def_readonly("inactive_max_rel_residual", &CudssBatchBenchResult::inactive_max_rel_residual,
+                      "Past the prefix, the solve on the factors held from before (their "
+                      "values were doubled meanwhile; -1 = not run)");
 
     pybind11::class_<TailCalibration>(m, "TailCalibration",
         "calibrate_tail_max_groups() output: mean wall ms of one REFACTORIZATION + SOLVE on "
@@ -3653,6 +3691,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("n_groups") = 1,
         pybind11::arg("n_handles") = 1,
         pybind11::arg("handle_launch") = "serial",
+        pybind11::arg("linear_solver") = LinearSolver::Cudss,
+        pybind11::arg("n_active") = 0,
         "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
         "same batch-mode env variables and config knobs) on an arbitrary CSR "
         "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "
@@ -3664,7 +3704,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "the continuous schedule's tail does. "
         "n_handles > 1: that many independent handles of batch_size matrices "
         "(handle_round_ms), launched from one stream ('serial'), one stream "
-        "each ('streams') or one stream and one host thread each ('threads').");
+        "each ('streams') or one stream and one host thread each ('threads'). "
+        "n_active > 0 (own LU): the active-prefix check (active_max_rel_residual, "
+        "n_inactive_touched, inactive_max_rel_residual).");
 
     m.def("warmup", &warmup,
         pybind11::arg("device") = -1,

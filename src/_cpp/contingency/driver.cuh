@@ -39,13 +39,21 @@
 
 // =============================================================================
 // TailSolve — the linear solve of a continuous run's tail (BatchPfDriver::
-// _compact_tail): the live rows sit in the first n_groups * G slots and one
-// cuDSS handle analysed for G matrices is pointed at each group of G slots in
-// turn (CudssBatchSolver::bind_slice), refactorized and solved. Nothing has to
-// survive between groups since every iteration refactorizes (the policy is
-// PolicyRefactorEvery). cuDSS 0.8.0's uniform batch costs over an order of
-// magnitude more from 16 matrices on (docs/dev_notes/outer_loops_performance.md),
-// whence groups of at most 15. Same timing buckets as the policy's.
+// _compact_tail): the live rows sit in the first n_groups * G slots.
+//
+//   cuDSS    one more handle analysed for G matrices is pointed at each group
+//            of G slots in turn (CudssBatchSolver::bind_slice), refactorized
+//            and solved. Nothing has to survive between groups since every
+//            iteration refactorizes (the policy is PolicyRefactorEvery).
+//            cuDSS 0.8.0's uniform batch costs over an order of magnitude more
+//            from 16 matrices on (docs/dev_notes/outer_loops_performance.md),
+//            whence groups of at most 15.
+//   own LU   (prefix) the forward's own solver on its first n_groups * G
+//            matrices (CudssBatchSolver::set_active_count), one call: no
+//            second plan, no groups to cycle; G is only the compaction's
+//            granularity. The full batch is restored before returning.
+//
+// Same timing buckets as the policy's.
 // =============================================================================
 struct TailSolve {
     CudssBatchSolver* solver   = nullptr;
@@ -53,11 +61,27 @@ struct TailSolve {
     int               n_groups = 0;
     int               dim_J    = 0;
     int               nnz_J    = 0;
+    bool              prefix   = false;
 
     // Returns the REFACTORIZATIONs done (a fresh handle FACTORIZES first).
     int solve(cuda_real_type* d_J, cuda_real_type* d_F, cuda_real_type* d_dx,
               CudaTimer& timer, NrIterTimings& t)
     {
+        if (prefix) {
+            const int full = solver->active_count();
+            solver->bind_slice(d_J, d_F, d_dx);   // the forward's own buffers (pointers only)
+            solver->set_active_count(n_groups * G);
+            const bool refac = solver->factorized_since_analysis_;
+            timer.start();
+            solver->refactor();
+            if (refac) t.t_refactorize += timer.stop_ms();
+            else       t.t_first_factorize += timer.stop_ms();
+            timer.start();
+            solver->solve();
+            t.t_solve += timer.stop_ms();
+            solver->set_active_count(full);
+            return refac ? 1 : 0;
+        }
         int n_refac = 0;
         for (int g = 0; g < n_groups; ++g) {
             const size_t s0 = static_cast<size_t>(g) * static_cast<size_t>(G);
@@ -100,7 +124,8 @@ struct TailSolve {
 //   cs            — CUDA stream (all kernels launched on this stream)
 //   timer         — stream-bound CudaTimer (reused across phases)
 //   t             — BatchTimings accumulator (updated in-place)
-//   tail          — null, or the continuous tail's small cuDSS handle: it then
+//   tail          — null, or the continuous tail's solve (a small cuDSS handle
+//                   cycled over groups, or the own LU's active prefix): it then
 //                   does the linear solve instead of the policy (and spmv is
 //                   the prefix one, over batch_size slots)
 // =============================================================================
@@ -177,7 +202,8 @@ inline void run_nr_loop(
         //
         //   Returns true if REFACTORIZATION was done (false = first FACTORIZATION).
         //   With `tail` (a continuous run's compacted tail), the solve goes
-        //   through its small handle, group after group, instead.
+        //   through it instead (TailSolve: small handle per group, or the own
+        //   LU's active prefix).
         bool did_refactor = false;
         int  n_tail_refactor = 0;
         if (tail != nullptr)

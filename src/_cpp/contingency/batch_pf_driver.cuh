@@ -125,7 +125,7 @@ inline void check_continuous_scheduling(ContingencySolverType strategy,
         throw std::invalid_argument(
             "scheduling='continuous' does not support strategy 'direct_refactor_every_n' "
             "(its period counts the batch's iterations, not a row's)");
-    if (cudss_batch_mode_from_env() != CudssBatchMode::Uniform)
+    if (!cudss_mode_is_uniform(cudss_batch_mode_from_env()))
         throw std::invalid_argument(
             "scheduling='continuous' needs cuDSS's uniform batch mode (unset "
             "GPUSIM2GRID_USE_BLOCKDIAG / GPUSIM2GRID_USE_BATCH_MODE)");
@@ -599,7 +599,10 @@ struct BatchPfDriver {
     // solve on one more cuDSS handle analysed for G matrices, cycled over the
     // groups (TailSolve). cuDSS 0.8.0's uniform batch costs over an order of
     // magnitude more from 16 matrices on, so G <= 15 and the full S-slot solve
-    // only pays while many rows are live. tail_max_groups_ = 0: off. Only with
+    // only pays while many rows are live. The own LU (linear_solver OwnLu)
+    // builds no second solver: its forward solver runs on the first
+    // n_groups * G matrices (active prefix), G only sets how finely the live
+    // rows are compacted. tail_max_groups_ = 0: off. Only with
     // PolicyRefactorEvery (the others keep factors across iterations). Public
     // and set per run like nb_iter_per_round_ (the sessions patch them); the
     // handle and the prefix SpMV are built on the first tail round that needs
@@ -607,7 +610,7 @@ struct BatchPfDriver {
     // -------------------------------------------------------------------------
     int tail_max_groups_ = 16;
     int tail_group_size_ = 15;
-    std::unique_ptr<CudssBatchSolver> tail_solver_;   // analysed for tail_solver_G_ matrices
+    std::unique_ptr<CudssBatchSolver> tail_solver_;   // analysed for tail_solver_G_ matrices (cuDSS only)
     int                               tail_solver_G_ = 0;
     std::unique_ptr<CuSpMV>           spmv_tail_;     // over the first spmv_tail_n_ slots
     int                               spmv_tail_n_ = 0;
@@ -620,6 +623,14 @@ struct BatchPfDriver {
     MatchingAlg     matching_alg_      = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
     int             ir_n_steps_        = 0;   // CUDSS_CONFIG_IR_N_STEPS, forward and adjoint
+    LinearSolver    linear_solver_kind_ = LinearSolver::Cudss;   // forward, tail and adjoint
+    // The order every batch solver gets: the own LU's (AcPfNrState::own_lu_perm,
+    // chosen on the host from reordering_alg), else cuDSS's user permutation.
+    const std::vector<int>* _solver_perm() const
+    {
+        return linear_solver_kind_ == LinearSolver::OwnLu ? &base.own_lu_perm(reordering_alg_)
+                                                           : base.user_perm_or_null();
+    }
 
     // -------------------------------------------------------------------------
     // Persistence / adjoint state
@@ -722,7 +733,9 @@ struct BatchPfDriver {
         // Scheduling -- see the members' own doc. Chunked by default.
         BatchScheduling           scheduling = BatchScheduling::Chunked,
         int                       nb_iter_per_round = 1,
-        double                    tol = 1e-8);
+        double                    tol = 1e-8,
+        // Who factorizes and solves the batch Jacobians (linear_solver.hpp).
+        LinearSolver              linear_solver = LinearSolver::Cudss);
 
     ~BatchPfDriver() = default;
 

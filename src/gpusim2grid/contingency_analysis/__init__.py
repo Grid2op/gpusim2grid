@@ -73,6 +73,7 @@ _REORDERING_ALG_MAP = {
     # prototype, docs/dev_notes/batched_lu_and_constrained_ordering.md
     'ls2g_constrained':  _ReorderingAlg.Ls2gConstrained,
     'ls2g_constrained_nd': _ReorderingAlg.Ls2gConstrainedNd,
+    'ls2g_constrained_minfill': _ReorderingAlg.Ls2gConstrainedMinFill,
 }
 
 

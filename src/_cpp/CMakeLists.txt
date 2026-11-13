@@ -58,6 +58,9 @@ pybind11_add_module(
     dlpack_export.cu
     raw_cudss_solve.cu
     warmup.cu
+    own_lu/lu_plan.cpp
+    own_lu/lu_order.cpp
+    own_lu/batched_lu.cu
     ${_gpusim2grid_ls2g_sources})
 target_link_libraries(_gpusim2grid PRIVATE CUDA::cusparse cudss)
 
