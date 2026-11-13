@@ -1,6 +1,27 @@
 
 project(_gpusim2grid LANGUAGES CXX CUDA)
 find_package(cudss 0.8.0 REQUIRED)
+# A CUDA toolkit installed from PyPI (``cuda-toolkit[nvcc,...]``, CUDA 13: one
+# prefix <site-packages>/nvidia/cu13 holding bin/nvcc, include/ and lib/) ships
+# each library under its soname only (libcudart.so.13, libcusparse.so.12), not
+# the unversioned libcudart.so that FindCUDAToolkit's find_library looks for.
+# Point it at the versioned files then; a toolkit from NVIDIA's installer or
+# container has the unversioned names and is left alone.
+get_filename_component(_g2g_cuda_lib "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+get_filename_component(_g2g_cuda_lib "${_g2g_cuda_lib}/../lib" ABSOLUTE)
+foreach(_g2g_l cudart cublas cublasLt cusolver cusparse nvJitLink)
+    if(NOT EXISTS "${_g2g_cuda_lib}/lib${_g2g_l}.so")
+        file(GLOB _g2g_f "${_g2g_cuda_lib}/lib${_g2g_l}.so.[0-9]*")
+        if(_g2g_f)
+            list(SORT _g2g_f)
+            list(GET _g2g_f 0 _g2g_f)
+            set(CUDA_${_g2g_l}_LIBRARY "${_g2g_f}" CACHE FILEPATH "")
+            if(_g2g_l STREQUAL "cudart")
+                set(CUDA_CUDART "${_g2g_f}" CACHE FILEPATH "")
+            endif()
+        endif()
+    endif()
+endforeach()
 find_package(CUDAToolkit REQUIRED COMPONENTS cublas cudart cusolver cusparse)
 # The zero-copy lightsim2grid bridge is compiled only when lightsim2grid_core
 # was found at configure time (see ../CMakeLists.txt). It is a CUDA-free .cpp.

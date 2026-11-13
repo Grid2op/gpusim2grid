@@ -1,31 +1,71 @@
 Installation
 ============
 
-There is no PyPI release yet — install from source.
+There is no PyPI release of gpusim2grid yet — install from source. Everything
+it builds against comes from PyPI wherever PyPI has it.
 
 Requirements
 ------------
 
-* A CUDA-capable NVIDIA GPU.
-* The `NVIDIA CUDA Toolkit <https://developer.nvidia.com/cuda-downloads>`_.
-* `cuDSS <https://developer.nvidia.com/cudss>`_ >= 0.8.0 (sparse direct solve).
-* cuSPARSE (ships with the CUDA Toolkit).
-* Python >= 3.9, a C++17 compiler, CMake >= 3.15.
-* `lightsim2grid <https://github.com/Grid2op/lightsim2grid>`_ — CPU
-  preprocessing and reference oracle (hard dependency).
+* A CUDA-capable NVIDIA GPU and its driver.
+* Python >= 3.9 and a C++17 compiler.
+* From PyPI:
 
-NVIDIA libraries (cuDSS, cuSPARSE) are **not** redistributed with this package;
-install the CUDA Toolkit and cuDSS yourself before building.
+  * `lightsim2grid <https://github.com/Grid2op/lightsim2grid>`_ >= 1.3.1 — CPU
+    preprocessing and reference oracle (hard dependency). Its wheel ships
+    ``lightsim2grid_core``, its headers and the KLU headers the bridge compiles
+    against: no lightsim2grid or SuiteSparse checkout is needed.
+  * `cuDSS <https://developer.nvidia.com/cudss>`_ 1.x (sparse direct solve):
+    ``nvidia-cudss-cu12`` or ``nvidia-cudss-cu13``, ``>=1.0.0.35,<2``.
+  * the CUDA libraries (cudart, cuBLAS, cuSOLVER, cuSPARSE), and for CUDA 13 the
+    compiler too: ``cuda-toolkit``. ``pip install ".[cuda12]"`` / ``".[cuda13]"``
+    lists the runtime ones.
+  * ``scikit-build-core``, ``pybind11`` and ``cmake``.
 
-From source
------------
+* PyPI has no CUDA 12 compiler (``nvidia-cuda-nvcc-cu12`` ships ``ptxas`` only):
+  with CUDA 12, ``nvcc`` (12.4 or later) comes from the
+  `NVIDIA CUDA Toolkit <https://developer.nvidia.com/cuda-downloads>`_ installer.
+
+CI builds both: CUDA 12.4 with ``nvidia-cudss-cu12``, and the latest CUDA 13 on
+PyPI with ``nvidia-cudss-cu13`` (``.github/workflows/build.yml``).
+
+From source, CUDA 13
+--------------------
 
 .. code-block:: bash
 
    git clone https://github.com/Grid2Op/gpusim2grid.git
    cd gpusim2grid
-   source env_compile.sh   # exports CUDAToolkit_ROOT, cudss_ROOT, LD_LIBRARY_PATH — edit for your machine
-   pip install --no-build-isolation .
+   pip install "lightsim2grid>=1.3.1" "nvidia-cudss-cu13>=1.0.0.35,<2" \
+       "cuda-toolkit[nvcc,crt,cudart,cccl,cublas,cusolver,cusparse,nvjitlink,nvvm]>=13,<14" \
+       scikit-build-core pybind11 cmake
+   CUDA_ROOT=$(python -c "import nvidia.cu13 as m; print(list(m.__path__)[0])")
+   CUDACXX=$CUDA_ROOT/bin/nvcc CUDAToolkit_ROOT=$CUDA_ROOT cudss_DIR=$PWD/ci/cmake/cudss \
+       pip install --no-build-isolation .
+   export LD_LIBRARY_PATH=$CUDA_ROOT/lib:$LD_LIBRARY_PATH
+
+The CUDA 13 wheels put the whole toolkit, and cuDSS, under one prefix
+(``<site-packages>/nvidia/cu13``). Its libraries carry their soname only
+(``libcudart.so.13``); ``src/_cpp/CMakeLists.txt`` points CMake's
+``FindCUDAToolkit`` at them. They are not on the loader's path: set
+``LD_LIBRARY_PATH`` as above before importing gpusim2grid.
+
+From source, CUDA 12
+--------------------
+
+.. code-block:: bash
+
+   pip install "lightsim2grid>=1.3.1" "nvidia-cudss-cu12>=1.0.0.35,<2" \
+       scikit-build-core pybind11 cmake
+   # nvcc from the CUDA 12.4+ toolkit on PATH (or CUDACXX=/path/to/nvcc)
+   cudss_DIR=$PWD/ci/cmake/cudss pip install --no-build-isolation .
+   export LD_LIBRARY_PATH=$(python -c "import nvidia.cu12 as m; print(list(m.__path__)[0])")/lib:$LD_LIBRARY_PATH
+
+``ci/cmake/cudss/`` is a small CMake package for the cuDSS wheel, which ships
+none (``find_package(cudss)`` finds NVIDIA's tarball or apt packages without
+it: leave ``cudss_DIR`` unset and set ``cudss_ROOT`` for those). It takes the
+wheel matching nvcc's CUDA major in the building Python, or
+``CUDSS_WHEEL_ROOT`` (``<site-packages>/nvidia/cuXX``).
 
 The lightsim2grid C++ bridge
 -----------------------------
@@ -61,40 +101,31 @@ When ``lightsim2grid_core`` cannot be found (bridge disabled), the build
 falls back to the vendored Eigen copy (``src/eigen/``) and the Python
 fallback path is used at runtime instead — the Python fallback is exercised
 against the bridge path for parity in ``tests/python/test_new_api.py``
-(``use_bridge=False`` vs ``use_bridge=True``), but this project has no CI
-yet, so that comparison is only ever run by hand, not automatically on
-every change.
+(``use_bridge=False`` vs ``use_bridge=True``), a GPU test: CI's GPU-less
+build legs skip it, the opt-in Modal job runs it.
 
 SuiteSparse headers for the bridge
 -----------------------------------
 
 When the bridge is enabled, ``LSGrid.hpp`` transitively pulls in KLU headers
 (``cs.h``, ``klu.h``, ``amd.h``, ``colamd.h``, ``btf.h``,
-``SuiteSparse_config.h``) that the installed ``lightsim2grid_core`` package
-does not ship. CMake looks for them in order:
+``SuiteSparse_config.h``). CMake looks for them in order:
 
-1. A system SuiteSparse dev package (e.g. Debian/Ubuntu's
-   ``libsuitesparse-dev``), auto-detected via ``find_path``. Set
-   ``SUITESPARSE_INCLUDE_DIR`` (env var or ``-D``) if it's installed
-   somewhere non-standard.
-2. A SuiteSparse *source checkout*'s per-module ``Include/`` layout, via
+1. ``SUITESPARSE_INCLUDE_DIR`` (env var or ``-D``): a directory holding
+   ``klu.h`` and the others directly.
+2. The ones ``lightsim2grid_core`` ships (lightsim2grid >= 1.3.0, its wheel
+   included), already on its include path: the usual case, nothing to set.
+3. The SuiteSparse checkout next to the lightsim2grid *source* the Python's
+   lightsim2grid was built from (per-module ``Include/`` layout), or
    ``-DGPUSIM2GRID_SUITESPARSE_DIR=/path/to/SuiteSparse``.
+4. A system SuiteSparse dev package (e.g. Debian/Ubuntu's
+   ``libsuitesparse-dev``).
 
-If neither is found, configuration prints a warning and the bridge may fail
-to compile with a ``cs.h``/``klu.h`` not found error — install
-``libsuitesparse-dev`` (or point at a checkout) to fix it.
+If none is found, configuration stops with an error listing them.
 
-It's best to build against the **same Eigen and SuiteSparse** (same
-versions, same compile flags) that your ``lightsim2grid`` build used —
-mismatched ABI/struct layouts between the two can fail silently rather than
-at compile time. The only configuration currently exercised and known to
-work is:
-
-* ``lightsim2grid`` installed from source (``pip install --no-build-isolation .``),
-* ``gpusim2grid`` installed from source the same way.
-
-Other configurations (prebuilt ``lightsim2grid`` wheel, mixed Eigen/SuiteSparse
-versions, ...) may work but are not tested.
+The bridge is compiled with the flags ``lightsim2grid_core`` exports (its
+``-O3`` / ``-march=native``), so that both agree on the layout of the objects
+they share.
 
 Selecting floating-point precision
 ----------------------------------
