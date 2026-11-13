@@ -7,6 +7,27 @@ if(cudss_VERSION AND cudss_VERSION VERSION_LESS 0.8.0)
     message(FATAL_ERROR "cuDSS >= 0.8.0 required, found ${cudss_VERSION}")
 endif()
 message(STATUS "cuDSS ${cudss_VERSION} found in ${cudss_DIR}")
+# A CUDA toolkit installed from PyPI (``cuda-toolkit[nvcc,...]``, CUDA 13: one
+# prefix <site-packages>/nvidia/cu13 holding bin/nvcc, include/ and lib/) ships
+# each library under its soname only (libcudart.so.13, libcusparse.so.12), not
+# the unversioned libcudart.so that FindCUDAToolkit's find_library looks for.
+# Point it at the versioned files then; a toolkit from NVIDIA's installer or
+# container has the unversioned names and is left alone.
+get_filename_component(_g2g_cuda_lib "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+get_filename_component(_g2g_cuda_lib "${_g2g_cuda_lib}/../lib" ABSOLUTE)
+foreach(_g2g_l cudart cublas cublasLt cusolver cusparse nvJitLink)
+    if(NOT EXISTS "${_g2g_cuda_lib}/lib${_g2g_l}.so")
+        file(GLOB _g2g_f "${_g2g_cuda_lib}/lib${_g2g_l}.so.[0-9]*")
+        if(_g2g_f)
+            list(SORT _g2g_f)
+            list(GET _g2g_f 0 _g2g_f)
+            set(CUDA_${_g2g_l}_LIBRARY "${_g2g_f}" CACHE FILEPATH "")
+            if(_g2g_l STREQUAL "cudart")
+                set(CUDA_CUDART "${_g2g_f}" CACHE FILEPATH "")
+            endif()
+        endif()
+    endif()
+endforeach()
 find_package(CUDAToolkit REQUIRED COMPONENTS cublas cudart cusolver cusparse)
 # The zero-copy lightsim2grid bridge is compiled only when lightsim2grid_core
 # was found at configure time (see ../CMakeLists.txt). It is a CUDA-free .cpp.
@@ -127,17 +148,18 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
 
     # LSGrid.hpp transitively includes KLUSolver.hpp because lightsim2grid_core
     # exports -DKLU_SOLVER_AVAILABLE. That header needs the SuiteSparse headers
-    # (cs.h, klu.h, amd.h, colamd.h, btf.h, SuiteSparse_config.h), which the
-    # installed lightsim2grid_core package does NOT ship. We must compile the
-    # bridge *with* KLU_SOLVER_AVAILABLE to match the ABI of the loaded
-    # lightsim2grid_cpp module, so we need these headers from somewhere else.
-    # (Upstream fix: lightsim2grid_core should bundle these headers or keep KLU
-    #  out of its public header surface — see docs/lightsim2grid_requirements.md.)
+    # (cs.h, klu.h, amd.h, colamd.h, btf.h, SuiteSparse_config.h). We must
+    # compile the bridge *with* KLU_SOLVER_AVAILABLE to match the ABI of the
+    # loaded lightsim2grid_cpp module, so we need these headers. lightsim2grid
+    # >= 1.3.0 ships them with the core; older versions do not, and they have
+    # to come from somewhere else.
     #
     # Search order (first hit wins):
     #   1. SUITESPARSE_INCLUDE_DIR (CMake var or env var): a single directory
     #      containing klu.h et al. directly (flat layout, as a system package
     #      or a hand-merged include dir would produce).
+    #   1b. The ones lightsim2grid_core ships (lightsim2grid >= 1.3.0), already
+    #      on lightsim2grid::core's include path.
     #   2. The SuiteSparse checkout next to the lightsim2grid *source* this
     #      Python interpreter's lightsim2grid was built from (per-module
     #      Include/ layout, e.g. a local lightsim2grid clone's SuiteSparse
@@ -164,6 +186,19 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
         message(STATUS "[gpusim2grid] SUITESPARSE_INCLUDE_DIR="
                        "${SUITESPARSE_INCLUDE_DIR} does not contain klu.h "
                        "directly; ignoring it and trying the next option.")
+    endif()
+
+    # 1b. lightsim2grid >= 1.3.0 installs them with the core and puts them on
+    #     lightsim2grid::core's include path: nothing to add.
+    if(NOT GPUSIM2GRID_SUITESPARSE_FOUND)
+        get_target_property(_ls2g_incs lightsim2grid::core INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(_d IN LISTS _ls2g_incs)
+            if(EXISTS "${_d}/klu.h")
+                message(STATUS "[gpusim2grid] SuiteSparse headers for ls2g bridge "
+                               "(shipped with lightsim2grid_core): ${_d}")
+                set(GPUSIM2GRID_SUITESPARSE_FOUND TRUE)
+            endif()
+        endforeach()
     endif()
 
     # 2. Auto-detect the lightsim2grid source checkout's own SuiteSparse
@@ -215,7 +250,8 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
         message(FATAL_ERROR
             "[gpusim2grid] SuiteSparse headers not found (cs.h/klu.h). Tried, "
             "in order: SUITESPARSE_INCLUDE_DIR (env var or -D, flat dir "
-            "containing klu.h directly), the SuiteSparse checkout next to "
+            "containing klu.h directly), the ones lightsim2grid_core ships "
+            "(lightsim2grid >= 1.3.0), the SuiteSparse checkout next to "
             "the lightsim2grid this Python's lightsim2grid was built from "
             "(auto-detected, override with -DGPUSIM2GRID_SUITESPARSE_DIR=... "
             "at a per-module Include/ layout), and the system SuiteSparse dev "

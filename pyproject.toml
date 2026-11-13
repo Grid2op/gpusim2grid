@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core", "pybind11", "lightsim2grid>=1.0.0rc1"]
+requires = ["scikit-build-core", "pybind11", "lightsim2grid>=1.3.1"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -37,7 +37,9 @@ classifiers = [
 dependencies = [
   "numpy",
   "scipy",
-  "lightsim2grid>=1.0.0rc1",
+  # >= 1.3.1: its wheel ships lightsim2grid_core, its headers and the KLU
+  # headers the bridge compiles against, and the API the bridge uses.
+  "lightsim2grid>=1.3.1",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +52,20 @@ docs = [
   "sphinx>=7",
   "sphinx-rtd-theme>=2",
   "myst-parser>=2",
+]
+# The CUDA libraries and cuDSS from PyPI, for the CUDA major the extension was
+# built with (also what .github/workflows/build.yml installs). Building with
+# CUDA 13 also needs cuda-toolkit's nvcc, crt, cccl and nvvm; PyPI has no
+# CUDA 12 compiler (see docs/installation.rst).
+cuda12 = [
+  "cuda-toolkit[cudart,cublas,cusolver,cusparse,nvjitlink]>=12.4,<13",
+  "nvidia-cudss-cu12>=1.0.0.35",
+  "nvidia-cudss-cu12<2",
+]
+cuda13 = [
+  "cuda-toolkit[cudart,cublas,cusolver,cusparse,nvjitlink]>=13,<14",
+  "nvidia-cudss-cu13>=1.0.0.35",
+  "nvidia-cudss-cu13<2",
 ]
 # gpusim2grid.differentiable (BatchPowerFlow / PowerFlowFunction) needs a
 # CUDA-enabled PyTorch; everything else works without it.
