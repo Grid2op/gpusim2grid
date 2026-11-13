@@ -41,7 +41,7 @@ PY = "3.10"
 image = (
     # The runtime image ships cuSPARSE/cuBLAS/cuSOLVER, no compiler needed.
     modal.Image.from_registry(f"nvidia/cuda:{CUDA}-runtime-ubuntu22.04", add_python=PY)
-    .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8", "numpy", "scipy", "pytest",
+    .pip_install(f"nvidia-cudss-cu{CUDA_MAJOR}>=0.8,<1", "numpy", "scipy", "pytest",
                  "pytest-timeout", "pandapower", "pypowsybl")
     # Enables the DLPack / differentiable tests (importorskip("torch") otherwise).
     .pip_install("torch", index_url="https://download.pytorch.org/whl/"
