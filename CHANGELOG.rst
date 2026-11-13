@@ -3,6 +3,12 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [IMPROVED] ``outer_loops=True``: a row can trip an HVDC line with a station regulating a voltage
+  (it was ``BATCH_UNSUPPORTED``).
+- [FIXED] ``outer_loops=True``: a tripped controller came back at a reactive limit when ``ReactiveLimits``
+  froze a bus it shared with another controller of its group.
+- [IMPROVED] (diagnostic) ``GPUSIM2GRID_OC_PROFILE=1`` also counts the rows never re-solved, the loops
+  that act and the frozen buses resumed.
 - [ADDED] A contingency or a row can trip an SVC with a standby automaton (lightsim2grid leaves it out): its
   release-check entries and the ``VoltageMonitoring`` loop skip it for that row.
 - [IMPROVED] ``outer_loops=True``: the rows' adjoint terms (``pq_buses``, ``gen_p_fixed``, ...) are only computed
