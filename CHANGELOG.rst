@@ -1,7 +1,7 @@
 Change Log
 ===========
 
-[0.2.0] 2026-xx-yy
+[0.3.0] 2026-xx-yy
 --------------------
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at
   one end only keeps its charging from the other, as in lightsim2grid.
@@ -29,6 +29,11 @@ Change Log
   participants, resumed targets and reactive-limits plan are built once per grid, not per row.
 - [IMPROVED] ``compute_limit_violations``: the operational check runs one GPU block per row, not one thread,
   same records; it cost tens of ms per call on a real grid, every continuous round.
+- [FIXED] ``outer_loops=True``: parallel transformers of ``PhaseControl`` / ``TransformerVoltageControl`` lost
+  Ybus patches (racing threads), leaving rows at their iteration budget or on wrong blocks.
+- [ADDED] ``benchmark_cudss_batch_raw`` and ``solve_cudss_raw`` take ``ir_n_steps``.
+- [ADDED] ``benchmarks/outer_loops.py`` (the outer loops against lightsim2grid's ``NROuter_KLU``),
+  ``benchmarks/continuous_batching.py`` and ``continuous_batching_potential.py`` (chunked vs continuous).
 - [ADDED] ``BatchTimings.t_sched_res_sync`` / ``t_oc_gather`` / ``t_oc_decide`` / ``t_oc_controls`` /
   ``t_oc_load``: where a continuous run's per-round host time goes, outer loops included.
 - [ADDED] ``BatchTimings.t_driver_solve_wall_ms`` / ``t_session_run_wall_ms``: whole-call wall clocks,
@@ -78,6 +83,9 @@ Change Log
 - [IMPROVED] ``reactive_limits_outer_loop``: the second pass starts each contingency from its
   first-pass voltages (``outer_loop_warm_start``, default on); ``outer_loop_nb_iter`` sets its
   Newton iterations.
+
+[0.2.0] 2026-xx-yy
+--------------------
 - [ADDED] ``redistribute_slack`` (``ContingencyAnalysisGPU``, ``ScenarioSweepGPU``,
   ``BatchPowerFlow``): OpenLoadFlow's bounded slack pre-pass on what a row loses, as
   lightsim2grid PR #216.
@@ -86,6 +94,8 @@ Change Log
   (``SlackRedistributionData.base_p_mw``), as lightsim2grid.
 - [ADDED] ``reference_slack="auto"`` (default with ``handle_disconnected_grid``): the angle
   reference is the slack unit stranded by the fewest rows.
+- [ADDED] ``LimitViolationType`` mirrors lightsim2grid 1.2's ``LOW_VOLTAGE_REMOTE_CONTROL`` /
+  ``HIGH_VOLTAGE_REMOTE_CONTROL`` / ``HVDC_AC_EMULATION_RELEASE`` (category PHYSICAL, not computed yet).
 - [ADDED] PQ -> PV release check (``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q``) and
   ``physical_violation_tol_vm_pu``.
 - [ADDED] ``violation_rel_tol`` (default ``1e-9``): a value on its operational limit up to
