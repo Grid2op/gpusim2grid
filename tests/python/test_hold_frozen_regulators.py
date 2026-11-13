@@ -128,8 +128,9 @@ def test_held_controllers_are_read():
 
 
 def test_same_solution_with_held_controllers(solver_atol):
-    """AcPfGPU (from a flat start), ContingencyAnalysisGPU (islands masked,
-    physical checks) and ScenarioSweepGPU give the same answer on the held grid."""
+    """AcPfGPU (a Newton from the grid's own V, init_from_n_powerflow=False),
+    ContingencyAnalysisGPU (islands masked, physical checks) and ScenarioSweepGPU give
+    the same answer on the held grid."""
     from gpusim2grid import AcPfGPU, ContingencyAnalysisGPU, ScenarioSweepGPU
     (g_off, V_off), (g_on, V_on) = _grid(), _grid(hold=True)
     ac = AcPfGPU(g_on, max_iter=30, tol=1e-11, init_from_n_powerflow=False)

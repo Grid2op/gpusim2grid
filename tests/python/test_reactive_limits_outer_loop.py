@@ -291,6 +291,8 @@ def test_remote_release(solver_atol):
         if not getattr(_cpp, "have_ls2g_hold_frozen", False):
             assert st[i] == S.UNSUPPORTED
             assert _records(ca_on.get_physical_violations()[i]) == _records(phys[i])
+            np.testing.assert_allclose(V[i], ca_off.V_results.to_numpy().reshape(2, -1)[i],
+                                       atol=solver_atol, rtol=0)
             continue
         assert st[i] == S.RECOMPUTED and list(sw[i]["vc_release"]) == [1]
         ref = _remote_feeder(remote_on=True)
