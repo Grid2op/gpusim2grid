@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] ``BatchTimings.cudss_user_perm_honoured`` and, with ``GPUSIM2GRID_COUNT_PIVOTS=1``,
+  ``cudss_npivots_*``: whether cuDSS used the order given, and how many pivots it perturbed.
 - [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
   constrained order given to cuDSS. Removes its perturbed pivots but slows it 6-9x; see the dev note.
 - [ADDED] ``BatchPowerFlow``: ``redistribute_slack`` with ``outer_loops=True``, the lost power measured in
