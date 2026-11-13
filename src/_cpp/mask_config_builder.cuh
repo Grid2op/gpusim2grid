@@ -61,6 +61,10 @@ inline MaskConfig build_mask_config(const AcPfNrState& base, const LedgerData* l
         cfg.vc_vrow           = base.h_vc_vrow;
         cfg.vc_vrow_qcol_pos  = base.h_vc_vrow_qcol_pos;
         cfg.vc_vrow_vmcol_pos = base.h_vc_vrow_vmcol_pos;
+        cfg.vc_ctrl_sh_row       = base.h_vc_ctrl_sh_row;
+        cfg.vc_ctrl_sh_self_pos  = base.h_vc_ctrl_sh_self_pos;
+        cfg.vc_ctrl_sh_first_pos = base.h_vc_ctrl_sh_first_pos;
+        if (base.has_vc_held) cfg.vc_held = base.h_vc_held;
     }
     return cfg;
 }

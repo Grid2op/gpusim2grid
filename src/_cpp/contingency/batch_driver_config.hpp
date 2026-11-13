@@ -9,6 +9,7 @@
 #include "../reordering_alg.hpp"
 #include "../matching_alg.hpp"
 #include "../pivot_epsilon_alg.hpp"
+#include "row_status.hpp"                   // BatchScheduling
 
 // =============================================================================
 // BatchDriverConfig — the construction-time shape of a session's live batch
@@ -29,23 +30,29 @@ struct BatchDriverConfig {
     ReorderingAlg   reordering_alg    = ReorderingAlg::Default;
     MatchingAlg     matching_alg      = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default;
+    int    ir_n_steps = 0;
     bool   scaling_max_voltage_change = false;
     double max_dVa = 0.5, max_dVm = 0.1;
     bool   mask_mode            = false;   // handle_disconnected_grid
     bool   fixed_batch_capacity = false;
     int    base_state_generation = -1;
     int    rows_generation       = -1;     // ContingencyAnalysisSession: contingency list version
+    // The schedule: a chunked run after a continuous one must not take the
+    // hot path on a capacity built for the other. (The continuous schedule
+    // always takes the cold path anyway.)
+    BatchScheduling scheduling = BatchScheduling::Chunked;
 
     bool operator==(const BatchDriverConfig& o) const {
         return n_scenarios == o.n_scenarios && batch_size == o.batch_size
             && refactor_period == o.refactor_period && strategy == o.strategy
             && reordering_alg == o.reordering_alg && matching_alg == o.matching_alg
-            && pivot_epsilon_alg == o.pivot_epsilon_alg
+            && pivot_epsilon_alg == o.pivot_epsilon_alg && ir_n_steps == o.ir_n_steps
             && scaling_max_voltage_change == o.scaling_max_voltage_change
             && max_dVa == o.max_dVa && max_dVm == o.max_dVm
             && mask_mode == o.mask_mode && fixed_batch_capacity == o.fixed_batch_capacity
             && base_state_generation == o.base_state_generation
-            && rows_generation == o.rows_generation;
+            && rows_generation == o.rows_generation
+            && scheduling == o.scheduling;
     }
     bool operator!=(const BatchDriverConfig& o) const { return !(*this == o); }
 };

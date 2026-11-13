@@ -82,6 +82,41 @@ __device__ __forceinline__ void atomic_max_nonneg(double* addr, double val) {
 }
 
 // =============================================================================
+// override_branch_flows_kernel
+// =============================================================================
+__global__ void override_branch_flows_kernel(
+    const cudaComplexType* __restrict__ d_V,
+    const int*             __restrict__ d_row,
+    const int*             __restrict__ d_branch,
+    const cudaComplexType* __restrict__ d_blk,
+    const int*             __restrict__ d_branch_from,
+    const int*             __restrict__ d_branch_to,
+    const cuda_real_type*  __restrict__ d_base_current_A,
+    const cuda_real_type*  __restrict__ d_base_current_ex_A,
+          cuda_real_type*  __restrict__ d_or_amps,
+          cuda_real_type*  __restrict__ d_ex_amps,
+    int n_bus, int n_branches, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const ptrdiff_t r = d_row[i];
+    const int l = d_branch[i];
+    const int bf = d_branch_from[l];
+    const int bt = d_branch_to[l];
+    const cudaComplexType zero = CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType Vi = (bf >= 0) ? d_V[r * n_bus + bf] : zero;
+    const cudaComplexType Vj = (bt >= 0) ? d_V[r * n_bus + bt] : zero;
+    const cudaComplexType* y = d_blk + 4 * static_cast<ptrdiff_t>(i);
+    const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
+        CudaFunHelper::my_cuCmul(y[0], Vi), CudaFunHelper::my_cuCmul(y[1], Vj)) : zero;
+    const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
+        CudaFunHelper::my_cuCmul(y[2], Vi), CudaFunHelper::my_cuCmul(y[3], Vj)) : zero;
+    const ptrdiff_t out_idx = r * n_branches + l;
+    d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
+    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
+}
+
+// =============================================================================
 // compute_branch_flows_kernel
 // =============================================================================
 __global__ void compute_branch_flows_kernel(
@@ -100,7 +135,8 @@ __global__ void compute_branch_flows_kernel(
     int n_branches,
     int c_start,
     int actual_batch,
-    const int* __restrict__ d_result_map)
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active)
 {
     // tid/b widened to ptrdiff_t: see fill_J_kernel's own note. Here
     // actual_batch * n_branches (this launch's thread count) and b * n_bus /
@@ -109,6 +145,8 @@ __global__ void compute_branch_flows_kernel(
     const ptrdiff_t b   = tid / n_branches;   // contingency index in batch
     const int        l  = static_cast<int>(tid % n_branches);   // branch index
     if (b >= actual_batch) return;
+    const int a = d_slot_active ? d_slot_active[b] : static_cast<int>(c_start + b);
+    if (a < 0) return;
 
     // branch_from/branch_to are in AC-solver bus numbering (see
     // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
@@ -137,7 +175,7 @@ __global__ void compute_branch_flows_kernel(
     // d_result_map is null, e.g. the full-batch session call or injection).
     // out_c itself (a contingency index < n_contingencies) fits int32; only
     // out_c * n_branches (the flat offset) needs the 64-bit product.
-    const int out_c   = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
+    const int out_c   = d_result_map ? d_result_map[a] : a;
     const ptrdiff_t out_idx = static_cast<ptrdiff_t>(out_c) * n_branches + l;
     d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
     d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
@@ -157,7 +195,8 @@ __global__ void scatter_V_results_kernel(
     const int*             __restrict__ d_result_map,
     int c_start,
     int n_bus,
-    int actual_batch)
+    int actual_batch,
+    const int*             __restrict__ d_slot_active)
 {
     // tid/total/local_c widened to ptrdiff_t -- actual_batch * n_bus (this
     // launch's thread count) and local_c/out_c * n_bus (the offsets below)
@@ -168,7 +207,9 @@ __global__ void scatter_V_results_kernel(
 
     const ptrdiff_t local_c = tid / n_bus;   // active-slot index in this chunk
     const int       bus     = static_cast<int>(tid % n_bus);
-    const int out_c   = d_result_map[c_start + local_c];   // original index
+    const int a = d_slot_active ? d_slot_active[local_c] : static_cast<int>(c_start + local_c);
+    if (a < 0) return;
+    const int out_c = d_result_map ? d_result_map[a] : a;   // original index
     d_V_results[static_cast<ptrdiff_t>(out_c) * n_bus + bus] = d_V_batch[local_c * n_bus + bus];
 }
 
@@ -251,11 +292,15 @@ __global__ void mask_V_nan_kernel(
     const int*             __restrict__ d_maskv_bus,
     cuda_real_type nan_val,
     int n_bus,
-    int n_entries)
+    int n_entries,
+    const int*             __restrict__ d_slot_active)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_entries) return;
     const int slot = d_maskv_slot[tid];
+    // continuous batching: only the slots leaving this round (a slot that
+    // stays keeps iterating on its masked buses' finite values)
+    if (d_slot_active && d_slot_active[slot] < 0) return;
     const int bus  = d_maskv_bus[tid];
     d_V[static_cast<ptrdiff_t>(slot) * n_bus + bus] =
         CudaFunHelper::my_make_cuComplex(nan_val, nan_val);
@@ -267,12 +312,12 @@ __global__ void mask_V_nan_kernel(
 __global__ void zero_branch_flows_kernel(
           cuda_real_type* __restrict__ d_or_amps,
           cuda_real_type* __restrict__ d_ex_amps,
-    const int*           __restrict__ d_zero_indices,
-    int n_entries)
+    const long long*     __restrict__ d_zero_indices,
+    long long n_entries)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n_entries) return;
-    const int idx = d_zero_indices[i];
+    const long long idx = d_zero_indices[i];
     d_or_amps[idx] = cuda_real_type(0);
     d_ex_amps[idx] = cuda_real_type(0);
 }
@@ -336,6 +381,73 @@ __global__ void apply_gen_v_kernel(
     d_V_batch[r * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
         CudaFunHelper::my_cuCreal(v) * scale,
         CudaFunHelper::my_cuCimag(v) * scale);
+}
+
+// =============================================================================
+// vc_pinned_ctrl_rows_kernel
+// =============================================================================
+__global__ void vc_pinned_ctrl_rows_kernel(
+          cuda_real_type* __restrict__ d_F,
+    const cuda_real_type* __restrict__ d_vc_q,
+    const int*            __restrict__ d_slot,
+    const int*            __restrict__ d_row,
+    const int*            __restrict__ d_ctrl,
+    const cuda_real_type* __restrict__ d_target,
+    int n_ctrl,
+    int dim_J,
+    int n_entries)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_entries) return;
+    const ptrdiff_t slot = d_slot[k];
+    d_F[slot * dim_J + d_row[k]] = -(d_vc_q[slot * n_ctrl + d_ctrl[k]] - d_target[k]);
+}
+
+// =============================================================================
+// apply_vm_reseed_kernel
+// =============================================================================
+__global__ void apply_vm_reseed_kernel(
+          cudaComplexType* __restrict__ d_V_batch,
+    const int*             __restrict__ d_slot,
+    const int*             __restrict__ d_bus,
+    const cuda_real_type*  __restrict__ d_vm,
+    int n_entries,
+    int n_bus)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_entries) return;
+    const ptrdiff_t at = static_cast<ptrdiff_t>(d_slot[k]) * n_bus + d_bus[k];
+    cudaComplexType v = d_V_batch[at];
+    cuda_real_type mag = CudaFunHelper::my_cuCabs(v);
+    if (mag < cuda_real_type(1e-10)) {
+        v   = CudaFunHelper::my_make_cuComplex(cuda_real_type(1), cuda_real_type(0));
+        mag = cuda_real_type(1);
+    }
+    const cuda_real_type scale = d_vm[k] / mag;
+    d_V_batch[at] = CudaFunHelper::my_make_cuComplex(
+        CudaFunHelper::my_cuCreal(v) * scale,
+        CudaFunHelper::my_cuCimag(v) * scale);
+}
+
+// =============================================================================
+// gather_v_rows_kernel
+// =============================================================================
+__global__ void gather_v_rows_kernel(
+          cudaComplexType* __restrict__ d_dst,
+    const cudaComplexType* __restrict__ d_src,
+    const int*             __restrict__ d_map,
+    const cudaComplexType* __restrict__ d_fallback,
+    int n_bus,
+    int n_rows)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t r   = tid / n_bus;
+    const int       b   = static_cast<int>(tid % n_bus);
+    if (r >= n_rows) return;
+    const ptrdiff_t src_r = d_map ? d_map[r] : r;
+    const cudaComplexType v = d_src[src_r * n_bus + b];
+    d_dst[r * n_bus + b] = (isfinite(CudaFunHelper::my_cuCreal(v)) && isfinite(CudaFunHelper::my_cuCimag(v)))
+                         ? v : d_fallback[b];
 }
 
 // =============================================================================
@@ -754,6 +866,7 @@ __global__ void hvdc_adjust_mismatch_kernel(
     const int*             __restrict__ bus1,
     const int*             __restrict__ bus2,
     const int*             __restrict__ status,
+    int                                 status_stride,   // 0: shared, n_hvdc: per slot
     const cuda_real_type*  __restrict__ p0,
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
@@ -783,7 +896,7 @@ __global__ void hvdc_adjust_mismatch_kernel(
     const cuda_real_type raw = p0[e] + k[e] * (th1 - th2);
 
     cuda_real_type p1_flow, p2_flow;
-    hvdc_flows_pu(status[e], raw, lf1[e], lf2[e], r[e], pmax12[e], pmax21[e],
+    hvdc_flows_pu(status[b * status_stride + e], raw, lf1[e], lf2[e], r[e], pmax12[e], pmax21[e],
                   p1_flow, p2_flow);
 
     // mis(bus) += p_flow  ⇒  residual d_F[p_row] -= p_flow
@@ -797,6 +910,7 @@ __global__ void hvdc_fill_feature_kernel(
     const int*             __restrict__ bus1,
     const int*             __restrict__ bus2,
     const int*             __restrict__ status,
+    int                                 status_stride,   // 0: shared, n_hvdc: per slot
     const cuda_real_type*  __restrict__ p0,
     const cuda_real_type*  __restrict__ k,
     const cuda_real_type*  __restrict__ lf1,
@@ -816,7 +930,7 @@ __global__ void hvdc_fill_feature_kernel(
     const ptrdiff_t b   = tid / n_hvdc;
     const int       e   = static_cast<int>(tid % n_hvdc);
     if (b >= actual_batch) return;
-    if (status[e] != 0) return;   // saturated: constant injection, zero slopes
+    if (status[b * status_stride + e] != 0) return;   // saturated: constant injection, zero slopes
 
     const cudaComplexType V1 = d_V[b * n_bus + bus1[e]];
     const cudaComplexType V2 = d_V[b * n_bus + bus2[e]];
@@ -853,6 +967,7 @@ __global__ void vc_adjust_mismatch_kernel(
           cuda_real_type* __restrict__ d_F,
     const cuda_real_type* __restrict__ d_vc_q,
     const int*            __restrict__ d_vc_qrow,
+    const cuda_real_type* __restrict__ d_vc_qoff,
     int n_ctrl,
     int dim_J,
     int actual_batch)
@@ -862,8 +977,10 @@ __global__ void vc_adjust_mismatch_kernel(
     const ptrdiff_t b   = tid / n_ctrl;
     const int       j   = static_cast<int>(tid % n_ctrl);
     if (b >= actual_batch) return;
-    // mis(c.bus) -= i·Q_c  ⇒  residual d_F[q_row] += Q_c
-    atomic_add_real(&d_F[b * dim_J + d_vc_qrow[j]], d_vc_q[b * n_ctrl + j]);
+    // mis(c.bus) -= i·(Q_c - q_off_c)  ⇒  residual d_F[q_row] += Q_c - q_off_c: a held
+    // controller's frozen output is already in Sbus
+    const cuda_real_type off = d_vc_qoff ? d_vc_qoff[j] : cuda_real_type(0);
+    atomic_add_real(&d_F[b * dim_J + d_vc_qrow[j]], d_vc_q[b * n_ctrl + j] - off);
 }
 
 __global__ void vc_vrow_kernel(
@@ -954,7 +1071,8 @@ __global__ void compute_residuals_kernel(
     int dim_J,
     int actual_batch,
     int c_start,
-    const int* __restrict__ d_result_map)
+    const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active)
 {
     // One block handles one contingency. b widened to ptrdiff_t: blockIdx.x
     // itself is a valid small block index, but b * dim_J below is the same
@@ -962,6 +1080,10 @@ __global__ void compute_residuals_kernel(
     // dim_J grows large.
     const ptrdiff_t b = blockIdx.x;
     if (b >= actual_batch) return;
+    // The slot's active row (d_slot_active, -1 = skip: the whole block returns)
+    // or the chunk's c_start + b.
+    const int a = d_slot_active ? d_slot_active[b] : static_cast<int>(c_start + b);
+    if (a < 0) return;
 
     extern __shared__ cuda_real_type sdata[];
 
@@ -993,7 +1115,7 @@ __global__ void compute_residuals_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const int out = d_result_map ? d_result_map[c_start + b] : static_cast<int>(c_start + b);
+        const int out = d_result_map ? d_result_map[a] : a;
         d_residuals[out] = sdata[0];
     }
 }

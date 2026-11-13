@@ -29,6 +29,7 @@
 //   reordering_alg CUDSS_CONFIG_REORDERING_ALG choice for the ANALYSIS phase
 //   matching_alg   CUDSS_CONFIG_MATCHING_ALG choice for the ANALYSIS phase
 //   pivot_epsilon_alg CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for the ANALYSIS phase
+//   ir_n_steps     CUDSS_CONFIG_IR_N_STEPS, iterative refinement steps per SOLVE
 //
 // Returns dx (host, double), size dim.
 std::vector<double> solve_cudss_raw(
@@ -40,7 +41,8 @@ std::vector<double> solve_cudss_raw(
     int device = -1,
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
-    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0);
 
 // Result of benchmark_cudss_batch_raw(): wall-clock ms (stream-synchronized)
 // of each cuDSS phase on a uniform batch, the factor statistics cuDSS reports
@@ -78,6 +80,7 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     int device = -1,
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
-    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0);
 
 #endif  // RAW_CUDSS_SOLVE_H

@@ -44,7 +44,9 @@
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
-#include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/physical_checks_data.hpp"
+#include "contingency/row_status.hpp"   // BatchScheduling, RowStatus
+#include "outer/outer_hook.hpp"          // outer::OuterHook  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 
 #include <memory>
 #include <vector>
@@ -94,9 +96,17 @@ struct InjectionSweepSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // row runs nb_iter_ iterations) or continuous (nb_iter_ is each row's
+    // budget, checked every nb_iter_per_round_ iterations against tol_).
+    // Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see AcPfNrState's own
@@ -165,6 +175,8 @@ struct InjectionSweepSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
+    std::vector<double>               outer_gen_p_;  // the rows' generator targets (MW, row-major)
     // per-row set-points of the active-power check (set_gen_p_targets); empty
     // = the plan's base ones for every row
     RealMatRM gen_p_targets_;
@@ -203,6 +215,7 @@ struct InjectionSweepSession {
         ReorderingAlg reordering_alg = ReorderingAlg::Default,
         MatchingAlg matching_alg = MatchingAlg::None,
         PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int ir_n_steps = 0,
         // Opt-in diagnostic forwarded to base_state_ (see AcPfNrState's own
         // doc): force the pre-ground-truth cuDSS-solve derivation of
         // slack_absorbed/vc_q even when lightsim2grid's own converged values
@@ -309,6 +322,10 @@ struct InjectionSweepSession {
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_scenarios,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
 
     // =========================================================================
     // Post-solve PHYSICAL checks (opt-in, see contingency/physical_checks_data
@@ -321,6 +338,17 @@ struct InjectionSweepSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; see ScenarioSweepSession's): the model
+    // deciding on every row, built by the bridge off an NROuter_* grid.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    // the rows' generator targets (MW, n_rows x n_gen, row-major; empty: the grid's),
+    // what their loops start from
+    void set_outer_gen_p_rows(std::vector<double> gen_p) { outer_gen_p_ = std::move(gen_p); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);

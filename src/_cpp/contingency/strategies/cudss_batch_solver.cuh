@@ -207,6 +207,7 @@ struct CudssBatchSolver {
     //   reordering_alg    — CUDSS_CONFIG_REORDERING_ALG choice (default: cuDSS's own default)
     //   matching_alg      — CUDSS_CONFIG_MATCHING_ALG choice (default: cuDSS's own default, matching off)
     //   pivot_epsilon_alg — CUDSS_CONFIG_PIVOT_EPSILON_ALG choice (default: cuDSS's own default)
+    //   ir_n_steps        — CUDSS_CONFIG_IR_N_STEPS, iterative refinement steps per SOLVE
     //
     // Async: ANALYSIS is launched on cs; the caller must synchronize cs after
     // this call (or before consuming any results).
@@ -220,7 +221,8 @@ struct CudssBatchSolver {
                     cudaStream_t    cs,
                     ReorderingAlg   reordering_alg = ReorderingAlg::Default,
                     MatchingAlg     matching_alg = MatchingAlg::None,
-                    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default)
+                    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+                    int             ir_n_steps = 0)
     {
         auto chk = [](cudssStatus_t s, const char* msg) {
             if (s != CUDSS_STATUS_SUCCESS)
@@ -333,6 +335,7 @@ struct CudssBatchSolver {
         dss_.set_reordering_alg(reordering_alg);
         dss_.set_matching_alg(matching_alg);
         dss_.set_pivot_epsilon_alg(pivot_epsilon_alg);
+        dss_.set_ir_n_steps(ir_n_steps);
 
         if (mode_ == CudssBatchMode::Uniform) {
             dss_.analyze(dss_A_, dss_x_, dss_b_);
@@ -457,6 +460,8 @@ struct CudssBatchSolver {
         factorized_since_analysis_ = true;
     }
     void solve()    { dss_.solve      (dss_A_, dss_x_, dss_b_); }
+    // CUDSS_CONFIG_IR_N_STEPS for the next solves (read at SOLVE, no new ANALYSIS)
+    void set_ir_n_steps(int n) { dss_.set_ir_n_steps(n); }
 
     // Non-copyable, non-movable (cuDSS descriptors hold raw device pointers).
     CudssBatchSolver() = default;

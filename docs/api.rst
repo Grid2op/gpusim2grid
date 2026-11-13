@@ -30,6 +30,87 @@ callers without a lightsim2grid grid.
 
 .. autofunction:: gpusim2grid.optimize_reference_slack
 
+Batch scheduling
+~~~~~~~~~~~~~~~~
+
+The three batch facades (``ContingencyAnalysisGPU``, ``InjectionSweepGPU``,
+``ScenarioSweepGPU``) take ``scheduling="chunked"`` (the default) or
+``"continuous"``, a mutable setting like ``nb_iter``:
+
+- **chunked**: the rows go through the GPU in ``ceil(n_rows / batch_size)``
+  chunks, and every row runs exactly ``nb_iter`` Newton iterations. ``nb_iter``
+  must cover the hardest row, and the others pay for it.
+- **continuous**: ``batch_size`` slots. Every ``nb_iter_per_round``
+  iterations (default 1: a check is cheap next to a refactorization) each
+  row is checked, and one that converged
+  (``||F||inf < tol``), diverged or used its ``nb_iter`` budget leaves at
+  once -- its voltages, residual and violation records written -- and its slot
+  is refilled from the queue. A row pays the iterations it needs; it runs a
+  multiple of ``nb_iter_per_round``, at least one round.
+
+``tol`` (default 1e-8, 1e-3 in an FP32 build) is per unit, like
+``last_residuals()``; lightsim2grid takes its ``tol`` in MVA
+(``||F||inf < tol / sn_mva``). Both schedules report each row's outcome:
+``get_row_status()`` (:class:`gpusim2grid.RowStatus`: ``CONVERGED``,
+``MAX_ITER``, ``DIVERGED``, ``NOT_SIMULATED``) and ``get_row_iterations()``.
+The run's ``timings`` add ``n_rounds``, ``occupancy`` (useful row-iterations /
+slots x iterations run) and ``t_schedule`` (the scheduler's host work).
+
+The continuous schedule refuses the ``'direct_iter0_only'`` and
+``'direct_refactor_every_n'`` strategies and cuDSS's non-uniform batch modes,
+and a ``ScenarioSweepGPU`` in that mode rebuilds its batch driver on every
+``compute()``. With ``reactive_limits_outer_loop`` the second pass runs with
+the analysis' scheduling, and no row is ``LEFT_OUT``. The batched adjoint
+(``BatchPowerFlow``) works in both schedules; in the continuous one it keeps no
+Jacobian from the forward and rebuilds them in the backward (see below).
+
+.. code-block:: python
+
+    ca = ContingencyAnalysisGPU(grid, nb_iter=8, scheduling="continuous",
+                                nb_iter_per_round=1)
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_branches)])
+    ca.compute(batch_size=512)
+    ca.get_row_status()        # RowStatus per contingency
+    ca.get_row_iterations()    # Newton iterations each one ran
+    ca.timings.occupancy
+
+.. autoclass:: gpusim2grid.RowStatus
+   :members:
+
+Outer loops
+~~~~~~~~~~~
+
+With ``outer_loops=True`` the three batch facades run the grid's own outer
+loops on every row -- lightsim2grid's ``NROuter_*`` algorithm and its loops,
+OpenLoadFlow's defaults: ``DistributedSlack``, ``AcHvdcAcEmulationLimits``,
+``VoltageMonitoring``, ``ReactiveLimits``, with their parameters and the
+driver's (``max_outer_iterations``, the robust mode, the realistic voltage
+band). The grid must have been solved with that algorithm. Each row's inner
+Newton solves run on the GPU (the continuous schedule; ``nb_iter`` is the budget
+of each), its loops decide on the host after each one, and a row they change is
+re-solved in place from its voltages. With ``init_from_n_powerflow=True`` (the
+default) every row resumes from where the grid's own solve left its loops (its
+voltages, its frozen buses, its switched-on SVCs, its hvdc regimes), as
+lightsim2grid's batches with ``init_from_n_powerflow`` do.
+
+``get_row_status()`` then also reports ``OUTER_FAILED`` (a loop failed, e.g. a
+slack mismatch it could not share), ``OUTER_UNSTABLE`` (``max_outer_iterations``
+reached) and ``UNREALISTIC``, and ``get_outer_results()`` gives lightsim2grid's
+per-row ``OuterRowResult`` (``keep_outer_trace=True`` keeps the decision trace).
+A row's islanded buses (``handle_disconnected_grid``), its generator
+contingencies and its ``set_gen_v`` set-points are seen by its loops as
+lightsim2grid's batches show them. Not supported yet: ``redistribute_slack``
+(the ``DistributedSlack`` loop does that job), the physical checks, gradients.
+
+.. code-block:: python
+
+    grid.change_algorithm("NROuter_KLU")
+    grid.ac_pf(V0, 30, 1e-8)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=30)
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_branches)])
+    ca.compute(batch_size=512)
+    ca.get_outer_results()[0].nb_outer_iterations
+
 Contingency analysis
 --------------------
 
@@ -120,7 +201,10 @@ with lightsim2grid's names and contract. Unlike the operational limits above,
 its records say that the converged solution is **not a state the grid can
 reach at all** — the control it assumes cannot be held by the equipment: every
 entry of :meth:`~gpusim2grid.ContingencyAnalysisGPU.get_physical_violations`
-has ``category ==`` :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.PHYSICAL`.
+has ``category ==`` :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.PHYSICAL`,
+or :attr:`~gpusim2grid.contingency_analysis.ViolationCategory.CONTROL` for a release
+(a control an outer loop would put back: a frozen machine, an idle standby SVC, a
+saturated hvdc droop).
 One flag for the whole category, so the next physical limit needs no new one.
 Each check is the first pass of a PowSyBl OpenLoadFlow *outer loop*, as a
 detection: nothing is switched or re-solved, the row is only reported. They
@@ -352,12 +436,16 @@ paths:
 
 The result buffer behind ``v_results_dlpack()`` is overwritten in place by a
 warm or hot call and freed (reallocated) by a cold one — clone the tensor for
-a snapshot either way.
+a snapshot either way. With ``scheduling="continuous"`` every call is cold.
 
 For the differentiable layer (:class:`~gpusim2grid.differentiable.BatchPowerFlow`)
 the same table applies to its forward, with one addition when gradients are
 requested: the batched Jacobian is refilled at the converged voltages after
-the iterations (one extra ``fill J``, on every path). Its backward has its own
+the iterations (one extra ``fill J``, on every path; chunked schedule only --
+a continuous forward does nothing extra: its rows leave at different rounds,
+so the backward reloads them ``batch_size`` at a time and refills each one's
+Jacobian at its converged voltages, ``timings.t_adjoint_rebuild_J``, before
+factorizing Jᵀ chunk by chunk). Its backward has its own
 lazily built state: the first ``backward()`` transposes the Jacobian pattern,
 builds the J→Jᵀ position map and buffers and runs one cuDSS ANALYSIS + one
 FACTORIZATION of Jᵀ; every later backward only permutes the values with a

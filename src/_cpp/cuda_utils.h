@@ -336,6 +336,19 @@ struct CudssContext {
                 + std::to_string(static_cast<int>(s)));
     }
 
+    // CUDSS_CONFIG_IR_N_STEPS: steps of iterative refinement per SOLVE (0 = none). Read
+    // during CUDSS_PHASE_SOLVE, so it may be changed between two solves.
+    void set_ir_n_steps(int n) {
+        if (n < 0)
+            throw std::invalid_argument("CudssContext::set_ir_n_steps: ir_n_steps must be >= 0, got "
+                                        + std::to_string(n));
+        cudssStatus_t s = cudssConfigSet(config, CUDSS_CONFIG_IR_N_STEPS, &n, sizeof(n));
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(
+                std::string("CudssContext::set_ir_n_steps failed: status=")
+                + std::to_string(static_cast<int>(s)));
+    }
+
     void analyze(const CudssDescriptor& A, const CudssDescriptor& x, const CudssDescriptor& b) {
         // CUDSS_PHASE_ANALYSIS == CUDSS_PHASE_REORDERING | CUDSS_PHASE_SYMBOLIC_FACTORIZATION
         // (cudss_data_types.h). A single combined call is cuDSS's documented usage

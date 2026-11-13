@@ -32,6 +32,11 @@ def get_parser():
                         help="linear-solve strategy (default: direct_refactor_every)")
     parser.add_argument("--refactor_period", type=int, default=1,
                         help="refactor period N for direct_refactor_every_n (default: 1)")
+    parser.add_argument("--scheduling", default="chunked", choices=["chunked", "continuous"],
+                        help="batch scheduling; with 'continuous', nb_iter is each row's "
+                             "budget (default: chunked)")
+    parser.add_argument("--nb_iter_per_round", type=int, default=1,
+                        help="continuous scheduling: iterations between two checks (default: 1)")
     return parser
 
 
@@ -122,7 +127,8 @@ def main(args):
 
     print(f"\nRunning contingency analysis on GPU (strategy={args.strategy}, batch_size={batch_size}, nb_iter={nb_iter}, n cont = {n_conts_simul}) ...")
     ca = ContingencyAnalysisGPU(
-        grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6)
+        grid, nb_iter=nb_iter, max_iter_base=10, tol_base=1e-6,
+        scheduling=args.scheduling, nb_iter_per_round=args.nb_iter_per_round)
     # branch data (needed for compute_flows) is extracted automatically from
     # `grid` -- call ca.set_branch_data(...) only in explicit-array mode.
 

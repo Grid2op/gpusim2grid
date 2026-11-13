@@ -385,6 +385,32 @@ struct BatchTimings {
     TimingEntry t_gen_p_check;       // check_gen_p_violations_kernel, same gate
     TimingEntry t_gen_pv_release_check;   // check_gen_pv_release_violations_kernel, same gate
     TimingEntry t_flow_computation;
+    // continuous batching only: the per-round host work of the scheduler --
+    // the D->H of the slots' residuals, the decisions, the H->D of the
+    // eviction map and the load list (wall time; gpu_ms stays 0).
+    TimingEntry t_schedule;
+    // its breakdown (wall; NOT added again to any total): the D->H of the S
+    // residuals and the sync it waits on; with outer loops, the gather of the
+    // converged leaving slots (kernels, D->H, sync) and the host model's
+    // decisions (OuterHook::on_solved); the rest (decision loop, eviction map,
+    // load list, H->D) is t_schedule minus these three.
+    TimingEntry t_sched_res_sync;
+    TimingEntry t_oc_gather;
+    TimingEntry t_oc_decide;
+    // outer loops: the controls of the re-entering / loaded slots
+    // (_oc_write_controls: host packing, H->D, Sbus re-read, sync), wall.
+    TimingEntry t_oc_controls;
+    // outer loops: the host model's own setup of the run and of every slot
+    // (OuterHook::begin, _oc_setup, OuterHook::load on each (re)load), wall.
+    TimingEntry t_oc_load;
+
+    // Whole-call wall clocks (ms), to find what no phase above covers:
+    // BatchPfDriver::solve() from entry to return, and the session's run()
+    // around it (source build, driver build + cuDSS ANALYSIS of a cold run,
+    // the outer loops' row inputs, the post-solve folding). Not added to any
+    // total.
+    double t_driver_solve_wall_ms = 0.;
+    double t_session_run_wall_ms  = 0.;
 
     // --- metadata ---
     //
@@ -397,6 +423,13 @@ struct BatchTimings {
     int nb_iter          = 0;
     int n_refactorize    = 0;   // number of refactorize calls (n_chunks * nb_iter - 1)
     int n_disconnected   = 0;   // contingencies skipped (would disconnect the grid)
+    // scheduling (BatchScheduling: 0 = chunked, 1 = continuous). For the
+    // continuous schedule n_chunks is 0, chunk_size the slot count S, nb_iter
+    // the per-row budget, and these three describe the run:
+    int    scheduling        = 0;
+    int    nb_iter_per_round = 0;   // k
+    int    n_rounds          = 0;   // rounds of k iterations
+    double occupancy         = 0.;  // useful row-iterations / (S * iterations run)
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
@@ -406,6 +439,7 @@ struct BatchTimings {
     TimingEntry t_adjoint_first_factorize; // single FACTORIZATION of Jᵀ (first backward only)
     TimingEntry t_adjoint_refactorize;     // REFACTORIZATION of Jᵀ (every later backward after a new forward)
     TimingEntry t_adjoint_solve;           // SOLVE with Jᵀ (every backward)
+    TimingEntry t_adjoint_rebuild_J;       // continuous runs: reload of the rows + J at their converged V (every backward)
     int adjoint_n_analysis    = 0;         // 0 or 1 per driver life
     int adjoint_n_factorize   = 0;         // 0 or 1 per driver life
     int adjoint_n_refactorize = 0;
@@ -429,7 +463,8 @@ struct BatchTimings {
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
               + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
-              + t_flow_computation).wall_ms;
+              + t_flow_computation + t_schedule + t_oc_controls
+              + t_oc_load).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

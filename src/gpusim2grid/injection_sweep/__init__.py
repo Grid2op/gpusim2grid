@@ -51,11 +51,13 @@ from ..contingency_analysis import (
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from ..contingency_analysis._physical_checks import (
     PhysicalChecksEngineMixin,
     PhysicalChecksFacadeMixin,
 )
+from ..contingency_analysis._scheduling import SchedulingEngineMixin, SchedulingFacadeMixin
 
 
 _STRATEGY_MAP = {
@@ -172,7 +174,7 @@ class _DeviceBuffer:
         return f"DeviceBuffer(shape={self._shape}, dtype={self._dtype!r})"
 
 
-class _InjectionSweepSolver(PhysicalChecksEngineMixin):
+class _InjectionSweepSolver(PhysicalChecksEngineMixin, SchedulingEngineMixin):
     """Stateful GPU batched-injection power flow solver.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -219,9 +221,10 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
     def __init__(self, Ybus, Vinit, Sbus, slack_ids, slack_weights, pv, pq,
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
                  device=None, presolved_v=False, reordering_alg='default',
-                 matching_alg='none', pivot_epsilon_alg='default',
+                 matching_alg='none', pivot_epsilon_alg='default', ir_n_steps=0,
                  debug_base_case=False,
-                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
+                 scheduling='chunked', nb_iter_per_round=1, tol=None):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -238,9 +241,11 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
             reordering_alg=_resolve_reordering_alg(reordering_alg),
             matching_alg=_resolve_matching_alg(matching_alg),
             pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            ir_n_steps=_check_ir_n_steps(ir_n_steps),
             debug_base_case=bool(debug_base_case),
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
+        self._init_scheduling(scheduling, nb_iter_per_round, tol)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -369,6 +374,17 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
         self._pivot_epsilon_alg = value if isinstance(value, str) else str(value)
 
     @property
+    def ir_n_steps(self):
+        """cuDSS CUDSS_CONFIG_IR_N_STEPS: steps of iterative refinement per batch
+        solve (int >= 0, 0 = none). Takes effect on the next run(); the base case
+        keeps the construction value."""
+        return self._s.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._s.ir_n_steps = _check_ir_n_steps(value)
+
+    @property
     def refactor_period(self):
         return self._s.refactor_period
 
@@ -433,6 +449,7 @@ class _InjectionSweepSolver(PhysicalChecksEngineMixin):
 
     def run(self):
         """Run all scenarios; fills V_results and residuals on device."""
+        self._warn_tol_above_violation_tol()
         self._s.run()
 
     def compute_flows(self):

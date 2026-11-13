@@ -88,6 +88,14 @@ struct LedgerData {
     // (array/tuple mode, where there is no other numbering).
     std::vector<int>    hvdc_id;
 
+    // HVDC lines an outer loop froze at their AC-emulation limit (droop off, set-point at
+    // the limit; lightsim2grid's LSGrid::set_hvdc_ac_emulation_frozen). Not part of the
+    // solve: only checked for their release (HVDC_AC_EMULATION_RELEASE). Solver bus
+    // numbering, per-unit; dir +1 frozen 1->2, -1 frozen 2->1, limit the pmax of that
+    // direction; id the grid hvdc id. Empty when none.
+    std::vector<int>    hvdc_frz_bus1, hvdc_frz_bus2, hvdc_frz_dir, hvdc_frz_id;
+    std::vector<double> hvdc_frz_p0, hvdc_frz_k, hvdc_frz_limit;
+
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }
 
@@ -101,6 +109,15 @@ struct LedgerData {
     // J positions. kind: 0 = GEN, 1 = SVC (sloped).
     std::vector<int>    vc_bus, vc_kind, vc_group;       // per controller
     std::vector<double> vc_slope, vc_weight;             // per controller
+    // id of each controller in its own container (generator / svc id, the hvdc
+    // LINE id for a station); empty in array mode
+    std::vector<int>    vc_elem_id;                      // per controller
+    // lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators): 1 for a
+    // generator frozen at a reactive limit kept in its group, its reactive injection
+    // pinned at vc_q_held (pu, generator convention) -- which its Sbus entry already
+    // carries, so the mismatch only sees what it moves away from it. Empty = none.
+    std::vector<int>    vc_held;                         // per controller
+    std::vector<double> vc_q_held;                       // per controller, 0 unless held
     // J column of each controller's own Q unknown (controller-registration
     // order, from LSGrid::get_controller_q_col_solver() -- NOT the bus-keyed
     // q_col_of_bus map: that map collides whenever two controllers regulate
@@ -129,6 +146,53 @@ struct LedgerData {
     // pinning by value (identity-pinned Q row when still PV, plain PQ when
     // their last local controller is off). Empty on every un-extended ledger.
     std::vector<int>    switchable_vm_buses;
+
+    // ---- lightsim2grid's outer loops (the ledger of an NROuter_* solve) -------
+    // The Jacobian is the union pattern every loop reserved: the switchable buses
+    // above (PV ones pinned per slot), every droop hvdc regime and, when a loop may
+    // hold a controller (VoltageControl::set_may_hold_controllers), each group's
+    // (v_row, q_col_first) slot and every sharing row's entry on every controller.
+    // The batch then fills VoltageControl in its may_hold_ formulation (outer/
+    // outer_kernels.cuh). Single slack: slack_col is -1.
+    bool                outer_loops = false;
+
+    // ---- lightsim2grid's BranchControl (outer loops: PhaseControl, TransformerVoltageControl)
+    // Per transformer it handles, in its order (OuterControlLayout::branches, read off the
+    // grid's NROuter_* solve): the grid trafo id, its two solver buses, the shift column +
+    // row it owns when a phase controller solving for its shift (-1 otherwise), the ratio
+    // column when in a solved ratio group (-1 otherwise), and TrafoContainer's shift_sign /
+    // ratio_exponent. Its pi block is patched per slot at every Newton iteration
+    // (contingency/branch_control_kernels.cuh). Empty when no such loop runs.
+    std::vector<int>    bc_trafo, bc_bus1, bc_bus2;
+    int                 bc_n_lines = 0;               // the branches before the trafos (lines-then-trafos)
+    std::vector<int>    bc_phase, bc_ratio;           // 1: handled for its phase / its ratio
+    std::vector<int>    bc_shift_col, bc_shift_row, bc_ratio_col;
+    std::vector<double> bc_sign, bc_rexp;
+    // as the grid has it (BranchControl::_reset): the phase controller's regulated side
+    // (1, 2) and active power target (pu), the block at the grid's taps and the taps' shift
+    // and ratio, and the block the container stamps in Ybus (yac_eff), each block 8 doubles
+    // (re, im of y11 y12 y21 y22)
+    std::vector<int>    bc_side;
+    std::vector<double> bc_p_target, bc_a_tap0, bc_rho_tap0, bc_tap0, bc_yeff0;
+    // its solved ratio groups: the regulated bus, its Vm column and target (pu), the members
+    // (indices into the bc_* entries) and one row per member
+    std::vector<int>    bc_grp_bus, bc_grp_vm_col;
+    std::vector<double> bc_grp_target;
+    std::vector<std::vector<int>> bc_grp_members, bc_grp_rows;
+
+    // ---- lightsim2grid's ShuntControl (outer loops: ShuntVoltageControl) -------------------
+    // Per shunt controller (the regulating shunts of one bus, OuterControlLayout::shunts): its
+    // solver bus, its shunts (grid ids), the susceptance column of a solved group (-1
+    // otherwise) and its bus' Q row; then its solved groups, as the ratio groups above.
+    std::vector<int>              sc_bus, sc_col, sc_q_row;
+    std::vector<std::vector<int>> sc_shunts;
+    std::vector<double>           sc_b0;          // its susceptance as the grid has it (ShuntControl::_reset), pu
+    std::vector<int>              sc_grp_bus, sc_grp_vm_col;
+    std::vector<double>           sc_grp_target;
+    std::vector<std::vector<int>> sc_grp_members, sc_grp_rows;
+
+    int  n_bc() const { return static_cast<int>(bc_trafo.size()); }
+    int  n_sc() const { return static_cast<int>(sc_bus.size()); }
 
     int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
     int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }

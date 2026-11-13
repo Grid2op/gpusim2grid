@@ -204,6 +204,31 @@ def test_is_new_gen_v_keeps_the_driver(ieee14_base_case, solver_atol):
     _assert_same(sw.V_results.to_numpy(), _is_V(grid, F1, gen_v=gen_v), 1e-3 * solver_atol)
 
 
+def test_is_hot_gen_v_moves_voltage_control_columns(solver_atol):
+    """A hot run's new gen_v may drive other VoltageControl groups than the
+    last one (or none): the live source must re-derive its group columns,
+    not only re-upload the values, or a remote set-point is dropped / a
+    stale one kept."""
+    from gpusim2grid._gpusim2grid import have_ls2g_bridge
+    if not have_ls2g_bridge:
+        pytest.skip("VoltageControl needs the lightsim2grid C++ bridge")
+    from test_gen_v_regulated_bus import GEN_REMOTE, _remote_case14
+    grid, _ = _remote_case14()
+    n_gen = len(grid.get_generators())
+    F = np.linspace(0.98, 1.02, 3)
+    remote = np.full((len(F), n_gen), np.nan)
+    remote[:, GEN_REMOTE] = [1.03, 1.045, 1.055]
+    local = np.full((len(F), n_gen), np.nan)
+    local[:, 0] = 1.02
+    sw = _is(grid, F, nb_iter=20)
+    for gen_v in (local, remote, local):
+        sw.set_gen_v(gen_v)
+        sw.compute()
+        _assert_same(sw.V_results.to_numpy(), _is_V(grid, F, gen_v=gen_v, nb_iter=20),
+                     1e-3 * solver_atol)
+    assert _session(sw).driver_build_counter == 1
+
+
 def test_is_row_count_change_rebuilds(ieee14_base_case, solver_atol):
     grid = ieee14_base_case["grid"]
     sw = _is(grid, F1)

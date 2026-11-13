@@ -49,8 +49,10 @@
 //                  hvdc line id.
 //   side           OPTIONAL (empty = all 0): for an HVDC entry, the end (1 or 2)
 //                  of the VSC station it stands for -- the record's side.
-//   standby        OPTIONAL (empty = none): 1 for an entry of the standby SVC
-//                  check below, 0 for a release.
+//   standby        OPTIONAL (empty = all 0): which check the entry is of --
+//                  0 a release, 1 the standby SVC check (SVC entries only),
+//                  2 the remote voltage control check (GENERATOR entries only),
+//                  both below.
 //
 // An HVDC entry is a VSC converter station an outer loop froze at a reactive
 // limit (LSGrid::set_hvdc_can_be_pv): the generators' test verbatim on the
@@ -71,6 +73,20 @@
 //     TWO entries with standby = 1, at_min = 1 with target_vm_pu the low
 //     threshold and at_min = 0 with the high one -- the release test again --
 //     reported as LOW_VOLTAGE_SVC_STANDBY (11) / HIGH_VOLTAGE_SVC_STANDBY (12).
+//
+// A GENERATOR entry with standby = 2 is lightsim2grid's remote voltage control
+// check (RemoteVoltageControlCheck.hpp): a generator regulating a REMOTE bus
+// whose OWN bus leaves the realistic range the caller set
+// (LSGrid::set_remote_voltage_control_vm_range), which OpenLoadFlow's robust
+// remote voltage control switches to PQ. Up to TWO entries per generator,
+// at_min = 1 with target_vm_pu the low bound and at_min = 0 with the high one
+// -- the release test again, on a bus of its own: reg_bus_solver is the
+// generator's OWN bus (the one checked) and gen_bus_solver the remote bus it
+// regulates (only its mask matters), vn_kv the nominal voltage of its own bus.
+// Reported as LOW_VOLTAGE_REMOTE_CONTROL (13) / HIGH_VOLTAGE_REMOTE_CONTROL
+// (14) on the GENERATOR. A generator contingency disconnects it (the
+// generator mask applies), no row moves its bounds (a row's own targets are
+// ignored).
 //
 // Deliberately NOT carried, compared to lightsim2grid's plan: the grid bus id
 // of the regulated bus and the element names (gpusim2grid's records carry
@@ -93,6 +109,10 @@ struct GenPvReleasePlanData {
     static constexpr int EL_GENERATOR = 5;
     static constexpr int EL_SVC       = 7;
     static constexpr int EL_HVDC      = 4;
+    // what an entry checks (the `standby` column)
+    static constexpr int CHECK_RELEASE        = 0;
+    static constexpr int CHECK_SVC_STANDBY    = 1;
+    static constexpr int CHECK_REMOTE_CONTROL = 2;
 
     int             n_entries = 0;
     Eigen::VectorXi gen_id;          // [n_entries] generator id, or svc id for an SVC entry
@@ -102,12 +122,13 @@ struct GenPvReleasePlanData {
     RealVect        target_vm_pu;    // [n_entries] the grid's own target
     RealVect        vn_kv;           // [n_entries] nominal kV of the regulated bus
     Eigen::VectorXi el_type;         // [n_entries] EL_GENERATOR / EL_SVC, or empty = all generators
-    Eigen::VectorXi standby;         // [n_entries] 1 = a standby SVC check entry, or empty = none
+    Eigen::VectorXi standby;         // [n_entries] CHECK_* code, or empty = all releases
     Eigen::VectorXi side;            // [n_entries] 1 / 2 for an HVDC entry, or empty = all 0
 
     bool empty() const { return n_entries == 0; }
     bool is_svc(int k) const { return el_type.size() != 0 && el_type(k) == EL_SVC; }
-    bool is_standby(int k) const { return standby.size() != 0 && standby(k) != 0; }
+    bool is_standby(int k) const { return standby.size() != 0 && standby(k) == CHECK_SVC_STANDBY; }
+    bool is_remote_control(int k) const { return standby.size() != 0 && standby(k) == CHECK_REMOTE_CONTROL; }
     bool is_generator(int k) const { return el_type.size() == 0 || el_type(k) == EL_GENERATOR; }
 
     // Structural checks only (sizes / index ranges); throws std::runtime_error.
@@ -157,8 +178,10 @@ struct GenPvReleasePlanData {
                 m << "side[" << k << "] must be 0, 1 or 2";
                 fail(m.str());
             }
-            if (standby.size() != 0 && standby(k) != 0 && (standby(k) != 1 || !is_svc(k))) {
-                m << "standby[" << k << "] must be 0, or 1 on an SVC entry";
+            if (standby.size() != 0 && standby(k) != CHECK_RELEASE &&
+                !(standby(k) == CHECK_SVC_STANDBY && is_svc(k)) &&
+                !(standby(k) == CHECK_REMOTE_CONTROL && is_generator(k))) {
+                m << "standby[" << k << "] must be 0, 1 on an SVC entry or 2 on a GENERATOR entry";
                 fail(m.str());
             }
             if (!std::isfinite(static_cast<double>(target_vm_pu(k))) ||

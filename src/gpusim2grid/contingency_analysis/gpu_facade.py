@@ -10,6 +10,8 @@ CPU base-case (N) power flow, and runs the batched contingencies on the GPU.
 It is a thin, batch-oriented facade over :class:`_ContingencyAnalysisSolver`.
 """
 
+import warnings
+
 import numpy as np
 
 from . import (
@@ -17,10 +19,12 @@ from . import (
     _ContingencyAnalysisSolver,
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
+    SchedulingFacadeMixin,
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from .._ls2g_utils import (
     extract_grid_arrays,
@@ -29,8 +33,26 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
+from .._outer_loops import _check_outer_loops_args
+from ._reactive_limits import ReactiveLimitsStatus
 
-__all__ = ["ContingencyAnalysisGPU", "optimize_reference_slack"]
+
+def _check_reactive_limits_outer_loop(value):
+    if bool(value) != value:
+        raise ValueError("The `reactive_limits_outer_loop` attribute must be a boolean.")
+    return bool(value)
+
+
+def _warn_reactive_limits_outer_loop_deprecated():
+    # stacklevel 3: the caller of the constructor / of the attribute assignment
+    warnings.warn(
+        "reactive_limits_outer_loop is deprecated and will be removed in a future version: "
+        "use outer_loops=True instead, which runs lightsim2grid's ReactiveLimits outer loop "
+        "(PV <-> PQ) on every row until it is stable, with the other default outer loops.",
+        DeprecationWarning, stacklevel=3)
+
+
+__all__ = ["ContingencyAnalysisGPU", "optimize_reference_slack", "ReactiveLimitsStatus"]
 
 
 def _have_bridge():
@@ -92,7 +114,7 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
 
 
 class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
-                             LimitViolationsFacadeMixin):
+                             SchedulingFacadeMixin, LimitViolationsFacadeMixin):
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -150,6 +172,18 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG`` choice, same construction-time
         scope as ``reordering_alg`` above; ``None`` (default) leaves it at
         ``'default'``.
+    ir_n_steps : int, default 0
+        cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: steps of iterative refinement after
+        each linear solve, base case and batch (forward and adjoint). ``0``
+        (default) solves without refinement. Static pivoting can leave the
+        Jacobian's factors a little inexact, which Newton usually absorbs.
+        **With** ``outer_loops=True`` **use 1**: each inner solve must stop at
+        the iteration lightsim2grid's does, and a hard one (e.g. after
+        TransformerVoltageControl releases a held remote voltage controller)
+        can diverge without refinement where lightsim2grid's KLU converges.
+        One step costs one more residual and solve per Newton iteration. Mutable:
+        takes effect on the next :meth:`compute` (the base case keeps the
+        construction value).
     debug_base_case : bool, default False
         Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
         VoltageControl extension active (bridge path). By default, that
@@ -209,6 +243,82 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         Only meaningful on the lightsim2grid-bridge path; the explicit-array
         and Python-fallback paths have no ledger and always solve the bare
         system.
+    reactive_limits_outer_loop : bool, default False
+        .. deprecated:: 0.2.0
+            Use ``outer_loops=True``: lightsim2grid's own outer loops,
+            ``ReactiveLimits`` (PV <-> PQ) among them, run on every row until
+            they are stable.
+
+        Opt-in: after the batch, re-solve ONCE the contingencies whose
+        physical checks report a reactive-limit switch this loop handles --
+        ``LOW_Q`` / ``HIGH_Q`` on a bus its own machines hold (switched to
+        PQ at the limit) or on every controller bus of a voltage-control group
+        of generators (each held at its own limit, the regulated bus
+        floating), and ``LOW_VOLTAGE_AT_MIN_Q`` / ``HIGH_VOLTAGE_AT_MAX_Q`` on
+        a generator frozen at a limit that regulates its own PQ bus (held PV
+        again) or a remote one (released into its group, with lightsim2grid's
+        held controllers) -- one pass of OpenLoadFlow's ``ReactiveLimits``
+        outer loop, in a second, smaller batch. Their voltages, residuals and
+        violations (operational and physical, with the new labels) then
+        replace the first pass'. A contingency reporting a switch the loop
+        does not handle (a group only part of which saturated or holding an
+        SVC / station, an SVC) is not re-solved. See
+        :meth:`get_outer_loop_status` and ``_reactive_limits.py``. Needs a
+        lightsim2grid grid (bridge path) and ``compute_physical_violations``.
+        Mutable; takes effect on the next :meth:`compute`.
+    outer_loop_min_last_chunk : int, default 250
+        The second pass runs in chunks of ``batch_size``; a last, partial
+        chunk is only run when it is the only one or holds at least this many
+        contingencies -- otherwise they are left out
+        (``ReactiveLimitsStatus.LEFT_OUT``, first pass kept), rather than
+        paying a whole batch for a handful. Mutable.
+    outer_loop_warm_start : bool, default True
+        The second pass starts each contingency from its first-pass voltages
+        (a device-to-device copy; a masked bus from the base case), as
+        OpenLoadFlow continues from the current state after an outer-loop
+        action, instead of from the base case: only the switches are left to
+        converge. Mutable.
+    outer_loop_nb_iter : int or None, default None
+        Newton iterations of the second pass; None = :attr:`nb_iter`. With
+        the warm start, fewer usually suffice; a row that does not converge
+        is ``DIVERGED`` and keeps its first pass. Mutable.
+    scheduling : {"chunked", "continuous"} or None, default None
+        ``None``: ``"chunked"``, or ``"continuous"`` with ``outer_loops``.
+        How the rows go through the batch. ``"chunked"``: ``ceil(n_rows /
+        batch_size)`` chunks, every row runs exactly ``nb_iter`` Newton
+        iterations. ``"continuous"``: ``batch_size`` slots; every
+        ``nb_iter_per_round`` iterations each row is checked, and one that
+        converged (``||F||inf < tol``), diverged or used its ``nb_iter``
+        budget leaves at once, its slot refilled from the queue -- a row pays
+        the iterations it needs, not the hardest row's. ``nb_iter`` is then
+        each row's budget (a row runs a multiple of ``nb_iter_per_round``, at
+        least one round). Continuous refuses the ``'direct_iter0_only'`` /
+        ``'direct_refactor_every_n'`` strategies. With ``outer_loops``, only
+        ``"continuous"`` is supported, by design (not planned to change): a
+        row the loops change is re-solved in its own slot while the others
+        go on, which a chunk cannot do. Mutable.
+    nb_iter_per_round : int, default 1
+        Continuous scheduling: iterations between two convergence checks. A
+        check (one SpMV + mismatch) is cheap next to a refactorization, so 1
+        is usually fastest: on case6515rte N-1, 1 / 2 / 4 took 6.7 / 8.6 /
+        9.2 s. With ``outer_loops``, only 1 is supported, by design (not
+        planned to change): each inner solve must stop at the iteration
+        lightsim2grid's does, so that the loops decide on the same state.
+        Mutable.
+    tol : float or None, default None
+        A row has converged when ``||F||inf < tol``, per unit like
+        :meth:`last_residuals`: when it leaves (continuous) and its
+        :class:`RowStatus` (both schedules, :meth:`get_row_status`).
+        lightsim2grid compares the same way but takes its ``tol`` in MVA
+        (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
+        build). Mutable.
+    outer_loops, keep_outer_trace : bool, default False
+        Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
+        row; see :class:`ScenarioSweepGPU`. Requires ``scheduling="continuous"`` and
+        ``nb_iter_per_round=1``, by design (neither is planned to change); pass
+        ``ir_n_steps=1`` with it (see there). Each contingency keeps the grid's targets. With
+        ``init_from_n_powerflow`` (default) the rows resume from where the
+        grid's own solve left its loops. :meth:`get_outer_results`.
 
     Examples
     --------
@@ -232,13 +342,50 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
                  use_bridge=None, handle_disconnected_grid=False,
                  compute_limit_violations=False, reordering_alg=None,
-                 matching_alg=None, pivot_epsilon_alg=None,
+                 matching_alg=None, pivot_epsilon_alg=None, ir_n_steps=0,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
-                 reference_slack="auto"):
+                 reference_slack="auto", reactive_limits_outer_loop=False,
+                 outer_loop_min_last_chunk=250, outer_loop_warm_start=True,
+                 outer_loop_nb_iter=None, scheduling=None, nb_iter_per_round=1,
+                 tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        self._outer_loops = bool(outer_loops)
+        if scheduling is None:
+            scheduling = "continuous" if self._outer_loops else "chunked"
+        if self._outer_loops:
+            _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
+                                    redistribute_slack=redistribute_slack,
+                                    compute_physical_violations=compute_physical_violations,
+                                    reactive_limits_outer_loop=reactive_limits_outer_loop)
+        # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
+        # built (lazily) from the same grid with the same construction options
+        self._rl_ctor_kwargs = dict(
+            init_from_n_powerflow=init_from_n_powerflow, precision=precision,
+            nb_iter=nb_iter, max_iter_base=max_iter_base, tol_base=tol_base,
+            device=device, use_bridge=use_bridge, reordering_alg=reordering_alg,
+            matching_alg=matching_alg, pivot_epsilon_alg=pivot_epsilon_alg,
+            ir_n_steps=ir_n_steps,
+            debug_base_case=debug_base_case,
+            scaling_max_voltage_change=scaling_max_voltage_change,
+            max_dVa=max_dVa, max_dVm=max_dVm, use_distributed_slack=use_distributed_slack)
+        self._rl_sweep = None
+        # the last limits given (_set_limits; None = the bridge's, off the grid)
+        # and the generation of the ones the second pass has (_sync_second_pass)
+        self._limits_args = None
+        self._limits_gen = 0
+        self._limits_synced = -1
+        self._rl_ctx = None
+        self._rl_result = None
+        self._ctg_branch_ids = None
+        if reactive_limits_outer_loop:
+            _warn_reactive_limits_outer_loop_deprecated()
+        self._reactive_limits_outer_loop = _check_reactive_limits_outer_loop(reactive_limits_outer_loop)
+        self.outer_loop_min_last_chunk = outer_loop_min_last_chunk
+        self.outer_loop_warm_start = outer_loop_warm_start
+        self.outer_loop_nb_iter = outer_loop_nb_iter
 
         # Single source of truth, resolved once here and applied at
         # construction time to BOTH the base-case solve and the batch solver
@@ -247,6 +394,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
         _pivot_epsilon_alg = 'default' if pivot_epsilon_alg is None else pivot_epsilon_alg
+        _ir_n_steps = _check_ir_n_steps(ir_n_steps)
 
         if isinstance(grid, (tuple, list)):
             # Explicit-array mode: no lightsim2grid grid to seed from, extract
@@ -264,6 +412,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                 pivot_epsilon_alg=_pivot_epsilon_alg,
+                ir_n_steps=_ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 # No grid to inherit a scaling policy from -- None means off.
                 scaling_max_voltage_change=bool(scaling_max_voltage_change),
@@ -285,7 +434,24 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
-            if use_bridge:
+            if self._outer_loops:
+                # the grid's own outer loops (see ScenarioSweepGPU's outer_loops);
+                # every contingency keeps the grid's targets
+                session = _cpp._make_ca_outer_session_from_lsgrid(
+                    grid, 100, int(nb_iter), _normalize_device(device),
+                    bool(compute_limit_violations),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
+                    keep_trace=bool(keep_outer_trace),
+                    resume_from_n=bool(init_from_n_powerflow))
+                self._inner = _ContingencyAnalysisSolver._wrap_session(
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
+                self._n_branches = self._inner._s.n_branches
+            elif use_bridge:
                 # Zero-copy: extract everything in C++ off the solved LSGrid
                 # (no scipy CSR marshalling, branch data set automatically).
                 # When compute_limit_violations is True, the bridge also pulls
@@ -298,6 +464,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     # None => -1/-1.0 sentinels: inherit the grid's own
                     # get_ac_algo_config() (opt-in by construction). See
@@ -336,6 +503,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                     presolved_v=init_from_n_powerflow,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                     pivot_epsilon_alg=_pivot_epsilon_alg,
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     # Python-array fallback: no C++ bridge to inherit the
                     # grid's algo config through, same as the tuple path.
@@ -365,6 +533,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         # Post-solve physical checks (compute_physical_violations: bus reactive
         # capability + hvdc droop saturation): the bus-Q plan is pulled off the
         # grid here when there is one -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
         # OLF-style bounded slack redistribution of the island a contingency
@@ -395,8 +566,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                   branch_limit_a2_ka, n_lines):
         """Configure bus voltage / branch current limits (explicit-array mode
         only). Grid mode should use :meth:`set_limits_from_grid` instead."""
-        self._inner.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
-                               branch_limit_a2_ka, int(n_lines))
+        self._set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
+                         branch_limit_a2_ka, int(n_lines))
+
+    def _set_limits(self, *args):
+        """Every limit given to this analysis goes through here: the second pass
+        of reactive_limits_outer_loop is given the same ones (_sync_second_pass)."""
+        self._inner.set_limits(*args)
+        self._limits_args = args
+        self._limits_gen += 1
 
     def add_contingencies_by_branch_id(self, branch_ids_per_ctg):
         """Define contingencies as branch removals.
@@ -409,6 +587,21 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             line ``c``; ``c >= n_lines`` is trafo ``c - n_lines``).
         """
         self._inner.build_contingencies(branch_ids_per_ctg)
+        self._ctg_branch_ids = [list(map(int, ids)) for ids in branch_ids_per_ctg]
+
+    @property
+    def outer_loops(self):
+        """bool: whether the grid's own outer loops run on every contingency (see
+        :class:`ScenarioSweepGPU`'s ``outer_loops``; each contingency keeps the
+        grid's targets)."""
+        return self._outer_loops
+
+    def get_outer_results(self):
+        """Per contingency, the outcome of its outer loops (see
+        :meth:`ScenarioSweepGPU.get_outer_results`). Needs ``outer_loops=True``."""
+        if not self._outer_loops:
+            raise RuntimeError("get_outer_results() needs outer_loops=True")
+        return self._inner._s.get_outer_results()
 
     def compute(self, batch_size=512):
         """Solve every contingency and return the batched voltages.
@@ -417,11 +610,254 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         complex, aliasing live GPU memory.  Pass to ``torch.from_dlpack`` /
         ``jax.dlpack.from_dlpack``; clone before the next ``compute()`` for a
         snapshot.  Residuals are cached for :meth:`last_residuals`.
+
+        With :attr:`reactive_limits_outer_loop`, the contingencies it re-solves
+        have their second-pass voltages and residuals in these buffers (see
+        :meth:`get_outer_loop_status`).
         """
         self._inner.batch_size = int(batch_size)
+        self._rl_result = None
         self._inner.run()
         self._last_residuals = self._inner.residuals
+        if self._reactive_limits_outer_loop:
+            self._run_outer_loop(int(batch_size))
         return self._inner.v_results_dlpack()
+
+    # --------------------------------------------- reactive_limits_outer_loop
+    @property
+    def reactive_limits_outer_loop(self):
+        """bool: re-solve once, with the switches applied, the contingencies
+        whose physical checks report a reactive-limit switch this loop handles
+        (see the constructor's doc). Default False; takes effect on the next
+        :meth:`compute`. Deprecated: use ``outer_loops=True``."""
+        return self._reactive_limits_outer_loop
+
+    @reactive_limits_outer_loop.setter
+    def reactive_limits_outer_loop(self, value):
+        value = _check_reactive_limits_outer_loop(value)
+        if value:
+            _warn_reactive_limits_outer_loop_deprecated()
+        self._reactive_limits_outer_loop = value
+
+    @property
+    def outer_loop_min_last_chunk(self):
+        """int: a last, partial chunk of the second pass runs only when it is
+        the only one or holds at least this many contingencies (default 250)."""
+        return self._outer_loop_min_last_chunk
+
+    @outer_loop_min_last_chunk.setter
+    def outer_loop_min_last_chunk(self, value):
+        value = int(value)
+        if value < 0:
+            raise ValueError("outer_loop_min_last_chunk must be >= 0")
+        self._outer_loop_min_last_chunk = value
+
+    @property
+    def outer_loop_warm_start(self):
+        """bool: the second pass starts each contingency from its first-pass
+        voltages (default True) instead of the base case."""
+        return self._outer_loop_warm_start
+
+    @outer_loop_warm_start.setter
+    def outer_loop_warm_start(self, value):
+        if bool(value) != value:
+            raise ValueError("The `outer_loop_warm_start` attribute must be a boolean.")
+        self._outer_loop_warm_start = bool(value)
+
+    @property
+    def outer_loop_nb_iter(self):
+        """int or None: Newton iterations of the second pass (None:
+        :attr:`nb_iter`)."""
+        return self._outer_loop_nb_iter
+
+    @outer_loop_nb_iter.setter
+    def outer_loop_nb_iter(self, value):
+        if value is not None:
+            value = int(value)
+            if value < 1:
+                raise ValueError("outer_loop_nb_iter must be >= 1 (or None)")
+        self._outer_loop_nb_iter = value
+
+    def get_outer_loop_status(self):
+        """(n_contingencies,) int ndarray of :class:`ReactiveLimitsStatus`, from
+        the last :meth:`compute` made with :attr:`reactive_limits_outer_loop`:
+        NO_SWITCH (nothing to switch, first pass final), RECOMPUTED (second
+        pass), UNSUPPORTED / LEFT_OUT / DIVERGED (first pass kept -- a switch
+        the loop does not handle, left out by the batch rule, the second pass
+        did not converge)."""
+        if self._rl_result is None:
+            raise RuntimeError(
+                "get_outer_loop_status() needs a compute() made with "
+                "reactive_limits_outer_loop=True.")
+        return self._rl_result["status"].copy()
+
+    def get_outer_loop_switches(self):
+        """list, one entry per contingency, from the last :meth:`compute` made
+        with :attr:`reactive_limits_outer_loop`: None where nothing was
+        switched (every status but RECOMPUTED / LEFT_OUT / DIVERGED), else a
+        dict ``{"to_pq": {bus: (q_mvar, at_min)}, "to_pv": {bus: (gen_ids,
+        vm_pu)}, "vc_pin": {group: at_min}}`` -- the solver buses switched to PQ
+        with the summed reactive power their machines produce (their min_q sum
+        when ``at_min``, else their max_q sum), the buses held PV again at
+        ``vm_pu`` by the released generators ``gen_ids``, and the
+        VoltageControl groups ``{group: (at_min, gen_ids)}`` whose every
+        controller (the generators ``gen_ids``) is held at its own min_q
+        (``at_min``) / max_q, the bus they regulated floating; and, under
+        ``"vc_release"``, ``{gen_id: group}`` the frozen remote regulators
+        released into their VoltageControl group."""
+        if self._rl_result is None:
+            raise RuntimeError(
+                "get_outer_loop_switches() needs a compute() made with "
+                "reactive_limits_outer_loop=True.")
+        ctx = self._rl_ctx
+
+        def _pins(sw):
+            return {g: (at_min, tuple(int(ctx.vc_ctrl_elem[j]) for j in ctx.vc_grp_ctrls[g]))
+                    for g, at_min in sw.vc_pin.items()}
+        return [None if sw is None else {"to_pq": dict(sw.to_pq), "to_pv": dict(sw.to_pv),
+                                         "vc_pin": _pins(sw),
+                                         "vc_release": {int(g): int(ctx.vc_ctrl_group[j])
+                                                        for j, g in sw.vc_release.items()}}
+                for sw in self._rl_result["switches"]]
+
+    @property
+    def outer_loop_info(self):
+        """dict about the last second pass (None before one): ``n_rows`` the
+        contingencies it re-solved, ``time_s`` its wall time (decision +
+        solve + merge), ``timings`` its session's BatchTimings (None when no
+        row was re-solved)."""
+        if self._rl_result is None:
+            return None
+        return {k: self._rl_result[k] for k in ("n_rows", "time_s", "timings")}
+
+    def _second_pass_sweep(self):
+        from ._reactive_limits import build_context
+        if self._rl_sweep is None:
+            from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
+            if self._grid is None:
+                raise RuntimeError(
+                    "reactive_limits_outer_loop needs a lightsim2grid grid (this session was "
+                    "built from an explicit-array tuple).")
+            grid = self._hold_frozen_grid()
+            sweep = ScenarioSweepGPU(grid, compute_physical_violations=True,
+                                     **self._rl_ctor_kwargs)
+            self._rl_ctx = build_context(grid, sweep)
+            self._rl_sweep = sweep
+        return self._rl_sweep
+
+    def _hold_frozen_grid(self):
+        """The grid of the second pass: a copy with lightsim2grid's
+        ``set_hold_frozen_regulators`` on when it has a frozen remote regulator
+        (one the release of which a row may then ask for), else the grid
+        itself. Same solution either way."""
+        grid = self._grid
+        if not (getattr(_cpp, "have_ls2g_hold_frozen", False)
+                and hasattr(grid, "set_hold_frozen_regulators")):
+            return grid
+        if grid.get_hold_frozen_regulators():
+            return grid
+        if not any(g.connected and g.can_be_pv and not g.voltage_regulator_on
+                   and g.regulated_bus_id != g.bus_id for g in grid.get_generators()):
+            return grid
+        held = grid.copy()
+        held.set_hold_frozen_regulators(True)
+        V = held.ac_pf(np.asarray(grid.get_V()).copy(), int(self._rl_ctor_kwargs["max_iter_base"]),
+                       float(self._rl_ctor_kwargs["tol_base"]))
+        if V.shape[0] == 0:
+            return grid
+        return held
+
+    def _sync_second_pass(self, sweep):
+        """The mutable settings of this analysis, mirrored on the second pass."""
+        src, dst = self._inner, sweep.solver
+        dst.nb_iter = src.nb_iter if self._outer_loop_nb_iter is None else self._outer_loop_nb_iter
+        dst.strategy = src.strategy
+        dst.refactor_period = src.refactor_period
+        dst.nb_iter_per_round = src.nb_iter_per_round
+        dst.tol = src.tol
+        dst.scheduling = src.scheduling
+        dst.ir_n_steps = src.ir_n_steps
+        dst.handle_disconnected_grid = src.handle_disconnected_grid
+        # the limits this analysis checks, not the (copied) grid's: the second
+        # pass' records replace the first pass' of the rows it re-solves
+        if src.compute_limit_violations and self._limits_synced != self._limits_gen:
+            if self._limits_args is None:   # set by the bridge, off the grid
+                sweep.set_limits_from_grid()
+            else:
+                dst.set_limits(*self._limits_args)
+            self._limits_synced = self._limits_gen
+        dst.compute_limit_violations = src.compute_limit_violations
+        dst.violation_tol = src.violation_tol
+        dst.violation_rel_tol = src.violation_rel_tol
+        dst.violation_capacity = src.violation_capacity
+        sweep.physical_violation_tol_mva = self.physical_violation_tol_mva
+        sweep.physical_violation_tol_vm_pu = self.physical_violation_tol_vm_pu
+        sweep.physical_violation_capacity = self.physical_violation_capacity
+        if sweep.redistribute_slack != self.redistribute_slack:
+            sweep.redistribute_slack = self.redistribute_slack
+        sweep.reference_slack = self.reference_slack
+
+    def _run_outer_loop(self, batch_size):
+        import time
+        from ._reactive_limits import (plan_switches, batch_rule, run_second_pass,
+                                       held_release_offsets, fix_held_release_records)
+        beg = time.perf_counter()
+        if not self.compute_physical_violations:
+            raise RuntimeError(
+                "reactive_limits_outer_loop needs compute_physical_violations=True (the "
+                "switches are read off the physical checks).")
+        if self._ctg_branch_ids is None:
+            raise RuntimeError("reactive_limits_outer_loop: no contingency was added "
+                               "through add_contingencies_by_branch_id().")
+        sess = self._inner._s
+        res = self.last_residuals()
+        conv = np.isfinite(res) & (res <= self._inner.violation_tol)
+        sweep = self._second_pass_sweep()
+        ctx = self._rl_ctx
+        status, switches = plan_switches(ctx, sess.get_bus_q_violations(),
+                                         sess.get_gen_pv_release_violations(), conv)
+        cand = [r for r, sw in enumerate(switches) if sw is not None]
+        if self.scheduling == "continuous":
+            # no chunk, so no last partial chunk to leave out: every row re-solved
+            run_rows, left = cand, []
+        else:
+            run_rows, left = batch_rule(cand, batch_size, self._outer_loop_min_last_chunk)
+        status[left] = int(ReactiveLimitsStatus.LEFT_OUT)
+        out = {"status": status, "n_rows": len(run_rows), "timings": None, "switches": switches,
+               "viol": {}, "viol_trunc": {}, "viol_counts": {}, "phys": {}, "phys_trunc": {}}
+        if run_rows:
+            self._sync_second_pass(sweep)
+            v_init = (sess, list(map(int, run_rows))) if self._outer_loop_warm_start else None
+            run_second_pass(sweep, ctx, [self._ctg_branch_ids[r] for r in run_rows],
+                            [switches[r] for r in run_rows], batch_size, v_init=v_init)
+            out["timings"] = sweep.timings
+            res2 = sweep.last_residuals()
+            conv2 = np.isfinite(res2) & (res2 <= self._inner.violation_tol)
+            ok = np.flatnonzero(conv2)
+            status[np.asarray(run_rows)[~conv2]] = int(ReactiveLimitsStatus.DIVERGED)
+            dst = [int(run_rows[i]) for i in ok]
+            status[dst] = int(ReactiveLimitsStatus.RECOMPUTED)
+            s2 = sweep.solver._s
+            sess.overwrite_rows(dst, [int(i) for i in ok], s2)
+            # ... and their outcome: the second pass' iterations and status
+            sess.overwrite_row_outcomes(dst, [int(v) for v in np.asarray(s2.get_row_iterations())[ok]],
+                                        [int(v) for v in np.asarray(s2.get_row_status())[ok]])
+            phys = sweep.get_physical_violations()
+            phys_tr = sweep.get_physical_violations_truncated()
+            viol = sweep.get_violations() if sweep.solver.compute_limit_violations else None
+            if viol is not None:
+                viol_tr = sweep.get_violations_truncated()
+                viol_cnt = sweep.get_violation_counts()
+            offsets = held_release_offsets(ctx, [switches[r] for r in run_rows])
+            for i, r in zip(ok, dst):
+                out["phys"][r] = fix_held_release_records(phys[i], offsets[i])
+                out["phys_trunc"][r] = bool(phys_tr[i])
+                if viol is not None:
+                    out["viol"][r] = viol[i]
+                    out["viol_trunc"][r] = bool(viol_tr[i])
+                    out["viol_counts"][r] = {k: int(v[i]) for k, v in viol_cnt.items()}
+        out["time_s"] = time.perf_counter() - beg
+        self._rl_result = out
 
     def last_residuals(self):
         """``‖F‖∞`` per contingency from the most recent :meth:`compute`."""
@@ -483,7 +919,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines = \
             self._extract_limits_arrays()
-        self._inner.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        self._set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
 
     @property
     def compute_limit_violations(self):
@@ -499,13 +935,22 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def get_violations(self):
         """list[list[LimitViolation]]: one entry per contingency (row order
         matches add_contingencies_by_branch_id). Requires compute() with
-        compute_limit_violations=True."""
-        return self._inner.get_violations()
+        compute_limit_violations=True. With reactive_limits_outer_loop, a
+        RECOMPUTED contingency's entry is its second pass'."""
+        out = self._inner.get_violations()
+        if self._rl_result is not None:
+            for r, v in self._rl_result["viol"].items():
+                out[r] = v
+        return out
 
     def get_violations_truncated(self):
         """(n_ctg,) bool ndarray: True where more than violation_capacity
         violations were found for that contingency (clamped)."""
-        return self._inner.get_violations_truncated()
+        out = self._inner.get_violations_truncated()
+        if self._rl_result is not None:
+            for r, v in self._rl_result["viol_trunc"].items():
+                out[r] = v
+        return out
 
     def get_violation_counts(self):
         """dict of (n_ctg,) int ndarrays with keys 'low_voltage',
@@ -513,7 +958,31 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         each type per contingency (-1 = not simulated). Unlike
         get_violations()'s records (capped at violation_capacity), these
         totals stay exact even when get_violations_truncated() is True."""
-        return self._inner.get_violation_counts()
+        out = self._inner.get_violation_counts()
+        if self._rl_result is not None:
+            for r, cnt in self._rl_result["viol_counts"].items():
+                for k, v in cnt.items():
+                    out[k][r] = v
+        return out
+
+    def get_physical_violations(self):
+        """See :meth:`PhysicalChecksEngineMixin.get_physical_violations`. With
+        reactive_limits_outer_loop, a RECOMPUTED contingency's entry is its
+        second pass' (with the new labels, see ``_reactive_limits.py``)."""
+        out = self._inner.get_physical_violations()
+        if self._rl_result is not None:
+            for r, v in self._rl_result["phys"].items():
+                out[r] = v
+        return out
+
+    def get_physical_violations_truncated(self):
+        """(n_ctg,) bool ndarray: True where one of the physical checks kept
+        only its most severe records on that row."""
+        out = self._inner.get_physical_violations_truncated()
+        if self._rl_result is not None:
+            for r, v in self._rl_result["phys_trunc"].items():
+                out[r] = v
+        return out
 
     def converged(self, tol=None):
         """(n_ctg,) bool ndarray: residual <= tol (defaults to violation_tol).
@@ -616,6 +1085,16 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     @pivot_epsilon_alg.setter
     def pivot_epsilon_alg(self, value):
         self._inner.pivot_epsilon_alg = value
+
+    @property
+    def ir_n_steps(self):
+        """int: cuDSS ``CUDSS_CONFIG_IR_N_STEPS``, iterative refinement steps per
+        batch solve (0 = none). Takes effect on the next :meth:`compute`."""
+        return self._inner.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._inner.ir_n_steps = value
 
     @property
     def timings(self):

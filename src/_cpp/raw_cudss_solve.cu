@@ -45,7 +45,8 @@ std::vector<double> solve_cudss_raw(
     int device,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg)
+    PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps)
 {
     if (dim <= 0)
         throw std::runtime_error("solve_cudss_raw: dim must be > 0");
@@ -88,6 +89,7 @@ std::vector<double> solve_cudss_raw(
     dss.set_reordering_alg(reordering_alg);
     dss.set_matching_alg(matching_alg);
     dss.set_pivot_epsilon_alg(pivot_epsilon_alg);
+    dss.set_ir_n_steps(ir_n_steps);
 
     CudssDescriptor dss_A, dss_x, dss_b;
     dss_A.create_csr(dim, nnz,
@@ -119,7 +121,8 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     int device,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg)
+    PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps)
 {
     if (dim <= 0 || batch_size <= 0 || n_refactorize < 0)
         throw std::runtime_error(
@@ -172,7 +175,7 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
                       thrust::raw_pointer_cast(d_vals.data()),
                       thrust::raw_pointer_cast(d_rhs.data()),
                       thrust::raw_pointer_cast(d_x.data()),
-                      cs, reordering_alg, matching_alg, pivot_epsilon_alg);
+                      cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps);
     solver.set_values(thrust::raw_pointer_cast(d_vals.data()));
     solver.prepare_factorization();   // non-uniform modes: the deferred ANALYSIS
     cs.synchronize();

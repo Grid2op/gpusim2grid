@@ -87,56 +87,50 @@ limitations and for pointers to other open-source tools that cover them.
 
 ## Requirements
 
-- A **CUDA-capable NVIDIA GPU**.
-- The **[NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)**
-  12.x+.
-- **[cuDSS](https://developer.nvidia.com/cudss) >= 0.8.0** — required for the sparse
-  direct solve.
-- **cuSPARSE** (ships with the CUDA Toolkit).
-- Python 3.9+, a C++17 compiler, CMake >= 3.15.
-- **[`lightsim2grid`](https://github.com/Grid2op/lightsim2grid) (hard dependency)** —
-  CPU preprocessing and reference oracle. <!--REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER  Integration with `lightsim2grid` is expected to deepen in future releases. -->
-
-> NVIDIA libraries (cuDSS, cuSPARSE) are **not redistributed** with this package.
-> Install the CUDA Toolkit and cuDSS yourself before building, using the links above.
+- A **CUDA-capable NVIDIA GPU** and its driver.
+- Python 3.9+ and a C++17 compiler.
+- Everything else comes from PyPI:
+  - **[`lightsim2grid`](https://github.com/Grid2op/lightsim2grid) >= 1.3.1 (hard
+    dependency)** — CPU preprocessing and reference oracle. Its wheel ships the C++
+    core and headers (KLU's included) that gpusim2grid's bridge compiles against.
+    <!--REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER  Integration with `lightsim2grid` is expected to deepen in future releases. -->
+  - **[cuDSS](https://developer.nvidia.com/cudss) 1.x** (`nvidia-cudss-cu12` /
+    `nvidia-cudss-cu13`) — the sparse direct solve.
+  - the **CUDA 13 toolkit** (`cuda-toolkit`), compiler included. PyPI has no
+    CUDA 12 compiler: with CUDA 12, `nvcc` (12.4 or later) comes from the
+    [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) installer,
+    the libraries and cuDSS from PyPI.
 
 ## Installation
 
-Install from source (no PyPI release yet):
+Install from source (no PyPI release of gpusim2grid yet). With CUDA 13, everything
+it builds against comes from PyPI:
 
 ```bash
 git clone https://github.com/Grid2Op/gpusim2grid.git
 cd gpusim2grid
-pip install --no-build-isolation .
+pip install "lightsim2grid>=1.3.1" "nvidia-cudss-cu13>=1.0.0.35,<2" \
+    "cuda-toolkit[nvcc,crt,cudart,cccl,cublas,cusolver,cusparse,nvjitlink,nvvm]>=13,<14" \
+    scikit-build-core pybind11 cmake
+CUDA_ROOT=$(python -c "import nvidia.cu13 as m; print(list(m.__path__)[0])")
+CUDACXX=$CUDA_ROOT/bin/nvcc CUDAToolkit_ROOT=$CUDA_ROOT cudss_DIR=$PWD/ci/cmake/cudss \
+    pip install --no-build-isolation .
+export LD_LIBRARY_PATH=$CUDA_ROOT/lib:$LD_LIBRARY_PATH   # cuDSS / cuSPARSE at runtime
 ```
 
-This automatically builds the zero-copy C++ bridge to `lightsim2grid`
-(`lightsim2grid_core`) — CMake locates it via the Python interpreter it is
-building against, since `lightsim2grid` is a build-system requirement. No
-`CMAKE_ARGS` needed for the common case; see the
-[installation docs](#building-the-docs) if you need to point at a different
-`lightsim2grid` install. `--no-build-isolation` matters here too: it makes
-gpusim2grid's own build use the `lightsim2grid` already installed in your
-current environment (matching Eigen/SuiteSparse/compile flags) instead of
-pip resolving a fresh, isolated one that may not match.
+With CUDA 12, install `"nvidia-cudss-cu12>=1.0.0.35,<2"` instead and keep the
+toolkit's own `nvcc` on your `PATH`; `cudss_DIR` is the same, `LD_LIBRARY_PATH`
+needs the wheel's `nvidia/cu12/lib`. `pip install ".[cuda12]"` / `".[cuda13]"`
+lists the runtime libraries.
 
-> **`lightsim2grid` should also be built from source.** The PyPI wheel does
-> not ship the C++ headers (`LSGrid.hpp` and friends) the bridge needs, only
-> the compiled extension — so build it yourself first, with
-> `--no-build-isolation` so it's built against the same environment
-> gpusim2grid will use. It also needs its own submodules (SuiteSparse,
-> Eigen) checked out, or it won't compile:
-> ```bash
-> git clone --recurse-submodules https://github.com/Grid2op/lightsim2grid.git
-> cd lightsim2grid
-> pip install --no-build-isolation .
-> ```
-> (or the equivalent `uv pip install --no-build-isolation .`). See the
-> [installation docs](#building-the-docs) for details on matching Eigen /
-> SuiteSparse versions between the two builds.
+This builds the zero-copy C++ bridge to `lightsim2grid` (`lightsim2grid_core`):
+CMake locates it, and the KLU headers it ships, via the Python interpreter it is
+building against. `--no-build-isolation` makes the build use the `lightsim2grid`
+installed in your environment instead of a fresh, isolated one pip would resolve.
+`ci/cmake/cudss/` is a small CMake package for the cuDSS wheel, which ships none.
 
-For detailed installation options — selecting float precision, linking against a
-specific CUDA version, and other build customization — see the dedicated installation
+For detailed installation options — selecting float precision, a CUDA toolkit or
+cuDSS not from PyPI, and other build customization — see the dedicated installation
 page in the [documentation](#building-the-docs).
 
 ## Quickstart

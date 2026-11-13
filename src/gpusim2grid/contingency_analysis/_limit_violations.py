@@ -110,7 +110,7 @@ class LimitViolationType(IntEnum):
     #: the target it would hold: it absorbs too much for that target, and
     #: OpenLoadFlow's ReactiveLimits loop would switch it back to PV (the PQ ->
     #: PV direction, the mirror of LOW_Q / HIGH_Q; lightsim2grid PR #216).
-    #: Category PHYSICAL. value the regulated voltage, limit the target, kV.
+    #: Category CONTROL. value the regulated voltage, limit the target, kV.
     LOW_VOLTAGE_AT_MIN_Q = 9
     #: ... and the mirror: pinned at its MAXIMUM, regulated bus ABOVE the target.
     HIGH_VOLTAGE_AT_MAX_Q = 10
@@ -118,26 +118,36 @@ class LimitViolationType(IntEnum):
     #: (lightsim2grid's ``LSGrid.set_svc_standby``) whose regulated bus sits
     #: BELOW the automaton's low threshold: OpenLoadFlow's
     #: MonitoringVoltageOuterLoop would switch it to voltage control. Category
-    #: PHYSICAL. value the regulated voltage, limit the threshold, kV.
+    #: CONTROL. value the regulated voltage, limit the threshold, kV.
     LOW_VOLTAGE_SVC_STANDBY = 11
     #: ... and the mirror: regulated bus ABOVE the high threshold.
     HIGH_VOLTAGE_SVC_STANDBY = 12
-    #: A GENERATOR regulating a REMOTE bus whose own bus sits BELOW the
-    #: realistic range (lightsim2grid's
-    #: ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's
-    #: ReactiveLimits loop, in its robust remote voltage control mode, would
-    #: switch it to PQ. Category PHYSICAL. value the generator's own bus
-    #: voltage, limit the bound, kV. Mirrored for parity, not computed here.
+    #: A GENERATOR regulating a REMOTE bus whose OWN bus sits BELOW the
+    #: realistic range the caller set (lightsim2grid's
+    #: ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's robust
+    #: remote voltage control would switch it to PQ. Category PHYSICAL. value
+    #: its own bus' voltage, limit the bound, kV.
     LOW_VOLTAGE_REMOTE_CONTROL = 13
-    #: ... and the mirror: own bus ABOVE the realistic range.
+    #: ... and the mirror: own bus ABOVE the range.
     HIGH_VOLTAGE_REMOTE_CONTROL = 14
-    #: An angle-droop HVDC line an outer loop froze at its active power limit
-    #: (lightsim2grid's ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop
-    #: would now ask for LESS than that limit: OpenLoadFlow's
-    #: AcHvdcAcEmulationLimits loop would leave it in AC emulation. Category
-    #: PHYSICAL. side the direction it is frozen in, value/limit in MW.
-    #: Mirrored for parity, not computed here.
+    #: An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
+    #: ``LSGrid.set_hvdc_ac_emulation_frozen``) whose droop, from the row's angles,
+    #: asks for less than that limit: OpenLoadFlow would have left it in AC
+    #: emulation. Category CONTROL. side the frozen direction, value that flow,
+    #: limit the pmax, MW.
     HVDC_AC_EMULATION_RELEASE = 15
+    #: The types 16-20 mirror lightsim2grid's outer-loop detection (category
+    #: CONTROL); no gpusim2grid check reports them yet. The single slack bus
+    #: absorbed more than OpenLoadFlow's slackBusPMaxMismatch (GRID, MW).
+    SLACK_MISMATCH = 16
+    #: A phase tap changer's regulated active power off its target (TRAFO, MW).
+    PHASE_CONTROL_P = 17
+    #: A phase tap changer's limited current above its limit (TRAFO, A).
+    PHASE_LIMITER_CURRENT = 18
+    #: A bus ratio tap changers regulate, off half their deadband (BUS, kV).
+    TRANSFORMER_VOLTAGE_DEADBAND = 19
+    #: A bus shunt sections regulate, off its target (BUS, kV).
+    SHUNT_VOLTAGE_CONTROL = 20
 
 
 class ViolationCategory(IntEnum):
@@ -151,14 +161,19 @@ class ViolationCategory(IntEnum):
     PHYSICAL : a limit of the equipment itself, which nothing can leave: the
         converged solution is NOT physically realizable, the control it assumes
         cannot happen. LOW_Q, HIGH_Q, HIGH_P (= HVDC_P_SATURATION), LOW_P,
-        LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
-        HIGH_VOLTAGE_SVC_STANDBY, LOW_VOLTAGE_REMOTE_CONTROL,
-        HIGH_VOLTAGE_REMOTE_CONTROL, HVDC_AC_EMULATION_RELEASE.
+        LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL.
     SOLVER : not a limit at all, what the solver did. NOT_SIMULATED, DIVERGENCE.
+    CONTROL : a control or automaton the solution did not apply: the state is
+        reachable, just not the one an outer loop would settle in.
+        LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q, LOW_VOLTAGE_SVC_STANDBY,
+        HIGH_VOLTAGE_SVC_STANDBY, HVDC_AC_EMULATION_RELEASE, SLACK_MISMATCH,
+        PHASE_CONTROL_P, PHASE_LIMITER_CURRENT, TRANSFORMER_VOLTAGE_DEADBAND,
+        SHUNT_VOLTAGE_CONTROL.
     """
     OPERATIONAL = 0
     PHYSICAL = 1
     SOLVER = 2
+    CONTROL = 3
 
 
 def violation_category(violation_type):
@@ -169,14 +184,20 @@ def violation_category(violation_type):
         return ViolationCategory.OPERATIONAL
     if t in (LimitViolationType.LOW_Q, LimitViolationType.HIGH_Q,
              LimitViolationType.HVDC_P_SATURATION, LimitViolationType.LOW_P,
-             LimitViolationType.LOW_VOLTAGE_AT_MIN_Q,
+             LimitViolationType.LOW_VOLTAGE_REMOTE_CONTROL,
+             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL):
+        return ViolationCategory.PHYSICAL
+    if t in (LimitViolationType.LOW_VOLTAGE_AT_MIN_Q,
              LimitViolationType.HIGH_VOLTAGE_AT_MAX_Q,
              LimitViolationType.LOW_VOLTAGE_SVC_STANDBY,
              LimitViolationType.HIGH_VOLTAGE_SVC_STANDBY,
-             LimitViolationType.LOW_VOLTAGE_REMOTE_CONTROL,
-             LimitViolationType.HIGH_VOLTAGE_REMOTE_CONTROL,
-             LimitViolationType.HVDC_AC_EMULATION_RELEASE):
-        return ViolationCategory.PHYSICAL
+             LimitViolationType.HVDC_AC_EMULATION_RELEASE,
+             LimitViolationType.SLACK_MISMATCH,
+             LimitViolationType.PHASE_CONTROL_P,
+             LimitViolationType.PHASE_LIMITER_CURRENT,
+             LimitViolationType.TRANSFORMER_VOLTAGE_DEADBAND,
+             LimitViolationType.SHUNT_VOLTAGE_CONTROL):
+        return ViolationCategory.CONTROL
     return ViolationCategory.SOLVER
 
 
@@ -210,6 +231,9 @@ class LimitViolation:
         element_id the grid hvdc id, side 1 (would saturate 1->2: the flow
         leaving bus 1 exceeds pmax_1to2) or 2 (2->1), value that flow (MW),
         limit pmax (MW).
+    HVDC_AC_EMULATION_RELEASE (``compute_physical_violations``) : element_type
+        HVDC, a line frozen at its AC-emulation limit whose droop asks for less:
+        side its frozen direction, value that flow (MW), limit pmax (MW).
     LOW_P / HIGH_P on a GENERATOR / STORAGE (``compute_physical_violations``) :
         element_id the container id of that family, side 0, value the
         machine's converged active power -- its target plus its share of the
@@ -255,10 +279,10 @@ def bus_q_violations_from_result(res):
 def hvdc_p_violations_from_result(res):
     """list[list[LimitViolation]] from an ``HvdcPViolationsResult`` (the raw
     output of ``get_hvdc_p_violations[_n]()`` on a batch session)."""
-    hvdc_id, side, value, limit = res.hvdc_id, res.side, res.value, res.limit
+    hvdc_id, side, vtype, value, limit = res.hvdc_id, res.side, res.type, res.value, res.limit
     return _rows_from_flat(res.count, res.stride, lambda i: LimitViolation(
         ViolationElementType.HVDC, int(hvdc_id[i]), int(side[i]),
-        LimitViolationType.HVDC_P_SATURATION, float(value[i]), float(limit[i])))
+        LimitViolationType(int(vtype[i])), float(value[i]), float(limit[i])))
 
 
 def gen_p_violations_from_result(res):
@@ -273,8 +297,9 @@ def gen_p_violations_from_result(res):
 def gen_pv_release_violations_from_result(res):
     """list[list[LimitViolation]] from a ``GenPvReleaseViolationsResult`` (the
     raw output of ``get_gen_pv_release_violations[_n]()`` on a batch session):
-    the PQ -> PV release of the flagged generators and SVCs, and the switch on
-    of the flagged standby SVCs routed through the same plan -- ``el_type``
+    the PQ -> PV release of the flagged generators and SVCs, the switch on of
+    the flagged standby SVCs and the generators holding a remote bus from an
+    unrealistic voltage, routed through the same plan -- ``el_type``
     says which element ``gen_id`` names (an HVDC one: the hvdc line of a frozen VSC
     station, ``side`` the station's end)."""
     gen_id, el_type, vtype, value, limit = res.gen_id, res.el_type, res.type, res.value, res.limit

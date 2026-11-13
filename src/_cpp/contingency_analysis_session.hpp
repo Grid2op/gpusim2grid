@@ -37,6 +37,8 @@
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
+#include "outer/outer_hook.hpp"                  // outer::OuterHook
 #include "ledger_data.hpp"                      // LedgerData (the stored base ledger)
 #include "slack_redistribution.hpp"              // SlackRedistributionData, slack_redistribution::RowResult
 #include "reordering_alg.hpp"
@@ -47,6 +49,7 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -105,9 +108,17 @@ struct ContingencyAnalysisSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_   = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // contingency runs nb_iter_ iterations) or continuous (nb_iter_ is each
+    // contingency's budget, checked every nb_iter_per_round_ iterations
+    // against tol_). Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see AcPfNrState's own
@@ -179,6 +190,7 @@ struct ContingencyAnalysisSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
 
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
     // the participants snapshot, the base injections the pre-pass reads a
@@ -231,6 +243,7 @@ struct ContingencyAnalysisSession {
         ReorderingAlg reordering_alg = ReorderingAlg::Default,
         MatchingAlg matching_alg = MatchingAlg::None,
         PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int ir_n_steps = 0,
         // Opt-in diagnostic forwarded to base_state_ (see AcPfNrState's own
         // doc): force the pre-ground-truth cuDSS-solve derivation of
         // slack_absorbed/vc_q even when lightsim2grid's own converged values
@@ -334,6 +347,30 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_contingencies * n_bus,)  complex
     RealVect get_residuals()  const;   // (n_contingencies,)           real
+
+    // Overwrite the voltages and residuals of rows dst_rows[i] with row
+    // src_rows[i] of another session's result buffers (device pointers: a
+    // row-major (* x n_bus) complex voltage buffer and a (*,) residual one,
+    // e.g. ScenarioSweepSession::v_results_ptr / residuals_ptr, holding
+    // n_src_rows rows of n_bus_src buses -- every source row is checked against
+    // it): the reactive-limit outer loop's second pass. Requires run().
+    void overwrite_rows(const std::vector<int>& dst_rows, const std::vector<int>& src_rows,
+                        std::uintptr_t d_V_src, std::uintptr_t d_res_src,
+                        int n_src_rows, int n_bus_src);
+    // ... and their per-row outcome (iterations, RowStatus), given for those
+    // dst rows. Requires run().
+    void overwrite_row_outcomes(const std::vector<int>& rows, const std::vector<int>& iterations,
+                                const std::vector<int>& status);
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_contingencies,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
+    // Device pointer of the last run's row-major (n_contingencies x n_bus)
+    // complex voltages (0 before run()): the reactive-limit outer loop's second
+    // pass starts each row from it (ScenarioSweepSession::set_v_init_from_ptr).
+    std::uintptr_t v_results_ptr() const;
+    // Rows of the result buffers v_results_ptr() points to (0 before run()).
+    int result_rows() const;
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
@@ -371,6 +408,14 @@ struct ContingencyAnalysisSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; see ScenarioSweepSession's): the model
+    // deciding on every row, built by the bridge off an NROuter_* grid.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);

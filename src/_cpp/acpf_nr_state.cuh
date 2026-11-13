@@ -49,12 +49,34 @@
                                // CuSpMV, CudaTimer
 #include "cu_complex_utils.h" // cudaComplexType, CudaFunHelper, CUDA_C_TYPE …
 #include "timing_utils.hpp"   // AcPfTimings, TimingEntry
+#include "outer/branch_control_kernels.cuh"  // BcStatic, BcSlots
 
 struct LedgerData;            // ledger_data.hpp (host); optional augmented-J input
 
 // =============================================================================
 // AcPfNrState
 // =============================================================================
+// CtlGroups' device storage (outer/branch_control_kernels.cuh), built from a ledger's groups
+// (their regulated bus, its Vm column, target, members and rows) against the J skeleton
+struct CtlGroupsDevice {
+    int n_grp = 0;
+    thrust::device_vector<int> start, member, row, jvm, jstart, jcol, bus;
+    thrust::device_vector<cuda_real_type> target;
+    CtlGroups view() const {
+        CtlGroups g;
+        g.n_grp = n_grp;
+        g.start = thrust::raw_pointer_cast(start.data());
+        g.member = thrust::raw_pointer_cast(member.data());
+        g.row = thrust::raw_pointer_cast(row.data());
+        g.jvm = thrust::raw_pointer_cast(jvm.data());
+        g.jstart = thrust::raw_pointer_cast(jstart.data());
+        g.jcol = thrust::raw_pointer_cast(jcol.data());
+        g.bus = thrust::raw_pointer_cast(bus.data());
+        g.target = thrust::raw_pointer_cast(target.data());
+        return g;
+    }
+};
+
 struct AcPfNrState {
 
     // -------------------------------------------------------------------------
@@ -109,6 +131,8 @@ struct AcPfNrState {
     // once at construction).
     // -------------------------------------------------------------------------
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    // CUDSS_CONFIG_IR_N_STEPS, same treatment (read at SOLVE)
+    int ir_n_steps_ = 0;
 
     // -------------------------------------------------------------------------
     // debug_base_case_: opt-in diagnostic (presolved_v path only). When true,
@@ -201,6 +225,29 @@ struct AcPfNrState {
     std::vector<cuda_real_type> h_slack_w;
     std::vector<int>            h_vc_vrow, h_vc_vrow_qcol_pos, h_vc_vrow_vmcol_pos;
     std::vector<int>            h_vc_ctrl_vrow_qcol_pos;
+    //   h_vc_ctrl_sh_row / _sh_self_pos / _sh_first_pos : per CONTROLLER, the
+    //                                   sharing row tying it to its group's
+    //                                   first controller and the nnz pos of
+    //                                   its (own q_col) / (first's q_col)
+    //                                   entries; -1 for a first controller
+    std::vector<int>            h_vc_ctrl_sh_row, h_vc_ctrl_sh_self_pos, h_vc_ctrl_sh_first_pos;
+    //   h_vc_held / h_vc_q_held       : per CONTROLLER, lightsim2grid's held ones
+    //                                   (LedgerData::vc_held) and the output they
+    //                                   hold (pu); all 0 when none is held. Every
+    //                                   batch row pins them unless it releases one.
+    std::vector<int>            h_vc_held;
+    std::vector<double>         h_vc_q_held;
+    bool                        has_vc_held = false;
+    //   outer loops (LedgerData::outer_loops): what the may_hold_ formulation of
+    //   VoltageControl writes per slot (outer/outer_kernels.cuh) -- per controller
+    //   its (v_row, q_col) slot and, for a non-first one, its sharing row and that
+    //   row's entry on each controller of its group (flat, h_vch_rowpos_off); per
+    //   group its (v_row, vm_col(reg)). Empty otherwise.
+    bool                        vc_may_hold = false;
+    std::vector<int>            h_vch_rowpos_off, h_vch_rowpos;
+    thrust::device_vector<cuda_real_type> d_vc_weight;
+    thrust::device_vector<int>  d_vch_slope_pos, d_vch_vm_pos, d_vch_sh_row,
+                                d_vch_rowpos_off, d_vch_rowpos;
 
     // Switchable Vm buses (LedgerData::switchable_vm_buses, sorted): their Q
     // rows are identity-PINNED in this single-system base solve (the base
@@ -211,6 +258,11 @@ struct AcPfNrState {
     std::vector<int>            h_switchable_buses;
     int                         n_pin = 0;
     thrust::device_vector<int>  d_pin_slot, d_pin_row, d_pin_diag;
+    // ... and per switchable bus (h_switchable_buses' order, -1 where it owns no
+    // Q row): its Q row and (q_row, vm_col) position, what the outer loops pin
+    // per slot (NrIterBuffers::d_oc_pin_*)
+    std::vector<int>            h_sw_qrow, h_sw_qdiag;
+    thrust::device_vector<int>  d_sw_qrow, d_sw_qdiag;
 
     // -------------------------------------------------------------------------
     // MultiSlack (distributed slack in the Jacobian) — slack_col < 0 when absent.
@@ -238,6 +290,95 @@ struct AcPfNrState {
                                           d_hvdc_r, d_hvdc_pmax12, d_hvdc_pmax21;
     thrust::device_vector<int>            d_hvdc_prow1, d_hvdc_prow2;          // end P rows
     thrust::device_vector<int>            d_hvdc_h11, d_hvdc_h12, d_hvdc_h21, d_hvdc_h22;  // feature J pos
+    // the lines frozen at their AC-emulation limit (LedgerData::hvdc_frz_*): checked for
+    // their release only, never solved
+    int n_hvdc_frz = 0;
+    thrust::device_vector<int>            d_hvdc_frz_bus1, d_hvdc_frz_bus2, d_hvdc_frz_dir, d_hvdc_frz_id;
+    thrust::device_vector<cuda_real_type> d_hvdc_frz_p0, d_hvdc_frz_k, d_hvdc_frz_limit;
+
+    // -------------------------------------------------------------------------
+    // BranchControl (outer loops: PhaseControl, TransformerVoltageControl) — n_bc == 0
+    // when absent. Static per transformer (outer/branch_control_kernels.cuh's BcStatic);
+    // d_bcs_* the base solve's own one-slot state (BcSlots), the batch driver keeps
+    // its own per slot.
+    // -------------------------------------------------------------------------
+    int n_bc = 0;
+    std::vector<int>                       h_bc_trafo;   // grid trafo id per transformer
+    int                                    bc_n_lines = 0;   // its branch index is bc_n_lines + trafo id
+    thrust::device_vector<int>             d_bc_b1, d_bc_b2, d_bc_side, d_bc_row, d_bc_col;
+    thrust::device_vector<int>             d_bc_ypos, d_bc_jpos;
+    thrust::device_vector<cuda_real_type>  d_bc_sign, d_bc_rexp, d_bc_p_target, d_bc_a_tap0, d_bc_rho_tap0;
+    thrust::device_vector<cudaComplexType> d_bc_tap0, d_bc_yeff0;
+    thrust::device_vector<int>             d_bc_rcol, d_bc_jpos_r;
+    CtlGroupsDevice                        bc_groups;
+    thrust::device_vector<cuda_real_type>  d_bcs_a, d_bcs_rho, d_bcs_a_target, d_bcs_a_tap, d_bcs_rho_tap,
+                                           d_bcs_rho_target;
+    thrust::device_vector<cudaComplexType> d_bcs_tap, d_bcs_applied;
+    thrust::device_vector<unsigned char>   d_bcs_on, d_bcs_out, d_bcs_ron;
+    BcStatic bc_static() const {
+        BcStatic b;
+        b.n_bc = n_bc;
+        b.b1 = thrust::raw_pointer_cast(d_bc_b1.data());
+        b.b2 = thrust::raw_pointer_cast(d_bc_b2.data());
+        b.side = thrust::raw_pointer_cast(d_bc_side.data());
+        b.row = thrust::raw_pointer_cast(d_bc_row.data());
+        b.col = thrust::raw_pointer_cast(d_bc_col.data());
+        b.ypos = thrust::raw_pointer_cast(d_bc_ypos.data());
+        b.jpos = thrust::raw_pointer_cast(d_bc_jpos.data());
+        b.sign = thrust::raw_pointer_cast(d_bc_sign.data());
+        b.rexp = thrust::raw_pointer_cast(d_bc_rexp.data());
+        b.p_target = thrust::raw_pointer_cast(d_bc_p_target.data());
+        b.tap0 = thrust::raw_pointer_cast(d_bc_tap0.data());
+        b.yeff0 = thrust::raw_pointer_cast(d_bc_yeff0.data());
+        b.a_tap0 = thrust::raw_pointer_cast(d_bc_a_tap0.data());
+        b.rho_tap0 = thrust::raw_pointer_cast(d_bc_rho_tap0.data());
+        b.rcol = thrust::raw_pointer_cast(d_bc_rcol.data());
+        b.jpos_r = thrust::raw_pointer_cast(d_bc_jpos_r.data());
+        b.grp = bc_groups.view();
+        return b;
+    }
+    // ShuntControl (outer loops: ShuntVoltageControl) — n_sc == 0 when absent; d_scs_* the
+    // base solve's own one-slot state
+    int n_sc = 0;
+    thrust::device_vector<int>             d_sc_bus, d_sc_col, d_sc_jq, d_sc_ypos;
+    thrust::device_vector<cuda_real_type>  d_sc_b0;
+    CtlGroupsDevice                        sc_groups;
+    thrust::device_vector<cuda_real_type>  d_scs_b, d_scs_b_applied, d_scs_b_target;
+    thrust::device_vector<unsigned char>   d_scs_on;
+    ScStatic sc_static() const {
+        ScStatic b;
+        b.n_sc = n_sc;
+        b.bus = thrust::raw_pointer_cast(d_sc_bus.data());
+        b.col = thrust::raw_pointer_cast(d_sc_col.data());
+        b.jq = thrust::raw_pointer_cast(d_sc_jq.data());
+        b.ypos = thrust::raw_pointer_cast(d_sc_ypos.data());
+        b.b0 = thrust::raw_pointer_cast(d_sc_b0.data());
+        b.grp = sc_groups.view();
+        return b;
+    }
+    ScSlots sc_base_slots() {
+        ScSlots b;
+        b.b = thrust::raw_pointer_cast(d_scs_b.data());
+        b.b_applied = thrust::raw_pointer_cast(d_scs_b_applied.data());
+        b.b_target = thrust::raw_pointer_cast(d_scs_b_target.data());
+        b.on = thrust::raw_pointer_cast(d_scs_on.data());
+        return b;
+    }
+    BcSlots bc_base_slots() {
+        BcSlots b;
+        b.a = thrust::raw_pointer_cast(d_bcs_a.data());
+        b.rho = thrust::raw_pointer_cast(d_bcs_rho.data());
+        b.a_target = thrust::raw_pointer_cast(d_bcs_a_target.data());
+        b.a_tap = thrust::raw_pointer_cast(d_bcs_a_tap.data());
+        b.rho_tap = thrust::raw_pointer_cast(d_bcs_rho_tap.data());
+        b.tap = thrust::raw_pointer_cast(d_bcs_tap.data());
+        b.applied = thrust::raw_pointer_cast(d_bcs_applied.data());
+        b.on = thrust::raw_pointer_cast(d_bcs_on.data());
+        b.out = thrust::raw_pointer_cast(d_bcs_out.data());
+        b.rho_target = thrust::raw_pointer_cast(d_bcs_rho_target.data());
+        b.ron = thrust::raw_pointer_cast(d_bcs_ron.data());
+        return b;
+    }
 
     // -------------------------------------------------------------------------
     // VoltageControl (remote gen + SVC) — n_vc_ctrl == 0 when inactive.
@@ -256,6 +397,15 @@ struct AcPfNrState {
     thrust::device_vector<int>            d_vc_feat_pos;                        // flat feature J pos
     thrust::device_vector<cuda_real_type> d_vc_feat_val;                       // flat feature value
     thrust::device_vector<cuda_real_type> d_vc_q;                              // [n_vc_ctrl] running state
+    // held controllers: the frozen output offset out of the mismatch (empty = none
+    // held) and their pins in this base solve (the vcp / jov streams of the batch
+    // rows, slot 0)
+    thrust::device_vector<cuda_real_type> d_vc_qoff;                           // [n_vc_ctrl]
+    thrust::device_vector<int>            d_hold_vcp_slot, d_hold_vcp_row, d_hold_vcp_ctrl;
+    thrust::device_vector<cuda_real_type> d_hold_vcp_target;
+    thrust::device_vector<int>            d_hold_jov_slot, d_hold_jov_pos;
+    thrust::device_vector<cuda_real_type> d_hold_jov_val;
+    int                                   n_hold_vcp = 0, n_hold_jov = 0;
 
     // -------------------------------------------------------------------------
     // Ybus CSR (device, complex cuda_real_type)
@@ -422,6 +572,8 @@ struct AcPfNrState {
         // CUDSS_CONFIG_PIVOT_EPSILON_ALG choice for BOTH dss and dss_T's
         // CUDSS_PHASE_ANALYSIS. Default matches cuDSS's own implicit default.
         PivotEpsilonAlg                               pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        // CUDSS_CONFIG_IR_N_STEPS (iterative refinement per SOLVE) for BOTH dss and dss_T.
+        int                                           ir_n_steps = 0,
         // Opt-in diagnostic (presolved_v path only): force the cuDSS-solve
         // derivation of slack_absorbed/vc_q even when ledger ground truth is
         // available. See debug_base_case_ above. Default false.

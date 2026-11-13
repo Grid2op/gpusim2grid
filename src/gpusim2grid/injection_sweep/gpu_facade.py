@@ -13,11 +13,13 @@ import numpy as np
 
 from . import (
     PhysicalChecksFacadeMixin,
+    SchedulingFacadeMixin,
     _InjectionSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from .._ls2g_utils import (
     extract_grid_arrays,
@@ -29,6 +31,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
+from .._outer_loops import _check_outer_loops_args
 
 __all__ = ["InjectionSweepGPU"]
 
@@ -37,7 +40,7 @@ def _have_bridge():
     return getattr(_cpp, "have_ls2g_bridge", False)
 
 
-class InjectionSweepGPU(PhysicalChecksFacadeMixin):
+class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
     """Batch injection sweep on the GPU, seeded from a CPU base-case solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -85,6 +88,18 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG`` choice, same construction-time
         scope as ``reordering_alg`` above; ``None`` (default) leaves it at
         ``'default'``.
+    ir_n_steps : int, default 0
+        cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: steps of iterative refinement after
+        each linear solve, base case and batch (forward and adjoint). ``0``
+        (default) solves without refinement. Static pivoting can leave the
+        Jacobian's factors a little inexact, which Newton usually absorbs.
+        **With** ``outer_loops=True`` **use 1**: each inner solve must stop at
+        the iteration lightsim2grid's does, and a hard one (e.g. after
+        TransformerVoltageControl releases a held remote voltage controller)
+        can diverge without refinement where lightsim2grid's KLU converges.
+        One step costs one more residual and solve per Newton iteration. Mutable:
+        takes effect on the next :meth:`compute` (the base case keeps the
+        construction value).
     debug_base_case : bool, default False
         Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
         VoltageControl extension active (bridge path). By default, that
@@ -139,6 +154,39 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         Only meaningful on the lightsim2grid-bridge path; the explicit-array
         and Python-fallback paths have no ledger and always solve the bare
         system.
+    scheduling : {"chunked", "continuous"} or None, default None
+        ``None``: ``"chunked"``, or ``"continuous"`` with ``outer_loops``.
+        How the rows go through the batch. ``"chunked"``: ``ceil(n_rows /
+        batch_size)`` chunks, every row runs exactly ``nb_iter`` Newton
+        iterations. ``"continuous"``: ``batch_size`` slots; every
+        ``nb_iter_per_round`` iterations each row is checked, and one that
+        converged (``||F||inf < tol``), diverged or used its ``nb_iter``
+        budget leaves at once, its slot refilled from the queue -- a row pays
+        the iterations it needs, not the hardest row's. ``nb_iter`` is then
+        each row's budget (a row runs a multiple of ``nb_iter_per_round``, at
+        least one round). Continuous refuses the ``'direct_iter0_only'`` /
+        ``'direct_refactor_every_n'`` strategies. With ``outer_loops``, only
+        ``"continuous"`` is supported, by design (not planned to change): a
+        row the loops change is re-solved in its own slot while the others
+        go on, which a chunk cannot do. Mutable.
+    nb_iter_per_round : int, default 1
+        Continuous scheduling: iterations between two convergence checks; see
+:class:`ContingencyAnalysisGPU`. With ``outer_loops``, only 1 is
+        supported, by design (not planned to change). Mutable.
+    tol : float or None, default None
+        A row has converged when ``||F||inf < tol``, per unit like
+        :meth:`last_residuals`: when it leaves (continuous) and its
+        :class:`RowStatus` (both schedules, :meth:`get_row_status`).
+        lightsim2grid compares the same way but takes its ``tol`` in MVA
+        (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
+        build). Mutable.
+    outer_loops, keep_outer_trace : bool, default False
+        Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
+        row; see :class:`ScenarioSweepGPU`. Requires ``scheduling="continuous"`` and
+        ``nb_iter_per_round=1``, by design (neither is planned to change); pass
+        ``ir_n_steps=1`` with it (see there). Each row's generator targets are the ones :meth:`set_injections_from_elements` gives. With
+        ``init_from_n_powerflow`` (default) the rows resume from where the
+        grid's own solve left its loops. :meth:`get_outer_results`.
 
     Examples
     --------
@@ -166,12 +214,19 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
     def __init__(self, grid, *, init_from_n_powerflow=True, precision="fp64",
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
                  auto_branch_data=True, use_bridge=None, reordering_alg=None,
-                 matching_alg=None, pivot_epsilon_alg=None,
+                 matching_alg=None, pivot_epsilon_alg=None, ir_n_steps=0,
                  debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
-                 compute_physical_violations=False):
+                 compute_physical_violations=False, scheduling=None,
+                 nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        self._outer_loops = bool(outer_loops)
+        if scheduling is None:
+            scheduling = "continuous" if self._outer_loops else "chunked"
+        if self._outer_loops:
+            _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
+                                    compute_physical_violations=compute_physical_violations)
 
         # Single source of truth, resolved once here and applied at
         # construction time to BOTH the base-case solve and the batch solver
@@ -180,6 +235,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
         _pivot_epsilon_alg = 'default' if pivot_epsilon_alg is None else pivot_epsilon_alg
+        _ir_n_steps = _check_ir_n_steps(ir_n_steps)
 
         if isinstance(grid, (tuple, list)):
             # Explicit-array mode: no grid to seed/extract branch data from.
@@ -195,6 +251,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                 pivot_epsilon_alg=_pivot_epsilon_alg,
+                ir_n_steps=_ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 # No grid to inherit a scaling policy from -- None means off.
                 scaling_max_voltage_change=bool(scaling_max_voltage_change),
@@ -206,7 +263,21 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
-            if use_bridge:
+            if self._outer_loops:
+                # the grid's own outer loops (see ScenarioSweepGPU's outer_loops)
+                session = _cpp._make_is_outer_session_from_lsgrid(
+                    grid, 100, int(nb_iter), _normalize_device(device), bool(auto_branch_data),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
+                    keep_trace=bool(keep_outer_trace),
+                    resume_from_n=bool(init_from_n_powerflow))
+                self._inner = _InjectionSweepSolver._wrap_session(
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
+            elif use_bridge:
                 session = _cpp._make_is_session_from_lsgrid(
                     grid, bool(init_from_n_powerflow), 100, int(nb_iter),
                     int(max_iter_base), float(tol_base), _normalize_device(device),
@@ -214,6 +285,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     scaling_max_voltage_change_override=(
                         -1 if scaling_max_voltage_change is None
@@ -237,6 +309,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
                     presolved_v=init_from_n_powerflow,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                     pivot_epsilon_alg=_pivot_epsilon_alg,
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     # Python-array fallback: no C++ bridge to inherit the
                     # grid's algo config through, same as the tuple path.
@@ -269,6 +342,9 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         self._last_residuals = None
 
         # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
     # ------------------------------------------------------------------ spec
@@ -296,6 +372,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         self._gen_p_rows = None
         self._push_gen_p_targets()
         self._inner.set_injections(p_mw, q_mvar, sn_mva)
+        if self._outer_loops:
+            self._inner._s.set_outer_gen_p_rows([])
 
     def set_injections_from_elements(self, load_p, load_q, gen_p):
         """Store per-element injections, mirroring lightsim2grid's own batch API.
@@ -342,6 +420,23 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
         # set-points (see PhysicalChecksFacadeMixin._push_gen_p_targets)
         self._gen_p_rows = np.asarray(gen_p, dtype=np.float64)
         self._push_gen_p_targets()
+        # ... and the outer loops start from them (DistributedSlack's units,
+        # ReactiveLimits' capability curves)
+        if self._outer_loops:
+            self._inner._s.set_outer_gen_p_rows(list(self._gen_p_rows.ravel()))
+
+    @property
+    def outer_loops(self):
+        """bool: whether the grid's own outer loops run on every row (see
+        :class:`ScenarioSweepGPU`'s ``outer_loops``)."""
+        return self._outer_loops
+
+    def get_outer_results(self):
+        """Per row, the outcome of its outer loops (see
+        :meth:`ScenarioSweepGPU.get_outer_results`). Needs ``outer_loops=True``."""
+        if not self._outer_loops:
+            raise RuntimeError("get_outer_results() needs outer_loops=True")
+        return self._inner._s.get_outer_results()
 
     def set_gen_v(self, gen_v):
         """Store per-scenario generator target voltage magnitude (vm_pu, NOT kV).
@@ -478,6 +573,16 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin):
     @pivot_epsilon_alg.setter
     def pivot_epsilon_alg(self, value):
         self._inner.pivot_epsilon_alg = value
+
+    @property
+    def ir_n_steps(self):
+        """int: cuDSS ``CUDSS_CONFIG_IR_N_STEPS``, iterative refinement steps per
+        batch solve (0 = none). Takes effect on the next :meth:`compute`."""
+        return self._inner.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._inner.ir_n_steps = value
 
     @property
     def timings(self):

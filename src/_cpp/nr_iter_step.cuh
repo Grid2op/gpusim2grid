@@ -30,6 +30,8 @@
 #include "timing_utils.hpp"
 #include "dtypes.hpp"
 #include "cu_complex_utils.h"
+#include "outer/outer_kernels.cuh"
+#include "outer/branch_control_kernels.cuh"
 
 #include <limits>
 
@@ -194,6 +196,16 @@ struct NrIterBuffers {
     const int*             d_str_slot     = nullptr;   // [n_str]
     const int*             d_str_grp      = nullptr;   // [n_str]
     int                    n_str          = 0;
+    // controller rows held at a fixed reactive injection (the reactive-limit
+    // outer loop; MaskEntries::vcp): F[row] = -(Q_ctrl - target) per slot
+    const int*             d_vcp_slot     = nullptr;   // [n_vcp]
+    const int*             d_vcp_row      = nullptr;   // [n_vcp]
+    const int*             d_vcp_ctrl     = nullptr;   // [n_vcp]
+    const cuda_real_type*  d_vcp_target   = nullptr;   // [n_vcp]
+    int                    n_vcp          = 0;
+    // per controller, the frozen output a held one (LedgerData::vc_held) holds and
+    // its Sbus entry already carries: offset out of the mismatch; nullptr = none held
+    const cuda_real_type*  d_vc_qoff      = nullptr;   // [n_vc_ctrl]
 
     // ---- per-slot distributed-slack weights ---------------------------------
     // 0 (default): d_slack_w is the shared single-system [n_slack] array.
@@ -207,6 +219,41 @@ struct NrIterBuffers {
     // d_vc_vset is per slot, [actual_batch * n_vc_grp] -- a batch row whose
     // gen_v moves a controller's set-point (see GenVOverride).
     int                    vc_vset_stride = 0;
+
+    // ---- per-slot droop hvdc regimes -----------------------------------------
+    // 0 (default): d_hvdc_status is the shared [n_hvdc] array. n_hvdc: per slot,
+    // [actual_batch * n_hvdc] -- the AcHvdcAcEmulationLimits outer loop.
+    int                    hvdc_status_stride = 0;
+
+    // ---- outer loops: per-slot control state (outer/outer_hook.hpp) ---------
+    // All null / 0 unless an outer-loop model drives the batch; then:
+    //   * the switchable buses still PV in their slot have their Q row pinned
+    //     (identity on the Vm column, zero residual), after every feature stamp;
+    //   * VoltageControl runs lightsim2grid's may_hold_ formulation: a controller
+    //     held by value (d_oc_held_q finite) or by the plan (d_oc_plan_held) is
+    //     pinned at its output, the sharing taken against the first active one.
+    int                    n_oc_pin       = 0;
+    const int*             d_oc_pin_row   = nullptr;   // [n_oc_pin] Q row of each switchable bus
+    const int*             d_oc_pin_diag  = nullptr;   // [n_oc_pin] nnz pos of (q_row, vm_col)
+    const unsigned char*   d_oc_pin       = nullptr;   // [actual_batch * n_oc_pin] 1: PV
+    bool                   vc_may_hold    = false;
+    const cuda_real_type*  d_oc_held_q    = nullptr;   // [actual_batch * n_vc_ctrl] NaN: not held
+    const unsigned char*   d_oc_plan_held = nullptr;   // [actual_batch * n_vc_ctrl]
+    const cuda_real_type*  d_vc_weight    = nullptr;   // [n_vc_ctrl]
+    const int*             d_vch_slope_pos  = nullptr; // [n_vc_ctrl] (v_row, q_col) or -1
+    const int*             d_vch_vm_pos     = nullptr; // [n_vc_grp] (v_row, vm_col(reg)) or -1
+    const int*             d_vch_sh_row     = nullptr; // [n_vc_ctrl] its sharing row, -1 for a first one
+    const int*             d_vch_rowpos_off = nullptr; // [n_vc_ctrl] into d_vch_rowpos, -1 for a first one
+    const int*             d_vch_rowpos     = nullptr; // flat: per sharing row, its entry on each controller
+    // BranchControl (outer/branch_control_kernels.cuh): the transformers whose pi block
+    // follows their shift / ratio, patched into the slot's Ybus at every Newton step
+    // (d_Ybus_values_mut; null: the state moves, nothing is patched). n_bc == 0: off.
+    BcStatic               bc;
+    BcSlots                bcs;
+    ScStatic               sc;      // ShuntControl, the same way (n_sc == 0: off)
+    ScSlots                scs;
+    cudaComplexType*       d_Ybus_values_mut = nullptr;
+    int                    nnz_Y_bc = 0;            // per-slot Ybus stride for the patch
 
     // ---- NR step-scaling (MaxVoltageChange) -- inactive (alpha=1, no kernels
     // launched) unless enabled. Mirrors lightsim2grid's own
@@ -262,12 +309,12 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
     if (buf.n_hvdc > 0)
         hvdc_adjust_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
+            buf.hvdc_status_stride, buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_pmax12, buf.d_hvdc_pmax21, buf.d_hvdc_prow1, buf.d_hvdc_prow2,
             buf.n_hvdc, n_bus, dim_J, batch);
     if (buf.n_vc_ctrl > 0) {
         vc_adjust_mismatch_kernel<<<nr_grid_size((long long)batch * buf.n_vc_ctrl, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.n_vc_ctrl, dim_J, batch);
+            buf.d_F, buf.d_vc_q, buf.d_vc_qrow, buf.d_vc_qoff, buf.n_vc_ctrl, dim_J, batch);
         vc_vrow_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
             buf.d_F, buf.d_V, buf.d_vc_q, buf.d_vc_slope, buf.d_vc_reg_bus, buf.d_vc_vrow,
             buf.d_vc_grp_start, buf.d_vc_grp_count, buf.d_vc_vset, buf.vc_vset_stride,
@@ -277,7 +324,28 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
                 buf.d_F, buf.d_vc_q, buf.d_vc_sh_row, buf.d_vc_sh_first, buf.d_vc_sh_other,
                 buf.d_vc_sh_wfirst, buf.d_vc_sh_wother, buf.n_vc_share, buf.n_vc_ctrl,
                 dim_J, batch);
+        // controllers held by value: every group's rows rewritten (outer loops)
+        if (buf.vc_may_hold)
+            vc_hold_rows_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
+                buf.d_F, buf.d_V, buf.d_vc_q, buf.d_oc_held_q, buf.d_oc_plan_held, buf.d_vc_qoff,
+                buf.d_vc_vset, buf.vc_vset_stride, buf.d_vc_slope, buf.d_vc_weight,
+                buf.d_vc_reg_bus, buf.d_vc_vrow, buf.d_vch_sh_row,
+                buf.d_vc_grp_start, buf.d_vc_grp_count,
+                buf.n_vc_ctrl, buf.n_vc_grp, n_bus, dim_J, batch);
     }
+    // BranchControl: the shift rows, the ratio groups' rows
+    if (buf.bc.n_bc > 0)
+        bc_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.bc, buf.bcs, n_bus, dim_J, batch);
+    if (buf.bc.grp.n_grp > 0)
+        ctl_group_mismatch_kernel<<<nr_grid_size((long long)batch * buf.bc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.bc.grp, buf.bcs.rho, buf.bcs.rho_target, buf.bcs.ron, buf.bc.n_bc,
+            n_bus, dim_J, batch);
+    // ShuntControl: its groups' rows
+    if (buf.sc.grp.n_grp > 0)
+        ctl_group_mismatch_kernel<<<nr_grid_size((long long)batch * buf.sc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_F, buf.d_V, buf.sc.grp, buf.scs.b, buf.scs.b_target, buf.scs.on, buf.sc.n_sc,
+            n_bus, dim_J, batch);
 }
 
 inline void nr_feature_zero_J(const NrIterBuffers& buf, int nnz_J, int batch, cudaStream_t cs)
@@ -297,13 +365,33 @@ inline void nr_feature_fill_J(const NrIterBuffers& buf,
     if (buf.n_hvdc > 0)
         hvdc_fill_feature_kernel<<<nr_grid_size((long long)batch * buf.n_hvdc, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_V, buf.d_hvdc_bus1, buf.d_hvdc_bus2, buf.d_hvdc_status,
-            buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
+            buf.hvdc_status_stride, buf.d_hvdc_p0, buf.d_hvdc_k, buf.d_hvdc_lf1, buf.d_hvdc_lf2, buf.d_hvdc_r,
             buf.d_hvdc_h11, buf.d_hvdc_h12, buf.d_hvdc_h21, buf.d_hvdc_h22,
             buf.n_hvdc, n_bus, nnz_J, batch);
     if (buf.n_vc_feat > 0)
         fill_slack_feature_kernel<<<nr_grid_size((long long)batch * buf.n_vc_feat, BS), BS, 0, cs>>>(
             buf.d_J_values, buf.d_vc_feat_pos, buf.d_vc_feat_val, /*w_stride=*/0,
             buf.n_vc_feat, nnz_J, batch);
+    if (buf.vc_may_hold && buf.n_vc_grp > 0)
+        vc_hold_fill_J_kernel<<<nr_grid_size((long long)batch * buf.n_vc_grp, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.d_oc_held_q, buf.d_oc_plan_held, buf.d_vc_slope, buf.d_vc_weight,
+            buf.d_vch_slope_pos, buf.d_vch_vm_pos, buf.d_vch_rowpos_off, buf.d_vch_rowpos,
+            buf.d_vc_grp_start, buf.d_vc_grp_count,
+            buf.n_vc_ctrl, buf.n_vc_grp, nnz_J, batch);
+    // BranchControl: dS/da, dS/drho on the two buses, the shift rows, the ratio groups' rows
+    if (buf.bc.n_bc > 0)
+        bc_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.n_bc, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.d_V, buf.bc, buf.bcs, n_bus, nnz_J, batch);
+    if (buf.bc.grp.n_grp > 0)
+        ctl_group_fill_J_kernel<<<nr_grid_size((long long)batch * buf.bc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.bc.grp, buf.bcs.ron, buf.bc.n_bc, nnz_J, batch);
+    // ShuntControl: dQ/dB, its groups' rows
+    if (buf.sc.n_sc > 0)
+        sc_fill_J_kernel<<<nr_grid_size((long long)batch * buf.sc.n_sc, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.d_V, buf.sc, buf.scs, n_bus, nnz_J, batch);
+    if (buf.sc.grp.n_grp > 0)
+        ctl_group_fill_J_kernel<<<nr_grid_size((long long)batch * buf.sc.grp.n_grp, BS), BS, 0, cs>>>(
+            buf.d_J_values, buf.sc.grp, buf.scs.on, buf.sc.n_sc, nnz_J, batch);
 }
 
 inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cudaStream_t cs)
@@ -314,6 +402,14 @@ inline void nr_feature_update(const NrIterBuffers& buf, int dim_J, int batch, cu
     if (buf.n_vc_ctrl > 0)
         vc_apply_step_kernel<<<nr_grid_size((long long)batch * buf.n_vc_ctrl, BS), BS, 0, cs>>>(
             buf.d_vc_q, buf.d_dx, buf.d_vc_qcol, buf.n_vc_ctrl, dim_J, batch);
+    // BranchControl: the shift steps, its block patched into the slot's Ybus (the next
+    // SpMV reads it)
+    if (buf.bc.n_bc > 0)
+        bc_step_kernel<<<nr_grid_size((long long)batch, BS), BS, 0, cs>>>(
+            buf.d_dx, buf.d_Ybus_values_mut, buf.bc, buf.bcs, dim_J, buf.nnz_Y_bc, batch);
+    if (buf.sc.n_sc > 0)
+        sc_step_kernel<<<nr_grid_size((long long)batch * buf.sc.n_sc, BS), BS, 0, cs>>>(
+            buf.d_dx, buf.d_Ybus_values_mut, buf.sc, buf.scs, dim_J, buf.nnz_Y_bc, batch);
 }
 
 // -----------------------------------------------------------------------------
@@ -332,12 +428,16 @@ inline void nr_apply_bus_mask(const NrIterBuffers& buf,
             buf.d_J_outer_mask, nnz_J, dim_J, buf.n_mask_rows);
 }
 
-inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
+// d_slot_active (optional): only the slots whose entry is >= 0 (the slots
+// leaving a continuous-batching round); nullptr = every slot.
+inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs,
+                          const int* d_slot_active = nullptr)
 {
     if (buf.n_mask_v > 0) {
         const cuda_real_type nan_val = std::numeric_limits<cuda_real_type>::quiet_NaN();
         mask_V_nan_kernel<<<(buf.n_mask_v + BS - 1) / BS, BS, 0, cs>>>(
-            buf.d_V, buf.d_maskv_slot, buf.d_maskv_bus, nan_val, n_bus, buf.n_mask_v);
+            buf.d_V, buf.d_maskv_slot, buf.d_maskv_bus, nan_val, n_bus, buf.n_mask_v,
+            d_slot_active);
     }
 }
 
@@ -346,7 +446,9 @@ inline void nr_mask_v_nan(const NrIterBuffers& buf, int n_bus, cudaStream_t cs)
 //   nr_apply_J_overrides   : per-slot J value overrides. Must run AFTER every
 //                            feature stamp (they assign the normal values) and
 //                            BEFORE nr_apply_bus_mask (the masked rows win).
-//   nr_apply_stranded_vrow : F[v_row] = -Q_c for the stranded groups. Must run
+//   nr_apply_stranded_vrow : F[v_row] = -Q_c for the stranded groups (and
+//                            F[row] = -(Q_c - t) for the controllers held at a
+//                            fixed Q, MaskEntries::vcp). Must run
 //                            AFTER nr_feature_mismatch (vc_vrow_kernel assigns
 //                            the voltage-constraint residual it replaces).
 // The two composites below bundle each with the bus mask in the right order;
@@ -366,6 +468,10 @@ inline void nr_apply_stranded_vrow(const NrIterBuffers& buf, int dim_J, cudaStre
         vc_stranded_vrow_kernel<<<(buf.n_str + BS - 1) / BS, BS, 0, cs>>>(
             buf.d_F, buf.d_vc_q, buf.d_vc_vrow, buf.d_vc_grp_start,
             buf.d_str_slot, buf.d_str_grp, buf.n_vc_ctrl, dim_J, buf.n_str);
+    if (buf.n_vcp > 0)
+        vc_pinned_ctrl_rows_kernel<<<(buf.n_vcp + BS - 1) / BS, BS, 0, cs>>>(
+            buf.d_F, buf.d_vc_q, buf.d_vcp_slot, buf.d_vcp_row, buf.d_vcp_ctrl,
+            buf.d_vcp_target, buf.n_vc_ctrl, dim_J, buf.n_vcp);
 }
 
 // After fill_F + nr_feature_mismatch: stranded rows, then the bus mask.
@@ -373,6 +479,10 @@ inline void nr_apply_F_masks(const NrIterBuffers& buf,
                              int nnz_J, int dim_J, int batch, cudaStream_t cs)
 {
     nr_apply_stranded_vrow(buf, dim_J, cs);
+    if (buf.n_oc_pin > 0)
+        oc_pin_rows_kernel<<<nr_grid_size((long long)batch * buf.n_oc_pin, BS), BS, 0, cs>>>(
+            nullptr, buf.d_F, buf.d_oc_pin, buf.d_oc_pin_row, buf.d_oc_pin_diag,
+            buf.d_J_outer_mask, buf.n_oc_pin, nnz_J, dim_J, batch);
     nr_apply_bus_mask(buf, nnz_J, dim_J, batch, cs);
 }
 
@@ -381,6 +491,10 @@ inline void nr_apply_J_masks(const NrIterBuffers& buf,
                              int nnz_J, int dim_J, int batch, cudaStream_t cs)
 {
     nr_apply_J_overrides(buf, nnz_J, cs);
+    if (buf.n_oc_pin > 0)
+        oc_pin_rows_kernel<<<nr_grid_size((long long)batch * buf.n_oc_pin, BS), BS, 0, cs>>>(
+            buf.d_J_values, nullptr, buf.d_oc_pin, buf.d_oc_pin_row, buf.d_oc_pin_diag,
+            buf.d_J_outer_mask, buf.n_oc_pin, nnz_J, dim_J, batch);
     nr_apply_bus_mask(buf, nnz_J, dim_J, batch, cs);
 }
 

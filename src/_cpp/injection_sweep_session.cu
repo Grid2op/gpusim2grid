@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "injection_sweep_session.hpp"
+#include <limits>
 #include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
 #include "contingency/batch_pf_driver.cuh"
@@ -20,6 +21,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <utility>
@@ -54,6 +56,7 @@ InjectionSweepSession::InjectionSweepSession(
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
     PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
     bool   debug_base_case,
     bool   scaling_max_voltage_change,
     double max_dVa,
@@ -64,11 +67,23 @@ InjectionSweepSession::InjectionSweepSession(
     , reordering_alg_(reordering_alg)
     , matching_alg_(matching_alg)
     , pivot_epsilon_alg_(pivot_epsilon_alg)
+    , ir_n_steps_(ir_n_steps)
     , scaling_max_voltage_change_(scaling_max_voltage_change)
     , max_dVa_(max_dVa)
     , max_dVm_(max_dVm)
 {
     (void)slack_weights;
+    // lightsim2grid's held controllers (set_hold_frozen_regulators) are pinned per
+    // row by the mask streams, which an injection sweep does not have
+    // (the outer loops pin every held controller per slot themselves)
+    if (ledger != nullptr && !ledger->outer_loops)
+        for (int h : ledger->vc_held)
+            if (h)
+                throw std::runtime_error(
+                    "InjectionSweepSession: this grid holds frozen remote regulators in their "
+                    "voltage-control group (lightsim2grid's set_hold_frozen_regulators), which "
+                    "InjectionSweepGPU does not support: turn the option off on the grid, or "
+                    "use ScenarioSweepGPU.");
 
     auto t_base_start = std::chrono::steady_clock::now();
     base_state_ = std::make_unique<AcPfNrState>(
@@ -77,7 +92,7 @@ InjectionSweepSession::InjectionSweepSession(
         static_cast<eigen_real_type>(tol_base),
         device, ledger, presolved_v,
         /*diag_stop_before_state_correction=*/false,
-        reordering_alg, matching_alg, pivot_epsilon_alg,
+        reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps,
         debug_base_case, /*base_case_only=*/true,
         scaling_max_voltage_change, max_dVa, max_dVm);
     t_base_case_ms_ = ms_since(t_base_start);
@@ -88,6 +103,11 @@ InjectionSweepSession::InjectionSweepSession(
                          base_state_->h_vm_col_of_bus,
                          ledger ? ledger->vc_reg_bus : std::vector<int>{},
                          h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+    // the outer loops' switchable buses keep a gen_v re-seed (see ScenarioSweepSession's ctor)
+    if (ledger != nullptr && ledger->outer_loops)
+        for (int b : ledger->switchable_vm_buses)
+            if (b >= 0 && b < static_cast<int>(h_is_vm_fixed_bus_.size()))
+                h_is_vm_fixed_bus_[static_cast<size_t>(b)] = 1;
     if (ledger) {
         h_vc_v_set_ = ledger->vc_v_set;
         h_vc_group_fixed_.assign(ledger->vc_reg_bus.size(), 0);
@@ -159,9 +179,11 @@ BatchDriverConfig InjectionSweepSession::_current_config() const
     c.reordering_alg             = reordering_alg_;
     c.matching_alg               = matching_alg_;
     c.pivot_epsilon_alg          = pivot_epsilon_alg_;
+    c.ir_n_steps                 = ir_n_steps_;
     c.scaling_max_voltage_change = scaling_max_voltage_change_;
     c.max_dVa                    = max_dVa_;
     c.max_dVm                    = max_dVm_;
+    c.scheduling                 = scheduling_;
     return c;
 }
 
@@ -170,6 +192,7 @@ BatchDriverConfig InjectionSweepSession::_current_config() const
 // =============================================================================
 void InjectionSweepSession::run()
 {
+    const auto t_run0 = std::chrono::steady_clock::now();
     if (!has_injections_)
         throw std::runtime_error(
             "InjectionSweepSession: call set_injections() before run()");
@@ -181,13 +204,27 @@ void InjectionSweepSession::run()
             "again after changing set_injections()");
 
     const int n_bus = base_state_->n_bus;
+    const bool continuous = (scheduling_ == BatchScheduling::Continuous);
+    if (continuous)   // before any allocation / cuDSS ANALYSIS
+        check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+    if (outer_) {
+        auto refuse = [](const std::string& what) {
+            throw std::runtime_error("InjectionSweepSession: the outer loops do not support " + what + " yet");
+        };
+        check_outer_loops_scheduling("InjectionSweepSession", continuous, nb_iter_per_round_);
+        if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
+            refuse("a strategy other than 'direct_refactor_every'");
+        if (phys_.compute_physical_violations) refuse("compute_physical_violations");
+    }
 
     // Hot run: same settings and row count as the live driver -- keep it
     // (allocations, cuDSS ANALYSIS, the policy's factorization state); new
     // injections / gen_v, if any, go into its live source. Otherwise build a
-    // new one, as the first run() does.
+    // new one, as the first run() does. The continuous schedule always
+    // rebuilds (its reuse is a later step, docs/dev_notes/continuous_batching.md
+    // A.6).
     const BatchDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_;
+    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
     const bool new_rows = cold || injections_dirty_ || gen_v_dirty_;
 
     std::vector<cudaComplexType> h_Sbus_all;
@@ -214,8 +251,11 @@ void InjectionSweepSession::run()
     double t_rows_upload_ms = 0.;
     if (cold) {
         // Effective per-chunk batch size: balance the last chunk (same rule as
-        // run_injection_sweep_gpu / run_contingency_analysis_gpu).
-        {
+        // run_injection_sweep_gpu / run_contingency_analysis_gpu). Continuous:
+        // batch_size_ slots, never more than the rows.
+        if (continuous) {
+            used_batch_size_ = std::max(1, std::min(batch_size_, n_scenarios_));
+        } else {
             const size_t n_elem   = static_cast<size_t>(n_scenarios_);
             const size_t max_bs   = static_cast<size_t>(batch_size_);
             const size_t n_chunks = (n_elem + max_bs - 1) / max_bs;
@@ -240,9 +280,13 @@ void InjectionSweepSession::run()
             reordering_alg_,
             matching_alg_,
             pivot_epsilon_alg_,
+            ir_n_steps_,
             scaling_max_voltage_change_,
             max_dVa_,
-            max_dVm_);
+            max_dVm_,
+            scheduling_,
+            nb_iter_per_round_,
+            tol_);
         driver_cfg_ = cfg;
         ++driver_build_counter_;
     } else {
@@ -257,7 +301,10 @@ void InjectionSweepSession::run()
     }
     injections_dirty_ = false;
     gen_v_dirty_      = false;
-    solver_->nb_iter_ = nb_iter_;   // per-run knob, no rebuild needed
+    // per-run knobs, no rebuild needed
+    solver_->nb_iter_           = nb_iter_;
+    solver_->nb_iter_per_round_ = nb_iter_per_round_;
+    solver_->tol_               = tol_;
 
     // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
     // violations); an injection sweep never disconnects a generator (nullptr mask).
@@ -272,6 +319,33 @@ void InjectionSweepSession::run()
     if (phys_.compute_physical_violations) {
         gen_p_targets_dirty_ = false;
         gen_pv_release_targets_dirty_ = false;
+    }
+
+    // The outer loops: the model decides on every row, from the rows' own targets.
+    solver_->outer_hook_ = outer_.get();
+    if (outer_) {
+        outer_->set_row_targets(n_scenarios_, outer_gen_p_, {});
+        // the rows' generator set-points, and the groups' v_set they drive
+        outer::RowOverrides ov;
+        const int n_gen = static_cast<int>(gen_bus_.size());
+        if (has_gen_v_ && gen_v_.rows() == n_scenarios_ && gen_v_.cols() == n_gen) {
+            ov.gen_vm.resize(static_cast<size_t>(n_scenarios_) * n_gen);
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (int g = 0; g < n_gen; ++g) ov.gen_vm[static_cast<size_t>(r) * n_gen + g] = gen_v_(r, g);
+            const GenVOverride gvo = build_gen_v_override(gen_v_, gen_bus_, h_is_vm_fixed_bus_, h_vc_group_of_bus_);
+            const int n_grp = base_state_->n_vc_grp;
+            if (gvo.has_vc_columns() && n_grp > 0) {
+                const int k = gvo.k_active();
+                ov.vc_v_set.assign(static_cast<size_t>(n_scenarios_) * n_grp, std::numeric_limits<double>::quiet_NaN());
+                for (int r = 0; r < n_scenarios_; ++r)
+                    for (int j = 0; j < k; ++j) {
+                        const int grp = gvo.h_active_vc_group[static_cast<size_t>(j)];
+                        const double val = static_cast<double>(gvo.h_gen_v_all[static_cast<size_t>(r) * k + j]);
+                        if (grp >= 0 && std::isfinite(val)) ov.vc_v_set[static_cast<size_t>(r) * n_grp + grp] = val;
+                    }
+            }
+        }
+        outer_->set_row_overrides(std::move(ov));
     }
 
     timings_ = solver_->solve();
@@ -306,6 +380,7 @@ void InjectionSweepSession::run()
     physical_checks::after_solve(phys_, timings_, t_phys);
 
     solver_->cs.synchronize();
+    timings_.t_session_run_wall_ms = ms_since(t_run0);
 }
 
 // =============================================================================
@@ -357,13 +432,14 @@ void InjectionSweepSession::compute_flows()
     const int n_scen = solver_->n_contingencies;
     const int n_bra  = solver_->n_branches_;
     const int n_bus  = base_state_->n_bus;
-    const int total  = n_scen * n_bra;
+    // 64-bit: n_rows * n_branches passes INT32_MAX on large grids (70k buses, ~20k rows)
+    const long long total = static_cast<long long>(n_scen) * n_bra;
     const cudaStream_t cs = solver_->cs;
 
     CudaTimer flow_timer(cs);
     flow_timer.start();
 
-    compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+    compute_branch_flows_kernel<<<static_cast<unsigned>((total + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
         thrust::raw_pointer_cast(solver_->d_branch_from.data()),
         thrust::raw_pointer_cast(solver_->d_branch_to.data()),
@@ -376,12 +452,14 @@ void InjectionSweepSession::compute_flows()
         thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
         thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
         n_bus, n_bra, 0, n_scen, /*d_result_map=*/nullptr);
+    // the transformers the outer loops left on other taps: at the row's final taps
+    solver_->override_outer_trafo_flows();
 
     // stop_ms() records + synchronizes the stop event.
     timings_.t_flow_computation += flow_timer.stop_ms();
 
     // D→H download of flow results — timed separately.
-    const int n = n_scen * n_bra;
+    const Eigen::Index n = static_cast<Eigen::Index>(n_scen) * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
         // Through the driver's pinned staging buffer (download_into).
@@ -421,11 +499,26 @@ CplxVect InjectionSweepSession::get_V_results() const
         throw std::runtime_error("InjectionSweepSession: call run() first");
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
-    const int n = solver_->n_contingencies * base_state_->n_bus;
+    // 64-bit: n_rows * n_bus passes INT32_MAX on large grids (70k buses x 30k rows)
+    const Eigen::Index n = static_cast<Eigen::Index>(solver_->n_contingencies) * base_state_->n_bus;
     CplxVect out(n);
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
     return out;
+}
+
+Eigen::VectorXi InjectionSweepSession::get_row_iterations() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_iterations();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+Eigen::VectorXi InjectionSweepSession::get_row_status() const
+{
+    if (!solver_) return Eigen::VectorXi();
+    const std::vector<int>& v = solver_->row_status();
+    return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
 }
 
 RealVect InjectionSweepSession::get_residuals() const
