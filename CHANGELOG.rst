@@ -5,6 +5,8 @@ Change Log
 --------------------
 - [IMPROVED] the build takes the SuiteSparse headers lightsim2grid >= 1.3.0 ships with its core:
   a lightsim2grid installed from a wheel no longer needs a SuiteSparse checkout on the side.
+- [FIXED] CI: cap the cuDSS pip wheel below 1.0, whose ``libcudss.so.1`` the CMake shim does not find
+  (and whose API is untested here).
 
 [0.2.0] 2026-xx-yy
 --------------------
