@@ -3678,8 +3678,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "REFACTORIZATION + SOLVE each)")
         .def_readonly("n_active", &CudssBatchBenchResult::n_active)
         .def_readonly("active_max_rel_residual", &CudssBatchBenchResult::active_max_rel_residual,
-                      "Own LU active prefix: residual of its first n_active matrices, "
-                      "refactorized and solved alone (-1 = not run)")
+                      "Own LU active prefix: residual of its first n_active matrices, their "
+                      "values tripled before that call, refactorized and solved alone "
+                      "(-1 = not run)")
         .def_readonly("n_inactive_touched", &CudssBatchBenchResult::n_inactive_touched,
                       "Solution entries past the prefix that call changed (0 expected; -1 = not run)")
         .def_readonly("inactive_max_rel_residual", &CudssBatchBenchResult::inactive_max_rel_residual,

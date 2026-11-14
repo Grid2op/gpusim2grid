@@ -72,7 +72,7 @@ struct CudssBatchBenchResult {
     double      handle_setup_ms = 0.;     // creation + ANALYSIS + FACTORIZATION of handles 1..n-1
     double      handle_round_ms = 0.;     // mean wall ms of one round over all the handles
     int         n_active        = 0;      // own LU active-prefix check (0 = not run)
-    double      active_max_rel_residual   = -1.;  // the prefix, refactorized + solved alone
+    double      active_max_rel_residual   = -1.;  // the prefix, values x3, refactorized + solved alone
     long long   n_inactive_touched        = -1;   // solution entries past the prefix it changed
     double      inactive_max_rel_residual = -1.;  // past the prefix, solved on its earlier factors
 };

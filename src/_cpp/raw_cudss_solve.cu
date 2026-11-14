@@ -407,19 +407,24 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
         res.n_active = n_active;
         const cuda_real_type sentinel = cuda_real_type(7);
         const size_t A = static_cast<size_t>(n_active);
-        auto slot_residual = [&](const thrust::host_vector<cuda_real_type>& hx, size_t i) {
+        // residual of slot i's solution against (a_scale * A) x = b
+        auto slot_residual = [&](const thrust::host_vector<cuda_real_type>& hx, size_t i, double a_scale) {
             double worst = 0.;
             for (size_t r = 0; r < n; ++r) {
                 double ax = 0.;
                 for (int k = indptr[r]; k < indptr[r + 1]; ++k)
                     ax += data[static_cast<size_t>(k)]
                           * static_cast<double>(hx[i * n + static_cast<size_t>(indices[static_cast<size_t>(k)])]);
-                worst = std::max(worst, std::abs(ax - b[r]));
+                worst = std::max(worst, std::abs(a_scale * ax - b[r]));
             }
             return std::isfinite(worst) ? worst / bnorm : std::numeric_limits<double>::infinity();
         };
         restore_rhs();
         thrust::fill(d_x.begin(), d_x.end(), sentinel);
+        // new values everywhere: x3 in the prefix (its solution is right only if
+        // the prefix call refactorized them), x2 past it (never factorized)
+        thrust::transform(d_vals.begin(), d_vals.begin() + A * m, d_vals.begin(),
+                          thrust::placeholders::_1 * cuda_real_type(3));
         thrust::transform(d_vals.begin() + A * m, d_vals.begin() + B * m, d_vals.begin() + A * m,
                           thrust::placeholders::_1 * cuda_real_type(2));
         solver.set_active_count(n_active);
@@ -430,11 +435,11 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
         thrust::host_vector<cuda_real_type> hx(d_x);
         res.active_max_rel_residual = 0.;
         for (size_t i = 0; i < A; ++i)
-            res.active_max_rel_residual = std::max(res.active_max_rel_residual, slot_residual(hx, i));
+            res.active_max_rel_residual = std::max(res.active_max_rel_residual, slot_residual(hx, i, 3.));
         res.n_inactive_touched = 0;
         for (size_t k = A * n; k < B * n; ++k) res.n_inactive_touched += hx[k] != sentinel;
         // the whole batch on the factors it holds, no refinement (it would
-        // read the doubled values)
+        // read the new values): past the prefix, the original matrices'
         restore_rhs();
         solver.set_ir_n_steps(0);
         solver.solve();
@@ -443,7 +448,7 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
         hx = d_x;
         res.inactive_max_rel_residual = 0.;
         for (size_t i = A; i < B; ++i)
-            res.inactive_max_rel_residual = std::max(res.inactive_max_rel_residual, slot_residual(hx, i));
+            res.inactive_max_rel_residual = std::max(res.inactive_max_rel_residual, slot_residual(hx, i, 1.));
     }
     return res;
 }
