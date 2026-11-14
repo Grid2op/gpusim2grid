@@ -14,6 +14,21 @@ Change Log
   -- each row's last inner solve, its loops' decisions held; ``compute_flows`` at the taps they settled on.
 - [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
   the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
+- [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
+  the facade reach the session (they were plain attributes, silently ignored).
+- [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its
+  DIVERGENCE record into an empty buffer, an illegal address.
+- [FIXED] ``benchmark_cudss_batch_raw`` refuses a CSR matrix whose ``indptr`` or column indices are out of range.
+- [FIXED] Contingencies: a branch named twice, or in ``branch_ids`` and a side list, and a repeated shunt /
+  load / generator id are tripped once, as lightsim2grid (the admittance was subtracted twice).
+- [FIXED] ``ScenarioSweepGPU.set_contingency_shunts`` on a new row count no longer refuses the "no trip"
+  topology it filled in itself; ``set_contingency_loads`` checks its columns and its rows at ``compute()``.
+- [FIXED] ``redistribute_slack``: a ``ScenarioSweepGPU`` row tripping a resistive shunt shares its active power.
+- [FIXED] ``outer_loops=True``: a row the loops gave up on counts no violation, is not truncated and is not
+  ``converged()``, as its ``get_violations()`` entry says.
+- [FIXED] ``outer_loops=True`` with ``redistribute_slack``: the lost-power share keeps the row's targets as the
+  base, and a row gets its loss even when it is 0 at the grid's targets (lightsim2grid 1.3.1).
+- [FIXED] A generator contingency no longer turns PQ a bus a storage unit or an HVDC station still regulates.
 - [ADDED] ``benchmark_cudss_batch_raw(n_handles=, handle_launch=)`` and ``benchmarks/cudss_small_handles.py``:
   several independent cuDSS handles per round, timed against one large one.
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at
@@ -42,6 +57,14 @@ Change Log
   participants, resumed targets and reactive-limits plan are built once per grid, not per row.
 - [IMPROVED] ``compute_limit_violations``: the operational check runs one GPU block per row, not one thread,
   same records; it cost tens of ms per call on a real grid, every continuous round.
+
+- [FIXED] ``ContingencyAnalysisSession.overwrite_rows`` / ``ScenarioSweepSession.set_v_init_from`` (was
+  ``set_v_init_from_ptr``) take the source session, not raw pointers: a source row past its rows is refused.
+- [FIXED] ``reactive_limits_outer_loop``: the second pass checks the limits given to the analysis
+  (``set_limits``), not the grid's own.
+- [FIXED] ``outer_loops=True`` accepts ``scheduling=BatchScheduling.Continuous``, not only the string.
+- [FIXED] ``compute_flows`` / ``get_V_results`` on the three batch sessions: rows × branches (or buses) past
+  ``INT32_MAX`` overflowed (large grids, many rows); sizes and offsets are now 64-bit.
 - [FIXED] ``outer_loops=True``: parallel transformers of ``PhaseControl`` / ``TransformerVoltageControl`` lost
   Ybus patches (racing threads), leaving rows at their iteration budget or on wrong blocks.
 - [ADDED] ``benchmark_cudss_batch_raw`` and ``solve_cudss_raw`` take ``ir_n_steps``.

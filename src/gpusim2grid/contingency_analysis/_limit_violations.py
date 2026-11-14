@@ -441,7 +441,10 @@ class LimitViolationsEngineMixin:
 
     @violation_capacity.setter
     def violation_capacity(self, value):
-        self._s.violation_capacity = int(value)
+        value = int(value)
+        if value < 1:
+            raise ValueError(f"violation_capacity must be >= 1, got {value}")
+        self._s.violation_capacity = value
 
 
 class LimitViolationsFacadeMixin:
@@ -468,3 +471,27 @@ class LimitViolationsFacadeMixin:
     @violation_rel_tol.setter
     def violation_rel_tol(self, value):
         self._inner.violation_rel_tol = value
+
+    # Without these two, an assignment on the facade made a plain attribute the session
+    # never saw.
+    @property
+    def violation_tol(self):
+        """float: residual above which a row is reported as one GRID / DIVERGENCE record
+        (its V is not checked). Takes effect on the next compute()."""
+        return self._inner.violation_tol
+
+    @violation_tol.setter
+    def violation_tol(self, value):
+        self._inner.violation_tol = value
+
+    @property
+    def violation_capacity(self):
+        """int (>= 1): violation records kept per row AND per violation type, the most
+        severe first (see :meth:`get_violations_truncated`; the totals of
+        :meth:`get_violation_counts` stay exact). Takes effect on the next compute();
+        default 16."""
+        return self._inner.violation_capacity
+
+    @violation_capacity.setter
+    def violation_capacity(self, value):
+        self._inner.violation_capacity = value

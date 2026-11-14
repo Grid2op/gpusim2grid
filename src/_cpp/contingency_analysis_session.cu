@@ -24,7 +24,8 @@
 #include <thrust/fill.h>
 #include <thrust/execution_policy.h>
 
-#include <algorithm>   // std::max
+#include <algorithm>   // std::max, std::sort, std::set_union
+#include <iterator>    // std::back_inserter
 #include <cmath>       // std::abs
 #include <stdexcept>
 #include <string>
@@ -194,14 +195,69 @@ void ContingencyAnalysisSession::build_contingencies(
     build_contingencies_full(branch_ids_per_ctg, none, none, none);
 }
 
-void ContingencyAnalysisSession::build_contingencies_full(
-    const std::vector<std::vector<int>>& branch_ids_per_ctg,
-    const std::vector<std::vector<int>>& shunt_ids_per_ctg,
-    const std::vector<std::vector<int>>& load_ids_per_ctg,
-    const std::vector<std::vector<int>>& gen_ids_per_ctg,
-    const std::vector<std::vector<int>>& branch_ids_side1_per_ctg,
-    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg)
+namespace {
+// sorted, without repeats: lightsim2grid keeps each list of a contingency in a std::set
+std::vector<std::vector<int>> as_sets(const std::vector<std::vector<int>>& lists)
 {
+    std::vector<std::vector<int>> out(lists);
+    for (auto& l : out) {
+        std::sort(l.begin(), l.end());
+        l.erase(std::unique(l.begin(), l.end()), l.end());
+    }
+    return out;
+}
+}  // namespace
+
+void ContingencyAnalysisSession::build_contingencies_full(
+    const std::vector<std::vector<int>>& branch_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& shunt_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& load_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& gen_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& branch_ids_side1_per_ctg_in,
+    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg_in)
+{
+    // Each list as a set, and a branch opened at both ends one way or another (named in
+    // branch_ids and at one end, or at both ends) a trip, as lightsim2grid's
+    // _checked_contingency has it: subtracted twice, its admittance would leave -y.
+    const std::vector<std::vector<int>> shunt_ids_per_ctg = as_sets(shunt_ids_per_ctg_in);
+    const std::vector<std::vector<int>> load_ids_per_ctg  = as_sets(load_ids_per_ctg_in);
+    const std::vector<std::vector<int>> gen_ids_per_ctg   = as_sets(gen_ids_per_ctg_in);
+    std::vector<std::vector<int>> branch_ids_per_ctg       = as_sets(branch_ids_per_ctg_in);
+    std::vector<std::vector<int>> branch_ids_side1_per_ctg = as_sets(branch_ids_side1_per_ctg_in);
+    std::vector<std::vector<int>> branch_ids_side2_per_ctg = as_sets(branch_ids_side2_per_ctg_in);
+    if (branch_ids_side1_per_ctg.size() == branch_ids_per_ctg.size() &&
+        branch_ids_side2_per_ctg.size() == branch_ids_per_ctg.size()) {
+        for (size_t c = 0; c < branch_ids_per_ctg.size(); ++c) {
+            auto& both = branch_ids_per_ctg[c];
+            auto& s1 = branch_ids_side1_per_ctg[c];
+            auto& s2 = branch_ids_side2_per_ctg[c];
+            std::vector<int> on_both_sides;
+            std::set_intersection(s1.begin(), s1.end(), s2.begin(), s2.end(), std::back_inserter(on_both_sides));
+            std::vector<int> merged;
+            std::set_union(both.begin(), both.end(), on_both_sides.begin(), on_both_sides.end(),
+                           std::back_inserter(merged));
+            both = merged;
+            const auto drop_tripped = [&](std::vector<int>& side) {
+                side.erase(std::remove_if(side.begin(), side.end(),
+                                          [&](int b) { return std::binary_search(both.begin(), both.end(), b); }),
+                           side.end());
+            };
+            drop_tripped(s1);
+            drop_tripped(s2);
+        }
+    } else {
+        // one side list only (or none): a branch it shares with branch_ids is a trip
+        for (auto* sides : {&branch_ids_side1_per_ctg, &branch_ids_side2_per_ctg})
+            if (sides->size() == branch_ids_per_ctg.size())
+                for (size_t c = 0; c < branch_ids_per_ctg.size(); ++c) {
+                    const auto& both = branch_ids_per_ctg[c];
+                    auto& side = (*sides)[c];
+                    side.erase(std::remove_if(side.begin(), side.end(),
+                                              [&](int b) { return std::binary_search(both.begin(), both.end(), b); }),
+                               side.end());
+                }
+    }
+
     static const char* who = "ContingencyAnalysisSession::build_contingencies_full";
     if (!has_branch_data_)
         throw std::runtime_error(
@@ -479,7 +535,10 @@ void ContingencyAnalysisSession::run()
                                                                     ctg_shunts_[static_cast<size_t>(r)], bus_masked)
                                       : 0.);
                 if (outer_) {
-                    if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+                    // the loop gets the row's loss even when it is nothing at the grid's targets: it counts
+                    // the units the row loses at the targets in force, which a row resumed from
+                    // the "n" solve takes from that solve, and decides itself what is left to share
+                    row_lost_p_mw_[static_cast<size_t>(r)] = lost;
                 } else {
                     slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(slack_rd_, lost, bus_masked, g_off, g_p);
                 }
@@ -730,13 +789,14 @@ void ContingencyAnalysisSession::compute_flows()
     const int n_ctg  = solver_->n_contingencies;
     const int n_bra  = solver_->n_branches_;
     const int n_bus  = base_state_->n_bus;
-    const int total  = n_ctg * n_bra;
+    // 64-bit: n_rows * n_branches passes INT32_MAX on large grids (70k buses, ~20k rows)
+    const long long total = static_cast<long long>(n_ctg) * n_bra;
     const cudaStream_t cs = solver_->cs;
 
     CudaTimer flow_timer(cs);
     flow_timer.start();
 
-    compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+    compute_branch_flows_kernel<<<static_cast<unsigned>((total + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
         thrust::raw_pointer_cast(solver_->d_branch_from.data()),
         thrust::raw_pointer_cast(solver_->d_branch_to.data()),
@@ -755,16 +815,16 @@ void ContingencyAnalysisSession::compute_flows()
     // Zero flows for tripped branches (they carry no current by definition).
     // Build flat indices: c * n_bra + l for each (c, l) where branch l is
     // disconnected in contingency c.
-    std::vector<int> h_zero;
+    std::vector<long long> h_zero;   // flat row * n_bra + l: 64-bit
     for (int c = 0; c < n_ctg; ++c)
         for (int l : disconnected_per_ctg_[static_cast<size_t>(c)])
-            h_zero.push_back(c * n_bra + l);
+            h_zero.push_back(static_cast<long long>(c) * n_bra + l);
 
-    thrust::device_vector<int> d_zero;   // kept alive until after sync
+    thrust::device_vector<long long> d_zero;   // kept alive until after sync
     if (!h_zero.empty()) {
-        const int n_z = static_cast<int>(h_zero.size());
+        const long long n_z = static_cast<long long>(h_zero.size());
         upload_h2d(d_zero, h_zero.data(), static_cast<size_t>(n_z), cs);
-        zero_branch_flows_kernel<<<(n_z + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+        zero_branch_flows_kernel<<<static_cast<unsigned>((n_z + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
             thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
             thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
             thrust::raw_pointer_cast(d_zero.data()),
@@ -777,7 +837,7 @@ void ContingencyAnalysisSession::compute_flows()
     // d_zero destroyed here, after sync
 
     // D→H download of flow results — timed separately.
-    const int n = n_ctg * n_bra;
+    const Eigen::Index n = static_cast<Eigen::Index>(n_ctg) * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
         // Through the driver's pinned staging buffer (download_into).
@@ -1007,7 +1067,8 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
         throw std::runtime_error("ContingencyAnalysisSession: call run() first");
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
-    const int n = solver_->n_contingencies * base_state_->n_bus;
+    // 64-bit: n_rows * n_bus passes INT32_MAX on large grids (70k buses x 30k rows)
+    const Eigen::Index n = static_cast<Eigen::Index>(solver_->n_contingencies) * base_state_->n_bus;
     CplxVect out(n);
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
@@ -1029,7 +1090,8 @@ RealVect ContingencyAnalysisSession::get_residuals() const
 
 void ContingencyAnalysisSession::overwrite_rows(const std::vector<int>& dst_rows,
                                                 const std::vector<int>& src_rows,
-                                                std::uintptr_t d_V_src, std::uintptr_t d_res_src)
+                                                std::uintptr_t d_V_src, std::uintptr_t d_res_src,
+                                                int n_src_rows, int n_bus_src)
 {
     if (!solver_)
         throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: call run() first");
@@ -1044,9 +1106,15 @@ void ContingencyAnalysisSession::overwrite_rows(const std::vector<int>& dst_rows
         if (r < 0 || r >= n_rows)
             throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: row " +
                                      std::to_string(r) + " outside [0, n_contingencies)");
+    if (n_bus_src != base_state_->n_bus)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: the source has " +
+                                 std::to_string(n_bus_src) + " buses, this session " +
+                                 std::to_string(base_state_->n_bus));
     for (int r : src_rows)
-        if (r < 0)
-            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: negative source row");
+        if (r < 0 || r >= n_src_rows)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: source row " +
+                                     std::to_string(r) + " outside [0, " +
+                                     std::to_string(n_src_rows) + ")");
     const cudaStream_t cs = static_cast<cudaStream_t>(solver_->cs);
     thrust::device_vector<int> d_dst, d_src;
     upload_h2d(d_dst, dst_rows.data(), dst_rows.size(), cs);
@@ -1099,6 +1167,11 @@ Eigen::VectorXi ContingencyAnalysisSession::get_row_status() const
     if (!solver_) return Eigen::VectorXi();
     const std::vector<int>& v = solver_->row_status();
     return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+int ContingencyAnalysisSession::result_rows() const
+{
+    return solver_ ? solver_->n_contingencies : 0;
 }
 
 std::uintptr_t ContingencyAnalysisSession::v_results_ptr() const

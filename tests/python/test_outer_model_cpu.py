@@ -9,10 +9,11 @@ decides on every converged inner solve; here those solves are a small dense
 Newton in numpy instead of the device's (the test-only ``_OuterModelHarness``
 binding). Each row must end where lightsim2grid's own single ``NROuter_KLU``
 solve of the row's grid ends, after the same number of outer iterations, with
-the same decisions and the same targets moved. A difference here is a
+the same decisions (loop, iteration, action, element). A difference here is a
 difference in the port, not in the GPU solve.
 """
 
+import re
 import warnings
 
 import numpy as np
@@ -28,6 +29,28 @@ MAX_IT = 30
 TOL_MVA = 1e-8
 CONVERGED, MAX_ITER, DIVERGED = 0, 1, 2
 RESOLVE, DONE = 0, 1
+
+_DECISION = re.compile(r"(?:OuterDecision\()?(\w+) #(\d+) (\w+)( \(not taken\))?, element (-?\d+)")
+
+
+def _decision_keys(decisions, grid=None):
+    """(loop, outer iteration, action, taken, element) of each decision, the model's
+    trace strings and lightsim2grid's OuterDecision alike, sorted: the decisions of one
+    outer iteration are applied together, the order the two sides list them in (bus or
+    generator order) means nothing. Their values are compared through V, not here: a
+    last-digit difference is not a different decision. The model numbers a bus as the
+    solver does, lightsim2grid as the grid does: with `grid`, lightsim2grid's bus
+    decisions are moved to the solver's numbering."""
+    to_solver = None if grid is None else np.asarray(grid.id_me_to_ac_solver(), dtype=int)
+    keys = []
+    for d in decisions:
+        m = _DECISION.match(str(d))
+        assert m is not None, str(d)
+        el = int(m.group(5))
+        if to_solver is not None and el >= 0 and str(getattr(d, "element_type", "")).endswith("BUS"):
+            el = int(to_solver[el])
+        keys.append((m.group(1), int(m.group(2)), m.group(3), m.group(4) is None, el))
+    return sorted(keys)
 
 
 def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None, extra_load=None, algo=OUTER):
@@ -146,6 +169,7 @@ def test_host_model_matches_single_nrouter_solve(load_scale, line_off):
     msg = "\n".join(res.decisions) + "\n---- lightsim2grid\n" + "\n".join(str(d) for d in stats.decisions)
     assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
     assert int(res.status) == int(stats.status), msg
+    assert _decision_keys(res.decisions) == _decision_keys(stats.decisions, row), msg
     if V_ref.size == 0:
         assert status != CONVERGED, msg
         return
@@ -167,16 +191,20 @@ def test_row_masking_a_voltage_controlled_bus(load_scale):
     """A row whose contingency strands bus 7 and its regulating generator
     (handle_disconnected_grid masks the bus): the model builds no plan for it,
     it filters the grid's ReactiveLimits plan (ls2g_outer_model.cpp's
-    rl_plan_masked). The row must end where lightsim2grid's single solve of the
-    grid without that trafo, generator and bus ends, with the same decisions.
+    rl_plan_masked). The row (its loads scaled by `load_scale`, which brings more
+    ReactiveLimits switches) must end where lightsim2grid's single solve of the grid
+    without that trafo, generator and bus ends: same decisions (compared as sets per
+    outer iteration, lightsim2grid's buses moved to the base's solver numbering), outer
+    iterations, status and V.
 
     A load on bus 7 makes the test bite: masking zeroes a bus' equations, not its
     Sbus, so the device still gathers that load there, and a plan keeping the
-    masked bus would read its generator past its limit and switch it."""
+    masked bus would read its generator past its limit and switch it -- no decision may
+    name the masked bus."""
     TRAFO, GEN, BUS = 3, 3, 7                     # trafo 6-7, the generator on bus 7
     extra_load = (BUS, 0., 30.)                   # beyond the generator's 15 MVAr
     base = _case14(distributed=False, extra_load=extra_load)
-    base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    assert base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
     to_base = np.asarray(base.id_me_to_ac_solver(), dtype=int)
     masked = int(to_base[BUS])
     h = _cpp._OuterModelHarness(base, keep_trace=True)
@@ -205,10 +233,10 @@ def test_row_masking_a_voltage_controlled_bus(load_scale):
     V, status = _run_row(h, 0, Ybus, Sbus_row, ref, masked=(masked,))
     res = h.row_result(0)
     msg = "\n".join(res.decisions) + "\n---- lightsim2grid\n" + "\n".join(str(d) for d in stats.decisions)
-    # the same decisions, in the same order (loop, outer iteration, action, element)
-    ours = [d.split(", value=")[0] for d in res.decisions]
-    ref_decisions = [str(d)[len("OuterDecision("):].split(", value=")[0] for d in stats.decisions]
-    assert ours == ref_decisions, msg
+    # the same decisions (loop, outer iteration, action, taken, element), each outer
+    # iteration's as a set: the order the two sides list them in means nothing
+    assert _decision_keys(res.decisions) == _decision_keys(stats.decisions, grid=base), msg
+    assert all(k[4] != masked for k in _decision_keys(res.decisions)), msg
     assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
     assert int(res.status) == int(stats.status), msg
     assert V_ref.size > 0 and status == CONVERGED, msg
@@ -269,8 +297,8 @@ def _ieee300(load_scale=1.):
 
 @pytest.mark.parametrize("load_scale", [1., 1.01, 1.03])
 def test_ieee300_reactive_limits(load_scale):
-    """Many PV -> PQ switches over several outer iterations, releases, moved limits.
-    At 1.03 the second inner solve diverges, on both sides."""
+    """Many PV -> PQ switches over several outer iterations, the same decisions on both
+    sides. At 1.03 the second inner solve diverges, on both sides."""
     base = _ieee300()
     flat = np.full(base.total_bus(), 1.0 + 0j)
     V0 = np.exp(1j * np.angle(base.dc_pf(flat, 30, 1e-12)))
@@ -288,8 +316,9 @@ def test_ieee300_reactive_limits(load_scale):
     msg = "\n".join(res.decisions) + "\n---- lightsim2grid\n" + "\n".join(ls_trace)
     assert stats.nb_outer_iterations > 0
     assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
-    assert len(res.decisions) == len(ls_trace), msg
+    assert _decision_keys(res.decisions) == _decision_keys(stats.decisions, row), msg
     assert res.nb_nr_iterations == sum(max(n, 1) for n in stats.nr_iterations), msg
+    assert (V_ref.size == 0) == (load_scale == 1.03), msg
     if V_ref.size == 0:
         assert status == MAX_ITER, msg
         return
@@ -628,7 +657,7 @@ def _compare_single_solve(make_grid, tol_mva=TOL_MVA, start=None, branch_off=Non
     msg = "\n".join(res.decisions) + "\n---- lightsim2grid\n" + "\n".join(ls_trace)
     assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
     assert int(res.status) == int(stats.status), msg
-    assert len(res.decisions) == len(ls_trace), msg
+    assert _decision_keys(res.decisions) == _decision_keys(stats.decisions, row), msg
     assert (status == CONVERGED) == (V_ref.size > 0), msg
     if V_ref.size > 0:
         buses = np.asarray(row.id_ac_solver_to_me(), dtype=int)
@@ -738,6 +767,8 @@ def _ieee14_remote_group(qmax, regulators=("B6-G", "B8-G"), scale=1., qmin=None)
     return grid
 
 
+# the comments say which controllers each case is meant to freeze; what freezes is
+# checked through the decisions, compared with lightsim2grid's
 @pytest.mark.parametrize("regulators, qmax", [
     (("B6-G", "B8-G"), (100., 100.)),          # nothing frozen
     (("B6-G", "B8-G"), (10., 10.)),            # the whole group frozen
@@ -752,8 +783,9 @@ def test_reactive_limits_on_a_voltage_control_group(regulators, qmax):
 
 
 @pytest.mark.parametrize("regulators, qmin, qmax", [
-    # the same range (the same share), one of them close to its max: it alone freezes,
-    # and the group regulates on with the others
+    # the same range (the same share), one of them close to its max: meant to freeze
+    # it alone, the group regulating on with the others (the decisions are compared
+    # with lightsim2grid's; only "something froze" is asserted here)
     (("B6-G", "B8-G"), (-100., -3.), (3., 100.)),
     (("B6-G", "B8-G"), (-3., -100.), (100., 3.)),
     (("B3-G", "B6-G", "B8-G"), (-100., -100., -3.), (100., 3., 100.)),
@@ -777,7 +809,7 @@ def test_rows_resume_from_the_n_solve(q_limit):
     """lightsim2grid's ScenarioSweepCPP with init_from_n_powerflow: the rows start from the
     "n" solve's voltages and loops (its frozen buses frozen again at each row's own limit);
     every row sets its generators' targets (modify_gen_p), so the targets DistributedSlack
-    moved in "n" are not taken"""
+    moved in "n" are not taken (seen through the voltages, not asserted on the targets)"""
     from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
     n_rows = 6
     base = _case14(q_limit=q_limit)

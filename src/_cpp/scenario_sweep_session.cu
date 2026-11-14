@@ -484,7 +484,13 @@ std::uintptr_t ScenarioSweepSession::v_results_ptr() const
     return solver_ ? reinterpret_cast<std::uintptr_t>(solver_->d_V_results_ptr()) : 0;
 }
 
-void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows)
+int ScenarioSweepSession::result_rows() const
+{
+    return solver_ ? solver_->n_contingencies : 0;
+}
+
+void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows,
+                                               int n_src_rows, int n_bus_src)
 {
     if (d_V_src == 0)
         throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: null source buffer");
@@ -493,9 +499,15 @@ void ScenarioSweepSession::set_v_init_from_ptr(std::uintptr_t d_V_src, const std
     if (has_injections_ && static_cast<int>(src_rows.size()) != n_scenarios_)
         throw std::runtime_error(
             "ScenarioSweepSession::set_v_init_from_ptr: row count must match set_injections()'s n_scenarios");
+    if (n_bus_src != base_state_->n_bus)
+        throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: the source has " +
+                                 std::to_string(n_bus_src) + " buses, this session " +
+                                 std::to_string(base_state_->n_bus));
     for (int r : src_rows)
-        if (r < 0)
-            throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: negative source row");
+        if (r < 0 || r >= n_src_rows)
+            throw std::runtime_error("ScenarioSweepSession::set_v_init_from_ptr: source row " +
+                                     std::to_string(r) + " outside [0, " +
+                                     std::to_string(n_src_rows) + ")");
     const int n = static_cast<int>(src_rows.size());
     const int n_bus = base_state_->n_bus;
     const cudaStream_t cs = static_cast<cudaStream_t>(base_state_->cs);
@@ -757,6 +769,23 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     std::vector<double> row_p_mw(static_cast<size_t>(n_scenarios_), 0.);
     for (int r = 0; r < n_scenarios_; ++r)
         row_p_mw[static_cast<size_t>(r)] = static_cast<double>(p_mw_.row(r).sum());
+    // term (e): the active power of the shunts a row trips (set_contingency_shunts) is not
+    // in the AC Sbus, so its injections cannot carry it -- what the row loses is minus the
+    // consumption it no longer has (element_trips::trip_lost_mw, as the contingency
+    // analysis counts it). Folded into the row's total, which term (c) subtracts from the
+    // grid's balance; a shunt on a masked bus is the island's, already in term (a).
+    if (has_shunt_off_ && has_trip_data_) {
+        std::vector<char> is_masked(static_cast<size_t>(base_state_->n_bus), 0);
+        for (int r = 0; r < n_scenarios_ && static_cast<size_t>(r) < shunt_off_.size(); ++r) {
+            const auto& m = contingencies_[static_cast<size_t>(r)].masked_buses;
+            for (int b : m) if (b >= 0 && b < base_state_->n_bus) is_masked[static_cast<size_t>(b)] = 1;
+            const double lost_e = element_trips::trip_lost_mw(
+                trip_data_, {}, shunt_off_[static_cast<size_t>(r)],
+                [&](int b) { return b >= 0 && b < base_state_->n_bus && is_masked[static_cast<size_t>(b)] != 0; });
+            row_p_mw[static_cast<size_t>(r)] -= lost_e;
+            for (int b : m) if (b >= 0 && b < base_state_->n_bus) is_masked[static_cast<size_t>(b)] = 0;
+        }
+    }
     const auto skipped = [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; };
     const auto masked = [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; };
     const auto gen_off = [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); };
@@ -774,7 +803,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
         for (int r = 0; r < n_scenarios_; ++r) {
             if (skipped(r)) continue;
             const double lost = slack_redistribution::row_lost_mw(slack_rd_, r, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
-            if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+            // (even nothing at the grid's targets: see ContingencyAnalysisSession::run)
+            row_lost_p_mw_[static_cast<size_t>(r)] = lost;
         }
         return {};
     }
@@ -912,7 +942,9 @@ void ScenarioSweepSession::set_branch_data(
     if (has_topology_ && (!has_injections_ ||
             static_cast<int>(tripped_branches_per_scenario_.size()) == n_scenarios_)) {
         const std::vector<std::vector<int>> trips = tripped_branches_per_scenario_;
+        const bool implicit = topology_implicit_;   // a rebuild, not the caller's topology
         set_topology(trips);
+        topology_implicit_ = implicit;
     }
 
     // A live driver caches the admittances / flow buffers it uploaded (once
@@ -1020,9 +1052,10 @@ void ScenarioSweepSession::set_topology(
                 contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
-    has_topology_   = true;
-    topology_dirty_ = true;
-    auto_ref_valid_ = false;
+    has_topology_      = true;
+    topology_implicit_ = false;
+    topology_dirty_    = true;
+    auto_ref_valid_    = false;
 }
 
 // =============================================================================
@@ -1050,15 +1083,27 @@ void ScenarioSweepSession::set_contingency_shunts(Eigen::Ref<const BoolMat> mask
         for (Eigen::Index s = 0; s < mask.cols(); ++s)
             if (mask(r, s)) { shunt_off_[static_cast<size_t>(r)].push_back(static_cast<int>(s)); any = true; }
     has_shunt_off_ = any;
-    // the rows' Ybus patches, rebuilt with them (branch trips kept)
-    const std::vector<std::vector<int>> trips = has_topology_
+    // the rows' Ybus patches, rebuilt with them (the caller's branch trips kept; the
+    // implicit "none" a previous mask filled in follows the new row count)
+    const bool keep = has_topology_ && !topology_implicit_;
+    const std::vector<std::vector<int>> trips = keep
         ? tripped_branches_per_scenario_
         : std::vector<std::vector<int>>(static_cast<size_t>(mask.rows()));
     set_topology(trips);
+    topology_implicit_ = !keep;
 }
 
 void ScenarioSweepSession::set_contingency_loads(Eigen::Ref<const BoolMat> mask)
 {
+    if (!has_trip_data_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: this session has no element data "
+            "(explicit-array/tuple mode, or a build without the lightsim2grid bridge). Load "
+            "contingencies need a session built from a lightsim2grid grid.");
+    if (mask.cols() != trip_data_.n_load)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: the mask has " + std::to_string(mask.cols()) +
+            " columns but the grid has " + std::to_string(trip_data_.n_load) + " loads");
     if (mask.rows() <= 0)
         throw std::runtime_error("ScenarioSweepSession::set_contingency_loads: n_scenarios must be > 0");
     if (has_injections_ && static_cast<int>(mask.rows()) != n_scenarios_)
@@ -1193,6 +1238,11 @@ void ScenarioSweepSession::run()
     if (has_shunt_off_ && static_cast<int>(shunt_off_.size()) != n_scenarios_)
         throw std::runtime_error(
             "ScenarioSweepSession: set_contingency_shunts()'s row count no longer matches "
+            "set_injections()'s n_scenarios -- call it again after changing set_injections()");
+
+    if (has_load_off_ && static_cast<int>(load_off_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_contingency_loads()'s row count no longer matches "
             "set_injections()'s n_scenarios -- call it again after changing set_injections()");
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
@@ -1906,13 +1956,14 @@ void ScenarioSweepSession::compute_flows()
     const int n_scen = solver_->n_contingencies;
     const int n_bra  = solver_->n_branches_;
     const int n_bus  = base_state_->n_bus;
-    const int total  = n_scen * n_bra;
+    // 64-bit: n_rows * n_branches passes INT32_MAX on large grids (70k buses, ~20k rows)
+    const long long total = static_cast<long long>(n_scen) * n_bra;
     const cudaStream_t cs = solver_->cs;
 
     CudaTimer flow_timer(cs);
     flow_timer.start();
 
-    compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+    compute_branch_flows_kernel<<<static_cast<unsigned>((total + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
         thrust::raw_pointer_cast(solver_->d_branch_from.data()),
         thrust::raw_pointer_cast(solver_->d_branch_to.data()),
@@ -1930,16 +1981,16 @@ void ScenarioSweepSession::compute_flows()
 
     // Zero flows for each scenario's own tripped branches (they carry no
     // current by definition) — same pattern as ContingencyAnalysisSession.
-    std::vector<int> h_zero;
+    std::vector<long long> h_zero;   // flat row * n_bra + l: 64-bit
     for (int s = 0; s < n_scen; ++s)
         for (int l : tripped_branches_per_scenario_[static_cast<size_t>(s)])
-            h_zero.push_back(s * n_bra + l);
+            h_zero.push_back(static_cast<long long>(s) * n_bra + l);
 
-    thrust::device_vector<int> d_zero;   // kept alive until after sync
+    thrust::device_vector<long long> d_zero;   // kept alive until after sync
     if (!h_zero.empty()) {
-        const int n_z = static_cast<int>(h_zero.size());
+        const long long n_z = static_cast<long long>(h_zero.size());
         upload_h2d(d_zero, h_zero.data(), static_cast<size_t>(n_z), cs);
-        zero_branch_flows_kernel<<<(n_z + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+        zero_branch_flows_kernel<<<static_cast<unsigned>((n_z + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
             thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
             thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
             thrust::raw_pointer_cast(d_zero.data()),
@@ -1949,7 +2000,7 @@ void ScenarioSweepSession::compute_flows()
     timings_.t_flow_computation += flow_timer.stop_ms();
     // d_zero destroyed here, after sync (stop_ms() synchronizes)
 
-    const int n = n_scen * n_bra;
+    const Eigen::Index n = static_cast<Eigen::Index>(n_scen) * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
         // Through the driver's pinned staging buffer (download_into).
@@ -1989,7 +2040,8 @@ CplxVect ScenarioSweepSession::get_V_results() const
         throw std::runtime_error("ScenarioSweepSession: call run() first");
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
-    const int n = solver_->n_contingencies * base_state_->n_bus;
+    // 64-bit: n_rows * n_bus passes INT32_MAX on large grids (70k buses x 30k rows)
+    const Eigen::Index n = static_cast<Eigen::Index>(solver_->n_contingencies) * base_state_->n_bus;
     CplxVect out(n);
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);

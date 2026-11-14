@@ -31,11 +31,18 @@ Contingency build_contingency_from_branch_ids(
 {
     const int n_branches = static_cast<int>(branch_from.size());
 
-    Contingency ctg;
-    ctg.tripped_branches = branch_ids;
-    ctg.triplets.reserve(branch_ids.size() * 4);
+    // a branch named twice is tripped once (lightsim2grid's contingency is a set): its
+    // admittance subtracted twice would leave -y in Ybus and the edge in the graph
+    std::vector<int> unique_ids;
+    unique_ids.reserve(branch_ids.size());
+    for (int l : branch_ids)
+        if (std::find(unique_ids.begin(), unique_ids.end(), l) == unique_ids.end()) unique_ids.push_back(l);
 
-    for (int l : branch_ids) {
+    Contingency ctg;
+    ctg.tripped_branches = unique_ids;
+    ctg.triplets.reserve(unique_ids.size() * 4);
+
+    for (int l : unique_ids) {
         if (l < 0 || l >= n_branches)
             throw std::runtime_error(
                 "build_contingency_from_branch_ids: branch index out of range");

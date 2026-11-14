@@ -11,7 +11,10 @@ run on those groups only, the linear solve on a small cuDSS handle cycled over
 them. Only where the rows sit and which handle factorizes them change, so every
 row ends as without the tail: same status, same iteration count, same V up to
 cuDSS's rounding. Small groups (1, 3) make the rows move and the groups cycle
-as much as possible; a missed per-slot buffer in the move shows here.
+as much as possible, so a per-slot buffer the move misses shows here -- for what these
+rows use: Sbus and its slack correction, slack weights, masks, pins, gen_v / v_set, and
+with the outer loops the model's slot state. HVDC, voltage-control groups and the
+BranchControl / ShuntControl slots are not exercised by these grids.
 """
 
 import warnings
@@ -101,6 +104,8 @@ def test_contingency_analysis(case118, solver_atol):
 
 
 def test_injection_sweep(case118, solver_atol):
+    """Random injections on case118: with the tail on (groups of 3 and 1) every row ends with
+    the statuses, iteration counts and V of the run without it."""
     from gpusim2grid import InjectionSweepGPU
     grid = case118
     n_rows = 40
@@ -134,7 +139,7 @@ def test_scenario_sweep(solver_atol):
     n_line = len(grid.get_lines())
     leaf = [ln.id for ln in grid.get_lines() if 7 in (ln.bus1_id, ln.bus2_id)]
     leaf += [n_line + t.id for t in grid.get_trafos() if 7 in (t.bus1_id, t.bus2_id)]
-    others = list(range(1, n_gen))   # every generator shares the slack: all but the first
+    others = list(range(1, n_gen))   # the generators a row may disconnect: all but the first
     load_p, load_q = (np.asarray(a, dtype=float) for a in grid.get_loads_res_full()[:2])
     gen_p = np.asarray(grid.get_gen_target_p(), dtype=float)
 
@@ -169,6 +174,17 @@ def test_scenario_sweep(solver_atol):
         sw.compute(batch_size=8)
         runs[(mg, G)] = _outcome(sw, n)
         assert (sw.timings.n_slot_moves > 0) == (mg > 0)
+        if (mg, G) == (0, 15):
+            # what the docstring promises happens: the island is masked (NaN), a disconnected
+            # generator releases its bus, and the pre-pass shares what the rows lose
+            leaf_bus = list(np.asarray(grid.id_ac_solver_to_me(), dtype=int)).index(7)
+            V0 = runs[(mg, G)][2]
+            for r, kind in enumerate(kinds):
+                assert np.isnan(V0[r, leaf_bus]) == ("island" in kind), (r, kind)
+            pv_to_pq = sw._inner._s.get_row_pv_to_pq()
+            assert any(pv_to_pq[r] for r, kind in enumerate(kinds) if kind == "gen_off")
+            mismatch = sw.get_slack_redistribution_report()["mismatch_mw"]
+            assert all(abs(mismatch[r]) > 0. for r, kind in enumerate(kinds) if kind in ("island", "gen_off"))
     ref = runs.pop((0, 15))
     assert np.all(ref[0] == CONVERGED)
     _same_rows(runs, ref, solver_atol)
@@ -181,8 +197,10 @@ def test_scenario_sweep(solver_atol):
                     reason="gpusim2grid built against a lightsim2grid without NROuter_*")
 @pytest.mark.skipif(bool(_cpp.is_fp32), reason="the outer loops run in double precision")
 def test_outer_loops(solver_atol):
-    """case14 short of reactive power, sharing the slack (ReactiveLimits and
-    DistributedSlack act on most rows, re-solving them in their slot)."""
+    """case14 short of reactive power, sharing the slack: the loops act on most rows,
+    re-solving them in their slot, and with the tail on each row keeps its outer and Newton
+    iteration counts and its decisions (the actions and elements; their values agree up
+    to the other handle's rounding)."""
     from test_outer_loops_batch import _case14, _rows, _gpu, N_ROWS
     import test_outer_loops_batch as T
     grid = _case14()
@@ -201,14 +219,15 @@ def test_outer_loops(solver_atol):
         runs[(mg, G)] = _outcome(sw, n)
         res[(mg, G)] = sw.get_outer_results()
         assert (sw.timings.n_slot_moves > 0) == (mg > 0)
-    assert any(r.nb_outer_iterations > 0 for r in res[(0, 15)])
+    assert sum(r.nb_outer_iterations > 0 for r in res[(0, 15)]) > n // 2
     _same_rows(runs, runs.pop((0, 15)), solver_atol)
     for key in runs:
         for i in range(n):
             a, b = res[key][i], res[(0, 15)][i]
             assert a.nb_outer_iterations == b.nb_outer_iterations, (key, i)
             assert a.nb_nr_iterations == b.nb_nr_iterations, (key, i)
-            assert a.decisions == b.decisions, (key, i)
+            strip = lambda ds: [d.split(", value=")[0] for d in ds]   # noqa: E731
+            assert strip(a.decisions) == strip(b.decisions), (key, i)
 
 
 # =============================================================================

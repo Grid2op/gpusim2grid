@@ -249,6 +249,9 @@ struct ScenarioSweepSession {
     std::vector<Contingency>      contingencies_;
     std::vector<std::vector<int>> tripped_branches_per_scenario_;
     bool has_topology_ = false;
+    // the trip lists are the "none" set_contingency_shunts() filled in, not the caller's:
+    // a later mask on another row count resizes them instead of refusing them as stale
+    bool topology_implicit_ = false;
 
     // Caller-declared not-simulable rows (set_skipped_rows(); ORIGINAL row
     // order, n_scenarios entries). Copied into Contingency::skip by run(); a
@@ -678,6 +681,8 @@ struct ScenarioSweepSession {
     // for a caller copying rows into another session (0 before run()).
     std::uintptr_t v_results_ptr() const;
     std::uintptr_t residuals_ptr() const;
+    // Rows of the result buffers those point to (0 before run()).
+    int result_rows() const;
 
     // Per-row starting voltages, row-aligned with set_injections(): row i
     // starts from row src_rows[i] of a row-major (* x n_bus) complex device
@@ -686,7 +691,10 @@ struct ScenarioSweepSession {
     // The reactive-limit outer loop's second pass continues each contingency
     // from its first-pass solution this way. A hot change (no source rebuild).
     // clear_v_init: back to the base-case V.
-    void set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows);
+    // The source holds n_src_rows rows of n_bus_src buses: every source row is
+    // checked against it.
+    void set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows,
+                             int n_src_rows, int n_bus_src);
     void clear_v_init();
     bool has_v_init() const { return has_v_init_; }
 

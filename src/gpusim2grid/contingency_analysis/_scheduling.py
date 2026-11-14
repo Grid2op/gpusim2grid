@@ -57,6 +57,17 @@ class RowStatus(IntEnum):
 OUTER_FAILURE_STATUSES = frozenset((RowStatus.OUTER_FAILED, RowStatus.OUTER_UNSTABLE, RowStatus.UNREALISTIC))
 
 
+def outer_failure_rows(session, n_rows):
+    """(n_rows,) bool ndarray: the rows the outer loops gave up on (OUTER_FAILURE_STATUSES).
+    Their last inner solve converged, but lightsim2grid keeps no state for them: no
+    violation is counted, nothing is truncated and they are not converged."""
+    status = np.asarray(session.get_row_status(), dtype=int)
+    out = np.zeros(int(n_rows), dtype=bool)
+    m = min(len(status), out.shape[0])
+    out[:m] = np.isin(status[:m], [int(s) for s in OUTER_FAILURE_STATUSES])
+    return out
+
+
 def default_tol():
     """Per unit: 1e-8 in double precision; 1e-3 in an FP32 build, whose
     residual floor is around 1e-4 already on case118 (with a tighter tol the

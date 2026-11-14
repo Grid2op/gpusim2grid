@@ -509,6 +509,11 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
     int    K,
     int    n_lines)
 {
+    // K < 1 leaves the compact output empty while the kernel still writes a
+    // diverged row's DIVERGENCE record at its slice's first slot
+    if (K < 1)
+        throw std::invalid_argument(
+            "BatchPfDriver::set_violation_limits: violation_capacity must be >= 1, got " + std::to_string(K));
     if (!_has_branch_admittances)
         throw std::runtime_error(
             "BatchPfDriver::set_violation_limits: call upload_branch_admittances "

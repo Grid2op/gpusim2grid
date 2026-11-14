@@ -130,10 +130,11 @@ def _saddle_point_matrix(n=200):
     return K
 
 
-def test_refinement_recovers_a_perturbed_pivot_solve():
+def test_refinement_keeps_a_saddle_point_solve_accurate():
     """benchmark_cudss_batch_raw runs the driver's own CudssBatchSolver: with
-    refinement the solve of a matrix whose pivots were perturbed is accurate,
-    without it it need not be."""
+    refinement the solve of a saddle-point matrix (whose pivots cuDSS may perturb) is
+    accurate and no worse than without it. Whether a pivot was perturbed is not
+    checked."""
     from gpusim2grid import _gpusim2grid as c
     K = _saddle_point_matrix()
     res = {}

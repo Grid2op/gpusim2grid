@@ -151,6 +151,18 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     const int nnz = static_cast<int>(data.size());
     if (indptr[static_cast<size_t>(dim)] != nnz)
         throw std::runtime_error("benchmark_cudss_batch_raw: indptr[dim] must equal nnz");
+    // every later loop walks rows through indptr and reads x / b through indices:
+    // a pattern outside the matrix reads past the host arrays, and cuDSS gets it too
+    if (indptr[0] != 0)
+        throw std::runtime_error("benchmark_cudss_batch_raw: indptr[0] must be 0");
+    for (int r = 0; r < dim; ++r)
+        if (indptr[static_cast<size_t>(r) + 1] < indptr[static_cast<size_t>(r)])
+            throw std::runtime_error("benchmark_cudss_batch_raw: indptr must be non-decreasing (row " +
+                                     std::to_string(r) + ")");
+    for (int k = 0; k < nnz; ++k)
+        if (indices[static_cast<size_t>(k)] < 0 || indices[static_cast<size_t>(k)] >= dim)
+            throw std::runtime_error("benchmark_cudss_batch_raw: column index " +
+                                     std::to_string(indices[static_cast<size_t>(k)]) + " out of [0, dim)");
     if (device >= 0) CHK_CUDA_RAW(cudaSetDevice(device));
 
     const size_t B = static_cast<size_t>(batch_size);
@@ -316,6 +328,13 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
             std::atomic<bool> go{false};
             std::vector<std::exception_ptr> err(H);
             std::vector<std::thread> workers;
+            // a spawn that throws midway must not leave joinable threads spinning on `go`
+            // (their destructors would call std::terminate)
+            struct JoinGuard {
+                std::atomic<bool>& go; std::vector<std::thread>& w;
+                ~JoinGuard() { go.store(true, std::memory_order_release); for (auto& t : w) if (t.joinable()) t.join(); }
+            } guard{go, workers};
+            workers.reserve(H);
             for (size_t h = 0; h < H; ++h)
                 workers.emplace_back([&, h]() {
                     try {
