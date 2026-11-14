@@ -235,7 +235,8 @@ struct CudssBatchSolver {
     // docs/dev_notes/batched_lu_and_constrained_ordering.md): every handle writes
     // its skeleton, its permutations (user, and cuDSS's own after ANALYSIS) and the
     // J values of its first GPUSIM2GRID_DUMP_J_MAX (default 8) factorizations, as
-    // raw little-endian files <dir>/h<k>_*.{i32,f64} + h<k>_meta.txt.
+    // raw little-endian files <dir>/h<k>_*.{i32,f64} (.f32 for the values of an
+    // FP32 build) + h<k>_meta.txt.
     std::string dump_dir_;
     int dump_id_ = -1, dump_count_ = 0, dump_max_ = 8;
     int* d_J_outer_ = nullptr; int* d_J_inner_ = nullptr;
@@ -747,7 +748,9 @@ private:
         cudaStreamSynchronize(cs_);
         std::vector<cuda_real_type> h(static_cast<size_t>(ubatch_) * nnz_J_);
         cudaMemcpy(h.data(), d_values_cur_, h.size() * sizeof(cuda_real_type), cudaMemcpyDeviceToHost);
-        _dump_raw("vals_" + std::to_string(dump_count_++) + ".f64", h.data(), h.size());
+        // named by what is written: the build's real type (FP32 writes 4-byte floats)
+        _dump_raw("vals_" + std::to_string(dump_count_++) + (sizeof(cuda_real_type) == 4 ? ".f32" : ".f64"),
+                  h.data(), h.size());
     }
 
     static const void* const* raw_ptrs(thrust::device_vector<void*>& v)

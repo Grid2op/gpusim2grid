@@ -424,3 +424,27 @@ def test_calibrate_tail_max_groups_own_lu(case118):
         ca.tail_group_size = (c.max_groups + 1) * G
         nxt = ca.calibrate_tail_max_groups(n_repeat=5, batch_size=S)
         assert nxt.t_group_ms >= 0.8 * c.t_full_ms, (c.max_groups, nxt.t_group_ms, c.t_full_ms)
+
+
+@pytest.mark.parametrize("linear_solver", SOLVERS)
+def test_dump_j_names_values_by_their_precision(case118, linear_solver, monkeypatch, tmp_path):
+    """GPUSIM2GRID_DUMP_J (diagnostic): every batch solver writes its J values
+    as raw files whose extension says the element type the build writes
+    (``.f64`` in FP64, ``.f32`` in FP32), each B · nnz elements of the
+    ``real_bytes`` its meta file records."""
+    monkeypatch.setenv("GPUSIM2GRID_DUMP_J", str(tmp_path))
+    monkeypatch.setenv("GPUSIM2GRID_DUMP_J_MAX", "2")
+    ca, _ = _n1(case118, linear_solver)
+    ca.compute(batch_size=16)
+    metas = sorted(tmp_path.glob("h*_meta.txt"))
+    assert metas
+    for meta in metas:
+        kv = dict(line.split() for line in meta.read_text().splitlines())
+        rb, ub, nnz = int(kv["real_bytes"]), int(kv["ubatch"]), int(kv["nnz"])
+        assert rb == (4 if _cpp.is_fp32 else 8)
+        h = meta.name.split("_")[0]
+        vals = sorted(tmp_path.glob(f"{h}_vals_*"))
+        assert vals, meta.name
+        for v in vals:
+            assert v.suffix == f".f{8 * rb}", v.name
+            assert v.stat().st_size == ub * nnz * rb, v.name
