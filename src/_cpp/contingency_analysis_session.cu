@@ -728,13 +728,14 @@ void ContingencyAnalysisSession::compute_flows()
     const int n_ctg  = solver_->n_contingencies;
     const int n_bra  = solver_->n_branches_;
     const int n_bus  = base_state_->n_bus;
-    const int total  = n_ctg * n_bra;
+    // 64-bit: n_rows * n_branches passes INT32_MAX on large grids (70k buses, ~20k rows)
+    const long long total = static_cast<long long>(n_ctg) * n_bra;
     const cudaStream_t cs = solver_->cs;
 
     CudaTimer flow_timer(cs);
     flow_timer.start();
 
-    compute_branch_flows_kernel<<<(total + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+    compute_branch_flows_kernel<<<static_cast<unsigned>((total + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
         thrust::raw_pointer_cast(solver_->d_V_results.data()),
         thrust::raw_pointer_cast(solver_->d_branch_from.data()),
         thrust::raw_pointer_cast(solver_->d_branch_to.data()),
@@ -753,16 +754,16 @@ void ContingencyAnalysisSession::compute_flows()
     // Zero flows for tripped branches (they carry no current by definition).
     // Build flat indices: c * n_bra + l for each (c, l) where branch l is
     // disconnected in contingency c.
-    std::vector<int> h_zero;
+    std::vector<long long> h_zero;   // flat row * n_bra + l: 64-bit
     for (int c = 0; c < n_ctg; ++c)
         for (int l : disconnected_per_ctg_[static_cast<size_t>(c)])
-            h_zero.push_back(c * n_bra + l);
+            h_zero.push_back(static_cast<long long>(c) * n_bra + l);
 
-    thrust::device_vector<int> d_zero;   // kept alive until after sync
+    thrust::device_vector<long long> d_zero;   // kept alive until after sync
     if (!h_zero.empty()) {
-        const int n_z = static_cast<int>(h_zero.size());
+        const long long n_z = static_cast<long long>(h_zero.size());
         upload_h2d(d_zero, h_zero.data(), static_cast<size_t>(n_z), cs);
-        zero_branch_flows_kernel<<<(n_z + SESSION_BS - 1) / SESSION_BS, SESSION_BS, 0, cs>>>(
+        zero_branch_flows_kernel<<<static_cast<unsigned>((n_z + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
             thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
             thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
             thrust::raw_pointer_cast(d_zero.data()),
@@ -775,7 +776,7 @@ void ContingencyAnalysisSession::compute_flows()
     // d_zero destroyed here, after sync
 
     // D→H download of flow results — timed separately.
-    const int n = n_ctg * n_bra;
+    const Eigen::Index n = static_cast<Eigen::Index>(n_ctg) * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();
     {
         // Through the driver's pinned staging buffer (download_into).
@@ -1005,7 +1006,8 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
         throw std::runtime_error("ContingencyAnalysisSession: call run() first");
     solver_->cs.synchronize();
     auto t_copy_start = std::chrono::steady_clock::now();
-    const int n = solver_->n_contingencies * base_state_->n_bus;
+    // 64-bit: n_rows * n_bus passes INT32_MAX on large grids (70k buses x 30k rows)
+    const Eigen::Index n = static_cast<Eigen::Index>(solver_->n_contingencies) * base_state_->n_bus;
     CplxVect out(n);
     solver_->download_into(out.data(), static_cast<size_t>(n), solver_->d_V_results);   // pinned, pipelined
     timings_.t_copy_V_to_host_ms = ms_since(t_copy_start);
@@ -1027,7 +1029,8 @@ RealVect ContingencyAnalysisSession::get_residuals() const
 
 void ContingencyAnalysisSession::overwrite_rows(const std::vector<int>& dst_rows,
                                                 const std::vector<int>& src_rows,
-                                                std::uintptr_t d_V_src, std::uintptr_t d_res_src)
+                                                std::uintptr_t d_V_src, std::uintptr_t d_res_src,
+                                                int n_src_rows, int n_bus_src)
 {
     if (!solver_)
         throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: call run() first");
@@ -1042,9 +1045,15 @@ void ContingencyAnalysisSession::overwrite_rows(const std::vector<int>& dst_rows
         if (r < 0 || r >= n_rows)
             throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: row " +
                                      std::to_string(r) + " outside [0, n_contingencies)");
+    if (n_bus_src != base_state_->n_bus)
+        throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: the source has " +
+                                 std::to_string(n_bus_src) + " buses, this session " +
+                                 std::to_string(base_state_->n_bus));
     for (int r : src_rows)
-        if (r < 0)
-            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: negative source row");
+        if (r < 0 || r >= n_src_rows)
+            throw std::runtime_error("ContingencyAnalysisSession::overwrite_rows: source row " +
+                                     std::to_string(r) + " outside [0, " +
+                                     std::to_string(n_src_rows) + ")");
     const cudaStream_t cs = static_cast<cudaStream_t>(solver_->cs);
     thrust::device_vector<int> d_dst, d_src;
     upload_h2d(d_dst, dst_rows.data(), dst_rows.size(), cs);
@@ -1097,6 +1106,11 @@ Eigen::VectorXi ContingencyAnalysisSession::get_row_status() const
     if (!solver_) return Eigen::VectorXi();
     const std::vector<int>& v = solver_->row_status();
     return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
+}
+
+int ContingencyAnalysisSession::result_rows() const
+{
+    return solver_ ? solver_->n_contingencies : 0;
 }
 
 std::uintptr_t ContingencyAnalysisSession::v_results_ptr() const

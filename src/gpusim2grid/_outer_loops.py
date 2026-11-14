@@ -28,7 +28,9 @@ def _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round, **u
     if not getattr(_cpp, "have_ls2g_outer_loops", False):
         raise ValueError("outer_loops=True: gpusim2grid was built against a lightsim2grid "
                          "without outer loops (NROuter_*)")
-    if scheduling != "continuous":
+    # the facades take the BatchScheduling enum as well as the string
+    from .contingency_analysis._scheduling import resolve_scheduling
+    if resolve_scheduling(scheduling) != _cpp.BatchScheduling.Continuous:
         raise ValueError("outer_loops=True runs on scheduling='continuous' only, by design (a row "
                          "the loops change is re-solved in its own slot while the others go on, "
                          "which a chunk cannot do); 'chunked' is not supported and is not planned to be")
