@@ -206,7 +206,7 @@ class SchedulingEngineMixin:
           own fill-reducing order (AMD or MinFill), AMD otherwise; ``'amd'``,
           ``'none'``, ``'ls2g_constrained'`` (same as the default),
           ``'ls2g_constrained_nd'`` and ``'ls2g_constrained_minfill'`` (MinFill
-          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` is clamped (counted by
+          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` (``1e-5`` in an FP32 build) is clamped (counted by
           ``timings.cudss_npivots_*`` with ``GPUSIM2GRID_COUNT_PIVOTS=1``);
           ``ir_n_steps`` refines. ``matching_alg`` must stay ``'none'``.
 

@@ -47,12 +47,20 @@
 
 namespace own_lu {
 
+// The default relative pivot clamp (GPUSIM2GRID_OWN_LU_EPS overrides it):
+// 1e-12 in FP64; FP32 cannot resolve that (a clamped pivot then gives garbage
+// factors and refinement diverges), so 1e-5 there.
+constexpr double default_pivot_eps()
+{
+    return sizeof(cuda_real_type) == 4 ? 1e-5 : 1e-12;
+}
+
 class BatchedLu {
 public:
     // eps: relative pivot clamp (0 = none). split_chain / split_items: a level
     // with fewer than split_items items whose longest chain of contributions
     // exceeds split_chain shares each item over K warps (K = 2 ... 32).
-    void init(const LuPlan& plan, int batch, cudaStream_t stream, double eps = 1e-12,
+    void init(const LuPlan& plan, int batch, cudaStream_t stream, double eps = default_pivot_eps(),
               int split_chain = 16, int split_items = 256);
 
     // values: [B × nnz] slot-major, the pattern of the plan's A (CSR order);

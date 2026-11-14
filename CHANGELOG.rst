@@ -33,6 +33,8 @@ Change Log
   (k groups = one call), no longer ``t_full / t_group``, which advised far too few groups.
 - [IMPROVED] ``linear_solver='own_lu'`` with a ``reordering_alg`` / ``matching_alg`` it cannot take is refused at
   construction or by the setter making the combination, not at the first ``compute()``.
+- [FIXED] ``linear_solver='own_lu'`` in an FP32 build clamps tiny pivots at ``1e-5 * max|J|`` (was ``1e-12``,
+  below float resolution: garbage factors, refinement diverging).
 - [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
   the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its

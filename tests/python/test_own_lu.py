@@ -128,12 +128,11 @@ def test_raw_benchmark_solves_the_jacobian(case118, residual_atol):
 def test_raw_refinement_recovers_a_clamped_pivot(monkeypatch):
     """ir_n_steps refines the own LU's solution: a saddle matrix whose first
     pivot is 0 in the identity order gets it clamped (the factors are those of
-    a perturbed matrix, residual ~1e-5); each refinement step against the true
-    matrix cuts the residual by orders of magnitude. FP32 takes a clamp of
-    1e-4: the default 1e-12 is below float resolution, its factors are garbage
-    and refinement diverges."""
-    if _cpp.is_fp32:
-        monkeypatch.setenv("GPUSIM2GRID_OWN_LU_EPS", "1e-4")
+    a perturbed matrix); each refinement step against the true matrix cuts the
+    residual by orders of magnitude. On the default clamp, which depends on the
+    precision: 1e-12 of max|A| in FP64 would be below float resolution in FP32
+    (garbage factors, refinement diverging), so FP32 clamps at 1e-5."""
+    monkeypatch.delenv("GPUSIM2GRID_OWN_LU_EPS", raising=False)
     M = (3, [0, 3, 6, 9], [0, 1, 2] * 3, [0., 1., 2., 1., 1., 0., 2., 0., 1.])
     res = [_cpp.benchmark_cudss_batch_raw(*M, 4, n_refactorize=1, ir_n_steps=ir,
                                           reordering_alg=_cpp.ReorderingAlg.NoReordering,

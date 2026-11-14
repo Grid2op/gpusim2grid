@@ -47,7 +47,7 @@
 //              solve and the iterative refinement (ir_n_steps) are
 //              own_lu::BatchedLu's. matching_alg / pivot_epsilon_alg do not
 //              apply; GPUSIM2GRID_OWN_LU_EPS: the relative pivot clamp (default
-//              1e-12). Behaves as Uniform otherwise (bind_slice, continuous
+//              own_lu::default_pivot_eps(): 1e-12, 1e-5 in FP32). Behaves as Uniform otherwise (bind_slice, continuous
 //              scheduling); the continuous tail runs on its active prefix
 //              (set_active_count), not on a second handle. Refused with the
 //              two variables above.
@@ -697,7 +697,7 @@ private:
         cudaMemcpy(ip.data(), d_J_outer_, ip.size() * sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(ix.data(), d_J_inner_, ix.size() * sizeof(int), cudaMemcpyDeviceToHost);
         user_perm_ = perm ? *perm : own_lu::amd_order(dim_J_, ip, ix);
-        double eps = 1e-12;
+        double eps = own_lu::default_pivot_eps();
         if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_EPS")) eps = std::atof(e);
         own_.init(own_lu::build_lu_plan(dim_J_, ip, ix, user_perm_), ubatch_, cs_, eps);
     }
