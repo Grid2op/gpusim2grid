@@ -371,3 +371,36 @@ def test_mutated_reordering_alg_gets_its_own_order(monkeypatch):
     cu.reordering_alg = "default"
     cu.compute(batch_size=3)
     assert cu.timings.cudss_user_perm_honoured == -1
+
+
+_RAW_BAD_INPUTS = r"""
+import sys
+import gpusim2grid._gpusim2grid as _cpp
+case = sys.argv[1]
+dim, indptr, indices, data = {
+    "short_indptr": (200000, [0, 1, 2], [0, 1], [1.0, 1.0]),
+    "dim_zero": (0, [0], [], []),
+    "dim_negative": (-3, [0], [], []),
+    "indices_out_of_range": (2, [0, 1, 2], [0, 7], [1.0, 1.0]),
+}[case]
+try:
+    _cpp.benchmark_cudss_batch_raw(dim, indptr, indices, data, 2, n_refactorize=1,
+                                   linear_solver=_cpp.LinearSolver.OwnLu)
+except RuntimeError as e:
+    print("REFUSED:", e)
+"""
+
+
+@pytest.mark.parametrize("case", ["short_indptr", "dim_zero", "dim_negative", "indices_out_of_range"])
+def test_raw_own_lu_validates_before_ordering(case):
+    """benchmark_cudss_batch_raw(linear_solver=OwnLu) checks the CSR it is
+    handed before computing the own LU's order on it: a malformed matrix is
+    refused with the benchmark's own message, never read out of bounds (run in
+    a subprocess: an out-of-bounds read may crash the interpreter)."""
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, "-c", _RAW_BAD_INPUTS, case],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (r.returncode, r.stderr[-2000:])
+    assert "REFUSED: benchmark_cudss_batch_raw:" in r.stdout, (r.stdout, r.stderr[-2000:])
+

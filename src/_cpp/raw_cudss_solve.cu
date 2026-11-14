@@ -140,12 +140,6 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     LinearSolver linear_solver,
     int n_active)
 {
-    // the own LU's order: what reordering_alg names, chosen on the host (no grid:
-    // no constraints, so 'default' is AMD)
-    std::vector<int> own_perm;
-    if (linear_solver == LinearSolver::OwnLu)
-        own_perm = own_lu::choose_order(reordering_alg, dim, indptr, indices, nullptr, {});
-    const std::vector<int>* perm = own_perm.empty() ? nullptr : &own_perm;
     if (dim <= 0 || batch_size <= 0 || n_refactorize < 0 || n_groups <= 0 || n_handles <= 0)
         throw std::runtime_error(
             "benchmark_cudss_batch_raw: dim, batch_size, n_groups and n_handles must be > 0, "
@@ -180,6 +174,13 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
         if (indices[static_cast<size_t>(k)] < 0 || indices[static_cast<size_t>(k)] >= dim)
             throw std::runtime_error("benchmark_cudss_batch_raw: column index " +
                                      std::to_string(indices[static_cast<size_t>(k)]) + " out of [0, dim)");
+    // the own LU's order: what reordering_alg names, chosen on the host (no grid:
+    // no constraints, so 'default' is AMD) -- after the checks above: it walks the
+    // pattern through indptr / indices
+    std::vector<int> own_perm;
+    if (linear_solver == LinearSolver::OwnLu)
+        own_perm = own_lu::choose_order(reordering_alg, dim, indptr, indices, nullptr, {});
+    const std::vector<int>* perm = own_perm.empty() ? nullptr : &own_perm;
     if (device >= 0) CHK_CUDA_RAW(cudaSetDevice(device));
 
     const size_t B = static_cast<size_t>(batch_size);

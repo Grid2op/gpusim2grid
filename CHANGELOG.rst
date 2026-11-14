@@ -27,6 +27,8 @@ Change Log
   the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
 - [FIXED] ``reordering_alg`` changed after construction: the batch solvers get that algorithm's order (they kept
   the construction value's lightsim2grid order, with cuDSS and the own LU alike).
+- [FIXED] ``benchmark_cudss_batch_raw(linear_solver=OwnLu)`` checks the CSR before ordering it (a malformed one
+  crashed the interpreter).
 - [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
   the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its
