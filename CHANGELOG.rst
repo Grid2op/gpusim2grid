@@ -7,6 +7,7 @@ Change Log
   ``n_active`` matrices are factorized and solved, the others left untouched.
 - [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU
   of our own instead of cuDSS, ordered on the host (lightsim2grid's constrained order by default): no pivot to perturb.
+  The LU itself is Ralf Cortes Do Nascimento's contribution (ported from gpu-security-analysis).
 - [IMPROVED] ``linear_solver='own_lu'``: the continuous tail runs on the forward solver's first slots (active
   prefix) instead of a second solver cycled over groups of ``tail_group_size``.
 - [ADDED] lightsim2grid's constrained order now starts from the grid's own fill-reducing order (AMD or

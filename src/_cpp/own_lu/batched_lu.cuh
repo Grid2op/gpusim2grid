@@ -29,6 +29,9 @@
 // Kernels: gpu-security-analysis' engine/kernels/lu.cu (RTE-AssistFlux),
 // templated on the real type, plus the clamp counter and the refinement.
 // Not thread-safe; every launch on the stream given at init().
+//
+// Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
+// Nascimento (RTE), contributed from gpu-security-analysis.
 // =============================================================================
 
 #ifndef GPUSIM2GRID_OWN_LU_BATCHED_LU_CUH

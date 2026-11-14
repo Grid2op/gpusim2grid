@@ -307,4 +307,5 @@ REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
 Developed at RTE. Part of the [Grid2Op](https://github.com/Grid2Op) ecosystem and built
 on [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid). Uses
 [Eigen](https://eigen.tuxfamily.org), [KLU](https://github.com/DrTimothyAldenDavis/SuiteSparse),
-[cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. -->
+[cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. The batched LU behind
+`linear_solver='own_lu'` is Ralf Cortes Do Nascimento's contribution. -->

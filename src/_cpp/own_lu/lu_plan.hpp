@@ -26,6 +26,9 @@
 //     the two triangular solves.
 //
 // The device side (batched_lu.cuh) only streams values along these lists.
+//
+// Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
+// Nascimento (RTE), contributed from gpu-security-analysis.
 // =============================================================================
 
 #ifndef GPUSIM2GRID_OWN_LU_PLAN_HPP

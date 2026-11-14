@@ -5,6 +5,9 @@
 // own_lu/lu_plan.cpp -- see lu_plan.hpp. A line-by-line port of
 // gpu-security-analysis' LuPlan (engine/lu.py): _cholesky_rows, _levels,
 // _left_looking, the item sort and the level slices.
+//
+// Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
+// Nascimento (RTE), contributed from gpu-security-analysis.
 
 #include "lu_plan.hpp"
 

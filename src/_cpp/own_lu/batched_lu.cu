@@ -6,6 +6,9 @@
 // gpu-security-analysis' engine/kernels/lu.cu, templated on the real type; the
 // U steps also count the pivots they clamp, every kernel runs on the active
 // prefix (set_active), and refine() is new.
+//
+// Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
+// Nascimento (RTE), contributed from gpu-security-analysis.
 
 #include "batched_lu.cuh"
 

@@ -217,7 +217,7 @@ agreeing with the GPU to 1.8e-12.
 
 ## 6. A third LU: gpu-security-analysis' (2026-11-05), and the go / no-go
 
-A colleague's batched LU (github.com/RTE-AssistFlux/gpu-security-analysis, private, `engine/lu.py`,
+Ralf Cortes Do Nascimento's batched LU (github.com/RTE-AssistFlux/gpu-security-analysis, private, `engine/lu.py`,
 `engine/kernels/lu.cu`, its `docs/own_lu.md`) differs from olf-gpu's on the point that matters here: it
 **computes its own symbolic factorization for any order it is given** (Cholesky fill of the symmetrized
 permuted pattern, level schedules, CPU, once per pattern), instead of borrowing cuDSS's. Same engine
