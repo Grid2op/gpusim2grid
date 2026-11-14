@@ -49,6 +49,9 @@ void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, cons
         if (!gd.status[g] || !gd.local_vreg[g]) continue;
         const int b = gd.bus[g];
         if (b < 0) continue;
+        // something a row cannot take out holds this bus too: it stays PV whatever the
+        // generators do
+        if (!gd.bus_other_vreg.empty() && gd.bus_other_vreg[static_cast<size_t>(b)]) continue;
         gens_of_bus[b].push_back(g);
     }
 

@@ -512,6 +512,11 @@ void BatchPfDriver<BatchSource>::set_violation_limits(
     int    K,
     int    n_lines)
 {
+    // K < 1 leaves the compact output empty while the kernel still writes a
+    // diverged row's DIVERGENCE record at its slice's first slot
+    if (K < 1)
+        throw std::invalid_argument(
+            "BatchPfDriver::set_violation_limits: violation_capacity must be >= 1, got " + std::to_string(K));
     if (!_has_branch_admittances)
         throw std::runtime_error(
             "BatchPfDriver::set_violation_limits: call upload_branch_admittances "
@@ -1310,6 +1315,11 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
                      d_residuals.begin(), d_residuals.end(), nan_r);
     }
 
+    // GPUSIM2GRID_COUNT_PIVOTS: the counters are this run's (a reused driver
+    // keeps its handles), the tail's handle included (a new one starts at 0)
+    linear_solver_.reset_pivot_counts();
+    if (tail_solver_) tail_solver_->reset_pivot_counts();
+
     // Chunk loop runs over the ACTIVE set (c_start / actual_batch in active-slot
     // space); _solve_chunk scatters each result to its original index.
     // Per-chunk ANALYSIS of the non-uniform cuDSS modes (0 in uniform mode).
@@ -1336,6 +1346,14 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.cudss_npivots_total              = fs.npivots_total;
     t.cudss_npivots_max                = fs.npivots_max;
     t.cudss_npivots_reads              = fs.npivots_reads;
+    if (tail_solver_) {   // the continuous tail factorizes on its own handle
+        const CudssFactorStats& ts = tail_solver_->factor_stats();
+        if (ts.npivots_total >= 0) {
+            t.cudss_npivots_total = std::max(t.cudss_npivots_total, 0LL) + ts.npivots_total;
+            t.cudss_npivots_max   = std::max(t.cudss_npivots_max, ts.npivots_max);
+        }
+        t.cudss_npivots_reads += ts.npivots_reads;
+    }
 
     cs.synchronize();
 

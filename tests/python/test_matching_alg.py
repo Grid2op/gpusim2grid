@@ -14,10 +14,12 @@ Empirical findings (verified against the IEEE-14 reference solution, not
 assumed):
 
 - Batch mode (ContingencyAnalysisGPU / InjectionSweepGPU, always uniform-batch
-  via CUDSS_CONFIG_UBATCH_SIZE): cuDSS accepts ONLY 'none' (matching
+  via CUDSS_CONFIG_UBATCH_SIZE): cuDSS 0.8 accepts ONLY 'none' (matching
   disabled). Every other value raises RuntimeError
   (CUDSS_STATUS_NOT_SUPPORTED) -- exactly like BTF_COLAMD/COLAMD did for
   reordering_alg, but here it is ALL non-default matching values, not just two.
+  cuDSS 1.0 also accepts 'auto' there, and it converges on IEEE-14; the
+  other values still raise.
 - Single-system (AcPfGPU): 'none', 'max_diag_count', 'max_min_diag',
   'max_min_diag_alt', 'max_diag_sum' all reproduce the reference solution.
   'max_diag_product' and 'auto' silently produce NaN voltages (all non-slack
@@ -28,6 +30,9 @@ assumed):
   test_single_system_max_diag_product_and_auto_produce_nan below. Do not
   treat MaxDiagProduct/Auto as safe defaults.
 """
+import ctypes
+import os
+
 import numpy as np
 import pytest
 
@@ -42,8 +47,37 @@ _SINGLE_SYSTEM_SAFE_ALGS = [
 _SINGLE_SYSTEM_NAN_ALGS = ['max_diag_product', 'auto']
 _BATCH_UNSUPPORTED_ALGS = [
     'max_diag_count', 'max_min_diag', 'max_min_diag_alt',
-    'max_diag_sum', 'max_diag_product', 'auto',
+    'max_diag_sum', 'max_diag_product',
 ]
+
+
+def _cudss_major():
+    """Major version of the cuDSS the extension loaded (cudssGetProperty),
+    None if it cannot be read."""
+    import gpusim2grid._gpusim2grid  # noqa: F401 -- loads libcudss
+    for name in ("libcudss.so.1", "libcudss.so.0", "libcudss.so"):
+        try:
+            lib = ctypes.CDLL(name, mode=getattr(os, "RTLD_NOLOAD", 4))
+        except OSError:
+            continue
+        major = ctypes.c_int(-1)
+        if lib.cudssGetProperty(0, ctypes.byref(major)) == 0:  # MAJOR_VERSION
+            return major.value
+    return None
+
+
+def _check_batch_auto(compute, residuals, residual_atol):
+    """'auto' in uniform-batch mode: cuDSS 0.8 refuses it at ANALYSIS,
+    cuDSS >= 1.0 accepts it (and it converges on IEEE-14)."""
+    major = _cudss_major()
+    if major is None:
+        pytest.skip("cannot read the cuDSS version")
+    if major < 1:
+        with pytest.raises(RuntimeError, match="CudssContext::analyze"):
+            compute()
+    else:
+        compute()
+        assert np.all(residuals() < 100 * residual_atol)
 
 
 class TestMatchingAlgEnum:
@@ -156,6 +190,22 @@ class TestContingencyAnalysisGpuMatchingAlg:
         with pytest.raises(RuntimeError, match="CudssContext::analyze"):
             ca.compute(batch_size=5)
 
+    def test_batch_auto(self, ieee14_base_case, ieee14_grid, residual_atol):
+        from gpusim2grid import ContingencyAnalysisGPU
+
+        d = ieee14_base_case
+        grid_tuple = (d["Ybus"], d["v_init"].copy(), d["Sbus"],
+                      d["slack"], d["slack_weights"], d["pv"], d["pq"])
+        branch_data, n_lines, _ = branch_data_arrays(ieee14_grid)
+
+        ca = ContingencyAnalysisGPU(grid_tuple, init_from_n_powerflow=False,
+                                    nb_iter=10)
+        ca.matching_alg = 'auto'
+        ca.set_branch_data(*branch_data)
+        ca.add_contingencies_by_branch_id([[i] for i in range(min(5, n_lines))])
+        _check_batch_auto(lambda: ca.compute(batch_size=5), ca.last_residuals,
+                          residual_atol)
+
     def test_invalid_string_raises(self, ieee14_base_case):
         from gpusim2grid import ContingencyAnalysisGPU
 
@@ -202,6 +252,21 @@ class TestInjectionSweepGpuMatchingAlg:
         sweep.set_injections(p_mw, q_mvar, sn_mva=100.0)
         with pytest.raises(RuntimeError, match="CudssContext::analyze"):
             sweep.compute(batch_size=2)
+
+    def test_batch_auto(self, ieee14_base_case, residual_atol):
+        from gpusim2grid import InjectionSweepGPU
+
+        d = ieee14_base_case
+        grid_tuple = (d["Ybus"], d["v_init"].copy(), d["Sbus"],
+                      d["slack"], d["slack_weights"], d["pv"], d["pq"])
+        sweep = InjectionSweepGPU(grid_tuple, init_from_n_powerflow=False,
+                                  nb_iter=10)
+        sweep.matching_alg = 'auto'
+        p_mw = np.tile(d["Sbus"].real * 100.0, (2, 1))
+        q_mvar = np.tile(d["Sbus"].imag * 100.0, (2, 1))
+        sweep.set_injections(p_mw, q_mvar, sn_mva=100.0)
+        _check_batch_auto(lambda: sweep.compute(batch_size=2),
+                          sweep.last_residuals, residual_atol)
 
     def test_invalid_string_raises(self, ieee14_base_case):
         from gpusim2grid import InjectionSweepGPU

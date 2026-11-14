@@ -118,4 +118,6 @@ def test_matches_lightsim2grid(solver_atol, target_v_kv, nb):
 def test_range_off_reports_nothing():
     grid = _grid(14.2)
     grid.set_remote_voltage_control_vm_range(np.nan, np.nan)
-    assert _remote(_gpu_ca(grid, [0]).get_physical_violations_n()) == []
+    ca = _gpu_ca(grid, [0])
+    assert _remote(ca.get_physical_violations_n()) == []
+    assert all(_remote(r) == [] for r in ca.get_physical_violations())

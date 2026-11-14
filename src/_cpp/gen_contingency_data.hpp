@@ -42,6 +42,9 @@ struct GenContingencyData {
     // this share survives every row's re-weighting (lightsim2grid's
     // LSGrid::get_slack_weights_solver_without)
     std::vector<double> storage_slack_weight_bus;
+    // [n_bus_solver] a storage unit or an HVDC converter station also regulates this bus:
+    // no row disconnects those, so losing its generators never turns it PQ
+    std::vector<char>   bus_other_vreg;
 
     bool empty() const { return n_gen == 0; }
 };

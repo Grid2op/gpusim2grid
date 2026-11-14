@@ -470,9 +470,10 @@ struct BatchTimings {
     // 0 no, -1 no user permutation.
     int       cudss_user_perm_honoured         = -1;
     // CUDSS_DATA_NPIVOTS (pivots cuDSS perturbed), read after every
-    // factorization of the forward batch when GPUSIM2GRID_COUNT_PIVOTS is set
-    // (host sync per factorization); -1 otherwise. Summed over the run, the
-    // largest single read, and the number of reads.
+    // factorization of the forward batch (the continuous tail's handle
+    // included) when GPUSIM2GRID_COUNT_PIVOTS is set (host sync per
+    // factorization); -1 otherwise. Summed over this run (not the driver's
+    // life), the largest single read, and the number of reads.
     long long cudss_npivots_total              = -1;
     long long cudss_npivots_max                = -1;
     long long cudss_npivots_reads              = 0;
