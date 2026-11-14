@@ -102,16 +102,24 @@ def _outer_ca(grid):
                                       ir_n_steps=1, tol=TOL / grid.get_sn_mva())
 
 
-def test_outer_loops_trip_of_regulating_shunt_raises_at_compute():
-    """With outer_loops=True on a grid whose ShuntVoltageControl loop holds two shunts,
-    a contingency tripping one of them makes compute() raise a RuntimeError whose message
-    names ShuntVoltageControl (current behaviour: lightsim2grid instead leaves that row
-    out as BATCH_UNSUPPORTED). A contingency tripping a line on the same grid computes."""
+def test_outer_loops_trip_of_regulating_shunt_is_refused():
+    """With outer_loops=True on a grid whose ShuntVoltageControl loop holds two shunts, a
+    contingency tripping one of them is refused, never solved: either compute() raises a
+    RuntimeError naming ShuntVoltageControl (this branch), or -- once the batch leaves such
+    a row out as lightsim2grid does (BATCH_UNSUPPORTED, later in the stack) -- that row's V
+    is NaN while a line contingency next to it computes. A line contingency on its own
+    computes either way."""
     grid, reg, _ = _regulating_shunt_grid()
     ca = _outer_ca(grid)
     ca.add_contingency_shunt(reg[0])
-    with pytest.raises(RuntimeError, match="ShuntVoltageControl"):
+    ca.add_contingencies([((1,), (), (), ())])
+    try:
         ca.compute(batch_size=4)
+    except RuntimeError as e:
+        assert "ShuntVoltageControl" in str(e)
+    else:
+        V = ca.V_results.to_numpy().reshape(2, -1)
+        assert np.all(np.isnan(V[0])) and np.all(np.isfinite(V[1]))
 
     ok = _outer_ca(grid)
     ok.add_contingencies_by_branch_id([[1]])
