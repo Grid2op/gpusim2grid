@@ -6,6 +6,9 @@
 // gpu-security-analysis' engine/kernels/lu.cu, templated on the real type; the
 // U steps also count the pivots they clamp, every kernel runs on the active
 // prefix (set_active), and refine() is new.
+//
+// Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
+// Nascimento (RTE), contributed from gpu-security-analysis.
 
 #include "batched_lu.cuh"
 
@@ -390,6 +393,9 @@ void BatchedLu::refine(const cuda_real_type* values, const int* indptr, const in
 {
     using T = cuda_real_type;
     if (steps <= 0) return;
+    if (static_cast<const void*>(x) == static_cast<const void*>(b))
+        throw std::invalid_argument("own_lu::BatchedLu::refine: x aliases b (the residual b - A x needs b "
+                                    "intact): solve into another buffer to refine");
     if (d_r_.size() != static_cast<size_t>(n_) * B_) {   // sized for the whole batch, once
         d_r_.resize(static_cast<size_t>(n_) * B_);
         d_d_.resize(static_cast<size_t>(n_) * B_);

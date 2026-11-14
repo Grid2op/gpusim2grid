@@ -128,8 +128,9 @@ def _has_overshoot():
 @pytest.mark.parametrize("overshoot_mw", [15., 25.])
 def test_overshoot_matches_lightsim2grid(solver_atol, overshoot_mw):
     """The capped unit sat beyond its max_p in the reference solve: it only leaves it once
-    the common shift has used that up (15 MW: it gives 2.5 of the 20 MW; 25 MW: nothing) --
-    the data carries the overshoot and the GPU pre-pass gives lightsim2grid's voltages."""
+    the common shift has used that up (meant: 15 MW, it gives 2.5 of the 20 MW; 25 MW,
+    nothing) -- asserted here: the data carries the overshoot and the GPU pre-pass gives
+    lightsim2grid's voltages (the shares themselves are not checked)."""
     from gpusim2grid import _gpusim2grid as _cpp
     grid = _grid(True, 0., overshoot_mw)
     d = _cpp._extract_slack_redistribution_data_from_lsgrid(grid, grid.get_Ybus_solver().shape[0])

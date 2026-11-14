@@ -13,6 +13,7 @@
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
+#include "own_lu/lu_order.hpp"               // own_lu::check_config
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
 #include "warmup.hpp"                        // warmup
 
@@ -1830,13 +1831,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::arg("rows"), pybind11::arg("iterations"), pybind11::arg("status"),
          "Overwrite the per-row outcome (iterations, RowStatus) of the given rows "
          "(the reactive-limit outer loop's second pass). Requires run().")
-    .def("overwrite_rows", &ContingencyAnalysisSession::overwrite_rows,
-         pybind11::arg("dst_rows"), pybind11::arg("src_rows"),
-         pybind11::arg("d_V_src"), pybind11::arg("d_res_src"),
+    .def("overwrite_rows",
+         [](ContingencyAnalysisSession& self, const std::vector<int>& dst_rows,
+            const std::vector<int>& src_rows, const ScenarioSweepSession& src) {
+             // the source's buffers and their extent, read off the session
+             // itself at call time: never a pointer handed in from Python
+             self.overwrite_rows(dst_rows, src_rows, src.v_results_ptr(), src.residuals_ptr(),
+                                 src.result_rows(), src.n_bus());
+         },
+         pybind11::arg("dst_rows"), pybind11::arg("src_rows"), pybind11::arg("src"),
          "Overwrite the voltages and residuals of rows dst_rows[i] with row "
-         "src_rows[i] of another session's device result buffers (e.g. "
-         "ScenarioSweepSession.v_results_ptr() / residuals_ptr()): the "
-         "reactive-limit outer loop's second pass. Requires run().")
+         "src_rows[i] of the last run() of the ScenarioSweepSession src (a "
+         "source row outside its rows is refused): the reactive-limit outer "
+         "loop's second pass. Requires run() on both.")
     .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
          "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
@@ -2025,7 +2032,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                   "ka > limit*(1+tol), HIGH_VOLTAGE when v > vmax*(1+tol), LOW_VOLTAGE "
                   "when v < vmin*(1-tol), so a value on its limit up to rounding is not "
                   "reported. 0 = bare strict comparisons. Takes effect on the next run().")
-    .def_readwrite("violation_capacity", &ContingencyAnalysisSession::violation_capacity_,
+    .def_property("violation_capacity",
+                  [](const ContingencyAnalysisSession& s) { return s.violation_capacity_; },
+                  [](ContingencyAnalysisSession& s, int k) {
+                      if (k < 1)
+                          throw pybind11::value_error("violation_capacity must be >= 1, got " + std::to_string(k));
+                      s.violation_capacity_ = k;
+                  },
                    "Violation records kept per contingency AND per type (K): the K "
                    "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
                    "|value/limit - 1|, each type sorted most severe first. Bounds "
@@ -2622,14 +2635,26 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Device pointer (int) of the last run's (n_scenarios, n_bus) voltages, 0 before run().")
     .def("residuals_ptr", &ScenarioSweepSession::residuals_ptr,
          "Device pointer (int) of the last run's (n_scenarios,) residuals, 0 before run().")
-    .def("set_v_init_from_ptr", &ScenarioSweepSession::set_v_init_from_ptr,
-         pybind11::arg("d_V_src"), pybind11::arg("src_rows"),
+    // the source's buffer and its extent, read off the session itself at call
+    // time: never a pointer handed in from Python
+    .def("set_v_init_from",
+         [](ScenarioSweepSession& self, const ContingencyAnalysisSession& src,
+            const std::vector<int>& src_rows) {
+             self.set_v_init_from_ptr(src.v_results_ptr(), src_rows, src.result_rows(), src.n_bus());
+         },
+         pybind11::arg("src"), pybind11::arg("src_rows"),
          "Per-row starting voltages, row-aligned with set_injections(): row i starts "
-         "from row src_rows[i] of a row-major (*, n_bus) complex device buffer (e.g. "
-         "ContingencyAnalysisSession.v_results_ptr(), ready on the device), copied at "
-         "once; a non-finite entry starts from the base case. A hot change.")
+         "from row src_rows[i] of the last run() of src (a ContingencyAnalysisSession "
+         "or a ScenarioSweepSession; a source row outside its rows is refused), "
+         "copied at once; a non-finite entry starts from the base case. A hot change.")
+    .def("set_v_init_from",
+         [](ScenarioSweepSession& self, const ScenarioSweepSession& src,
+            const std::vector<int>& src_rows) {
+             self.set_v_init_from_ptr(src.v_results_ptr(), src_rows, src.result_rows(), src.n_bus());
+         },
+         pybind11::arg("src"), pybind11::arg("src_rows"))
     .def("clear_v_init", &ScenarioSweepSession::clear_v_init,
-         "Drop set_v_init_from_ptr(): every row starts from the base-case voltages again.")
+         "Drop set_v_init_from(): every row starts from the base-case voltages again.")
     .def_property_readonly("has_v_init", &ScenarioSweepSession::has_v_init)
     .def_property_readonly("dim_J", &ScenarioSweepSession::dim_J,
          "Augmented Jacobian dimension of the current base state (grows by "
@@ -2906,7 +2931,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                   "ka > limit*(1+tol), HIGH_VOLTAGE when v > vmax*(1+tol), LOW_VOLTAGE "
                   "when v < vmin*(1-tol), so a value on its limit up to rounding is not "
                   "reported. 0 = bare strict comparisons. Takes effect on the next run().")
-    .def_readwrite("violation_capacity", &ScenarioSweepSession::violation_capacity_,
+    .def_property("violation_capacity",
+                  [](const ScenarioSweepSession& s) { return s.violation_capacity_; },
+                  [](ScenarioSweepSession& s, int k) {
+                      if (k < 1)
+                          throw pybind11::value_error("violation_capacity must be >= 1, got " + std::to_string(k));
+                      s.violation_capacity_ = k;
+                  },
                    "Violation records kept per scenario AND per type (K): the K "
                    "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
                    "|value/limit - 1|, each type sorted most severe first. Bounds "
@@ -3543,7 +3574,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 h.model->set_row_overrides(std::move(ov));
             }, pybind11::arg("branch_off"), pybind11::arg("masked") = std::vector<std::vector<int>>{},
             "per row, the branches it opens (lines then trafos) and, optionally, the solver buses "
-            "handle_disconnected_grid masks")
+            "handle_disconnected_grid masks. Replaces ALL the rows' overrides (generators off, "
+            "gen_v, lost power... are cleared): call it before begin().")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;
@@ -3740,8 +3772,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "REFACTORIZATION + SOLVE each)")
         .def_readonly("n_active", &CudssBatchBenchResult::n_active)
         .def_readonly("active_max_rel_residual", &CudssBatchBenchResult::active_max_rel_residual,
-                      "Own LU active prefix: residual of its first n_active matrices, "
-                      "refactorized and solved alone (-1 = not run)")
+                      "Own LU active prefix: residual of its first n_active matrices, their "
+                      "values tripled before that call, refactorized and solved alone "
+                      "(-1 = not run)")
         .def_readonly("n_inactive_touched", &CudssBatchBenchResult::n_inactive_touched,
                       "Solution entries past the prefix that call changed (0 expected; -1 = not run)")
         .def_readonly("inactive_max_rel_residual", &CudssBatchBenchResult::inactive_max_rel_residual,
@@ -3769,6 +3802,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 + ", t_group_ms=" + std::to_string(c.t_group_ms)
                 + ", max_groups=" + std::to_string(c.max_groups) + ")";
         });
+
+    m.def("check_own_lu_config", &own_lu::check_config,
+        pybind11::arg("reordering_alg"), pybind11::arg("matching_alg"),
+        "Raise ValueError unless linear_solver='own_lu' can take this reordering_alg "
+        "and matching_alg (it never pivots: no matching, an order computed on the host).");
 
     m.def("benchmark_cudss_batch_raw", &benchmark_cudss_batch_raw,
         pybind11::arg("dim"),

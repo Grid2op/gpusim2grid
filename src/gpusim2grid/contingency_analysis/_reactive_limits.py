@@ -560,8 +560,8 @@ def _augmented_plans(ctx, row_switches):
 def run_second_pass(sweep, ctx, topology_rows, row_switches, batch_size, v_init=None):
     """Configure the second-pass ScenarioSweepGPU ``sweep`` (one row per entry of
     ``row_switches``, with the branches ``topology_rows`` trips) and solve it.
-    ``v_init``: ``(device pointer, source rows)`` of the voltages each row starts
-    from (the first pass' own, see ScenarioSweepSession.set_v_init_from_ptr);
+    ``v_init``: ``(source session, source rows)`` of the voltages each row starts
+    from (the first pass' own, see ScenarioSweepSession.set_v_init_from);
     None: the base case."""
     n2 = len(row_switches)
     eng = sweep.solver
@@ -615,5 +615,5 @@ def run_second_pass(sweep, ctx, topology_rows, row_switches, batch_size, v_init=
     if v_init is None:
         sess.clear_v_init()
     else:
-        sess.set_v_init_from_ptr(int(v_init[0]), list(v_init[1]))
+        sess.set_v_init_from(v_init[0], list(v_init[1]))
     sweep.compute(batch_size=batch_size)

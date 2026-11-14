@@ -694,9 +694,10 @@ def _grid_gen_next_to_regulator(kind):
 @requires_gpu
 @needs_bridge
 @pytest.mark.parametrize("kind", ["storage", "hvdc"])
-def test_gen_tripped_next_to_another_regulator_keeps_the_bus_pv(kind):
+def test_gen_tripped_next_to_another_regulator_keeps_the_bus_pv(kind, solver_atol):
     """The other regulator still holds the bus: tripping the generator must not turn it PQ
-    (found porting lightsim2grid #292's fix of the same wrong answer)."""
+    (lightsim2grid's _maybe_prepare_gen_contingency counts the storage units and converter
+    stations regulating a bus)."""
     from gpusim2grid import ContingencyAnalysisGPU
 
     grid, gen_id, bus, vm = _grid_gen_next_to_regulator(kind)
@@ -706,12 +707,12 @@ def test_gen_tripped_next_to_another_regulator_keeps_the_bus_pv(kind):
     ref_grid.tell_solver_need_reset()
     V_ref = ref_grid.ac_pf(v1.copy(), MAX_IT, TOL)
     assert V_ref.shape[0] > 0
-    assert abs(V_ref[bus]) == pytest.approx(vm, abs=1e-8)
+    assert abs(V_ref[bus]) == pytest.approx(vm, abs=solver_atol)
 
-    ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10)   # (the precision's default tol_base)
     ca.add_contingency_gen(gen_id)
     ca.compute(batch_size=1)
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
-    assert abs(V[list(buses).index(bus)]) == pytest.approx(vm, abs=1e-8)
-    np.testing.assert_allclose(V, V_ref[buses], rtol=0., atol=1e-8)
+    assert abs(V[list(buses).index(bus)]) == pytest.approx(vm, abs=solver_atol)
+    np.testing.assert_allclose(V, V_ref[buses], rtol=0., atol=solver_atol)

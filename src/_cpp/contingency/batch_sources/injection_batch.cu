@@ -26,8 +26,8 @@ inline void _chk_cuda(cudaError_t e, const char* what) {
 void InjectionBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
 {
     // Sanity: host array must match the configured (n_scenarios × n_bus).
-    if (static_cast<int>(h_Sbus_all_.size())
-            != n_scenarios_ * ctx.n_bus) {
+    if (h_Sbus_all_.size()
+            != static_cast<size_t>(n_scenarios_) * static_cast<size_t>(ctx.n_bus)) {
         throw std::runtime_error(
             "[injection_batch] h_Sbus_all_ size does not match n_scenarios * n_bus");
     }

@@ -415,6 +415,10 @@ def _record_key(v):
     return (int(v.element_type), v.element_id, v.side, int(v.violation_type))
 
 
+# threads per block of check_limit_violations_kernel (VIOL_BLOCK, violation_kernels.cuh)
+VIOL_BLOCK = 256
+
+
 @requires_gpu
 def test_truncation_ties_keep_scan_order(ieee14_grid, ieee14_base_case, solver_atol, residual_atol):
     """Equal severities are kept, and ranked, in scan order. A 0 kA limit
@@ -422,7 +426,10 @@ def test_truncation_ties_keep_scan_order(ieee14_grid, ieee14_base_case, solver_a
     vmin = +inf a LOW_VOLTAGE one of exactly 1, so each type has a run of ties
     at the top, the other elements (finite margins) below it. With K inside
     the tie run the kept records are its first K in scan order; with K past
-    it, the whole run then the most severe of the rest."""
+    it, the whole run then the most severe of the rest -- K = 2 is inside every
+    type's run, the next K past the voltage runs only, the last past the CURRENT
+    run too. Every bus violates on every row, and a type is truncated exactly
+    when it has more than K records."""
     cont_branch_ids = [[0], [3], [5]]
     baseline, n_lines, _ = _build_solver(ieee14_grid, ieee14_base_case, cont_branch_ids,
                                          violation_tol=residual_atol)
@@ -457,8 +464,13 @@ def test_truncation_ties_keep_scan_order(ieee14_grid, ieee14_base_case, solver_a
 
     full = run(n_bus + 2 * n_branches)
     assert not full.get_violations_truncated().any()
-    n_ties = [len(odd[::2]), len(even[::2])]   # LOW, HIGH ties per row (every bus violates)
-    for K in (2, max(n_ties) + 2):
+    counts = full.get_violation_counts()
+    np.testing.assert_array_equal(counts["low_voltage"] + counts["high_voltage"], n_bus)   # every bus violates
+    n_ties = [len(odd[::2]), len(even[::2])]   # LOW, HIGH ties per row
+    n_current_ties = max(sum(1 for v in row if v.violation_type.name == "CURRENT" and v.limit == 0.)
+                         for row in full.get_violations())
+    assert n_current_ties > max(n_ties) + 2
+    for K in (2, max(n_ties) + 2, n_current_ties + 2):
         capped = run(K)
         for r, (all_rows, kept) in enumerate(zip(full.get_violations(), capped.get_violations())):
             assert all_rows, f"row {r} must converge with violations"
@@ -474,7 +486,8 @@ def test_truncation_ties_keep_scan_order(ieee14_grid, ieee14_base_case, solver_a
             np.testing.assert_array_equal([v.limit for v in kept], [v.limit for v in expected])
         for name, got in capped.get_violation_counts().items():
             np.testing.assert_array_equal(got, full.get_violation_counts()[name])
-        assert capped.get_violations_truncated().all()
+        over = np.max([counts[k] for k in ("low_voltage", "high_voltage", "current")], axis=0) > K
+        np.testing.assert_array_equal(capped.get_violations_truncated(), over)
 
 
 @pytest.fixture(scope="module")
@@ -505,8 +518,9 @@ def case300():
 def test_truncation_multi_tile_matches_numpy(case300, solver_atol, residual_atol):
     """A grid with more buses and branches than the kernel's block has
     threads: every row's uncapped records are compute_violations_n's on that
-    row's voltages (tripped branch excluded), in the documented order, and the
-    capped ones are their K most severe per type."""
+    row's voltages (tripped branch excluded) -- up to the elements within
+    rounding of their limit, which either may report -- in the documented
+    order, and the capped ones are their K most severe per type."""
     from conftest import branch_data_arrays
     from gpusim2grid.contingency_analysis._limit_violations import compute_violations_n
     grid, d = case300
@@ -517,11 +531,11 @@ def test_truncation_multi_tile_matches_numpy(case300, solver_atol, residual_atol
     baseline, _, _ = _build_solver(grid, d, cont_branch_ids, batch_size=4,
                                    violation_tol=violation_tol)
     n_branches = baseline._s.n_branches
-    assert n_branches > 256 and d["n_bus"] > 256
+    assert n_branches > VIOL_BLOCK and d["n_bus"] > VIOL_BLOCK
     baseline.run()
     n_bus = d["n_bus"]
     V = baseline.V_results.to_numpy().reshape(len(cont_branch_ids), n_bus)
-    assert np.all(np.isfinite(V)), "every row must converge for this test"
+    assert np.all(np.isfinite(V)) and np.all(baseline.converged()), "every row must converge for this test"
     vn_kv = grid.get_bus_vn_kv()
     vm_kv0 = np.abs(V[0]) * vn_kv
 
@@ -554,8 +568,17 @@ def test_truncation_multi_tile_matches_numpy(case300, solver_atol, residual_atol
         ref = {_record_key(v): v for v in ref}
         got = {_record_key(v): v for v in all_rows}
         assert len(got) == len(all_rows)
-        # nothing within rounding of its limit, so the two sets are the same
-        assert set(got) == set(ref), f"row {r}"
+        # an element within rounding of its limit may be on either side: what violates
+        # limits tightened by m is reported, what is reported violates limits loosened by m
+        m = 10. * solver_atol
+        strict = {_record_key(v) for v in compute_violations_n(
+            V[r], vn_kv, bus_vmin_kv * (1. + m), bus_vmax_kv * (1. - m), *branch_data[:6],
+            a1 * (1. - m), a2 * (1. - m), sn_mva, n_lines)}
+        loose = {_record_key(v) for v in compute_violations_n(
+            V[r], vn_kv, bus_vmin_kv * (1. - m), bus_vmax_kv * (1. + m), *branch_data[:6],
+            a1 * (1. + m), a2 * (1. + m), sn_mva, n_lines)}
+        assert strict <= set(got) <= loose, f"row {r}"
+        ref = {k: v for k, v in ref.items() if k in got}
         for k, v in got.items():
             # a branch current is a difference of two products: FP32 loses digits there
             np.testing.assert_allclose(v.value, ref[k].value, rtol=solver_atol, atol=solver_atol)

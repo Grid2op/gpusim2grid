@@ -47,7 +47,7 @@
 //              solve and the iterative refinement (ir_n_steps) are
 //              own_lu::BatchedLu's. matching_alg / pivot_epsilon_alg do not
 //              apply; GPUSIM2GRID_OWN_LU_EPS: the relative pivot clamp (default
-//              1e-12). Behaves as Uniform otherwise (bind_slice, continuous
+//              own_lu::default_pivot_eps(): 1e-12, 1e-5 in FP32). Behaves as Uniform otherwise (bind_slice, continuous
 //              scheduling); the continuous tail runs on its active prefix
 //              (set_active_count), not on a second handle. Refused with the
 //              two variables above.
@@ -235,7 +235,8 @@ struct CudssBatchSolver {
     // docs/dev_notes/batched_lu_and_constrained_ordering.md): every handle writes
     // its skeleton, its permutations (user, and cuDSS's own after ANALYSIS) and the
     // J values of its first GPUSIM2GRID_DUMP_J_MAX (default 8) factorizations, as
-    // raw little-endian files <dir>/h<k>_*.{i32,f64} + h<k>_meta.txt.
+    // raw little-endian files <dir>/h<k>_*.{i32,f64} (.f32 for the values of an
+    // FP32 build) + h<k>_meta.txt.
     std::string dump_dir_;
     int dump_id_ = -1, dump_count_ = 0, dump_max_ = 8;
     int* d_J_outer_ = nullptr; int* d_J_inner_ = nullptr;
@@ -296,9 +297,7 @@ struct CudssBatchSolver {
                 throw std::invalid_argument(
                     "linear_solver='own_lu' cannot be combined with GPUSIM2GRID_USE_BLOCKDIAG / "
                     "GPUSIM2GRID_USE_BATCH_MODE");
-            if (matching_alg != MatchingAlg::None)
-                throw std::invalid_argument(
-                    "linear_solver='own_lu' does not pivot: matching_alg must be 'none'");
+            own_lu::check_config(reordering_alg, matching_alg);
             mode_ = CudssBatchMode::OwnLu;
         }
         cs_     = cs;
@@ -345,9 +344,12 @@ struct CudssBatchSolver {
         t_context_init_ms_ = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_ctx_start).count();
 
+        // every mode named, no default: a new CudssBatchMode must be handled here
+        // (-Wswitch), not silently set up as Uniform
         switch (mode_) {
+        case CudssBatchMode::OwnLu:   // returned above: no cuDSS object
+            throw std::logic_error("[CudssBatchSolver::initialize] own LU reached the cuDSS setup");
         case CudssBatchMode::Uniform:
-        default:
             dss_A_.create_csr(dim_J, nnz_J, d_J_outer, d_J_inner, d_J_values_batch);
             dss_x_.create_dn(dim_J, d_dx_batch);
             dss_b_.create_dn(dim_J, d_F_batch);
@@ -549,6 +551,13 @@ struct CudssBatchSolver {
         npivots_entries_ = static_cast<int>(n);
     }
     int npivots_entries() const { return npivots_entries_; }
+    // Restart the pivot counters (BatchPfDriver::solve: they are a run's, not the handle's life)
+    void reset_pivot_counts()
+    {
+        factor_stats_.npivots_total = -1;
+        factor_stats_.npivots_max   = -1;
+        factor_stats_.npivots_reads = 0;
+    }
 
     const CudssFactorStats& factor_stats() const { return factor_stats_; }
 
@@ -688,7 +697,7 @@ private:
         cudaMemcpy(ip.data(), d_J_outer_, ip.size() * sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(ix.data(), d_J_inner_, ix.size() * sizeof(int), cudaMemcpyDeviceToHost);
         user_perm_ = perm ? *perm : own_lu::amd_order(dim_J_, ip, ix);
-        double eps = 1e-12;
+        double eps = own_lu::default_pivot_eps();
         if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_EPS")) eps = std::atof(e);
         own_.init(own_lu::build_lu_plan(dim_J_, ip, ix, user_perm_), ubatch_, cs_, eps);
     }
@@ -740,7 +749,9 @@ private:
         cudaStreamSynchronize(cs_);
         std::vector<cuda_real_type> h(static_cast<size_t>(ubatch_) * nnz_J_);
         cudaMemcpy(h.data(), d_values_cur_, h.size() * sizeof(cuda_real_type), cudaMemcpyDeviceToHost);
-        _dump_raw("vals_" + std::to_string(dump_count_++) + ".f64", h.data(), h.size());
+        // named by what is written: the build's real type (FP32 writes 4-byte floats)
+        _dump_raw("vals_" + std::to_string(dump_count_++) + (sizeof(cuda_real_type) == 4 ? ".f32" : ".f64"),
+                  h.data(), h.size());
     }
 
     static const void* const* raw_ptrs(thrust::device_vector<void*>& v)

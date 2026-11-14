@@ -27,6 +27,8 @@ PV→PQ relabelling without changing the Jacobian pattern).
 
 import numpy as np
 
+from ..contingency_analysis._scheduling import check_linear_solver_args
+
 from . import (
     LimitViolationsFacadeMixin,
     PhysicalChecksFacadeMixin,
@@ -222,6 +224,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  reference_slack="auto", scheduling=None, nb_iter_per_round=1,
                  tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
         self._outer_loops = bool(outer_loops)
         if scheduling is None:
             scheduling = "continuous" if self._outer_loops else "chunked"

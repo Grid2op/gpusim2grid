@@ -373,7 +373,7 @@ def test_tol_above_violation_tol_warns(case14):
 # =============================================================================
 def test_scenario_sweep_reload_hygiene(case14, solver_atol):
     """Plain rows, a branch trip, an island solved on its main component, a
-    generator contingency (bus released PV -> PQ, slack re-weighted) and gen_v
+    generator contingency (bus released PV -> PQ) and gen_v
     overrides, interleaved and cycled through 1 and 2 slots: every row is the
     chunked one."""
     from gpusim2grid import ScenarioSweepGPU
@@ -470,10 +470,14 @@ def test_reactive_limits_outer_loop_continuous(solver_atol):
     if not is_fp32:
         _assert_same_records(ca_k.get_physical_violations(), ca_ref.get_physical_violations(),
                              rtol=solver_atol)
-    # a re-solved row reports its second pass' outcome
+    # a re-solved row reports its second pass' outcome: the second pass' rows are the
+    # re-solved and diverged ones, in order (none left out in continuous mode)
     np.testing.assert_array_equal(ca_k.get_row_status(), CONVERGED)
-    rec = st_k == ReactiveLimitsStatus.RECOMPUTED
-    assert np.all(ca_k.get_row_iterations()[rec] >= 1)
+    run_rows = np.flatnonzero((st_k == ReactiveLimitsStatus.RECOMPUTED) | (st_k == ReactiveLimitsStatus.DIVERGED))
+    it2 = np.asarray(ca_k._rl_sweep.get_row_iterations())
+    assert it2.shape == run_rows.shape
+    ok = st_k[run_rows] == ReactiveLimitsStatus.RECOMPUTED
+    np.testing.assert_array_equal(ca_k.get_row_iterations()[run_rows[ok]], it2[ok])
 
 
 # =============================================================================

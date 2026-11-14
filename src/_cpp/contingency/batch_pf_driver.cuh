@@ -629,7 +629,7 @@ struct BatchPfDriver {
     const std::vector<int>* _solver_perm() const
     {
         return linear_solver_kind_ == LinearSolver::OwnLu ? &base.own_lu_perm(reordering_alg_)
-                                                           : base.user_perm_or_null();
+                                                           : base.user_perm(reordering_alg_);
     }
 
     // -------------------------------------------------------------------------

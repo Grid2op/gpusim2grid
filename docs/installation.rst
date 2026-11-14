@@ -141,6 +141,11 @@ Precision is chosen at **build time**. The default is FP64 (double).
 Equivalently, pass ``-DUSE_FLOAT_PRECISION=ON`` to CMake. Query the compiled
 precision at runtime with :func:`gpusim2grid.compilation_options.is_fp32`.
 
+FP32 is faster but less accurate: its default ``tol`` is ``1e-3`` per unit
+(``1e-8`` in FP64). Avoid it with ``outer_loops=True``: the loops then
+decide on states lightsim2grid's double-precision solve does not reach (see
+:ref:`the outer loops <outer-loops>`).
+
 Building the documentation
 --------------------------
 

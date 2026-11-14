@@ -289,13 +289,14 @@ struct SlotState {
     // and on which side, those the row's lost-power share put at a bound
     bool ds_in_newton = false;
     std::vector<char> ds_parked, ds_parked_high, ds_lost_sat;
-    // ds_parked and ds_current_mw as the last Newton solve had them, what its Jacobian (and so
-    // the adjoint) holds: a check parking a unit with too small a move to re-solve changes
-    // ds_parked for no solve
+    bool ds_lost_high = false;
+    // ds_parked and ds_current_mw as the last Newton solve had them, which its Jacobian (and so
+    // the adjoint, adjoint_info) holds: a check that parks a unit with too small a move to
+    // re-solve changes ds_parked for no solve (DistributedSlackLoop::solved_parked_ / solved_mw_);
+    // kept only when gradients are wanted (keep_adjoint_)
     std::vector<char> ds_solved_parked;
     std::vector<double> ds_solved_mw;
     void ds_mark_solved() { ds_solved_parked = ds_parked; ds_solved_mw = ds_current_mw; }
-    bool ds_lost_high = false;
     // the last solve's slack_absorbed, and whether its units took it (OuterLoopAlgo::
     // _fold_slack_share: then the mismatch keeps `+ slack_absorbed * weight`); the target Q
     // the share moved, which that solve did not see (OuterInjections::unsolved_q_mvar)
@@ -3125,11 +3126,13 @@ void Ls2gOuterModel::adjoint_info(const SlotState& st, RowResult& r) const
     };
     // DistributedSlackLoop::_adjoint_terms: a generator parked at a bound sits there whatever
     // its set-point -- unless that bound is its own set-point (one already beyond a limit). Its
-    // own: from before the row's lost-power share (ds_initial_mw) -- a unit that share put at
-    // its bound is held there too. As the last Newton solve had them: a unit parked by a check
-    // that did not re-solve still shared the slack in that solve
+    // own: from before the row's lost-power share, which moves the initial targets the loop
+    // starts from (injection_mw) -- a unit that share put at its bound is held there too.
+    // As the last Newton solve had them: a unit parked by a check that did not re-solve still
+    // shared the slack in that solve
     if (st.ds_in_newton)
-        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_solved_parked.size() && k < st.ds_initial_mw.size(); ++k) {
+        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_solved_parked.size() &&
+                           k < st.ds_solved_mw.size() && k < st.ds_initial_mw.size(); ++k) {
             const auto& u = st.ds_units[k];
             if (!st.ds_solved_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
             if (st.ds_solved_mw[k] == st.ds_initial_mw[k]) continue;

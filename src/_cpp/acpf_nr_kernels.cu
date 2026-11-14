@@ -312,12 +312,12 @@ __global__ void mask_V_nan_kernel(
 __global__ void zero_branch_flows_kernel(
           cuda_real_type* __restrict__ d_or_amps,
           cuda_real_type* __restrict__ d_ex_amps,
-    const int*           __restrict__ d_zero_indices,
-    int n_entries)
+    const long long*     __restrict__ d_zero_indices,
+    long long n_entries)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n_entries) return;
-    const int idx = d_zero_indices[i];
+    const long long idx = d_zero_indices[i];
     d_or_amps[idx] = cuda_real_type(0);
     d_ex_amps[idx] = cuda_real_type(0);
 }
