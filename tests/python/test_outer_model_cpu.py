@@ -191,16 +191,20 @@ def test_row_masking_a_voltage_controlled_bus(load_scale):
     """A row whose contingency strands bus 7 and its regulating generator
     (handle_disconnected_grid masks the bus): the model builds no plan for it,
     it filters the grid's ReactiveLimits plan (ls2g_outer_model.cpp's
-    rl_plan_masked). The row must end where lightsim2grid's single solve of the
-    grid without that trafo, generator and bus ends, with the same decisions.
+    rl_plan_masked). The row (its loads scaled by `load_scale`, which brings more
+    ReactiveLimits switches) must end where lightsim2grid's single solve of the grid
+    without that trafo, generator and bus ends: same decisions (compared as sets per
+    outer iteration, lightsim2grid's buses moved to the base's solver numbering), outer
+    iterations, status and V.
 
     A load on bus 7 makes the test bite: masking zeroes a bus' equations, not its
     Sbus, so the device still gathers that load there, and a plan keeping the
-    masked bus would read its generator past its limit and switch it."""
+    masked bus would read its generator past its limit and switch it -- no decision may
+    name the masked bus."""
     TRAFO, GEN, BUS = 3, 3, 7                     # trafo 6-7, the generator on bus 7
     extra_load = (BUS, 0., 30.)                   # beyond the generator's 15 MVAr
     base = _case14(distributed=False, extra_load=extra_load)
-    base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    assert base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
     to_base = np.asarray(base.id_me_to_ac_solver(), dtype=int)
     masked = int(to_base[BUS])
     h = _cpp._OuterModelHarness(base, keep_trace=True)
@@ -229,10 +233,10 @@ def test_row_masking_a_voltage_controlled_bus(load_scale):
     V, status = _run_row(h, 0, Ybus, Sbus_row, ref, masked=(masked,))
     res = h.row_result(0)
     msg = "\n".join(res.decisions) + "\n---- lightsim2grid\n" + "\n".join(str(d) for d in stats.decisions)
-    # the same decisions, in the same order (loop, outer iteration, action, element)
-    ours = [d.split(", value=")[0] for d in res.decisions]
-    ref_decisions = [str(d)[len("OuterDecision("):].split(", value=")[0] for d in stats.decisions]
-    assert ours == ref_decisions, msg
+    # the same decisions (loop, outer iteration, action, taken, element), each outer
+    # iteration's as a set: the order the two sides list them in means nothing
+    assert _decision_keys(res.decisions) == _decision_keys(stats.decisions, grid=base), msg
+    assert all(k[4] != masked for k in _decision_keys(res.decisions)), msg
     assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
     assert int(res.status) == int(stats.status), msg
     assert V_ref.size > 0 and status == CONVERGED, msg

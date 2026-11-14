@@ -3402,7 +3402,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 h.model->set_row_overrides(std::move(ov));
             }, pybind11::arg("branch_off"), pybind11::arg("masked") = std::vector<std::vector<int>>{},
             "per row, the branches it opens (lines then trafos) and, optionally, the solver buses "
-            "handle_disconnected_grid masks")
+            "handle_disconnected_grid masks. Replaces ALL the rows' overrides (generators off, "
+            "gen_v, lost power... are cleared): call it before begin().")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;

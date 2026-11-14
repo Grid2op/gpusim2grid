@@ -62,7 +62,7 @@ def test_lu_nnz_grows_with_fill_in():
 
 
 @pytest.mark.parametrize("n_groups", [2, 5])
-def test_benchmark_raw_cycles_one_handle_over_groups(n_groups, solver_atol):
+def test_benchmark_raw_cycles_one_handle_over_groups(n_groups, residual_atol):
     # one handle of 3 matrices pointed at each slice in turn (bind_slice), as
     # the continuous tail does; slice g's rhs is (g + 1)·A·1: a slice solved
     # against another's data, or left unsolved, fails the residual check
@@ -73,12 +73,12 @@ def test_benchmark_raw_cycles_one_handle_over_groups(n_groups, solver_atol):
         3, 2, n_groups=n_groups)
     assert r.n_groups == n_groups
     assert r.n_nonfinite_slots == 0
-    assert r.max_rel_residual < solver_atol
+    assert r.max_rel_residual < residual_atol
     assert r.group_cycle_ms > 0.0
 
 
 @pytest.mark.parametrize("launch", ["serial", "streams", "threads"])
-def test_benchmark_raw_independent_handles(launch, solver_atol):
+def test_benchmark_raw_independent_handles(launch, residual_atol):
     # handle h solves slice h, whose rhs is (h + 1)·A·1: a handle solving
     # another's slice, or a slice left unsolved, fails the residual check
     from gpusim2grid import _gpusim2grid as _c
@@ -88,11 +88,13 @@ def test_benchmark_raw_independent_handles(launch, solver_atol):
         3, 2, n_handles=4, handle_launch=launch)
     assert r.n_handles == 4 and r.handle_launch == launch
     assert r.n_nonfinite_slots == 0
-    assert r.max_rel_residual < solver_atol
+    assert r.max_rel_residual < residual_atol
     assert r.handle_round_ms > 0.0 and r.handle_setup_ms > 0.0
 
 
-def test_benchmark_raw_handles_and_groups_are_exclusive():
+def test_benchmark_raw_handle_options_are_validated():
+    """n_groups and n_handles cannot be combined, and handle_launch must be one of
+    'serial' / 'streams' / 'threads'."""
     from gpusim2grid import _gpusim2grid as _c
     A = _random_system()
     args = (A.shape[0], A.indptr.tolist(), A.indices.tolist(), A.data.tolist(), 2, 1)

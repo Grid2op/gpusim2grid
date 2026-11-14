@@ -709,7 +709,7 @@ def test_gen_tripped_next_to_another_regulator_keeps_the_bus_pv(kind, solver_ato
     assert V_ref.shape[0] > 0
     assert abs(V_ref[bus]) == pytest.approx(vm, abs=solver_atol)
 
-    ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10)   # (the precision's default tol_base)
     ca.add_contingency_gen(gen_id)
     ca.compute(batch_size=1)
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)

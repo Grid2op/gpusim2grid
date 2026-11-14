@@ -460,10 +460,12 @@ def _case14_remote_controller(max_realistic_voltage):
 
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_contingency_analysis_robust_mode_releases_remote_controller(init_from_n):
-    """The ReactiveLimits loop's robust mode, its band read off the driver (the loop's own
-    parameters left at their defaults): a remote controller within its reactive limits but
-    whose own bus is unrealistic stops regulating (PV_TO_PQ_UNREALISTIC) on every row, as in
-    lightsim2grid's batch"""
+    """The ReactiveLimits loop's robust mode, its realistic band read off the driver (only the
+    driver's max_realistic_voltage is set, the loop's own parameters stay at their defaults):
+    a remote controller within its reactive limits but whose own bus is unrealistic stops
+    regulating (PV_TO_PQ_UNREALISTIC). Started from the grid's targets, most converged rows
+    release it; resumed from the "n" solve, that solve released it and no row does it again.
+    Every row matches lightsim2grid's batch (status, outer iterations, V)."""
     from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
     from gpusim2grid import ContingencyAnalysisGPU
     if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
@@ -494,18 +496,25 @@ def test_contingency_analysis_robust_mode_releases_remote_controller(init_from_n
         assert (status[i] == CONVERGED) == bool(conv[i]), msg
         if not conv[i]:
             continue
-        # resumed from the "n" solve, the controller is already released there
-        nb_released += init_from_n or any("PV_TO_PQ_UNREALISTIC" in d for d in res[i].decisions)
+        nb_released += any("PV_TO_PQ_UNREALISTIC" in d for d in res[i].decisions)
         assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
         fin = np.isfinite(V[i])
         np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=1e-8, err_msg=msg)
-    assert nb_released > 0
+    if init_from_n:
+        # the "n" solve released it: the rows resume from there and never decide it again
+        stats = grid.get_algo().get_outer_loop_stats()
+        assert any("PV_TO_PQ_UNREALISTIC" in str(d) for d in stats.decisions)
+        assert nb_released == 0
+    else:
+        assert nb_released > conv.sum() // 2
 
 
 def test_contingency_analysis_outer_failure_is_divergence():
     """A row the outer loops reject (here UNREALISTIC: the realistic band just under the
-    base case's lowest voltage) solved its last inner powerflow, but get_violations gives
-    it one GRID/DIVERGENCE entry, value = limit = nan, as lightsim2grid's batch does"""
+    base case's lowest voltage; OUTER_FAILED / OUTER_UNSTABLE take the same path) solved its
+    last inner powerflow, but get_violations gives it one GRID/DIVERGENCE entry, value =
+    limit = nan, as lightsim2grid's batch does -- and no violation counted, no truncation,
+    not converged(), though its last state is above every bus limit"""
     from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
     from gpusim2grid import ContingencyAnalysisGPU
     from gpusim2grid.contingency_analysis import LimitViolationType, ViolationElementType
@@ -520,8 +529,10 @@ def test_contingency_analysis_outer_failure_is_divergence():
     batch.handle_disconnected_grid = True
     batch.add_all_n1()
     batch.compute(_v_batch(grid, False), MAX_IT, TOL_MVA)
+    # both sides start from the grid's targets (lightsim2grid's default init_from_n_powerflow)
     ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, handle_disconnected_grid=True,
-                                compute_limit_violations=True, tol=TOL_MVA / grid.get_sn_mva())
+                                compute_limit_violations=True, init_from_n_powerflow=False,
+                                tol=TOL_MVA / grid.get_sn_mva())
     # every bus above its limit: the last state of a rejected row would report them all
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     vn = np.asarray(grid.get_bus_vn_kv(), dtype=float)[buses]
@@ -1196,6 +1207,9 @@ def test_contingency_analysis_redistribute_slack(init_from_n):
     leaf_trafo = [n_line + el.id for el in grid.get_trafos() if 7 in (el.bus1_id, el.bus2_id)]
     leaf_lines = [el.id for el in grid.get_lines() if 13 in (el.bus1_id, el.bus2_id)]
     gen_40mw = [el.id for el in grid.get_generators() if el.target_p_mw > 0. and not el.is_slack]
+    assert len(gen_40mw) == 1
+    gen_bus8 = [el.id for el in grid.get_generators() if el.bus_id == 7]
+    assert len(gen_bus8) == 1
     ctgs = [(leaf_trafo, [], [], []), (leaf_lines, [], [], []), ([], [], [], gen_40mw), ([], [], [3], []),
             ([0], [], [], [])]
     loses_p = [init_from_n, True, True, True, False]
@@ -1229,6 +1243,11 @@ def test_contingency_analysis_redistribute_slack(init_from_n):
         k = row_ls[key(ctg)]
         msg = f"contingency {ctg}: " + "\n".join(res[i].decisions)
         assert any("SHARE_LOST_P" in d for d in res[i].decisions) == loses_p[i], msg
+        # shared before the first solve: at outer iteration #0
+        assert all(d.startswith("DistributedSlack #0 ") for d in res[i].decisions if "SHARE_LOST_P" in d), msg
+        if i == 0 and not init_from_n:
+            # the generator islanded on bus 8 takes no share (resumed, it keeps the "n" target)
+            assert gen_bus8[0] not in dict(res[i].gen_target_p), msg
         assert (status[i] == CONVERGED) == bool(conv[k]), msg
         assert res[i].nb_outer_iterations == res_ls[k].nb_outer_iterations, msg
         if conv[k]:
@@ -1288,6 +1307,8 @@ def test_scenario_sweep_redistribute_slack(init_from_n):
     for i in range(n_rows):
         msg = f"row {i}: " + "\n".join(res[i].decisions)
         assert any("SHARE_LOST_P" in d for d in res[i].decisions) == loses_p[i], msg
+        # shared before the first solve: at outer iteration #0
+        assert all(d.startswith("DistributedSlack #0 ") for d in res[i].decisions if "SHARE_LOST_P" in d), msg
         assert (status[i] == CONVERGED) == bool(conv[i]), msg
         assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
         if conv[i]:
