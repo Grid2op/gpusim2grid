@@ -1035,14 +1035,38 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             n_grp = pf._vc_v_row.numel()
             pq = torch.zeros(V.shape, dtype=torch.bool, device=dev)
             lost = torch.zeros(V.shape[0], n_grp, dtype=torch.bool, device=dev)
-            fixed, slopes = [], []
+            # gathered on the host, uploaded once each (not one copy and scatter per row)
+            pq_r, pq_b, lost_r, lost_g, fix_r, fix_g = [], [], [], [], [], []
+            sl_r, sl_g, sl_row, sl_c = [], [], [], []
             for r, rr in enumerate(res):
-                if rr.pq_buses:
-                    pq[r, torch.as_tensor(list(rr.pq_buses), device=dev)] = True
-                if rr.vset_lost_groups and n_grp:
-                    lost[r, torch.as_tensor(list(rr.vset_lost_groups), device=dev)] = True
-                fixed.extend((r, g) for g in rr.gen_p_fixed)
-                slopes.extend((r, g, row, c) for g, row, c in rr.gen_p_slope)
+                b = rr.pq_buses
+                if b:
+                    pq_r.extend([r] * len(b))
+                    pq_b.extend(b)
+                gl = rr.vset_lost_groups
+                if gl and n_grp:
+                    lost_r.extend([r] * len(gl))
+                    lost_g.extend(gl)
+                gf = rr.gen_p_fixed
+                if gf:
+                    fix_r.extend([r] * len(gf))
+                    fix_g.extend(gf)
+                for g, row, c in rr.gen_p_slope:
+                    sl_r.append(r)
+                    sl_g.append(g)
+                    sl_row.append(row)
+                    sl_c.append(c)
+
+            def _idx(x):
+                return torch.as_tensor(np.asarray(x, dtype=np.int64), device=dev)
+            if pq_r:
+                pq[_idx(pq_r), _idx(pq_b)] = True
+            if lost_r:
+                lost[_idx(lost_r), _idx(lost_g)] = True
+            fixed = (_idx(fix_r), _idx(fix_g)) if fix_r else None
+            slopes = ((_idx(sl_r), _idx(sl_g), _idx(sl_row),
+                       torch.as_tensor(np.asarray(sl_c, dtype=np.float64), dtype=pf._rdtype, device=dev))
+                      if sl_r else None)
             ctx.outer = (pq, lost, fixed, slopes)
 
         ctx.pf = pf
@@ -1180,12 +1204,16 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             _, _, fixed, slopes = ctx.outer
             grad_gen_p = torch.zeros(n_scen, pf.n_gen, dtype=rdtype, device=dev)
             inv_sn = 1.0 / pf.sn_mva
-            for r, g in fixed:
-                bus = int(pf._gen_bus_all[g])
-                pr = int(p_row[bus]) if bus >= 0 else -1
-                if pr >= 0:
-                    grad_gen_p[r, g] -= lam[r, pr] * inv_sn
-            for r, g, row, coeff in slopes:
-                grad_gen_p[r, g] += lam[r, row] * coeff
+            # on the device in one go each (repeated (row, gen) pairs add up)
+            if fixed is not None:
+                r_t, g_t = fixed
+                bus = pf._gen_bus_all[g_t]
+                pr = torch.where(bus >= 0, p_row[bus.clamp(min=0)], torch.full_like(bus, -1))
+                ok = pr >= 0
+                r_t, g_t, pr = r_t[ok], g_t[ok], pr[ok]
+                grad_gen_p.index_put_((r_t, g_t), -lam[r_t, pr].to(rdtype) * inv_sn, accumulate=True)
+            if slopes is not None:
+                r_t, g_t, row_t, c_t = slopes
+                grad_gen_p.index_put_((r_t, g_t), lam[r_t, row_t].to(rdtype) * c_t, accumulate=True)
 
         return grad_P, grad_Q, grad_gen_v, grad_gen_p, None
