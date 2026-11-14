@@ -33,11 +33,11 @@ N_SCEN = 4
 TOL_MVA = 1e-10
 
 
-def _grid(distributed=False, init_from_n=False):
+def _grid(distributed=False, init_from_n=False, reactive_limits=True, moved_fraction=None):
     """lightsim2grid's test grid: case14 short of reactive power (ReactiveLimits switches buses
     PQ), its only loop -- with `distributed`, the slack shared in the Newton (NROuterDist_KLU)
     with DistributedSlack, the first generator capped just above its target, so that the
-    Newton's share parks it there"""
+    Newton's share parks it there; `moved_fraction` is DistributedSlack's"""
     import pandapower.networks as pn
     from lightsim2grid.network import init_from_pandapower
     from lightsim2grid.algorithm import ReactiveLimits, DistributedSlack
@@ -54,9 +54,11 @@ def _grid(distributed=False, init_from_n=False):
         p_max[0] = float(grid.get_gen_target_p()[0]) + 1.
     grid.set_gen_p_limits(np.zeros(nb_gen), p_max)
     grid.clear_outer_loops()
-    grid.add_outer_loop(ReactiveLimits())
+    if reactive_limits:
+        grid.add_outer_loop(ReactiveLimits())
     if distributed:
-        grid.add_outer_loop(DistributedSlack())
+        grid.add_outer_loop(DistributedSlack() if moved_fraction is None
+                            else DistributedSlack(moved_fraction=moved_fraction))
     grid.change_algorithm("NROuterDist_KLU" if distributed else "NROuter_KLU")
     assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), 30, TOL_MVA).size > 0
     return grid
@@ -161,6 +163,29 @@ def test_distributed_slack_in_the_newton():
         else:
             assert abs(grads["gen_p"][r, 0]) > 1e-4
     _check_all(pf, inputs, grads, names=("load_p", "gen_p"))
+
+
+def test_distributed_slack_parked_at_the_last_check():
+    """NROuterDist_*: a unit DistributedSlack parks at a check whose move is too small to
+    re-solve (below moved_fraction * p_residue_eps_mw) still shared the slack in the last
+    Newton, whose Jacobian the backward reads: its gen_p reaches the voltages as every other
+    unit's does (lightsim2grid 46897582, TestGridPowerFlowParkedAtTheLastCheck)"""
+    grid = _grid(distributed=True, reactive_limits=False, moved_fraction=1e9)
+    pf = _pf(grid)
+    inputs = _inputs(grid, zero_gen_p_to=5.)
+    cap = float(grid.get_gen_target_p()[0]) + 1.
+    rows = [r for r in range(N_SCEN) if inputs["gen_p"][r, 0] < cap]
+    assert rows
+    V, grads = _grads(pf, inputs)
+    assert torch.isfinite(V).all()
+    res = pf.sweep.get_outer_results()
+    for r in rows:
+        msg = "\n".join(res[r].decisions)
+        assert any("PARK" in d and "element 0," in d for d in res[r].decisions), msg
+        assert res[r].nb_outer_iterations == 0, msg
+        # parked by a check no solve followed: not held at its bound in the gradient
+        assert 0 not in res[r].gen_p_fixed, msg
+    _check_all(pf, inputs, grads, names=("gen_p",))
 
 
 def test_generator_contingency():

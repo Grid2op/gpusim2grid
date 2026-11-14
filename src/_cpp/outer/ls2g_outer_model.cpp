@@ -157,6 +157,11 @@ struct SlotState {
     bool ds_in_newton = false;
     std::vector<char> ds_parked, ds_parked_high, ds_lost_sat;
     bool ds_lost_high = false;
+    // ds_parked and ds_current_mw as the last Newton solve had them, which its Jacobian (and so
+    // the adjoint, adjoint_info) holds: a check that parks a unit with too small a move to
+    // re-solve changes ds_parked for no solve (DistributedSlackLoop::solved_parked_ / solved_mw_)
+    std::vector<char> ds_solved_parked;
+    std::vector<double> ds_solved_mw;
     // the last solve's slack_absorbed, and whether its units took it (OuterLoopAlgo::
     // _fold_slack_share: then the mismatch keeps `+ slack_absorbed * weight`); the target Q
     // the share moved, which that solve did not see (OuterInjections::unsolved_q_mvar)
@@ -398,6 +403,8 @@ private:
     // correction included): V.conj(Ybus.V) - Sbus + the droop flows - the controllers' Q
     cplx mis_bus(const SlotState& st, const RowView& rv, const SlotControls& c, int b) const;
     void materialize(SlotState& st) const;
+    // DistributedSlackLoop::_mark_solved
+    static void ds_mark_solved(SlotState& st) { st.ds_solved_parked = st.ds_parked; st.ds_solved_mw = st.ds_current_mw; }
 
     // the loops
     void init_loops(SlotState& st) const;
@@ -1149,6 +1156,7 @@ void Ls2gOuterModel::init_loops(SlotState& st) const
                         st.ds_parked_high[k] = st.ds_lost_high ? 1 : 0;
                     }
                 }
+                ds_mark_solved(st);   // the first solve runs with these
                 break;
             }
             case Kind::HvdcLimits:
@@ -1636,6 +1644,9 @@ int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const R
         st.ds_current_mw[k] = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR
             ? gen_in_force(st, u.el_id) : -sto_in_force(st, u.el_id);
     }
+    // the solve just checked ran with the units parked as the last check left them: the driver
+    // checks this loop again only after a solve
+    ds_mark_solved(st);
     // the same cumulative sharing from the initial targets as around a single-slack Newton;
     // what the reference bus kept is not nothing only when every unit is parked
     double mismatch = mis_bus(st, rv, st.ctl, slack_bus_).real() * sn_;
@@ -1678,6 +1689,8 @@ int Ls2gOuterModel::check_ds_in_newton(SlotState& st, const LoopDecl& L, const R
         record(st, L.name, "TARGET_Q_FOLLOWED", true, -1, unsolved_q, threshold);
         unstable = true;
     }
+    // the re-solve asked for runs with the units as this check left them
+    if (unstable) ds_mark_solved(st);
     return unstable ? UNSTABLE : STABLE;
 }
 
@@ -2667,12 +2680,15 @@ void Ls2gOuterModel::adjoint_info(const SlotState& st, RowResult& r) const
     // DistributedSlackLoop::_adjoint_terms: a generator parked at a bound sits there whatever
     // its set-point -- unless that bound is its own set-point (one already beyond a limit). Its
     // own: from before the row's lost-power share, which moves the initial targets the loop
-    // starts from (injection_mw) -- a unit that share put at its bound is held there too
+    // starts from (injection_mw) -- a unit that share put at its bound is held there too.
+    // As the last Newton solve had them: a unit parked by a check that did not re-solve still
+    // shared the slack in that solve
     if (st.ds_in_newton)
-        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_parked.size() && k < st.ds_initial_mw.size(); ++k) {
+        for (size_t k = 0; k < st.ds_units.size() && k < st.ds_solved_parked.size() &&
+                           k < st.ds_solved_mw.size() && k < st.ds_initial_mw.size(); ++k) {
             const auto& u = st.ds_units[k];
-            if (!st.ds_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
-            if (st.ds_current_mw[k] == st.ds_initial_mw[k]) continue;
+            if (!st.ds_solved_parked[k] || u.kind != ls2g::slack_redistribution::UnitKind::GENERATOR) continue;
+            if (st.ds_solved_mw[k] == st.ds_initial_mw[k]) continue;
             r.gen_p_fixed.push_back(u.el_id);
         }
     // ReactiveLimitsLoop::_adjoint_terms (OuterLoopAlgo::get_adjoint_solve_info: a unit whose P
