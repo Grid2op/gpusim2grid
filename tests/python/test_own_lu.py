@@ -337,3 +337,37 @@ def test_batch_power_flow_gradient(ieee14_base_case):
     coords = [("load_p", (0, 2)), ("load_p", (1, 5)), ("load_q", (2, 4)),
               ("gen_p", (1, 1)), ("gen_v", (0, 1)), ("gen_v", (2, 1))]
     _fd_check(pf, load_p, load_q, gen_p, gen_v, line_status, coords)
+
+
+def test_mutated_reordering_alg_gets_its_own_order(monkeypatch):
+    """reordering_alg is mutable: a session built with 'ls2g_constrained' and
+    switched to 'ls2g_constrained_minfill' (own LU) must solve with the
+    minimum-fill order, as a session built with it does, not with the order the
+    base state computed for its construction value. Read through the LU fill
+    (AMD and MinFill differ on this grid). The cuDSS side: switched back to
+    'default', cuDSS must get no user permutation at all."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    grid = _ieee118_outer(False)
+    sn = grid.get_sn_mva()
+
+    def ca_(alg, solver):
+        ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=30, tol=1e-6 / sn,
+                                    reordering_alg=alg, linear_solver=solver)
+        ca.add_contingencies_by_branch_id([[0], [1], [2]])
+        return ca
+
+    fresh = ca_("ls2g_constrained_minfill", "own_lu")
+    fresh.compute(batch_size=3)
+    amd = ca_("ls2g_constrained", "own_lu")
+    amd.compute(batch_size=3)
+    assert fresh.timings.cudss_lu_nnz != amd.timings.cudss_lu_nnz   # the grid tells them apart
+    amd.reordering_alg = "ls2g_constrained_minfill"
+    amd.compute(batch_size=3)
+    assert amd.timings.cudss_lu_nnz == fresh.timings.cudss_lu_nnz
+
+    cu = ca_("ls2g_constrained", "cudss")
+    cu.compute(batch_size=3)
+    assert cu.timings.cudss_user_perm_honoured != -1
+    cu.reordering_alg = "default"
+    cu.compute(batch_size=3)
+    assert cu.timings.cudss_user_perm_honoured == -1

@@ -463,7 +463,7 @@ TailCalibration calibrate_tail_groups(
     PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, LinearSolver linear_solver)
 {
     const std::vector<int>* perm = linear_solver == LinearSolver::OwnLu
-        ? &base.own_lu_perm(reordering_alg) : base.user_perm_or_null();
+        ? &base.own_lu_perm(reordering_alg) : base.user_perm(reordering_alg);
     if (batch_size < 1 || group_size < 1 || n_repeat < 1)
         throw std::invalid_argument(
             "calibrate_tail_groups: batch_size, group_size and n_repeat must be >= 1");

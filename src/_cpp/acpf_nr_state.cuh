@@ -437,13 +437,13 @@ struct AcPfNrState {
     //   Sparsity pattern is FIXED across all NR iterations and contingencies.
     // -------------------------------------------------------------------------
     // Prototype (docs/dev_notes/batched_lu_and_constrained_ordering.md): with
-    // ReorderingAlg::Ls2gConstrained, lightsim2grid's constrained order of this
-    // state's J skeleton (ls2g_constrained_perm, user_ordering.hpp), which the
-    // batch solvers hand cuDSS as CUDSS_DATA_USER_PERM. Empty otherwise.
-    std::vector<int>                      h_user_perm;
-    const std::vector<int>* user_perm_or_null() const {
-        return h_user_perm.empty() ? nullptr : &h_user_perm;
-    }
+    // ReorderingAlg::Ls2gConstrained[Nd|MinFill], lightsim2grid's constrained
+    // order of this state's J skeleton (ls2g_constrained_perm, user_ordering.hpp),
+    // which the batch solvers hand cuDSS as CUDSS_DATA_USER_PERM; nullptr for
+    // any other alg. Keyed by the alg the caller (a driver) asks for, not the
+    // construction value: reordering_alg is mutable. Computed on first use.
+    const std::vector<int>* user_perm(ReorderingAlg alg) const;
+    mutable std::map<int, std::vector<int>> user_perms_;      // user_perm()'s cache
     // The batched LU of our own (linear_solver OwnLu) never pivots: its order
     // is chosen on the host by own_lu::choose_order (own_lu/lu_order.hpp) from
     // this state's J skeleton and, with a lightsim2grid grid, its ordering

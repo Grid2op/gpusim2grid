@@ -25,6 +25,8 @@ Change Log
   the forward that returned ``V`` (``taps_from=`` for a clone).
 - [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
   the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
+- [FIXED] ``reordering_alg`` changed after construction: the batch solvers get that algorithm's order (they kept
+  the construction value's lightsim2grid order, with cuDSS and the own LU alike).
 - [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
   the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its
