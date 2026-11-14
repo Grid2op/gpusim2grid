@@ -58,10 +58,11 @@ public:
     // values: [B × nnz] slot-major, the pattern of the plan's A (CSR order);
     // the first active() matrices are read.
     void factorize(const cuda_real_type* values);
-    // b, x: [B × n] slot-major. x may alias b.
+    // b, x: [B × n] slot-major. x may alias b (but then b is gone: no refine()).
     void solve(const cuda_real_type* b, cuda_real_type* x);
     // x += LU^-1 (b - A x), `steps` times; A = values on (indptr, indices),
-    // device CSR of the plan's pattern.
+    // device CSR of the plan's pattern. Needs b intact: x must not alias b
+    // (std::invalid_argument when steps > 0).
     void refine(const cuda_real_type* values, const int* indptr, const int* indices,
                 const cuda_real_type* b, cuda_real_type* x, int steps);
 
