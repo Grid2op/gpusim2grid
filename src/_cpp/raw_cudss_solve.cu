@@ -490,12 +490,11 @@ TailCalibration calibrate_tail_groups(
     int* inner = const_cast<int*>(thrust::raw_pointer_cast(base.d_J_inner.data()));
 
     using clk = std::chrono::steady_clock;
-    // one handle of B matrices on the first B systems: factorized once, then
-    // the mean of n_repeat REFACTORIZATION + SOLVE (b refilled untimed: cuDSS
-    // may use it as workspace). active > 0 (own LU): the same on the first
-    // `active` matrices of that handle (its active prefix, what the tail runs).
-    auto time_handle = [&](int B, int active) {
-        CudssBatchSolver solver;
+    // one handle of B matrices on the first B systems, factorized once; timed()
+    // is the mean of n_repeat REFACTORIZATION + SOLVE (b refilled untimed: cuDSS
+    // may use it as workspace) on the handle's first `active` matrices (0 = all;
+    // own LU only: its active prefix, what the tail runs on).
+    auto make_handle = [&](CudssBatchSolver& solver, int B) {
         solver.initialize(B, dim, nnz, outer, inner,
                           thrust::raw_pointer_cast(d_vals.data()),
                           thrust::raw_pointer_cast(d_rhs.data()),
@@ -505,6 +504,8 @@ TailCalibration calibrate_tail_groups(
         thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)), d_rhs.begin(), d_rhs.end(), cuda_real_type(1));
         solver.factor();
         solver.solve();
+    };
+    auto timed = [&](CudssBatchSolver& solver, int active) {
         if (active > 0) solver.set_active_count(active);
         cs.synchronize();
         double total = 0.;
@@ -517,11 +518,23 @@ TailCalibration calibrate_tail_groups(
             cs.synchronize();
             total += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         }
+        if (active > 0) solver.set_active_count(batch_size);   // own LU: one solver of batch_size
         return total / n_repeat;
     };
     const int G = std::min(group_size, batch_size);
-    res.t_full_ms  = time_handle(batch_size, 0);
-    res.t_group_ms = linear_solver == LinearSolver::OwnLu ? time_handle(batch_size, G) : time_handle(G, 0);
+    if (linear_solver == LinearSolver::OwnLu) {
+        // one solver: the full batch, then its prefix (no second plan / factors)
+        CudssBatchSolver solver;
+        make_handle(solver, batch_size);
+        res.t_full_ms  = timed(solver, 0);
+        res.t_group_ms = timed(solver, G);
+    } else {
+        CudssBatchSolver full, group;
+        make_handle(full, batch_size);
+        res.t_full_ms = timed(full, 0);
+        make_handle(group, G);
+        res.t_group_ms = timed(group, 0);
+    }
     res.max_groups = (group_size < batch_size && res.t_group_ms > 0.)
         ? static_cast<int>(std::floor(res.t_full_ms / res.t_group_ms)) : 0;
     return res;
