@@ -447,6 +447,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     @reordering_alg.setter
     def reordering_alg(self, value):
+        self._check_own_lu(reordering_alg=_resolve_reordering_alg(value))
         self._reordering_alg = value
         self._s.reordering_alg = _resolve_reordering_alg(value)
 
@@ -464,6 +465,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     @matching_alg.setter
     def matching_alg(self, value):
+        self._check_own_lu(matching_alg=_resolve_matching_alg(value))
         self._matching_alg = value
         self._s.matching_alg = _resolve_matching_alg(value)
 

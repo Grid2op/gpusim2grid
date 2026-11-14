@@ -215,14 +215,30 @@ def test_switching_solver_rebuilds_the_driver(case118, solver_atol):
     _same_rows(_outcome(ca, nbr), ref, solver_atol)
 
 
-def test_refusals(case118):
+@pytest.mark.parametrize("facade", ["ca", "is", "ss"])
+def test_refusals(case118, facade):
+    """What the own LU cannot take is refused when it is set -- at
+    construction, or by the setter that makes the combination -- not at the
+    first compute(), and the refused setter leaves the setting as it was."""
+    from gpusim2grid import ContingencyAnalysisGPU, InjectionSweepGPU, ScenarioSweepGPU
+    cls = {"ca": ContingencyAnalysisGPU, "is": InjectionSweepGPU, "ss": ScenarioSweepGPU}[facade]
     with pytest.raises(ValueError, match="linear_solver"):
-        _n1(case118, "klu")
+        cls(case118, precision=PREC, linear_solver="klu")
     for kw, match in (({"reordering_alg": "nested_dissection"}, "reordering_alg"),
                       ({"matching_alg": "max_diag_product"}, "matching_alg")):
-        ca, _ = _n1(case118, "own_lu", **kw)
         with pytest.raises(ValueError, match=match):
-            ca.compute(batch_size=64)
+            cls(case118, precision=PREC, linear_solver="own_lu", **kw)
+        # the combination made by a setter, either way round
+        obj = cls(case118, precision=PREC, linear_solver="own_lu")
+        (name, value), = kw.items()
+        before = getattr(obj, name)
+        with pytest.raises(ValueError, match=match):
+            setattr(obj, name, value)
+        assert getattr(obj, name) == before
+        obj = cls(case118, precision=PREC, **kw)
+        with pytest.raises(ValueError, match=match):
+            obj.linear_solver = "own_lu"
+        assert obj.linear_solver == "cudss"
 
 
 # =============================================================================

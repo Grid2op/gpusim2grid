@@ -13,6 +13,7 @@
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "dlpack_export.hpp"                 // export_v_base_dlpack etc.
+#include "own_lu/lu_order.hpp"               // own_lu::check_config
 #include "raw_cudss_solve.hpp"               // solve_cudss_raw
 #include "warmup.hpp"                        // warmup
 
@@ -3706,6 +3707,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 + ", t_group_ms=" + std::to_string(c.t_group_ms)
                 + ", max_groups=" + std::to_string(c.max_groups) + ")";
         });
+
+    m.def("check_own_lu_config", &own_lu::check_config,
+        pybind11::arg("reordering_alg"), pybind11::arg("matching_alg"),
+        "Raise ValueError unless linear_solver='own_lu' can take this reordering_alg "
+        "and matching_alg (it never pivots: no matching, an order computed on the host).");
 
     m.def("benchmark_cudss_batch_raw", &benchmark_cudss_batch_raw,
         pybind11::arg("dim"),

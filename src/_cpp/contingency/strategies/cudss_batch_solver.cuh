@@ -297,9 +297,7 @@ struct CudssBatchSolver {
                 throw std::invalid_argument(
                     "linear_solver='own_lu' cannot be combined with GPUSIM2GRID_USE_BLOCKDIAG / "
                     "GPUSIM2GRID_USE_BATCH_MODE");
-            if (matching_alg != MatchingAlg::None)
-                throw std::invalid_argument(
-                    "linear_solver='own_lu' does not pivot: matching_alg must be 'none'");
+            own_lu::check_config(reordering_alg, matching_alg);
             mode_ = CudssBatchMode::OwnLu;
         }
         cs_     = cs;
