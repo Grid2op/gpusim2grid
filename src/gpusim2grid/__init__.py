@@ -29,4 +29,19 @@ __all__ = [
     "ScenarioSweepGPU",
     "AcPfGPU",
     "warmup",
+    "get_cmake_dir",
 ]
+
+
+def get_cmake_dir() -> str:
+    """Return the CMake config directory of ``gpusim2grid_core``, gpusim2grid's solvers as a
+    C++ shared library without Python (imported target ``gpusim2grid::core``)::
+
+        cmake -Dgpusim2grid_core_DIR=$(python -c "import gpusim2grid; print(gpusim2grid.get_cmake_dir())")
+
+    Only installed by a build with the lightsim2grid bridge.
+    """
+    import os
+    from . import _gpusim2grid
+    # next to the compiled module (in an editable install, not next to this file)
+    return os.path.join(os.path.dirname(os.path.abspath(_gpusim2grid.__file__)), "share", "cmake", "gpusim2grid_core")
