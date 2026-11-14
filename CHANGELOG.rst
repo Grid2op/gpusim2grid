@@ -3,6 +3,19 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its
+  DIVERGENCE record into an empty buffer, an illegal address.
+- [FIXED] ``benchmark_cudss_batch_raw`` refuses a CSR matrix whose ``indptr`` or column indices are out of range.
+- [FIXED] Contingencies: a branch named twice, or in ``branch_ids`` and a side list, and a repeated shunt /
+  load / generator id are tripped once, as lightsim2grid (the admittance was subtracted twice).
+- [FIXED] ``ScenarioSweepGPU.set_contingency_shunts`` on a new row count no longer refuses the "no trip"
+  topology it filled in itself; ``set_contingency_loads`` checks its columns and its rows at ``compute()``.
+- [FIXED] ``redistribute_slack``: a ``ScenarioSweepGPU`` row tripping a resistive shunt shares its active power.
+- [FIXED] ``outer_loops=True``: a row the loops gave up on counts no violation, is not truncated and is not
+  ``converged()``, as its ``get_violations()`` entry says.
+- [FIXED] ``outer_loops=True`` with ``redistribute_slack``: the lost-power share keeps the row's targets as the
+  base, and a row gets its loss even when it is 0 at the grid's targets (lightsim2grid 1.3.1).
+- [FIXED] A generator contingency no longer turns PQ a bus a storage unit or an HVDC station still regulates.
 - [ADDED] ``benchmark_cudss_batch_raw(n_handles=, handle_launch=)`` and ``benchmarks/cudss_small_handles.py``:
   several independent cuDSS handles per round, timed against one large one.
 - [ADDED] ``ContingencyAnalysisGPU.add_contingency(branch_ids_side1=, branch_ids_side2=)``: a branch opened at

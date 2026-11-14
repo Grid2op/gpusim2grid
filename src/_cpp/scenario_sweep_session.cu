@@ -758,6 +758,23 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     std::vector<double> row_p_mw(static_cast<size_t>(n_scenarios_), 0.);
     for (int r = 0; r < n_scenarios_; ++r)
         row_p_mw[static_cast<size_t>(r)] = static_cast<double>(p_mw_.row(r).sum());
+    // term (e): the active power of the shunts a row trips (set_contingency_shunts) is not
+    // in the AC Sbus, so its injections cannot carry it -- what the row loses is minus the
+    // consumption it no longer has (element_trips::trip_lost_mw, as the contingency
+    // analysis counts it). Folded into the row's total, which term (c) subtracts from the
+    // grid's balance; a shunt on a masked bus is the island's, already in term (a).
+    if (has_shunt_off_ && has_trip_data_) {
+        std::vector<char> is_masked(static_cast<size_t>(base_state_->n_bus), 0);
+        for (int r = 0; r < n_scenarios_ && static_cast<size_t>(r) < shunt_off_.size(); ++r) {
+            const auto& m = contingencies_[static_cast<size_t>(r)].masked_buses;
+            for (int b : m) if (b >= 0 && b < base_state_->n_bus) is_masked[static_cast<size_t>(b)] = 1;
+            const double lost_e = element_trips::trip_lost_mw(
+                trip_data_, {}, shunt_off_[static_cast<size_t>(r)],
+                [&](int b) { return b >= 0 && b < base_state_->n_bus && is_masked[static_cast<size_t>(b)] != 0; });
+            row_p_mw[static_cast<size_t>(r)] -= lost_e;
+            for (int b : m) if (b >= 0 && b < base_state_->n_bus) is_masked[static_cast<size_t>(b)] = 0;
+        }
+    }
     const auto skipped = [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; };
     const auto masked = [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; };
     const auto gen_off = [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); };
@@ -775,7 +792,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
         for (int r = 0; r < n_scenarios_; ++r) {
             if (skipped(r)) continue;
             const double lost = slack_redistribution::row_lost_mw(slack_rd_, r, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
-            if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+            // (even nothing at the grid's targets: see ContingencyAnalysisSession::run)
+            row_lost_p_mw_[static_cast<size_t>(r)] = lost;
         }
         return {};
     }
@@ -902,7 +920,9 @@ void ScenarioSweepSession::set_branch_data(
     if (has_topology_ && (!has_injections_ ||
             static_cast<int>(tripped_branches_per_scenario_.size()) == n_scenarios_)) {
         const std::vector<std::vector<int>> trips = tripped_branches_per_scenario_;
+        const bool implicit = topology_implicit_;   // a rebuild, not the caller's topology
         set_topology(trips);
+        topology_implicit_ = implicit;
     }
 
     // A live driver caches the admittances / flow buffers it uploaded (once
@@ -1010,9 +1030,10 @@ void ScenarioSweepSession::set_topology(
                 contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
-    has_topology_   = true;
-    topology_dirty_ = true;
-    auto_ref_valid_ = false;
+    has_topology_      = true;
+    topology_implicit_ = false;
+    topology_dirty_    = true;
+    auto_ref_valid_    = false;
 }
 
 // =============================================================================
@@ -1040,15 +1061,27 @@ void ScenarioSweepSession::set_contingency_shunts(Eigen::Ref<const BoolMat> mask
         for (Eigen::Index s = 0; s < mask.cols(); ++s)
             if (mask(r, s)) { shunt_off_[static_cast<size_t>(r)].push_back(static_cast<int>(s)); any = true; }
     has_shunt_off_ = any;
-    // the rows' Ybus patches, rebuilt with them (branch trips kept)
-    const std::vector<std::vector<int>> trips = has_topology_
+    // the rows' Ybus patches, rebuilt with them (the caller's branch trips kept; the
+    // implicit "none" a previous mask filled in follows the new row count)
+    const bool keep = has_topology_ && !topology_implicit_;
+    const std::vector<std::vector<int>> trips = keep
         ? tripped_branches_per_scenario_
         : std::vector<std::vector<int>>(static_cast<size_t>(mask.rows()));
     set_topology(trips);
+    topology_implicit_ = !keep;
 }
 
 void ScenarioSweepSession::set_contingency_loads(Eigen::Ref<const BoolMat> mask)
 {
+    if (!has_trip_data_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: this session has no element data "
+            "(explicit-array/tuple mode, or a build without the lightsim2grid bridge). Load "
+            "contingencies need a session built from a lightsim2grid grid.");
+    if (mask.cols() != trip_data_.n_load)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: the mask has " + std::to_string(mask.cols()) +
+            " columns but the grid has " + std::to_string(trip_data_.n_load) + " loads");
     if (mask.rows() <= 0)
         throw std::runtime_error("ScenarioSweepSession::set_contingency_loads: n_scenarios must be > 0");
     if (has_injections_ && static_cast<int>(mask.rows()) != n_scenarios_)
@@ -1184,6 +1217,11 @@ void ScenarioSweepSession::run()
     if (has_shunt_off_ && static_cast<int>(shunt_off_.size()) != n_scenarios_)
         throw std::runtime_error(
             "ScenarioSweepSession: set_contingency_shunts()'s row count no longer matches "
+            "set_injections()'s n_scenarios -- call it again after changing set_injections()");
+
+    if (has_load_off_ && static_cast<int>(load_off_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_contingency_loads()'s row count no longer matches "
             "set_injections()'s n_scenarios -- call it again after changing set_injections()");
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)

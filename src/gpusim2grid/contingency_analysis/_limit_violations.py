@@ -441,7 +441,10 @@ class LimitViolationsEngineMixin:
 
     @violation_capacity.setter
     def violation_capacity(self, value):
-        self._s.violation_capacity = int(value)
+        value = int(value)
+        if value < 1:
+            raise ValueError(f"violation_capacity must be >= 1, got {value}")
+        self._s.violation_capacity = value
 
 
 class LimitViolationsFacadeMixin:

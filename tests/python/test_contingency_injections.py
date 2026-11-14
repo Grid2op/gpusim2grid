@@ -304,6 +304,75 @@ def test_sweep_shunt_and_load_masks(case, solver_atol):
     np.testing.assert_allclose(V[0], _reference_V(((), (0,), (), ()))[case["buses"]], atol=10 * solver_atol)
 
 
+def _grid_resistive_shunt(algo):
+    """case14 with two slack participants (the external grid and generator 0) and its shunt
+    given an active part: tripping it changes the active balance the pre-pass shares."""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        net = pn.case14()
+        net.gen["slack"] = False
+        net.gen.loc[0, "slack"] = True
+        net.shunt["p_mw"] = 8.
+        grid = init_from_pandapower(net)
+    grid.change_algorithm(algo)
+    v_ref = grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, TOL)
+    assert v_ref.shape[0] > 0
+    return grid, v_ref
+
+
+@pytest.mark.parametrize("outer_loops", [False, True])
+def test_sweep_redistribute_slack_counts_a_tripped_shunt(outer_loops, solver_atol):
+    """ScenarioSweepGPU's redistribute_slack counts the active power of a shunt its row
+    trips (lightsim2grid's term (e), not in the AC Sbus), as ContingencyAnalysisGPU does and
+    as lightsim2grid's ScenarioSweep has it."""
+    from gpusim2grid import ScenarioSweepGPU, ContingencyAnalysisGPU
+    from lightsim2grid.scenarioSweep import ScenarioSweepCPP
+
+    algo = "NROuter_KLU" if outer_loops else "NR_KLU"
+    grid, v_ref = _grid_resistive_shunt(algo)
+    n_rows, n_shunt = 2, len(grid.get_shunts())
+    shunt_off = np.zeros((n_rows, n_shunt), dtype=bool)
+    shunt_off[0, 0] = True
+    load_p, load_q = grid.get_loads_res_full()[:2]
+    gen_p = np.asarray(grid.get_gen_target_p(), dtype=np.float64)
+    rep = lambda a: np.repeat(np.asarray(a, dtype=np.float64)[None, :], n_rows, axis=0)   # noqa: E731
+    kw = dict(outer_loops=True, scheduling="continuous", nb_iter=30, init_from_n_powerflow=False,
+              tol=TOL / grid.get_sn_mva(), ir_n_steps=1) if outer_loops else dict(nb_iter=10, tol_base=TOL)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sw = ScenarioSweepGPU(grid, redistribute_slack=True, **kw)
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+    sw.set_contingency_shunts(shunt_off)
+    sw.compute(batch_size=4)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = sw.solver.V_results.to_numpy().reshape(n_rows, -1)
+
+    ls = ScenarioSweepCPP(grid)
+    ls.redistribute_slack = True
+    ls.init_from_n_powerflow = False
+    ls.modify_gen_p(rep(gen_p))
+    ls.modify_load_p(rep(load_p))
+    ls.modify_load_q(rep(load_q))
+    ls.set_contingency_shunts(shunt_off)
+    ls.compute(1.0 * v_ref, MAX_IT, TOL)
+    assert all(ls.converged_mask())
+    np.testing.assert_allclose(V, np.asarray(ls.get_voltages())[:, buses], rtol=0., atol=10 * solver_atol)
+
+    # the same trip through the contingency analysis, which counts it already
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ca = ContingencyAnalysisGPU(grid, redistribute_slack=True, **kw)
+    ca.add_contingency_shunt(0)
+    ca.compute(batch_size=1)
+    np.testing.assert_allclose(V[0], ca.V_results.to_numpy(), rtol=0., atol=10 * solver_atol)
+    if not outer_loops:
+        # the shunt's 8 MW (at 1 pu, load convention) come back to the units
+        assert sw.get_slack_redistribution_report()["mismatch_mw"][0] == pytest.approx(-8., abs=1e-6)
+
+
 # -------------------------------------------------------------------- BatchPowerFlow
 def test_batch_power_flow_statuses(case, solver_atol):
     torch = pytest.importorskip("torch")

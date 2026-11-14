@@ -1144,7 +1144,8 @@ void Ls2gOuterModel::share_lost_p(SlotState& st, const LoopDecl& L) const
         auto& u = st.ds_units[k];
         if (u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR) move_gen(st, u.el_id, st.ds_unit_bus[k], new_mw[k]);
         else move_storage(st, u.el_id, st.ds_unit_bus[k], -new_mw[k]);
-        u.injection_mw = new_mw[k];
+        // the base (u.injection_mw) stays the targets the row started from: the checks share
+        // the cumulative mismatch from there, as OpenLoadFlow resets to initialTargetP
         st.ds_current_mw[k] = new_mw[k];
     }
     record(st, L.name, "SHARE_LOST_P", true, -1, lost, L.ds_eps_mw);

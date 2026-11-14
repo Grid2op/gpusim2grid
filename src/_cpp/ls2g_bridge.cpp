@@ -703,6 +703,26 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
         if (bus_solver < 0 || bus_solver >= n_bus_solver) continue;
         d.storage_slack_weight_bus[static_cast<size_t>(bus_solver)] += static_cast<double>(si.slack_weight);
     }
+
+    // the other local regulators of a bus (BaseBatchSweep::_maybe_prepare_gen_contingency's
+    // storages_of_bus / stations_of_bus): a bus one of them holds stays PV
+    d.bus_other_vreg.assign(static_cast<size_t>(std::max(n_bus_solver, 0)), 0);
+    const auto mark_regulated = [&](int bus_me) {
+        int bus_solver = bus_me;
+        if (!me_to_solver.empty())
+            bus_solver = (bus_me >= 0 && bus_me < static_cast<int>(me_to_solver.size())) ? me_to_solver[bus_me] : -1;
+        if (bus_solver >= 0 && bus_solver < n_bus_solver) d.bus_other_vreg[static_cast<size_t>(bus_solver)] = 1;
+    };
+    for (int s = 0; s < storages.nb(); ++s)
+        if (storages.get_status()[static_cast<size_t>(s)] && storages.is_local_voltage_controller(s))
+            mark_regulated(storages.get_bus_id()(s).cast_int());
+    const auto& hvdc_lines = grid.get_dclines();
+    for (int h = 0; h < static_cast<int>(hvdc_lines.nb()); ++h) {
+        if (!hvdc_lines.get_status_global()[static_cast<size_t>(h)]) continue;
+        for (int side = 1; side <= 2; ++side)
+            if (hvdc_lines.station_is_voltage_controller(h, side))
+                mark_regulated(hvdc_lines.get_station_bus(h, side).cast_int());
+    }
     return d;
 }
 

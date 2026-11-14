@@ -522,21 +522,36 @@ def test_contingency_analysis_outer_failure_is_divergence():
     batch.compute(_v_batch(grid, False), MAX_IT, TOL_MVA)
     ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, handle_disconnected_grid=True,
                                 compute_limit_violations=True, tol=TOL_MVA / grid.get_sn_mva())
+    # every bus above its limit: the last state of a rejected row would report them all
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    vn = np.asarray(grid.get_bus_vn_kv(), dtype=float)[buses]
+    n_lines = len(grid.get_lines())
+    nan_br = np.full(n_br, np.nan)
+    ca.set_limits(0.1 * vn, 0.5 * vn, nan_br, nan_br, n_lines)
     ca.add_contingencies_by_branch_id([[i] for i in range(n_br)])
     ca.compute(batch_size=4)
     status = np.asarray(ca.get_row_status())
     conv = np.asarray(batch.converged_mask(), dtype=bool)
     assert (status == UNREALISTIC).any()
     v_ls, v_gpu = batch.get_violations(), ca.get_violations()
+    counts, truncated, converged = ca.get_violation_counts(), ca.get_violations_truncated(), ca.converged()
     for i in range(n_br):
         assert (status[i] == CONVERGED) == bool(conv[i]), i
+        if status[i] == CONVERGED:
+            assert counts["high_voltage"][i] > 0, i   # the limits bite
+            assert converged[i], i
         if status[i] in (OUTER_FAILED, OUTER_UNSTABLE, UNREALISTIC):
             assert len(v_ls[i]) == 1 and f"{v_ls[i][0].violation_type}".endswith("DIVERGENCE"), i
+            assert np.isnan(v_ls[i][0].value) and np.isnan(v_ls[i][0].limit), i
             assert len(v_gpu[i]) == 1, i
             el = v_gpu[i][0]
             assert el.violation_type == LimitViolationType.DIVERGENCE, i
             assert el.element_type == ViolationElementType.GRID, i
             assert np.isnan(el.value) and np.isnan(el.limit), i
+            # the totals, the truncation flag and converged() say the same: no state to check
+            assert all(counts[k][i] == 0 for k in ("low_voltage", "high_voltage", "current")), (i, counts)
+            assert not truncated[i], i
+            assert not converged[i], i
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
@@ -912,6 +927,35 @@ def test_transformer_voltage_control_scenario_sweep(init_from_n):
     _check_rows(sw, ls, grid, n_rows)
 
 
+
+def test_transformer_voltage_control_scenario_sweep_row_load_q():
+    """TransformerVoltageControl freezes its low voltage generators at their output minus the
+    bus' load Q: the row's own load_q (set_injections_from_elements), as lightsim2grid's
+    batch fills the outer view's loads.target_q -- not the grid's"""
+    from lightsim2grid.lightsim2grid_cpp import ScenarioSweepCPP
+    from gpusim2grid import ScenarioSweepGPU
+    grid, _ = _tvc()
+    n_rows = 4
+    load_p = np.asarray(grid.get_load_target_p())
+    load_q = np.array([l.target_q_mvar for l in grid.get_loads()], dtype=float)
+    gen_p = np.array([g.target_p_mw for g in grid.get_generators()])
+    q_scale = 1. + 0.5 * np.arange(n_rows)
+    rows_q = np.outer(q_scale, load_q)
+    ls = ScenarioSweepCPP(grid)
+    ls.change_algorithm(OUTER)
+    ls.init_from_n_powerflow = False
+    ls.modify_gen_p(np.outer(np.ones(n_rows), gen_p))
+    ls.modify_load_p(np.outer(np.ones(n_rows), load_p))
+    ls.modify_load_q(rows_q)
+    ls.compute(np.asarray(grid.get_V(), dtype=complex), MAX_IT, 1e-10)
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=MAX_IT, init_from_n_powerflow=False,
+                          tol=1e-10 / grid.get_sn_mva(), keep_outer_trace=True)
+    sw.set_injections_from_elements(np.outer(np.ones(n_rows), load_p), rows_q, np.outer(np.ones(n_rows), gen_p))
+    sw.compute(batch_size=2)
+    _check_rows(sw, ls, grid, n_rows)
+    V = _V(sw, grid, n_rows)
+    assert np.abs(V[-1] - V[0]).max() > 1e-4   # the rows' load Q does move the state
+
 def test_transformer_voltage_control_injection_sweep():
     from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
     from gpusim2grid import InjectionSweepGPU
@@ -1141,7 +1185,8 @@ def test_contingency_analysis_redistribute_slack(init_from_n):
     contingency loses before its first solve -- the island it cuts off (the load on bus 14), the
     generator or the load it trips -- from the targets in force (a resumed row's lost generator
     at the "n" solve's moved target), as lightsim2grid's batch. The generator islanded on bus 8
-    produces nothing and a line outage loses no injection: nothing to share there"""
+    produces nothing at the grid's target (it loses what the "n" solve moved it by, with
+    init_from_n) and a line outage loses no injection: nothing to share there"""
     from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
     from gpusim2grid import ContingencyAnalysisGPU
     if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
@@ -1153,7 +1198,7 @@ def test_contingency_analysis_redistribute_slack(init_from_n):
     gen_40mw = [el.id for el in grid.get_generators() if el.target_p_mw > 0. and not el.is_slack]
     ctgs = [(leaf_trafo, [], [], []), (leaf_lines, [], [], []), ([], [], [], gen_40mw), ([], [], [3], []),
             ([0], [], [], [])]
-    loses_p = [False, True, True, True, False]
+    loses_p = [init_from_n, True, True, True, False]
     batch = ContingencyAnalysisCPP(grid)
     batch.change_algorithm(OUTER)
     batch.init_from_n_powerflow = init_from_n
@@ -1170,10 +1215,12 @@ def test_contingency_analysis_redistribute_slack(init_from_n):
     n_ctg, n_bus = len(ctgs), grid.get_Ybus_solver().shape[0]
     V = ca.V_results.to_numpy().reshape(n_ctg, n_bus)
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
-    # lightsim2grid orders its contingencies
-    # (my_contingencies adds the branches opened at one end only, a fifth and sixth list)
-    key = lambda c: tuple(tuple(sorted(int(e) for e in el)) for el in (tuple(c) + ((), ()))[:6])
-    row_ls = {key(c): k for k, c in enumerate(batch.my_contingencies())}
+    # lightsim2grid orders its contingencies; my_contingencies' tuples grew with it (6 lists,
+    # 10 in 1.3.1): pad each contingency to the length this version returns
+    conts = batch.my_contingencies()
+    n_lists = len(conts[0])
+    key = lambda c: tuple(tuple(sorted(int(e) for e in el)) for el in (tuple(c) + ((),) * n_lists)[:n_lists])
+    row_ls = {key(c): k for k, c in enumerate(conts)}
     V_ls = np.asarray(batch.get_voltages())[:, buses]
     conv = np.asarray(batch.converged_mask(), dtype=bool)
     status = np.asarray(ca.get_row_status())
@@ -1246,3 +1293,66 @@ def test_scenario_sweep_redistribute_slack(init_from_n):
         if conv[i]:
             fin = np.isfinite(V[i])
             np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=1e-8, err_msg=msg)
+
+
+def test_redistribute_slack_a_unit_at_its_bound_stays_there():
+    """lightsim2grid 6a67eca1: a lost generator, a unit its share sends to max_p, the losses
+    then dropping: sharing the cumulative mismatch from the row's own targets, the unit stays
+    at its bound and the row is lightsim2grid's batch"""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from lightsim2grid.algorithm import DistributedSlack, ReactiveLimits
+    from gpusim2grid import ContingencyAnalysisGPU
+    if not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    TRIPPED, CAPPED, HEADROOM = 0, 2, 2.
+
+    def make(cap):
+        net = pn.case14()
+        net.gen["min_q_mvar"] = -1e4     # ReactiveLimits only reserves the buses the trip may release
+        net.gen["max_q_mvar"] = 1e4
+        net.ext_grid["min_q_mvar"] = -1e4
+        net.ext_grid["max_q_mvar"] = 1e4
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            grid = init_from_pandapower(net)
+        nb_gen = len(grid.get_generators())
+        p_max = np.full(nb_gen, 300.)
+        grid.set_gen_can_participate_slack([True] * nb_gen, p_max.copy())
+        p_max[CAPPED] = cap
+        grid.set_gen_p_limits(np.zeros(nb_gen), p_max)
+        grid.clear_outer_loops()
+        grid.add_outer_loop(DistributedSlack(slack_bus_p_max_mismatch_mw=1e-6, p_residue_eps_mw=1e-6))
+        grid.add_outer_loop(ReactiveLimits())
+        grid.change_algorithm(OUTER)
+        assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+        return grid
+    grid = make(300.)
+    cap = float(grid.get_gen_res()[0][CAPPED]) + HEADROOM
+    grid = make(cap)
+    p_n = np.asarray(grid.get_gen_res()[0], dtype=float).copy()
+    assert p_n[CAPPED] < cap - 1. and 0.25 * p_n[TRIPPED] > HEADROOM
+
+    ls = ContingencyAnalysisCPP(grid)
+    ls.init_from_n_powerflow = True
+    ls.redistribute_slack = True
+    ls.add_contingency_gen(TRIPPED)
+    ls.change_algorithm(OUTER)
+    ls.compute(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    res_ls = ls.get_outer_results()[0]
+    assert res_ls.converged
+    assert dict(res_ls.gen_target_p)[CAPPED] == pytest.approx(cap, abs=1e-6)
+
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, ir_n_steps=1,
+                                init_from_n_powerflow=True, redistribute_slack=True, keep_outer_trace=True,
+                                tol=TOL_MVA / grid.get_sn_mva())
+    ca.add_contingency_gen(TRIPPED)
+    ca.compute(batch_size=1)
+    res = ca.get_outer_results()[0]
+    msg = "\n".join(res.decisions)
+    assert ca.get_row_status()[0] == CONVERGED, msg
+    assert dict(res.gen_target_p)[CAPPED] == pytest.approx(cap, abs=1e-6), msg
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
+    np.testing.assert_allclose(V, np.asarray(ls.get_voltages())[0, buses], rtol=0., atol=1e-7, err_msg=msg)

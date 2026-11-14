@@ -249,6 +249,9 @@ struct ScenarioSweepSession {
     std::vector<Contingency>      contingencies_;
     std::vector<std::vector<int>> tripped_branches_per_scenario_;
     bool has_topology_ = false;
+    // the trip lists are the "none" set_contingency_shunts() filled in, not the caller's:
+    // a later mask on another row count resizes them instead of refusing them as stale
+    bool topology_implicit_ = false;
 
     // Caller-declared not-simulable rows (set_skipped_rows(); ORIGINAL row
     // order, n_scenarios entries). Copied into Contingency::skip by run(); a

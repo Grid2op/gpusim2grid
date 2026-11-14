@@ -24,7 +24,8 @@
 #include <thrust/fill.h>
 #include <thrust/execution_policy.h>
 
-#include <algorithm>   // std::max
+#include <algorithm>   // std::max, std::sort, std::set_union
+#include <iterator>    // std::back_inserter
 #include <cmath>       // std::abs
 #include <stdexcept>
 #include <string>
@@ -194,14 +195,69 @@ void ContingencyAnalysisSession::build_contingencies(
     build_contingencies_full(branch_ids_per_ctg, none, none, none);
 }
 
-void ContingencyAnalysisSession::build_contingencies_full(
-    const std::vector<std::vector<int>>& branch_ids_per_ctg,
-    const std::vector<std::vector<int>>& shunt_ids_per_ctg,
-    const std::vector<std::vector<int>>& load_ids_per_ctg,
-    const std::vector<std::vector<int>>& gen_ids_per_ctg,
-    const std::vector<std::vector<int>>& branch_ids_side1_per_ctg,
-    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg)
+namespace {
+// sorted, without repeats: lightsim2grid keeps each list of a contingency in a std::set
+std::vector<std::vector<int>> as_sets(const std::vector<std::vector<int>>& lists)
 {
+    std::vector<std::vector<int>> out(lists);
+    for (auto& l : out) {
+        std::sort(l.begin(), l.end());
+        l.erase(std::unique(l.begin(), l.end()), l.end());
+    }
+    return out;
+}
+}  // namespace
+
+void ContingencyAnalysisSession::build_contingencies_full(
+    const std::vector<std::vector<int>>& branch_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& shunt_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& load_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& gen_ids_per_ctg_in,
+    const std::vector<std::vector<int>>& branch_ids_side1_per_ctg_in,
+    const std::vector<std::vector<int>>& branch_ids_side2_per_ctg_in)
+{
+    // Each list as a set, and a branch opened at both ends one way or another (named in
+    // branch_ids and at one end, or at both ends) a trip, as lightsim2grid's
+    // _checked_contingency has it: subtracted twice, its admittance would leave -y.
+    const std::vector<std::vector<int>> shunt_ids_per_ctg = as_sets(shunt_ids_per_ctg_in);
+    const std::vector<std::vector<int>> load_ids_per_ctg  = as_sets(load_ids_per_ctg_in);
+    const std::vector<std::vector<int>> gen_ids_per_ctg   = as_sets(gen_ids_per_ctg_in);
+    std::vector<std::vector<int>> branch_ids_per_ctg       = as_sets(branch_ids_per_ctg_in);
+    std::vector<std::vector<int>> branch_ids_side1_per_ctg = as_sets(branch_ids_side1_per_ctg_in);
+    std::vector<std::vector<int>> branch_ids_side2_per_ctg = as_sets(branch_ids_side2_per_ctg_in);
+    if (branch_ids_side1_per_ctg.size() == branch_ids_per_ctg.size() &&
+        branch_ids_side2_per_ctg.size() == branch_ids_per_ctg.size()) {
+        for (size_t c = 0; c < branch_ids_per_ctg.size(); ++c) {
+            auto& both = branch_ids_per_ctg[c];
+            auto& s1 = branch_ids_side1_per_ctg[c];
+            auto& s2 = branch_ids_side2_per_ctg[c];
+            std::vector<int> on_both_sides;
+            std::set_intersection(s1.begin(), s1.end(), s2.begin(), s2.end(), std::back_inserter(on_both_sides));
+            std::vector<int> merged;
+            std::set_union(both.begin(), both.end(), on_both_sides.begin(), on_both_sides.end(),
+                           std::back_inserter(merged));
+            both = merged;
+            const auto drop_tripped = [&](std::vector<int>& side) {
+                side.erase(std::remove_if(side.begin(), side.end(),
+                                          [&](int b) { return std::binary_search(both.begin(), both.end(), b); }),
+                           side.end());
+            };
+            drop_tripped(s1);
+            drop_tripped(s2);
+        }
+    } else {
+        // one side list only (or none): a branch it shares with branch_ids is a trip
+        for (auto* sides : {&branch_ids_side1_per_ctg, &branch_ids_side2_per_ctg})
+            if (sides->size() == branch_ids_per_ctg.size())
+                for (size_t c = 0; c < branch_ids_per_ctg.size(); ++c) {
+                    const auto& both = branch_ids_per_ctg[c];
+                    auto& side = (*sides)[c];
+                    side.erase(std::remove_if(side.begin(), side.end(),
+                                              [&](int b) { return std::binary_search(both.begin(), both.end(), b); }),
+                               side.end());
+                }
+    }
+
     static const char* who = "ContingencyAnalysisSession::build_contingencies_full";
     if (!has_branch_data_)
         throw std::runtime_error(
@@ -479,7 +535,10 @@ void ContingencyAnalysisSession::run()
                                                                     ctg_shunts_[static_cast<size_t>(r)], bus_masked)
                                       : 0.);
                 if (outer_) {
-                    if (std::abs(lost) > slack_redistribution::DEFAULT_EPS_MW) row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+                    // the loop gets the row's loss even when it is nothing at the grid's targets: it counts
+                    // the units the row loses at the targets in force, which a row resumed from
+                    // the "n" solve takes from that solve, and decides itself what is left to share
+                    row_lost_p_mw_[static_cast<size_t>(r)] = lost;
                 } else {
                     slack_rows_[static_cast<size_t>(r)] = slack_redistribution::redistribute_row(slack_rd_, lost, bus_masked, g_off, g_p);
                 }

@@ -587,7 +587,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             line ``c``; ``c >= n_lines`` is trafo ``c - n_lines``).
         """
         self._inner.build_contingencies(branch_ids_per_ctg)
-        self._ctg_branch_ids = [list(map(int, ids)) for ids in branch_ids_per_ctg]
+        # a branch named twice is tripped once (the session does the same)
+        self._ctg_branch_ids = [list(dict.fromkeys(map(int, ids))) for ids in branch_ids_per_ctg]
         self._ctg_elements = [(list(ids), [], [], [], [], []) for ids in self._ctg_branch_ids]
 
     # ------------------------------------- shunts, loads and generators tripped

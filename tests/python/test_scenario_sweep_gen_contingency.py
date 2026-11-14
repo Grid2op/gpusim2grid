@@ -666,3 +666,53 @@ def test_set_gen_v_with_released_bus(case, solver_atol):
     ref = grid2.ac_pf(v1.copy(), MAX_IT, TOL)
     assert ref.shape[0] > 0
     np.testing.assert_allclose(V, ref[case["buses"]], atol=10 * solver_atol)
+
+
+# ----- a generator tripped next to another regulator of its bus ------------------------
+def _grid_gen_next_to_regulator(kind):
+    """case14 with something else regulating the bus of a non-slack generator, at that
+    generator's set-point: a storage unit, or two HVDC converter stations. Returns (grid, the
+    generator, its bus, the set-point)."""
+    grid, _ = _make_grid()
+    gen = next(g for g in grid.get_generators() if not g.is_slack)
+    if kind == "storage":
+        grid.init_storages_full(np.array([0.]), np.array([0.]), [True], np.array([gen.target_vm_pu]),
+                                np.array([-500.]), np.array([500.]), np.array([gen.bus_id], dtype=np.int32))
+    else:
+        big = np.full(2, 1e3)
+        grid.init_hvdc_lines(np.array([gen.bus_id, gen.bus_id], dtype=np.int32), np.array([13, 12], dtype=np.int32),
+                             [0, 0], [0, 0], np.ones(2), np.ones(2), [True, True], [False, False],
+                             np.full(2, gen.target_vm_pu), np.ones(2), np.zeros(2), np.zeros(2), -big, big, -big, big,
+                             np.ones(2), np.ones(2), [0, 0], np.array([1., 2.]), np.ones(2), np.full(2, 12.),
+                             [False, False], np.zeros(2), np.zeros(2), np.full(2, 100.), np.full(2, 100.))
+    grid.tell_solver_need_reset()
+    v0 = np.ones(grid.total_bus(), dtype=complex)
+    assert grid.ac_pf(v0, MAX_IT, TOL).shape[0] > 0
+    return grid, gen.id, gen.bus_id, gen.target_vm_pu
+
+
+@requires_gpu
+@needs_bridge
+@pytest.mark.parametrize("kind", ["storage", "hvdc"])
+def test_gen_tripped_next_to_another_regulator_keeps_the_bus_pv(kind, solver_atol):
+    """The other regulator still holds the bus: tripping the generator must not turn it PQ
+    (lightsim2grid's _maybe_prepare_gen_contingency counts the storage units and converter
+    stations regulating a bus)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid, gen_id, bus, vm = _grid_gen_next_to_regulator(kind)
+    v1 = np.asarray(grid.get_V(), dtype=complex)
+    ref_grid = grid.copy()
+    ref_grid.deactivate_gen(gen_id)
+    ref_grid.tell_solver_need_reset()
+    V_ref = ref_grid.ac_pf(v1.copy(), MAX_IT, TOL)
+    assert V_ref.shape[0] > 0
+    assert abs(V_ref[bus]) == pytest.approx(vm, abs=solver_atol)
+
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    ca.add_contingency_gen(gen_id)
+    ca.compute(batch_size=1)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
+    assert abs(V[list(buses).index(bus)]) == pytest.approx(vm, abs=solver_atol)
+    np.testing.assert_allclose(V, V_ref[buses], rtol=0., atol=solver_atol)

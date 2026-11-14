@@ -1925,7 +1925,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                   "ka > limit*(1+tol), HIGH_VOLTAGE when v > vmax*(1+tol), LOW_VOLTAGE "
                   "when v < vmin*(1-tol), so a value on its limit up to rounding is not "
                   "reported. 0 = bare strict comparisons. Takes effect on the next run().")
-    .def_readwrite("violation_capacity", &ContingencyAnalysisSession::violation_capacity_,
+    .def_property("violation_capacity",
+                  [](const ContingencyAnalysisSession& s) { return s.violation_capacity_; },
+                  [](ContingencyAnalysisSession& s, int k) {
+                      if (k < 1)
+                          throw pybind11::value_error("violation_capacity must be >= 1, got " + std::to_string(k));
+                      s.violation_capacity_ = k;
+                  },
                    "Violation records kept per contingency AND per type (K): the K "
                    "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
                    "|value/limit - 1|, each type sorted most severe first. Bounds "
@@ -2756,7 +2762,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                   "ka > limit*(1+tol), HIGH_VOLTAGE when v > vmax*(1+tol), LOW_VOLTAGE "
                   "when v < vmin*(1-tol), so a value on its limit up to rounding is not "
                   "reported. 0 = bare strict comparisons. Takes effect on the next run().")
-    .def_readwrite("violation_capacity", &ScenarioSweepSession::violation_capacity_,
+    .def_property("violation_capacity",
+                  [](const ScenarioSweepSession& s) { return s.violation_capacity_; },
+                  [](ScenarioSweepSession& s, int k) {
+                      if (k < 1)
+                          throw pybind11::value_error("violation_capacity must be >= 1, got " + std::to_string(k));
+                      s.violation_capacity_ = k;
+                  },
                    "Violation records kept per scenario AND per type (K): the K "
                    "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
                    "|value/limit - 1|, each type sorted most severe first. Bounds "
