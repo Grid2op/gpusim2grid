@@ -1345,6 +1345,11 @@ def _compare_moved_targets(res, res_ls, conv, n_rows, atol_mw):
 @pytest.mark.parametrize("init_from_n", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 3, N_ROWS])
 def test_dist_scenario_sweep_matches_lightsim2grid(init_from_n, batch_size, solver_atol):
+    """rows with more load and a line open, against lightsim2grid's ScenarioSweep of the same
+    algorithm: statuses, outer iterations, V and moved targets; every row parks the capped
+    unit -- by a check from the grid's targets, already at the start when resuming from the
+    "n" solve (which parked it)"""
+    from test_outer_model_cpu import CAPPED_GEN, CAPPED_MAX_P
     if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
         pytest.skip("lightsim2grid without its loops' state accessors")
     grid = _case14_dist()
@@ -1352,7 +1357,11 @@ def test_dist_scenario_sweep_matches_lightsim2grid(init_from_n, batch_size, solv
     ls = _lightsim2grid(grid, rows, algo=DIST, init_from_n=init_from_n)
     sw = _gpu(grid, rows, batch_size, init_from_n_powerflow=init_from_n, keep_outer_trace=True)
     res, res_ls = sw.get_outer_results(), ls.get_outer_results()
-    assert any("PARK" in d for r in res for d in r.decisions) or init_from_n
+    assert np.asarray(ls.converged_mask(), dtype=bool).all()
+    for i, r in enumerate(res):
+        parked_by_a_check = any(" PARK, element %d," % CAPPED_GEN in d for d in r.decisions)
+        assert parked_by_a_check != init_from_n, f"row {i}: " + "\n".join(r.decisions)
+        assert dict(r.gen_target_p)[CAPPED_GEN] == pytest.approx(CAPPED_MAX_P, abs=solver_atol * grid.get_sn_mva())
     _compare_with_batch(_V(sw, grid, N_ROWS), np.asarray(sw.get_row_status()), res, ls, grid, N_ROWS,
                         atol=solver_atol)
     _compare_moved_targets(res, res_ls, np.asarray(ls.converged_mask(), dtype=bool), N_ROWS,
@@ -1361,7 +1370,9 @@ def test_dist_scenario_sweep_matches_lightsim2grid(init_from_n, batch_size, solv
 
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_dist_contingency_analysis_matches_lightsim2grid(init_from_n, solver_atol):
-    """every branch tripped in turn, handle_disconnected_grid: a masked unit takes no share"""
+    """every branch tripped in turn, handle_disconnected_grid, against lightsim2grid's
+    ContingencyAnalysis of the same algorithm; a unit a row masks takes no share: it keeps the
+    target the row started from (the grid's, or the "n" solve's when resuming from it)"""
     from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
     from gpusim2grid import ContingencyAnalysisGPU
     if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
@@ -1395,10 +1406,29 @@ def test_dist_contingency_analysis_matches_lightsim2grid(init_from_n, solver_ato
             fin = np.isfinite(V[i])
             np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=solver_atol, err_msg=msg)
     _compare_moved_targets(res, res_ls, conv, n_br, solver_atol * grid.get_sn_mva())
+    # the masked units
+    to_solver = np.asarray(grid.id_me_to_ac_solver(), dtype=int)
+    gens = grid.get_generators()
+    start = (np.asarray(grid.get_gen_res()[0], dtype=float) if init_from_n
+             else np.array([g.target_p_mw for g in gens], dtype=float))
+    n_masked = 0
+    for i in range(n_br):
+        if status[i] != CONVERGED:
+            continue
+        moved = dict(res[i].gen_target_p)
+        for g, gen in enumerate(gens):
+            if np.isfinite(V[i][to_solver[gen.bus_id]]):
+                continue
+            n_masked += 1
+            assert moved.get(g, gen.target_p_mw) == pytest.approx(start[g], abs=solver_atol * grid.get_sn_mva()), \
+                f"branch {i}, generator {g}: {moved}"
+    assert n_masked > 0
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_dist_injection_sweep_matches_lightsim2grid(init_from_n, solver_atol):
+    """rows with more load, DistributedSlack the only loop, against lightsim2grid's
+    InjectionSweep of the same algorithm: statuses, outer iterations, V and moved targets"""
     from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
     from gpusim2grid import InjectionSweepGPU
     if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
@@ -1494,6 +1524,9 @@ def test_dist_lost_power_parks_the_units_it_saturates(solver_atol):
     assert sw.get_row_status()[0] == CONVERGED, msg
     assert res.nb_outer_iterations == 0, msg
     assert dict(res.gen_target_p)[UNIT_C] == pytest.approx(25., abs=solver_atol * grid.get_sn_mva()), msg
+    # parked by the share before the first solve, never by a check
+    assert any("SHARE_LOST_P" in d for d in res.decisions), msg
+    assert not any(" PARK, element %d," % UNIT_C in d for d in res.decisions), msg
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V_ls = np.asarray(ca.get_voltages())[0, buses]
     np.testing.assert_allclose(_V(sw, grid, 1)[0], V_ls, rtol=0., atol=solver_atol, err_msg=msg)

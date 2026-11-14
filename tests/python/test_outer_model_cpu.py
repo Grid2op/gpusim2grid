@@ -1154,31 +1154,40 @@ def test_dist_harness_layout():
     "can participate" stands on, whatever the weight the grid's last solve gave it"""
     base = _case14_dist()
     assert base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    # the grid's last solve parked the capped unit: weight 0 in it
+    stats = base.get_algo().get_outer_loop_stats()
+    assert any(d.action == "PARK" and d.element_id == CAPPED_GEN for d in stats.decisions)
     h = _cpp._OuterModelHarness(base, keep_trace=True)
     assert h.slack_col >= 0
     to_solver = np.asarray(base.id_me_to_ac_solver(), dtype=int)
     gen_buses = sorted({int(to_solver[g.bus_id]) for g in base.get_generators()})
     assert list(h.slack_bus) == gen_buses
+    assert int(np.asarray(h.slack)[0]) in gen_buses   # the reference among them
+    assert int(to_solver[base.get_generators()[CAPPED_GEN].bus_id]) in gen_buses   # parked, still there
     h.begin(1, 1)
     h.load(0, 0)
     w = np.asarray(h.controls(0)["slack_w"])
     assert w.sum() == pytest.approx(1.)
-    # the capped unit's bus has no share before the loop parks it: every unit shares
+    # a row starts with every unit sharing, the capped one included (the loop parks it again)
     assert np.all(w > 0.)
 
 
 @pytest.mark.parametrize("load_scale, line_off", [(1., None), (1.05, 1), (1.1, 2), (1.2, 3), (0.9, 5)])
 def test_dist_matches_single_nrouterdist_solve(load_scale, line_off, solver_atol):
+    """a row (more load, a line open) against lightsim2grid's single NROuterDist_KLU solve:
+    decisions, iteration counts, status, V; the capped unit parked; every generator's target
+    moved to what it produces, the reference's included"""
     res, stats = _compare_single_solve(
         lambda **kw: _case14_dist(**kw), load_scale=load_scale, line_off=line_off)
-    assert any("PARK" in str(d) for d in stats.decisions)
+    assert any(d.action == "PARK" and d.element_id == CAPPED_GEN for d in stats.decisions)
+    assert any(" PARK, element %d," % CAPPED_GEN in d for d in res.decisions), res.decisions
     # what each generator produces, the reference's included: the Newton left nothing on it
     row = _case14_dist(load_scale=load_scale, line_off=line_off)
     row.ac_pf(np.asarray(_solved(_case14_dist()).get_V(), dtype=complex), MAX_IT, TOL_MVA)
     moved = dict(res.gen_target_p)
+    assert sorted(moved) == list(range(len(row.get_generators()))), res.decisions
     for g, gen in enumerate(row.get_generators()):
-        if g in moved:
-            assert moved[g] == pytest.approx(gen.res_p_mw, abs=solver_atol * row.get_sn_mva())
+        assert moved[g] == pytest.approx(gen.res_p_mw, abs=solver_atol * row.get_sn_mva()), f"generator {g}"
 
 
 def _solved(grid):
@@ -1195,30 +1204,51 @@ def test_dist_no_unit_at_a_limit_needs_no_outer_iteration():
 
 @pytest.mark.parametrize("fail_on_residue", [True, False])
 def test_dist_every_unit_at_its_limit(fail_on_residue):
-    """every unit at its max_p (285 MW, the base's load and losses fit, not the row's): FAILED,
-    or (LEAVE_ON_SLACK_BUS) every unit parked, the reference taking the rest"""
+    """every unit at its max_p (285 MW, the base's load and losses fit, not the row's): FAILED
+    on the residue, or (LEAVE_ON_SLACK_BUS) every unit parked at its max_p, the reference
+    taking the rest"""
+    max_p = [45., 5., 5., 5., 225.]
     res, stats = _compare_single_solve(
-        lambda **kw: _case14_dist(capped=False, only_ds=True, max_p=[45., 5., 5., 5., 225.],
+        lambda **kw: _case14_dist(capped=False, only_ds=True, max_p=max_p,
                                   fail_on_residue=fail_on_residue, **kw),
         load_scale=1.2)
-    assert int(stats.status) == (2 if fail_on_residue else 0)
+    assert int(stats.status) == int(res.status) == (2 if fail_on_residue else 0)
+    if fail_on_residue:
+        assert res.failed_loop == "DistributedSlack", res.decisions
+        assert any("FAIL_RESIDUE" in d for d in res.decisions), res.decisions
+    else:
+        moved = dict(res.gen_target_p)
+        for g, p in enumerate(max_p):
+            assert any(" PARK, element %d," % g in d for d in res.decisions), (g, res.decisions)
+            assert moved[g] == pytest.approx(p), (g, moved)
 
 
-def test_dist_without_the_loop_is_the_single_slack():
-    """no DistributedSlack loop: the reference takes it all, as NROuter_*'s Newton"""
-    def make(**kw):
+def test_dist_without_the_loop_is_the_single_slack(solver_atol):
+    """no DistributedSlack loop: the reference takes it all (weight 1, every other bus 0), and
+    the row lands where NROuter_*'s single-slack Newton does"""
+    def make(algo=DIST, **kw):
         grid = _case14_dist(capped=False, **kw)
         grid.clear_outer_loops()
         from lightsim2grid.algorithm import ReactiveLimits
         grid.add_outer_loop(ReactiveLimits())
+        grid.change_algorithm(algo)
         return grid
     res, stats = _compare_single_solve(make, load_scale=1.1)
     h = _cpp._OuterModelHarness(_solved(make()), keep_trace=True)
     h.begin(1, 1)
     h.load(0, 0)
     w = np.asarray(h.controls(0)["slack_w"])
-    assert w.sum() == pytest.approx(1.)
-    assert w[list(h.slack_bus).index(int(np.asarray(h.slack)[0]))] == 1.
+    ref = list(h.slack_bus).index(int(np.asarray(h.slack)[0]))
+    assert w[ref] == 1.
+    assert np.all(np.delete(w, ref) == 0.)
+    # the same row by NROuter_KLU's single-slack Newton
+    base = _solved(make())
+    single = make(algo=OUTER, load_scale=1.1)
+    V_single = single.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, TOL_MVA)
+    dist = make(load_scale=1.1)
+    V_dist = dist.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, TOL_MVA)
+    assert V_single.size > 0 and V_dist.size > 0
+    np.testing.assert_allclose(V_dist, V_single, rtol=0., atol=solver_atol)
 
 
 @pytest.mark.skipif(not getattr(_cpp, "have_ls2g_outer_resume", False),
@@ -1257,5 +1287,7 @@ def test_dist_rows_resume_with_the_parked_units(only_ds, solver_atol):
         assert int(res.status) == int(res_ls[i].status), msg
         np.testing.assert_allclose(V, V_ls[i][buses], rtol=0., atol=solver_atol, err_msg=msg)
         assert dict(res.gen_target_p)[CAPPED_GEN] == pytest.approx(CAPPED_MAX_P, abs=solver_atol * base.get_sn_mva())
-    if only_ds:
-        assert all(r.nb_outer_iterations == 0 for r in res_ls)
+        # parked from the start: no check of the row parks it (again)
+        assert not any(" PARK, element %d," % CAPPED_GEN in d for d in res.decisions), msg
+        if only_ds:
+            assert res.nb_outer_iterations == res_ls[i].nb_outer_iterations == 0, msg

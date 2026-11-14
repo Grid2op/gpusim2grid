@@ -139,7 +139,18 @@ def test_reactive_limits(init_from_n):
     assert torch.isfinite(V).all()
     res = pf.sweep.get_outer_results()
     assert any(r.pq_buses for r in res), [r.decisions for r in res]
-    assert (grads["gen_v"] == 0.).any() and (grads["gen_v"] != 0.).any()
+    # row by row: a generator whose regulated bus the loops switched PQ gets exactly 0, one
+    # whose bus is still PV (pinned) a gradient
+    gen_v_bus = pf._gen_v_bus_np
+    for r, rr in enumerate(res):
+        pq = set(rr.pq_buses)
+        for g, b in enumerate(gen_v_bus):
+            if b < 0:
+                continue
+            if int(b) in pq:
+                assert grads["gen_v"][r, g] == 0., (r, g, rr.decisions)
+            else:
+                assert grads["gen_v"][r, g] != 0., (r, g, rr.decisions)
     _check_all(pf, inputs, grads)
 
 
@@ -189,7 +200,9 @@ def test_distributed_slack_parked_at_the_last_check():
 
 
 def test_generator_contingency():
-    """rows that disconnect generators (gen_status) with the loops on"""
+    """rows that disconnect generators (gen_status) with the loops on: the disconnected
+    generator gets no gen_p / gen_v gradient, the others' and the loads' match central
+    differences (on rows with and without the trip)"""
     grid = _grid()
     pf = _pf(grid)
     inputs = _inputs(grid)
@@ -230,6 +243,8 @@ def test_redistribute_slack_forward_is_the_sessions(solver_atol):
         V = pf(**{k: _t(v) for k, v in inputs.items()}, **status).cpu().numpy()
     res = pf.sweep.get_outer_results()
     assert all(any("SHARE_LOST_P" in d for d in r.decisions) for r in res), [r.decisions for r in res]
+    # shared before the first solve: at outer iteration #0
+    assert all(d.startswith("DistributedSlack #0 ") for r in res for d in r.decisions if "SHARE_LOST_P" in d)
 
     sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=30, init_from_n_powerflow=False,
                           handle_disconnected_grid=True, redistribute_slack=True, ir_n_steps=1,
@@ -364,4 +379,6 @@ def test_capability_curve_slope():
     assert torch.isfinite(V).all()
     res = pf.sweep.get_outer_results()
     assert any(r.gen_p_slope for r in res), [r.decisions for r in res]
+    # the slopes are those of the two generators with a curve
+    assert {g for r in res for g, _, _ in r.gen_p_slope} <= {0, 1}
     _check_all(pf, inputs, grads, names=("gen_p", "load_q"))
