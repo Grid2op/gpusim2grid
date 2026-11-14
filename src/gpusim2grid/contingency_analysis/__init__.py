@@ -14,6 +14,8 @@ __all__ = [
 
 import operator
 
+import numpy as np
+
 from .._gpusim2grid import (
     ContingencyAnalysisSession as _ContingencyAnalysisSession,
     ContingencySolverType as _ContingencySolverType,
@@ -28,7 +30,8 @@ from ._limit_violations import (ViolationElementType, LimitViolationType, Violat
 from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
 from ._reactive_limits import ReactiveLimitsStatus
-from ._scheduling import RowStatus, SchedulingEngineMixin, SchedulingFacadeMixin
+from ._scheduling import (RowStatus, OUTER_FAILURE_STATUSES, SchedulingEngineMixin, SchedulingFacadeMixin,
+                          outer_failure_rows)
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -542,6 +545,17 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         """
         self._s.build_contingencies(branch_ids_per_ctg)
 
+    def build_contingencies_full(self, branch_ids_per_ctg, shunt_ids_per_ctg,
+                                 load_ids_per_ctg, gen_ids_per_ctg,
+                                 branch_ids_side1_per_ctg=(), branch_ids_side2_per_ctg=()):
+        """Build contingencies tripping branches, shunts, loads and generators
+        together: aligned list-of-lists, one entry per contingency (see
+        ContingencyAnalysisSession.build_contingencies_full). The last two (empty,
+        or one entry per contingency): the branches opened at that end only."""
+        self._s.build_contingencies_full(branch_ids_per_ctg, shunt_ids_per_ctg,
+                                         load_ids_per_ctg, gen_ids_per_ctg,
+                                         list(branch_ids_side1_per_ctg), list(branch_ids_side2_per_ctg))
+
     def run(self):
         """Run all contingencies.  Fills V_results and residuals on device.
 
@@ -590,7 +604,10 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         (disconnected / masked-skip) contingency gets a single GRID/
         NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
-        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol), and
+        one the outer loops gave up on (``RowStatus.OUTER_FAILED``,
+        ``OUTER_UNSTABLE``, ``UNREALISTIC``) a GRID/DIVERGENCE entry with
+        value=limit=nan, as lightsim2grid.
         Otherwise the records of a contingency come type after type -- CURRENT,
         then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
         violation_capacity) most severe violations, most severe first.
@@ -611,8 +628,14 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         # row c owns slots [c*stride, c*stride + count[c]) -- stride is
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
+        status = self._s.get_row_status()
         out = []
         for c, cnt in enumerate(counts):
+            if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.DIVERGENCE,
+                                            float('nan'), float('nan'))])
+                continue
             if cnt < 0:
                 # Pre-check (graph connectivity) dropped this contingency
                 # before it ever reached check_limit_violations_kernel -- the
@@ -637,7 +660,9 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         contingency (only the most severe were kept -- raise violation_capacity
         if this matters for your use case; get_violation_counts() has the
         exact totals). Requires run() with compute_limit_violations=True."""
-        return self._s.get_violation_truncated().astype(bool)
+        out = self._s.get_violation_truncated().astype(bool)
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     def get_violation_counts(self):
         """dict of (n_contingencies,) int ndarrays with keys 'low_voltage',
@@ -654,19 +679,29 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
             raise RuntimeError(
                 "get_violation_counts() requires compute_limit_violations=True "
                 "(set solver.compute_limit_violations = True before run()).")
-        return {
-            "low_voltage":  self._s.get_violation_count_low_voltage(),
-            "high_voltage": self._s.get_violation_count_high_voltage(),
-            "current":      self._s.get_violation_count_current(),
+        out = {
+            "low_voltage":  np.array(self._s.get_violation_count_low_voltage()),
+            "high_voltage": np.array(self._s.get_violation_count_high_voltage()),
+            "current":      np.array(self._s.get_violation_count_current()),
         }
+        # a row the outer loops gave up on has one DIVERGENCE record and nothing counted
+        # (get_violations), not the violations of the state they rejected
+        failed = outer_failure_rows(self._s, out["current"].shape[0])
+        for v in out.values():
+            v[failed] = 0
+        return out
 
     def converged(self, tol=None):
         """(n_contingencies,) bool ndarray: residual <= tol (defaults to
-        violation_tol). Independent of compute_limit_violations -- residuals
+        violation_tol), False on a row the outer loops gave up on
+        (``OUTER_FAILURE_STATUSES``). Independent of compute_limit_violations -- residuals
         are always O(n_contingencies) and always computed (see residuals);
         this does not require compute_limit_violations to be enabled."""
         t = self.violation_tol if tol is None else tol
-        return self.residuals.to_numpy() <= t
+        out = self.residuals.to_numpy() <= t
+        # a row the outer loops gave up on solved its last inner powerflow, but is no solution
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     @property
     def V_results(self):

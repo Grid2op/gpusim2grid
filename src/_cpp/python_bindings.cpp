@@ -904,6 +904,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("t_oc_load", &BatchTimings::t_oc_load,
                       "Outer loops: the host model's setup of the run and of each (re)loaded slot "
                       "(begin, load), wall")
+        .def_readonly("t_tail_compact", &BatchTimings::t_tail_compact,
+                      "Continuous scheduling, the tail: moves of the live rows into the first "
+                      "slots and the set-up of the prefix SpMV / small cuDSS handle, wall")
         .def_readonly("t_driver_solve_wall_ms", &BatchTimings::t_driver_solve_wall_ms,
                       "Wall clock of the batch driver's whole solve() (ms); not in any total")
         .def_readonly("t_session_run_wall_ms", &BatchTimings::t_session_run_wall_ms,
@@ -915,7 +918,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("n_rounds", &BatchTimings::n_rounds,
                       "Continuous scheduling: rounds of nb_iter_per_round iterations run")
         .def_readonly("occupancy", &BatchTimings::occupancy,
-                      "Continuous scheduling: useful row-iterations / (slots x iterations run)")
+                      "Continuous scheduling: useful row-iterations / slot-iterations run (all S slots "
+                      "per round, the compacted ones in the tail)")
+        .def_readonly("n_tail_rounds", &BatchTimings::n_tail_rounds,
+                      "Continuous scheduling: rounds run on the compacted live rows with the "
+                      "small cuDSS handle (tail_max_groups)")
+        .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,
+                      "Continuous scheduling: rows moved to another slot by the tail compaction")
         // --- metadata ---
         .def_readonly("n_contingencies", &BatchTimings::n_contingencies,
                       "Total number of contingencies")
@@ -1060,6 +1069,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             gpu_compute["oc_decide"]         = entry_dict(t.t_oc_decide);
             gpu_compute["oc_controls"]       = entry_dict(t.t_oc_controls);
             gpu_compute["oc_load"]           = entry_dict(t.t_oc_load);
+            gpu_compute["tail_compact"]      = entry_dict(t.t_tail_compact);
 
             py::dict d2h;
             d2h["total"]                      = t.t_device_to_host_ms();
@@ -1667,6 +1677,26 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Define the contingency set from a list of branch-index lists; each "
          "inner list is the branches tripped in that contingency. Requires "
          "set_branch_data() first.")
+    .def("build_contingencies_full",
+         &ContingencyAnalysisSession::build_contingencies_full,
+         pybind11::arg("branch_ids_per_ctg"), pybind11::arg("shunt_ids_per_ctg"),
+         pybind11::arg("load_ids_per_ctg"), pybind11::arg("gen_ids_per_ctg"),
+         pybind11::arg("branch_ids_side1_per_ctg") = std::vector<std::vector<int>>(),
+         pybind11::arg("branch_ids_side2_per_ctg") = std::vector<std::vector<int>>(),
+         "Define the contingency set, each contingency tripping branches, shunts, "
+         "loads and generators together (aligned lists, one entry per "
+         "contingency; lightsim2grid's ContingencyAnalysis.add_contingency). A shunt "
+         "leaves the row's Ybus (its diagonal coefficient), a load / generator its "
+         "Sbus; a generator that was the last one regulating its bus turns that bus "
+         "PQ for the row and leaves its distributed slack. Needs the element and "
+         "generator data of a session built from a lightsim2grid grid. "
+         "branch_ids_side1_per_ctg / branch_ids_side2_per_ctg (empty, or one entry "
+         "per contingency): the branches opened at that end only, their other end "
+         "keeping the branch's Kron-reduced part (its charging).")
+    .def_property_readonly("has_element_trip_data", &ContingencyAnalysisSession::has_element_trip_data)
+    .def_property_readonly("ctg_shunts", &ContingencyAnalysisSession::ctg_shunts)
+    .def_property_readonly("ctg_loads", &ContingencyAnalysisSession::ctg_loads)
+    .def_property_readonly("ctg_gens", &ContingencyAnalysisSession::ctg_gens)
     .def("run",   &ContingencyAnalysisSession::run,
          "Solve all contingencies. Fills the device-side voltage and residual "
          "buffers; contingencies that would disconnect the graph get NaN residuals "
@@ -1744,6 +1774,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("nb_iter_per_round", &ContingencyAnalysisSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
+    .def_readwrite("tail_max_groups", &ContingencyAnalysisSession::tail_max_groups_,
+                   "Continuous scheduling: once the queue is empty and the live rows fit in "
+                   "this many groups of tail_group_size slots, the rounds run on those groups "
+                   "only, their linear solve on a cuDSS handle of tail_group_size matrices "
+                   "cycled over them (0 = off; calibrate_tail_max_groups() measures a value). "
+                   "Takes effect on the next run()")
+    .def_readwrite("tail_group_size", &ContingencyAnalysisSession::tail_group_size_,
+                   "Continuous scheduling: matrices of the tail's cuDSS handle (default 15: "
+                   "cuDSS 0.8.0's uniform batch costs over an order of magnitude more from 16 "
+                   "on). Takes effect on the next run()")
+    .def("calibrate_tail_max_groups",
+         [](const ContingencyAnalysisSession& s, int n_repeat, int batch_size) {
+             return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
+                                          s.tail_group_size_, n_repeat, s.reordering_alg_,
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+         },
+         pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
+         "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
+         "case's J on a cuDSS handle of batch_size matrices (-1: the session's) and on one "
+         "of tail_group_size matrices, n_repeat times each (TailCalibration). Does not set "
+         "anything. Allocates batch_size systems and their factors while it runs.")
     .def_readwrite("tol", &ContingencyAnalysisSession::tol_,
                    "A row has converged when ||F||inf < tol: decides when it leaves "
                    "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
@@ -1874,7 +1925,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                   "ka > limit*(1+tol), HIGH_VOLTAGE when v > vmax*(1+tol), LOW_VOLTAGE "
                   "when v < vmin*(1-tol), so a value on its limit up to rounding is not "
                   "reported. 0 = bare strict comparisons. Takes effect on the next run().")
-    .def_readwrite("violation_capacity", &ContingencyAnalysisSession::violation_capacity_,
+    .def_property("violation_capacity",
+                  [](const ContingencyAnalysisSession& s) { return s.violation_capacity_; },
+                  [](ContingencyAnalysisSession& s, int k) {
+                      if (k < 1)
+                          throw pybind11::value_error("violation_capacity must be >= 1, got " + std::to_string(k));
+                      s.violation_capacity_ = k;
+                  },
                    "Violation records kept per contingency AND per type (K): the K "
                    "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
                    "|value/limit - 1|, each type sorted most severe first. Bounds "
@@ -2089,6 +2146,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("nb_iter_per_round", &InjectionSweepSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
+    .def_readwrite("tail_max_groups", &InjectionSweepSession::tail_max_groups_,
+                   "Continuous scheduling: once the queue is empty and the live rows fit in "
+                   "this many groups of tail_group_size slots, the rounds run on those groups "
+                   "only, their linear solve on a cuDSS handle of tail_group_size matrices "
+                   "cycled over them (0 = off; calibrate_tail_max_groups() measures a value). "
+                   "Takes effect on the next run()")
+    .def_readwrite("tail_group_size", &InjectionSweepSession::tail_group_size_,
+                   "Continuous scheduling: matrices of the tail's cuDSS handle (default 15: "
+                   "cuDSS 0.8.0's uniform batch costs over an order of magnitude more from 16 "
+                   "on). Takes effect on the next run()")
+    .def("calibrate_tail_max_groups",
+         [](const InjectionSweepSession& s, int n_repeat, int batch_size) {
+             return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
+                                          s.tail_group_size_, n_repeat, s.reordering_alg_,
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+         },
+         pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
+         "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
+         "case's J on a cuDSS handle of batch_size matrices (-1: the session's) and on one "
+         "of tail_group_size matrices, n_repeat times each (TailCalibration). Does not set "
+         "anything. Allocates batch_size systems and their factors while it runs.")
     .def_readwrite("tol", &InjectionSweepSession::tol_,
                    "A row has converged when ||F||inf < tol: decides when it leaves "
                    "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
@@ -2276,6 +2354,40 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("clear_skipped_rows", &ScenarioSweepSession::clear_skipped_rows,
          "Drop any set_skipped_rows() mask.")
     .def_property_readonly("has_skipped_rows", &ScenarioSweepSession::has_skipped_rows)
+    .def("set_contingency_shunts",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error("ScenarioSweepSession::set_contingency_shunts: mask must be 2-D (n_scenarios, n_shunt)");
+             ScenarioSweepSession::BoolMat m(static_cast<Eigen::Index>(mask.shape(0)), static_cast<Eigen::Index>(mask.shape(1)));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_contingency_shunts(m);
+         },
+         pybind11::arg("mask"),
+         "Per-row shunt contingency mask, shape (n_scenarios, n_shunt), dtype bool: True "
+         "disconnects that shunt for that row (lightsim2grid's "
+         "ScenarioSweep.set_contingency_shunts). Its diagonal Ybus coefficient joins the "
+         "row's patch; refused with the outer loops for a shunt regulating a voltage. "
+         "Needs a session built from a lightsim2grid grid.")
+    .def("set_contingency_loads",
+         [](ScenarioSweepSession& self,
+            pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
+             if (mask.ndim() != 2)
+                 throw std::runtime_error("ScenarioSweepSession::set_contingency_loads: mask must be 2-D (n_scenarios, n_load)");
+             ScenarioSweepSession::BoolMat m(static_cast<Eigen::Index>(mask.shape(0)), static_cast<Eigen::Index>(mask.shape(1)));
+             auto r = mask.unchecked<2>();
+             for (Eigen::Index i = 0; i < m.rows(); ++i)
+                 for (Eigen::Index j = 0; j < m.cols(); ++j) m(i, j) = r(i, j);
+             self.set_contingency_loads(m);
+         },
+         pybind11::arg("mask"),
+         "Per-row load contingency mask, shape (n_scenarios, n_load), dtype bool. The "
+         "injection side (the load leaving Sbus) is the caller's job "
+         "(ScenarioSweepGPU.set_contingency_loads does it in set_injections_from_elements); "
+         "this is what the outer loops' view of the row reads.")
+    .def_property_readonly("has_element_trip_data", &ScenarioSweepSession::has_element_trip_data)
     .def("set_contingency_gens",
          [](ScenarioSweepSession& self,
             pybind11::array_t<bool, pybind11::array::c_style | pybind11::array::forcecast> mask) {
@@ -2488,6 +2600,27 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def_readwrite("nb_iter_per_round", &ScenarioSweepSession::nb_iter_per_round_,
                    "Continuous scheduling: NR iterations between two convergence checks "
                    "(takes effect on the next run())")
+    .def_readwrite("tail_max_groups", &ScenarioSweepSession::tail_max_groups_,
+                   "Continuous scheduling: once the queue is empty and the live rows fit in "
+                   "this many groups of tail_group_size slots, the rounds run on those groups "
+                   "only, their linear solve on a cuDSS handle of tail_group_size matrices "
+                   "cycled over them (0 = off; calibrate_tail_max_groups() measures a value). "
+                   "Takes effect on the next run()")
+    .def_readwrite("tail_group_size", &ScenarioSweepSession::tail_group_size_,
+                   "Continuous scheduling: matrices of the tail's cuDSS handle (default 15: "
+                   "cuDSS 0.8.0's uniform batch costs over an order of magnitude more from 16 "
+                   "on). Takes effect on the next run()")
+    .def("calibrate_tail_max_groups",
+         [](const ScenarioSweepSession& s, int n_repeat, int batch_size) {
+             return calibrate_tail_groups(*s.base_state_, batch_size > 0 ? batch_size : s.batch_size_,
+                                          s.tail_group_size_, n_repeat, s.reordering_alg_,
+                                          s.matching_alg_, s.pivot_epsilon_alg_, s.ir_n_steps_);
+         },
+         pybind11::arg("n_repeat") = 5, pybind11::arg("batch_size") = -1,
+         "Measure a tail_max_groups for this session: REFACTORIZATION + SOLVE of the base "
+         "case's J on a cuDSS handle of batch_size matrices (-1: the session's) and on one "
+         "of tail_group_size matrices, n_repeat times each (TailCalibration). Does not set "
+         "anything. Allocates batch_size systems and their factors while it runs.")
     .def_readwrite("tol", &ScenarioSweepSession::tol_,
                    "A row has converged when ||F||inf < tol: decides when it leaves "
                    "(continuous) and its RowStatus (both schedules). Takes effect on the next run()")
@@ -2629,7 +2762,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
                   "ka > limit*(1+tol), HIGH_VOLTAGE when v > vmax*(1+tol), LOW_VOLTAGE "
                   "when v < vmin*(1-tol), so a value on its limit up to rounding is not "
                   "reported. 0 = bare strict comparisons. Takes effect on the next run().")
-    .def_readwrite("violation_capacity", &ScenarioSweepSession::violation_capacity_,
+    .def_property("violation_capacity",
+                  [](const ScenarioSweepSession& s) { return s.violation_capacity_; },
+                  [](ScenarioSweepSession& s, int k) {
+                      if (k < 1)
+                          throw pybind11::value_error("violation_capacity must be >= 1, got " + std::to_string(k));
+                      s.violation_capacity_ = k;
+                  },
                    "Violation records kept per scenario AND per type (K): the K "
                    "most severe CURRENT, LOW_VOLTAGE and HIGH_VOLTAGE ones, by "
                    "|value/limit - 1|, each type sorted most severe first. Bounds "
@@ -3255,11 +3394,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
-        .def("set_branch_off", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off) {
+        .def("set_branch_off", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off,
+                                  std::vector<std::vector<int>> masked) {
                 outer::RowOverrides ov;
                 ov.branch_off = std::move(branch_off);
+                ov.masked = std::move(masked);
                 h.model->set_row_overrides(std::move(ov));
-            }, "per row, the branches it opens (lines then trafos)")
+            }, pybind11::arg("branch_off"), pybind11::arg("masked") = std::vector<std::vector<int>>{},
+            "per row, the branches it opens (lines then trafos) and, optionally, the solver buses "
+            "handle_disconnected_grid masks. Replaces ALL the rows' overrides (generators off, "
+            "gen_v, lost power... are cleared): call it before begin().")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;
@@ -3425,7 +3569,40 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_readonly("mem_host_peak", &CudssBatchBenchResult::mem_host_peak)
         .def_readonly("max_rel_residual", &CudssBatchBenchResult::max_rel_residual,
                       "max over slots of ||A x - b||inf / ||b||inf (b = A*1)")
-        .def_readonly("n_nonfinite_slots", &CudssBatchBenchResult::n_nonfinite_slots);
+        .def_readonly("n_nonfinite_slots", &CudssBatchBenchResult::n_nonfinite_slots)
+        .def_readonly("n_groups", &CudssBatchBenchResult::n_groups)
+        .def_readonly("group_cycle_ms", &CudssBatchBenchResult::group_cycle_ms,
+                      "Mean wall ms per group of one cycle (rebind + REFACTORIZATION + "
+                      "SOLVE per group, one stream sync per cycle)")
+        .def_readonly("n_handles", &CudssBatchBenchResult::n_handles)
+        .def_readonly("handle_launch", &CudssBatchBenchResult::handle_launch)
+        .def_readonly("handle_setup_ms", &CudssBatchBenchResult::handle_setup_ms,
+                      "Wall ms to create, analyse and factorize handles 1..n_handles-1")
+        .def_readonly("handle_round_ms", &CudssBatchBenchResult::handle_round_ms,
+                      "Mean wall ms of one round over all the handles (rhs reset + "
+                      "REFACTORIZATION + SOLVE each)");
+
+    pybind11::class_<TailCalibration>(m, "TailCalibration",
+        "calibrate_tail_max_groups() output: mean wall ms of one REFACTORIZATION + SOLVE on "
+        "the full batch and on one group of the continuous tail, and the tail_max_groups "
+        "they imply.")
+        .def_readonly("batch_size", &TailCalibration::batch_size)
+        .def_readonly("group_size", &TailCalibration::group_size)
+        .def_readonly("n_repeat", &TailCalibration::n_repeat)
+        .def_readonly("t_full_ms", &TailCalibration::t_full_ms,
+                      "Mean wall ms of REFACTORIZATION + SOLVE on batch_size matrices")
+        .def_readonly("t_group_ms", &TailCalibration::t_group_ms,
+                      "Mean wall ms of REFACTORIZATION + SOLVE on group_size matrices")
+        .def_readonly("max_groups", &TailCalibration::max_groups,
+                      "floor(t_full_ms / t_group_ms): the tail's groups pay up to this many "
+                      "(0 when group_size >= batch_size)")
+        .def("__repr__", [](const TailCalibration& c) {
+            return "TailCalibration(batch_size=" + std::to_string(c.batch_size)
+                + ", group_size=" + std::to_string(c.group_size)
+                + ", t_full_ms=" + std::to_string(c.t_full_ms)
+                + ", t_group_ms=" + std::to_string(c.t_group_ms)
+                + ", max_groups=" + std::to_string(c.max_groups) + ")";
+        });
 
     m.def("benchmark_cudss_batch_raw", &benchmark_cudss_batch_raw,
         pybind11::arg("dim"),
@@ -3439,12 +3616,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("matching_alg") = MatchingAlg::None,
         pybind11::arg("pivot_epsilon_alg") = PivotEpsilonAlg::Default,
         pybind11::arg("ir_n_steps") = 0,
+        pybind11::arg("n_groups") = 1,
+        pybind11::arg("n_handles") = 1,
+        pybind11::arg("handle_launch") = "serial",
         "Time gpusim2grid's CudssBatchSolver (the NR driver's own cuDSS path, "
         "same batch-mode env variables and config knobs) on an arbitrary CSR "
         "matrix replicated batch_size times: ANALYSIS, FACTORIZATION, then "
         "n_refactorize REFACTORIZATION + SOLVE pairs. rhs = A*1. Returns a "
         "CudssBatchBenchResult with per-phase wall ms, CUDSS_DATA_LU_NNZ and "
-        "CUDSS_DATA_MEMORY_ESTIMATES. For sizing a Jacobian no session builds yet.");
+        "CUDSS_DATA_MEMORY_ESTIMATES. For sizing a Jacobian no session builds yet. "
+        "n_groups > 1: one handle of batch_size matrices cycled over n_groups "
+        "slices (rebind, REFACTORIZATION, SOLVE per slice; group_cycle_ms), as "
+        "the continuous schedule's tail does. "
+        "n_handles > 1: that many independent handles of batch_size matrices "
+        "(handle_round_ms), launched from one stream ('serial'), one stream "
+        "each ('streams') or one stream and one host thread each ('threads').");
 
     m.def("warmup", &warmup,
         pybind11::arg("device") = -1,

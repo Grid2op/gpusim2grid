@@ -61,7 +61,8 @@ from ..contingency_analysis._slack_redistribution import (
     SlackRedistributionEngineMixin,
     SlackRedistributionFacadeMixin,
 )
-from ..contingency_analysis._scheduling import SchedulingEngineMixin, SchedulingFacadeMixin
+from ..contingency_analysis._scheduling import (OUTER_FAILURE_STATUSES, SchedulingEngineMixin, outer_failure_rows,
+                                                SchedulingFacadeMixin)
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
 
@@ -465,7 +466,10 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         not-simulated (disconnected / masked-skip) scenario gets a single
         GRID/NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
-        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol), and
+        one the outer loops gave up on (``RowStatus.OUTER_FAILED``,
+        ``OUTER_UNSTABLE``, ``UNREALISTIC``) a GRID/DIVERGENCE entry with
+        value=limit=nan, as lightsim2grid.
         Otherwise the records of a scenario come type after type -- CURRENT,
         then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
         violation_capacity) most severe violations, most severe first.
@@ -484,8 +488,14 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         # row c owns slots [c*stride, c*stride + count[c]) -- stride is
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
+        status = self._s.get_row_status()
         out = []
         for c, cnt in enumerate(counts):
+            if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.DIVERGENCE,
+                                            float('nan'), float('nan'))])
+                continue
             if cnt < 0:
                 # Pre-check (graph connectivity) dropped this scenario before
                 # it ever reached check_limit_violations_kernel -- the solver
@@ -510,7 +520,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         scenario (only the most severe were kept -- raise violation_capacity
         if this matters for your use case; get_violation_counts() has the
         exact totals). Requires run() with compute_limit_violations=True."""
-        return self._s.get_violation_truncated().astype(bool)
+        out = self._s.get_violation_truncated().astype(bool)
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     def get_violation_counts(self):
         """dict of (n_scenarios,) int ndarrays with keys 'low_voltage',
@@ -527,19 +539,29 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
             raise RuntimeError(
                 "get_violation_counts() requires compute_limit_violations=True "
                 "(set solver.compute_limit_violations = True before run()).")
-        return {
-            "low_voltage":  self._s.get_violation_count_low_voltage(),
-            "high_voltage": self._s.get_violation_count_high_voltage(),
-            "current":      self._s.get_violation_count_current(),
+        out = {
+            "low_voltage":  np.array(self._s.get_violation_count_low_voltage()),
+            "high_voltage": np.array(self._s.get_violation_count_high_voltage()),
+            "current":      np.array(self._s.get_violation_count_current()),
         }
+        # a row the outer loops gave up on has one DIVERGENCE record and nothing counted
+        # (get_violations), not the violations of the state they rejected
+        failed = outer_failure_rows(self._s, out["current"].shape[0])
+        for v in out.values():
+            v[failed] = 0
+        return out
 
     def converged(self, tol=None):
         """(n_scenarios,) bool ndarray: residual <= tol (defaults to
-        violation_tol). Independent of compute_limit_violations -- residuals
+        violation_tol), False on a row the outer loops gave up on
+        (``OUTER_FAILURE_STATUSES``). Independent of compute_limit_violations -- residuals
         are always O(n_scenarios) and always computed (see residuals);
         this does not require compute_limit_violations to be enabled."""
         t = self.violation_tol if tol is None else tol
-        return self.residuals.to_numpy() <= t
+        out = self.residuals.to_numpy() <= t
+        # a row the outer loops gave up on solved its last inner powerflow, but is no solution
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     # --- results ---
     @property

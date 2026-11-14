@@ -395,6 +395,16 @@ struct ScenarioSweepBatch {
         gv_vset_.fill(buf);
     }
 
+    // The continuous tail's compaction (BatchPfDriver::_compact_tail): this
+    // source's per-slot rows follow their moves (the masks follow the slot
+    // table at the next bind_slots).
+    void move_slots(const SlotMoveView& M, int n_bus, cudaStream_t cs)
+    {
+        launch_move_slot_rows(thrust::raw_pointer_cast(d_Sbus_batch.data()), n_bus, M, cs);
+        slack_.move_slots(M, cs);
+        gv_vset_.move_slots(M, cs);
+    }
+
     // -------------------------------------------------------------------------
     // Active-set interface (consumed by BatchPfDriver to compact the batch) —
     // identical semantics to ContingencyBatch.

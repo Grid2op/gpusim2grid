@@ -6,6 +6,7 @@
 // scenario_sweep_session.cu
 // =============================================================================
 
+#include "gen_contingency_rows.hpp"
 #include "scenario_sweep_session.hpp"
 #include "contingency/physical_checks_impl.cuh"
 #include "acpf_nr_state.cuh"
@@ -600,50 +601,18 @@ void ScenarioSweepSession::_prepare_gen_contingency(
     std::vector<std::vector<int>>& row_pv_to_pq,
     std::vector<std::vector<int>>& row_slack_off) const
 {
-    required.clear();
-    row_pv_to_pq.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
-    row_slack_off.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
-    if (!has_gen_off_) return;
-
-    const int n_gen  = gen_data_.n_gen;
+    if (!has_gen_off_) {
+        required.clear();
+        row_pv_to_pq.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
+        row_slack_off.assign(static_cast<size_t>(n_scenarios_), std::vector<int>());
+        return;
+    }
     const int n_rows = std::min(n_scenarios_, static_cast<int>(gen_off_.rows()));
-
-    // Which bus does each LOCAL voltage controller pin? (-1: none)
-    std::map<int, std::vector<int>> gens_of_bus;
-    for (int g = 0; g < n_gen; ++g) {
-        if (!gen_data_.status[g] || !gen_data_.local_vreg[g]) continue;
-        const int b = gen_data_.bus[g];
-        if (b < 0) continue;
-        gens_of_bus[b].push_back(g);
-    }
-
-    std::set<int> req;
-    for (int r = 0; r < n_rows; ++r) {
-        for (const auto& kv : gens_of_bus) {
-            bool all_off = true;
-            for (int g : kv.second)
-                if (!gen_off_(r, g)) { all_off = false; break; }
-            if (all_off) {
-                row_pv_to_pq[static_cast<size_t>(r)].push_back(kv.first);
-                req.insert(kv.first);
-            }
-        }
-        for (int g = 0; g < n_gen; ++g)
-            if (gen_off_(r, g) && gen_data_.status[g] && gen_data_.slack_participant[g])
-                row_slack_off[static_cast<size_t>(r)].push_back(g);
-    }
-
-    // Only a bus that owns no Vm unknown / Q equation in the base ledger needs
-    // a reserved pair (add_switchable_vm_buses skips the others anyway, so
-    // this keeps `required` comparable to reserved_buses_).
-    for (int b : req) {
-        if (base_ledger_ &&
-            (base_ledger_->vm_col_of_bus[static_cast<size_t>(b)] >= 0 ||
-             base_ledger_->q_row_of_bus[static_cast<size_t>(b)] >= 0))
-            continue;
-        required.push_back(b);
-    }
-    std::sort(required.begin(), required.end());
+    gen_contingency::prepare_rows(gen_data_, n_rows,
+                                  [this](int r, int g) { return gen_off_(r, g); },
+                                  base_ledger_.get(), required, row_pv_to_pq, row_slack_off);
+    row_pv_to_pq.resize(static_cast<size_t>(n_scenarios_));
+    row_slack_off.resize(static_cast<size_t>(n_scenarios_));
 }
 
 // =============================================================================
@@ -653,75 +622,15 @@ void ScenarioSweepSession::_prepare_gen_contingency(
 std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     const std::vector<std::vector<int>>& row_slack_off) const
 {
-    std::vector<cuda_real_type> out;
-    const int n_slack = base_state_->n_slack;
-    if (n_slack <= 0) return out;
-    bool any = false;
-    for (const auto& v : row_slack_off) if (!v.empty()) { any = true; break; }
-    if (!any) return out;
-
+    if (base_state_->n_slack <= 0) return {};
     const int n_bus = base_state_->n_bus;
-    const std::vector<int>& slack_bus = base_state_->h_slack_bus;
-    const std::vector<cuda_real_type>& base_w = base_state_->h_slack_w;
     int ref_bus = -1;
     for (int b = 0; b < n_bus; ++b)
         if (mask_cfg_.is_reference_bus[static_cast<size_t>(b)]) { ref_bus = b; break; }
     if (ref_bus < 0 && slack_ids_.size() > 0) ref_bus = slack_ids_(0);
-
-    out.assign(static_cast<size_t>(n_scenarios_) * n_slack, static_cast<cuda_real_type>(0.));
-    std::vector<double> w(static_cast<size_t>(n_bus));
-    std::vector<char>   off(static_cast<size_t>(gen_data_.n_gen));
-    for (int r = 0; r < n_scenarios_; ++r) {
-        cuda_real_type* row = out.data() + static_cast<ptrdiff_t>(r) * n_slack;
-        if (row_slack_off[static_cast<size_t>(r)].empty()) {
-            std::copy(base_w.begin(), base_w.end(), row);
-            continue;
-        }
-        std::fill(off.begin(), off.end(), 0);
-        for (int g : row_slack_off[static_cast<size_t>(r)]) off[static_cast<size_t>(g)] = 1;
-        // the storage units taking part in the slack keep their share on every
-        // row: no row disconnects one
-        std::fill(w.begin(), w.end(), 0.0);
-        double sum = 0.0;
-        const std::vector<double>& sto_w = gen_data_.storage_slack_weight_bus;
-        for (int b = 0; b < n_bus && b < static_cast<int>(sto_w.size()); ++b) {
-            w[static_cast<size_t>(b)] = sto_w[static_cast<size_t>(b)];
-            sum += sto_w[static_cast<size_t>(b)];
-        }
-        for (int g = 0; g < gen_data_.n_gen; ++g) {
-            if (!gen_data_.status[g] || !gen_data_.slack_participant[g] || off[static_cast<size_t>(g)]) continue;
-            const int b = gen_data_.bus[g];
-            if (b < 0) continue;
-            w[static_cast<size_t>(b)] += gen_data_.slack_weight[g];
-            sum += gen_data_.slack_weight[g];
-        }
-        if (std::abs(sum) < 1e-12) {
-            // Every participant off: the reference bus keeps the whole share
-            // (the angle reference is a property of the batch, picked once).
-            std::fill(w.begin(), w.end(), 0.0);
-            if (ref_bus >= 0 && ref_bus < n_bus) w[static_cast<size_t>(ref_bus)] = 1.0;
-        } else {
-            for (double& x : w) x /= sum;
-        }
-        for (int k = 0; k < n_slack; ++k) {
-            const int b = slack_bus[static_cast<size_t>(k)];
-            row[k] = static_cast<cuda_real_type>(w[static_cast<size_t>(b)]);
-            w[static_cast<size_t>(b)] = 0.0;   // consumed
-        }
-        // A survivor bus that is not a base participant cannot exist (the
-        // survivors are a subset of the base participants); the degenerate
-        // "reference gets 1" case can, when the reference carries no base
-        // weight (several slacks) -- refuse rather than silently drop it.
-        for (int b = 0; b < n_bus; ++b)
-            if (w[static_cast<size_t>(b)] != 0.0)
-                throw std::runtime_error(
-                    "ScenarioSweepSession: row " + std::to_string(r) + " re-weights "
-                    "the distributed slack onto bus " + std::to_string(b) + ", which "
-                    "owns no slack column entry in the base case (a reference "
-                    "bus with zero base weight). Keep at least one participating "
-                    "generator connected on that row.");
-    }
-    return out;
+    return gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_scenarios_, n_bus,
+                                              base_state_->h_slack_bus, base_state_->h_slack_w,
+                                              ref_bus, "ScenarioSweepSession");
 }
 
 // =============================================================================
@@ -815,7 +724,8 @@ void ScenarioSweepSession::_check_redistribute_slack() const
             "ScenarioSweepSession: redistribute_slack needs the slack participants -- call "
             "set_slack_redistribution_data() first (the ScenarioSweepGPU facade does it from a "
             "lightsim2grid grid).");
-    if (base_state_->n_slack <= 0)
+    // with the outer loops, the DistributedSlack loop's participants share it, not the Newton's
+    if (!outer_ && base_state_->n_slack <= 0)
         throw std::runtime_error(
             "ScenarioSweepSession: redistribute_slack needs the distributed slack "
             "(use_distributed_slack=True): without it no participant takes a share.");
@@ -840,7 +750,7 @@ void ScenarioSweepSession::_check_redistribute_slack() const
             "n_gen) -- call it again after changing set_injections().");
 }
 
-std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepass() const
+std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepass()
 {
     const bool has_rows = gen_p_rows_.size() > 0;
     // each row's total active injection (MW): term (c), what its injections take
@@ -848,16 +758,47 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     std::vector<double> row_p_mw(static_cast<size_t>(n_scenarios_), 0.);
     for (int r = 0; r < n_scenarios_; ++r)
         row_p_mw[static_cast<size_t>(r)] = static_cast<double>(p_mw_.row(r).sum());
-    return slack_redistribution::prepass_all(
-        slack_rd_, n_scenarios_, base_state_->n_bus,
-        [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; },
-        [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; },
-        [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); },
-        [this, has_rows](int r, int g) {
-            return has_rows ? static_cast<double>(gen_p_rows_(r, g))
-                            : static_cast<double>(slack_rd_.gen_target_p_mw(g)); },
-        [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); },
-        [&row_p_mw](int r) { return row_p_mw[static_cast<size_t>(r)]; });
+    // term (e): the active power of the shunts a row trips (set_contingency_shunts) is not
+    // in the AC Sbus, so its injections cannot carry it -- what the row loses is minus the
+    // consumption it no longer has (element_trips::trip_lost_mw, as the contingency
+    // analysis counts it). Folded into the row's total, which term (c) subtracts from the
+    // grid's balance; a shunt on a masked bus is the island's, already in term (a).
+    if (has_shunt_off_ && has_trip_data_) {
+        std::vector<char> is_masked(static_cast<size_t>(base_state_->n_bus), 0);
+        for (int r = 0; r < n_scenarios_ && static_cast<size_t>(r) < shunt_off_.size(); ++r) {
+            const auto& m = contingencies_[static_cast<size_t>(r)].masked_buses;
+            for (int b : m) if (b >= 0 && b < base_state_->n_bus) is_masked[static_cast<size_t>(b)] = 1;
+            const double lost_e = element_trips::trip_lost_mw(
+                trip_data_, {}, shunt_off_[static_cast<size_t>(r)],
+                [&](int b) { return b >= 0 && b < base_state_->n_bus && is_masked[static_cast<size_t>(b)] != 0; });
+            row_p_mw[static_cast<size_t>(r)] -= lost_e;
+            for (int b : m) if (b >= 0 && b < base_state_->n_bus) is_masked[static_cast<size_t>(b)] = 0;
+        }
+    }
+    const auto skipped = [this](int r) { return contingencies_[static_cast<size_t>(r)].disconnected; };
+    const auto masked = [this](int r) -> const std::vector<int>& { return contingencies_[static_cast<size_t>(r)].masked_buses; };
+    const auto gen_off = [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && gen_off_(r, g); };
+    const auto gen_p_row = [this, has_rows](int r, int g) {
+        return has_rows ? static_cast<double>(gen_p_rows_(r, g))
+                        : static_cast<double>(slack_rd_.gen_target_p_mw(g)); };
+    const auto sbus_p_mw = [this](int r, int b) { return static_cast<double>(p_mw_(r, b)); };
+    const auto row_p = [&row_p_mw](int r) { return row_p_mw[static_cast<size_t>(r)]; };
+    row_lost_p_mw_.clear();
+    if (outer_) {
+        // the Newton has a single slack: what each row loses goes to its DistributedSlack loop,
+        // which shares it before the row's first solve from the targets in force
+        // (outer::RowOverrides::lost_p_mw) -- lightsim2grid's batch does the same
+        row_lost_p_mw_.assign(static_cast<size_t>(n_scenarios_), std::numeric_limits<double>::quiet_NaN());
+        for (int r = 0; r < n_scenarios_; ++r) {
+            if (skipped(r)) continue;
+            const double lost = slack_redistribution::row_lost_mw(slack_rd_, r, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
+            // (even nothing at the grid's targets: see ContingencyAnalysisSession::run)
+            row_lost_p_mw_[static_cast<size_t>(r)] = lost;
+        }
+        return {};
+    }
+    return slack_redistribution::prepass_all(slack_rd_, n_scenarios_, base_state_->n_bus,
+                                             skipped, masked, gen_off, gen_p_row, sbus_p_mw, row_p);
 }
 
 // =============================================================================
@@ -979,7 +920,9 @@ void ScenarioSweepSession::set_branch_data(
     if (has_topology_ && (!has_injections_ ||
             static_cast<int>(tripped_branches_per_scenario_.size()) == n_scenarios_)) {
         const std::vector<std::vector<int>> trips = tripped_branches_per_scenario_;
+        const bool implicit = topology_implicit_;   // a rebuild, not the caller's topology
         set_topology(trips);
+        topology_implicit_ = implicit;
     }
 
     // A live driver caches the admittances / flow buffers it uploaded (once
@@ -1075,16 +1018,80 @@ void ScenarioSweepSession::set_topology(
     tripped_branches_per_scenario_.clear();
     tripped_branches_per_scenario_.reserve(branch_ids_per_scenario.size());
 
-    for (const auto& branch_ids : branch_ids_per_scenario) {
+    for (size_t r = 0; r < branch_ids_per_scenario.size(); ++r) {
+        const auto& branch_ids = branch_ids_per_scenario[r];
         contingencies_.push_back(build_contingency_from_branch_ids(
             branch_ids,
             h_branch_from_, h_branch_to_,
             h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_));
+        // the shunts the row trips (set_contingency_shunts): their diagonal coefficients
+        if (has_shunt_off_ && r < shunt_off_.size())
+            for (const auto& t : element_trips::shunt_triplets(trip_data_, shunt_off_[r]))
+                contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
-    has_topology_   = true;
-    topology_dirty_ = true;
-    auto_ref_valid_ = false;
+    has_topology_      = true;
+    topology_implicit_ = false;
+    topology_dirty_    = true;
+    auto_ref_valid_    = false;
+}
+
+// =============================================================================
+// set_contingency_shunts / set_contingency_loads
+// =============================================================================
+void ScenarioSweepSession::set_contingency_shunts(Eigen::Ref<const BoolMat> mask)
+{
+    if (!has_trip_data_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_shunts: this session has no element data "
+            "(explicit-array/tuple mode, or a build without the lightsim2grid bridge). Shunt "
+            "contingencies need a session built from a lightsim2grid grid.");
+    if (mask.cols() != trip_data_.n_shunt)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_shunts: the mask has " + std::to_string(mask.cols()) +
+            " columns but the grid has " + std::to_string(trip_data_.n_shunt) + " shunts");
+    if (mask.rows() <= 0)
+        throw std::runtime_error("ScenarioSweepSession::set_contingency_shunts: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(mask.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_shunts: row count must match set_injections()'s n_scenarios");
+    shunt_off_.assign(static_cast<size_t>(mask.rows()), std::vector<int>());
+    bool any = false;
+    for (Eigen::Index r = 0; r < mask.rows(); ++r)
+        for (Eigen::Index s = 0; s < mask.cols(); ++s)
+            if (mask(r, s)) { shunt_off_[static_cast<size_t>(r)].push_back(static_cast<int>(s)); any = true; }
+    has_shunt_off_ = any;
+    // the rows' Ybus patches, rebuilt with them (the caller's branch trips kept; the
+    // implicit "none" a previous mask filled in follows the new row count)
+    const bool keep = has_topology_ && !topology_implicit_;
+    const std::vector<std::vector<int>> trips = keep
+        ? tripped_branches_per_scenario_
+        : std::vector<std::vector<int>>(static_cast<size_t>(mask.rows()));
+    set_topology(trips);
+    topology_implicit_ = !keep;
+}
+
+void ScenarioSweepSession::set_contingency_loads(Eigen::Ref<const BoolMat> mask)
+{
+    if (!has_trip_data_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: this session has no element data "
+            "(explicit-array/tuple mode, or a build without the lightsim2grid bridge). Load "
+            "contingencies need a session built from a lightsim2grid grid.");
+    if (mask.cols() != trip_data_.n_load)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: the mask has " + std::to_string(mask.cols()) +
+            " columns but the grid has " + std::to_string(trip_data_.n_load) + " loads");
+    if (mask.rows() <= 0)
+        throw std::runtime_error("ScenarioSweepSession::set_contingency_loads: n_scenarios must be > 0");
+    if (has_injections_ && static_cast<int>(mask.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_contingency_loads: row count must match set_injections()'s n_scenarios");
+    load_off_ = mask;
+    has_load_off_ = false;
+    for (Eigen::Index r = 0; r < mask.rows() && !has_load_off_; ++r)
+        for (Eigen::Index l = 0; l < mask.cols(); ++l)
+            if (mask(r, l)) { has_load_off_ = true; break; }
 }
 
 // =============================================================================
@@ -1185,6 +1192,7 @@ void ScenarioSweepSession::run()
     const bool continuous = (scheduling_ == BatchScheduling::Continuous);
     if (continuous)   // before any allocation / cuDSS ANALYSIS
         check_continuous_scheduling(strategy_type_, nb_iter_, nb_iter_per_round_, tol_);
+    check_tail_settings(tail_max_groups_, tail_group_size_);
     if (outer_) {
         auto refuse = [](const std::string& what) {
             throw std::runtime_error("ScenarioSweepSession: the outer loops do not support " + what + " yet");
@@ -1192,12 +1200,29 @@ void ScenarioSweepSession::run()
         check_outer_loops_scheduling("ScenarioSweepSession", continuous, nb_iter_per_round_);
         if (strategy_type_ != ContingencySolverType::DirectRefactorEvery)
             refuse("a strategy other than 'direct_refactor_every'");
-        if (redistribute_slack_)    refuse("redistribute_slack (the DistributedSlack loop shares the slack)");
         if (has_switches_ || has_vc_pins_ || has_vc_release_)
             refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
         if (keep_final_jacobian_)   refuse("gradients (keep_final_jacobian)");
+        // a regulating shunt's sections are the ShuntVoltageControl loop's
+        if (has_shunt_off_)
+            for (size_t r = 0; r < shunt_off_.size(); ++r)
+                for (int sh : shunt_off_[r])
+                    if (trip_data_.shunt_regulating[static_cast<size_t>(sh)] && trip_data_.shunt_bus[static_cast<size_t>(sh)] >= 0)
+                        throw std::runtime_error(
+                            "ScenarioSweepSession: row " + std::to_string(r) + " trips shunt " + std::to_string(sh) +
+                            ", which regulates a voltage, with the outer loops: the ShuntVoltageControl loop owns "
+                            "its sections and does not support a row taking it out yet");
     }
+    if (has_shunt_off_ && static_cast<int>(shunt_off_.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_contingency_shunts()'s row count no longer matches "
+            "set_injections()'s n_scenarios -- call it again after changing set_injections()");
+
+    if (has_load_off_ && static_cast<int>(load_off_.rows()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_contingency_loads()'s row count no longer matches "
+            "set_injections()'s n_scenarios -- call it again after changing set_injections()");
 
     if (has_gen_off_ && static_cast<int>(gen_off_.rows()) != n_scenarios_)
         throw std::runtime_error(
@@ -1548,8 +1573,10 @@ void ScenarioSweepSession::run()
             slack_rows_[r].saturated_units = ext_sat_units_[r];
     } else {
         slack_rows_.clear();
+        row_lost_p_mw_.clear();
     }
-    const bool rd_active = redistribute_slack_ || has_ext_sat_;
+    // with the outer loops, the pre-pass only measured what each row loses (row_lost_p_mw_)
+    const bool rd_active = (redistribute_slack_ && !outer_) || has_ext_sat_;
     if (cold || warm || rd_active || rd_applied_) {
         std::vector<cuda_real_type> w_rows;
         std::vector<std::vector<std::pair<int, double>>> dp_rows;
@@ -1575,6 +1602,8 @@ void ScenarioSweepSession::run()
     solver_->keep_final_jacobian_ = keep_final_jacobian_;
     solver_->nb_iter_per_round_   = nb_iter_per_round_;
     solver_->tol_                 = tol_;
+    solver_->tail_max_groups_     = tail_max_groups_;
+    solver_->tail_group_size_     = tail_group_size_;
 
     // compute_limit_violations: the fused per-chunk kernel needs branch
     // admittances + limits on device BEFORE solve() runs its chunk loop
@@ -1691,6 +1720,12 @@ void ScenarioSweepSession::run()
                     ov.gen_off[static_cast<size_t>(r) * gen_off_.cols() + g] = gen_off_(r, g) ? 1 : 0;
             ov.pq_buses = row_pv_to_pq_;
         }
+        if (has_load_off_ && load_off_.rows() == n_scenarios_) {
+            ov.load_off.assign(static_cast<size_t>(n_scenarios_) * load_off_.cols(), 0);
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (Eigen::Index l = 0; l < load_off_.cols(); ++l)
+                    ov.load_off[static_cast<size_t>(r) * load_off_.cols() + l] = load_off_(r, l) ? 1 : 0;
+        }
         if (has_gen_v_ && gen_v_.rows() == n_scenarios_ && gen_v_.cols() == n_gen) {
             ov.gen_vm.resize(static_cast<size_t>(n_scenarios_) * n_gen);
             for (int r = 0; r < n_scenarios_; ++r)
@@ -1709,6 +1744,8 @@ void ScenarioSweepSession::run()
                     }
             }
         }
+        // ... and what it loses, for its DistributedSlack loop to share (redistribute_slack)
+        ov.lost_p_mw = row_lost_p_mw_;
         outer_->set_row_overrides(std::move(ov));
     }
 

@@ -59,6 +59,18 @@ struct SlotTableView {
     int        chunk      = -1;        // as SlotLoadView::chunk
 };
 
+// The slot moves of a continuous run's tail compaction (BatchPfDriver::
+// _compact_tail): slot from[i]'s per-slot state is copied to slot to[i]. The
+// from and to sets are disjoint (live slots past n_live into phantom slots
+// before it), so every copy can run at once, in place.
+struct SlotMoveView {
+    int        n      = 0;
+    const int* d_from = nullptr;   // [n] (device)
+    const int* d_to   = nullptr;
+    const int* h_from = nullptr;   // the same two lists on the host
+    const int* h_to   = nullptr;
+};
+
 // -----------------------------------------------------------------------------
 // Kernels
 // -----------------------------------------------------------------------------
@@ -84,6 +96,21 @@ __global__ void gather_rows_to_slots_kernel(T* __restrict__ dst,
         dst[at] = src[static_cast<ptrdiff_t>(row) * width + j];
     else if (base != nullptr)
         dst[at] = base[j];
+}
+
+// buf[to[i] * width + j] = buf[from[i] * width + j]; the two slot sets are
+// disjoint (SlotMoveView).
+template <typename T>
+__global__ void move_slot_rows_kernel(T* __restrict__ buf,
+                                      const int* __restrict__ d_from,
+                                      const int* __restrict__ d_to,
+                                      int n, int width)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t i   = tid / width;
+    const int       j   = static_cast<int>(tid % width);
+    if (i >= n) return;
+    buf[static_cast<ptrdiff_t>(d_to[i]) * width + j] = buf[static_cast<ptrdiff_t>(d_from[i]) * width + j];
 }
 
 // dst[slot[i] * width + j] = value
@@ -141,6 +168,16 @@ inline void launch_fill_slots(T* dst, T value, const SlotLoadView& L, int width,
     if (L.n <= 0 || width <= 0) return;
     fill_slots_kernel<T><<<nr_grid_size((long long)L.n * width, BS), BS, 0, cs>>>(
         dst, value, L.d_slot, L.n, width);
+}
+
+// Copy the rows of a [S × width] per-slot buffer along the moves (no-op on a
+// null / empty buffer).
+template <typename T>
+inline void launch_move_slot_rows(T* buf, int width, const SlotMoveView& M, cudaStream_t cs)
+{
+    if (buf == nullptr || M.n <= 0 || width <= 0) return;
+    move_slot_rows_kernel<T><<<nr_grid_size((long long)M.n * width, BS), BS, 0, cs>>>(
+        buf, M.d_from, M.d_to, M.n, width);
 }
 
 template <typename T>

@@ -37,6 +37,7 @@
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
 #include "gen_contingency_data.hpp"  // GenContingencyData
+#include "element_trip_data.hpp"     // ElementTripData
 #include "contingency/bus_q_check_data.hpp"  // BusQPlanData
 #include "contingency/gen_p_check_data.hpp"  // GenPPlanData
 
@@ -100,6 +101,12 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
 // every generator's solver bus and set-point, and the shunts' active power per
 // solver bus. See slack_redistribution.hpp.
 SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver);
+
+// What tripping each shunt (its diagonal Ybus coefficient), load (its power)
+// and generator (its active set-point) changes, for the contingencies that trip
+// them (ContingencyAnalysisSession::build_contingencies_full,
+// ScenarioSweepSession::set_contingency_shunts). See element_trip_data.hpp.
+ElementTripData extract_element_trip_data(const ls2g::LSGrid& grid, int n_bus_solver);
 
 // The reference slack bus the caller forced on the grid
 // (LSGrid::set_reference_slack_bus), in solver numbering; -1 when none.

@@ -36,6 +36,13 @@ def get_parser():
                         help="the rows resume from the 'n' solve's loops (init_from_n_powerflow)")
     parser.add_argument("--handle_disconnected_grid", action="store_true",
                         help="solve a contingency that islands buses on its main component")
+    parser.add_argument("--tail_max_groups", type=int, default=16,
+                        help="the continuous tail: at most this many groups of tail_group_size slots "
+                             "once the queue is empty (0 = off)")
+    parser.add_argument("--tail_group_size", type=int, default=15,
+                        help="matrices of the tail's cuDSS handle")
+    parser.add_argument("--calibrate_tail", action="store_true",
+                        help="print calibrate_tail_max_groups() for this grid and batch size")
     parser.add_argument("--skip_cpu", action="store_true", help="time the GPU only")
     return parser
 
@@ -97,6 +104,7 @@ def print_breakdown(t, compute_ms):
             *[(f"  {k}", v) for k, v in parts.items()],
             ("outer controls upload", t.t_oc_controls.wall_ms),
             ("outer model loads (begin, load)", t.t_oc_load.wall_ms),
+            ("tail compaction (moves)", t.t_tail_compact.wall_ms),
             ("driver, untimed", t.t_driver_solve_wall_ms - t.t_chunks_total_wall_ms),
             ("session around solve() (cold build)", t.t_session_run_wall_ms - t.t_driver_solve_wall_ms),
             ("  of which cuDSS ANALYSIS", t.t_analysis_ms),
@@ -127,8 +135,11 @@ def main(args):
                                 init_from_n_powerflow=args.init_from_n,
                                 handle_disconnected_grid=args.handle_disconnected_grid,
                                 tol=args.tol_mva / grid.get_sn_mva(), ir_n_steps=args.ir_n_steps)
+    ca.tail_max_groups, ca.tail_group_size = args.tail_max_groups, args.tail_group_size
     ca.add_contingencies_by_branch_id([[c] for c in ctgs])
     t_build = time.perf_counter() - t0
+    if args.calibrate_tail:
+        print(f"tail calibration: {ca.calibrate_tail_max_groups(batch_size=min(args.batch_size, len(ctgs)))}")
     t0 = time.perf_counter()
     ca.compute(batch_size=args.batch_size)
     t_gpu = time.perf_counter() - t0
@@ -138,7 +149,7 @@ def main(args):
     t = ca.timings
     print(f"GPU: build {1e3 * t_build:.0f} ms, compute {1e3 * t_gpu:.0f} ms "
           f"({1e3 * t_gpu / len(ctgs):.2f} ms / contingency), rounds {t.n_rounds}, "
-          f"occupancy {t.occupancy:.2f}")
+          f"occupancy {t.occupancy:.2f}, tail rounds {t.n_tail_rounds} ({t.n_slot_moves} row moves)")
     print(f"     statuses {dict(zip(*np.unique(status, return_counts=True)))}, "
           f"outer iterations mean {nb_outer.mean():.2f} max {nb_outer.max()}")
     print_breakdown(t, 1e3 * t_gpu)
