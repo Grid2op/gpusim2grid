@@ -113,6 +113,23 @@ __global__ void move_slot_rows_kernel(T* __restrict__ buf,
     buf[static_cast<ptrdiff_t>(d_to[i]) * width + j] = buf[static_cast<ptrdiff_t>(d_from[i]) * width + j];
 }
 
+// dst[row[s] * width + j] = src[s * width + j] for every slot s < n whose row[s]
+// is >= 0 (an eviction map: the slot's leaving row), the others left alone.
+template <typename T>
+__global__ void scatter_slots_to_rows_kernel(T* __restrict__ dst,
+                                             const T* __restrict__ src,
+                                             const int* __restrict__ d_row,
+                                             int n, int width)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t s   = tid / width;
+    const int       j   = static_cast<int>(tid % width);
+    if (s >= n) return;
+    const int row = d_row[s];
+    if (row < 0) return;
+    dst[static_cast<ptrdiff_t>(row) * width + j] = src[s * width + j];
+}
+
 // dst[slot[i] * width + j] = value
 template <typename T>
 __global__ void fill_slots_kernel(T* __restrict__ dst, T value,
@@ -160,6 +177,15 @@ inline void launch_gather_rows_to_slots(T* dst, const T* src, const T* base,
     if (L.n <= 0 || width <= 0) return;
     gather_rows_to_slots_kernel<T><<<nr_grid_size((long long)L.n * width, BS), BS, 0, cs>>>(
         dst, src, base, L.d_slot, L.d_row, L.n, width);
+}
+
+template <typename T>
+inline void launch_scatter_slots_to_rows(T* dst, const T* src, const int* d_row, int n, int width,
+                                         cudaStream_t cs)
+{
+    if (dst == nullptr || n <= 0 || width <= 0) return;
+    scatter_slots_to_rows_kernel<T><<<nr_grid_size((long long)n * width, BS), BS, 0, cs>>>(
+        dst, src, d_row, n, width);
 }
 
 template <typename T>

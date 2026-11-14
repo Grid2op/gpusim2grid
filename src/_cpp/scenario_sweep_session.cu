@@ -622,7 +622,8 @@ void ScenarioSweepSession::_prepare_gen_contingency(
 std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     const std::vector<std::vector<int>>& row_slack_off) const
 {
-    if (base_state_->n_slack <= 0) return {};
+    // with the outer loops, a distributed-slack Newton's weights are its model's, per slot
+    if (base_state_->n_slack <= 0 || outer_) return {};
     const int n_bus = base_state_->n_bus;
     int ref_bus = -1;
     for (int b = 0; b < n_bus; ++b)
@@ -684,6 +685,16 @@ void ScenarioSweepSession::set_external_slack_saturation(
     ext_sat_units_ = sat_units_per_row;
     for (auto& row : ext_sat_units_) std::sort(row.begin(), row.end());
     has_ext_sat_ = true;
+}
+
+void ScenarioSweepSession::set_external_lost_p(const std::vector<double>& lost_p_mw)
+{
+    if (!outer_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::set_external_lost_p: only with the outer loops (without them, "
+            "set_external_slack_saturation and the caller's own Sbus correction).");
+    ext_lost_p_mw_ = lost_p_mw;
+    has_ext_lost_  = true;
 }
 
 std::pair<std::vector<int>, std::vector<std::vector<int>>>
@@ -853,7 +864,18 @@ void ScenarioSweepSession::set_gen_v_device(const void* d_ptr, int n_scen, int n
                                  + cudaGetErrorString(e));
     base_state_->cs.synchronize();
 
-    gen_v_.resize(n_scen, n_gen);   // row-count bookkeeping only (run() checks rows)
+    gen_v_.resize(n_scen, n_gen);   // row-count bookkeeping only (run() checks rows) ...
+    if (outer_) {
+        // ... but the outer loops read each row's set-points on the host (RowOverrides::gen_vm,
+        // the groups' v_set): their values too
+        std::vector<cuda_real_type> h(static_cast<size_t>(n_scen) * n_gen);
+        e = cudaMemcpy(h.data(), thrust::raw_pointer_cast(dev_->d_gen_v_orig.data()),
+                       h.size() * sizeof(cuda_real_type), cudaMemcpyDeviceToHost);
+        if (e != cudaSuccess)
+            throw std::runtime_error(std::string("ScenarioSweepSession::set_gen_v_device: ")
+                                     + cudaGetErrorString(e));
+        for (size_t k = 0; k < h.size(); ++k) gen_v_.data()[k] = static_cast<eigen_real_type>(h[k]);
+    }
     gen_bus_         = gen_bus;
     has_gen_v_       = true;
     gen_v_dirty_     = true;
@@ -1203,7 +1225,6 @@ void ScenarioSweepSession::run()
         if (has_switches_ || has_vc_pins_ || has_vc_release_)
             refuse("the reactive-limit switches (set_pv_pq_switches / set_vc_controller_*)");
         if (phys_.compute_physical_violations) refuse("compute_physical_violations");
-        if (keep_final_jacobian_)   refuse("gradients (keep_final_jacobian)");
         // a regulating shunt's sections are the ShuntVoltageControl loop's
         if (has_shunt_off_)
             for (size_t r = 0; r < shunt_off_.size(); ++r)
@@ -1553,13 +1574,23 @@ void ScenarioSweepSession::run()
     // redistribute_slack, the pre-pass of what each row loses -- recomputed on
     // every run, since it reads the injections (a hot change) as well as the
     // masks and generator mask of the live source.
-    if (redistribute_slack_ && has_ext_sat_)
+    if (redistribute_slack_ && (has_ext_sat_ || has_ext_lost_))
         throw std::runtime_error(
-            "ScenarioSweepSession: redistribute_slack and set_external_slack_saturation "
-            "are exclusive (the pre-pass runs here, or the caller ran it).");
+            "ScenarioSweepSession: redistribute_slack and set_external_slack_saturation / "
+            "set_external_lost_p are exclusive (the pre-pass runs here, or the caller ran it).");
     if (redistribute_slack_) {
         _check_redistribute_slack();
         slack_rows_ = _slack_prepass();
+    } else if (has_ext_lost_) {
+        if (!outer_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_external_lost_p is only for the outer loops.");
+        if (static_cast<int>(ext_lost_p_mw_.size()) != n_scenarios_)
+            throw std::runtime_error(
+                "ScenarioSweepSession: set_external_lost_p()'s row count no longer matches "
+                "set_injections()'s n_scenarios.");
+        slack_rows_.clear();
+        row_lost_p_mw_ = ext_lost_p_mw_;
     } else if (has_ext_sat_) {
         if (static_cast<int>(ext_sat_units_.size()) != n_scenarios_)
             throw std::runtime_error(
@@ -1694,6 +1725,9 @@ void ScenarioSweepSession::run()
     // The outer loops: the model decides on every row; it starts the rows' loops
     // from their own generator set-points.
     solver_->outer_hook_ = outer_.get();
+    // gradients through the loops: each row's last control state is kept (the adjoint of its
+    // last inner solve, every decision of its loops held, as lightsim2grid)
+    solver_->keep_outer_adjoint_ = outer_ && keep_final_jacobian_;
     if (outer_) {
         std::vector<double> gp;
         if (gen_p_rows_.size() > 0 && gen_p_rows_.rows() == n_scenarios_)
@@ -1796,9 +1830,6 @@ void ScenarioSweepSession::solve_JT_batch(const void* d_rhs_orig, const void* d_
                                           const void* d_Ybus_ext, const void* d_V_ext_orig,
                                           std::uintptr_t producer_stream)
 {
-    if (outer_)
-        throw std::runtime_error("ScenarioSweepSession::solve_JT_batch: no gradients through the "
-                                 "outer loops yet (each slot holds its last row's controls)");
     if (!solver_)
         throw std::runtime_error(
             "ScenarioSweepSession::solve_JT_batch: call run() first");

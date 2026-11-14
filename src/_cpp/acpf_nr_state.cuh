@@ -433,6 +433,14 @@ struct AcPfNrState {
     // Jacobian CSR skeleton (device, real cuda_real_type)
     //   Sparsity pattern is FIXED across all NR iterations and contingencies.
     // -------------------------------------------------------------------------
+    // Prototype (docs/dev_notes/batched_lu_and_constrained_ordering.md): with
+    // ReorderingAlg::Ls2gConstrained, lightsim2grid's constrained order of this
+    // state's J skeleton (ls2g_constrained_perm, user_ordering.hpp), which the
+    // batch solvers hand cuDSS as CUDSS_DATA_USER_PERM. Empty otherwise.
+    std::vector<int>                      h_user_perm;
+    const std::vector<int>* user_perm_or_null() const {
+        return h_user_perm.empty() ? nullptr : &h_user_perm;
+    }
     thrust::device_vector<int>            d_J_outer;   // size dim_J+1
     thrust::device_vector<int>            d_J_inner;   // size nnz_J
     thrust::device_vector<cuda_real_type> d_J_values;  // current numeric values

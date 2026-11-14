@@ -87,10 +87,12 @@ __global__ void oc_gather_kernel(
 
 // One thread per (listed slot): 1 when some candidate bus whose magnitude is a
 // Newton unknown in that slot (not a pinned switchable bus) is outside
-// [vmin, vmax], written to out[i * stride + stride - 1].
+// [vmin, vmax], written to out[i * stride + stride - 1]; the slot's
+// slack_absorbed (0 without one) to out[i * stride + stride - 2].
 __global__ void oc_unrealistic_kernel(
           cuda_real_type*  __restrict__ d_out,
     const cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_slack_absorbed,   // [S] or nullptr
     const unsigned char*   __restrict__ d_pin,        // [S * n_pin] or nullptr
     const int*             __restrict__ d_cand_bus,   // [n_cand]
     const int*             __restrict__ d_cand_pin,   // [n_cand] its switchable index, -1 none

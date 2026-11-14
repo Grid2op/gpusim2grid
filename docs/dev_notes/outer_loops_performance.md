@@ -232,8 +232,8 @@ best S in the replay.
 
 ## Not to pursue
 
-- `CUDSS_DATA_UBATCH_MASK` (cuDSS 0.8.0) to skip idle matrices: it does not work yet; re-check on a
-  later cuDSS.
+- `CUDSS_DATA_UBATCH_MASK` (cuDSS 0.8.0) to skip idle matrices: broken in 0.8.0, works in 1.0.0,
+  whose full batch is however slower on the laptop; see `cudss_ubatch_mask.md`.
 - cuDSS factorization / solve algorithm knobs against the 16-matrix cliff: it is a cuDSS bug
   (above), wait for the fix.
 - Several large queues of different sizes summing to S from the start: a slow row still lands in

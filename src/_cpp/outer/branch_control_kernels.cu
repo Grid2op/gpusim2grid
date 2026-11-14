@@ -309,6 +309,24 @@ __global__ void bc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic
     }
 }
 
+__global__ void bc_stamp_applied_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
+                                        int nnz_Y, int n)
+{
+    // one thread per slot, its transformers in order (see bc_step_kernel)
+    const ptrdiff_t s = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (s >= n) return;
+    cudaComplexType* Ys = d_Ybus + s * nnz_Y;
+    for (int e = 0; e < st.n_bc; ++e) {
+        const ptrdiff_t idx = s * st.n_bc + e;
+        if (sl.out[idx]) continue;
+        const cudaComplexType* applied = sl.applied + 4 * idx;
+        for (int k = 0; k < 4; ++k) {
+            const int p = st.ypos[4 * e + k];
+            Ys[p] = cadd(Ys[p], csub(applied[k], st.yeff0[4 * e + k]));
+        }
+    }
+}
+
 __global__ void bc_gather_kernel(cuda_real_type* __restrict__ d_out, BcStatic st, BcSlots sl,
                                  const int* __restrict__ d_slots, int n_list, int offset, int stride)
 {
@@ -402,6 +420,17 @@ __global__ void sc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic
     cudaComplexType* p = d_Ybus + s * nnz_Y + st.ypos[e];
     *p = cadd(*p, cx(0, st.b0[e] - sl.b_applied[tid]));
     sl.b_applied[tid] = st.b0[e];
+}
+
+__global__ void sc_stamp_applied_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic st, ScSlots sl,
+                                        int nnz_Y, int n)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n) * st.n_sc) return;
+    const ptrdiff_t s = tid / st.n_sc;
+    const int e = static_cast<int>(tid % st.n_sc);
+    cudaComplexType* p = d_Ybus + s * nnz_Y + st.ypos[e];
+    *p = cadd(*p, cx(0, sl.b_applied[tid] - st.b0[e]));
 }
 
 __global__ void sc_gather_kernel(cuda_real_type* __restrict__ d_out, ScStatic st, ScSlots sl,

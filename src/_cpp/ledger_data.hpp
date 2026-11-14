@@ -61,6 +61,12 @@ struct LedgerData {
     // Re(sum Sbus), computed by AcPfNrState from the per-system Sbus.
     int                 slack_col = -1;
     std::vector<double> slack_weights;   // size n_bus (empty when inactive)
+    // The buses with an entry in the slack_absorbed column whatever their weight, sorted:
+    // set for the ledger of an NROuterDist_* solve (outer loops around a distributed-slack
+    // Newton), where the reference and every bus a unit may share the slack from are
+    // reserved and a unit at a bound has weight 0 (MultiSlack::set_slack_participant_buses).
+    // Empty: the participants are the buses with a nonzero weight.
+    std::vector<int>    slack_participant_buses;
 
     bool has_multislack() const { return slack_col >= 0; }
     int  nnz_J()          const { return static_cast<int>(J_inner.size()); }
@@ -153,7 +159,9 @@ struct LedgerData {
     // hold a controller (VoltageControl::set_may_hold_controllers), each group's
     // (v_row, q_col_first) slot and every sharing row's entry on every controller.
     // The batch then fills VoltageControl in its may_hold_ formulation (outer/
-    // outer_kernels.cuh). Single slack: slack_col is -1.
+    // outer_kernels.cuh). Single slack (NROuter_*): slack_col is -1. Around a
+    // distributed-slack Newton (NROuterDist_*): slack_col >= 0, the reference's P row and
+    // slack_participant_buses' entries in its column, the weights per slot (the model's).
     bool                outer_loops = false;
 
     // ---- lightsim2grid's BranchControl (outer loops: PhaseControl, TransformerVoltageControl)
@@ -211,6 +219,21 @@ struct LedgerData {
     double               slack_absorbed_gt = 0.0;   // valid iff has_ext_state_ground_truth && slack_col>=0
     std::vector<double>  vc_q_gt;                    // size vc_n_controllers(); valid iff has_ext_state_ground_truth
     double               t_ground_truth_check_ms = 0.0;  // check_solution() wall time
+
+    // ---- lightsim2grid's ordering constraints (prototype) --------------------
+    // NRSystem::ordering_constraints() of the grid's solver, read by
+    // extract_ledger_data (BaseAlgo::get_ordering_constraints), flattened:
+    // constraint c's follow indices are ord_follow[ord_follow_ptr[c] ..
+    // ord_follow_ptr[c+1]), its leads likewise, ord_in_order[c] its flag. J
+    // indices of THIS ledger: valid as long as no index moved -- extensions that
+    // only append (add_switchable_vm_buses) or swap theta/P indices
+    // (move_reference) keep them; drop_multislack_augmentation clears them
+    // (ord_constraints_read = false). Used by ReorderingAlg::Ls2gConstrained, see
+    // docs/dev_notes/batched_lu_and_constrained_ordering.md.
+    bool                 ord_constraints_read = false;
+    std::vector<int>     ord_follow_ptr, ord_follow, ord_lead_ptr, ord_lead;
+    std::vector<char>    ord_in_order;
+    int  ord_n_constraints() const { return static_cast<int>(ord_in_order.size()); }
 };
 
 #endif  // LEDGER_DATA_HPP

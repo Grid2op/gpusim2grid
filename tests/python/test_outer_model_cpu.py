@@ -53,7 +53,7 @@ def _decision_keys(decisions, grid=None):
     return sorted(keys)
 
 
-def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None, extra_load=None):
+def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None, extra_load=None, algo=OUTER):
     """`extra_load`: (bus, p_mw, q_mvar) of one more load, the last one"""
     import pandapower as pp
     import pandapower.networks as pn
@@ -70,7 +70,7 @@ def _case14(q_limit=15., distributed=True, load_scale=1., line_off=None, extra_l
     grid.set_gen_p_limits(np.zeros(nb_gen), np.full(nb_gen, 300.))
     if distributed:
         grid.set_gen_can_participate_slack([True] * nb_gen, np.full(nb_gen, 300.))
-    grid.change_algorithm(OUTER)
+    grid.change_algorithm(algo)
     if load_scale != 1.:
         for load_id, p in enumerate(np.asarray(grid.get_load_target_p())):
             grid.change_p_load(load_id, float(p) * load_scale)
@@ -359,6 +359,11 @@ class _FullSystem:
         self.p_bus = np.flatnonzero(np.asarray(L["p_row_of_bus"]) >= 0)
         self.th_bus = np.flatnonzero(np.asarray(L["theta_col_of_bus"]) >= 0)
         self.vm_col = np.asarray(L["vm_col_of_bus"]) >= 0
+        # a distributed-slack Newton (NROuterDist_*): its slack_absorbed unknown, shared on the
+        # participant buses by the weights of each solve (controls()["slack_w"])
+        self.slack_bus = np.asarray(h.slack_bus, dtype=int)
+        self.dist = h.slack_col >= 0
+        self.sa = 0.
         self.nc = len(L["vc_bus"])
         self.q_plan = np.zeros(self.nc)
         if len(L["vc_q_held"]) == self.nc:
@@ -470,7 +475,7 @@ class _FullSystem:
             Y[b2, b2] += d[3]
         return Y
 
-    def residual(self, V, q, Sbus, c, vm_bus, a=None, rho=None, b=None):
+    def residual(self, V, q, Sbus, c, vm_bus, a=None, rho=None, b=None, sa=0.):
         L = self.L
         a = self.bc_a if a is None else a
         rho = self.bc_rho if rho is None else rho
@@ -478,6 +483,8 @@ class _FullSystem:
         Y = self.ybus(a, rho, b) if (self.nb or self.ns) else self.Y
         S = V * np.conj(Y @ V)
         mis = S - Sbus
+        if self.dist:   # MultiSlack::adjust_mismatch
+            mis[self.slack_bus] += sa * np.asarray(c["slack_w"], dtype=float)
         Va = np.angle(V)
         for e in range(len(L["hvdc_bus1"])):
             b1, b2 = L["hvdc_bus1"][e], L["hvdc_bus2"][e]
@@ -553,7 +560,7 @@ class _FullSystem:
         vm_bus = np.flatnonzero(vm_unknown)
         nt, nv = self.th_bus.size, vm_bus.size
 
-        nq, na, nr = len(q), self.bc_col.size, self.bc_rcol.size
+        nq, na, nr, ns = len(q), self.bc_col.size, self.bc_rcol.size, self.sc_col.size
 
         def unpack(x):
             Va, Vm = np.angle(V0).copy(), np.abs(V0).copy()
@@ -565,26 +572,33 @@ class _FullSystem:
             rho = self.bc_rho.copy()
             rho[self.bc_rcol] = x[o + na:o + na + nr]
             b = self.sc_b.copy()
-            b[self.sc_col] = x[o + na + nr:]
-            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a, rho, b
+            b[self.sc_col] = x[o + na + nr:o + na + nr + ns]
+            sa = x[-1] if self.dist else 0.
+            return Vm * np.exp(1j * Va), x[nt + nv:nt + nv + nq], a, rho, b, sa
 
         V0 = V.copy()
         x = np.concatenate([np.angle(V)[self.th_bus], np.abs(V)[vm_bus], q, self.bc_a[self.bc_col],
-                            self.bc_rho[self.bc_rcol], self.sc_b[self.sc_col]])
+                            self.bc_rho[self.bc_rcol], self.sc_b[self.sc_col],
+                            [self.sa] if self.dist else []])
+        if self.dist:
+            # NRSystem::calibrate_slack_absorbed: the P rows balanced by slack_absorbed first
+            Vx, qx, ax, rx, bx, sx = unpack(x)
+            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax, rx, bx, sx)
+            w = np.asarray(c["slack_w"], dtype=float)
+            if abs(w.sum()) > 1e-12:
+                x[-1] -= F[:self.p_bus.size].sum() / w.sum()
         for it in range(max_it + 1):
-            Vx, qx, ax, rx, bx = unpack(x)
-            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax, rx, bx)
+            Vx, qx, ax, rx, bx, sx = unpack(x)
+            F = self.residual(Vx, qx, Sbus, c, vm_bus, ax, rx, bx, sx)
             if np.max(np.abs(F)) < tol or it == max_it:
-                self.bc_a, self.bc_rho, self.sc_b = ax, rx, bx
+                self.bc_a, self.bc_rho, self.sc_b, self.sa = ax, rx, bx, sx
                 return Vx, qx, np.max(np.abs(F)) < tol, it, vm_unknown
             J = np.empty((F.size, x.size))
             for k in range(x.size):
                 d = np.zeros(x.size)
                 d[k] = 1e-7
-                Vp, qp, ap, rp, bp = unpack(x + d)
-                Vm_, qm, am, rm, bm = unpack(x - d)
-                J[:, k] = (self.residual(Vp, qp, Sbus, c, vm_bus, ap, rp, bp) -
-                           self.residual(Vm_, qm, Sbus, c, vm_bus, am, rm, bm)) / 2e-7
+                J[:, k] = (self.residual(*unpack(x + d)[:2], Sbus, c, vm_bus, *unpack(x + d)[2:]) -
+                           self.residual(*unpack(x - d)[:2], Sbus, c, vm_bus, *unpack(x - d)[2:])) / 2e-7
             x = x - np.linalg.solve(J, F)
         raise AssertionError("unreachable")
 
@@ -614,7 +628,8 @@ def _run_row_full(h, row, Ybus, Sbus_row, tol_pu):
         unrealistic = bool(np.any((np.abs(V[cand]) < 0.5) | (np.abs(V[cand]) > 2.))) if cand else False
         nxt, status = h.on_solved(0, conv, nr, CONVERGED if conv else MAX_ITER,
                                   list(V[watch]), list(S[watch]), list(Sbus[watch]), list(q), unrealistic,
-                                  list(sysm.bc_a), list(sysm.bc_rho), list(sysm.sc_b))
+                                  list(sysm.bc_a), list(sysm.bc_rho), list(sysm.sc_b),
+                                  slack_absorbed=float(sysm.sa))
         if nxt == DONE:
             return V, status
     raise AssertionError("the row never ended")
@@ -1106,3 +1121,173 @@ def test_shunt_voltage_control_hidden_by_a_transformer():
 @pytest.mark.parametrize("row_kwargs, branch_off", [(dict(load_scale=1.05), None), (dict(line_off=1), [1])])
 def test_shunt_voltage_control_rows(row_kwargs, branch_off):
     _check_shunts("B9", 13.2, (3, 1), branch_off=branch_off, row_kwargs=row_kwargs)
+
+
+# --------------------------------------------------------------------------------------
+# NROuterDist_*: the same loops around a distributed-slack Newton -- its slack_absorbed
+# unknown shared on the participants by weights each solve sets, the DistributedSlack loop
+# only capping the units that sharing pushes past a limit (parked: weight 0)
+# --------------------------------------------------------------------------------------
+DIST = "NROuterDist_KLU"
+CAPPED_GEN, CAPPED_MAX_P = 1, 1.   # case14's generator 1 (bus 2, 0 MW): its share is more
+
+
+def _case14_dist(capped=True, only_ds=False, fail_on_residue=True, max_p=None, **kwargs):
+    """lightsim2grid's test_outer_dist_batch grid: _case14 with one unit that has little room
+    above its target, solved by NROuterDist_KLU; `only_ds`: DistributedSlack its only loop;
+    `max_p`: the generators'"""
+    grid = _case14(algo=DIST, **kwargs)
+    nb_gen = len(grid.get_generators())
+    p_max = np.full(nb_gen, 300.) if max_p is None else np.asarray(max_p, dtype=float).copy()
+    if capped:
+        p_max[CAPPED_GEN] = CAPPED_MAX_P
+    grid.set_gen_p_limits(np.zeros(nb_gen), p_max)
+    if only_ds or not fail_on_residue:
+        from lightsim2grid.algorithm import DistributedSlack
+        grid.clear_outer_loops()
+        grid.add_outer_loop(DistributedSlack(fail_on_residue=fail_on_residue))
+    return grid
+
+
+def test_dist_harness_layout():
+    """the slack_absorbed column has an entry on the reference and on every bus a unit flagged
+    "can participate" stands on, whatever the weight the grid's last solve gave it"""
+    base = _case14_dist()
+    assert base.ac_pf(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    # the grid's last solve parked the capped unit: weight 0 in it
+    stats = base.get_algo().get_outer_loop_stats()
+    assert any(d.action == "PARK" and d.element_id == CAPPED_GEN for d in stats.decisions)
+    h = _cpp._OuterModelHarness(base, keep_trace=True)
+    assert h.slack_col >= 0
+    to_solver = np.asarray(base.id_me_to_ac_solver(), dtype=int)
+    gen_buses = sorted({int(to_solver[g.bus_id]) for g in base.get_generators()})
+    assert list(h.slack_bus) == gen_buses
+    assert int(np.asarray(h.slack)[0]) in gen_buses   # the reference among them
+    assert int(to_solver[base.get_generators()[CAPPED_GEN].bus_id]) in gen_buses   # parked, still there
+    h.begin(1, 1)
+    h.load(0, 0)
+    w = np.asarray(h.controls(0)["slack_w"])
+    assert w.sum() == pytest.approx(1.)
+    # a row starts with every unit sharing, the capped one included (the loop parks it again)
+    assert np.all(w > 0.)
+
+
+@pytest.mark.parametrize("load_scale, line_off", [(1., None), (1.05, 1), (1.1, 2), (1.2, 3), (0.9, 5)])
+def test_dist_matches_single_nrouterdist_solve(load_scale, line_off, solver_atol):
+    """a row (more load, a line open) against lightsim2grid's single NROuterDist_KLU solve:
+    decisions, iteration counts, status, V; the capped unit parked; every generator's target
+    moved to what it produces, the reference's included"""
+    res, stats = _compare_single_solve(
+        lambda **kw: _case14_dist(**kw), load_scale=load_scale, line_off=line_off)
+    assert any(d.action == "PARK" and d.element_id == CAPPED_GEN for d in stats.decisions)
+    assert any(" PARK, element %d," % CAPPED_GEN in d for d in res.decisions), res.decisions
+    # what each generator produces, the reference's included: the Newton left nothing on it
+    row = _case14_dist(load_scale=load_scale, line_off=line_off)
+    row.ac_pf(np.asarray(_solved(_case14_dist()).get_V(), dtype=complex), MAX_IT, TOL_MVA)
+    moved = dict(res.gen_target_p)
+    assert sorted(moved) == list(range(len(row.get_generators()))), res.decisions
+    for g, gen in enumerate(row.get_generators()):
+        assert moved[g] == pytest.approx(gen.res_p_mw, abs=solver_atol * row.get_sn_mva()), f"generator {g}"
+
+
+def _solved(grid):
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    return grid
+
+
+def test_dist_no_unit_at_a_limit_needs_no_outer_iteration():
+    """the Newton's share is the answer: no outer iteration, nothing parked"""
+    res, stats = _compare_single_solve(lambda **kw: _case14_dist(capped=False, only_ds=True, **kw), load_scale=1.1)
+    assert res.nb_outer_iterations == stats.nb_outer_iterations == 0
+    assert not any("PARK" in d for d in res.decisions)
+
+
+@pytest.mark.parametrize("fail_on_residue", [True, False])
+def test_dist_every_unit_at_its_limit(fail_on_residue):
+    """every unit at its max_p (285 MW, the base's load and losses fit, not the row's): FAILED
+    on the residue, or (LEAVE_ON_SLACK_BUS) every unit parked at its max_p, the reference
+    taking the rest"""
+    max_p = [45., 5., 5., 5., 225.]
+    res, stats = _compare_single_solve(
+        lambda **kw: _case14_dist(capped=False, only_ds=True, max_p=max_p,
+                                  fail_on_residue=fail_on_residue, **kw),
+        load_scale=1.2)
+    assert int(stats.status) == int(res.status) == (2 if fail_on_residue else 0)
+    if fail_on_residue:
+        assert res.failed_loop == "DistributedSlack", res.decisions
+        assert any("FAIL_RESIDUE" in d for d in res.decisions), res.decisions
+    else:
+        moved = dict(res.gen_target_p)
+        for g, p in enumerate(max_p):
+            assert any(" PARK, element %d," % g in d for d in res.decisions), (g, res.decisions)
+            assert moved[g] == pytest.approx(p), (g, moved)
+
+
+def test_dist_without_the_loop_is_the_single_slack(solver_atol):
+    """no DistributedSlack loop: the reference takes it all (weight 1, every other bus 0), and
+    the row lands where NROuter_*'s single-slack Newton does"""
+    def make(algo=DIST, **kw):
+        grid = _case14_dist(capped=False, **kw)
+        grid.clear_outer_loops()
+        from lightsim2grid.algorithm import ReactiveLimits
+        grid.add_outer_loop(ReactiveLimits())
+        grid.change_algorithm(algo)
+        return grid
+    res, stats = _compare_single_solve(make, load_scale=1.1)
+    h = _cpp._OuterModelHarness(_solved(make()), keep_trace=True)
+    h.begin(1, 1)
+    h.load(0, 0)
+    w = np.asarray(h.controls(0)["slack_w"])
+    ref = list(h.slack_bus).index(int(np.asarray(h.slack)[0]))
+    assert w[ref] == 1.
+    assert np.all(np.delete(w, ref) == 0.)
+    # the same row by NROuter_KLU's single-slack Newton
+    base = _solved(make())
+    single = make(algo=OUTER, load_scale=1.1)
+    V_single = single.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, TOL_MVA)
+    dist = make(load_scale=1.1)
+    V_dist = dist.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, TOL_MVA)
+    assert V_single.size > 0 and V_dist.size > 0
+    np.testing.assert_allclose(V_dist, V_single, rtol=0., atol=solver_atol)
+
+
+@pytest.mark.skipif(not getattr(_cpp, "have_ls2g_outer_resume", False),
+                    reason="lightsim2grid without its loops' state accessors")
+@pytest.mark.parametrize("only_ds", [True, False])
+def test_dist_rows_resume_with_the_parked_units(only_ds, solver_atol):
+    """lightsim2grid's InjectionSweepCPP from its "n" solve: the unit the "n" solve parked starts
+    each row parked at its bound, so a row with more load needs no outer iteration
+    (DistributedSlackLoop::_keep_parked, read off the resume point's parked_units())"""
+    from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
+    n_rows = 3
+    base = _solved(_case14_dist(only_ds=only_ds))
+    assert any(d.action == "PARK" for d in base.get_algo().get_outer_loop_stats().decisions)
+    load_p = np.asarray(base.get_load_target_p())
+    scales = 1. + 0.03 * np.arange(1, n_rows + 1)
+    sweep = InjectionSweepCPP(base)
+    sweep.change_algorithm(DIST)
+    sweep.init_from_n_powerflow = True
+    sweep.modify_load_p(np.outer(scales, load_p))
+    sweep.compute(np.full(base.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA)
+    V_ls = np.asarray(sweep.get_voltages())
+    res_ls = sweep.get_outer_results()
+
+    h = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=True)
+    h.begin(1, n_rows)
+    buses = np.asarray(base.id_ac_solver_to_me(), dtype=int)
+    for i in range(n_rows):
+        row = _case14_dist(only_ds=only_ds, load_scale=scales[i])
+        _solved(row)   # its Ybus and Sbus
+        V, status = _run_row_full(h, i, row.get_Ybus_solver().toarray(), np.asarray(row.get_Sbus_solver()),
+                                  TOL_MVA / row.get_sn_mva())
+        res = h.row_result(i)
+        msg = f"row {i}:\n" + "\n".join(res.decisions)
+        assert res_ls[i].converged and status == CONVERGED, msg
+        assert res.nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        assert int(res.status) == int(res_ls[i].status), msg
+        np.testing.assert_allclose(V, V_ls[i][buses], rtol=0., atol=solver_atol, err_msg=msg)
+        assert dict(res.gen_target_p)[CAPPED_GEN] == pytest.approx(CAPPED_MAX_P, abs=solver_atol * base.get_sn_mva())
+        # parked from the start: no check of the row parks it (again)
+        assert not any(" PARK, element %d," % CAPPED_GEN in d for d in res.decisions), msg
+        if only_ds:
+            assert res.nb_outer_iterations == res_ls[i].nb_outer_iterations == 0, msg

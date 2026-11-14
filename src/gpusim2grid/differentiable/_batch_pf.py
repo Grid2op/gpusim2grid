@@ -159,6 +159,32 @@ pinned rows all live there and are read at backward time): another forward
 in between may change the injections / ``gen_v`` (hot path) but not the
 topology or generator mask (``source_build_counter`` guard).
 
+Outer loops: ``from_lsgrid(outer_loops=True)`` runs the grid's own outer loops on every
+row (a grid solved with lightsim2grid's ``NROuter_*`` / ``NROuterDist_*``; continuous
+scheduling), and the gradient is lightsim2grid's through them: the one of each row's
+LAST inner solve, every decision of its loops held -- a bus they switched PQ stays PQ, a
+controller they hold stays held, a tap stays where they left it, a unit the distributed
+slack parked stays at its bound. When a row leaves its slot, the per-slot state its last
+Jacobian was built with is kept on the device (the pins, held controllers, hvdc regimes,
+slack weights, the transformer / shunt control state and the blocks it stamped in Ybus),
+and the backward puts it back before refilling J. What J does not say comes from the
+session's per-row outer results: a switched-PQ bus' generators and a group that lost its
+set-point get no ``gen_v`` gradient; a generator the distributed slack holds at a bound
+gets no ``gen_p`` gradient (one already beyond its bound keeps its own); a generator
+frozen at a limit of its capability curve adds that slope (its reactive output follows its
+target P). ``compute_flows`` uses the taps the loops settled on. It is the derivative of
+the whole run wherever a small enough change flips no decision. With ``NROuter_*`` and
+``DistributedSlack``, the loop moves the targets between Newton solves: the gradient is
+then the single-slack one of the last solve (every change of the balance on the reference
+bus), as lightsim2grid's; ``NROuterDist_*`` carries the distributed slack in J, and its
+gradient with it. With ``redistribute_slack``, what a row loses (measured here in torch, as
+above) is handed to its DistributedSlack loop, which shares it before the row's first solve
+(lightsim2grid's batch does the same), and the gradient takes that share as a constant.
+Around a distributed-slack Newton that is exact: the units that stay free take it by the
+Newton's own weights, so it moves nothing the slack would not; a unit the share puts at a
+bound is parked there and gets no ``gen_p`` gradient, as one the Newton's share parks. With
+``NROuter_*`` it is the single-slack convention above.
+
 Scheduling: ``scheduling="continuous"`` (``from_lsgrid``) solves the rows in
 ``batch_size`` slots (default ``n_scen``), each row leaving as soon as its
 residual is below ``tol`` (``nb_iter`` is then each row's budget; see
@@ -176,6 +202,8 @@ the next forward in both modes (and ``torch.autograd.gradcheck``, which runs
 several forwards first, cannot be used: check with central differences).
 """
 
+import weakref
+
 import numpy as np
 import torch
 from torch import Tensor
@@ -184,6 +212,13 @@ from .. import _gpusim2grid as _cpp
 from .._ls2g_utils import extract_branch_data, gen_v_driven_columns, GEN_V_CONFLICT_TOL
 from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
 from ._flows import compute_flows as _compute_flows_torch
+
+
+def _drop_outer_taps(table, key, ref):
+    """weakref.finalize of a forward output: forget its taps (unless a newer output took the key)"""
+    entry = table.get(key)
+    if entry is not None and entry[0] is ref:
+        del table[key]
 
 
 __all__ = ["BatchPowerFlow"]
@@ -279,6 +314,8 @@ class BatchPowerFlow:
         self._rd_masks = None           # (masked, dropped, topology mask they were built from)
         self._pending_ext_sat = None    # per-row saturated units for the session, or "clear"
         self._ext_sat_in_session = False
+        self._pending_ext_lost = None   # outer loops: per-row lost MW for the session, or "clear"
+        self._ext_lost_in_session = False
 
         # Call-to-call state.
         self._last_n_scen = None
@@ -305,6 +342,9 @@ class BatchPowerFlow:
         self._pending_gen_off = None    # mask to hand to the session on the next run
         self._pending_gen_off_mask = None   # _gen_off_mask once _pending_gen_off is set
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
+        # outer loops: the taps each live forward output's rows settled on, keyed by that V
+        # (see _register_outer_taps)
+        self._outer_taps = {}
         self._skip_in_session = False
         self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
         # Columns the session drives (their regulated bus is Vm-fixed, or held by
@@ -339,8 +379,8 @@ class BatchPowerFlow:
                     scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                     init_from_n_powerflow=True, max_iter_base=10, tol_base=1e-8,
                     precision=None, gen_v_conflict_tol=GEN_V_CONFLICT_TOL,
-                    redistribute_slack=False, scheduling="chunked", batch_size=None,
-                    nb_iter_per_round=1, tol=None):
+                    redistribute_slack=False, scheduling=None, batch_size=None,
+                    nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False):
         """Build from a *solved* lightsim2grid grid (``grid.ac_pf`` done).
 
         The keyword arguments are :class:`gpusim2grid.ScenarioSweepGPU`'s
@@ -350,7 +390,14 @@ class BatchPowerFlow:
         fixed Newton-Raphson iteration count per row (chunked), or each row's
         budget (``scheduling="continuous"``: a row stops at ``tol``): raise it
         (and lower ``tol_base``) when gradients must be accurate -- the adjoint
-        is exact only at a converged solution.
+        is exact only at a converged solution. ``scheduling`` (``None``):
+        ``"chunked"``, or ``"continuous"`` with ``outer_loops``.
+
+        ``outer_loops=True`` runs the grid's own outer loops on every row (a grid
+        solved with lightsim2grid's ``NROuter_*`` or ``NROuterDist_*``, see
+        :class:`ScenarioSweepGPU`), and the gradient is lightsim2grid's through
+        them: the one of each row's last inner solve, every decision of its loops
+        held (see the module docstring), ``redistribute_slack`` included.
         """
         sweep = ScenarioSweepGPU(
             grid, init_from_n_powerflow=init_from_n_powerflow, precision=precision,
@@ -363,7 +410,8 @@ class BatchPowerFlow:
             use_distributed_slack=use_distributed_slack,
             # a row's angles must not depend on the other rows' topologies
             reference_slack="grid",
-            scheduling=scheduling, nb_iter_per_round=nb_iter_per_round, tol=tol)
+            scheduling=scheduling, nb_iter_per_round=nb_iter_per_round, tol=tol,
+            outer_loops=outer_loops, keep_outer_trace=keep_outer_trace)
         sweep.strategy = strategy
         pf = cls(sweep, snapshot_jacobian=snapshot_jacobian,
                  gen_v_conflict_tol=gen_v_conflict_tol, batch_size=batch_size)
@@ -388,7 +436,8 @@ class BatchPowerFlow:
         if value:
             grid = self._sweep._grid
             data = _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self.n_bus)
-            self._solver._s.set_slack_redistribution_data(data)
+            if not self._sweep.outer_loops:
+                self._solver._s.set_slack_redistribution_data(data)
             dev, rdt = self._dev, self._rdtype
             kind = np.asarray(data.kind, dtype=np.int64)
             self._rd = {
@@ -407,6 +456,8 @@ class BatchPowerFlow:
             }
         elif self._ext_sat_in_session:
             self._pending_ext_sat = "clear"
+        elif self._ext_lost_in_session:
+            self._pending_ext_lost = "clear"
         self._redistribute_slack = value
 
     # --------------------------------------------------------------- forward
@@ -494,7 +545,10 @@ class BatchPowerFlow:
         if self._redistribute_slack:
             P = self._slack_prepass(P, gen_p_in, gen_off, n_scen)
 
-        return _BatchPowerFlowOp.apply(P, Q, gen_v, self)
+        # with the outer loops, gen_p also enters through what they hold (a unit the
+        # distributed slack parks, a capability curve a frozen unit follows): the op's
+        # backward adds those terms to its gradient
+        return _BatchPowerFlowOp.apply(P, Q, gen_v, gen_p_in if self._sweep.outer_loops else None, self)
 
     def _row_masks(self, n_scen):
         """(n_scen, n_bus) bool: the buses each row's topology masks (none
@@ -549,6 +603,13 @@ class BatchPowerFlow:
             if gen_off is not None:
                 lost = lost - (gen_p_in * off.to(P.dtype)).sum(1)
         lost = torch.where(dropped, torch.zeros_like(lost), lost)
+        if self._sweep.outer_loops:
+            # the rows' DistributedSlack loop shares it before their first solve; for the
+            # gradient that share is a constant (see the module docstring)
+            lost_np = lost.detach().cpu().numpy().astype(np.float64)
+            lost_np[~(np.abs(lost_np) > 1e-6)] = np.nan
+            self._pending_ext_lost = lost_np.tolist()
+            return P
         if rd["n"] == 0:
             self._queue_ext_sat([[] for _ in range(n_scen)])
             return P
@@ -626,16 +687,65 @@ class BatchPowerFlow:
     def device(self):
         return self._dev
 
-    def compute_flows(self, V):
+    def compute_flows(self, V, taps_from=None):
         """Branch flows (``p_or_mw``, ``q_or_mvar``, ``p_ex_mw``, ``q_ex_mvar``,
         ``i_or_a``, ``i_ex_a``) of shape ``(n_scen, n_branch)`` from ``V``
         ``(n_scen, n_bus)``; pure torch, differentiable. Branches a row tripped
-        are NOT zeroed here (mask them with the status inputs if needed)."""
-        return _compute_flows_torch(V, self._yff, self._yft, self._ytf, self._ytt,
+        are NOT zeroed here (mask them with the status inputs if needed).
+
+        With ``outer_loops=True`` the transformers the loops moved are at the taps
+        each row settled on *in the forward that returned V* (any live forward,
+        not only the latest), which is found from ``V`` itself: the tensor that
+        forward returned, or a view of it as a whole (``detach()``). A tensor no
+        forward returned (a clone, a computed one) names its forward through
+        ``taps_from`` (the tensor that forward returned); without it, it is
+        refused rather than given another forward's taps."""
+        yff, yft, ytf, ytt = self._yff, self._yft, self._ytf, self._ytt
+        moved = None
+        if self._sweep.outer_loops:
+            src = V if taps_from is None else taps_from
+            found, moved = self._outer_taps_of(src)
+            if not found:
+                raise ValueError(
+                    "compute_flows: with outer_loops=True the flows depend on the taps the "
+                    "loops settled on in the forward that produced V, and "
+                    + ("V" if taps_from is None else "taps_from")
+                    + " is not a (live) tensor a forward of this BatchPowerFlow returned; "
+                    "pass that forward's output as taps_from")
+            if moved is not None and (V.dim() != 2 or V.shape[0] != moved[0]):
+                raise ValueError(
+                    f"compute_flows: V has shape {tuple(V.shape)}, its forward {moved[0]} rows")
+        if moved is not None:
+            # the transformers the outer loops left off the grid's taps, at the row's final
+            # taps (as lightsim2grid's compute_flows, get_outer_trafo_admittances)
+            n_scen, rows, cols, blocks = moved
+            ys = [y.unsqueeze(0).expand(n_scen, -1).clone() for y in (yff, yft, ytf, ytt)]
+            for k, y in enumerate(ys):
+                y[rows, cols] = blocks[:, k]
+            yff, yft, ytf, ytt = ys
+        return _compute_flows_torch(V, yff, yft, ytf, ytt,
                                     self._branch_from, self._branch_to,
                                     self._bus_vn_kv, self.sn_mva)
 
     # --------------------------------------------------------------- helpers
+    def _register_outer_taps(self, V, moved):
+        """Remember the taps (or None: none moved) the forward returning V settled on, for
+        as long as V lives: keyed by V's data pointer and shape, so that a view of V as a
+        whole finds them and a slice or another tensor does not"""
+        key = (V.data_ptr(), tuple(V.shape))
+        ref = weakref.ref(V)
+        self._outer_taps[key] = (ref, moved)
+        weakref.finalize(V, _drop_outer_taps, self._outer_taps, key, ref)
+
+    def _outer_taps_of(self, V):
+        """(found, taps) of the live forward output V is (a view of)"""
+        if not isinstance(V, Tensor):
+            return False, None
+        entry = self._outer_taps.get((V.data_ptr(), tuple(V.shape)))
+        if entry is None or entry[0]() is None:
+            return False, None
+        return True, entry[1]
+
     def _infer_n_scen(self, *inputs):
         n = None
         for x in inputs:
@@ -807,13 +917,17 @@ class _BatchPowerFlowOp(torch.autograd.Function):
     (P, Q) from the element inputs so autograd gets their gradients for free."""
 
     @staticmethod
-    def forward(ctx, P: Tensor, Q: Tensor, gen_v, pf: BatchPowerFlow) -> Tensor:
+    def forward(ctx, P: Tensor, Q: Tensor, gen_v, gen_p, pf: BatchPowerFlow) -> Tensor:
         solver = pf._solver
         dev = pf._dev
         stream = torch.cuda.current_stream(dev).cuda_stream
 
         S = torch.complex(P, Q).contiguous()
         solver.set_injections_dlpack(S.__dlpack__(), stream)
+        if gen_p is not None:
+            # the outer loops start each row's units from its own set-points (DistributedSlack,
+            # ReactiveLimits' capability curves)
+            solver._s.set_gen_p_rows(np.ascontiguousarray(gen_p.detach().cpu().numpy(), dtype=np.float64))
         if pf._pending_topology is not None:
             pf._sweep.set_topology(pf._pending_topology)
             pf._topology_mask = pf._pending_topology_mask
@@ -864,6 +978,14 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                 solver._s.set_external_slack_saturation(pf._pending_ext_sat)
                 pf._ext_sat_in_session = True
             pf._pending_ext_sat = None
+        if pf._pending_ext_lost is not None:
+            if isinstance(pf._pending_ext_lost, str):
+                solver._s.clear_external_lost_p()
+                pf._ext_lost_in_session = False
+            else:
+                solver._s.set_external_lost_p(pf._pending_ext_lost)
+                pf._ext_lost_in_session = True
+            pf._pending_ext_lost = None
 
         want_gen_v = gen_v is not None and ctx.needs_input_grad[2]
         needs_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or want_gen_v
@@ -895,6 +1017,57 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                     if groups:
                         m[r, torch.as_tensor(groups, device=dev)] = True
                 ctx.stranded = m
+
+        # The outer loops: the taps they settled on (compute_flows), and what each row's
+        # last inner solve held (lightsim2grid's AdjointSolveInfo), read off the session
+        if pf._sweep.outer_loops:
+            moved = None
+            rows, trafos, blocks = solver._s.get_outer_trafo_blocks()
+            if len(rows):
+                moved = (
+                    V.shape[0], torch.as_tensor(np.asarray(rows, dtype=np.int64), device=dev),
+                    torch.as_tensor(pf.n_line + np.asarray(trafos, dtype=np.int64), device=dev),
+                    torch.as_tensor(np.asarray(blocks).reshape(-1, 4), dtype=pf._cdtype, device=dev))
+            pf._register_outer_taps(V, moved)
+        ctx.outer = None
+        if pf._sweep.outer_loops and needs_grad:
+            res = pf._sweep.get_outer_results()
+            n_grp = pf._vc_v_row.numel()
+            pq = torch.zeros(V.shape, dtype=torch.bool, device=dev)
+            lost = torch.zeros(V.shape[0], n_grp, dtype=torch.bool, device=dev)
+            # gathered on the host, uploaded once each (not one copy and scatter per row)
+            pq_r, pq_b, lost_r, lost_g, fix_r, fix_g = [], [], [], [], [], []
+            sl_r, sl_g, sl_row, sl_c = [], [], [], []
+            for r, rr in enumerate(res):
+                b = rr.pq_buses
+                if b:
+                    pq_r.extend([r] * len(b))
+                    pq_b.extend(b)
+                gl = rr.vset_lost_groups
+                if gl and n_grp:
+                    lost_r.extend([r] * len(gl))
+                    lost_g.extend(gl)
+                gf = rr.gen_p_fixed
+                if gf:
+                    fix_r.extend([r] * len(gf))
+                    fix_g.extend(gf)
+                for g, row, c in rr.gen_p_slope:
+                    sl_r.append(r)
+                    sl_g.append(g)
+                    sl_row.append(row)
+                    sl_c.append(c)
+
+            def _idx(x):
+                return torch.as_tensor(np.asarray(x, dtype=np.int64), device=dev)
+            if pq_r:
+                pq[_idx(pq_r), _idx(pq_b)] = True
+            if lost_r:
+                lost[_idx(lost_r), _idx(lost_g)] = True
+            fixed = (_idx(fix_r), _idx(fix_g)) if fix_r else None
+            slopes = ((_idx(sl_r), _idx(sl_g), _idx(sl_row),
+                       torch.as_tensor(np.asarray(sl_c, dtype=np.float64), dtype=pf._rdtype, device=dev))
+                      if sl_r else None)
+            ctx.outer = (pq, lost, fixed, slopes)
 
         ctx.pf = pf
         ctx.run_id = solver.run_counter
@@ -1006,6 +1179,15 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             if ctx.released is not None:
                 rel = ctx.released[:, safe_bus]
                 g = torch.where(rel, torch.zeros_like(g), g)
+            if ctx.outer is not None:
+                # what the loops left: a bus they switched PQ fixes no |V| any more, a group
+                # every controller of which they hold lost its set-point
+                pq, lost, _, _ = ctx.outer
+                g = torch.where(pq[:, safe_bus], torch.zeros_like(g), g)
+                if lost.shape[1]:
+                    grp = pf._vc_group[safe_bus]
+                    lost_col = (grp >= 0).unsqueeze(0) & lost[:, grp.clamp(min=0)]
+                    g = torch.where(lost_col, torch.zeros_like(g), g)
             # tied set-points: the one derivative that exists is split between
             # the columns that actually applied on that row
             applied = pf._driven.unsqueeze(0) & ~torch.isnan(gen_v)
@@ -1014,4 +1196,24 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             share = 1.0 / count.gather(1, safe_bus.unsqueeze(0).expand(n_scen, -1)).clamp(min=1.0)
             grad_gen_v = torch.where(applied, g * share, torch.zeros_like(g))
 
-        return grad_P, grad_Q, grad_gen_v, None
+        # gen_p beyond its bus injection (lightsim2grid's gen_p_indirect_grad): a unit the
+        # distributed slack holds at a bound moves nothing, the reactive output of a unit
+        # frozen at a limit of its capability curve follows its target P
+        grad_gen_p = None
+        if ctx.outer is not None and ctx.needs_input_grad[3]:
+            _, _, fixed, slopes = ctx.outer
+            grad_gen_p = torch.zeros(n_scen, pf.n_gen, dtype=rdtype, device=dev)
+            inv_sn = 1.0 / pf.sn_mva
+            # on the device in one go each (repeated (row, gen) pairs add up)
+            if fixed is not None:
+                r_t, g_t = fixed
+                bus = pf._gen_bus_all[g_t]
+                pr = torch.where(bus >= 0, p_row[bus.clamp(min=0)], torch.full_like(bus, -1))
+                ok = pr >= 0
+                r_t, g_t, pr = r_t[ok], g_t[ok], pr[ok]
+                grad_gen_p.index_put_((r_t, g_t), -lam[r_t, pr].to(rdtype) * inv_sn, accumulate=True)
+            if slopes is not None:
+                r_t, g_t, row_t, c_t = slopes
+                grad_gen_p.index_put_((r_t, g_t), lam[r_t, row_t].to(rdtype) * c_t, accumulate=True)
+
+        return grad_P, grad_Q, grad_gen_v, grad_gen_p, None

@@ -271,3 +271,43 @@ def test_calibrate_tail_max_groups(case118):
     assert c.max_groups == int(np.floor(c.t_full_ms / c.t_group_ms))
     assert ca.tail_max_groups == 16          # measured, not set
     assert ca.calibrate_tail_max_groups(n_repeat=1, batch_size=4).max_groups == 0
+
+
+# =============================================================================
+# GPUSIM2GRID_COUNT_PIVOTS: the counters are the run's, every handle included
+# =============================================================================
+def _pivot_ca(grid, monkeypatch, **kwargs):
+    from gpusim2grid import ContingencyAnalysisGPU
+    monkeypatch.setenv("GPUSIM2GRID_COUNT_PIVOTS", "1")   # read when the driver's solvers are built
+    nbr = len(grid.get_lines()) + len(grid.get_trafos())
+    ca = ContingencyAnalysisGPU(grid, precision=PREC, nb_iter=10, handle_disconnected_grid=True, **kwargs)
+    ca.add_contingencies_by_branch_id([[i] for i in range(nbr)])
+    return ca
+
+
+def test_pivot_counters_are_the_runs(case118, monkeypatch):
+    """a run that reuses its driver reports its own factorizations, not the driver's whole life"""
+    ca = _pivot_ca(case118, monkeypatch)
+    ca.compute(batch_size=64)
+    t1 = ca.timings
+    ca.compute(batch_size=64)
+    t2 = ca.timings
+    assert ca.solver._s.driver_build_counter == 1   # the same driver
+    assert t1.cudss_npivots_reads > 0
+    assert t2.cudss_npivots_reads == t1.cudss_npivots_reads
+    assert 0 <= t2.cudss_npivots_total and t2.cudss_npivots_max <= t2.cudss_npivots_total
+
+
+def test_pivot_counters_count_the_tail(case118, monkeypatch):
+    """a continuous run's tail factorizes on its own handle: its reads count too (one per round
+    and group, so at least one per round)"""
+    reads = {}
+    for mg in (0, 10 ** 6):
+        ca = _pivot_ca(case118, monkeypatch, scheduling="continuous")
+        ca.tail_max_groups, ca.tail_group_size = mg, 3
+        ca.compute(batch_size=64)
+        t = ca.timings
+        assert (t.n_tail_rounds > 0) == (mg > 0)
+        assert t.cudss_npivots_reads >= t.n_rounds, (mg, t.cudss_npivots_reads, t.n_rounds, t.n_tail_rounds)
+        reads[mg] = t.cudss_npivots_reads
+    assert reads[10 ** 6] > reads[0]
