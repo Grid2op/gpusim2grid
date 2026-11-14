@@ -25,12 +25,14 @@ import numpy as np
 import pytest
 
 from conftest import requires_gpu
-from gpusim2grid._gpusim2grid import have_ls2g_bridge
+from gpusim2grid._gpusim2grid import have_ls2g_bridge, is_fp32
 
 pytestmark = requires_gpu
 needs_bridge = pytest.mark.skipif(not have_ls2g_bridge, reason="needs the lightsim2grid C++ bridge")
 
 MAX_IT, TOL = 20, 1e-10
+# the GPU base case's tolerance: 1e-10 cannot be reached in FP32, which keeps the default
+GPU_TOL = {} if is_fp32 else {"tol_base": TOL}
 
 
 def _make_grid():
@@ -69,8 +71,8 @@ def _elements(grid, n):
 # ---------------------------------------------------------------- violation_capacity
 def _sessions(grid):
     from gpusim2grid import ContingencyAnalysisGPU, ScenarioSweepGPU
-    ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
-    sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=TOL)
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
+    sw = ScenarioSweepGPU(grid, nb_iter=10, **GPU_TOL)
     return {"ca": ca, "ss": sw}
 
 
@@ -90,21 +92,46 @@ def test_violation_capacity_below_one_is_refused(case, kind, value):
 
 
 @needs_bridge
-def test_violation_capacity_of_one_still_runs(case):
-    """K = 1, the smallest capacity, gives one record per type and a diverged row its
-    DIVERGENCE record."""
-    from gpusim2grid import ContingencyAnalysisGPU
+@pytest.mark.parametrize("kind", ["ca", "ss"])
+def test_violation_settings_set_on_the_facade_take_effect(case, kind):
+    """violation_capacity and violation_tol set on the ContingencyAnalysisGPU /
+    ScenarioSweepGPU facade reach the session (they were plain Python attributes, silently
+    ignored): with K = 1 and every bus above its limit, each row keeps one record and is
+    truncated, its total still exact; with a violation_tol no Newton step can reach, every
+    row is one DIVERGENCE record."""
+    from gpusim2grid import ContingencyAnalysisGPU, ScenarioSweepGPU
     from gpusim2grid.contingency_analysis import LimitViolationType
 
     grid = case["grid"]
-    ca = ContingencyAnalysisGPU(grid, nb_iter=1, tol_base=TOL, compute_limit_violations=True)
-    ca.violation_capacity = 1
-    ca.add_contingencies_by_branch_id([[0]])
-    ca.violation_tol = 1e-12          # one Newton step from the base case cannot reach it
-    ca.compute(batch_size=1)
-    viol = ca.get_violations()
-    assert len(viol) == 1 and len(viol[0]) == 1
-    assert viol[0][0].violation_type == LimitViolationType.DIVERGENCE
+    n_bus, n_rows = case["n_bus"], 2
+    n_lines = len(grid.get_lines())
+    n_br = n_lines + len(grid.get_trafos())
+    vn = np.asarray(grid.get_bus_vn_kv(), dtype=float)[case["buses"]]
+    if kind == "ca":
+        obj = ContingencyAnalysisGPU(grid, nb_iter=10, compute_limit_violations=True, **GPU_TOL)
+        obj.add_contingencies_by_branch_id([[0], [1]])
+    else:
+        obj = ScenarioSweepGPU(grid, nb_iter=10, compute_limit_violations=True, **GPU_TOL)
+        obj.set_injections_from_elements(*_elements(grid, n_rows))
+    obj.set_limits(0.1 * vn, 0.5 * vn, np.full(n_br, np.nan), np.full(n_br, np.nan), n_lines) \
+        if kind == "ca" else obj._inner.set_limits(0.1 * vn, 0.5 * vn, np.full(n_br, np.nan),
+                                                   np.full(n_br, np.nan), n_lines)
+    obj.violation_capacity = 1
+    assert obj._inner.violation_capacity == 1
+    obj.compute(batch_size=4)
+    viol = obj.get_violations()
+    assert [len(v) for v in viol] == [1] * n_rows
+    assert all(v[0].violation_type == LimitViolationType.HIGH_VOLTAGE for v in viol)
+    assert obj.get_violations_truncated().all()
+    np.testing.assert_array_equal(obj.get_violation_counts()["high_voltage"], n_bus)
+
+    obj.violation_tol = 1e-30           # below rounding: nothing can converge to it
+    assert obj._inner.violation_tol == pytest.approx(1e-30)
+    obj.compute(batch_size=4)
+    viol = obj.get_violations()
+    assert all(len(v) == 1 and v[0].violation_type == LimitViolationType.DIVERGENCE for v in viol)
+    with pytest.raises(ValueError, match="violation_capacity"):
+        obj.violation_capacity = 0
 
 
 # ------------------------------------------------------- benchmark_cudss_batch_raw
@@ -143,13 +170,13 @@ def test_branch_named_twice_is_tripped_once(case, solver_atol):
     (whose contingency is a set) has it."""
     from gpusim2grid import ContingencyAnalysisGPU
     grid = case["grid"]
-    ca = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
     ca.add_contingencies_by_branch_id([[3], [3, 3], [5, 3, 5]])
     ca.compute(batch_size=4)
     V = _V(ca, 3, case["n_bus"])
     assert np.all(ca.last_residuals() < solver_atol)
     np.testing.assert_allclose(V[1], V[0], rtol=0., atol=solver_atol)
-    ref = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    ref = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
     ref.add_contingencies_by_branch_id([[3, 5]])
     ref.compute(batch_size=1)
     np.testing.assert_allclose(V[2], _V(ref, 1, case["n_bus"])[0], rtol=0., atol=solver_atol)
@@ -164,7 +191,7 @@ def test_engine_normalises_overlapping_lists(case, solver_atol):
     from gpusim2grid import ContingencyAnalysisGPU
     grid = case["grid"]
     n_bus = case["n_bus"]
-    raw = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    raw = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
     #       branches    shunts  loads   gens    side1   side2
     rows = [([3],       [],     [],     [],     [3],    []),
             ([],        [],     [],     [],     [4],    [4]),
@@ -173,7 +200,7 @@ def test_engine_normalises_overlapping_lists(case, solver_atol):
             ([],        [],     [],     [1, 1], [],     [])]
     raw._inner.build_contingencies_full(*[[list(r[k]) for r in rows] for k in range(6)])
     raw.compute(batch_size=8)
-    clean = ContingencyAnalysisGPU(grid, nb_iter=10, tol_base=TOL)
+    clean = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
     clean.add_contingencies([((3,), (), (), ()), ((4,), (), (), ()), ((), (0,), (), ()),
                              ((), (), (2,), ()), ((), (), (), (1,))])
     clean.compute(batch_size=8)
@@ -197,7 +224,7 @@ def test_sweep_shunt_mask_follows_a_new_row_count(case, solver_atol):
     implicit "none", resized with the rows (the user never called set_topology)."""
     from gpusim2grid import ScenarioSweepGPU
     grid = case["grid"]
-    sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=TOL)
+    sw = ScenarioSweepGPU(grid, nb_iter=10, **GPU_TOL)
     shunt_off_ref = grid.copy()
     shunt_off_ref.deactivate_shunt(0)
     shunt_off_ref.tell_solver_need_reset()
@@ -219,7 +246,7 @@ def test_sweep_shunt_mask_keeps_refusing_a_stale_explicit_topology(case):
     rows become 4: the shunt mask (or the run) asks for set_topology again."""
     from gpusim2grid import ScenarioSweepGPU
     grid = case["grid"]
-    sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=TOL)
+    sw = ScenarioSweepGPU(grid, nb_iter=10, **GPU_TOL)
     sw.set_injections_from_elements(*_elements(grid, 2))
     sw.set_topology([[3], []])
     sw.set_injections_from_elements(*_elements(grid, 4))
@@ -249,7 +276,7 @@ def test_batch_power_flow_shunt_status_then_another_row_count(case, solver_atol)
 def test_load_mask_with_wrong_columns_is_refused_by_the_session(case):
     from gpusim2grid import ScenarioSweepGPU
     grid = case["grid"]
-    sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=TOL)
+    sw = ScenarioSweepGPU(grid, nb_iter=10, **GPU_TOL)
     with pytest.raises(RuntimeError, match="load"):
         sw._inner._s.set_contingency_loads(np.zeros((2, len(grid.get_loads()) + 1), dtype=bool))
 
@@ -260,7 +287,7 @@ def test_stale_load_mask_is_refused_not_dropped(case):
     set_contingency_gens) instead of solving with every load connected."""
     from gpusim2grid import ScenarioSweepGPU
     grid = case["grid"]
-    sw = ScenarioSweepGPU(grid, nb_iter=10, tol_base=TOL)
+    sw = ScenarioSweepGPU(grid, nb_iter=10, **GPU_TOL)
     mask = np.zeros((2, len(grid.get_loads())), dtype=bool)
     mask[0, 3] = True
     sw.set_contingency_loads(mask)

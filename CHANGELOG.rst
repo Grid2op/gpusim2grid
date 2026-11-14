@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
+  the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its
   DIVERGENCE record into an empty buffer, an illegal address.
 - [FIXED] ``benchmark_cudss_batch_raw`` refuses a CSR matrix whose ``indptr`` or column indices are out of range.
