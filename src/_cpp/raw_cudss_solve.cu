@@ -528,6 +528,25 @@ TailCalibration calibrate_tail_groups(
         make_handle(solver, batch_size);
         res.t_full_ms  = timed(solver, 0);
         res.t_group_ms = timed(solver, G);
+        // k groups are ONE prefix call of k·G matrices (TailSolve::prefix), far
+        // cheaper than k · t_group: the largest k with k·G < batch_size whose
+        // prefix is still faster than the full batch, bisected (prefix time
+        // grows with k)
+        const int k_max = group_size < batch_size ? (batch_size - 1) / G : 0;
+        int lo = 0, hi = k_max;   // t(lo·G) < t_full (lo = 0 trivially); answer in [lo, hi]
+        if (k_max >= 1 && res.t_group_ms < res.t_full_ms) {
+            lo = 1;
+            // the common case first: every prefix short of the batch pays
+            if (k_max > 1 && timed(solver, k_max * G) < res.t_full_ms) lo = k_max;
+            else if (k_max > 1) hi = k_max - 1;
+            while (lo < hi) {
+                const int mid = lo + (hi - lo + 1) / 2;
+                if (timed(solver, mid * G) < res.t_full_ms) lo = mid;
+                else                                         hi = mid - 1;
+            }
+        }
+        res.max_groups = lo;
+        return res;
     } else {
         CudssBatchSolver full, group;
         make_handle(full, batch_size);

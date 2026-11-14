@@ -29,6 +29,8 @@ Change Log
   the construction value's lightsim2grid order, with cuDSS and the own LU alike).
 - [FIXED] ``benchmark_cudss_batch_raw(linear_solver=OwnLu)`` checks the CSR before ordering it (a malformed one
   crashed the interpreter).
+- [FIXED] ``calibrate_tail_max_groups()`` with ``linear_solver='own_lu'``: measured on the prefix the tail runs
+  (k groups = one call), no longer ``t_full / t_group``, which advised far too few groups.
 - [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
   the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its

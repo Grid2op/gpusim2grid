@@ -126,7 +126,9 @@ struct TailCalibration {
     int    batch_size = 0, group_size = 0, n_repeat = 0;
     double t_full_ms  = 0.;   // mean wall ms of REFACTORIZATION + SOLVE, batch_size matrices
     double t_group_ms = 0.;   // the same, group_size matrices
-    int    max_groups = 0;    // floor(t_full_ms / t_group_ms); 0 when group_size >= batch_size
+    int    max_groups = 0;    // cuDSS: floor(t_full_ms / t_group_ms); own LU: the largest k with
+                              // k·group_size < batch_size whose prefix is faster than t_full_ms;
+                              // 0 when group_size >= batch_size
 };
 
 struct AcPfNrState;
@@ -138,8 +140,9 @@ struct AcPfNrState;
 // one of group_size matrices, each stream-synchronized; the tail's groups pay
 // as long as ceil(n_live / G) * t_group < t_full, i.e. up to max_groups
 // groups. The own LU's tail runs on an active prefix of the forward's solver
-// rather than a second handle, so its t_group is measured that way (and k
-// groups cost less than k · t_group there: one launch sequence). The tail also
+// rather than a second handle: k groups are one call on k·G matrices, far
+// cheaper than k · t_group, so its max_groups is bisected on the prefix time
+// itself (one solver, t_group = the G-matrix prefix). The tail also
 // runs the Newton kernels on fewer slots, so the value is conservative. Allocates batch_size systems (values,
 // right-hand sides, solutions) and their factors for the duration of the call.
 TailCalibration calibrate_tail_groups(

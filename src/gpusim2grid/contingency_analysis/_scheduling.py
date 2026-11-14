@@ -214,9 +214,12 @@ class SchedulingEngineMixin:
         on one of :attr:`tail_group_size` matrices. Returns the
         ``TailCalibration`` (``t_full_ms``, ``t_group_ms``, ``max_groups =
         floor(t_full_ms / t_group_ms)``, what the tail's rule compares); sets
-        nothing. cuDSS only: the tail also runs the Newton kernels on fewer
-        slots, so ``max_groups`` is conservative. Allocates ``batch_size``
-        systems and their factors while it runs."""
+        nothing. With ``linear_solver='own_lu'`` the tail runs k groups as one
+        solve on the first k·``tail_group_size`` matrices, so ``max_groups`` is
+        the largest k whose such prefix is still faster than the full batch
+        (bisected; ``t_group_ms`` is the one-group prefix). The tail also runs
+        the Newton kernels on fewer slots, so ``max_groups`` is conservative.
+        Allocates ``batch_size`` systems and their factors while it runs."""
         return self._s.calibrate_tail_max_groups(
             int(n_repeat), -1 if batch_size is None else int(batch_size))
 

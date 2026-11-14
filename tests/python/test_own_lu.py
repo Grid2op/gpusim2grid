@@ -404,3 +404,23 @@ def test_raw_own_lu_validates_before_ordering(case):
     assert r.returncode == 0, (r.returncode, r.stderr[-2000:])
     assert "REFUSED: benchmark_cudss_batch_raw:" in r.stdout, (r.stdout, r.stderr[-2000:])
 
+
+
+def test_calibrate_tail_max_groups_own_lu(case118):
+    """The own LU's tail runs k groups as ONE prefix call of k·G matrices, so
+    k groups pay while that prefix is faster than the full batch -- not while
+    k · t(G) is (a prefix costs far less than k separate groups). One group
+    more than the calibrated value must not still be clearly cheaper than the
+    full batch (re-measured: up to timing noise)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    S, G = 512, 15
+    ca = ContingencyAnalysisGPU(case118, precision=PREC, nb_iter=10, scheduling="continuous",
+                                linear_solver="own_lu")
+    ca.tail_group_size = G
+    c = ca.calibrate_tail_max_groups(n_repeat=5, batch_size=S)
+    assert c.t_full_ms > 0 and c.t_group_ms > 0
+    assert 1 <= c.max_groups and c.max_groups * G < S
+    if (c.max_groups + 1) * G < S:
+        ca.tail_group_size = (c.max_groups + 1) * G
+        nxt = ca.calibrate_tail_max_groups(n_repeat=5, batch_size=S)
+        assert nxt.t_group_ms >= 0.8 * c.t_full_ms, (c.max_groups, nxt.t_group_ms, c.t_full_ms)
