@@ -1168,7 +1168,7 @@ def test_dist_harness_layout():
 
 
 @pytest.mark.parametrize("load_scale, line_off", [(1., None), (1.05, 1), (1.1, 2), (1.2, 3), (0.9, 5)])
-def test_dist_matches_single_nrouterdist_solve(load_scale, line_off):
+def test_dist_matches_single_nrouterdist_solve(load_scale, line_off, solver_atol):
     res, stats = _compare_single_solve(
         lambda **kw: _case14_dist(**kw), load_scale=load_scale, line_off=line_off)
     assert any("PARK" in str(d) for d in stats.decisions)
@@ -1178,7 +1178,7 @@ def test_dist_matches_single_nrouterdist_solve(load_scale, line_off):
     moved = dict(res.gen_target_p)
     for g, gen in enumerate(row.get_generators()):
         if g in moved:
-            assert moved[g] == pytest.approx(gen.res_p_mw, abs=1e-6)
+            assert moved[g] == pytest.approx(gen.res_p_mw, abs=solver_atol * row.get_sn_mva())
 
 
 def _solved(grid):
@@ -1224,7 +1224,7 @@ def test_dist_without_the_loop_is_the_single_slack():
 @pytest.mark.skipif(not getattr(_cpp, "have_ls2g_outer_resume", False),
                     reason="lightsim2grid without its loops' state accessors")
 @pytest.mark.parametrize("only_ds", [True, False])
-def test_dist_rows_resume_with_the_parked_units(only_ds):
+def test_dist_rows_resume_with_the_parked_units(only_ds, solver_atol):
     """lightsim2grid's InjectionSweepCPP from its "n" solve: the unit the "n" solve parked starts
     each row parked at its bound, so a row with more load needs no outer iteration
     (DistributedSlackLoop::_keep_parked, read off the resume point's parked_units())"""
@@ -1255,7 +1255,7 @@ def test_dist_rows_resume_with_the_parked_units(only_ds):
         assert res_ls[i].converged and status == CONVERGED, msg
         assert res.nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
         assert int(res.status) == int(res_ls[i].status), msg
-        np.testing.assert_allclose(V, V_ls[i][buses], rtol=0., atol=1e-8, err_msg=msg)
-        assert dict(res.gen_target_p)[CAPPED_GEN] == pytest.approx(CAPPED_MAX_P, abs=1e-9)
+        np.testing.assert_allclose(V, V_ls[i][buses], rtol=0., atol=solver_atol, err_msg=msg)
+        assert dict(res.gen_target_p)[CAPPED_GEN] == pytest.approx(CAPPED_MAX_P, abs=solver_atol * base.get_sn_mva())
     if only_ds:
         assert all(r.nb_outer_iterations == 0 for r in res_ls)

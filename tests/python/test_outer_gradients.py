@@ -218,7 +218,7 @@ def _redistribute_rows(grid):
                     "line_status": torch.as_tensor(line_status, device="cuda")}
 
 
-def test_redistribute_slack_forward_is_the_sessions():
+def test_redistribute_slack_forward_is_the_sessions(solver_atol):
     """BatchPowerFlow measures what each row loses in torch: the same rows as ScenarioSweepGPU's
     own redistribute_slack, whose DistributedSlack loop shares it before the first solve"""
     from gpusim2grid import ScenarioSweepGPU
@@ -242,7 +242,7 @@ def test_redistribute_slack_forward_is_the_sessions():
     V_sw = np.asarray(sw.V_results.to_numpy()).reshape(V.shape)
     np.testing.assert_array_equal(np.isfinite(V), np.isfinite(V_sw))
     fin = np.isfinite(V)
-    np.testing.assert_allclose(V[fin], V_sw[fin], rtol=0., atol=1e-10)
+    np.testing.assert_allclose(V[fin], V_sw[fin], rtol=0., atol=solver_atol)
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
@@ -271,7 +271,7 @@ def test_redistribute_slack_distributed_in_the_newton(init_from_n):
     _check_all(pf, inputs, grads, **status)
 
 
-def test_redistribute_slack_turned_off():
+def test_redistribute_slack_turned_off(solver_atol):
     """turning redistribute_slack off hands the session nothing to share any more: the next
     forward is the one of a model built without it"""
     grid = _grid(distributed=True)
@@ -285,10 +285,10 @@ def test_redistribute_slack_turned_off():
         V_ref = _pf(grid, handle_disconnected_grid=True)(**tensors, **status).cpu().numpy()
     assert not any(any("SHARE_LOST_P" in d for d in r.decisions) for r in pf.sweep.get_outer_results())
     fin = np.isfinite(V_ref)
-    np.testing.assert_allclose(V[fin], V_ref[fin], rtol=0., atol=1e-10)
+    np.testing.assert_allclose(V[fin], V_ref[fin], rtol=0., atol=solver_atol)
 
 
-def test_tap_changer_settled_taps():
+def test_tap_changer_settled_taps(solver_atol):
     """TransformerVoltageControl moves a ratio tap in the rows: the gradient is the one at the
     taps the loops settled on (the row's last Ybus, put back by the adjoint), and compute_flows
     uses those taps, as the session's own flows"""
@@ -313,11 +313,11 @@ def test_tap_changer_settled_taps():
         amps = pf.compute_flows(V0)["i_or_a"].cpu().numpy()
     pf.sweep.compute_flows()
     amps_sw = np.asarray(pf.sweep.or_amps.to_numpy()).reshape(len(scales), -1)
-    np.testing.assert_allclose(amps, amps_sw, rtol=1e-8, atol=1e-6)
+    np.testing.assert_allclose(amps, amps_sw, rtol=solver_atol, atol=solver_atol)
     _check_all(pf, inputs, grads, names=("load_p", "gen_v"))
 
 
-def test_compute_flows_at_the_taps_of_its_own_forward():
+def test_compute_flows_at_the_taps_of_its_own_forward(solver_atol):
     """compute_flows(V) uses the taps the loops settled on in the forward that returned V, not
     those of the latest forward; a tensor no forward returned (a clone) names its forward
     through `taps_from`, and is refused without it rather than given another forward's taps"""
@@ -339,15 +339,15 @@ def test_compute_flows_at_the_taps_of_its_own_forward():
         taps_b = [tuple(r.ratio_tap) for r in pf.sweep.get_outer_results()]
         assert taps_a[0] != taps_b[0], (taps_a, taps_b)
         amps = pf.compute_flows(V_a)["i_or_a"].cpu().numpy()
-        np.testing.assert_allclose(amps, amps_a, rtol=1e-8, atol=1e-6)
+        np.testing.assert_allclose(amps, amps_a, rtol=solver_atol, atol=solver_atol)
         # a detached view of V_a is V_a's
         amps_view = pf.compute_flows(V_a.detach()[:, :])["i_or_a"].cpu().numpy()
-        np.testing.assert_allclose(amps_view, amps_a, rtol=1e-8, atol=1e-6)
+        np.testing.assert_allclose(amps_view, amps_a, rtol=solver_atol, atol=solver_atol)
         # a clone: no forward returned it
         with pytest.raises(ValueError, match="taps_from"):
             pf.compute_flows(V_a.clone())
         amps_clone = pf.compute_flows(V_a.clone(), taps_from=V_a)["i_or_a"].cpu().numpy()
-        np.testing.assert_allclose(amps_clone, amps_a, rtol=1e-8, atol=1e-6)
+        np.testing.assert_allclose(amps_clone, amps_a, rtol=solver_atol, atol=solver_atol)
 
 
 def test_capability_curve_slope():
