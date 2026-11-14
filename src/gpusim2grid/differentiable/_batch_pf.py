@@ -202,6 +202,8 @@ the next forward in both modes (and ``torch.autograd.gradcheck``, which runs
 several forwards first, cannot be used: check with central differences).
 """
 
+import weakref
+
 import numpy as np
 import torch
 from torch import Tensor
@@ -210,6 +212,13 @@ from .. import _gpusim2grid as _cpp
 from .._ls2g_utils import extract_branch_data, gen_v_driven_columns, GEN_V_CONFLICT_TOL
 from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
 from ._flows import compute_flows as _compute_flows_torch
+
+
+def _drop_outer_taps(table, key, ref):
+    """weakref.finalize of a forward output: forget its taps (unless a newer output took the key)"""
+    entry = table.get(key)
+    if entry is not None and entry[0] is ref:
+        del table[key]
 
 
 __all__ = ["BatchPowerFlow"]
@@ -333,7 +342,9 @@ class BatchPowerFlow:
         self._pending_gen_off = None    # mask to hand to the session on the next run
         self._pending_gen_off_mask = None   # _gen_off_mask once _pending_gen_off is set
         self._released = None           # (n_scen, n_bus) bool of the last run, or None
-        self._trafo_moved = None        # outer loops: (n_scen, rows, branches, blocks) moved taps
+        # outer loops: the taps each live forward output's rows settled on, keyed by that V
+        # (see _register_outer_taps)
+        self._outer_taps = {}
         self._skip_in_session = False
         self._pending_skip = None       # (n_scen,) bool ndarray, or "clear"
         # Columns the session drives (their regulated bus is Vm-fixed, or held by
@@ -676,14 +687,35 @@ class BatchPowerFlow:
     def device(self):
         return self._dev
 
-    def compute_flows(self, V):
+    def compute_flows(self, V, taps_from=None):
         """Branch flows (``p_or_mw``, ``q_or_mvar``, ``p_ex_mw``, ``q_ex_mvar``,
         ``i_or_a``, ``i_ex_a``) of shape ``(n_scen, n_branch)`` from ``V``
         ``(n_scen, n_bus)``; pure torch, differentiable. Branches a row tripped
-        are NOT zeroed here (mask them with the status inputs if needed)."""
+        are NOT zeroed here (mask them with the status inputs if needed).
+
+        With ``outer_loops=True`` the transformers the loops moved are at the taps
+        each row settled on *in the forward that returned V* (any live forward,
+        not only the latest), which is found from ``V`` itself: the tensor that
+        forward returned, or a view of it as a whole (``detach()``). A tensor no
+        forward returned (a clone, a computed one) names its forward through
+        ``taps_from`` (the tensor that forward returned); without it, it is
+        refused rather than given another forward's taps."""
         yff, yft, ytf, ytt = self._yff, self._yft, self._ytf, self._ytt
-        moved = self._trafo_moved
-        if moved is not None and V.dim() == 2 and V.shape[0] == moved[0]:
+        moved = None
+        if self._sweep.outer_loops:
+            src = V if taps_from is None else taps_from
+            found, moved = self._outer_taps_of(src)
+            if not found:
+                raise ValueError(
+                    "compute_flows: with outer_loops=True the flows depend on the taps the "
+                    "loops settled on in the forward that produced V, and "
+                    + ("V" if taps_from is None else "taps_from")
+                    + " is not a (live) tensor a forward of this BatchPowerFlow returned; "
+                    "pass that forward's output as taps_from")
+            if moved is not None and (V.dim() != 2 or V.shape[0] != moved[0]):
+                raise ValueError(
+                    f"compute_flows: V has shape {tuple(V.shape)}, its forward {moved[0]} rows")
+        if moved is not None:
             # the transformers the outer loops left off the grid's taps, at the row's final
             # taps (as lightsim2grid's compute_flows, get_outer_trafo_admittances)
             n_scen, rows, cols, blocks = moved
@@ -696,6 +728,24 @@ class BatchPowerFlow:
                                     self._bus_vn_kv, self.sn_mva)
 
     # --------------------------------------------------------------- helpers
+    def _register_outer_taps(self, V, moved):
+        """Remember the taps (or None: none moved) the forward returning V settled on, for
+        as long as V lives: keyed by V's data pointer and shape, so that a view of V as a
+        whole finds them and a slice or another tensor does not"""
+        key = (V.data_ptr(), tuple(V.shape))
+        ref = weakref.ref(V)
+        self._outer_taps[key] = (ref, moved)
+        weakref.finalize(V, _drop_outer_taps, self._outer_taps, key, ref)
+
+    def _outer_taps_of(self, V):
+        """(found, taps) of the live forward output V is (a view of)"""
+        if not isinstance(V, Tensor):
+            return False, None
+        entry = self._outer_taps.get((V.data_ptr(), tuple(V.shape)))
+        if entry is None or entry[0]() is None:
+            return False, None
+        return True, entry[1]
+
     def _infer_n_scen(self, *inputs):
         n = None
         for x in inputs:
@@ -970,14 +1020,15 @@ class _BatchPowerFlowOp(torch.autograd.Function):
 
         # The outer loops: the taps they settled on (compute_flows), and what each row's
         # last inner solve held (lightsim2grid's AdjointSolveInfo), read off the session
-        pf._trafo_moved = None
         if pf._sweep.outer_loops:
+            moved = None
             rows, trafos, blocks = solver._s.get_outer_trafo_blocks()
             if len(rows):
-                pf._trafo_moved = (
+                moved = (
                     V.shape[0], torch.as_tensor(np.asarray(rows, dtype=np.int64), device=dev),
                     torch.as_tensor(pf.n_line + np.asarray(trafos, dtype=np.int64), device=dev),
                     torch.as_tensor(np.asarray(blocks).reshape(-1, 4), dtype=pf._cdtype, device=dev))
+            pf._register_outer_taps(V, moved)
         ctx.outer = None
         if pf._sweep.outer_loops and needs_grad:
             res = pf._sweep.get_outer_results()

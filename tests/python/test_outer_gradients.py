@@ -317,6 +317,39 @@ def test_tap_changer_settled_taps():
     _check_all(pf, inputs, grads, names=("load_p", "gen_v"))
 
 
+def test_compute_flows_at_the_taps_of_its_own_forward():
+    """compute_flows(V) uses the taps the loops settled on in the forward that returned V, not
+    those of the latest forward; a tensor no forward returned (a clone) names its forward
+    through `taps_from`, and is refused without it rather than given another forward's taps"""
+    from test_outer_model_cpu import _tvc_grid
+    from gpusim2grid.differentiable import BatchPowerFlow
+    grid = _tvc_grid("T4-9-1", 12.4, 0.05)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), 30, TOL_MVA).size > 0
+    pf = BatchPowerFlow.from_lsgrid(grid, outer_loops=True, nb_iter=30, tol=TOL_MVA / grid.get_sn_mva(),
+                                    init_from_n_powerflow=False, ir_n_steps=1)
+    base_lp = np.asarray(grid.get_load_target_p(), dtype=float)
+    scales = np.array([0.85, 1., 1.3])   # each row settles on another tap
+    with torch.no_grad():
+        V_a = pf(load_p=_t(np.outer(scales, base_lp)))
+        taps_a = [tuple(r.ratio_tap) for r in pf.sweep.get_outer_results()]
+        pf.sweep.compute_flows()
+        amps_a = np.asarray(pf.sweep.or_amps.to_numpy()).reshape(len(scales), -1)
+        # the rows the other way round: rows 0 and 2 settle on each other's taps
+        pf(load_p=_t(np.outer(scales[::-1], base_lp)))
+        taps_b = [tuple(r.ratio_tap) for r in pf.sweep.get_outer_results()]
+        assert taps_a[0] != taps_b[0], (taps_a, taps_b)
+        amps = pf.compute_flows(V_a)["i_or_a"].cpu().numpy()
+        np.testing.assert_allclose(amps, amps_a, rtol=1e-8, atol=1e-6)
+        # a detached view of V_a is V_a's
+        amps_view = pf.compute_flows(V_a.detach()[:, :])["i_or_a"].cpu().numpy()
+        np.testing.assert_allclose(amps_view, amps_a, rtol=1e-8, atol=1e-6)
+        # a clone: no forward returned it
+        with pytest.raises(ValueError, match="taps_from"):
+            pf.compute_flows(V_a.clone())
+        amps_clone = pf.compute_flows(V_a.clone(), taps_from=V_a)["i_or_a"].cpu().numpy()
+        np.testing.assert_allclose(amps_clone, amps_a, rtol=1e-8, atol=1e-6)
+
+
 def test_capability_curve_slope():
     """a generator frozen at a limit of its capability curve: its reactive output follows its
     target P (the row's), which the gen_p gradient owes (lightsim2grid's gen_p_indirect_grad)"""
