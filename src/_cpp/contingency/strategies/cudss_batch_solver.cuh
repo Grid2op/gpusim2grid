@@ -462,6 +462,13 @@ struct CudssBatchSolver {
         npivots_entries_ = static_cast<int>(n);
     }
     int npivots_entries() const { return npivots_entries_; }
+    // Restart the pivot counters (BatchPfDriver::solve: they are a run's, not the handle's life)
+    void reset_pivot_counts()
+    {
+        factor_stats_.npivots_total = -1;
+        factor_stats_.npivots_max   = -1;
+        factor_stats_.npivots_reads = 0;
+    }
 
     const CudssFactorStats& factor_stats() const { return factor_stats_; }
 
