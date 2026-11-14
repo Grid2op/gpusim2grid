@@ -346,9 +346,12 @@ struct CudssBatchSolver {
         t_context_init_ms_ = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_ctx_start).count();
 
+        // every mode named, no default: a new CudssBatchMode must be handled here
+        // (-Wswitch), not silently set up as Uniform
         switch (mode_) {
+        case CudssBatchMode::OwnLu:   // returned above: no cuDSS object
+            throw std::logic_error("[CudssBatchSolver::initialize] own LU reached the cuDSS setup");
         case CudssBatchMode::Uniform:
-        default:
             dss_A_.create_csr(dim_J, nnz_J, d_J_outer, d_J_inner, d_J_values_batch);
             dss_x_.create_dn(dim_J, d_dx_batch);
             dss_b_.create_dn(dim_J, d_F_batch);
