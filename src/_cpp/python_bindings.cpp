@@ -957,6 +957,16 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "Number of J^T REFACTORIZATION calls over the driver's life")
         .def_readonly("adjoint_n_solve", &BatchTimings::adjoint_n_solve,
                       "Number of J^T SOLVE calls over the driver's life")
+        .def_readonly("cudss_user_perm_honoured", &BatchTimings::cudss_user_perm_honoured,
+                      "Prototype: 1 if cuDSS's reordering equals the user permutation "
+                      "(reordering_alg='ls2g_constrained'), 0 if not, -1 without one")
+        .def_readonly("cudss_npivots_total", &BatchTimings::cudss_npivots_total,
+                      "Prototype: CUDSS_DATA_NPIVOTS summed over the forward factorizations "
+                      "(GPUSIM2GRID_COUNT_PIVOTS set; -1 otherwise)")
+        .def_readonly("cudss_npivots_max", &BatchTimings::cudss_npivots_max,
+                      "Prototype: the largest CUDSS_DATA_NPIVOTS of one factorization (-1 if not counted)")
+        .def_readonly("cudss_npivots_reads", &BatchTimings::cudss_npivots_reads,
+                      "Prototype: factorizations whose CUDSS_DATA_NPIVOTS was read")
         .def_readonly("cudss_lu_nnz", &BatchTimings::cudss_lu_nnz,
                       "cuDSS CUDSS_DATA_LU_NNZ after the forward solver's last ANALYSIS "
                       "(non-zeros of the L+U factors of ONE system, i.e. the fill-in; -1 = not "
@@ -1179,7 +1189,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .value("NestedDissection", ReorderingAlg::NestedDissection,
              "Nested dissection.")
       .value("NoReordering", ReorderingAlg::None,
-             "Natural (identity) ordering — no reordering applied.");
+             "Natural (identity) ordering — no reordering applied.")
+      .value("Ls2gConstrained", ReorderingAlg::Ls2gConstrained,
+             "Prototype: lightsim2grid's constrained order of the batch Jacobian "
+             "(AMD post-moved by the grid's OrderingConstraints), given to cuDSS as "
+             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid (bridge).")
+      .value("Ls2gConstrainedNd", ReorderingAlg::Ls2gConstrainedNd,
+             "Prototype: cuDSS's own (nested dissection) order of the batch Jacobian, "
+             "post-moved by the grid's OrderingConstraints, given to cuDSS as "
+             "CUDSS_DATA_USER_PERM. Needs a lightsim2grid grid.");
 
   // -----------------------------------------------------------------
   // MatchingAlg enum — selects CUDSS_CONFIG_MATCHING_ALG ahead of
@@ -1474,7 +1492,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
             return out;
         }, "(shunt id, section count) the same for the shunt sections")
       .def_readonly("decisions", &outer::RowResult::decisions,
-                    "the decision trace, when the session keeps it (keep_trace)");
+                    "the decision trace, when the session keeps it (keep_trace)")
+      .def_readonly("pq_buses", &outer::RowResult::pq_buses,
+                    "the adjoint of the last inner solve: the switchable solver buses PQ in it")
+      .def_readonly("vset_lost_groups", &outer::RowResult::vset_lost_groups,
+                    "... the VoltageControl groups whose voltage row lost its set-point")
+      .def_readonly("gen_p_fixed", &outer::RowResult::gen_p_fixed,
+                    "... the generators DistributedSlack holds at a bound (no gen_p gradient)")
+      .def_property_readonly("gen_p_slope", [](const outer::RowResult& r) {
+            std::vector<std::tuple<int, int, double>> out;
+            for (size_t k = 0; k < r.gen_p_slope_gen.size(); ++k)
+                out.emplace_back(r.gen_p_slope_gen[k], r.gen_p_slope_row[k], r.gen_p_slope_coeff[k]);
+            return out;
+        }, "... (generator, J row, pu per MW): a generator frozen at a limit of its capability "
+           "curve, whose reactive output follows its target P");
 
   pybind11::enum_<RowStatus>(m, "RowStatus")
       .value("Converged",    RowStatus::Converged,    "||F||inf < tol")
@@ -2586,6 +2617,29 @@ PYBIND11_MODULE(_gpusim2grid, m)
                    "BatchScheduling (takes effect on the next run())")
     .def_property_readonly("has_outer_model", &ScenarioSweepSession::has_outer_model,
                    "Whether the outer loops (lightsim2grid's NROuter_* ones) decide on every row.")
+    .def("get_outer_trafo_blocks", [](const ScenarioSweepSession& s) {
+            const outer::OuterHook* m = s.outer_model();
+            if (m == nullptr)
+                throw std::runtime_error("ScenarioSweepSession: no outer loops (build the session "
+                                         "with _make_ss_outer_session_from_lsgrid)");
+            std::vector<int> rows, trafos;
+            std::vector<std::complex<double>> blocks;
+            for (int r = 0; r < m->n_rows(); ++r) {
+                std::vector<int> t;
+                std::vector<double> b;
+                m->row_trafo_blocks(r, t, b);
+                for (size_t k = 0; k < t.size(); ++k) {
+                    rows.push_back(r);
+                    trafos.push_back(t[k]);
+                    for (int q = 0; q < 4; ++q) blocks.emplace_back(b[8 * k + 2 * q], b[8 * k + 2 * q + 1]);
+                }
+            }
+            return std::make_tuple(rows, trafos, blocks);
+        },
+        "(rows, trafo ids, blocks): the pi block (y11, y12, y21, y22, pu, 4 per entry, flat) of "
+        "every transformer the outer loops left off the grid's taps in a row of the last run(), "
+        "at its final taps (lightsim2grid's get_outer_trafo_admittances): what that row's flows "
+        "are computed with")
     .def("get_outer_results", [](const ScenarioSweepSession& s) {
             const outer::OuterHook* m = s.outer_model();
             if (m == nullptr)
@@ -2711,6 +2765,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "leave that row's distributed slack. The caller's Sbus already carries the "
          "correction. Exclusive with redistribute_slack.")
     .def("clear_external_slack_saturation", &ScenarioSweepSession::clear_external_slack_saturation)
+    .def("set_external_lost_p", &ScenarioSweepSession::set_external_lost_p,
+         pybind11::arg("lost_p_mw"),
+         "With the outer loops: what each row loses (MW, generator convention, NaN: nothing), "
+         "measured by the caller (BatchPowerFlow), for the rows' DistributedSlack loop to share "
+         "before their first solve. Exclusive with redistribute_slack.")
+    .def("clear_external_lost_p", &ScenarioSweepSession::clear_external_lost_p)
     .def("preview_row_masks", &ScenarioSweepSession::preview_row_masks,
          pybind11::arg("branch_ids_per_row"),
          "(disconnected, masked buses per row) that these per-row branch trips would give, "
@@ -3339,6 +3399,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def_property_readonly("realistic_bus", [](const OuterModelHarness& h) { return h.model->layout().realistic_bus; })
         .def_property_readonly("vm_col_of_bus", [](const OuterModelHarness& h) { return h.in.ledger.vm_col_of_bus; })
         .def_property_readonly("n_ctrl", [](const OuterModelHarness& h) { return h.model->layout().n_ctrl; })
+        .def_property_readonly("slack_bus", [](const OuterModelHarness& h) { return h.model->layout().slack_bus; })
+        .def_property_readonly("slack_col", [](const OuterModelHarness& h) { return h.in.ledger.slack_col; })
         .def_property_readonly("ledger", [](const OuterModelHarness& h) {
                 const LedgerData& L = h.in.ledger;
                 pybind11::dict d;
@@ -3391,6 +3453,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 d["sc_set"] = c.sc_set;
                 d["sc_b_new"] = c.sc_b_new;
                 d["sc_ctl"] = std::vector<int>(c.sc_ctl.begin(), c.sc_ctl.end());
+                d["slack_w"] = c.slack_w;
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
@@ -3413,7 +3476,8 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def("on_solved", [](OuterModelHarness& h, int slot, bool converged, int nr_iter, int inner_status,
                              std::vector<std::complex<double>> V, std::vector<std::complex<double>> S,
                              std::vector<std::complex<double>> Sb, std::vector<double> vc_q, bool unrealistic,
-                             std::vector<double> bc_a, std::vector<double> bc_rho, std::vector<double> sc_b) {
+                             std::vector<double> bc_a, std::vector<double> bc_rho, std::vector<double> sc_b,
+                             double slack_absorbed) {
                 std::vector<double> vr, vi, sr, si, br, bi;
                 for (auto z : V)  { vr.push_back(z.real()); vi.push_back(z.imag()); }
                 for (auto z : S)  { sr.push_back(z.real()); si.push_back(z.imag()); }
@@ -3421,6 +3485,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 outer::SlotData d;
                 d.v_re = vr.data(); d.v_im = vi.data(); d.s_re = sr.data(); d.s_im = si.data();
                 d.sb_re = br.data(); d.sb_im = bi.data(); d.vc_q = vc_q.data(); d.unrealistic = unrealistic;
+                d.slack_absorbed = slack_absorbed;
                 const size_t n_bc = static_cast<size_t>(h.model->layout().n_bc);
                 if (converged && (bc_a.size() != n_bc || bc_rho.size() != n_bc))
                     throw std::invalid_argument("on_solved: bc_a / bc_rho must hold one value per BranchControl transformer");
@@ -3436,7 +3501,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
             pybind11::arg("inner_status"), pybind11::arg("V"), pybind11::arg("S"), pybind11::arg("Sb"),
             pybind11::arg("vc_q"), pybind11::arg("unrealistic"),
             pybind11::arg("bc_a") = std::vector<double>(), pybind11::arg("bc_rho") = std::vector<double>(),
-            pybind11::arg("sc_b") = std::vector<double>())
+            pybind11::arg("sc_b") = std::vector<double>(), pybind11::arg("slack_absorbed") = 0.)
         .def("row_result", [](const OuterModelHarness& h, int row) { return h.model->row_result(row); });
 
     m.def("_make_ca_outer_session_from_lsgrid",

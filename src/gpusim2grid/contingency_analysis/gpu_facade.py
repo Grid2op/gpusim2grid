@@ -313,7 +313,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         (``||F||inf < tol / sn_mva``). ``None`` = 1e-8 (1e-3 in an FP32
         build). Mutable.
     outer_loops, keep_outer_trace : bool, default False
-        Run the grid's own outer loops (lightsim2grid's ``NROuter_*``) on every
+        Run the grid's own outer loops (lightsim2grid's ``NROuter_*`` / ``NROuterDist_*``) on every
         row; see :class:`ScenarioSweepGPU`. Requires ``scheduling="continuous"`` and
         ``nb_iter_per_round=1``, by design (neither is planned to change); pass
         ``ir_n_steps=1`` with it (see there). Each contingency keeps the grid's targets. With

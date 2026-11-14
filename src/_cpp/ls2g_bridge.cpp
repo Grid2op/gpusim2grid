@@ -10,6 +10,9 @@
 #include "ledger_extend.hpp"   // materialize_vc_custom_rows, reserve_stranded_controller_slots
 #include "outer/ls2g_outer_model.hpp"   // the outer loops' model (lightsim2grid's NROuter_*)
 #include "timing_utils.hpp"    // ms_since
+#include "user_ordering.hpp"    // prototype: constrained_order_hook
+
+#include <linear_solvers/KLUStaticPivotSolver.hpp>   // ls2g::constrained_order
 
 #include <batch_algorithm/BusQCheck.hpp>   // ls2g::bus_q_check::build_bus_q_plan (lightsim2grid >= PR #206)
 #include <batch_algorithm/GenPCheck.hpp>   // ls2g::gen_p_check::build_gen_p_plan (lightsim2grid >= 1.1.0)
@@ -393,6 +396,10 @@ LedgerData drop_multislack_augmentation(const LedgerData& in,
     const int new_dim = old_dim - n_row_drop;
 
     LedgerData out = in;
+    // deleting indices invalidates lightsim2grid's ordering constraints (prototype)
+    out.ord_constraints_read = false;
+    out.ord_follow_ptr.clear(); out.ord_follow.clear();
+    out.ord_lead_ptr.clear();   out.ord_lead.clear(); out.ord_in_order.clear();
     out.dim_J = new_dim;
 
     // Skeleton: drop the surplus rows, and the surplus columns of every kept
@@ -948,6 +955,23 @@ LedgerData extract_ledger_data(const ls2g::LSGrid& grid, bool presolved_v, doubl
             ld.vc_q_gt.assign(qgt.data(), qgt.data() + qgt.size());
             ld.has_ext_state_ground_truth = true;
         }
+    }
+
+    // lightsim2grid's ordering constraints of this J (prototype,
+    // docs/dev_notes/batched_lu_and_constrained_ordering.md): read whatever the
+    // grid's linear solver, flattened (LedgerData::ord_*).
+    {
+        const ls2g::OrderingConstraints cons = grid.get_algo().get_ordering_constraints();
+        ld.ord_follow_ptr.assign(1, 0);
+        ld.ord_lead_ptr.assign(1, 0);
+        for (const ls2g::OrderingConstraint& c : cons) {
+            ld.ord_follow.insert(ld.ord_follow.end(), c.follow.begin(), c.follow.end());
+            ld.ord_lead.insert(ld.ord_lead.end(), c.lead.begin(), c.lead.end());
+            ld.ord_follow_ptr.push_back(static_cast<int>(ld.ord_follow.size()));
+            ld.ord_lead_ptr.push_back(static_cast<int>(ld.ord_lead.size()));
+            ld.ord_in_order.push_back(c.in_order ? 1 : 0);
+        }
+        ld.ord_constraints_read = true;
     }
     return ld;
 }
@@ -1550,7 +1574,7 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
                              "(NROuter_*, branch dev_outer_batch_perf)");
 #else
     if (!grid.get_algo().supports_outer_loops())
-        throw std::runtime_error("the outer loops need a grid whose algorithm is an NROuter_* one, "
+        throw std::runtime_error("the outer loops need a grid whose algorithm is an NROuter_* (or NROuterDist_*) one, "
                                  "solved (grid.change_algorithm('NROuter_KLU'); grid.ac_pf(...))");
     // the loops ported (outer/ls2g_outer_model.cpp)
     for (const auto& loop : grid.get_outer_loops()) {
@@ -1583,10 +1607,34 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
 
     // the inner Newton's ledger, as it is (the NROuter_* accessors forward to it)
     in.ledger = extract_ledger_data(grid, /*presolved_v=*/false, 0.);
-    if (in.ledger.slack_col >= 0)
-        throw std::runtime_error("extract_outer_inputs: the grid's ledger has a distributed slack: "
-                                 "solve it with its NROuter_* algorithm first");
     in.ledger.outer_loops = true;
+    // NROuterDist_*: its Newton shares the slack itself (MultiSlack with participant buses).
+    // Every bus its DistributedSlack loop reserved has an entry in the slack_absorbed column,
+    // the reference's P row included, whatever the weight the last solve gave it: they are
+    // the column's rows, mapped back to their buses
+    if (in.ledger.slack_col >= 0) {
+        LedgerData& L = in.ledger;
+        std::vector<int> bus_of_p_row(static_cast<size_t>(L.dim_J), -1);
+        for (size_t k = 0; k < L.p_rows.size(); ++k) bus_of_p_row[static_cast<size_t>(L.p_rows[k])] = L.p_buses[k];
+        for (int r = 0; r < L.dim_J; ++r) {
+            const auto s = L.J_inner.begin() + L.J_outer[static_cast<size_t>(r)];
+            const auto e = L.J_inner.begin() + L.J_outer[static_cast<size_t>(r) + 1];
+            if (!std::binary_search(s, e, L.slack_col)) continue;
+            const int b = bus_of_p_row[static_cast<size_t>(r)];
+            if (b < 0)
+                throw std::runtime_error("extract_outer_inputs: the slack_absorbed column has an entry on "
+                                         "a row that is no bus' P equation");
+            L.slack_participant_buses.push_back(b);
+        }
+        std::sort(L.slack_participant_buses.begin(), L.slack_participant_buses.end());
+        if (!std::binary_search(L.slack_participant_buses.begin(), L.slack_participant_buses.end(),
+                                static_cast<int>(slack(0))))
+            throw std::runtime_error("extract_outer_inputs: the reference bus has no entry in the "
+                                     "slack_absorbed column");
+        // the slots start their own (_init_slot_state): nothing to derive on the base system
+        L.slack_absorbed_gt = 0.;
+        L.has_ext_state_ground_truth = true;
+    }
     // BranchControl / ShuntControl, as the grid's solve reserved them; their custom rows come
     // after VoltageControl's, so these are no longer "the last rows of J": read off the system
     {
@@ -1855,3 +1903,27 @@ make_is_outer_session_from_lsgrid(
     session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
     return session;
 }
+
+// ---- prototype: lightsim2grid's constrained order for ReorderingAlg::Ls2gConstrained
+// (user_ordering.hpp). Installed when the module loads: the CUDA side only sees the hook.
+namespace {
+bool g2g_ls2g_constrained_order(int n, const int* row_ptr, const int* col_idx,
+                                const LedgerData& ledger, std::vector<int>& perm)
+{
+    ls2g::OrderingConstraints cons(static_cast<size_t>(ledger.ord_n_constraints()));
+    for (int c = 0; c < ledger.ord_n_constraints(); ++c) {
+        cons[c].follow.assign(ledger.ord_follow.begin() + ledger.ord_follow_ptr[c],
+                              ledger.ord_follow.begin() + ledger.ord_follow_ptr[c + 1]);
+        cons[c].lead.assign(ledger.ord_lead.begin() + ledger.ord_lead_ptr[c],
+                            ledger.ord_lead.begin() + ledger.ord_lead_ptr[c + 1]);
+        cons[c].in_order = ledger.ord_in_order[c] != 0;
+    }
+    // J is CSR here, CSC in lightsim2grid: the order is computed on A + A^T,
+    // which is the same pattern either way.
+    return ls2g::constrained_order(n, row_ptr, col_idx, cons,
+                                   ls2g::FillReducingOrdering::AMD, perm);
+}
+struct InstallConstrainedOrderHook {
+    InstallConstrainedOrderHook() { constrained_order_hook() = &g2g_ls2g_constrained_order; }
+} g_install_constrained_order_hook;
+}  // namespace

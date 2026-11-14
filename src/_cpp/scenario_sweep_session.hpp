@@ -358,6 +358,11 @@ struct ScenarioSweepSession {
     // correction): only the row weights are rebuilt from them.
     std::vector<std::vector<int>> ext_sat_units_;
     bool                    has_ext_sat_ = false;
+    // ... and, with the outer loops, what each row loses (MW, NaN: nothing), which
+    // takes the place of row_lost_p_mw_ (BatchPowerFlow, whose injections are on the
+    // device where the pre-pass cannot read them)
+    std::vector<double>     ext_lost_p_mw_;
+    bool                    has_ext_lost_ = false;
     bool                    rd_gp_last_ = false;   // the gen-P check got pre-pass targets last run
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
@@ -560,6 +565,12 @@ struct ScenarioSweepSession {
     // clear_external_slack_saturation drops it.
     void set_external_slack_saturation(const std::vector<std::vector<int>>& sat_units_per_row);
     void clear_external_slack_saturation() { ext_sat_units_.clear(); has_ext_sat_ = false; }
+    // With the outer loops, the caller's measure of what each row loses (MW, generator
+    // convention, ORIGINAL order, NaN: nothing), for the rows' DistributedSlack loop to
+    // share (outer::RowOverrides::lost_p_mw). Takes the place of redistribute_slack's
+    // own measure (which must be off); clear_external_lost_p drops it.
+    void set_external_lost_p(const std::vector<double>& lost_p_mw);
+    void clear_external_lost_p() { ext_lost_p_mw_.clear(); has_ext_lost_ = false; }
 
     // The masked (stranded) solver buses and the "not simulated" flag each row
     // of `branch_ids_per_row` would get, computed on a copy (host only, the

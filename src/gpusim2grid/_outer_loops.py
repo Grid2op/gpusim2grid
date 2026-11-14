@@ -2,8 +2,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""``outer_loops=True`` on the batch facades: lightsim2grid's ``NROuter_*``
-outer loops run per row (docs/dev_notes/continuous_batching.md, Part B; the
+"""``outer_loops=True`` on the batch facades: lightsim2grid's ``NROuter_*`` /
+``NROuterDist_*`` outer loops run per row (docs/dev_notes/continuous_batching.md, Part B; the
 C++ side is ``outer/``). What the three facades check alike."""
 
 from . import _gpusim2grid as _cpp

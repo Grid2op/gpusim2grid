@@ -1,6 +1,12 @@
 
 project(_gpusim2grid LANGUAGES CXX CUDA)
-find_package(cudss 0.8.0 REQUIRED)
+# No version in find_package: cuDSS's version file only accepts a request of its own
+# major version, so `find_package(cudss 0.8.0)` would reject 1.x. Check the floor here.
+find_package(cudss REQUIRED)
+if(cudss_VERSION AND cudss_VERSION VERSION_LESS 0.8.0)
+    message(FATAL_ERROR "cuDSS >= 0.8.0 required, found ${cudss_VERSION}")
+endif()
+message(STATUS "cuDSS ${cudss_VERSION} found in ${cudss_DIR}")
 # A CUDA toolkit installed from PyPI (``cuda-toolkit[nvcc,...]``, CUDA 13: one
 # prefix <site-packages>/nvidia/cu13 holding bin/nvcc, include/ and lib/) ships
 # each library under its soname only (libcudart.so.13, libcusparse.so.12), not

@@ -565,9 +565,11 @@ void ContingencyAnalysisSession::run()
             }
         } else {
             slack_rows_.clear();
-            w_rows = gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_ctg_all, n_bus,
-                                                        base_state_->h_slack_bus, base_state_->h_slack_w,
-                                                        ref_bus, "ContingencyAnalysisSession");
+            // with the outer loops, a distributed-slack Newton's weights are its model's, per slot
+            if (!outer_)
+                w_rows = gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_ctg_all, n_bus,
+                                                            base_state_->h_slack_bus, base_state_->h_slack_w,
+                                                            ref_bus, "ContingencyAnalysisSession");
         }
         bool any_ds = false;
         for (const auto& ds : ds_rows) if (!ds.empty()) { any_ds = true; break; }

@@ -429,7 +429,10 @@ Scope of the first version, decided before planning:
 9. **Jacobian size.** Every switchable bus is reserved up front (the union pattern of B.5).
    This is accepted on the CPU, so it is accepted on the GPU.
 10. **No gradients** with the outer loops on in the first version: `BatchPowerFlow` and the
-    batched adjoint refuse them (an issue to open).
+    batched adjoint refuse them (an issue to open). *Since done (2026-10-20), after
+    lightsim2grid's own: the adjoint of each row's last inner solve, every decision of its
+    loops held; the per-slot state that J was built with is saved by row at eviction and put
+    back by the rebuilt adjoint (CLAUDE.md "Outer loops", Gradients).*
 
 Issues to open: the three remaining loops (1), the decisions as kernels (7), gradients
 through the outer loops (10).
@@ -710,12 +713,14 @@ loops reserve.
 *Reviewed 2026-10-15 against lightsim2grid `dev_outer_batch_perf`.*
 
 With the outer loops on, gpusim2grid uses a **single-slack inner Newton**, as lightsim2grid's
-`NROuter_*` algorithms do, and shares the slack only through the `DistributedSlack` loop. A
-distributed slack inside the Newton *and* the outer loops together is not part of
-lightsim2grid yet. It is only a proposal there (`docs/dev_notes/slack_handling_refactor.md`,
-"A distributed-slack Newton inside `NROuter_*`": the Newton shares by `slack_absorbed`, and the
-loop only caps units at their limits and redistributes what they no longer take). Follow
-lightsim2grid when it lands; until then, no parity reference exists for it.
+`NROuter_*` algorithms do, and shares the slack only through the `DistributedSlack` loop.
+
+*Update 2026-10-20:* lightsim2grid's `NROuterDist_*` (its `slack_handling_refactor.md`, "A
+distributed-slack Newton inside the outer loops") has landed and is ported. Its Newton has
+MultiSlack's `slack_absorbed` column with an entry on the reference's P row and on every bus
+DistributedSlack reserved; each slot sets its weights by value (a parked unit at 0, no new
+analysis), the model folds each solve's share into the units' targets and runs the loop's
+`_check_in_newton`. The grid's algorithm decides, no option; see CLAUDE.md "Outer loops".
 
 What "single slack" means changed with lightsim2grid commit `148e2e52`
 (`OuterLoopAlgo.tpp:47-58`):

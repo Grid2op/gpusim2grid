@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cmath>
 #include <numeric>
+#include <type_traits>
 #include <vector>
 #include <limits>
 #include <stdexcept>
@@ -291,7 +292,8 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         reordering_alg,
         matching_alg,
         pivot_epsilon_alg,
-        ir_n_steps);
+        ir_n_steps,
+        base.user_perm_or_null());  // prototype: ReorderingAlg::Ls2gConstrained
 
     std::visit([&](auto& policy) {
         policy.initialize_from_base(
@@ -1310,6 +1312,11 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
                      d_residuals.begin(), d_residuals.end(), nan_r);
     }
 
+    // GPUSIM2GRID_COUNT_PIVOTS: the counters are this run's (a reused driver
+    // keeps its handles), the tail's handle included (a new one starts at 0)
+    linear_solver_.reset_pivot_counts();
+    if (tail_solver_) tail_solver_->reset_pivot_counts();
+
     // Chunk loop runs over the ACTIVE set (c_start / actual_batch in active-slot
     // space); _solve_chunk scatters each result to its original index.
     // Per-chunk ANALYSIS of the non-uniform cuDSS modes (0 in uniform mode).
@@ -1332,6 +1339,18 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     t.cudss_mem_device_peak_bytes      = fs.mem_device_peak;
     t.cudss_mem_host_permanent_bytes   = fs.mem_host_permanent;
     t.cudss_mem_host_peak_bytes        = fs.mem_host_peak;
+    t.cudss_user_perm_honoured         = fs.user_perm_honoured;
+    t.cudss_npivots_total              = fs.npivots_total;
+    t.cudss_npivots_max                = fs.npivots_max;
+    t.cudss_npivots_reads              = fs.npivots_reads;
+    if (tail_solver_) {   // the continuous tail factorizes on its own handle
+        const CudssFactorStats& ts = tail_solver_->factor_stats();
+        if (ts.npivots_total >= 0) {
+            t.cudss_npivots_total = std::max(t.cudss_npivots_total, 0LL) + ts.npivots_total;
+            t.cudss_npivots_max   = std::max(t.cudss_npivots_max, ts.npivots_max);
+        }
+        t.cudss_npivots_reads += ts.npivots_reads;
+    }
 
     cs.synchronize();
 
@@ -1591,6 +1610,11 @@ void BatchPfDriver<BatchSource>::_oc_setup()
         throw std::runtime_error("[batch_pf] outer loops need the ledger of an NROuter_* solve (LedgerData::outer_loops)");
     if (Lo.n_bc != base.n_bc || Lo.n_sc != base.n_sc)
         throw std::runtime_error("[batch_pf] outer loops: the model's transformers / shunt controllers are not the base state's");
+    if (Lo.slack_bus != base.h_slack_bus && !(Lo.slack_bus.empty() && base.slack_col < 0))
+        throw std::runtime_error("[batch_pf] outer loops: the model's slack participants are not the base state's");
+    const int n_sw = static_cast<int>(Lo.slack_bus.size());
+    h_oc_slack_w_.assign(static_cast<size_t>(S) * n_sw, cuda_real_type(0));
+    d_oc_slack_w_.resize(std::max<size_t>(h_oc_slack_w_.size(), 1));
     h_oc_pin_.assign(static_cast<size_t>(S) * n_pin, 1);
     h_oc_held_q_.assign(static_cast<size_t>(S) * Lo.n_ctrl, std::numeric_limits<cuda_real_type>::quiet_NaN());
     h_oc_plan_held_.assign(static_cast<size_t>(S) * Lo.n_ctrl, 0);
@@ -1617,8 +1641,9 @@ void BatchPfDriver<BatchSource>::_oc_setup()
         d_sc_on_.assign(n, 0);
     }
     const int n_watch = static_cast<int>(Lo.watch_bus.size());
-    // ... then BranchControl's shifts and ratios, ShuntControl's susceptances, the unrealistic flag
-    oc_stride_ = 6 * n_watch + Lo.n_ctrl + 2 * base.n_bc + base.n_sc + 1;
+    // ... then BranchControl's shifts and ratios, ShuntControl's susceptances, slack_absorbed,
+    // the unrealistic flag
+    oc_stride_ = 6 * n_watch + Lo.n_ctrl + 2 * base.n_bc + base.n_sc + 2;
     std::vector<int> watch = Lo.watch_bus;
     if (watch.empty()) watch.push_back(0);
     upload_h2d(d_oc_watch_, watch.data(), watch.size(), cs);
@@ -1657,6 +1682,9 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
             h_oc_vset_[static_cast<size_t>(s) * Lo.n_grp + g] = static_cast<cuda_real_type>(c.v_set[static_cast<size_t>(g)]);
         for (int e = 0; e < Lo.n_hvdc; ++e)
             h_oc_hvdc_[static_cast<size_t>(s) * Lo.n_hvdc + e] = c.hvdc_status[static_cast<size_t>(e)];
+        const size_t n_sw = Lo.slack_bus.size();
+        for (size_t k = 0; k < n_sw && k < c.slack_w.size(); ++k)
+            h_oc_slack_w_[static_cast<size_t>(s) * n_sw + k] = static_cast<cuda_real_type>(c.slack_w[k]);
         for (size_t k = 0; k < c.sbus_bus.size(); ++k) {
             ds_slot.push_back(s); ds_bus.push_back(c.sbus_bus[k]);
             ds_p.push_back(static_cast<cuda_real_type>(c.sbus_dp[k]));
@@ -1673,6 +1701,7 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
     if (!h_oc_plan_held_.empty()) upload_h2d(d_oc_plan_held_, h_oc_plan_held_.data(), h_oc_plan_held_.size(), cs);
     if (!h_oc_vset_.empty())      upload_h2d(d_oc_vset_, h_oc_vset_.data(), h_oc_vset_.size(), cs);
     if (!h_oc_hvdc_.empty())      upload_h2d(d_oc_hvdc_, h_oc_hvdc_.data(), h_oc_hvdc_.size(), cs);
+    if (!h_oc_slack_w_.empty())   upload_h2d(d_oc_slack_w_, h_oc_slack_w_.data(), h_oc_slack_w_.size(), cs);
 
     // Sbus: the row's own (re-read on a re-entry), then its correction
     NrIterBuffers buf = _make_nr_buffers();
@@ -1824,6 +1853,7 @@ void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const
             n, n_watch, Lo.n_ctrl, base.n_bus, oc_stride_);
     oc_unrealistic_kernel<<<(n + BS - 1) / BS, BS, 0, cs>>>(
         thrust::raw_pointer_cast(d_oc_gather_.data()), buf.d_V,
+        base.slack_col >= 0 ? thrust::raw_pointer_cast(d_slack_absorbed_batch.data()) : nullptr,
         Lo.pin_bus.empty() ? nullptr : thrust::raw_pointer_cast(d_oc_pin_.data()),
         thrust::raw_pointer_cast(d_oc_cand_bus_.data()),
         thrust::raw_pointer_cast(d_oc_cand_pin_.data()),
@@ -1931,6 +1961,12 @@ NrIterBuffers BatchPfDriver<BatchSource>::_bound_nr_buffers(const SlotTableView&
     if (outer_hook_ != nullptr && oc_stride_ > 0 && base.n_vc_ctrl > 0 && base.vc_may_hold) {
         buf.d_vc_vset      = thrust::raw_pointer_cast(d_oc_vset_.data());
         buf.vc_vset_stride = base.n_vc_grp;
+    }
+    // ... and, around a distributed-slack Newton, each slot's slack weights (its parked units
+    // at 0): they win over the source's per-row ones
+    if (outer_hook_ != nullptr && oc_stride_ > 0 && base.n_slack > 0 && !outer_hook_->layout().slack_bus.empty()) {
+        buf.d_slack_w      = thrust::raw_pointer_cast(d_oc_slack_w_.data());
+        buf.slack_w_stride = base.n_slack;
     }
     return buf;
 }
@@ -2382,7 +2418,8 @@ TailSolve BatchPfDriver<BatchSource>::_tail_solve(int n_groups)
             thrust::raw_pointer_cast(d_J_values_batch.data()),
             thrust::raw_pointer_cast(d_F_batch.data()),
             thrust::raw_pointer_cast(d_dx_batch.data()),
-            cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_);
+            cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_,
+            base.user_perm_or_null());
         tail_solver_G_ = G;
     }
     TailSolve ts;
@@ -2465,6 +2502,9 @@ void BatchPfDriver<BatchSource>::_compact_tail(int n_keep, int n_cur, std::vecto
         move_host(h_oc_plan_held_, Lo.n_ctrl);
         move_host(h_oc_vset_, Lo.n_grp);
         move_host(h_oc_hvdc_, Lo.n_hvdc);
+        const int n_sw = static_cast<int>(Lo.slack_bus.size());
+        move_host(h_oc_slack_w_, n_sw);
+        if (n_sw > 0)      launch_move_slot_rows(raw(d_oc_slack_w_), n_sw, M, cs);
         if (n_pin > 0)     launch_move_slot_rows(raw(d_oc_pin_), n_pin, M, cs);
         if (Lo.n_ctrl > 0) {
             launch_move_slot_rows(raw(d_oc_held_q_), Lo.n_ctrl, M, cs);
@@ -2498,6 +2538,101 @@ void BatchPfDriver<BatchSource>::_compact_tail(int n_keep, int n_cur, std::vecto
     CHK_CUDA_BPF(cudaGetLastError());
     _upload_sched();   // the new slot table
     t.n_slot_moves += n;
+}
+
+// =============================================================================
+// The outer-loop adjoint store (keep_outer_adjoint_): each active row's last
+// per-slot state, saved when it leaves its slot, put back by the adjoint.
+// =============================================================================
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_oa_alloc()
+{
+    const outer::Layout& Lo = outer_hook_->layout();
+    const size_t n = static_cast<size_t>(std::max(n_active_, 1));
+    auto sized = [n](auto& v, int w) { v.resize(n * static_cast<size_t>(std::max(w, 1))); };
+    sized(oa_.pin, static_cast<int>(Lo.pin_bus.size()));
+    sized(oa_.held_q, Lo.n_ctrl);
+    sized(oa_.plan_held, Lo.n_ctrl);
+    sized(oa_.vset, Lo.n_grp);
+    sized(oa_.hvdc, Lo.n_hvdc);
+    sized(oa_.slack_w, static_cast<int>(Lo.slack_bus.size()));
+    sized(oa_.bc_a, base.n_bc);
+    sized(oa_.bc_rho, base.n_bc);
+    sized(oa_.bc_applied, 4 * base.n_bc);
+    sized(oa_.bc_on, base.n_bc);
+    sized(oa_.bc_ron, base.n_bc);
+    sized(oa_.bc_out, base.n_bc);
+    sized(oa_.sc_b, base.n_sc);
+    sized(oa_.sc_b_applied, base.n_sc);
+    sized(oa_.sc_on, base.n_sc);
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_oa_save(const int* d_evict, int n_slots)
+{
+    const outer::Layout& Lo = outer_hook_->layout();
+    auto raw = [](auto& v) { return thrust::raw_pointer_cast(v.data()); };
+    auto save = [&](auto& store, auto& slots, int w) {
+        if (w > 0) launch_scatter_slots_to_rows(raw(store), raw(slots), d_evict, n_slots, w, cs);
+    };
+    save(oa_.pin, d_oc_pin_, static_cast<int>(Lo.pin_bus.size()));
+    save(oa_.held_q, d_oc_held_q_, Lo.n_ctrl);
+    save(oa_.plan_held, d_oc_plan_held_, Lo.n_ctrl);
+    save(oa_.vset, d_oc_vset_, Lo.n_grp);
+    save(oa_.hvdc, d_oc_hvdc_, Lo.n_hvdc);
+    save(oa_.slack_w, d_oc_slack_w_, static_cast<int>(Lo.slack_bus.size()));
+    if (base.n_bc > 0) {
+        save(oa_.bc_a, d_bc_a_, base.n_bc);
+        save(oa_.bc_rho, d_bc_rho_, base.n_bc);
+        save(oa_.bc_applied, d_bc_applied_, 4 * base.n_bc);
+        save(oa_.bc_on, d_bc_on_, base.n_bc);
+        save(oa_.bc_ron, d_bc_ron_, base.n_bc);
+        save(oa_.bc_out, d_bc_out_, base.n_bc);
+    }
+    if (base.n_sc > 0) {
+        save(oa_.sc_b, d_sc_b_, base.n_sc);
+        save(oa_.sc_b_applied, d_sc_b_applied_, base.n_sc);
+        save(oa_.sc_on, d_sc_on_, base.n_sc);
+    }
+    CHK_CUDA_BPF(cudaGetLastError());
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_oa_load(const SlotLoadView& L)
+{
+    const outer::Layout& Lo = outer_hook_->layout();
+    auto raw = [](auto& v) { return thrust::raw_pointer_cast(v.data()); };
+    auto load = [&](auto& slots, auto& store, int w) {
+        using T = typename std::remove_reference<decltype(slots)>::type::value_type;
+        if (w > 0) launch_gather_rows_to_slots<T>(raw(slots), raw(store), nullptr, L, w, cs);
+    };
+    load(d_oc_pin_, oa_.pin, static_cast<int>(Lo.pin_bus.size()));
+    load(d_oc_held_q_, oa_.held_q, Lo.n_ctrl);
+    load(d_oc_plan_held_, oa_.plan_held, Lo.n_ctrl);
+    load(d_oc_vset_, oa_.vset, Lo.n_grp);
+    load(d_oc_hvdc_, oa_.hvdc, Lo.n_hvdc);
+    load(d_oc_slack_w_, oa_.slack_w, static_cast<int>(Lo.slack_bus.size()));
+    if (base.n_bc > 0) {
+        load(d_bc_a_, oa_.bc_a, base.n_bc);
+        load(d_bc_rho_, oa_.bc_rho, base.n_bc);
+        load(d_bc_applied_, oa_.bc_applied, 4 * base.n_bc);
+        load(d_bc_on_, oa_.bc_on, base.n_bc);
+        load(d_bc_ron_, oa_.bc_ron, base.n_bc);
+        load(d_bc_out_, oa_.bc_out, base.n_bc);
+        // the slots' Ybus, reloaded with the container's blocks: the blocks the rows stamped
+        bc_stamp_applied_kernel<<<nr_grid_size(static_cast<long long>(L.n_real), BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
+            base.nnz_Y, L.n_real);
+    }
+    if (base.n_sc > 0) {
+        load(d_sc_b_, oa_.sc_b, base.n_sc);
+        load(d_sc_b_applied_, oa_.sc_b_applied, base.n_sc);
+        load(d_sc_on_, oa_.sc_on, base.n_sc);
+        sc_stamp_applied_kernel<<<nr_grid_size(static_cast<long long>(L.n_real) * base.n_sc, BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.sc_static(), _sc_slots(),
+            base.nnz_Y, L.n_real);
+    }
+    CHK_CUDA_BPF(cudaGetLastError());
 }
 
 // =============================================================================
@@ -2573,9 +2708,11 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         t.t_tail_compact += TimingEntry{0., ms_since(t_c0)};
     };
 
+    oa_.ready = false;
     if (hook != nullptr) {
         const auto t_l0 = std::chrono::steady_clock::now();
         _oc_setup();
+        if (keep_outer_adjoint_) _oa_alloc();
         hook->begin(S, n_contingencies);
         t.t_oc_load += TimingEntry{0., ms_since(t_l0)};
     }
@@ -2687,6 +2824,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                     data.bc_a  = gbuf.data() + 6 * n_watch + Lo.n_ctrl;
                     data.bc_rho = data.bc_a + base.n_bc;
                     data.sc_b   = data.bc_rho + base.n_bc;
+                    data.slack_absorbed = gbuf[static_cast<size_t>(oc_stride_ - 2)];
                     data.unrealistic = gbuf[static_cast<size_t>(oc_stride_ - 1)] != 0.;
                 }
                 int final_status = static_cast<int>(st);
@@ -2751,6 +2889,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             dim_J, n_cur, /*c_start=*/0, d_result_map, d_evict());
         t.t_residual += timer.stop_ms();
         _evict(buf, n_cur, /*c_start=*/0, d_evict(), timer, t);
+        // the leaving rows' last control state, for the adjoint (before it is restored below)
+        if (hook != nullptr && keep_outer_adjoint_) _oa_save(d_evict(), n_cur);
         // the transformers the leaving rows' loops moved: their slots' Ybus back to the
         // grid's blocks (a source that never reloads Ybus, an injection sweep, reuses it)
         if (hook != nullptr && base.n_bc > 0)
@@ -2796,6 +2936,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         CHK_CUDA_BPF(cudaGetLastError());
     }
 
+    oa_.ready = hook != nullptr && keep_outer_adjoint_;
     t.n_rounds  = rounds;
     t.occupancy = run > 0
         ? static_cast<double>(useful) / (static_cast<double>(run) * k) : 0.;
@@ -2916,6 +3057,22 @@ __global__ void zero_identity_rows_kernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_entries) return;
     d_sol[static_cast<ptrdiff_t>(d_mask_slot[i]) * dim_J + d_mask_row[i]] = cuda_real_type(0);
+}
+
+// The same for the Q rows the outer loops kept pinned (a switchable bus still PV in
+// the row's last solve, oc_pin_rows_kernel), slots [0, n): lightsim2grid's
+// AdjointSolveInfo::pinned_buses.
+__global__ void zero_pinned_rows_kernel(
+          cuda_real_type* __restrict__ d_sol,       // [batch × dim_J] (slot order)
+    const unsigned char*  __restrict__ d_pin,       // [S × n_pin]
+    const int*            __restrict__ d_qrow,      // [n_pin]
+    int dim_J, int n_pin, int n)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n) * n_pin) return;
+    const ptrdiff_t s = tid / n_pin;
+    const int k = static_cast<int>(tid % n_pin);
+    if (d_pin[tid]) d_sol[s * dim_J + d_qrow[k]] = cuda_real_type(0);
 }
 
 // gen_v adjoint: for every (slot, Vm-fixed bus k) the contraction of the
@@ -3044,7 +3201,8 @@ void BatchPfDriver<BatchSource>::_prepare_adjoint()
         thrust::raw_pointer_cast(A.d_JT_values.data()),
         thrust::raw_pointer_cast(A.d_rhs.data()),
         thrust::raw_pointer_cast(A.d_sol.data()),
-        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_);
+        cs, reordering_alg_, matching_alg_, pivot_epsilon_alg_, ir_n_steps_,
+        base.user_perm_or_null());  // symmetric: valid for J^T too
     A.n_analysis = 1;
     cs.synchronize();
     A.t_build_ms = bpf_ms_since(t_build_start);
@@ -3174,6 +3332,13 @@ void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rh
     const int n_adj_chunks = (n_active_ + S - 1) / S;
     const bool reuse = A.factorized && n_adj_chunks == 1 && d_V_ext_orig == nullptr
                     && A.factorized_for_solve == n_solves_;
+    // the outer loops: each row's J is the one of its last inner solve, every decision of
+    // its loops held (lightsim2grid's adjoint through them), from the state saved by row
+    const bool with_outer = outer_hook_ != nullptr && oc_stride_ > 0;
+    if (with_outer && !oa_.ready)
+        throw std::runtime_error(
+            "[batch_pf] solve_JT_batch: the outer loops' forward did not keep the rows' control "
+            "state -- run() it with keep_final_jacobian (BatchPowerFlow does)");
 
     CudaTimer timer(cs);
     BatchTimings t_load;   // the reloads belong to no run()'s timings
@@ -3214,6 +3379,8 @@ void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rh
             thrust::raw_pointer_cast(d_V_batch.data()),
             d_V_src, d_map, c0, n_bus, n);
         CHK_CUDA_BPF(cudaGetLastError());
+        // with the outer loops: each row's last control state, its blocks stamped in Ybus
+        if (with_outer) _oa_load(_load_view(S, -1, n));
         const NrIterBuffers buf = _bound_nr_buffers(_table_view(-1));
 
         // ③
@@ -3238,6 +3405,12 @@ void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rh
             zero_identity_rows_kernel<<<(buf.n_mask_rows + BS - 1) / BS, BS, 0, cs>>>(
                 thrust::raw_pointer_cast(A.d_sol.data()),
                 buf.d_mask_slot, buf.d_mask_row, dim_J, buf.n_mask_rows);
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
+        if (with_outer && buf.n_oc_pin > 0) {
+            zero_pinned_rows_kernel<<<nr_grid_size((long long)n * buf.n_oc_pin, BS), BS, 0, cs>>>(
+                thrust::raw_pointer_cast(A.d_sol.data()), buf.d_oc_pin, buf.d_oc_pin_row,
+                dim_J, buf.n_oc_pin, n);
             CHK_CUDA_BPF(cudaGetLastError());
         }
         launch_scatter_rows(rows_of(thrust::raw_pointer_cast(A.d_sol_full.data()), dim_J),
@@ -3266,6 +3439,16 @@ void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rh
                                 thrust::raw_pointer_cast(A.d_gvm.data()), map_c, n_bus, n, cs);
             CHK_CUDA_BPF(cudaGetLastError());
         }
+        // the slots' Ybus back to the container's blocks, their state with it
+        if (with_outer && base.n_bc > 0)
+            bc_restore_kernel<<<nr_grid_size(static_cast<long long>(n), BS), BS, 0, cs>>>(
+                thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
+                /*d_evict=*/nullptr, base.nnz_Y, n);
+        if (with_outer && base.n_sc > 0)
+            sc_restore_kernel<<<nr_grid_size(static_cast<long long>(n) * base.n_sc, BS), BS, 0, cs>>>(
+                thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.sc_static(), _sc_slots(),
+                /*d_evict=*/nullptr, base.nnz_Y, n);
+        CHK_CUDA_BPF(cudaGetLastError());
     }
     A.factorized_for_solve = (n_adj_chunks == 1 && d_V_ext_orig == nullptr) ? n_solves_ : -1;
     cs.synchronize();

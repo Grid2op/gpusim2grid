@@ -678,6 +678,13 @@ struct BatchPfDriver {
     // row's LAST inner solve.
     // -------------------------------------------------------------------------
     outer::OuterHook* outer_hook_ = nullptr;
+    // The batched adjoint through the outer loops (lightsim2grid's: the last inner solve of
+    // each row, every decision of its loops held): when set, a continuous solve() with a model
+    // keeps, per active row, the per-slot state that row's last Jacobian was built with -- the
+    // pins, held controllers, v_set, hvdc regimes, the distributed slack's weights, the
+    // BranchControl / ShuntControl state and the blocks they stamped (_oa_save, at eviction) --
+    // and _solve_JT_rebuilt puts it back into the slots (_oa_load) before refilling J.
+    bool keep_outer_adjoint_ = false;
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -1075,12 +1082,14 @@ private:
     // ---- outer loops: the per-slot control state on the device -------------
     // Dense per slot, mirrored on the host ([S * n] each, outer::SlotControls'
     // layout); the gather buffer of the converged slots ([S * oc_stride_]:
-    // V, V.conj(Ibus), Sbus at the watched buses, controller Q, unrealistic flag).
+    // V, V.conj(Ibus), Sbus at the watched buses, controller Q, BranchControl's
+    // and ShuntControl's unknowns, slack_absorbed, unrealistic flag).
+    // d_oc_slack_w_: the distributed slack's weights [S * n_slack] (NROuterDist_*).
     thrust::device_vector<unsigned char>  d_oc_pin_, d_oc_plan_held_;
-    thrust::device_vector<cuda_real_type> d_oc_held_q_, d_oc_vset_;
+    thrust::device_vector<cuda_real_type> d_oc_held_q_, d_oc_vset_, d_oc_slack_w_;
     thrust::device_vector<int>            d_oc_hvdc_;
     std::vector<unsigned char>            h_oc_pin_, h_oc_plan_held_;
-    std::vector<cuda_real_type>           h_oc_held_q_, h_oc_vset_;
+    std::vector<cuda_real_type>           h_oc_held_q_, h_oc_vset_, h_oc_slack_w_;
     std::vector<int>                      h_oc_hvdc_;
     thrust::device_vector<int>            d_oc_watch_, d_oc_cand_bus_, d_oc_cand_pin_, d_oc_list_;
     thrust::device_vector<cuda_real_type> d_oc_gather_;
@@ -1106,6 +1115,17 @@ private:
     thrust::device_vector<signed char>     d_sc_in_ctl_;
     ScSlots _sc_slots();
     thrust::device_vector<int>             d_branch_bc_;   // [n_branches_] the transformer entry, -1
+    // keep_outer_adjoint_: each active row's last per-slot state, [n_active * width] (see there)
+    struct OuterAdjointStore {
+        bool ready = false;   // the last solve() filled it
+        thrust::device_vector<unsigned char>   pin, plan_held, bc_on, bc_ron, bc_out, sc_on;
+        thrust::device_vector<cuda_real_type>  held_q, vset, slack_w, bc_a, bc_rho, sc_b, sc_b_applied;
+        thrust::device_vector<int>             hvdc;
+        thrust::device_vector<cudaComplexType> bc_applied;
+    } oa_;
+    void _oa_alloc();
+    void _oa_save(const int* d_evict, int n_slots);
+    void _oa_load(const SlotLoadView& L);
 public:
     // The outer loops moved some transformers' taps: their flows of each row recomputed
     // with the block at the row's final taps (outer::OuterHook::row_trafo_blocks), over

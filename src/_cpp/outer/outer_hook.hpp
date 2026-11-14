@@ -45,6 +45,10 @@ struct Layout {
     std::vector<int> realistic_bus;
     double min_realistic_v = 0.5;
     double max_realistic_v = 2.;
+    // Around a distributed-slack Newton (NROuterDist_*): the buses with an entry in the
+    // slack_absorbed column (LedgerData::slack_participant_buses, the base state's order),
+    // whose weights each slot sets. Empty: a single-slack Newton (NROuter_*).
+    std::vector<int> slack_bus;
 };
 
 // The control state of one slot: what its loops changed in its equations,
@@ -81,6 +85,9 @@ struct SlotControls {
     std::vector<int>           sc_set;
     std::vector<double>        sc_b_new;
     std::vector<signed char>   sc_ctl;
+    // The distributed slack's weights of this solve, per Layout::slack_bus, normalised (the
+    // reference alone at 1 when no unit takes a share); empty with a single-slack Newton
+    std::vector<double>        slack_w;
 };
 
 // What the device gathered for one converged slot, as host doubles, indexed
@@ -96,6 +103,7 @@ struct SlotData {
     const double* bc_a  = nullptr;   // BranchControl's shift and ratio unknowns [n_bc]
     const double* bc_rho = nullptr;
     const double* sc_b  = nullptr;   // ShuntControl's susceptances [n_sc]
+    double slack_absorbed = 0.;      // the distributed slack's unknown, pu (0 with a single slack)
     bool unrealistic = false;        // some Layout::realistic_bus outside the band
 };
 
@@ -148,6 +156,18 @@ struct RowResult {
     std::vector<int>    shunt_ids, shunt_sections;
     // the decision trace (OuterLoopStats::decisions), when the model keeps it
     std::vector<std::string> decisions;
+    // The adjoint of the row's last inner solve, every decision of its loops held (lightsim2grid's
+    // AdjointSolveInfo and BaseOuterLoop::adjoint_terms): the switchable buses PQ in that solve
+    // (no gen_v reaches them), the VoltageControl groups whose voltage row lost its set-point
+    // (every controller held), and what the gen_p gradient owes beyond lambda at the unit's P
+    // row / sn -- minus that for a generator DistributedSlack holds at a bound (gen_p_fixed),
+    // lambda at gen_p_slope_row times gen_p_slope_coeff (pu per MW) for a generator frozen at a
+    // limit of its capability curve, which its reactive output follows.
+    std::vector<int>    pq_buses;
+    std::vector<int>    vset_lost_groups;
+    std::vector<int>    gen_p_fixed;
+    std::vector<int>    gen_p_slope_gen, gen_p_slope_row;
+    std::vector<double> gen_p_slope_coeff;
 };
 
 class OuterHook {

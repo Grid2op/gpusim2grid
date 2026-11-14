@@ -44,6 +44,13 @@ def get_parser():
     parser.add_argument("--calibrate_tail", action="store_true",
                         help="print calibrate_tail_max_groups() for this grid and batch size")
     parser.add_argument("--skip_cpu", action="store_true", help="time the GPU only")
+    parser.add_argument("--reordering_alg", default="default",
+                        help="cuDSS reordering ('ls2g_constrained': lightsim2grid's constrained order, "
+                             "docs/dev_notes/batched_lu_and_constrained_ordering.md). Set "
+                             "GPUSIM2GRID_COUNT_PIVOTS=1 to count cuDSS's perturbed pivots")
+    parser.add_argument("--cpu_algo", default="NROuter_KLU",
+                        help="lightsim2grid's reference algorithm (NROuter_KLUStaticPivot: its fallback "
+                             "factorizations predict the GPU's frozen-pivot failures)")
     return parser
 
 
@@ -134,7 +141,8 @@ def main(args):
     ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=args.nb_iter,
                                 init_from_n_powerflow=args.init_from_n,
                                 handle_disconnected_grid=args.handle_disconnected_grid,
-                                tol=args.tol_mva / grid.get_sn_mva(), ir_n_steps=args.ir_n_steps)
+                                tol=args.tol_mva / grid.get_sn_mva(), ir_n_steps=args.ir_n_steps,
+                                reordering_alg=args.reordering_alg)
     ca.tail_max_groups, ca.tail_group_size = args.tail_max_groups, args.tail_group_size
     ca.add_contingencies_by_branch_id([[c] for c in ctgs])
     t_build = time.perf_counter() - t0
@@ -152,13 +160,16 @@ def main(args):
           f"occupancy {t.occupancy:.2f}, tail rounds {t.n_tail_rounds} ({t.n_slot_moves} row moves)")
     print(f"     statuses {dict(zip(*np.unique(status, return_counts=True)))}, "
           f"outer iterations mean {nb_outer.mean():.2f} max {nb_outer.max()}")
+    print(f"     cuDSS: reordering {args.reordering_alg}, user perm honoured {t.cudss_user_perm_honoured}, "
+          f"LU nnz {t.cudss_lu_nnz}, perturbed pivots {t.cudss_npivots_total} over "
+          f"{t.cudss_npivots_reads} factorizations (max {t.cudss_npivots_max})")
     print_breakdown(t, 1e3 * t_gpu)
     if args.skip_cpu:
         return
 
     from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
     batch = ContingencyAnalysisCPP(grid)
-    batch.change_algorithm("NROuter_KLU")
+    batch.change_algorithm(args.cpu_algo)
     batch.init_from_n_powerflow = args.init_from_n
     batch.handle_disconnected_grid = args.handle_disconnected_grid
     for c in ctgs:
@@ -168,7 +179,9 @@ def main(args):
     t_cpu = time.perf_counter() - t0
     conv = np.asarray(batch.converged_mask(), dtype=bool)
     res_ls = batch.get_outer_results()
-    print(f"CPU (lightsim2grid NROuter_KLU, 1 thread): {1e3 * t_cpu:.0f} ms "
+    st = batch.get_linear_solver_stats()
+    print(f"     CPU linear solver: {st}")
+    print(f"CPU (lightsim2grid {args.cpu_algo}, 1 thread): {1e3 * t_cpu:.0f} ms "
           f"({1e3 * t_cpu / len(ctgs):.2f} ms / contingency) -> GPU speed-up {t_cpu / t_gpu:.1f}x")
 
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)

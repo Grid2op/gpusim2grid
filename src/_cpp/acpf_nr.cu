@@ -41,6 +41,7 @@
 // See acpf_nr_state.cuh for the full class declaration and design notes.
 // =============================================================================
 
+#include "user_ordering.hpp"   // prototype: ls2g_constrained_perm
 #include "acpf_nr_state.cuh"
 #include "acpf_nr.hpp"
 #include "acpf_nr_kernels.cuh"
@@ -662,6 +663,10 @@ AcPfNrState::AcPfNrState(
     std::vector<int> theta_buses, theta_cols, vm_buses, vm_cols;
 
     if (ledger == nullptr) {
+        if (reordering_alg_ == ReorderingAlg::Ls2gConstrained
+            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd)
+            throw std::runtime_error("reordering_alg 'ls2g_constrained[_nd]' needs a lightsim2grid "
+                                     "grid (its ordering constraints), not array mode");
         build_J_structure(J_outer_h, J_inner_h,
                           h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                           Ybus_rm, pvpq_host, pq_in);
@@ -681,6 +686,8 @@ AcPfNrState::AcPfNrState(
         J_outer_h = ledger->J_outer;
         J_inner_h = ledger->J_inner;
         nnz_J     = static_cast<int>(J_inner_h.size());
+        if (reordering_alg_ == ReorderingAlg::Ls2gConstrained)
+            h_user_perm = ls2g_constrained_perm(*ledger);   // prototype, throws if unavailable
         build_scatter_maps_aug(h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                                J_outer_h, J_inner_h, Ybus_rm,
                                ledger->p_row_of_bus, ledger->q_row_of_bus,
@@ -813,26 +820,34 @@ AcPfNrState::AcPfNrState(
             auto it = std::lower_bound(in + s, in + e, col);
             return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
         };
-        for (int bus = 0; bus < n_bus; ++bus) {
-            const double w = ledger->slack_weights[bus];
-            if (w == 0.0) continue;
+        // the participants: every reserved bus, whatever its weight (an NROuterDist_*
+        // ledger, the weights then per slot), else the buses with a weight
+        std::vector<int> buses;
+        if (!ledger->slack_participant_buses.empty()) {
+            buses = ledger->slack_participant_buses;
+        } else {
+            for (int bus = 0; bus < n_bus; ++bus)
+                if (ledger->slack_weights[bus] != 0.0 && ledger->p_row_of_bus[bus] >= 0) buses.push_back(bus);
+        }
+        h_slack_bus.clear();
+        for (int bus : buses) {
+            const double w = static_cast<size_t>(bus) < ledger->slack_weights.size() ? ledger->slack_weights[bus] : 0.0;
             const int prow = ledger->p_row_of_bus[bus];
             if (prow < 0) continue;   // defensive: a weighted bus must own a P row
+            const int pos = find_J_pos(prow, slack_col);
+            if (pos < 0)
+                throw std::runtime_error("AcPfNrState: slack participant bus " + std::to_string(bus) +
+                                         " has no entry in the slack_absorbed column of J");
             h_prow.push_back(prow);
             h_w.push_back(static_cast<cuda_real_type>(w));
-            h_feat_pos.push_back(find_J_pos(prow, slack_col));
+            h_feat_pos.push_back(pos);
+            h_slack_bus.push_back(bus);
         }
         n_slack = static_cast<int>(h_prow.size());
         upload_h2d(d_slack_prow,     h_prow.data(),     n_slack, cs);
         upload_h2d(d_slack_w,        h_w.data(),        n_slack, cs);
         upload_h2d(d_slack_feat_pos, h_feat_pos.data(), n_slack, cs);
         h_slack_w = h_w;
-        h_slack_bus.clear();
-        for (int bus = 0; bus < n_bus; ++bus) {
-            const double w = ledger->slack_weights[bus];
-            if (w == 0.0 || ledger->p_row_of_bus[bus] < 0) continue;
-            h_slack_bus.push_back(bus);
-        }
 
         // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
         cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
@@ -1338,6 +1353,16 @@ AcPfNrState::AcPfNrState(
     // Jacobian skeleton (H→D) — augmented or trivial, both in J_outer_h/J_inner_h
     upload_h2d(d_J_outer, J_outer_h.data(), dim_J + 1, cs);
     upload_h2d(d_J_inner, J_inner_h.data(), nnz_J,     cs);
+    // prototype: cuDSS's own order of this skeleton, post-moved by lightsim2grid's
+    // constraints (ReorderingAlg::Ls2gConstrainedNd)
+    // (GPUSIM2GRID_ND_NO_POSTMOVE, diagnostic: hand cuDSS its own order back unchanged)
+    if (reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd && ledger != nullptr) {
+        std::vector<int> nd = cudss_reorder_perm(dim_J, nnz_J, thrust::raw_pointer_cast(d_J_outer.data()),
+                                                 thrust::raw_pointer_cast(d_J_inner.data()), cs,
+                                                 ReorderingAlg::Default);
+        const char* raw = std::getenv("GPUSIM2GRID_ND_NO_POSTMOVE");
+        h_user_perm = (raw && raw[0] && raw[0] != '0') ? nd : apply_ordering_constraints(std::move(nd), *ledger);
+    }
     d_J_values.resize(nnz_J);  zero_d(d_J_values, cs);
 
     timings.t_upload_ms = ms_since(t_upload_start);

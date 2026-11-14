@@ -3,6 +3,18 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] ``BatchTimings.cudss_user_perm_honoured`` and, with ``GPUSIM2GRID_COUNT_PIVOTS=1``,
+  ``cudss_npivots_*``: whether cuDSS used the order given, and how many pivots it perturbed.
+- [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
+  constrained order given to cuDSS. Removes its perturbed pivots but slows it 6-9x; see the dev note.
+- [ADDED] ``BatchPowerFlow``: ``redistribute_slack`` with ``outer_loops=True``, the lost power measured in
+  torch and shared by the rows' ``DistributedSlack`` loop; a unit that share puts at a bound gets no ``gen_p``
+  gradient.
+- [ADDED] ``BatchPowerFlow.from_lsgrid(outer_loops=True)``: gradients through the outer loops, as lightsim2grid
+  -- each row's last inner solve, its loops' decisions held; ``compute_flows`` at the taps they settled on in
+  the forward that returned ``V`` (``taps_from=`` for a clone).
+- [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
+  the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
 - [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
   the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its

@@ -182,6 +182,16 @@ __global__ void bc_controls_kernel(cudaComplexType* __restrict__ d_Ybus, BcStati
 __global__ void bc_restore_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
                                   const int* __restrict__ d_evict, int nnz_Y, int batch);
 
+// One thread per slot (the first n), its transformers in order: the slot's Ybus holds the
+// container's blocks (nothing for a transformer the row opens), as a fresh load leaves it,
+// while its BcSlots hold the state a row's last solve left (the batched adjoint copies it back
+// from where the row's eviction saved it): the block that solve stamped (sl.applied) patched in.
+__global__ void bc_stamp_applied_kernel(cudaComplexType* __restrict__ d_Ybus, BcStatic st, BcSlots sl,
+                                        int nnz_Y, int n);
+// One thread per (slot, controller), the first n slots: the same for ShuntControl (b_applied).
+__global__ void sc_stamp_applied_kernel(cudaComplexType* __restrict__ d_Ybus, ScStatic st, ScSlots sl,
+                                        int nnz_Y, int n);
+
 // One thread per (listed slot, transformer): its shift and ratio into the gather buffer
 // (row i of `d_out`, stride `stride`, the shifts at `offset`, the ratios after them).
 __global__ void bc_gather_kernel(cuda_real_type* __restrict__ d_out, BcStatic st, BcSlots sl,
