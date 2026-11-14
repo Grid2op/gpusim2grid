@@ -1,1 +1,2 @@
 DONNOT Benjamin <benjamin.donnot@gmail.com>
+CORTES DO NASCIMENTO Ralf (batched LU, linear_solver='own_lu')

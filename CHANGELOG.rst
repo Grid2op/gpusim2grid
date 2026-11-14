@@ -3,6 +3,16 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] ``benchmark_cudss_batch_raw(n_active=)``: with ``linear_solver='own_lu'``, only the first
+  ``n_active`` matrices are factorized and solved, the others left untouched.
+- [ADDED] (experimental) ``linear_solver='own_lu'`` on the three batch facades and ``BatchPowerFlow``: a batched LU
+  of our own instead of cuDSS, ordered on the host (lightsim2grid's constrained order by default): no pivot to perturb.
+  The LU itself is Ralf Cortes Do Nascimento's contribution (ported from gpu-security-analysis).
+- [IMPROVED] ``linear_solver='own_lu'``: the continuous tail runs on the forward solver's first slots (active
+  prefix) instead of a second solver cycled over groups of ``tail_group_size``.
+- [ADDED] lightsim2grid's constrained order now starts from the grid's own fill-reducing order (AMD or
+  ``MinFill``); ``reordering_alg='ls2g_constrained_minfill'`` forces minimum fill.
+- [ADDED] (diagnostic) ``GPUSIM2GRID_DUMP_J=<dir>``: every batch solver dumps its Jacobians and orders.
 - [ADDED] ``BatchTimings.cudss_user_perm_honoured`` and, with ``GPUSIM2GRID_COUNT_PIVOTS=1``,
   ``cudss_npivots_*``: whether cuDSS used the order given, and how many pivots it perturbed.
 - [ADDED] (prototype) ``reordering_alg='ls2g_constrained'`` / ``'ls2g_constrained_nd'``: lightsim2grid's
@@ -15,6 +25,16 @@ Change Log
   the forward that returned ``V`` (``taps_from=`` for a clone).
 - [ADDED] ``outer_loops=True`` on a grid solved with lightsim2grid's ``NROuterDist_*``: the inner Newton shares
   the slack, ``DistributedSlack`` only parks the units it pushes past a limit, as lightsim2grid.
+- [FIXED] ``reordering_alg`` changed after construction: the batch solvers get that algorithm's order (they kept
+  the construction value's lightsim2grid order, with cuDSS and the own LU alike).
+- [FIXED] ``benchmark_cudss_batch_raw(linear_solver=OwnLu)`` checks the CSR before ordering it (a malformed one
+  crashed the interpreter).
+- [FIXED] ``calibrate_tail_max_groups()`` with ``linear_solver='own_lu'``: measured on the prefix the tail runs
+  (k groups = one call), no longer ``t_full / t_group``, which advised far too few groups.
+- [IMPROVED] ``linear_solver='own_lu'`` with a ``reordering_alg`` / ``matching_alg`` it cannot take is refused at
+  construction or by the setter making the combination, not at the first ``compute()``.
+- [FIXED] ``linear_solver='own_lu'`` in an FP32 build clamps tiny pivots at ``1e-5 * max|J|`` (was ``1e-12``,
+  below float resolution: garbage factors, refinement diverging).
 - [FIXED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: ``violation_capacity`` and ``violation_tol`` set on
   the facade reach the session (they were plain attributes, silently ignored).
 - [FIXED] ``violation_capacity`` below 1 is refused (``ValueError``): the operational check wrote its

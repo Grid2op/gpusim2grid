@@ -11,6 +11,7 @@ It is a thin facade over :class:`_InjectionSweepSolver`.
 
 import numpy as np
 
+from ..contingency_analysis._scheduling import check_linear_solver_args
 from . import (
     PhysicalChecksFacadeMixin,
     SchedulingFacadeMixin,
@@ -100,6 +101,11 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         One step costs one more residual and solve per Newton iteration. Mutable:
         takes effect on the next :meth:`compute` (the base case keeps the
         construction value).
+    linear_solver : {'cudss', 'own_lu'}, default 'cudss'
+        Who factorizes and solves the batch Jacobians (forward, continuous tail,
+        adjoint); ``'own_lu'`` is the batched LU of our own, its order chosen on
+        the host from ``reordering_alg`` (lightsim2grid's constrained order by
+        default). See :attr:`linear_solver`; mutable, next run.
     debug_base_case : bool, default False
         Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
         VoltageControl extension active (bridge path). By default, that
@@ -215,12 +221,13 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
                  auto_branch_data=True, use_bridge=None, reordering_alg=None,
                  matching_alg=None, pivot_epsilon_alg=None, ir_n_steps=0,
-                 debug_base_case=False,
+                 linear_solver="cudss", debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, scheduling=None,
                  nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
         self._outer_loops = bool(outer_loops)
         if scheduling is None:
             scheduling = "continuous" if self._outer_loops else "chunked"
@@ -343,6 +350,9 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
 
         # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
         # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        # Who factorizes / solves the batch Jacobians, see
+        # SchedulingFacadeMixin.linear_solver (the base case stays on cuDSS).
+        self._inner.linear_solver = linear_solver
         self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
 
         self._apply_physical_checks_kwargs(compute_physical_violations)

@@ -257,6 +257,12 @@ ConstrainedOrderFn& constrained_order_hook()
 
 std::vector<int> ls2g_constrained_perm(const LedgerData& ledger)
 {
+    return ls2g_constrained_perm(ledger, ledger.ord_fill_reducing == 1 ? Ls2gFillReducing::MinFill
+                                                                       : Ls2gFillReducing::Amd);
+}
+
+std::vector<int> ls2g_constrained_perm(const LedgerData& ledger, Ls2gFillReducing fill)
+{
     if (!constrained_order_hook())
         throw std::runtime_error("reordering_alg 'ls2g_constrained' needs gpusim2grid built "
                                  "with the lightsim2grid bridge");
@@ -266,7 +272,7 @@ std::vector<int> ls2g_constrained_perm(const LedgerData& ledger)
                                  "use_distributed_slack=False, which renumbers J)");
     std::vector<int> perm;
     if (!constrained_order_hook()(ledger.dim_J, ledger.J_outer.data(), ledger.J_inner.data(),
-                                  ledger, perm)
+                                  ledger, fill, perm)
         || static_cast<int>(perm.size()) != ledger.dim_J)
         throw std::runtime_error("reordering_alg 'ls2g_constrained': lightsim2grid's "
                                  "constrained_order failed");

@@ -36,7 +36,11 @@ enum class ReorderingAlg {
     // default, nested dissection, read back from a throwaway ANALYSIS) instead
     // of AMD: AMD's tree has too little parallelism for cuDSS (8.7x slower
     // Newton rounds on a French snapshot, see the dev note).
-    Ls2gConstrainedNd
+    Ls2gConstrainedNd,
+    // lightsim2grid's constrained order started from its MINIMUM-FILL order
+    // (FillReducingOrdering::MinFill, Tinney-Walker scheme 3) whatever the grid's
+    // Newton is set to; Ls2gConstrained follows the grid's own setting.
+    Ls2gConstrainedMinFill
 };
 
 #endif  // REORDERING_ALG_HPP

@@ -49,6 +49,7 @@
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "reordering_alg.hpp"
+#include "linear_solver.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
 #include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
@@ -157,6 +158,9 @@ struct ScenarioSweepSession {
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
     int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
+    // Who factorizes / solves the batch Jacobians (linear_solver.hpp); the base
+    // case always stays on cuDSS. Next run(); a change builds a new driver.
+    LinearSolver linear_solver_ = LinearSolver::Cudss;
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see the other

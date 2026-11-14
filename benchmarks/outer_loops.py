@@ -48,6 +48,9 @@ def get_parser():
                         help="cuDSS reordering ('ls2g_constrained': lightsim2grid's constrained order, "
                              "docs/dev_notes/batched_lu_and_constrained_ordering.md). Set "
                              "GPUSIM2GRID_COUNT_PIVOTS=1 to count cuDSS's perturbed pivots")
+    parser.add_argument("--linear_solver", default="cudss",
+                        help="batch linear solver: 'cudss' or 'own_lu' (the batched LU of our own; its order "
+                             "from --reordering_alg, 'default' = lightsim2grid's constrained order)")
     parser.add_argument("--cpu_algo", default="NROuter_KLU",
                         help="lightsim2grid's reference algorithm (NROuter_KLUStaticPivot: its fallback "
                              "factorizations predict the GPU's frozen-pivot failures)")
@@ -142,7 +145,7 @@ def main(args):
                                 init_from_n_powerflow=args.init_from_n,
                                 handle_disconnected_grid=args.handle_disconnected_grid,
                                 tol=args.tol_mva / grid.get_sn_mva(), ir_n_steps=args.ir_n_steps,
-                                reordering_alg=args.reordering_alg)
+                                reordering_alg=args.reordering_alg, linear_solver=args.linear_solver)
     ca.tail_max_groups, ca.tail_group_size = args.tail_max_groups, args.tail_group_size
     ca.add_contingencies_by_branch_id([[c] for c in ctgs])
     t_build = time.perf_counter() - t0
@@ -160,7 +163,8 @@ def main(args):
           f"occupancy {t.occupancy:.2f}, tail rounds {t.n_tail_rounds} ({t.n_slot_moves} row moves)")
     print(f"     statuses {dict(zip(*np.unique(status, return_counts=True)))}, "
           f"outer iterations mean {nb_outer.mean():.2f} max {nb_outer.max()}")
-    print(f"     cuDSS: reordering {args.reordering_alg}, user perm honoured {t.cudss_user_perm_honoured}, "
+    print(f"     {args.linear_solver}: reordering {args.reordering_alg}, analysis {t.t_analysis_ms:.0f} ms, "
+          f"user perm honoured {t.cudss_user_perm_honoured}, "
           f"LU nnz {t.cudss_lu_nnz}, perturbed pivots {t.cudss_npivots_total} over "
           f"{t.cudss_npivots_reads} factorizations (max {t.cudss_npivots_max})")
     print_breakdown(t, 1e3 * t_gpu)

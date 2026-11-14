@@ -18,6 +18,8 @@ from enum import IntEnum
 import numpy as np
 
 from .._gpusim2grid import BatchScheduling as _BatchScheduling, is_fp32 as _is_fp32
+from .._gpusim2grid import LinearSolver as _LinearSolver
+from .._gpusim2grid import check_own_lu_config as _check_own_lu_config
 
 _SCHEDULING_MAP = {
     "chunked":    _BatchScheduling.Chunked,
@@ -29,6 +31,31 @@ _SCHEDULING_NAME = {v: k for k, v in _SCHEDULING_MAP.items()}
 # in batch_pf_driver.cuh, which raises at run() whatever the order of the
 # settings)
 _CONTINUOUS_REFUSED_STRATEGIES = ("direct_iter0_only", "direct_refactor_every_n")
+
+
+_LINEAR_SOLVER_MAP = {
+    "cudss":  _LinearSolver.Cudss,
+    "own_lu": _LinearSolver.OwnLu,
+}
+_LINEAR_SOLVER_NAME = {v: k for k, v in _LINEAR_SOLVER_MAP.items()}
+
+
+def resolve_linear_solver(value):
+    """'cudss' / 'own_lu' (or the LinearSolver enum) -> enum."""
+    if isinstance(value, _LinearSolver):
+        return value
+    if value not in _LINEAR_SOLVER_MAP:
+        raise ValueError(f"Unknown linear_solver {value!r}. Choose from: {list(_LINEAR_SOLVER_MAP)}")
+    return _LINEAR_SOLVER_MAP[value]
+
+
+def check_linear_solver_args(linear_solver, reordering_alg=None, matching_alg=None):
+    """Facade constructors: refuse what ``linear_solver='own_lu'`` cannot
+    take before any base case is solved (ValueError). None = the default."""
+    from . import _resolve_matching_alg, _resolve_reordering_alg
+    if resolve_linear_solver(linear_solver) == _LinearSolver.OwnLu:
+        _check_own_lu_config(_resolve_reordering_alg("default" if reordering_alg is None else reordering_alg),
+                             _resolve_matching_alg("none" if matching_alg is None else matching_alg))
 
 
 class RowStatus(IntEnum):
@@ -164,6 +191,44 @@ class SchedulingEngineMixin:
             raise ValueError("tail_group_size must be >= 1")
         self._s.tail_group_size = value
 
+    @property
+    def linear_solver(self):
+        """str: who factorizes and solves the batch Jacobians -- forward, the
+        continuous tail and the adjoint; the base case always stays on cuDSS.
+
+        - ``'cudss'`` (default): cuDSS's uniform batch.
+        - ``'own_lu'`` (experimental): the batched LU of our own
+          (docs/dev_notes/batched_lu_and_constrained_ordering.md). It never
+          pivots: its elimination order is chosen on the host from
+          :attr:`reordering_alg` -- ``'default'`` is lightsim2grid's constrained
+          order when the grid declares ordering constraints (a row the outer
+          loops switch by value keeps a valid pivot), started from the grid's
+          own fill-reducing order (AMD or MinFill), AMD otherwise; ``'amd'``,
+          ``'none'``, ``'ls2g_constrained'`` (same as the default),
+          ``'ls2g_constrained_nd'`` and ``'ls2g_constrained_minfill'`` (MinFill
+          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` (``1e-5`` in an FP32 build) is clamped (counted by
+          ``timings.cudss_npivots_*`` with ``GPUSIM2GRID_COUNT_PIVOTS=1``);
+          ``ir_n_steps`` refines. ``matching_alg`` must stay ``'none'``.
+
+        Takes effect on the next run (a new driver)."""
+        return _LINEAR_SOLVER_NAME[self._s.linear_solver]
+
+    @linear_solver.setter
+    def linear_solver(self, value):
+        ls = resolve_linear_solver(value)
+        self._check_own_lu(linear_solver=ls)
+        self._s.linear_solver = ls
+
+    def _check_own_lu(self, linear_solver=None, reordering_alg=None, matching_alg=None):
+        """ValueError if the session's settings, with the given ones (enums)
+        replacing theirs, ask the own LU for what it cannot take: called by the
+        setters before they assign, so a refused value changes nothing."""
+        ls = self._s.linear_solver if linear_solver is None else linear_solver
+        if ls != _LinearSolver.OwnLu:
+            return
+        _check_own_lu_config(self._s.reordering_alg if reordering_alg is None else reordering_alg,
+                             self._s.matching_alg if matching_alg is None else matching_alg)
+
     def calibrate_tail_max_groups(self, n_repeat=5, batch_size=None):
         """Measure a :attr:`tail_max_groups` for this grid on this GPU: the
         base case's Jacobian refactorized and solved ``n_repeat`` times on a
@@ -171,9 +236,12 @@ class SchedulingEngineMixin:
         on one of :attr:`tail_group_size` matrices. Returns the
         ``TailCalibration`` (``t_full_ms``, ``t_group_ms``, ``max_groups =
         floor(t_full_ms / t_group_ms)``, what the tail's rule compares); sets
-        nothing. cuDSS only: the tail also runs the Newton kernels on fewer
-        slots, so ``max_groups`` is conservative. Allocates ``batch_size``
-        systems and their factors while it runs."""
+        nothing. With ``linear_solver='own_lu'`` the tail runs k groups as one
+        solve on the first k·``tail_group_size`` matrices, so ``max_groups`` is
+        the largest k whose such prefix is still faster than the full batch
+        (bisected; ``t_group_ms`` is the one-group prefix). The tail also runs
+        the Newton kernels on fewer slots, so ``max_groups`` is conservative.
+        Allocates ``batch_size`` systems and their factors while it runs."""
         return self._s.calibrate_tail_max_groups(
             int(n_repeat), -1 if batch_size is None else int(batch_size))
 
@@ -220,6 +288,15 @@ class SchedulingEngineMixin:
 class SchedulingFacadeMixin:
     """For the ``*GPU`` facades: expects ``self._inner`` (an engine carrying
     :class:`SchedulingEngineMixin`)."""
+
+    @property
+    def linear_solver(self):
+        """See :attr:`SchedulingEngineMixin.linear_solver`."""
+        return self._inner.linear_solver
+
+    @linear_solver.setter
+    def linear_solver(self, value):
+        self._inner.linear_solver = value
 
     @property
     def scheduling(self):

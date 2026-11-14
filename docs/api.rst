@@ -77,6 +77,8 @@ Jacobian from the forward and rebuilds them in the backward (see below).
 .. autoclass:: gpusim2grid.RowStatus
    :members:
 
+.. _outer-loops:
+
 Outer loops
 ~~~~~~~~~~~
 
@@ -110,6 +112,15 @@ lightsim2grid's batches show them. Not supported yet: ``redistribute_slack``
     ca.add_contingencies_by_branch_id([[i] for i in range(n_branches)])
     ca.compute(batch_size=512)
     ca.get_outer_results()[0].nb_outer_iterations
+
+.. warning::
+
+   Use an FP64 build with ``outer_loops=True``. The loops decide on the state
+   each inner solve converges to, and match lightsim2grid's decisions only if
+   those solves stop where its double-precision Newton does: an FP32 build
+   cannot reach lightsim2grid's tolerances (at ``1e-6`` MVA the rows of an
+   ieee118 contingency analysis all end ``MAX_ITER``), and with a looser
+   ``tol`` its loops may decide differently.
 
 Contingency analysis
 --------------------

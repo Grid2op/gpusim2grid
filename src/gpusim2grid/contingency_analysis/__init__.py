@@ -76,6 +76,7 @@ _REORDERING_ALG_MAP = {
     # prototype, docs/dev_notes/batched_lu_and_constrained_ordering.md
     'ls2g_constrained':  _ReorderingAlg.Ls2gConstrained,
     'ls2g_constrained_nd': _ReorderingAlg.Ls2gConstrainedNd,
+    'ls2g_constrained_minfill': _ReorderingAlg.Ls2gConstrainedMinFill,
 }
 
 
@@ -446,6 +447,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     @reordering_alg.setter
     def reordering_alg(self, value):
+        self._check_own_lu(reordering_alg=_resolve_reordering_alg(value))
         self._reordering_alg = value
         self._s.reordering_alg = _resolve_reordering_alg(value)
 
@@ -463,6 +465,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     @matching_alg.setter
     def matching_alg(self, value):
+        self._check_own_lu(matching_alg=_resolve_matching_alg(value))
         self._matching_alg = value
         self._s.matching_alg = _resolve_matching_alg(value)
 
