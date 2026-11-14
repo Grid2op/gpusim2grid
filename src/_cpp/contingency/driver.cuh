@@ -68,7 +68,12 @@ struct TailSolve {
               CudaTimer& timer, NrIterTimings& t)
     {
         if (prefix) {
-            const int full = solver->active_count();
+            // the full batch back on every way out: a throw from refactor() /
+            // solve() must not leave a reused driver's forward solver on the prefix
+            struct RestoreActive {
+                CudssBatchSolver* s; int full;
+                ~RestoreActive() { s->set_active_count(full); }
+            } restore{solver, solver->active_count()};
             solver->bind_slice(d_J, d_F, d_dx);   // the forward's own buffers (pointers only)
             solver->set_active_count(n_groups * G);
             const bool refac = solver->factorized_since_analysis_;
@@ -79,7 +84,6 @@ struct TailSolve {
             timer.start();
             solver->solve();
             t.t_solve += timer.stop_ms();
-            solver->set_active_count(full);
             return refac ? 1 : 0;
         }
         int n_refac = 0;
