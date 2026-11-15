@@ -7,6 +7,8 @@ Change Log
   cuDSS from PyPI, and the libraries find the ``nvidia`` wheels without ``LD_LIBRARY_PATH``.
 - [ADDED] ``gpusim2grid[cuda12]`` builds with the CUDA 12 nvcc ``CUDACXX`` names (the build's CUDA major is
   picked from the environment by an in-tree backend: an extra never reaches the build).
+- [ADDED] ``.github/workflows/publish.yml``: a published GitHub release ``vX.Y.Z`` uploads the sdist to PyPI
+  (trusted publishing), once a GPU-less ``pip install`` of it builds; manual dispatch rehearses on TestPyPI.
 - [ADDED] ``import gpusim2grid`` refuses CUDA libraries of another major than the build, a too old driver, and
   another lightsim2grid version than the bridge's.
 - [FIXED] the first cuDSS call of a process (``warmup()`` or any session) left the calling thread in the "C"
