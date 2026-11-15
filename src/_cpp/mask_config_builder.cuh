@@ -52,6 +52,7 @@ inline MaskConfig build_mask_config(const AcPfNrState& base, const LedgerData* l
         for (int b : ledger->hvdc_bus1)  mark(b);
         for (int b : ledger->hvdc_bus2)  mark(b);
 
+        cfg.vc_hold_by_value  = ledger->vc_may_trip && !ledger->outer_loops;
         cfg.vc_bus            = ledger->vc_bus;
         cfg.vc_group          = ledger->vc_group;
         cfg.vc_ctrl_vrow_qcol_pos = base.h_vc_ctrl_vrow_qcol_pos;

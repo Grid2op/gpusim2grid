@@ -145,6 +145,8 @@ struct Contingency {
     // not listed here is pinned whatever vc_pinned_ctrl says, so a row built
     // without pins (a preview of its masks) still sees it pinned.
     std::vector<int> vc_released;
+    // The controllers of the voltage-control groups this row trips: gone (lightsim2grid PR #292)
+    std::vector<int> vc_tripped;
 
     // Branch ids (lines-then-trafos) tripped by this contingency, populated
     // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.
@@ -385,6 +387,12 @@ struct MaskConfig {
     // per controller, 1 for a held one (LedgerData::vc_held): pinned on every row
     // that does not release it (Contingency::vc_released); empty = none
     std::vector<int> vc_held;
+    // The rows' lost controllers (tripped, or on a masked bus) are held by value through
+    // the holding formulation (SlotVcHold, LedgerData::vc_may_trip): in a group where a row
+    // loses one, its pinned controllers (Contingency::vc_pinned_ctrl) are held there too,
+    // at their targets, and get no jov / vcp entries -- those rewrite only two entries of a
+    // sharing row the holding formulation may have taken against another reference.
+    bool vc_hold_by_value = false;
 
     MaskRowInfo       row_info;
 };

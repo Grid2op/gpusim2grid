@@ -42,6 +42,7 @@
 // =============================================================================
 
 #include "dtypes.hpp"
+#include "ledger_data.hpp"      // HVDC_STATUS_TRIPPED
 #include "cu_complex_utils.h"   // cudaComplexType, cuda_real_type, CudaFunHelper
 
 // ---------------------------------------------------------------------------
@@ -451,7 +452,10 @@ __device__ __forceinline__ void hvdc_flows_pu(
     cuda_real_type pmax12, cuda_real_type pmax21,
     cuda_real_type& p1_flow, cuda_real_type& p2_flow)
 {
-    if (st == 0) {
+    if (st == HVDC_STATUS_TRIPPED) {
+        p1_flow = static_cast<cuda_real_type>(0.);
+        p2_flow = static_cast<cuda_real_type>(0.);
+    } else if (st == 0) {
         if (raw >= static_cast<cuda_real_type>(0.)) {
             p1_flow =  raw;
             p2_flow = -hvdc_recv_pu(raw, true, lf1, lf2, r);

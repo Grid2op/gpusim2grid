@@ -382,7 +382,9 @@ make_ss_outer_session_from_lsgrid(
     bool   keep_trace = false,
     // every row resumes from where the grid's own solve left its loops (lightsim2grid's
     // init_from_n_powerflow), starting from its voltages as they are
-    bool   resume_from_n = false);
+    bool   resume_from_n = false,
+    // the step scaling of the inner Newton: -1 / negative = the grid's own
+    int scaling_max_voltage_change_override = -1, double max_dVa_override = -1.0, double max_dVm_override = -1.0);
 
 // The same for a contingency analysis (each contingency keeps the grid's targets)
 // and an injection sweep (set_outer_gen_p_rows: the rows' own).
@@ -394,7 +396,8 @@ make_ca_outer_session_from_lsgrid(
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
     int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
-    bool keep_trace = false, bool resume_from_n = false);
+    bool keep_trace = false, bool resume_from_n = false,
+    int scaling_max_voltage_change_override = -1, double max_dVa_override = -1.0, double max_dVm_override = -1.0);
 std::shared_ptr<InjectionSweepSession>
 make_is_outer_session_from_lsgrid(
     const ls2g::LSGrid& grid, int batch_size, int nb_iter, int device,
@@ -403,6 +406,7 @@ make_is_outer_session_from_lsgrid(
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
     int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
-    bool keep_trace = false, bool resume_from_n = false);
+    bool keep_trace = false, bool resume_from_n = false,
+    int scaling_max_voltage_change_override = -1, double max_dVa_override = -1.0, double max_dVm_override = -1.0);
 
 #endif  // LS2G_BRIDGE_HPP

@@ -75,15 +75,20 @@ Coming soon:
 
 ## ⚠️ Important warning
 
-**This is a raw Newton-Raphson solver. There is no outer loop.** It does not enforce
-reactive-power limits (no PV→PQ switching), adjust tap / phase-shifter setpoints, or
-perform any other outer-loop correction. The *in-Jacobian* controls that
+**By default this is a raw Newton-Raphson solver, with no outer loop.** It does not
+enforce reactive-power limits (no PV→PQ switching), adjust tap / phase-shifter setpoints,
+or perform any other outer-loop correction. The *in-Jacobian* controls that
 lightsim2grid models — distributed slack, HVDC angle-droop, SVC, and remote
 generator voltage control — **are** solved when you go through the lightsim2grid
-bridge (the default facade path), and then match lightsim2grid. But if your problem
-relies on outer-loop behaviour (Q limits, tap changing, …), results will differ from
-a full load-flow tool. See [`DISCLAIMER.md`](DISCLAIMER.md) for the full list of
-limitations and for pointers to other open-source tools that cover them.
+bridge (the default facade path), and then match lightsim2grid. The three batch
+facades can also run the grid's own lightsim2grid outer loops on every row
+(`outer_loops=True`, a grid solved with an `NROuter_*` algorithm: OpenLoadFlow's
+reactive limits, distributed slack, HVDC AC-emulation limits, voltage monitoring,
+phase / transformer / shunt voltage control); the single solve (`AcPfGPU`) cannot.
+Without them, if your problem relies on outer-loop behaviour (Q limits, tap
+changing, …), results will differ from a full load-flow tool. See
+[`DISCLAIMER.md`](DISCLAIMER.md) for the full list of limitations and for pointers
+to other open-source tools that cover them.
 
 ## Requirements
 

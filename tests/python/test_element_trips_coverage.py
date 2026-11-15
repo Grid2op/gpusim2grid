@@ -379,7 +379,8 @@ def test_ca_mixed_repeated_trip_kinds_match_lightsim2grid(solver_atol):
     ca = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
     ca.add_contingencies(MIXED)
     ca.add_contingencies(MIXED_APPENDED)
-    assert ca.get_contingencies() == [tuple(sorted(set(el)) for el in t) for t in trips]
+    # (the four element kinds this batch trips none of come back empty)
+    assert ca.get_contingencies() == [tuple(sorted(set(el)) for el in t) + ([],) * 4 for t in trips]
     ca.compute(batch_size=4)
     assert np.all(ca.last_residuals() < 100 * solver_atol)
     V = ca.V_results.to_numpy().reshape(len(trips), -1)

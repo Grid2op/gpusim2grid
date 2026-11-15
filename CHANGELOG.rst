@@ -3,6 +3,53 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [IMPROVED] ``outer_loops=True``: a row can trip an HVDC line with a station regulating a voltage
+  (it was ``BATCH_UNSUPPORTED``).
+- [FIXED] ``outer_loops=True``: a tripped controller came back at a reactive limit when ``ReactiveLimits``
+  froze a bus it shared with another controller of its group.
+- [IMPROVED] (diagnostic) ``GPUSIM2GRID_OC_PROFILE=1`` also counts the rows never re-solved, the loops
+  that act and the frozen buses resumed.
+- [ADDED] A contingency or a row can trip an SVC with a standby automaton (lightsim2grid leaves it out): its
+  release-check entries and the ``VoltageMonitoring`` loop skip it for that row.
+- [IMPROVED] ``outer_loops=True``: the rows' adjoint terms (``pq_buses``, ``gen_p_fixed``, ...) are only computed
+  with gradients; ``get_outer_results()`` leaves them empty otherwise.
+- [IMPROVED] ``outer_loops=True``: a finished row's taps, sections and regimes are listed when read, not in the run.
+- [IMPROVED] ``outer_loops=True``: a slot's load starts from a state prepared once per run, reusing its memory.
+- [ADDED] A row can trip a controller of a voltage-control group (a remote or group generator, an SVC in voltage
+  mode, a converter station): it leaves its group by value, still one analysis, the regulated bus free when none is left.
+- [ADDED] A contingency or a row can trip an HVDC line in AC emulation: no flow, no slope, still one analysis.
+- [FIXED] ``ScenarioSweepGPU`` with ``redistribute_slack``: a tripped storage unit kept its share of the row's slack.
+- [ADDED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: a contingency can trip static generators, storage units,
+  SVCs and HVDC lines (lightsim2grid #292): ``add_contingency(sgen_ids=, ...)``, ``set_contingency_sgens`` etc.
+- [BREAKING] What the batch cannot do (a remote generator, an SVC in voltage mode, ...) is reported per row
+  (``get_batch_unsupported_reasons``, a ``BATCH_UNSUPPORTED`` violation) instead of raising for the whole batch.
+- [BREAKING] ``ContingencyAnalysisGPU.get_contingencies()`` returns 10 lists, as lightsim2grid's ``my_contingencies()``.
+- [FIXED] Tripping a generator next to a storage unit or HVDC station still regulating its bus turned that bus PQ.
+- [FIXED] ``outer_loops=True``: a voltage-control group losing a controller to an island, the others held at a
+  reactive limit, failed: the islanded controller is now gone and the regulated bus free.
+- [FIXED] ``outer_loops=True`` with ``redistribute_slack``: after a contingency's lost-power share, ``DistributedSlack``
+  shares the rest from the row's own targets (lightsim2grid 1.3.1, OpenLoadFlow): a unit put at a bound stays there.
+- [FIXED] ``outer_loops=True`` with ``redistribute_slack`` and ``init_from_n_powerflow``: a row losing a unit the "n"
+  solve moved shares that power, even when it loses nothing at the grid's targets.
+- [FIXED] ``outer_loops=True``: ``DistributedSlack(run_without_participant=True)`` is honoured (lightsim2grid #269).
+- [FIXED] Gradients with ``NROuterDist_*``: a unit parked at a check that did not re-solve keeps its ``gen_p`` gradient.
+- [FIXED] ``BatchPowerFlow.compute_flows`` refuses a ``V`` of another row count when the outer loops moved taps,
+  instead of silently using the grid's taps.
+- [ADDED] Continuous scheduling: ``round_records`` (rows and times of each round), and ``t_sess_*_ms`` for what
+  a contingency analysis does around the driver's solve.
+- [IMPROVED] Continuous scheduling: no base-case load of a freed slot the tail overwrites or drops
+  (``n_base_loads`` / ``n_base_loads_skipped``); results unchanged.
+- [FIXED] ``outer_loops=True``: ``scaling_max_voltage_change`` / ``max_dVa`` / ``max_dVm`` were silently ignored at
+  construction (the grid's own setting was always used).
+- [IMPROVED] MaxVoltageChange step scaling: one block per slot instead of one thread per entry (about 4x cheaper),
+  now timed in ``t_update_V``; results unchanged.
+- [IMPROVED] ``outer_loops=True``: the host model's row load is ~3x and its decisions ~2x cheaper (shared
+  ReactiveLimits plans, base limit sums, flat per-row state); results unchanged.
+- [ADDED] Continuous scheduling timings: ``t_main_phase_wall_ms`` (every slot in use) and ``t_tail_phase_wall_ms``,
+  with the live rows solved in each (``n_main_row_rounds``, ``n_tail_row_rounds``).
+- [ADDED] (diagnostic) ``GPUSIM2GRID_OC_PROFILE=1``: wall time per part of the outer model, on stderr.
+- [BREAKING] ``SlackRedistributionData.gen_target_p_mw`` is now ``gens_target_p_mw``. In C++, ``RowResult``
+  has a dense ``gens_target_p_mw`` and ``gen_target_p_mw(gen_id)``; ``gen_ids`` is gone.
 - [ADDED] ``gpusim2grid_core``: the solvers as a C++ shared library without Python (headers, CMake package
   ``gpusim2grid::core``, ``gpusim2grid.get_cmake_dir()``), for C++ / JNI callers; the Python module links it.
 - [ADDED] ``benchmark_cudss_batch_raw(n_active=)``: with ``linear_solver='own_lu'``, only the first

@@ -148,6 +148,7 @@ class LimitViolationType(IntEnum):
     TRANSFORMER_VOLTAGE_DEADBAND = 19
     #: A bus shunt sections regulate, off its target (BUS, kV).
     SHUNT_VOLTAGE_CONTROL = 20
+    BATCH_UNSUPPORTED = 21
 
 
 class ViolationCategory(IntEnum):

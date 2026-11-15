@@ -198,6 +198,49 @@ def test_refusals(case14):
         ScenarioSweepGPU(case14, init_from_n_powerflow=False).get_outer_results()
 
 
+def _outer_facade(kind, grid, **kwargs):
+    from gpusim2grid import ContingencyAnalysisGPU, InjectionSweepGPU, ScenarioSweepGPU
+    cls = {"ca": ContingencyAnalysisGPU, "ss": ScenarioSweepGPU, "is": InjectionSweepGPU}[kind]
+    return cls(grid, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, **kwargs)
+
+
+@pytest.mark.parametrize("kind", ["ca", "ss", "is"])
+def test_step_scaling_arguments_reach_the_outer_session(case14, kind):
+    """they force the grid's own setting, as without the outer loops; None inherits it"""
+    cfg = case14.get_ac_algo_config()
+    s = _outer_facade(kind, case14)._inner._s
+    assert s.scaling_max_voltage_change == (list(cfg.int_params)[0] == 1)
+    for forced in (True, False):
+        s = _outer_facade(kind, case14, scaling_max_voltage_change=forced, max_dVa=0.25, max_dVm=0.05)._inner._s
+        assert s.scaling_max_voltage_change is forced
+        assert s.max_dVa == pytest.approx(0.25)
+        assert s.max_dVm == pytest.approx(0.05)
+    # a grid with the scaling on: None inherits it and its limits
+    grid = _case14()
+    cfg = grid.get_ac_algo_config()
+    ip, rp = list(cfg.int_params), list(cfg.real_params)
+    ip[0], rp[0], rp[1] = 1, 0.3, 0.07
+    cfg.int_params, cfg.real_params = ip, rp
+    grid.set_ac_algo_config(cfg)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    s = _outer_facade(kind, grid)._inner._s
+    assert s.scaling_max_voltage_change is True
+    assert s.max_dVa == pytest.approx(0.3)
+    assert s.max_dVm == pytest.approx(0.07)
+    s = _outer_facade(kind, grid, scaling_max_voltage_change=False)._inner._s
+    assert s.scaling_max_voltage_change is False
+
+
+def test_step_scaling_arguments_change_the_outer_newton(case14):
+    """tight limits damp every inner Newton: more iterations than with the scaling off"""
+    def newton(**kwargs):
+        ca = _outer_facade("ca", case14, tol=TOL_MVA / case14.get_sn_mva(), ir_n_steps=1, **kwargs)
+        ca.add_contingencies_by_branch_id([[1], [2], [3]])
+        ca.compute(batch_size=3)
+        return sum(r.nb_nr_iterations for r in ca.get_outer_results())
+    assert newton(scaling_max_voltage_change=True, max_dVa=0.01, max_dVm=0.002) > newton(scaling_max_voltage_change=False)
+
+
 def test_scheduling_enum_is_accepted(case14):
     """scheduling=BatchScheduling.Continuous is scheduling='continuous': every
     facade takes the enum, the outer-loop check too, and the rows are the same."""
@@ -968,6 +1011,52 @@ def test_transformer_voltage_control_scenario_sweep_row_load_q():
     V = _V(sw, grid, n_rows)
     assert np.abs(V[-1] - V[0]).max() > 1e-4   # the rows' load Q does move the state
 
+def test_transformer_voltage_control_releases_a_group_past_a_masked_bus(solver_atol):
+    """TransformerVoltageControl freezes a remote regulator (B8 holding bus 6, a group of one)
+    and releases it once the taps are settled. On a contingency islanding bus 5 (B6's entry of
+    the ReactiveLimits plan, before B8's), the row's plan is the grid's without that entry
+    (rl_plan_masked): the release must still find B8's entry, and bus 6 end at its set-point,
+    as in lightsim2grid's single solve of the grid without the island."""
+    import test_outer_model_cpu as cpu
+    from gpusim2grid import ContingencyAnalysisGPU
+    GEN_B8, REGULATED, V_SET, TRAFO_5_6, LINES_OF_5, BUS_B6 = 4, 6, 1.06, 2, (7, 8, 9), 5
+
+    def make():
+        grid = cpu._tvc_grid("T4-9-1", 12.6, 0.1, max_controlled_nominal_voltage=120.)
+        grid.set_gen_regulated_bus(GEN_B8, REGULATED)
+        grid.change_v_gen(GEN_B8, V_SET)
+        grid.set_keep_vinit_at_group_controlled_buses(True)
+        return grid
+
+    grid = make()
+    v0 = np.full(grid.total_bus(), 1. + 0j)
+    assert grid.ac_pf(v0, MAX_IT, 1e-10).size > 0
+    ref = make()
+    ref.deactivate_trafo(TRAFO_5_6)
+    for line in LINES_OF_5:
+        ref.deactivate_powerline(line)
+    ref.consider_only_main_component(False)
+    V_ref = ref.ac_pf(v0, MAX_IT, 1e-10)
+    assert V_ref.size > 0
+    ref_trace = [str(d) for d in ref.get_algo().get_outer_loop_stats().decisions]
+    assert any("TransformerVoltageControl" in d and "ROUND_TAP" in d for d in ref_trace), ref_trace
+    assert abs(V_ref[REGULATED]) == pytest.approx(V_SET, abs=solver_atol)
+
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, ir_n_steps=1,
+                                handle_disconnected_grid=True, keep_outer_trace=True, init_from_n_powerflow=False,
+                                tol=1e-10 / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[len(grid.get_lines()) + TRAFO_5_6, *LINES_OF_5]])
+    ca.compute(batch_size=1)
+    msg = "\n".join(ca.get_outer_results()[0].decisions) + "\n---- lightsim2grid\n" + "\n".join(ref_trace)
+    assert ca.get_row_status()[0] == CONVERGED, msg
+    buses = list(np.asarray(grid.id_ac_solver_to_me(), dtype=int))
+    V = ca.V_results.to_numpy().reshape(1, len(buses))[0]
+    live = np.isfinite(V)
+    assert not live[buses.index(BUS_B6)], msg
+    assert abs(V[buses.index(REGULATED)]) == pytest.approx(V_SET, abs=solver_atol), msg
+    np.testing.assert_allclose(V[live], V_ref[np.asarray(buses)][live], rtol=0., atol=solver_atol, err_msg=msg)
+
+
 def test_transformer_voltage_control_injection_sweep():
     from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
     from gpusim2grid import InjectionSweepGPU
@@ -1530,6 +1619,54 @@ def test_dist_lost_power_parks_the_units_it_saturates(solver_atol):
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V_ls = np.asarray(ca.get_voltages())[0, buses]
     np.testing.assert_allclose(_V(sw, grid, 1)[0], V_ls, rtol=0., atol=solver_atol, err_msg=msg)
+
+
+def test_islanded_group_controller_others_held_frees_the_bus(solver_atol):
+    """lightsim2grid 1f975882: a shared voltage control whose contingency islands one
+    controller, the live one held at its reactive limit by ReactiveLimits: the islanded one is
+    gone (never the group's reference, pinned at 0), the regulated bus is free, as in a single
+    solve of the grid without the island"""
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+    from lightsim2grid.algorithm import ReactiveLimits
+    from gpusim2grid import ContingencyAnalysisGPU
+    REGULATED, CONTROLLERS, LEAF, TARGET = 8, (5, 7), 7, 1.05
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(pn.case14())
+    for el in grid.get_generators():
+        if el.bus_id in CONTROLLERS:
+            grid.set_gen_regulated_bus(el.id, REGULATED)
+            grid.change_v_gen(el.id, TARGET)
+    grid.set_keep_vinit_at_group_controlled_buses(True)
+    grid.clear_outer_loops()
+    grid.add_outer_loop(ReactiveLimits())
+    grid.change_algorithm(OUTER)
+    v0 = np.full(grid.total_bus(), 1. + 0j)
+    assert grid.ac_pf(v0, MAX_IT, TOL_MVA).size > 0
+    trafo = [t.id for t in grid.get_trafos() if LEAF in (t.bus1_id, t.bus2_id)][0]
+    ref = grid.copy()
+    ref.deactivate_trafo(trafo)
+    ref.consider_only_main_component(False)
+    V_ref = ref.ac_pf(v0, MAX_IT, TOL_MVA)
+    assert V_ref.size > 0
+    live = [el for el in ref.get_generators() if el.bus_id == CONTROLLERS[0]][0]
+    assert ref.get_gen_res()[1][live.id] == pytest.approx(live.max_q_mvar, abs=1e-6)  # the case at hand
+    assert abs(V_ref[REGULATED]) < TARGET - 1e-3
+
+    n_line = len(grid.get_lines())
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, ir_n_steps=1,
+                                handle_disconnected_grid=True, keep_outer_trace=True, init_from_n_powerflow=False,
+                                tol=TOL_MVA / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[n_line + trafo]])
+    ca.compute(batch_size=1)
+    msg = "\n".join(ca.get_outer_results()[0].decisions)
+    assert ca.get_row_status()[0] == CONVERGED, msg
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
+    live_bus = np.isfinite(V)
+    assert not live_bus[list(buses).index(LEAF)], msg
+    np.testing.assert_allclose(V[live_bus], V_ref[buses][live_bus], rtol=0., atol=solver_atol, err_msg=msg)
 
 
 def test_redistribute_slack_a_unit_at_its_bound_stays_there():
