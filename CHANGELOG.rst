@@ -11,6 +11,8 @@ Change Log
   (trusted publishing), once a GPU-less ``pip install`` of it builds; manual dispatch rehearses on TestPyPI.
 - [ADDED] ``import gpusim2grid`` refuses CUDA libraries of another major than the build, a too old driver, and
   another lightsim2grid version than the bridge's.
+- [ADDED] CI: one build leg and a GPU test subset pin lightsim2grid to 1.3.1, the minimum supported, so a
+  change needing a newer one is caught.
 - [FIXED] the first cuDSS call of a process (``warmup()`` or any session) left the calling thread in the "C"
   locale (NVRTC, cuDSS's JIT, never restores it): Python then read ASCII as its default file encoding.
 - [FIXED] ``ContingencyAnalysisGPU.add_contingenc*``: a refused contingency (an id out of range) stayed in the

@@ -9,7 +9,12 @@
 #   ubuntu22.04 image.
 #
 # lightsim2grid comes from PyPI too: its wheel (>= 1.3.1) ships
-# lightsim2grid_core, its headers and the KLU headers the bridge needs.
+# lightsim2grid_core, its headers and the KLU headers the bridge needs. One more
+# leg (CUDA 13, FP64) pins it to the minimum version pyproject.toml declares,
+# 1.3.1, instead of the latest: a change on gpusim2grid's side that needs a newer
+# lightsim2grid shows up there (and the minimum is raised), not on a user's
+# machine. That leg also requires every optional lightsim2grid feature the bridge
+# detects at compile time (`have_ls2g_*`), since a lost one only skips tests.
 #
 # No GPU is needed to *build*. The pytest step then runs on that GPU-less
 # machine: every test marked `requires_gpu` (conftest.py) is skipped, but all
@@ -43,14 +48,15 @@ defaults:
 
 env:
   VENV: /opt/venv
-  LS2G_REQ: "lightsim2grid>=1.3.1"
+  # Keep in sync with pyproject.toml's lightsim2grid requirement.
+  LS2G_MIN: "1.3.1"
 
 jobs:
   # ---------------------------------------------------------------------------
   # Compile gpusim2grid in both precisions and run the (GPU-less) test suite.
   # ---------------------------------------------------------------------------
   build:
-    name: build (CUDA ${{ matrix.cuda }}, ${{ matrix.precision }})
+    name: build (CUDA ${{ matrix.cuda }}, ${{ matrix.precision }}, lightsim2grid ${{ matrix.ls2g }})
     runs-on: ubuntu-latest
     # Both images are ubuntu22.04 (Python 3.10): the CUDA 13 / FP64 wheel is
     # installed on Modal next to that Python.
@@ -60,6 +66,14 @@ jobs:
       matrix:
         cuda: ["12.4", "13"]
         precision: [fp64, fp32]
+        # latest = the newest lightsim2grid on PyPI; min = pinned to LS2G_MIN
+        # (one leg only: CUDA 13, FP64).
+        ls2g: [latest, min]
+        exclude:
+          - ls2g: min
+            cuda: "12.4"
+          - ls2g: min
+            precision: fp32
         include:
           - cuda: "12.4"
             image: nvidia/cuda:12.4.1-devel-ubuntu22.04
@@ -77,6 +91,9 @@ jobs:
           - precision: fp32
             precision_env: CUDA_REAL_FLOAT
             expect_fp32: "True"
+          - ls2g: min
+            # every optional bridge feature 1.3.1 provides must be compiled in
+            require_ls2g_features: "1"
     steps:
       - name: Install system packages
         run: |
@@ -91,6 +108,11 @@ jobs:
           CUDSS_REQ: ${{ matrix.cudss_req }}
           CUDA_REQ: ${{ matrix.cuda_req }}
         run: |
+          if [ "${{ matrix.ls2g }}" = min ]; then
+            LS2G_REQ="lightsim2grid==$LS2G_MIN"
+          else
+            LS2G_REQ="lightsim2grid>=$LS2G_MIN"
+          fi
           python3 -m venv "$VENV"
           . "$VENV/bin/activate"
           pip install -q -U pip
@@ -98,6 +120,7 @@ jobs:
           pip install -q "$CUDSS_REQ" ${CUDA_REQ:+"$CUDA_REQ"} "$LS2G_REQ" \
             scikit-build-core pybind11 cmake numpy scipy pytest pandapower
           echo "$VENV/bin" >> "$GITHUB_PATH"
+          echo "LS2G_REQ=$LS2G_REQ" >> "$GITHUB_ENV"
           # cuDSS (and, for CUDA 13, the whole toolkit) lives under
           # <site-packages>/nvidia/cuXX.
           root=$(python -c "import nvidia.${{ matrix.cu }} as m; print(list(m.__path__)[0])")
@@ -126,11 +149,13 @@ jobs:
         if: matrix.cuda == '13' && matrix.precision == 'fp64'
         uses: actions/upload-artifact@v4
         with:
-          name: gpusim2grid-wheel-cu13-fp64
+          name: gpusim2grid-wheel-cu13-fp64-ls2g-${{ matrix.ls2g }}
           path: dist/gpusim2grid-*.whl
           retention-days: 1
 
       - name: Check the installed extension
+        env:
+          REQUIRE_LS2G_FEATURES: ${{ matrix.require_ls2g_features }}
         run: |
           export LD_LIBRARY_PATH="$NVIDIA_LIB:${LD_LIBRARY_PATH:-}"
           cd /
@@ -142,6 +167,14 @@ jobs:
           # The zero-copy lightsim2grid bridge is only compiled when
           # lightsim2grid_core is found; make sure it was.
           assert hasattr(m, "_make_ca_session_from_lsgrid"), "ls2g bridge not built"
+          import os, lightsim2grid
+          print("lightsim2grid", lightsim2grid.__version__)
+          flags = {k: bool(getattr(m, k)) for k in dir(m) if k.startswith("have_ls2g_")}
+          for k, v in sorted(flags.items()):
+              print(f"  {k} = {v}")
+          if os.environ.get("REQUIRE_LS2G_FEATURES"):
+              missing = [k for k, v in flags.items() if not v]
+              assert not missing, f"lightsim2grid features not compiled in: {missing}"
           EOF
 
       - name: Run tests (GPU tests skip)
@@ -158,8 +191,12 @@ jobs:
   # the MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets, which GitHub does not
   # expose to PRs from forks.
   # ---------------------------------------------------------------------------
+  #
+  # Two legs: the full suite against the latest lightsim2grid, and a subset
+  # (the bridge-facing tests: base case, the three batch workloads, the
+  # augmented system, the checks, the outer loops) against the pinned minimum.
   gpu-tests:
-    name: gpu tests (Modal, CUDA 13, fp64, T4)
+    name: gpu tests (Modal, CUDA 13, fp64, T4, lightsim2grid ${{ matrix.ls2g }})
     needs: build
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -167,6 +204,27 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'gpu-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ls2g: latest
+            tests: tests/python
+          - ls2g: min
+            tests: >-
+              tests/python/test_base_case.py
+              tests/python/test_augmented_features.py
+              tests/python/test_contingency_batch.py
+              tests/python/test_injection_batch.py
+              tests/python/test_scenario_sweep.py
+              tests/python/test_scenario_sweep_gen_contingency.py
+              tests/python/test_handle_disconnected_grid.py
+              tests/python/test_limit_violations.py
+              tests/python/test_bus_q_violations.py
+              tests/python/test_gen_pv_release_violations.py
+              tests/python/test_redistribute_slack.py
+              tests/python/test_batch_power_flow.py
+              tests/python/test_outer_loops_batch.py
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -186,7 +244,7 @@ jobs:
       - name: Download the gpusim2grid wheel
         uses: actions/download-artifact@v4
         with:
-          name: gpusim2grid-wheel-cu13-fp64
+          name: gpusim2grid-wheel-cu13-fp64-ls2g-${{ matrix.ls2g }}
           path: wheels
 
       - uses: actions/setup-python@v5
@@ -197,4 +255,13 @@ jobs:
         run: pip install -q modal
 
       - name: Run GPU tests on Modal
-        run: modal run ci/modal/gpu_tests.py
+        env:
+          TESTS: ${{ matrix.tests }}
+        run: |
+          # The image's lightsim2grid must be the one the wheel was built against.
+          if [ "${{ matrix.ls2g }}" = min ]; then
+            export G2G_LS2G_REQ="lightsim2grid==$LS2G_MIN"
+          else
+            export G2G_LS2G_REQ="lightsim2grid>=$LS2G_MIN"
+          fi
+          modal run ci/modal/gpu_tests.py --tests "$TESTS"
