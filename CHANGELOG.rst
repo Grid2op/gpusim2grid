@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [IMPROVED] The GIL is released during the long calls (session construction, ``run``, ``compute_flows``,
+  ``resolve``, adjoint solves, result downloads, ``warmup``), so other Python threads keep running.
 - [FIXED] ``benchmarks/contingency_analysis.py`` stopped on a ``NameError`` on grids with more branches
   than ``nb_max_cont_cpu``, and ran some contingencies twice.
 - [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
