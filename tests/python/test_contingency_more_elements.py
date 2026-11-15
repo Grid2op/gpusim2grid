@@ -188,17 +188,17 @@ CASES = [
 
 @pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
 @pytest.mark.parametrize("kind, make, trips", CASES, ids=[c[0] for c in CASES])
-def test_matches_a_one_off_powerflow(runner, kind, make, trips):
+def test_matches_a_one_off_powerflow(solver_atol, runner, kind, make, trips):
     grid = make()
     session, V = runner(grid, trips, kind)
     assert not any(session.get_batch_unsupported_reasons())
     for r, (ids, branches) in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, kind, ids, branches), rtol=0., atol=1e-7,
+        np.testing.assert_allclose(V[r], _reference(grid, kind, ids, branches), rtol=0., atol=solver_atol,
                                    err_msg=f"row {r}: {kind} {ids}, branches {branches}")
 
 
 @pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
-def test_a_storage_unit_of_the_slack_leaves_it(runner):
+def test_a_storage_unit_of_the_slack_leaves_it(solver_atol, runner):
     grid = _grid_storage()
     for gen in grid.get_generators():
         grid.add_gen_slackbus(gen.id, 1.)
@@ -206,13 +206,13 @@ def test_a_storage_unit_of_the_slack_leaves_it(runner):
     _finish(grid)
     trips = [([PQ], [])]
     session, V = runner(grid, trips, STORAGE)
-    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=solver_atol)
 
 
 @pytest.mark.parametrize("gens_off, hvdcs, moves", [([True], [], False), ([], [0, 1], False), ([True], [0], False),
                                                     ([True], [0, 1], True)],
                          ids=["gen", "stations", "gen+one", "all"])
-def test_controllers_of_a_bus_generator_and_stations(gens_off, hvdcs, moves):
+def test_controllers_of_a_bus_generator_and_stations(solver_atol, gens_off, hvdcs, moves):
     """the bus turns PQ only when the row takes out every one of its controllers"""
     from gpusim2grid import ContingencyAnalysisGPU
     grid, gen_id, bus, vm = _grid_two_stations_on_a_gen_bus()
@@ -224,7 +224,7 @@ def test_controllers_of_a_bus_generator_and_stations(gens_off, hvdcs, moves):
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
     assert (abs(abs(V[list(buses).index(bus)]) - vm) > 1e-4) == moves
-    np.testing.assert_allclose(V, _reference(grid, HVDC, hvdcs, gens=gens), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V, _reference(grid, HVDC, hvdcs, gens=gens), rtol=0., atol=solver_atol)
 
 
 def _grid_storage_on_group_bus():
@@ -251,7 +251,7 @@ UNSUPPORTED = [
 
 @pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
 @pytest.mark.parametrize("kind, make, bad, word", UNSUPPORTED, ids=[c[0] for c in UNSUPPORTED])
-def test_what_the_batch_cannot_do_is_reported_per_row(runner, kind, make, bad, word):
+def test_what_the_batch_cannot_do_is_reported_per_row(solver_atol, runner, kind, make, bad, word):
     from gpusim2grid.contingency_analysis import LimitViolationType
     grid = make()
     # (an element the batch can take out, or nothing: the second row opens a line anyway)
@@ -261,7 +261,7 @@ def test_what_the_batch_cannot_do_is_reported_per_row(runner, kind, make, bad, w
     reasons = session.get_batch_unsupported_reasons()
     assert word in reasons[0] and reasons[1] == ""
     assert np.isnan(V[0]).all()
-    np.testing.assert_allclose(V[1], _reference(grid, kind, ok, [5]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[1], _reference(grid, kind, ok, [5]), rtol=0., atol=solver_atol)
     v0 = session.get_violations()[0]
     assert [el.violation_type for el in v0] == [LimitViolationType.BATCH_UNSUPPORTED]
 
@@ -281,13 +281,13 @@ def _grid_standby_svc_b0(low=0.9, high=1.1):
 
 
 @pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
-def test_a_standby_svc_matches_a_one_off_powerflow(runner):
+def test_a_standby_svc_matches_a_one_off_powerflow(solver_atol, runner):
     grid = _grid_standby_svc_b0()
     trips = [([0], []), ([0], [5]), ([], [5])]
     session, V = runner(grid, trips, SVC)
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
     for r, (ids, branches) in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=1e-7,
+        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=solver_atol,
                                    err_msg=f"row {r}: {ids}, branches {branches}")
 
 
@@ -300,7 +300,7 @@ def _standby_records(session):
 
 
 @pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
-def test_a_tripped_standby_svc_leaves_its_physical_check(runner):
+def test_a_tripped_standby_svc_leaves_its_physical_check(solver_atol, runner):
     """thresholds below the voltage of its bus: the automaton would switch it on in every row
     keeping it, in none tripping it -- what a one-off check of the grid without it reports"""
     grid = _grid_standby_svc_b0()
@@ -314,12 +314,12 @@ def test_a_tripped_standby_svc_leaves_its_physical_check(runner):
     assert records[0] == [] and records[2] == [], records
     assert len(records[1]) == 1 and records[1][0][0] == 0, records
     for r, (ids, branches) in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=1e-7)
+        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=solver_atol)
 
 
 @pytest.mark.parametrize("init_from_n_powerflow", [False, True], ids=["cold", "resumed"])
 @pytest.mark.parametrize("low_pu, high_pu", [(0.90, 1.00), (0.90, 1.20)], ids=["switched_on", "idle"])
-def test_a_standby_svc_with_the_outer_loops(low_pu, high_pu, init_from_n_powerflow):
+def test_a_standby_svc_with_the_outer_loops(solver_atol, low_pu, high_pu, init_from_n_powerflow):
     """the row is lightsim2grid's one-off NROuter solve of the grid without the SVC: VoltageMonitoring
     never switches it on, and a row resuming the grid's loops does not keep it switched on"""
     pytest.importorskip("pypowsybl")
@@ -333,9 +333,9 @@ def test_a_standby_svc_with_the_outer_loops(low_pu, high_pu, init_from_n_powerfl
     res = session.get_outer_results()
     for r in (0, 1):
         assert not any("SWITCH_ON" in d for d in res[r].decisions), res[r].decisions
-    np.testing.assert_allclose(V[0], _reference(grid, SVC, [0]), rtol=0., atol=1e-6)
-    np.testing.assert_allclose(V[1], _reference(grid, SVC, [0], [5]), rtol=0., atol=1e-6)
-    np.testing.assert_allclose(V[2], _reference(grid, branches=[5]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[0], _reference(grid, SVC, [0]), rtol=0., atol=solver_atol)
+    np.testing.assert_allclose(V[1], _reference(grid, SVC, [0], [5]), rtol=0., atol=solver_atol)
+    np.testing.assert_allclose(V[2], _reference(grid, branches=[5]), rtol=0., atol=solver_atol)
 
 
 # ----- controllers of a voltage-control group ---------------------------------------------
@@ -388,29 +388,29 @@ def _gens_in_sweep(grid, trips, **kwargs):
 
 @pytest.mark.parametrize("runner", [_gens_in_analysis, _gens_in_sweep], ids=["analysis", "sweep"])
 @pytest.mark.parametrize("kwargs", [{}, {"handle_disconnected_grid": True}], ids=["plain", "islands"])
-def test_generators_of_a_group_match_a_one_off_powerflow(runner, kwargs):
+def test_generators_of_a_group_match_a_one_off_powerflow(solver_atol, runner, kwargs):
     grid = _grid_group()
     session, V = runner(grid, GROUP_TRIPS, **kwargs)
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
     for r, gens in enumerate(GROUP_TRIPS):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-7, err_msg=f"row {r}: {gens}")
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"row {r}: {gens}")
 
 
-def test_a_group_of_one():
+def test_a_group_of_one(solver_atol):
     grid = _grid_group(group=(3,))
     session, V = _gens_in_analysis(grid, [[3]])
-    np.testing.assert_allclose(V[0], _reference(grid, gens=[3]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[0], _reference(grid, gens=[3]), rtol=0., atol=solver_atol)
 
 
-def test_the_regulated_bus_goes_free_when_nobody_is_left():
+def test_the_regulated_bus_goes_free_when_nobody_is_left(solver_atol):
     grid = _grid_group()
     session, V = _gens_in_analysis(grid, [GROUP, [1]])
     buses = list(np.asarray(grid.id_ac_solver_to_me(), dtype=int))
     assert abs(abs(V[0][buses.index(REG_BUS)]) - 1.04) > 1e-3
-    assert abs(V[1][buses.index(REG_BUS)]) == pytest.approx(1.04, abs=1e-8)
+    assert abs(V[1][buses.index(REG_BUS)]) == pytest.approx(1.04, abs=solver_atol)
 
 
-def test_a_local_generator_of_a_group():
+def test_a_local_generator_of_a_group(solver_atol):
     """generator 1 stands on the bus generator 3 regulates remotely: both are of the group"""
     bus_of_1 = _base().get_generators()[1].bus_id
     grid = _grid_group(group=(1, 3), reg_bus=bus_of_1)
@@ -418,21 +418,21 @@ def test_a_local_generator_of_a_group():
     session, V = _gens_in_analysis(grid, trips)
     assert not any(session.get_batch_unsupported_reasons())
     for r, gens in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-7, err_msg=f"{gens}")
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"{gens}")
 
 
-def test_a_row_that_trips_no_controller_next_to_one_that_does():
+def test_a_row_that_trips_no_controller_next_to_one_that_does(solver_atol):
     grid = _grid_group()
     from gpusim2grid import ContingencyAnalysisGPU
     ca = ContingencyAnalysisGPU(grid, nb_iter=15, tol_base=TOL)
     ca.add_contingencies([([], [], [], [1]), ([5], [], [], [])])
     ca.compute(batch_size=2)
     V = ca.V_results.to_numpy().reshape(2, -1)
-    np.testing.assert_allclose(V[0], _reference(grid, gens=[1]), rtol=0., atol=1e-7)
-    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[0], _reference(grid, gens=[1]), rtol=0., atol=solver_atol)
+    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=solver_atol)
 
 
-def test_an_islanded_controller_next_to_a_tripped_one():
+def test_an_islanded_controller_next_to_a_tripped_one(solver_atol):
     """the islanded one is gone too: the row trips the live controller, nobody is left"""
     n_line = len(_base().get_lines())
     grid = _grid_group(group=(2, 3), reg_bus=8)
@@ -453,29 +453,29 @@ def test_an_islanded_controller_next_to_a_tripped_one():
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     live = np.isfinite(V)
     assert not live[list(buses).index(7)]
-    np.testing.assert_allclose(V[live], V_ref[buses][live], rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[live], V_ref[buses][live], rtol=0., atol=solver_atol)
 
 
-def test_a_voltage_mode_svc():
+def test_a_voltage_mode_svc(solver_atol):
     grid = _grid_svc()
     trips = [([VOLTAGE], []), ([VOLTAGE, FIXED_Q], []), ([VOLTAGE], [5])]
     for runner in (_analysis, _sweep):
         session, V = runner(grid, trips, SVC)
         assert not any(session.get_batch_unsupported_reasons())
         for r, (ids, branches) in enumerate(trips):
-            np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=1e-7, err_msg=f"{ids}")
+            np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=solver_atol, err_msg=f"{ids}")
 
 
-def test_stations_of_a_control_group():
+def test_stations_of_a_control_group(solver_atol):
     grid = _grid_hvdc_station_in_group()
     other_gen_trips = [([0], []), ([0, 1], [])]
     session, V = _analysis(grid, other_gen_trips, HVDC)
     assert not any(session.get_batch_unsupported_reasons())
     for r, (ids, _) in enumerate(other_gen_trips):
-        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=1e-7, err_msg=f"{ids}")
+        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=solver_atol, err_msg=f"{ids}")
 
 
-def test_with_the_outer_loops_a_generator_of_a_group():
+def test_with_the_outer_loops_a_generator_of_a_group(solver_atol):
     from lightsim2grid.algorithm import ReactiveLimits
     grid = _grid_group(algo=OUTER)
     grid.clear_outer_loops()
@@ -485,7 +485,7 @@ def test_with_the_outer_loops_a_generator_of_a_group():
                                    ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
     for r, gens in enumerate(GROUP_TRIPS):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-6, err_msg=f"row {r}: {gens}")
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"row {r}: {gens}")
 
 
 def _grid_two_controllers_on_a_bus(algo):
@@ -514,7 +514,7 @@ def _grid_two_controllers_on_a_bus(algo):
     return _finish(grid, algo), on_bus
 
 
-def test_a_tripped_controller_stays_out_when_its_bus_is_frozen():
+def test_a_tripped_controller_stays_out_when_its_bus_is_frozen(solver_atol):
     """found on a real grid: ReactiveLimits freezing the bus also wrote its limit over the
     controller the row had tripped, which came back to life at that limit"""
     grid, on_bus = _grid_two_controllers_on_a_bus(OUTER)
@@ -525,10 +525,10 @@ def test_a_tripped_controller_stays_out_when_its_bus_is_frozen():
     res = session.get_outer_results()
     for r, gens in enumerate(trips):
         assert any("PV_TO_PQ" in d and "not taken" not in d for d in res[r].decisions), res[r].decisions
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=1e-6, err_msg=f"{gens}")
+        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"{gens}")
 
 
-def test_controllers_follow_their_row_through_the_continuous_tail():
+def test_controllers_follow_their_row_through_the_continuous_tail(solver_atol):
     from gpusim2grid import ContingencyAnalysisGPU
     grid = _grid_group()
     conts = [([b], [], [], [1 + (b % 3)]) for b in range(7)] * 2
@@ -540,10 +540,10 @@ def test_controllers_follow_their_row_through_the_continuous_tail():
     assert ca.timings.n_slot_moves > 0
     V = ca.V_results.to_numpy().reshape(len(conts), grid.get_Ybus_solver().shape[0])
     for r, c in enumerate(conts):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=c[3], branches=c[0]), rtol=0., atol=1e-7, err_msg=f"{c}")
+        np.testing.assert_allclose(V[r], _reference(grid, gens=c[3], branches=c[0]), rtol=0., atol=solver_atol, err_msg=f"{c}")
 
 
-def test_a_sweep_can_drop_and_regain_its_controller_trips():
+def test_a_sweep_can_drop_and_regain_its_controller_trips(solver_atol):
     """the entries a tripped controller needs are reserved from the masks, on every run: the same
     session then matches a one-off powerflow with the trips gone and back"""
     from gpusim2grid import ScenarioSweepGPU
@@ -559,7 +559,7 @@ def test_a_sweep_can_drop_and_regain_its_controller_trips():
         sw.set_contingency_gens(mask)
         sw.compute(batch_size=1)
         V = sw.solver.V_results.to_numpy().reshape(1, -1)[0]
-        np.testing.assert_allclose(V, _reference(grid, gens=[1] if trip else []), rtol=0., atol=1e-7, err_msg=f"{trip}")
+        np.testing.assert_allclose(V, _reference(grid, gens=[1] if trip else []), rtol=0., atol=solver_atol, err_msg=f"{trip}")
 
 
 def test_a_controller_with_physical_checks_is_reported():
@@ -588,7 +588,7 @@ def test_a_controller_with_gradients_is_reported():
 @pytest.mark.parametrize("kind, make, ids, lost", [
     (SGEN, _grid_sgen, [0], 5.), (STORAGE, _grid_storage, [PQ], 3.), (HVDC, _grid_hvdc, [FIXED], None)],
     ids=[SGEN, STORAGE, HVDC])
-def test_redistribute_slack_counts_what_the_element_loses(kind, make, ids, lost):
+def test_redistribute_slack_counts_what_the_element_loses(solver_atol, kind, make, ids, lost):
     """the pre-pass' term: a static generator's P, minus a storage unit's (load convention:
     the -3 MW unit produced 3 MW), both converter stations' set-points"""
     grid = make()
@@ -608,17 +608,17 @@ def test_redistribute_slack_counts_what_the_element_loses(kind, make, ids, lost)
         ref.tell_solver_need_reset()
         assert ref.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, TOL).shape[0] > 0
         expected = float(np.sum(np.real(grid.get_Sbus_solver())) - np.sum(np.real(ref.get_Sbus_solver()))) * grid.get_sn_mva()
-        assert mismatch == pytest.approx(expected, abs=1e-7)
+        assert mismatch == pytest.approx(expected, abs=solver_atol * grid.get_sn_mva())
         # the line's own losses come back: the units at 0 MW cannot go lower and leave the
         # slack, so this row is not the plain one-off solve
         assert mismatch < 0. and report["nb_saturated"][0] > 0
         return
-    assert mismatch == pytest.approx(lost, abs=1e-8)
+    assert mismatch == pytest.approx(lost, abs=solver_atol * grid.get_sn_mva())
     # no limit is reached: the pre-pass does not change the converged state
-    np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=solver_atol)
 
 
-def test_redistribute_slack_a_storage_unit_of_the_slack_leaves_it_on_a_sweep():
+def test_redistribute_slack_a_storage_unit_of_the_slack_leaves_it_on_a_sweep(solver_atol):
     """the pre-pass' weights too: a tripped storage unit keeps no share of the row's slack"""
     grid = _grid_storage()
     for gen in grid.get_generators():
@@ -628,10 +628,10 @@ def test_redistribute_slack_a_storage_unit_of_the_slack_leaves_it_on_a_sweep():
     grid.set_gen_p_limits(np.zeros(nb_gen), np.full(nb_gen, 1e3))
     _finish(grid)
     session, V = _sweep(grid, [([PQ], [])], STORAGE, redistribute_slack=True)
-    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=solver_atol)
 
 
-def test_the_ten_tuple_and_the_shortcuts():
+def test_the_ten_tuple_and_the_shortcuts(solver_atol):
     from gpusim2grid import ContingencyAnalysisGPU
     grid = _grid_sgen()
     ca = ContingencyAnalysisGPU(grid, nb_iter=15, tol_base=TOL)
@@ -641,8 +641,8 @@ def test_the_ten_tuple_and_the_shortcuts():
                                       ([5], [], [], [], [], [], [0, 1], [], [], [])]
     ca.compute(batch_size=2)
     V = ca.V_results.to_numpy().reshape(2, -1)
-    np.testing.assert_allclose(V[0], _reference(grid, SGEN, [1]), rtol=0., atol=1e-7)
-    np.testing.assert_allclose(V[1], _reference(grid, SGEN, [0, 1], [5]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[0], _reference(grid, SGEN, [1]), rtol=0., atol=solver_atol)
+    np.testing.assert_allclose(V[1], _reference(grid, SGEN, [0, 1], [5]), rtol=0., atol=solver_atol)
     with pytest.raises(Exception):
         ca.add_contingency_sgen(2)
 
@@ -650,7 +650,7 @@ def test_the_ten_tuple_and_the_shortcuts():
 @pytest.mark.parametrize("kind, make, ids", [(STORAGE, _grid_storage, [PQ]), (STORAGE, _grid_storage, [REGULATING]),
                                              (HVDC, _grid_hvdc, [FIXED])],
                          ids=["storage_pq", "storage_regulating", "hvdc_fixed"])
-def test_with_the_outer_loops(kind, make, ids):
+def test_with_the_outer_loops(solver_atol, kind, make, ids):
     """the row is lightsim2grid's one-off NROuter solve of the grid without the element"""
     from lightsim2grid.algorithm import ReactiveLimits
     grid = make()
@@ -663,7 +663,7 @@ def test_with_the_outer_loops(kind, make, ids):
         assert "reserved" in session.get_batch_unsupported_reasons()[0]
         return
     assert not any(session.get_batch_unsupported_reasons())
-    np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=solver_atol)
 
 
 def _grid_droop_only(algo="NR_KLU", p_max=100., limits=True):
@@ -682,24 +682,24 @@ def _grid_droop_only(algo="NR_KLU", p_max=100., limits=True):
     return _finish(grid, algo)
 
 
-def test_a_line_in_ac_emulation_with_the_outer_loops():
+def test_a_line_in_ac_emulation_with_the_outer_loops(solver_atol):
     """the row is a one-off NROuter solve of the grid without the line; its limits loop skips it
     (the second row, keeping the line, is the one-off solve of the grid itself)"""
     grid = _grid_droop_only(OUTER)
     session, V = _analysis(grid, [([0], []), ([], [5])], HVDC, outer_loops=True, scheduling="continuous",
                            nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
     assert not any(session.get_batch_unsupported_reasons())
-    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=1e-6)
-    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=solver_atol)
+    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=solver_atol)
 
 
-def test_a_saturated_line_can_be_tripped():
+def test_a_saturated_line_can_be_tripped(solver_atol):
     """at its limit, the line injects pmax: the trip takes that out too"""
     grid = _grid_droop_only(p_max=1., limits=False)
     grid.set_status_droop_hvdc(0, 1)
     _finish(grid)
     session, V = _analysis(grid, [([0], [])], HVDC)
-    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=1e-7)
+    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=solver_atol)
 
 
 def test_physical_checks_report_a_line_in_ac_emulation():
@@ -708,7 +708,7 @@ def test_physical_checks_report_a_line_in_ac_emulation():
     assert "physical" in session.get_batch_unsupported_reasons()[0]
 
 
-def test_a_regulating_station_with_the_outer_loops():
+def test_a_regulating_station_with_the_outer_loops(solver_atol):
     """the row is a one-off NROuter solve of the grid without the line"""
     from lightsim2grid.algorithm import ReactiveLimits
     grid = _grid_hvdc()
@@ -718,7 +718,7 @@ def test_a_regulating_station_with_the_outer_loops():
     session, V = _analysis(grid, [([HV_REGULATING], [])], HVDC, outer_loops=True, scheduling="continuous",
                            nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
-    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [HV_REGULATING]), rtol=0., atol=1e-6)
+    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [HV_REGULATING]), rtol=0., atol=solver_atol)
 
 
 def _grid_stations_short_of_reactive_power():
@@ -744,7 +744,7 @@ def _grid_stations_short_of_reactive_power():
     return _finish(grid, OUTER), gen.id
 
 
-def test_a_tripped_station_stays_out_when_its_bus_is_frozen():
+def test_a_tripped_station_stays_out_when_its_bus_is_frozen(solver_atol):
     """the ReactiveLimits plan of the row leaves the tripped line's stations out of its bus' limit"""
     grid, gen_id = _grid_stations_short_of_reactive_power()
     trips = [([0], []), ([1], []), ([0, 1], [])]
@@ -754,7 +754,7 @@ def test_a_tripped_station_stays_out_when_its_bus_is_frozen():
     res = session.get_outer_results()
     for r, (ids, _) in enumerate(trips):
         assert any("PV_TO_PQ" in d and "not taken" not in d for d in res[r].decisions), res[r].decisions
-        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=1e-6, err_msg=f"{ids}")
+        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=solver_atol, err_msg=f"{ids}")
 
 
 @pytest.mark.parametrize("kind, make, ids", [(STORAGE, _grid_storage, [REGULATING]),
@@ -765,7 +765,7 @@ def test_physical_checks_report_the_rows_they_cannot_check(kind, make, ids):
     assert "physical" in session.get_batch_unsupported_reasons()[0]
 
 
-def test_a_tripped_line_follows_its_row_through_the_continuous_tail():
+def test_a_tripped_line_follows_its_row_through_the_continuous_tail(solver_atol):
     """the per-slot status moves with its row when the tail compacts the slots"""
     from gpusim2grid import ContingencyAnalysisGPU
     grid = _grid_droop_only(limits=False)
@@ -781,4 +781,4 @@ def test_a_tripped_line_follows_its_row_through_the_continuous_tail():
     V = ca.V_results.to_numpy().reshape(len(conts), grid.get_Ybus_solver().shape[0])
     for r, c in enumerate(conts):
         ids, br = c[TUPLE_POS[HVDC]], c[0]
-        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids, br), rtol=0., atol=1e-7, err_msg=f"row {r}")
+        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids, br), rtol=0., atol=solver_atol, err_msg=f"row {r}")

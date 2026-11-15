@@ -1607,7 +1607,7 @@ def test_dist_lost_power_parks_the_units_it_saturates(solver_atol):
     np.testing.assert_allclose(_V(sw, grid, 1)[0], V_ls, rtol=0., atol=solver_atol, err_msg=msg)
 
 
-def test_islanded_group_controller_others_held_frees_the_bus():
+def test_islanded_group_controller_others_held_frees_the_bus(solver_atol):
     """lightsim2grid 1f975882: a shared voltage control whose contingency islands one
     controller, the live one held at its reactive limit by ReactiveLimits: the islanded one is
     gone (never the group's reference, pinned at 0), the regulated bus is free, as in a single
@@ -1652,7 +1652,7 @@ def test_islanded_group_controller_others_held_frees_the_bus():
     V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
     live_bus = np.isfinite(V)
     assert not live_bus[list(buses).index(LEAF)], msg
-    np.testing.assert_allclose(V[live_bus], V_ref[buses][live_bus], rtol=0., atol=1e-7, err_msg=msg)
+    np.testing.assert_allclose(V[live_bus], V_ref[buses][live_bus], rtol=0., atol=solver_atol, err_msg=msg)
 
 
 def test_redistribute_slack_a_unit_at_its_bound_stays_there():
