@@ -250,7 +250,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         and Python-fallback paths have no ledger and always solve the bare
         system.
     reactive_limits_outer_loop : bool, default False
-        .. deprecated:: 0.2.0
+        .. deprecated:: 0.3.0
             Use ``outer_loops=True``: lightsim2grid's own outer loops,
             ``ReactiveLimits`` (PV <-> PQ) among them, run on every row until
             they are stable.

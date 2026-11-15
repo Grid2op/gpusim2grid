@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] the first cuDSS call of a process (``warmup()`` or any session) left the calling thread in the "C"
+  locale (NVRTC, cuDSS's JIT, never restores it): Python then read ASCII as its default file encoding.
 - [FIXED] ``ContingencyAnalysisGPU.add_contingenc*``: a refused contingency (an id out of range) stayed in the
   list, so every later call raised too; the session's own list is left as it was.
 - [FIXED] ``ScenarioSweepGPU.set_contingency_loads``: a mask disconnecting nothing clears it (per-bus
