@@ -3,6 +3,12 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] An sdist installable with ``pip install gpusim2grid[cuda13]``: the isolated build takes nvcc and
+  cuDSS from PyPI, and the libraries find the ``nvidia`` wheels without ``LD_LIBRARY_PATH``.
+- [ADDED] ``gpusim2grid[cuda12]`` builds with the CUDA 12 nvcc ``CUDACXX`` names (the build's CUDA major is
+  picked from the environment by an in-tree backend: an extra never reaches the build).
+- [ADDED] ``import gpusim2grid`` refuses CUDA libraries of another major than the build, a too old driver, and
+  another lightsim2grid version than the bridge's.
 - [FIXED] the first cuDSS call of a process (``warmup()`` or any session) left the calling thread in the "C"
   locale (NVRTC, cuDSS's JIT, never restores it): Python then read ASCII as its default file encoding.
 - [FIXED] ``ContingencyAnalysisGPU.add_contingenc*``: a refused contingency (an id out of range) stayed in the

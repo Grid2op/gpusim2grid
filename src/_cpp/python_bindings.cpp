@@ -34,7 +34,61 @@
 #include <optional>
 #include <tuple>
 #include <vector>
+#include <string>
+#include <cstring>
+#if defined(__linux__)
+#include <link.h>   // dl_iterate_phdr
+#endif
 
+// -----------------------------------------------------------------------------
+// The shared libraries loaded in this process whose file name starts with one of
+// `prefixes`, each with its DT_NEEDED entries, read from its dynamic section in
+// memory. gpusim2grid/_build_checks.py reads the CUDA major of the cuDSS /
+// cuSPARSE actually loaded off them (libcudss.so.1 NEEDs libcublas.so.<major>,
+// a CUDA 12 cuSPARSE libnvJitLink.so.12): the sonames alone are the same for
+// both majors. Empty on a platform without dl_iterate_phdr.
+// -----------------------------------------------------------------------------
+namespace {
+struct LoadedLibsQuery {
+    std::vector<std::string> prefixes;
+    std::vector<std::pair<std::string, std::vector<std::string>>> found;
+};
+
+std::vector<std::pair<std::string, std::vector<std::string>>>
+loaded_library_needs(const std::vector<std::string>& prefixes)
+{
+    LoadedLibsQuery q{prefixes, {}};
+#if defined(__linux__)
+    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+        auto* q = static_cast<LoadedLibsQuery*>(data);
+        if (info->dlpi_name == nullptr || info->dlpi_name[0] == '\0') return 0;
+        const char* slash = std::strrchr(info->dlpi_name, '/');
+        const std::string base = slash ? slash + 1 : info->dlpi_name;
+        bool match = false;
+        for (const auto& p : q->prefixes) match = match || base.rfind(p, 0) == 0;
+        if (!match) return 0;
+        std::vector<std::string> needed;
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) continue;
+            const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            ElfW(Addr) strtab = 0;
+            for (const auto* d = dyn; d->d_tag != DT_NULL; ++d)
+                if (d->d_tag == DT_STRTAB) strtab = d->d_un.d_ptr;
+            if (strtab == 0) break;
+            // glibc relocates d_ptr in place on most targets, not on all of them
+            if (strtab < info->dlpi_addr) strtab += info->dlpi_addr;
+            for (const auto* d = dyn; d->d_tag != DT_NULL; ++d)
+                if (d->d_tag == DT_NEEDED)
+                    needed.emplace_back(reinterpret_cast<const char*>(strtab + d->d_un.d_val));
+        }
+        q->found.emplace_back(info->dlpi_name, std::move(needed));
+        return 0;
+    }, &q);
+#endif
+    return q.found;
+}
+}  // namespace
 
 // -----------------------------------------------------------------------------
 // Post-solve physical checks (compute_physical_violations / compute_hvdc_p_
@@ -3923,4 +3977,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
 #else
     m.attr("is_fp32") = false;
 #endif
+    m.def("_loaded_library_needs", &loaded_library_needs, pybind11::arg("prefixes"),
+        "[(path, [DT_NEEDED...])] of the shared libraries loaded in this process whose "
+        "file name starts with one of `prefixes` (Linux; empty elsewhere). Used by "
+        "gpusim2grid._build_checks.");
+    m.def("_cuda_driver_version", &cuda_driver_version,
+        "cudaDriverGetVersion (e.g. 13000), 0 without a driver.");
 }

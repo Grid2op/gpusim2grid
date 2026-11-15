@@ -1,8 +1,63 @@
 Installation
 ============
 
-There is no PyPI release of gpusim2grid yet — install from source. Everything
-it builds against comes from PyPI wherever PyPI has it.
+gpusim2grid is distributed as a source distribution: ``pip`` compiles it on
+your machine. Everything it builds against comes from PyPI wherever PyPI has it.
+
+From PyPI
+---------
+
+.. code-block:: bash
+
+   pip install "gpusim2grid[cuda13]"
+
+Nothing else is needed but an NVIDIA driver recent enough for CUDA 13
+(>= 580) and a C++17 compiler: ``pip`` builds gpusim2grid in an isolated
+environment holding PyPI's CUDA 13 toolkit (``nvcc`` included), cuDSS,
+lightsim2grid, pybind11 and cmake, which CMake finds by itself; the
+``cuda13`` extra installs the CUDA libraries and cuDSS the extension runs
+on, which it finds next to itself (no ``LD_LIBRARY_PATH``). The build
+compiles for the GPUs ``nvidia-smi`` lists, or for every architecture from
+``sm_75`` on when it lists none; ``CMAKE_ARGS=-DCMAKE_CUDA_ARCHITECTURES=86``
+picks one, ``CUDA_REAL_FLOAT=1`` builds the FP32 version.
+
+**CUDA 12.** PyPI has no CUDA 12 compiler, so a CUDA 12 toolkit (12.4 or
+later) must be installed on the machine; name its ``nvcc``:
+
+.. code-block:: bash
+
+   CUDACXX=/usr/local/cuda-12.4/bin/nvcc pip install "gpusim2grid[cuda12]"
+
+An extra never reaches the build, so the CUDA major of the build is chosen
+from the environment (``_build_backend/gpusim2grid_build.py``):
+``GPUSIM2GRID_CUDA=12`` / ``13`` if set, else the version of the ``nvcc``
+``CUDACXX`` (or ``$CUDAToolkit_ROOT/bin/nvcc``) names, else CUDA 13 with
+PyPI's toolkit. ``GPUSIM2GRID_CUDA=12`` alone uses the ``nvcc`` on ``PATH``;
+that ``nvcc`` never chooses by itself. cuDSS comes from PyPI for the chosen
+major (``GPUSIM2GRID_CUDSS_FROM_PYPI=0``: from ``cudss_ROOT`` / ``cudss_DIR``
+instead).
+
+**Checked at import.** ``import gpusim2grid`` raises an ``ImportError``
+naming the library at fault, rather than crashing later, when:
+
+* the cuDSS or cuSPARSE loaded is of another CUDA major than the build
+  (``gpusim2grid[cuda12]`` on a CUDA 13 build, a CUDA 12 directory on
+  ``LD_LIBRARY_PATH``: the sonames are the same for both majors);
+* the driver is too old for the build's CUDA major;
+* lightsim2grid is not the version the C++ bridge was compiled against.
+
+``gpusim2grid.compilation_options`` shows what the build used
+(``cuda_version``, ``cudss_version``, ``lightsim2grid_version``, ...);
+``GPUSIM2GRID_SKIP_BUILD_CHECKS=1`` skips the checks. To rebuild, e.g. for
+another CUDA major, bypass pip's wheel cache, which would hand back the
+previous build: ``pip install --force-reinstall --no-deps --no-cache-dir``.
+
+**lightsim2grid.** The isolated build compiles against the newest
+lightsim2grid on PyPI. To compile against the one installed in your
+environment (built from source, or pinned), build without isolation:
+``pip install --no-build-isolation "gpusim2grid[cuda13]"``, with
+scikit-build-core, pybind11 and cmake installed (and, for CUDA 13, PyPI's
+toolkit, found by itself, or ``CUDACXX``).
 
 Requirements
 ------------
@@ -47,8 +102,11 @@ From source, CUDA 13
 The CUDA 13 wheels put the whole toolkit, and cuDSS, under one prefix
 (``<site-packages>/nvidia/cu13``). Its libraries carry their soname only
 (``libcudart.so.13``); ``src/_cpp/CMakeLists.txt`` points CMake's
-``FindCUDAToolkit`` at them. They are not on the loader's path: set
-``LD_LIBRARY_PATH`` as above before importing gpusim2grid.
+``FindCUDAToolkit`` at them. The installed libraries look for them there
+(rpath ``$ORIGIN/../nvidia/cu13/lib``), so ``LD_LIBRARY_PATH`` is only needed
+when gpusim2grid and the wheels are not installed side by side. With no
+``CUDACXX`` / ``CUDAToolkit_ROOT`` set, CMake uses that prefix by itself, and
+``cudss_DIR`` may be left unset: the shim is the fallback.
 
 From source, CUDA 12
 --------------------

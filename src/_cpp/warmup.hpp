@@ -33,4 +33,8 @@
 // ---------------------------------------------------------------------------
 double warmup(int device = -1);
 
+// cudaDriverGetVersion (e.g. 13000 for a CUDA 13.0 driver), 0 without a driver.
+// Never throws: `import gpusim2grid` calls it on GPU-less machines too.
+int cuda_driver_version();
+
 #endif  // GPUSIM2GRID_WARMUP_HPP

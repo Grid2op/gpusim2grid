@@ -13,6 +13,11 @@ try:  # pragma: no cover - environment dependent
 except ImportError:
     pass
 
+# The CUDA libraries, the driver and lightsim2grid must be the ones the extension
+# was built for (_build_checks.py); a clear ImportError rather than a crash later.
+from ._build_checks import check_build as _check_build
+_check_build()
+
 from .contingency_analysis import (ContingencyAnalysisGPU, optimize_reference_slack,
                                    ReactiveLimitsStatus, RowStatus)
 from .injection_sweep import InjectionSweepGPU
