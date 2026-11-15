@@ -19,6 +19,7 @@
 #include "../batch_dims_check.hpp"          // check_batch_stride
 #include "violation_kernels.cuh"            // check_limit_violations_kernel
 #include "../outer/outer_kernels.cuh"       // the outer loops' per-slot controls
+#include "slot_ranges.hpp"                  // slot_upload_ranges
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -1627,6 +1628,9 @@ void BatchPfDriver<BatchSource>::_oc_setup()
     if (Lo.slack_bus != base.h_slack_bus && !(Lo.slack_bus.empty() && base.slack_col < 0))
         throw std::runtime_error("[batch_pf] outer loops: the model's slack participants are not the base state's");
     const int n_sw = static_cast<int>(Lo.slack_bus.size());
+    // the mirrors restart from their defaults, the device arrays do not: the next
+    // _oc_write_controls uploads them whole
+    oc_mirrors_on_device_ = false;
     h_oc_slack_w_.assign(static_cast<size_t>(S) * n_sw, cuda_real_type(0));
     d_oc_slack_w_.resize(std::max<size_t>(h_oc_slack_w_.size(), 1));
     h_oc_pin_.assign(static_cast<size_t>(S) * n_pin, 1);
@@ -1709,13 +1713,33 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
             vr_vm.push_back(static_cast<cuda_real_type>(c.vm_reset_vm[k]));
         }
     }
-    // the dense arrays whole: a few kB per slot at most
-    if (!h_oc_pin_.empty())       upload_h2d(d_oc_pin_, h_oc_pin_.data(), h_oc_pin_.size(), cs);
-    if (!h_oc_held_q_.empty())    upload_h2d(d_oc_held_q_, h_oc_held_q_.data(), h_oc_held_q_.size(), cs);
-    if (!h_oc_plan_held_.empty()) upload_h2d(d_oc_plan_held_, h_oc_plan_held_.data(), h_oc_plan_held_.size(), cs);
-    if (!h_oc_vset_.empty())      upload_h2d(d_oc_vset_, h_oc_vset_.data(), h_oc_vset_.size(), cs);
-    if (!h_oc_hvdc_.empty())      upload_h2d(d_oc_hvdc_, h_oc_hvdc_.data(), h_oc_hvdc_.size(), cs);
-    if (!h_oc_slack_w_.empty())   upload_h2d(d_oc_slack_w_, h_oc_slack_w_.data(), h_oc_slack_w_.size(), cs);
+    // The dense arrays: the rows of the listed slots only (a few kB per slot, times
+    // thousands of slots when uploaded whole, twice a round). The mirrors hold what the
+    // device holds for every other slot once a whole upload made them agree
+    // (oc_mirrors_on_device_; _compact_tail then moves both), so the list goes up as a
+    // few contiguous slot ranges, the slots between two listed ones riding along.
+    {
+        std::vector<std::pair<int, int>> ranges;
+        if (oc_mirrors_on_device_) ranges = slot_upload_ranges(slots);
+        else                       ranges.emplace_back(0, batch_size_ - 1);
+        auto upload_rows = [&](auto& d, const auto& h, size_t w) {
+            if (w == 0 || h.empty()) return;
+            using T = typename std::remove_reference<decltype(h)>::type::value_type;
+            for (const auto& r : ranges) {
+                const size_t off = static_cast<size_t>(r.first) * w;
+                const size_t cnt = static_cast<size_t>(r.second - r.first + 1) * w;
+                CHK_CUDA_BPF(cudaMemcpyAsync(thrust::raw_pointer_cast(d.data()) + off, h.data() + off,
+                                             cnt * sizeof(T), cudaMemcpyHostToDevice, cs));
+            }
+        };
+        upload_rows(d_oc_pin_, h_oc_pin_, static_cast<size_t>(n_pin));
+        upload_rows(d_oc_held_q_, h_oc_held_q_, static_cast<size_t>(Lo.n_ctrl));
+        upload_rows(d_oc_plan_held_, h_oc_plan_held_, static_cast<size_t>(Lo.n_ctrl));
+        upload_rows(d_oc_vset_, h_oc_vset_, static_cast<size_t>(Lo.n_grp));
+        upload_rows(d_oc_hvdc_, h_oc_hvdc_, static_cast<size_t>(Lo.n_hvdc));
+        upload_rows(d_oc_slack_w_, h_oc_slack_w_, Lo.slack_bus.size());
+        oc_mirrors_on_device_ = true;
+    }
 
     // Sbus: the row's own (re-read on a re-entry), then its correction
     NrIterBuffers buf = _make_nr_buffers();
@@ -2515,7 +2539,8 @@ void BatchPfDriver<BatchSource>::_compact_tail(int n_keep, int n_cur, std::vecto
     if (outer_hook_ != nullptr && oc_stride_ > 0) {
         const outer::Layout& Lo = outer_hook_->layout();
         const int n_pin = static_cast<int>(Lo.pin_bus.size());
-        // the host mirrors first (_oc_write_controls uploads them whole)
+        // the host mirrors with the device arrays: _oc_write_controls only uploads the
+        // slots it is given, and relies on the two agreeing everywhere else
         auto move_host = [&](auto& h, int w) {
             if (w <= 0) return;
             for (int i = 0; i < n; ++i)
@@ -2631,6 +2656,8 @@ void BatchPfDriver<BatchSource>::_oa_load(const SlotLoadView& L)
         using T = typename std::remove_reference<decltype(slots)>::type::value_type;
         if (w > 0) launch_gather_rows_to_slots<T>(raw(slots), raw(store), nullptr, L, w, cs);
     };
+    // the device arrays now hold the rows' saved state, not the host mirrors'
+    oc_mirrors_on_device_ = false;
     load(d_oc_pin_, oa_.pin, static_cast<int>(Lo.pin_bus.size()));
     load(d_oc_held_q_, oa_.held_q, Lo.n_ctrl);
     load(d_oc_plan_held_, oa_.plan_held, Lo.n_ctrl);
@@ -2810,7 +2837,12 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         h_slot_row()[s]  = row;
         if (row >= 0) ++n_live;
     }
-    if (n_live == 0) return;   // nothing to solve
+    if (n_live == 0) {   // nothing to solve
+        // ... and no row's control state to keep: the adjoint of such a run is zero on
+        // every row (solve_JT_batch walks no active row), as without the outer loops
+        oa_.ready = hook != nullptr && keep_outer_adjoint_;
+        return;
+    }
     _upload_sched();
     _load(_load_view(S, -1, n_live), timer, t);
     if (hook != nullptr) {

@@ -439,7 +439,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         # ... and the outer loops start from them (DistributedSlack's units,
         # ReactiveLimits' capability curves)
         if self._outer_loops:
-            self._inner._s.set_outer_gen_p_rows(list(self._gen_p_rows.ravel()))
+            self._inner._s.set_outer_gen_p_rows(np.ascontiguousarray(self._gen_p_rows))
 
     @property
     def outer_loops(self):

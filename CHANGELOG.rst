@@ -3,6 +3,18 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] ``ContingencyAnalysisGPU.add_contingenc*``: a refused contingency (an id out of range) stayed in the
+  list, so every later call raised too; the session's own list is left as it was.
+- [FIXED] ``ScenarioSweepGPU.set_contingency_loads``: a mask disconnecting nothing clears it (per-bus
+  ``set_injections`` stayed refused until the facade was rebuilt).
+- [FIXED] ``BatchPowerFlow(outer_loops=True)``: the backward of a forward with no simulated row raised;
+  it gives zero gradients, as without the outer loops.
+- [FIXED] ``BatchPowerFlow(outer_loops=True)``: ``load_status`` reaches the loops' view of the row, as
+  ``ScenarioSweepGPU.set_contingency_loads``.
+- [IMPROVED] ``outer_loops=True``: the per-slot controls go up for the slots that changed, not whole twice
+  a round; ``InjectionSweepGPU`` hands the rows' generator targets over as an array.
+- [IMPROVED] The automatic reference slack checks that lightsim2grid's ordering constraints name no index
+  it moves (pinned against lightsim2grid's own ledger for that reference).
 - [FIXED] ``benchmarks/contingency_analysis.py`` stopped on a ``NameError`` on grids with more branches
   than ``nb_max_cont_cpu``, and ran some contingencies twice.
 - [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of

@@ -21,6 +21,7 @@
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
 #include "outer/ls2g_outer_model.hpp"        // the outer-loop model (test harness)
 #include "ledger_extend.hpp"                 // move_reference (test hook)
+#include "contingency/slot_ranges.hpp"       // slot_upload_ranges (test hook)
 #include "Ls2gAbiTag.hpp"                    // ls2g_current_abi_tag, core_abi_tag
 #endif
 
@@ -2217,10 +2218,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
         },
         "Per row (original order), the outcome of its outer loops after the last run() "
         "(lightsim2grid's OuterRowResult).")
-    .def("set_outer_gen_p_rows", [](InjectionSweepSession& s, std::vector<double> gen_p) {
-            s.set_outer_gen_p_rows(std::move(gen_p)); },
-        "The rows' generator targets (MW, row-major n_rows x n_gen; empty: the grid's), "
-        "what their outer loops start from.")
+    .def("set_outer_gen_p_rows",
+         [](InjectionSweepSession& s,
+            pybind11::array_t<double, pybind11::array::c_style | pybind11::array::forcecast> gen_p) {
+             // one copy of the buffer (a list of floats is still taken, converted by numpy)
+             s.set_outer_gen_p_rows(std::vector<double>(gen_p.data(), gen_p.data() + gen_p.size()));
+         },
+         pybind11::arg("gen_p"),
+         "The rows' generator targets (MW, an (n_rows, n_gen) float64 array or its row-major "
+         "flattening; empty: the grid's), what their outer loops start from.")
     .def("get_row_status", &InjectionSweepSession::get_row_status,
          "(n_scenarios,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &InjectionSweepSession::get_or_amps,
@@ -3203,13 +3209,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "numbering; n_bus_solver "
         "is the session's n_bus.");
 
+    // Test hook: the slot ranges BatchPfDriver::_oc_write_controls uploads a slot list by.
+    m.def("_slot_upload_ranges",
+        [](const std::vector<int>& slots, int max_gap, std::size_t max_ranges) {
+            return slot_upload_ranges(slots, max_gap, max_ranges);
+        },
+        pybind11::arg("slots"), pybind11::arg("max_gap") = 8, pybind11::arg("max_ranges") = 32);
+
     // Test hook: the augmented-J skeleton and maps a solved grid gives, with its
     // angle reference optionally moved (move_reference) -- what the automatic
     // reference slack builds, to compare with lightsim2grid's own ledger.
     m.def("_ledger_skeleton",
-        [](pybind11::object grid_py, int move_reference_to) {
+        [](pybind11::object grid_py, int move_reference_to, bool presolved_v) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
-            LedgerData ld = extract_ledger_data(grid, /*presolved_v=*/true, 1e-8);
+            LedgerData ld = extract_ledger_data(grid, presolved_v, 1e-8);
             if (move_reference_to >= 0) {
                 const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Y = grid.get_Ybus_solver();
                 move_reference(ld, move_reference_to, Y);
@@ -3225,9 +3238,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
             d["theta_buses"] = ld.theta_buses; d["theta_cols"] = ld.theta_cols;
             d["slack_col"] = ld.slack_col;
             d["reference_bus"] = ledger_reference_bus(ld);
+            // lightsim2grid's ordering constraints, as the batch solvers order with them
+            d["ord_constraints_read"] = ld.ord_constraints_read ? 1 : 0;
+            d["ord_follow_ptr"] = ld.ord_follow_ptr; d["ord_follow"] = ld.ord_follow;
+            d["ord_lead_ptr"] = ld.ord_lead_ptr;     d["ord_lead"] = ld.ord_lead;
+            d["ord_in_order"] = std::vector<int>(ld.ord_in_order.begin(), ld.ord_in_order.end());
             return d;
         },
-        pybind11::arg("grid"), pybind11::arg("move_reference_to") = -1);
+        pybind11::arg("grid"), pybind11::arg("move_reference_to") = -1,
+        pybind11::arg("presolved_v") = true);
 
     m.def("_extract_slack_redistribution_data_from_lsgrid",
         [](pybind11::object grid_py, int n_bus_solver) {

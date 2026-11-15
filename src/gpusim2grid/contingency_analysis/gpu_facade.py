@@ -616,8 +616,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             return [int(ids)]
         return sorted(set(int(el) for el in ids))
 
-    def _push_contingencies(self):
-        b, s, l, g, b1, b2, sg, st, sv, hv = ([list(c[k]) for c in self._ctg_elements] for k in range(10))
+    def _push_contingencies(self, elements):
+        """Hand `elements` (the whole list) to the session, and keep it only once the
+        session took it: a refused list (an id out of range, an element this session
+        has no data for) leaves the facade's own, and the session's, as they were."""
+        b, s, l, g, b1, b2, sg, st, sv, hv = ([list(c[k]) for c in elements] for k in range(10))
         if any(sg) or any(st) or any(sv) or any(hv):
             self._inner.build_contingencies_full(b, s, l, g, b1, b2, sg, st, sv, hv)
         elif any(b1) or any(b2):
@@ -626,6 +629,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             self._inner.build_contingencies_full(b, s, l, g)
         else:
             self._inner.build_contingencies(b)
+        self._ctg_elements = elements
         self._ctg_branch_ids = b
 
     def add_contingencies(self, contingencies):
@@ -692,8 +696,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             if not any(cont):
                 raise ValueError("a contingency must trip something (every list is empty)")
             new.append(cont)
-        self._ctg_elements = self._ctg_elements + new
-        self._push_contingencies()
+        self._push_contingencies(self._ctg_elements + new)
 
     def add_contingency(self, branch_ids=(), shunt_ids=(), load_ids=(), gen_ids=(),
                         branch_ids_side1=(), branch_ids_side2=(), sgen_ids=(), storage_ids=(),

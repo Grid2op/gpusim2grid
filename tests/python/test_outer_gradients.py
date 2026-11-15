@@ -431,3 +431,62 @@ def test_compute_flows_refuses_rows_it_cannot_match_to_their_taps():
     with pytest.raises(ValueError, match="its forward 3 rows"):
         pf.compute_flows(V[1:].clone(), taps_from=V)
     assert full.shape[0] == 3
+
+
+def test_no_row_simulated_gives_zero_gradients():
+    """Every row islands bus 8 and handle_disconnected_grid is off: no row is simulated (NaN
+    voltages), and the backward gives zero gradients, as without the outer loops, instead of
+    asking for the control state no row left"""
+    grid = _grid()
+    pf = _pf(grid)
+    inputs = _inputs(grid)
+    spur = [el.id for el in grid.get_trafos() if 7 in (el.bus1_id, el.bus2_id)]
+    assert len(spur) == 1   # bus 8 hangs off one transformer
+    trafo_status = np.ones((N_SCEN, len(grid.get_trafos())), dtype=bool)
+    trafo_status[:, spur] = False
+    V, grads = _grads(pf, inputs, trafo_status=torch.as_tensor(trafo_status, device="cuda"))
+    assert not np.isfinite(V.detach().cpu().numpy()).any()
+    for name, g in grads.items():
+        assert np.all(g == 0.), name
+
+
+def test_load_status_reaches_the_loops_view_of_the_row(solver_atol):
+    """load_status with the loops on: the session gets the mask as well (the loops' view of the
+    row; the injections lose the loads in torch), and the rows are those of
+    ScenarioSweepGPU.set_contingency_loads. A later forward without it, on another row count,
+    hands an empty mask over: every load connected, no stale row count"""
+    from gpusim2grid import ScenarioSweepGPU
+    grid = _grid()
+    pf = _pf(grid)
+    inputs = _inputs(grid)
+    inputs.pop("gen_v")
+    load_status = np.ones_like(inputs["load_p"], dtype=bool)
+    load_status[1, 3] = False
+    load_status[3, [0, 5]] = False
+    with torch.no_grad():
+        V = pf(**{k: _t(v) for k, v in inputs.items()},
+               load_status=torch.as_tensor(load_status, device="cuda")).cpu().numpy()
+    assert pf._load_off_in_session and pf._load_off_rows == N_SCEN
+    assert np.isfinite(V).all()
+
+    sw = ScenarioSweepGPU(grid, outer_loops=True, keep_outer_trace=True, nb_iter=30,
+                          init_from_n_powerflow=False, ir_n_steps=1, reference_slack="grid",
+                          tol=TOL_MVA / grid.get_sn_mva())
+    sw.set_injections_from_elements(inputs["load_p"], inputs["load_q"], inputs["gen_p"])
+    sw.set_contingency_loads(~load_status)
+    sw.compute()
+    np.testing.assert_allclose(V, np.asarray(sw.V_results.to_numpy()).reshape(V.shape),
+                               rtol=0., atol=solver_atol)
+    assert ([r.decisions for r in pf.sweep.get_outer_results()]
+            == [r.decisions for r in sw.get_outer_results()])
+    # the loads make a difference: not the rows that keep them
+    with torch.no_grad():
+        V_all = _pf(grid)(**{k: _t(v) for k, v in inputs.items()}).cpu().numpy()
+    assert np.abs(V - V_all)[[1, 3]].max() > 1e-4
+    np.testing.assert_allclose(V[[0, 2]], V_all[[0, 2]], rtol=0., atol=solver_atol)
+
+    # fewer rows, no load_status: the session's mask is cleared with the rows
+    with torch.no_grad():
+        V2 = pf(**{k: _t(v[:2]) for k, v in inputs.items()}).cpu().numpy()
+    assert pf._load_off_mask is None
+    np.testing.assert_allclose(V2, V_all[:2], rtol=0., atol=solver_atol)

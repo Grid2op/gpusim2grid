@@ -14,7 +14,9 @@
 - ``ScenarioSweepGPU.set_contingency_shunts`` after the row count changed: the branch
   trips it keeps are the implicit "none" ones, not a stale explicit topology;
 - ``set_contingency_loads`` with a wrong column count, or one that no longer matches the
-  rows: refused, not silently dropped.
+  rows: refused, not silently dropped; a mask disconnecting nothing clears it;
+- a contingency the session refuses (an id out of range): not kept by the facade, nor
+  half-built by the session.
 """
 import subprocess
 import sys
@@ -294,3 +296,62 @@ def test_stale_load_mask_is_refused_not_dropped(case):
     sw.set_injections_from_elements(*_elements(grid, 4))
     with pytest.raises(RuntimeError, match="set_contingency_loads"):
         sw.compute(batch_size=4)
+
+
+@needs_bridge
+def test_load_mask_disconnecting_nothing_clears_it(case, solver_atol):
+    """Per-bus injections are refused while a load mask disconnects a load (the facade
+    only takes loads out of its own element inputs); an all-False mask clears it, and
+    the per-bus rows then run."""
+    from gpusim2grid import ScenarioSweepGPU
+    from gpusim2grid._ls2g_utils import build_bus_injections
+    grid = case["grid"]
+    sw = ScenarioSweepGPU(grid, nb_iter=10, **GPU_TOL)
+    mask = np.zeros((2, len(grid.get_loads())), dtype=bool)
+    mask[0, 3] = True
+    sw.set_contingency_loads(mask)
+    p_mw, q_mvar = build_bus_injections(sw._elements, *_elements(grid, 2))
+    sw.set_injections(p_mw, q_mvar, sw._elements.sn_mva)
+    with pytest.raises(RuntimeError, match="set_contingency_loads"):
+        sw.compute(batch_size=4)
+    sw.set_contingency_loads(np.zeros_like(mask))
+    sw.compute(batch_size=4)
+    np.testing.assert_allclose(_V(sw.solver, 2, case["n_bus"]),
+                               np.repeat(case["v_ref"][case["buses"]][None, :], 2, axis=0),
+                               rtol=0., atol=10 * solver_atol)
+
+
+# ------------------------------------------------- a contingency the session refuses
+@needs_bridge
+@pytest.mark.parametrize("bad", ["generator", "branch"])
+def test_refused_contingency_is_not_kept(case, bad, solver_atol):
+    """add_contingency with an id out of range raises and leaves the list as it was, in
+    the facade and in the session (a branch id is only found out of range once the
+    session is rebuilding its list): the contingencies before it still run, and the next
+    add_contingency is not refused for the one that was."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    grid = case["grid"]
+    n_bus = case["n_bus"]
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
+    ca.add_contingencies_by_branch_id([[3]])
+    ca.add_contingency_load([2])
+    before = ca.get_contingencies()
+    with pytest.raises(RuntimeError, match=bad if bad == "generator" else "out of range"):
+        if bad == "generator":
+            ca.add_contingency_gen([len(grid.get_generators()) + 5])
+        else:
+            ca.add_contingency(branch_ids=[10 ** 6])
+    assert ca.get_contingencies() == before
+    ca.compute(batch_size=4)   # the session still holds the two contingencies
+    ref = ContingencyAnalysisGPU(grid, nb_iter=10, **GPU_TOL)
+    ref.add_contingencies_by_branch_id([[3]])
+    ref.add_contingency_load([2])
+    ref.add_contingency_shunt([0])
+    ref.compute(batch_size=4)
+    V_ref = _V(ref, 3, n_bus)
+    assert np.all(ref.last_residuals() < solver_atol)
+    np.testing.assert_allclose(_V(ca, 2, n_bus), V_ref[:2], rtol=0., atol=solver_atol)
+    ca.add_contingency_shunt([0])   # not refused because of the one that was
+    assert ca.get_contingencies() == ref.get_contingencies()
+    ca.compute(batch_size=4)
+    np.testing.assert_allclose(_V(ca, 3, n_bus), V_ref, rtol=0., atol=solver_atol)
