@@ -185,7 +185,7 @@ struct TvcRatio {   // TransformerRatioManager's, per transformer
     double shared_min = 1., shared_max = 1., shared_initial = 1.;
 };
 struct TvcFrozen {  // a generator bus frozen by INITIAL
-    int entry;
+    int entry;           // into RlPlan::plan->buses (RlBus::entry)
     int bus_solver;
     bool local;
     double target_vm;
@@ -2612,7 +2612,8 @@ void Ls2gOuterModel::tvc_freeze(SlotState& st, const RowView& rv, double limit,
             }
         }
         st.suspended.insert(b);
-        st.tvc_frozen.push_back(TvcFrozen{static_cast<int>(k), b, local, target_vm});
+        // (the plan's entry, not k: a row masking buses shares the grid's plan, its buses fewer)
+        st.tvc_frozen.push_back(TvcFrozen{st.rl->buses[k].entry, b, local, target_vm});
     }
 }
 

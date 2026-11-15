@@ -997,6 +997,52 @@ def test_transformer_voltage_control_scenario_sweep_row_load_q():
     V = _V(sw, grid, n_rows)
     assert np.abs(V[-1] - V[0]).max() > 1e-4   # the rows' load Q does move the state
 
+def test_transformer_voltage_control_releases_a_group_past_a_masked_bus(solver_atol):
+    """TransformerVoltageControl freezes a remote regulator (B8 holding bus 6, a group of one)
+    and releases it once the taps are settled. On a contingency islanding bus 5 (B6's entry of
+    the ReactiveLimits plan, before B8's), the row's plan is the grid's without that entry
+    (rl_plan_masked): the release must still find B8's entry, and bus 6 end at its set-point,
+    as in lightsim2grid's single solve of the grid without the island."""
+    import test_outer_model_cpu as cpu
+    from gpusim2grid import ContingencyAnalysisGPU
+    GEN_B8, REGULATED, V_SET, TRAFO_5_6, LINES_OF_5, BUS_B6 = 4, 6, 1.06, 2, (7, 8, 9), 5
+
+    def make():
+        grid = cpu._tvc_grid("T4-9-1", 12.6, 0.1, max_controlled_nominal_voltage=120.)
+        grid.set_gen_regulated_bus(GEN_B8, REGULATED)
+        grid.change_v_gen(GEN_B8, V_SET)
+        grid.set_keep_vinit_at_group_controlled_buses(True)
+        return grid
+
+    grid = make()
+    v0 = np.full(grid.total_bus(), 1. + 0j)
+    assert grid.ac_pf(v0, MAX_IT, 1e-10).size > 0
+    ref = make()
+    ref.deactivate_trafo(TRAFO_5_6)
+    for line in LINES_OF_5:
+        ref.deactivate_powerline(line)
+    ref.consider_only_main_component(False)
+    V_ref = ref.ac_pf(v0, MAX_IT, 1e-10)
+    assert V_ref.size > 0
+    ref_trace = [str(d) for d in ref.get_algo().get_outer_loop_stats().decisions]
+    assert any("TransformerVoltageControl" in d and "ROUND_TAP" in d for d in ref_trace), ref_trace
+    assert abs(V_ref[REGULATED]) == pytest.approx(V_SET, abs=solver_atol)
+
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT, ir_n_steps=1,
+                                handle_disconnected_grid=True, keep_outer_trace=True, init_from_n_powerflow=False,
+                                tol=1e-10 / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[len(grid.get_lines()) + TRAFO_5_6, *LINES_OF_5]])
+    ca.compute(batch_size=1)
+    msg = "\n".join(ca.get_outer_results()[0].decisions) + "\n---- lightsim2grid\n" + "\n".join(ref_trace)
+    assert ca.get_row_status()[0] == CONVERGED, msg
+    buses = list(np.asarray(grid.id_ac_solver_to_me(), dtype=int))
+    V = ca.V_results.to_numpy().reshape(1, len(buses))[0]
+    live = np.isfinite(V)
+    assert not live[buses.index(BUS_B6)], msg
+    assert abs(V[buses.index(REGULATED)]) == pytest.approx(V_SET, abs=solver_atol), msg
+    np.testing.assert_allclose(V[live], V_ref[np.asarray(buses)][live], rtol=0., atol=solver_atol, err_msg=msg)
+
+
 def test_transformer_voltage_control_injection_sweep():
     from lightsim2grid.lightsim2grid_cpp import InjectionSweepCPP
     from gpusim2grid import InjectionSweepGPU
