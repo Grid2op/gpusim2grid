@@ -3,6 +3,8 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [ADDED] CI: one build leg and a GPU test subset pin lightsim2grid to 1.3.1, the minimum supported, so a
+  change needing a newer one is caught.
 - [FIXED] ``ContingencyAnalysisGPU.add_contingenc*``: a refused contingency (an id out of range) stayed in the
   list, so every later call raised too; the session's own list is left as it was.
 - [FIXED] ``ScenarioSweepGPU.set_contingency_loads``: a mask disconnecting nothing clears it (per-bus
