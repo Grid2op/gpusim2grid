@@ -926,9 +926,22 @@ void build_mask_entries(
                 out.jov_pos.push_back(pos);
                 out.jov_val.push_back(static_cast<cuda_real_type>(val));
             };
+            // (the groups the row loses a controller of hold their pins by value, SlotVcHold)
+            std::vector<char> held_by_value;
+            if (cfg.vc_hold_by_value && !ctg.vc_pinned_ctrl.empty()) {
+                held_by_value.assign(cfg.vc_grp_start.size(), 0);
+                for (int j : ctg.vc_tripped)
+                    if (j >= 0 && j < static_cast<int>(cfg.vc_group.size()))
+                        held_by_value[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])] = 1;
+                for (size_t j = 0; j < cfg.vc_bus.size(); ++j)
+                    if (std::find(ctg.masked_buses.begin(), ctg.masked_buses.end(), cfg.vc_bus[j]) !=
+                        ctg.masked_buses.end())
+                        held_by_value[static_cast<size_t>(cfg.vc_group[j])] = 1;
+            }
             for (const auto& pc : ctg.vc_pinned_ctrl) {
                 const int j = pc.first;
                 const int g = cfg.vc_group[static_cast<size_t>(j)];
+                if (!held_by_value.empty() && held_by_value[static_cast<size_t>(g)]) continue;
                 const int first = cfg.vc_grp_start[static_cast<size_t>(g)];
                 int row;
                 if (j == first) {

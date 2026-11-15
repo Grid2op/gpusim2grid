@@ -1753,10 +1753,14 @@ void ScenarioSweepSession::run()
 
     // the controllers each row has lost: tripped, or on a bus it masks
     if (!outer_ && reserved_vc_trip_) {
-        std::vector<std::vector<int>> lost(static_cast<size_t>(n_scenarios_));
-        for (int r = 0; r < n_scenarios_; ++r)
-            lost[static_cast<size_t>(r)] = gen_contingency::lost_controllers(
-                *base_ledger_, row_vc_tripped_[static_cast<size_t>(r)], contingencies_[static_cast<size_t>(r)].masked_buses);
+        std::vector<std::vector<std::pair<int, double>>> lost(static_cast<size_t>(n_scenarios_));
+        for (int r = 0; r < n_scenarios_; ++r) {
+            const Contingency& ctg = contingencies_[static_cast<size_t>(r)];
+            lost[static_cast<size_t>(r)] = gen_contingency::held_by_value(
+                *base_ledger_, gen_contingency::lost_controllers(*base_ledger_, row_vc_tripped_[static_cast<size_t>(r)],
+                                                                 ctg.masked_buses),
+                ctg.vc_pinned_ctrl);
+        }
         solver_->source_.set_vc_hold(base_state_->n_vc_ctrl, lost, solver_->batch_size_, scs);
     }
     // the lines in AC emulation each row trips (the outer loops own the slots' regimes)

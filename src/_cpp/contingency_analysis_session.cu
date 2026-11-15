@@ -670,10 +670,12 @@ void ContingencyAnalysisSession::run()
             source.set_hvdc_off_host(base_state_->h_hvdc_status, droop_off);
             // ... and the controllers each has lost: tripped, or on a bus it masks
             if (reserved_vc_trip_) {
-                std::vector<std::vector<int>> lost(contingencies_.size());
+                std::vector<std::vector<std::pair<int, double>>> lost(contingencies_.size());
                 for (size_t r = 0; r < contingencies_.size(); ++r)
-                    lost[r] = gen_contingency::lost_controllers(*base_ledger_, contingencies_[r].vc_tripped,
-                                                                contingencies_[r].masked_buses);
+                    lost[r] = gen_contingency::held_by_value(
+                        *base_ledger_, gen_contingency::lost_controllers(*base_ledger_, contingencies_[r].vc_tripped,
+                                                                         contingencies_[r].masked_buses),
+                        contingencies_[r].vc_pinned_ctrl);
                 source.set_vc_hold_host(base_state_->n_vc_ctrl, lost);
             }
         }
