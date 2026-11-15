@@ -550,10 +550,15 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         reuses it otherwise. :attr:`dim_J` / :attr:`reserved_switchable_buses`
         show the current structure.
 
-        Only generators regulating their **own** bus are supported: raises
-        for a generator regulating a remote bus, or one whose bus a control
-        group holds (a remote generator, an SVC or an HVDC converter station),
-        and in explicit-array (tuple) mode (no generator data).
+        A controller of a voltage-control group (a generator regulating a
+        remote bus, or one whose bus a group holds) leaves its group on that
+        row, the regulated bus going free when nobody is left. Such a row is
+        reported BATCH_UNSUPPORTED (see :meth:`get_batch_unsupported_reasons`)
+        with ``compute_physical_violations`` or ``keep_final_jacobian``, when
+        the generator is held at a reactive limit (lightsim2grid's held
+        regulators), or when it takes out every controller of a group
+        regulating a slack bus. Raises in explicit-array (tuple) mode (no
+        generator data).
         """
         if self._elements is None:
             raise RuntimeError(
@@ -771,7 +776,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     def set_contingency_storages(self, mask):
         """Per-row storage unit mask ``(n_scenarios, n_storage)``: the unit leaves the row's
         injection and distributed slack; the last controller of a bus turns it PQ. A unit on
-        a bus a control group holds is reported BATCH_UNSUPPORTED, see
+        a bus a control group holds, or one the physical checks look at with
+        ``compute_physical_violations``, is reported BATCH_UNSUPPORTED, see
         :meth:`get_batch_unsupported_reasons`."""
         self._set_more_trip("set_contingency_storages", mask)
 
@@ -779,14 +785,16 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         """Per-row static var compensator mask ``(n_scenarios, n_svc)``: its fixed reactive
         injection and its b0 leave the row. One in voltage mode leaves its control group, one
         with a standby automaton its automaton's check and the VoltageMonitoring loop
-        (lightsim2grid leaves that row out). One frozen at a reactive limit is reported
-        BATCH_UNSUPPORTED."""
+        (lightsim2grid leaves that row out). One frozen at a reactive limit, or one in voltage
+        mode with ``compute_physical_violations``, is reported BATCH_UNSUPPORTED."""
         self._set_more_trip("set_contingency_svcs", mask)
 
     def set_contingency_hvdcs(self, mask):
         """Per-row HVDC line mask ``(n_scenarios, n_hvdc)``: both converter stations leave the
-        row; the bus a regulating one was the last to hold turns PQ. A line in AC emulation or
-        with a station in a control group is reported BATCH_UNSUPPORTED."""
+        row. A line in AC emulation carries no flow any more, a station in a control group leaves
+        it, and the bus a regulating station was the last to hold turns PQ. With
+        ``compute_physical_violations``, a line in AC emulation or with a regulating station is
+        reported BATCH_UNSUPPORTED (those checks cannot leave it out of a row yet)."""
         self._set_more_trip("set_contingency_hvdcs", mask)
 
     def get_batch_unsupported_reasons(self):

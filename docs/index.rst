@@ -16,12 +16,15 @@ preprocessing and as a reference oracle.
 
 .. warning::
 
-   This is a raw Newton-Raphson solver with **no outer loop**: it does not
-   enforce reactive-power limits (no PV→PQ switching) or adjust tap/phase-shifter
-   setpoints. The in-Jacobian controls that lightsim2grid models — distributed
-   slack, HVDC angle-droop, SVC, and remote generator voltage control — *are*
-   solved when seeded from a lightsim2grid grid (the default facade path), and
-   then match lightsim2grid. See the project ``DISCLAIMER.md`` before using it for
+   By default this is a raw Newton-Raphson solver with **no outer loop**: it does
+   not enforce reactive-power limits (no PV→PQ switching) or adjust
+   tap/phase-shifter setpoints. The in-Jacobian controls that lightsim2grid
+   models — distributed slack, HVDC angle-droop, SVC, and remote generator
+   voltage control — *are* solved when seeded from a lightsim2grid grid (the
+   default facade path), and then match lightsim2grid. The three batch facades
+   can also run the grid's own lightsim2grid outer loops on every row
+   (``outer_loops=True``, see :ref:`outer-loops`); the single solve
+   (``AcPfGPU``) cannot. See the project ``DISCLAIMER.md`` before using it for
    power-system analysis.
 
 .. toctree::

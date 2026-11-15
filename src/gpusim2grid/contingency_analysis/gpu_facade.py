@@ -644,8 +644,13 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         - a generator too (its active power, and the reactive setpoint of one that does
           not regulate voltage), and the distributed slack is re-weighted without it;
           when it was the last one regulating its own bus, that bus turns PQ for the
-          contingency. A generator regulating a remote bus, or on a bus a control group
-          holds, is reported BATCH_UNSUPPORTED (see :meth:`get_batch_unsupported_reasons`);
+          contingency. A controller of a voltage-control group (regulating a remote bus,
+          or on a bus a group holds) leaves its group, the regulated bus going free when
+          nobody is left; such a contingency is reported BATCH_UNSUPPORTED (see
+          :meth:`get_batch_unsupported_reasons`) with ``compute_physical_violations``,
+          when the controller is held at a reactive limit (lightsim2grid's held
+          regulators), or when it takes out every controller of a group regulating a
+          slack bus;
         - a branch of ``branch_ids_side1`` (``branch_ids_side2``) is opened at side 1 (2)
           only: its other end stays connected and keeps the branch's charging, as
           OpenLoadFlow models a branch whose breaker opens at one end. Its flows read 0,
@@ -658,14 +663,16 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
           mode leaves its control group; one with a standby automaton leaves its automaton's
           check and the VoltageMonitoring loop (lightsim2grid leaves that row out); one
           frozen at a limit is BATCH_UNSUPPORTED;
-        - an HVDC line stops transmitting, both converter stations leaving the injection,
-          the bus a regulating one was the last to hold turning PQ; one in AC emulation or
-          with a station in a control group is BATCH_UNSUPPORTED.
+        - an HVDC line stops transmitting, both converter stations leaving the injection:
+          a line in AC emulation carries no flow any more, a station in a control group
+          leaves it, and the bus a regulating station was the last to hold turns PQ.
 
-        With the outer loops, a shunt that regulates a voltage is BATCH_UNSUPPORTED (its
-        sections are the ShuntVoltageControl loop's), and so is an HVDC line with a
-        regulating station. Needs a grid-mode instance (the element
-        data comes from the lightsim2grid grid).
+        With ``compute_physical_violations``, the elements those checks cannot leave out of
+        a row yet are BATCH_UNSUPPORTED: a storage unit they check, an SVC in voltage mode,
+        an HVDC line in AC emulation or with a regulating station. With the outer loops, a
+        shunt that regulates a voltage is BATCH_UNSUPPORTED (its sections are the
+        ShuntVoltageControl loop's). Needs a grid-mode instance (the element data comes
+        from the lightsim2grid grid).
         """
         if getattr(self, "_ctg_elements", None) is None:
             self._ctg_elements = []
