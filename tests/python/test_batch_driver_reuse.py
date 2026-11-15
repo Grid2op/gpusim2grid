@@ -240,19 +240,23 @@ def test_is_hot_gen_v_drives_remote_regulators(solver_atol):
     if not have_ls2g_bridge:
         pytest.skip("VoltageControl needs the lightsim2grid C++ bridge")
     from test_gen_v_regulated_bus import _remote_case14, GEN_REMOTE, REG_BUS, NB_ITER, TOL
-    model, _ = _remote_case14()
+    model, V0 = _remote_case14()
     sn = model.get_sn_mva()
     S = np.asarray(model.get_Sbus_solver())
     n, n_bus, n_gen = 2, S.shape[0], len(model.get_generators())
     p, q = np.tile(S.real * sn, (n, 1)), np.tile(S.imag * sn, (n, 1))
     reg = int(np.asarray(model.id_me_to_ac_solver())[REG_BUS])
+    base_reg = abs(np.asarray(V0)[REG_BUS])      # the group's own set-point
     LOCAL = 0                                   # gen 0 holds its own (PV) bus
+    local_bus = int(np.asarray(model.id_me_to_ac_solver())[model.get_generators()[LOCAL].bus_id])
     remote_v, local_v = np.array([1.03, 1.055]), np.array([1.03, 1.05])
+    remote_v2 = np.array([1.04, 1.02])
+    atol = 10 * solver_atol
 
-    def gv(remote=False, local=False):
+    def gv(remote=None, local=False):
         g = np.full((n, n_gen), np.nan)
-        if remote:
-            g[:, GEN_REMOTE] = remote_v
+        if remote is not None:
+            g[:, GEN_REMOTE] = remote
         if local:
             g[:, LOCAL] = local_v
         return g
@@ -275,16 +279,25 @@ def test_is_hot_gen_v_drives_remote_regulators(solver_atol):
         _assert_same(V(sw), V(build(gen_v)), solver_atol)
         return V(sw)
 
-    # the first build had no gen_v at all
-    sw = build()
-    Vh = hot(sw, gv(remote=True))
-    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v, atol=10 * solver_atol)
+    assert not np.any(np.isclose(remote_v, base_reg, atol=1e-3))   # a move to see
+    assert not np.any(np.isclose(remote_v2, remote_v, atol=1e-3))
 
-    # the first build had the remote column only: more columns, then none of the group's
-    sw = build(gv(remote=True))
-    Vh = hot(sw, gv(remote=True, local=True))
-    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v, atol=10 * solver_atol)
-    hot(sw, gv(local=True))
+    # the first build had no gen_v at all: the remote column brought in
+    sw = build()
+    Vh = hot(sw, gv(remote_v))
+    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v, atol=atol)
+
+    # the first build had the remote column only: more columns, the remote one
+    # changed, then dropped (the group goes back to its own set-point)
+    sw = build(gv(remote_v))
+    Vh = hot(sw, gv(remote_v, local=True))
+    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v, atol=atol)
+    np.testing.assert_allclose(np.abs(Vh[:, local_bus]), local_v, atol=atol)
+    Vh = hot(sw, gv(remote_v2, local=True))
+    np.testing.assert_allclose(np.abs(Vh[:, reg]), remote_v2, atol=atol)
+    Vh = hot(sw, gv(local=True))
+    np.testing.assert_allclose(np.abs(Vh[:, reg]), base_reg, atol=atol)
+    np.testing.assert_allclose(np.abs(Vh[:, local_bus]), local_v, atol=atol)
 
 
 def test_is_row_count_change_rebuilds(ieee14_base_case, solver_atol):

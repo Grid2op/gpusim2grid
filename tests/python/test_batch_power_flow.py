@@ -383,9 +383,13 @@ class TestAdjointPrimitives:
         V = pf(load_p=lp, load_q=load_q, gen_p=gen_p)
 
         # keep_final_jacobian is still on from the forward above
-        pf.sweep.solver.batch_size = 1                  # cold rebuild, 3 chunks
+        sol = pf.sweep.solver
+        runs, drivers = sol.run_counter, sol.driver_build_counter
+        sol.batch_size = 1                              # cold rebuild, 3 chunks
         with pytest.raises(RuntimeError, match="keep_final_jacobian"):
-            pf.sweep.solver.run()
+            sol.run()
+        assert sol.driver_build_counter > drivers       # the driver was replaced...
+        assert sol.run_counter > runs                   # ...and the failed run counted
         with pytest.raises(RuntimeError, match="another forward"):
             V.real.sum().backward()
 
