@@ -234,9 +234,11 @@ struct LedgerData {
     // extract_ledger_data (BaseAlgo::get_ordering_constraints), flattened:
     // constraint c's follow indices are ord_follow[ord_follow_ptr[c] ..
     // ord_follow_ptr[c+1]), its leads likewise, ord_in_order[c] its flag. J
-    // indices of THIS ledger: valid as long as no index moved -- extensions that
-    // only append (add_switchable_vm_buses) or swap theta/P indices
-    // (move_reference) keep them; drop_multislack_augmentation clears them
+    // indices of THIS ledger: valid as long as no index they name moved --
+    // extensions that only append (add_switchable_vm_buses) keep them, and so does
+    // move_reference, which only changes a theta column, two P rows and nothing
+    // the constraints name (Vm columns, controller unknowns, custom rows; it
+    // checks, and clears them otherwise); drop_multislack_augmentation clears them
     // (ord_constraints_read = false). Used by ReorderingAlg::Ls2gConstrained, see
     // docs/dev_notes/batched_lu_and_constrained_ordering.md.
     bool                 ord_constraints_read = false;

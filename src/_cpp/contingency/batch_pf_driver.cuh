@@ -1104,6 +1104,11 @@ private:
     std::vector<unsigned char>            h_oc_pin_, h_oc_plan_held_;
     std::vector<cuda_real_type>           h_oc_held_q_, h_oc_vset_, h_oc_slack_w_;
     std::vector<int>                      h_oc_hvdc_;
+    // Whether the six device arrays above hold what their host mirrors hold, for every
+    // slot: _oc_write_controls then uploads the slots it is given only. False until a
+    // whole upload, after _oc_setup (the mirrors restart from defaults) and after the
+    // adjoint's _oa_load (the device arrays take the rows' saved state).
+    bool                                  oc_mirrors_on_device_ = false;
     thrust::device_vector<int>            d_oc_watch_, d_oc_cand_bus_, d_oc_cand_pin_, d_oc_list_;
     thrust::device_vector<cuda_real_type> d_oc_gather_;
     PinnedBuffer<cuda_real_type>          h_oc_gather_;

@@ -337,6 +337,12 @@ class BatchPowerFlow:
         self._shunt_off_rows = None
         self._pending_shunt_off = None
         self._pending_shunt_off_mask = None
+        # ... and the load mask, which only the outer loops' row view reads
+        self._load_off_mask = None
+        self._load_off_in_session = False
+        self._load_off_rows = None
+        self._pending_load_off = None
+        self._pending_load_off_mask = None
         self._gen_off_in_session = False
         self._gen_off_rows = None       # row count of the mask the session holds
         self._pending_gen_off = None    # mask to hand to the session on the next run
@@ -501,9 +507,9 @@ class BatchPowerFlow:
         self._apply_topology(line_status, trafo_status, n_scen)
         self._apply_shunt_status(shunt_status, n_scen)
         gen_off = self._apply_gen_status(gen_status, n_scen)
-        if load_status is not None:
+        load_off = self._apply_load_status(load_status, n_scen)
+        if load_off is not None:
             # a disconnected load draws nothing in its row (and so carries no gradient there)
-            load_off = ~self._as_status(load_status, self.n_load, n_scen, "load_status")
             load_p = torch.where(load_off, torch.zeros_like(load_p), load_p)
             load_q = torch.where(load_off, torch.zeros_like(load_q), load_q)
         gen_p_in = gen_p   # a disconnected generator's set-point is what the others make up
@@ -876,6 +882,28 @@ class BatchPowerFlow:
             self._pending_shunt_off = np.ascontiguousarray(shunt_off.cpu().numpy(), dtype=bool)
             self._pending_shunt_off_mask = shunt_off.clone()
 
+    def _apply_load_status(self, load_status, n_scen):
+        """Returns the (n_scen, n_load) bool "disconnected" mask to apply to the
+        injections (None without load_status). With the outer loops the session
+        gets it too, same contract as _apply_gen_status: their row view must see
+        the load disconnected (ScenarioSweepGPU.set_contingency_loads does the
+        same); without them nothing but the injections reads it."""
+        self._pending_load_off = None
+        self._pending_load_off_mask = None
+        outer = self._sweep.outer_loops
+        if load_status is None:
+            if outer and (self._load_off_mask is not None or (
+                    self._load_off_in_session and n_scen != self._load_off_rows)):
+                self._pending_load_off = np.zeros((n_scen, self.n_load), dtype=bool)
+            return None
+        load_off = ~self._as_status(load_status, self.n_load, n_scen, "load_status")
+        if outer:
+            prev = self._load_off_mask
+            if prev is None or prev.shape != load_off.shape or not torch.equal(prev, load_off):
+                self._pending_load_off = np.ascontiguousarray(load_off.cpu().numpy(), dtype=bool)
+                self._pending_load_off_mask = load_off.clone()
+        return load_off
+
     def _apply_gen_status(self, gen_status, n_scen):
         """Same contract as _apply_topology for the generator mask. Returns the
         (n_scen, n_gen) bool "disconnected" mask to apply to the injections
@@ -944,6 +972,16 @@ class _BatchPowerFlowOp(torch.autograd.Function):
             pf._shunt_off_in_session = True
             pf._pending_shunt_off = None
             pf._pending_shunt_off_mask = None
+        if pf._pending_load_off is not None:
+            # After the injections (the session checks the row count against them), and to
+            # the session itself: the injections above already left the loads out, and the
+            # facade's own mask is for its set_injections_from_elements inputs.
+            solver._s.set_contingency_loads(pf._pending_load_off)
+            pf._load_off_mask = pf._pending_load_off_mask
+            pf._load_off_rows = int(pf._pending_load_off.shape[0])
+            pf._load_off_in_session = True
+            pf._pending_load_off = None
+            pf._pending_load_off_mask = None
         if pf._pending_skip is not None:
             if isinstance(pf._pending_skip, str):
                 solver.clear_skipped_rows()

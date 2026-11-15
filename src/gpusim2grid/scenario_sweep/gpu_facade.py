@@ -736,8 +736,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         row's own load (:meth:`set_injections_from_elements`) leaves its
         injection, whichever of the two is called first, and the distributed
         slack makes up the balance. A caller giving per-bus injections
-        (:meth:`set_injections`) takes the loads out itself. Needs a lightsim2grid
-        grid.
+        (:meth:`set_injections`) takes the loads out of its arrays itself:
+        :meth:`compute` refuses a mask disconnecting a load there. A mask
+        disconnecting nothing (all ``False``) clears a previous one. Needs a
+        lightsim2grid grid.
         """
         if self._elements is None:
             raise RuntimeError(
@@ -752,7 +754,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                 f"differs from the number of columns of the mask ({mask.shape[1]}).")
         mask = np.ascontiguousarray(mask, dtype=bool)
         self._inner._s.set_contingency_loads(mask)   # what the outer loops' view reads
-        self._load_off = mask
+        # no load disconnected = no mask: compute() must not refuse the per-bus
+        # injections of a caller who cleared it
+        self._load_off = mask if mask.any() else None
         if self._pending_elements is not None:
             self._assemble_injections()
 

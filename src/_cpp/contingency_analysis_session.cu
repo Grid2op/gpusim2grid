@@ -316,16 +316,13 @@ void ContingencyAnalysisSession::build_contingencies_full(
         if (t.any()) element_trips::check_ids(t, trip_data_, who);
     }
 
-    contingencies_.clear();
-    contingencies_.reserve(n_ctg);
-    disconnected_per_ctg_.clear();
-    disconnected_per_ctg_.reserve(n_ctg);
-    ctg_shunts_ = shunt_ids_per_ctg;
-    ctg_loads_  = load_ids_per_ctg;
-    ctg_gens_   = gen_ids_per_ctg;
-    ctg_more_   = more_trips;
-    ctg_sbus_ds_.assign(static_cast<size_t>(n_ctg), {});
-    has_gen_trips_ = any_gen;
+    // Built aside and committed at the end: a list refused below (a branch id out of
+    // range) leaves the session's own contingencies as they were.
+    std::vector<Contingency>      contingencies;
+    std::vector<std::vector<int>> disconnected_per_ctg;
+    decltype(ctg_sbus_ds_)        ctg_sbus_ds(static_cast<size_t>(n_ctg));
+    contingencies.reserve(n_ctg);
+    disconnected_per_ctg.reserve(n_ctg);
 
     for (int c = 0; c < n_ctg; ++c) {
         Contingency ctg = build_contingency_from_branch_ids(
@@ -349,13 +346,21 @@ void ContingencyAnalysisSession::build_contingencies_full(
                 ctg.triplets.push_back({t.bus, t.bus, t.re, t.im});
         // a load / generator / ...: its injection leaves the row's Sbus
         if (!load_ids_per_ctg[c].empty() || !gen_ids_per_ctg[c].empty() || more.any())
-            ctg_sbus_ds_[static_cast<size_t>(c)] = element_trips::sbus_delta(
+            ctg_sbus_ds[static_cast<size_t>(c)] = element_trips::sbus_delta(
                 trip_data_, load_ids_per_ctg[c], gen_ids_per_ctg[c],
                 gen_data_.bus, gen_data_.vreg_on, gen_data_.target_q_mvar, &more);
         // every branch it opens, at one end or both: no flow reported
-        disconnected_per_ctg_.push_back(ctg.tripped_branches);
-        contingencies_.push_back(std::move(ctg));
+        disconnected_per_ctg.push_back(ctg.tripped_branches);
+        contingencies.push_back(std::move(ctg));
     }
+    contingencies_        = std::move(contingencies);
+    disconnected_per_ctg_ = std::move(disconnected_per_ctg);
+    ctg_sbus_ds_          = std::move(ctg_sbus_ds);
+    ctg_shunts_ = shunt_ids_per_ctg;
+    ctg_loads_  = load_ids_per_ctg;
+    ctg_gens_   = gen_ids_per_ctg;
+    ctg_more_   = std::move(more_trips);
+    has_gen_trips_ = any_gen;
     has_contingencies_ = true;
     auto_ref_valid_    = false;
     ++contingencies_generation_;   // the live driver's source is stale now
