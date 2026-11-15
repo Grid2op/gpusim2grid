@@ -84,7 +84,9 @@ def _gpu_ca(grid, branches):
 
 def _one_off(grid, branch):
     """The remote control records of lightsim2grid's own single solve with ``branch``
-    (lines then trafos) disconnected."""
+    (lines then trafos) disconnected. It starts from the base case's voltages, as the
+    GPU analysis starts each contingency; the records compared are those of the
+    converged state, which does not depend on the start."""
     g = grid.copy()
     n_lines = len(g.get_lines())
     if branch < n_lines:
@@ -131,9 +133,9 @@ def test_matches_lightsim2grid(solver_atol, target_v_kv, nb):
     atol = 10. * VN_KV * solver_atol
     _assert_same(ref_n, _remote(gpu.get_physical_violations_n()), atol)
     # Every row against lightsim2grid's single solve of that contingency, and against
-    # its ContingencyAnalysisCPP where that converged: lightsim2grid master's batch
-    # leaves branch 5 unconverged after one iteration with B6-G regulating remotely
-    # (the grid stays connected and the single solve converges).
+    # its ContingencyAnalysisCPP where that converged: some lightsim2grid versions'
+    # batch leaves branch 5 unconverged after one iteration with B6-G regulating
+    # remotely (the grid stays connected and the single solve converges).
     ls_conv = np.asarray(ls.converged_mask(), dtype=bool)
     for row, b in enumerate(branches):
         got = _remote(gpu.get_physical_violations()[row])
