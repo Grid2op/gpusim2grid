@@ -1,7 +1,7 @@
 Change Log
 ===========
 
-[0.3.0] 2026-xx-yy
+[0.3.0] 2026-11-16
 --------------------
 - [ADDED] An sdist installable with ``pip install gpusim2grid[cuda13]``: the isolated build takes nvcc and
   cuDSS from PyPI, and the libraries find the ``nvidia`` wheels without ``LD_LIBRARY_PATH``.
