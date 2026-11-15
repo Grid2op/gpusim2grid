@@ -15,6 +15,8 @@ Change Log
   a round; ``InjectionSweepGPU`` hands the rows' generator targets over as an array.
 - [IMPROVED] The automatic reference slack checks that lightsim2grid's ordering constraints name no index
   it moves (pinned against lightsim2grid's own ledger for that reference).
+- [IMPROVED] The GIL is released during the long calls (session construction, ``run``, ``compute_flows``,
+  ``resolve``, adjoint solves, result downloads, ``warmup``), so other Python threads keep running.
 - [FIXED] ``benchmarks/contingency_analysis.py`` stopped on a ``NameError`` on grids with more branches
   than ``nb_max_cont_cpu``, and ran some contingencies twice.
 - [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
