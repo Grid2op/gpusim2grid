@@ -302,8 +302,9 @@ Copyright © "DOUBLE BLINDE REMOVED" DO NOT DISTRIBUTE THIS ANONYMISED VERSION !
 [Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem. 
 
 NVIDIA CUDA libraries (CUDA Toolkit, cuDSS, cuSPARSE) are dependencies, not
-redistributed components, and remain under their respective NVIDIA licenses. DLPack is
-used under its own [license](https://github.com/dmlc/dlpack/blob/main/LICENSE).
+redistributed components, and remain under their respective NVIDIA licenses. The vendored
+DLPack header (`src/_cpp/dlpack/dlpack.h`) is under the Apache License 2.0, its
+[license](src/_cpp/dlpack/LICENSE) next to it.
 
 <!-- ## Acknowledgements
 
