@@ -91,7 +91,8 @@ def test_contingency_analysis(case118, solver_atol):
         runs[(mg, G)] = _outcome(ca, nbr)
         timings[(mg, G)] = ca.timings
     ref = runs.pop((0, 15))
-    assert np.any(ref[0] == NOT_SIMULATED) or np.any(np.isnan(ref[2]))
+    # masked islands: rows solved (converged) with NaN at the buses they cut off
+    assert np.any((ref[0] == CONVERGED)[:, None] & np.isnan(ref[2]))
     _same_rows(runs, ref, solver_atol)
     t_off = timings[(0, 15)]
     assert t_off.n_tail_rounds == 0 and t_off.n_slot_moves == 0

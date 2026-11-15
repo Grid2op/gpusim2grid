@@ -140,6 +140,15 @@ def _reference(grid, kind=None, ids=(), branches=(), gens=()):
     return V[np.asarray(grid.id_ac_solver_to_me(), dtype=int)]
 
 
+def _assert_trip(V_row, grid, kind=None, ids=(), branches=(), gens=(), *, atol, msg=""):
+    """the row is the one-off powerflow without the elements -- and, when it trips any, visibly not
+    the one keeping them, so a trip without effect cannot pass"""
+    np.testing.assert_allclose(V_row, _reference(grid, kind, ids, branches, gens), rtol=0., atol=atol, err_msg=msg)
+    if len(ids) or len(gens):
+        kept = _reference(grid, branches=branches)
+        assert np.max(np.abs(V_row - kept)) > 5 * atol, f"{msg}: the trip leaves the row unchanged"
+
+
 def _ctg(kind, ids, branches=(), gens=()):
     """the 10-tuple of a contingency"""
     c = [list(branches), [], [], list(gens), [], [], [], [], [], []]
@@ -193,8 +202,7 @@ def test_matches_a_one_off_powerflow(solver_atol, runner, kind, make, trips):
     session, V = runner(grid, trips, kind)
     assert not any(session.get_batch_unsupported_reasons())
     for r, (ids, branches) in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, kind, ids, branches), rtol=0., atol=solver_atol,
-                                   err_msg=f"row {r}: {kind} {ids}, branches {branches}")
+        _assert_trip(V[r], grid, kind, ids, branches, atol=solver_atol, msg=f"row {r}: {kind} {ids}, branches {branches}")
 
 
 @pytest.mark.parametrize("runner", [_analysis, _sweep], ids=["analysis", "sweep"])
@@ -206,7 +214,7 @@ def test_a_storage_unit_of_the_slack_leaves_it(solver_atol, runner):
     _finish(grid)
     trips = [([PQ], [])]
     session, V = runner(grid, trips, STORAGE)
-    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, STORAGE, [PQ], atol=solver_atol)
 
 
 @pytest.mark.parametrize("gens_off, hvdcs, moves", [([True], [], False), ([], [0, 1], False), ([True], [0], False),
@@ -224,7 +232,7 @@ def test_controllers_of_a_bus_generator_and_stations(solver_atol, gens_off, hvdc
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
     assert (abs(abs(V[list(buses).index(bus)]) - vm) > 1e-4) == moves
-    np.testing.assert_allclose(V, _reference(grid, HVDC, hvdcs, gens=gens), rtol=0., atol=solver_atol)
+    _assert_trip(V, grid, HVDC, hvdcs, gens=gens, atol=solver_atol)
 
 
 def _grid_storage_on_group_bus():
@@ -245,7 +253,8 @@ def _grid_hvdc_station_in_group():
 
 
 UNSUPPORTED = [
-    (STORAGE, lambda: _grid_storage_on_group_bus()[0], [REGULATING], "group"),
+    (STORAGE, lambda: _grid_storage_on_group_bus()[0], [REGULATING],
+     f"storage unit {REGULATING}, which regulates a bus a control group holds"),
 ]
 
 
@@ -261,7 +270,7 @@ def test_what_the_batch_cannot_do_is_reported_per_row(solver_atol, runner, kind,
     reasons = session.get_batch_unsupported_reasons()
     assert word in reasons[0] and reasons[1] == ""
     assert np.isnan(V[0]).all()
-    np.testing.assert_allclose(V[1], _reference(grid, kind, ok, [5]), rtol=0., atol=solver_atol)
+    _assert_trip(V[1], grid, kind, ok, [5], atol=solver_atol)
     v0 = session.get_violations()[0]
     assert [el.violation_type for el in v0] == [LimitViolationType.BATCH_UNSUPPORTED]
 
@@ -287,8 +296,7 @@ def test_a_standby_svc_matches_a_one_off_powerflow(solver_atol, runner):
     session, V = runner(grid, trips, SVC)
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
     for r, (ids, branches) in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=solver_atol,
-                                   err_msg=f"row {r}: {ids}, branches {branches}")
+        _assert_trip(V[r], grid, SVC, ids, branches, atol=solver_atol, msg=f"row {r}: {ids}, branches {branches}")
 
 
 def _standby_records(session):
@@ -314,7 +322,7 @@ def test_a_tripped_standby_svc_leaves_its_physical_check(solver_atol, runner):
     assert records[0] == [] and records[2] == [], records
     assert len(records[1]) == 1 and records[1][0][0] == 0, records
     for r, (ids, branches) in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=solver_atol)
+        _assert_trip(V[r], grid, SVC, ids, branches, atol=solver_atol)
 
 
 @pytest.mark.parametrize("init_from_n_powerflow", [False, True], ids=["cold", "resumed"])
@@ -333,9 +341,12 @@ def test_a_standby_svc_with_the_outer_loops(solver_atol, low_pu, high_pu, init_f
     res = session.get_outer_results()
     for r in (0, 1):
         assert not any("SWITCH_ON" in d for d in res[r].decisions), res[r].decisions
-    np.testing.assert_allclose(V[0], _reference(grid, SVC, [0]), rtol=0., atol=solver_atol)
-    np.testing.assert_allclose(V[1], _reference(grid, SVC, [0], [5]), rtol=0., atol=solver_atol)
-    np.testing.assert_allclose(V[2], _reference(grid, branches=[5]), rtol=0., atol=solver_atol)
+    if high_pu < 1.1 and not init_from_n_powerflow:
+        # the row keeping it does switch it on: the check above is not vacuous
+        assert any("SWITCH_ON" in d for d in res[2].decisions), res[2].decisions
+    _assert_trip(V[0], grid, SVC, [0], atol=solver_atol)
+    _assert_trip(V[1], grid, SVC, [0], [5], atol=solver_atol)
+    _assert_trip(V[2], grid, branches=[5], atol=solver_atol)
 
 
 # ----- controllers of a voltage-control group ---------------------------------------------
@@ -393,13 +404,13 @@ def test_generators_of_a_group_match_a_one_off_powerflow(solver_atol, runner, kw
     session, V = runner(grid, GROUP_TRIPS, **kwargs)
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
     for r, gens in enumerate(GROUP_TRIPS):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"row {r}: {gens}")
+        _assert_trip(V[r], grid, gens=gens, atol=solver_atol, msg=f"row {r}: {gens}")
 
 
 def test_a_group_of_one(solver_atol):
     grid = _grid_group(group=(3,))
     session, V = _gens_in_analysis(grid, [[3]])
-    np.testing.assert_allclose(V[0], _reference(grid, gens=[3]), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, gens=[3], atol=solver_atol)
 
 
 def test_the_regulated_bus_goes_free_when_nobody_is_left(solver_atol):
@@ -418,7 +429,7 @@ def test_a_local_generator_of_a_group(solver_atol):
     session, V = _gens_in_analysis(grid, trips)
     assert not any(session.get_batch_unsupported_reasons())
     for r, gens in enumerate(trips):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"{gens}")
+        _assert_trip(V[r], grid, gens=gens, atol=solver_atol, msg=f"{gens}")
 
 
 def test_a_row_that_trips_no_controller_next_to_one_that_does(solver_atol):
@@ -428,8 +439,8 @@ def test_a_row_that_trips_no_controller_next_to_one_that_does(solver_atol):
     ca.add_contingencies([([], [], [], [1]), ([5], [], [], [])])
     ca.compute(batch_size=2)
     V = ca.V_results.to_numpy().reshape(2, -1)
-    np.testing.assert_allclose(V[0], _reference(grid, gens=[1]), rtol=0., atol=solver_atol)
-    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, gens=[1], atol=solver_atol)
+    _assert_trip(V[1], grid, branches=[5], atol=solver_atol)
 
 
 def test_an_islanded_controller_next_to_a_tripped_one(solver_atol):
@@ -453,6 +464,7 @@ def test_an_islanded_controller_next_to_a_tripped_one(solver_atol):
     buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
     live = np.isfinite(V)
     assert not live[list(buses).index(7)]
+    assert abs(abs(V[list(buses).index(8)]) - 1.04) > 1e-3   # nobody holds the regulated bus any more
     np.testing.assert_allclose(V[live], V_ref[buses][live], rtol=0., atol=solver_atol)
 
 
@@ -463,16 +475,16 @@ def test_a_voltage_mode_svc(solver_atol):
         session, V = runner(grid, trips, SVC)
         assert not any(session.get_batch_unsupported_reasons())
         for r, (ids, branches) in enumerate(trips):
-            np.testing.assert_allclose(V[r], _reference(grid, SVC, ids, branches), rtol=0., atol=solver_atol, err_msg=f"{ids}")
+            _assert_trip(V[r], grid, SVC, ids, branches, atol=solver_atol, msg=f"{ids}")
 
 
 def test_stations_of_a_control_group(solver_atol):
     grid = _grid_hvdc_station_in_group()
-    other_gen_trips = [([0], []), ([0, 1], [])]
-    session, V = _analysis(grid, other_gen_trips, HVDC)
+    trips = [([0], []), ([0, 1], [])]
+    session, V = _analysis(grid, trips, HVDC)
     assert not any(session.get_batch_unsupported_reasons())
-    for r, (ids, _) in enumerate(other_gen_trips):
-        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=solver_atol, err_msg=f"{ids}")
+    for r, (ids, _) in enumerate(trips):
+        _assert_trip(V[r], grid, HVDC, ids, atol=solver_atol, msg=f"{ids}")
 
 
 def test_with_the_outer_loops_a_generator_of_a_group(solver_atol):
@@ -485,7 +497,7 @@ def test_with_the_outer_loops_a_generator_of_a_group(solver_atol):
                                    ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
     for r, gens in enumerate(GROUP_TRIPS):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"row {r}: {gens}")
+        _assert_trip(V[r], grid, gens=gens, atol=solver_atol, msg=f"row {r}: {gens}")
 
 
 def _grid_two_controllers_on_a_bus(algo):
@@ -525,7 +537,7 @@ def test_a_tripped_controller_stays_out_when_its_bus_is_frozen(solver_atol):
     res = session.get_outer_results()
     for r, gens in enumerate(trips):
         assert any("PV_TO_PQ" in d and "not taken" not in d for d in res[r].decisions), res[r].decisions
-        np.testing.assert_allclose(V[r], _reference(grid, gens=gens), rtol=0., atol=solver_atol, err_msg=f"{gens}")
+        _assert_trip(V[r], grid, gens=gens, atol=solver_atol, msg=f"{gens}")
 
 
 def test_controllers_follow_their_row_through_the_continuous_tail(solver_atol):
@@ -540,7 +552,7 @@ def test_controllers_follow_their_row_through_the_continuous_tail(solver_atol):
     assert ca.timings.n_slot_moves > 0
     V = ca.V_results.to_numpy().reshape(len(conts), grid.get_Ybus_solver().shape[0])
     for r, c in enumerate(conts):
-        np.testing.assert_allclose(V[r], _reference(grid, gens=c[3], branches=c[0]), rtol=0., atol=solver_atol, err_msg=f"{c}")
+        _assert_trip(V[r], grid, gens=c[3], branches=c[0], atol=solver_atol, msg=f"{c}")
 
 
 def test_a_sweep_can_drop_and_regain_its_controller_trips(solver_atol):
@@ -559,13 +571,15 @@ def test_a_sweep_can_drop_and_regain_its_controller_trips(solver_atol):
         sw.set_contingency_gens(mask)
         sw.compute(batch_size=1)
         V = sw.solver.V_results.to_numpy().reshape(1, -1)[0]
-        np.testing.assert_allclose(V, _reference(grid, gens=[1] if trip else []), rtol=0., atol=solver_atol, err_msg=f"{trip}")
+        _assert_trip(V, grid, gens=[1] if trip else [], atol=solver_atol, msg=f"{trip}")
 
 
 def test_a_controller_with_physical_checks_is_reported():
     grid = _grid_group()
     session, V = _gens_in_analysis(grid, [[1]], compute_physical_violations=True)
-    assert "physical" in session.get_batch_unsupported_reasons()[0]
+    reason = session.get_batch_unsupported_reasons()[0]
+    assert "generator 1" in reason and "voltage-control group" in reason and "physical" in reason, reason
+    assert np.isnan(V[0]).all()
 
 
 def test_a_controller_with_gradients_is_reported():
@@ -615,7 +629,7 @@ def test_redistribute_slack_counts_what_the_element_loses(solver_atol, kind, mak
         return
     assert mismatch == pytest.approx(lost, abs=solver_atol * grid.get_sn_mva())
     # no limit is reached: the pre-pass does not change the converged state
-    np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, kind, ids, atol=solver_atol)
 
 
 def test_redistribute_slack_a_storage_unit_of_the_slack_leaves_it_on_a_sweep(solver_atol):
@@ -628,7 +642,11 @@ def test_redistribute_slack_a_storage_unit_of_the_slack_leaves_it_on_a_sweep(sol
     grid.set_gen_p_limits(np.zeros(nb_gen), np.full(nb_gen, 1e3))
     _finish(grid)
     session, V = _sweep(grid, [([PQ], [])], STORAGE, redistribute_slack=True)
-    np.testing.assert_allclose(V[0], _reference(grid, STORAGE, [PQ]), rtol=0., atol=solver_atol)
+    report = session.get_slack_redistribution_report()
+    # the 3 MW it produced are lost, and shared among the generators alone
+    assert report["mismatch_mw"][0] == pytest.approx(3., abs=solver_atol * grid.get_sn_mva())
+    assert report["nb_participants"][0] == nb_gen and report["nb_saturated"][0] == 0
+    _assert_trip(V[0], grid, STORAGE, [PQ], atol=solver_atol)
 
 
 def test_the_ten_tuple_and_the_shortcuts(solver_atol):
@@ -641,8 +659,8 @@ def test_the_ten_tuple_and_the_shortcuts(solver_atol):
                                       ([5], [], [], [], [], [], [0, 1], [], [], [])]
     ca.compute(batch_size=2)
     V = ca.V_results.to_numpy().reshape(2, -1)
-    np.testing.assert_allclose(V[0], _reference(grid, SGEN, [1]), rtol=0., atol=solver_atol)
-    np.testing.assert_allclose(V[1], _reference(grid, SGEN, [0, 1], [5]), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, SGEN, [1], atol=solver_atol)
+    _assert_trip(V[1], grid, SGEN, [0, 1], [5], atol=solver_atol)
     with pytest.raises(Exception):
         ca.add_contingency_sgen(2)
 
@@ -659,11 +677,8 @@ def test_with_the_outer_loops(solver_atol, kind, make, ids):
     _finish(grid, OUTER)
     session, V = _analysis(grid, [(ids, [])], kind, outer_loops=True, scheduling="continuous", nb_iter=MAX_IT,
                            ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
-    if kind == STORAGE and ids == [REGULATING] and session.get_batch_unsupported_reasons()[0]:
-        assert "reserved" in session.get_batch_unsupported_reasons()[0]
-        return
-    assert not any(session.get_batch_unsupported_reasons())
-    np.testing.assert_allclose(V[0], _reference(grid, kind, ids), rtol=0., atol=solver_atol)
+    assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
+    _assert_trip(V[0], grid, kind, ids, atol=solver_atol)
 
 
 def _grid_droop_only(algo="NR_KLU", p_max=100., limits=True):
@@ -684,13 +699,17 @@ def _grid_droop_only(algo="NR_KLU", p_max=100., limits=True):
 
 def test_a_line_in_ac_emulation_with_the_outer_loops(solver_atol):
     """the row is a one-off NROuter solve of the grid without the line; its limits loop skips it
-    (the second row, keeping the line, is the one-off solve of the grid itself)"""
-    grid = _grid_droop_only(OUTER)
+    (the second row, keeping the line, is the one-off solve of the grid itself, the line saturated)"""
+    grid = _grid_droop_only(OUTER, p_max=2.)
     session, V = _analysis(grid, [([0], []), ([], [5])], HVDC, outer_loops=True, scheduling="continuous",
-                           nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
+                           nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, keep_outer_trace=True,
+                           tol=1e-8 / grid.get_sn_mva())
     assert not any(session.get_batch_unsupported_reasons())
-    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=solver_atol)
-    np.testing.assert_allclose(V[1], _reference(grid, branches=[5]), rtol=0., atol=solver_atol)
+    res = session.get_outer_results()
+    assert not any("SATURATE" in d for d in res[0].decisions), res[0].decisions
+    assert any("SATURATE" in d for d in res[1].decisions), res[1].decisions
+    _assert_trip(V[0], grid, HVDC, [0], atol=solver_atol)
+    _assert_trip(V[1], grid, branches=[5], atol=solver_atol)
 
 
 def test_a_saturated_line_can_be_tripped(solver_atol):
@@ -699,13 +718,15 @@ def test_a_saturated_line_can_be_tripped(solver_atol):
     grid.set_status_droop_hvdc(0, 1)
     _finish(grid)
     session, V = _analysis(grid, [([0], [])], HVDC)
-    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [0]), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, HVDC, [0], atol=solver_atol)
 
 
 def test_physical_checks_report_a_line_in_ac_emulation():
     grid = _grid_droop_only(limits=False)
     session, V = _analysis(grid, [([0], [])], HVDC, compute_physical_violations=True)
-    assert "physical" in session.get_batch_unsupported_reasons()[0]
+    reason = session.get_batch_unsupported_reasons()[0]
+    assert "hvdc line 0" in reason and "AC emulation" in reason and "physical" in reason, reason
+    assert np.isnan(V[0]).all()
 
 
 def test_a_regulating_station_with_the_outer_loops(solver_atol):
@@ -718,7 +739,7 @@ def test_a_regulating_station_with_the_outer_loops(solver_atol):
     session, V = _analysis(grid, [([HV_REGULATING], [])], HVDC, outer_loops=True, scheduling="continuous",
                            nb_iter=MAX_IT, ir_n_steps=1, init_from_n_powerflow=False, tol=1e-8 / grid.get_sn_mva())
     assert not any(session.get_batch_unsupported_reasons()), session.get_batch_unsupported_reasons()
-    np.testing.assert_allclose(V[0], _reference(grid, HVDC, [HV_REGULATING]), rtol=0., atol=solver_atol)
+    _assert_trip(V[0], grid, HVDC, [HV_REGULATING], atol=solver_atol)
 
 
 def _grid_stations_short_of_reactive_power():
@@ -754,15 +775,18 @@ def test_a_tripped_station_stays_out_when_its_bus_is_frozen(solver_atol):
     res = session.get_outer_results()
     for r, (ids, _) in enumerate(trips):
         assert any("PV_TO_PQ" in d and "not taken" not in d for d in res[r].decisions), res[r].decisions
-        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids), rtol=0., atol=solver_atol, err_msg=f"{ids}")
+        _assert_trip(V[r], grid, HVDC, ids, atol=solver_atol, msg=f"{ids}")
 
 
-@pytest.mark.parametrize("kind, make, ids", [(STORAGE, _grid_storage, [REGULATING]),
-                                             (HVDC, _grid_hvdc, [HV_REGULATING])], ids=[STORAGE, HVDC])
-def test_physical_checks_report_the_rows_they_cannot_check(kind, make, ids):
+@pytest.mark.parametrize("kind, make, ids, name", [(STORAGE, _grid_storage, [REGULATING], f"storage unit {REGULATING}"),
+                                                   (HVDC, _grid_hvdc, [HV_REGULATING], f"hvdc line {HV_REGULATING}")],
+                         ids=[STORAGE, HVDC])
+def test_physical_checks_report_the_rows_they_cannot_check(kind, make, ids, name):
     grid = make()
     session, V = _analysis(grid, [(ids, [])], kind, compute_physical_violations=True)
-    assert "physical" in session.get_batch_unsupported_reasons()[0]
+    reason = session.get_batch_unsupported_reasons()[0]
+    assert name in reason and "physical" in reason, reason
+    assert np.isnan(V[0]).all()
 
 
 def test_a_tripped_line_follows_its_row_through_the_continuous_tail(solver_atol):
@@ -781,4 +805,4 @@ def test_a_tripped_line_follows_its_row_through_the_continuous_tail(solver_atol)
     V = ca.V_results.to_numpy().reshape(len(conts), grid.get_Ybus_solver().shape[0])
     for r, c in enumerate(conts):
         ids, br = c[TUPLE_POS[HVDC]], c[0]
-        np.testing.assert_allclose(V[r], _reference(grid, HVDC, ids, br), rtol=0., atol=solver_atol, err_msg=f"row {r}")
+        _assert_trip(V[r], grid, HVDC, ids, br, atol=solver_atol, msg=f"row {r}")

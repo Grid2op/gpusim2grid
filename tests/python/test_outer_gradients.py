@@ -401,7 +401,8 @@ def test_distributed_slack_parked_at_a_check_that_does_not_resolve():
     V, grads = _grads(pf, inputs)
     assert torch.isfinite(V).all()
     res = pf.sweep.get_outer_results()
-    assert any("PARK" in d for r in res for d in r.decisions), [r.decisions for r in res]
+    # every row parks the capped unit (generator 0) at a check
+    assert all(any(" PARK, element 0," in d for d in r.decisions) for r in res), [r.decisions for r in res]
     assert all(r.nb_outer_iterations == 0 for r in res), [r.decisions for r in res]
     assert not any(r.gen_p_fixed for r in res), [r.gen_p_fixed for r in res]
     assert (grads["gen_p"][:, 0] != 0.).all()
@@ -423,6 +424,10 @@ def test_compute_flows_refuses_rows_it_cannot_match_to_their_taps():
     found, moved = pf._outer_taps_of(V)
     assert found and moved is not None and len(moved[1]) > 0
     full = pf.compute_flows(V)["i_or_a"]
+    # (a slice is not the forward's output: refused for that already)
     with pytest.raises(ValueError, match="taps"):
         pf.compute_flows(V[1:])
+    # named through taps_from: refused for its row count
+    with pytest.raises(ValueError, match="its forward 3 rows"):
+        pf.compute_flows(V[1:].clone(), taps_from=V)
     assert full.shape[0] == 3

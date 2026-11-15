@@ -1342,3 +1342,5 @@ def test_distributed_slack_run_without_participant(run, fail, algo):
     else:
         res, stats = _compare_single_solve(make)
         assert int(stats.status) == 0
+        # the loop runs (DISTRIBUTE) only with run_without_participant
+        assert any(d.startswith("DistributedSlack") for d in res.decisions) == run, res.decisions

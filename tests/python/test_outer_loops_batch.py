@@ -215,6 +215,20 @@ def test_step_scaling_arguments_reach_the_outer_session(case14, kind):
         assert s.scaling_max_voltage_change is forced
         assert s.max_dVa == pytest.approx(0.25)
         assert s.max_dVm == pytest.approx(0.05)
+    # a grid with the scaling on: None inherits it and its limits
+    grid = _case14()
+    cfg = grid.get_ac_algo_config()
+    ip, rp = list(cfg.int_params), list(cfg.real_params)
+    ip[0], rp[0], rp[1] = 1, 0.3, 0.07
+    cfg.int_params, cfg.real_params = ip, rp
+    grid.set_ac_algo_config(cfg)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    s = _outer_facade(kind, grid)._inner._s
+    assert s.scaling_max_voltage_change is True
+    assert s.max_dVa == pytest.approx(0.3)
+    assert s.max_dVm == pytest.approx(0.07)
+    s = _outer_facade(kind, grid, scaling_max_voltage_change=False)._inner._s
+    assert s.scaling_max_voltage_change is False
 
 
 def test_step_scaling_arguments_change_the_outer_newton(case14):
