@@ -237,7 +237,7 @@ struct ContingencyBatch {
     }
 
     // the controllers each row has lost (see SlotVcHold), before initialize()
-    void set_vc_hold_host(int n_ctrl, const std::vector<std::vector<int>>& held_orig)
+    void set_vc_hold_host(int n_ctrl, const std::vector<std::vector<std::pair<int, double>>>& held_orig)
     {
         vc_hold_.set_host(n_ctrl, held_orig, active_to_orig_);
     }

@@ -19,6 +19,7 @@ import numpy as np
 
 from .._gpusim2grid import BatchScheduling as _BatchScheduling, is_fp32 as _is_fp32
 from .._gpusim2grid import LinearSolver as _LinearSolver
+from .._gpusim2grid import check_own_lu_config as _check_own_lu_config
 
 _SCHEDULING_MAP = {
     "chunked":    _BatchScheduling.Chunked,
@@ -48,6 +49,15 @@ def resolve_linear_solver(value):
     return _LINEAR_SOLVER_MAP[value]
 
 
+def check_linear_solver_args(linear_solver, reordering_alg=None, matching_alg=None):
+    """Facade constructors: refuse what ``linear_solver='own_lu'`` cannot
+    take before any base case is solved (ValueError). None = the default."""
+    from . import _resolve_matching_alg, _resolve_reordering_alg
+    if resolve_linear_solver(linear_solver) == _LinearSolver.OwnLu:
+        _check_own_lu_config(_resolve_reordering_alg("default" if reordering_alg is None else reordering_alg),
+                             _resolve_matching_alg("none" if matching_alg is None else matching_alg))
+
+
 class RowStatus(IntEnum):
     """Outcome of one row of a batched solve (``get_row_status()``); mirrors
     the C++ ``RowStatus`` (contingency/row_status.hpp)."""
@@ -72,6 +82,17 @@ class RowStatus(IntEnum):
 # the rows the outer loops gave up on: their last inner solve converged, so the violation
 # kernel scanned a state no engine accepts (get_violations reports them as diverged)
 OUTER_FAILURE_STATUSES = frozenset((RowStatus.OUTER_FAILED, RowStatus.OUTER_UNSTABLE, RowStatus.UNREALISTIC))
+
+
+def outer_failure_rows(session, n_rows):
+    """(n_rows,) bool ndarray: the rows the outer loops gave up on (OUTER_FAILURE_STATUSES).
+    Their last inner solve converged, but lightsim2grid keeps no state for them: no
+    violation is counted, nothing is truncated and they are not converged."""
+    status = np.asarray(session.get_row_status(), dtype=int)
+    out = np.zeros(int(n_rows), dtype=bool)
+    m = min(len(status), out.shape[0])
+    out[:m] = np.isin(status[:m], [int(s) for s in OUTER_FAILURE_STATUSES])
+    return out
 
 
 def default_tol():
@@ -185,7 +206,7 @@ class SchedulingEngineMixin:
           own fill-reducing order (AMD or MinFill), AMD otherwise; ``'amd'``,
           ``'none'``, ``'ls2g_constrained'`` (same as the default),
           ``'ls2g_constrained_nd'`` and ``'ls2g_constrained_minfill'`` (MinFill
-          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` is clamped (counted by
+          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` (``1e-5`` in an FP32 build) is clamped (counted by
           ``timings.cudss_npivots_*`` with ``GPUSIM2GRID_COUNT_PIVOTS=1``);
           ``ir_n_steps`` refines. ``matching_alg`` must stay ``'none'``.
 
@@ -194,7 +215,19 @@ class SchedulingEngineMixin:
 
     @linear_solver.setter
     def linear_solver(self, value):
-        self._s.linear_solver = resolve_linear_solver(value)
+        ls = resolve_linear_solver(value)
+        self._check_own_lu(linear_solver=ls)
+        self._s.linear_solver = ls
+
+    def _check_own_lu(self, linear_solver=None, reordering_alg=None, matching_alg=None):
+        """ValueError if the session's settings, with the given ones (enums)
+        replacing theirs, ask the own LU for what it cannot take: called by the
+        setters before they assign, so a refused value changes nothing."""
+        ls = self._s.linear_solver if linear_solver is None else linear_solver
+        if ls != _LinearSolver.OwnLu:
+            return
+        _check_own_lu_config(self._s.reordering_alg if reordering_alg is None else reordering_alg,
+                             self._s.matching_alg if matching_alg is None else matching_alg)
 
     def calibrate_tail_max_groups(self, n_repeat=5, batch_size=None):
         """Measure a :attr:`tail_max_groups` for this grid on this GPU: the
@@ -203,9 +236,12 @@ class SchedulingEngineMixin:
         on one of :attr:`tail_group_size` matrices. Returns the
         ``TailCalibration`` (``t_full_ms``, ``t_group_ms``, ``max_groups =
         floor(t_full_ms / t_group_ms)``, what the tail's rule compares); sets
-        nothing. cuDSS only: the tail also runs the Newton kernels on fewer
-        slots, so ``max_groups`` is conservative. Allocates ``batch_size``
-        systems and their factors while it runs."""
+        nothing. With ``linear_solver='own_lu'`` the tail runs k groups as one
+        solve on the first k·``tail_group_size`` matrices, so ``max_groups`` is
+        the largest k whose such prefix is still faster than the full batch
+        (bisected; ``t_group_ms`` is the one-group prefix). The tail also runs
+        the Newton kernels on fewer slots, so ``max_groups`` is conservative.
+        Allocates ``batch_size`` systems and their factors while it runs."""
         return self._s.calibrate_tail_max_groups(
             int(n_repeat), -1 if batch_size is None else int(batch_size))
 

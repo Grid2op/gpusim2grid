@@ -33,11 +33,11 @@ N_SCEN = 4
 TOL_MVA = 1e-10
 
 
-def _grid(distributed=False, init_from_n=False):
+def _grid(distributed=False, init_from_n=False, reactive_limits=True, moved_fraction=None):
     """lightsim2grid's test grid: case14 short of reactive power (ReactiveLimits switches buses
     PQ), its only loop -- with `distributed`, the slack shared in the Newton (NROuterDist_KLU)
     with DistributedSlack, the first generator capped just above its target, so that the
-    Newton's share parks it there"""
+    Newton's share parks it there; `moved_fraction` is DistributedSlack's"""
     import pandapower.networks as pn
     from lightsim2grid.network import init_from_pandapower
     from lightsim2grid.algorithm import ReactiveLimits, DistributedSlack
@@ -54,9 +54,11 @@ def _grid(distributed=False, init_from_n=False):
         p_max[0] = float(grid.get_gen_target_p()[0]) + 1.
     grid.set_gen_p_limits(np.zeros(nb_gen), p_max)
     grid.clear_outer_loops()
-    grid.add_outer_loop(ReactiveLimits())
+    if reactive_limits:
+        grid.add_outer_loop(ReactiveLimits())
     if distributed:
-        grid.add_outer_loop(DistributedSlack())
+        grid.add_outer_loop(DistributedSlack() if moved_fraction is None
+                            else DistributedSlack(moved_fraction=moved_fraction))
     grid.change_algorithm("NROuterDist_KLU" if distributed else "NROuter_KLU")
     assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), 30, TOL_MVA).size > 0
     return grid
@@ -137,7 +139,18 @@ def test_reactive_limits(init_from_n):
     assert torch.isfinite(V).all()
     res = pf.sweep.get_outer_results()
     assert any(r.pq_buses for r in res), [r.decisions for r in res]
-    assert (grads["gen_v"] == 0.).any() and (grads["gen_v"] != 0.).any()
+    # row by row: a generator whose regulated bus the loops switched PQ gets exactly 0, one
+    # whose bus is still PV (pinned) a gradient
+    gen_v_bus = pf._gen_v_bus_np
+    for r, rr in enumerate(res):
+        pq = set(rr.pq_buses)
+        for g, b in enumerate(gen_v_bus):
+            if b < 0:
+                continue
+            if int(b) in pq:
+                assert grads["gen_v"][r, g] == 0., (r, g, rr.decisions)
+            else:
+                assert grads["gen_v"][r, g] != 0., (r, g, rr.decisions)
     # a forward without gradients leaves the adjoint terms out
     pf(**{k: _t(v) for k, v in inputs.items()})
     assert not any(r.pq_buses for r in pf.sweep.get_outer_results())
@@ -166,8 +179,33 @@ def test_distributed_slack_in_the_newton():
     _check_all(pf, inputs, grads, names=("load_p", "gen_p"))
 
 
+def test_distributed_slack_parked_at_the_last_check():
+    """NROuterDist_*: a unit DistributedSlack parks at a check whose move is too small to
+    re-solve (below moved_fraction * p_residue_eps_mw) still shared the slack in the last
+    Newton, whose Jacobian the backward reads: its gen_p reaches the voltages as every other
+    unit's does (lightsim2grid 46897582, TestGridPowerFlowParkedAtTheLastCheck)"""
+    grid = _grid(distributed=True, reactive_limits=False, moved_fraction=1e9)
+    pf = _pf(grid)
+    inputs = _inputs(grid, zero_gen_p_to=5.)
+    cap = float(grid.get_gen_target_p()[0]) + 1.
+    rows = [r for r in range(N_SCEN) if inputs["gen_p"][r, 0] < cap]
+    assert rows
+    V, grads = _grads(pf, inputs)
+    assert torch.isfinite(V).all()
+    res = pf.sweep.get_outer_results()
+    for r in rows:
+        msg = "\n".join(res[r].decisions)
+        assert any("PARK" in d and "element 0," in d for d in res[r].decisions), msg
+        assert res[r].nb_outer_iterations == 0, msg
+        # parked by a check no solve followed: not held at its bound in the gradient
+        assert 0 not in res[r].gen_p_fixed, msg
+    _check_all(pf, inputs, grads, names=("gen_p",))
+
+
 def test_generator_contingency():
-    """rows that disconnect generators (gen_status) with the loops on"""
+    """rows that disconnect generators (gen_status) with the loops on: the disconnected
+    generator gets no gen_p / gen_v gradient, the others' and the loads' match central
+    differences (on rows with and without the trip)"""
     grid = _grid()
     pf = _pf(grid)
     inputs = _inputs(grid)
@@ -196,7 +234,7 @@ def _redistribute_rows(grid):
                     "line_status": torch.as_tensor(line_status, device="cuda")}
 
 
-def test_redistribute_slack_forward_is_the_sessions():
+def test_redistribute_slack_forward_is_the_sessions(solver_atol):
     """BatchPowerFlow measures what each row loses in torch: the same rows as ScenarioSweepGPU's
     own redistribute_slack, whose DistributedSlack loop shares it before the first solve"""
     from gpusim2grid import ScenarioSweepGPU
@@ -208,6 +246,8 @@ def test_redistribute_slack_forward_is_the_sessions():
         V = pf(**{k: _t(v) for k, v in inputs.items()}, **status).cpu().numpy()
     res = pf.sweep.get_outer_results()
     assert all(any("SHARE_LOST_P" in d for d in r.decisions) for r in res), [r.decisions for r in res]
+    # shared before the first solve: at outer iteration #0
+    assert all(d.startswith("DistributedSlack #0 ") for r in res for d in r.decisions if "SHARE_LOST_P" in d)
 
     sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=30, init_from_n_powerflow=False,
                           handle_disconnected_grid=True, redistribute_slack=True, ir_n_steps=1,
@@ -220,7 +260,7 @@ def test_redistribute_slack_forward_is_the_sessions():
     V_sw = np.asarray(sw.V_results.to_numpy()).reshape(V.shape)
     np.testing.assert_array_equal(np.isfinite(V), np.isfinite(V_sw))
     fin = np.isfinite(V)
-    np.testing.assert_allclose(V[fin], V_sw[fin], rtol=0., atol=1e-10)
+    np.testing.assert_allclose(V[fin], V_sw[fin], rtol=0., atol=solver_atol)
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
@@ -249,7 +289,7 @@ def test_redistribute_slack_distributed_in_the_newton(init_from_n):
     _check_all(pf, inputs, grads, **status)
 
 
-def test_redistribute_slack_turned_off():
+def test_redistribute_slack_turned_off(solver_atol):
     """turning redistribute_slack off hands the session nothing to share any more: the next
     forward is the one of a model built without it"""
     grid = _grid(distributed=True)
@@ -263,10 +303,10 @@ def test_redistribute_slack_turned_off():
         V_ref = _pf(grid, handle_disconnected_grid=True)(**tensors, **status).cpu().numpy()
     assert not any(any("SHARE_LOST_P" in d for d in r.decisions) for r in pf.sweep.get_outer_results())
     fin = np.isfinite(V_ref)
-    np.testing.assert_allclose(V[fin], V_ref[fin], rtol=0., atol=1e-10)
+    np.testing.assert_allclose(V[fin], V_ref[fin], rtol=0., atol=solver_atol)
 
 
-def test_tap_changer_settled_taps():
+def test_tap_changer_settled_taps(solver_atol):
     """TransformerVoltageControl moves a ratio tap in the rows: the gradient is the one at the
     taps the loops settled on (the row's last Ybus, put back by the adjoint), and compute_flows
     uses those taps, as the session's own flows"""
@@ -291,8 +331,41 @@ def test_tap_changer_settled_taps():
         amps = pf.compute_flows(V0)["i_or_a"].cpu().numpy()
     pf.sweep.compute_flows()
     amps_sw = np.asarray(pf.sweep.or_amps.to_numpy()).reshape(len(scales), -1)
-    np.testing.assert_allclose(amps, amps_sw, rtol=1e-8, atol=1e-6)
+    np.testing.assert_allclose(amps, amps_sw, rtol=solver_atol, atol=solver_atol)
     _check_all(pf, inputs, grads, names=("load_p", "gen_v"))
+
+
+def test_compute_flows_at_the_taps_of_its_own_forward(solver_atol):
+    """compute_flows(V) uses the taps the loops settled on in the forward that returned V, not
+    those of the latest forward; a tensor no forward returned (a clone) names its forward
+    through `taps_from`, and is refused without it rather than given another forward's taps"""
+    from test_outer_model_cpu import _tvc_grid
+    from gpusim2grid.differentiable import BatchPowerFlow
+    grid = _tvc_grid("T4-9-1", 12.4, 0.05)
+    assert grid.ac_pf(np.full(grid.total_bus(), 1. + 0j), 30, TOL_MVA).size > 0
+    pf = BatchPowerFlow.from_lsgrid(grid, outer_loops=True, nb_iter=30, tol=TOL_MVA / grid.get_sn_mva(),
+                                    init_from_n_powerflow=False, ir_n_steps=1)
+    base_lp = np.asarray(grid.get_load_target_p(), dtype=float)
+    scales = np.array([0.85, 1., 1.3])   # each row settles on another tap
+    with torch.no_grad():
+        V_a = pf(load_p=_t(np.outer(scales, base_lp)))
+        taps_a = [tuple(r.ratio_tap) for r in pf.sweep.get_outer_results()]
+        pf.sweep.compute_flows()
+        amps_a = np.asarray(pf.sweep.or_amps.to_numpy()).reshape(len(scales), -1)
+        # the rows the other way round: rows 0 and 2 settle on each other's taps
+        pf(load_p=_t(np.outer(scales[::-1], base_lp)))
+        taps_b = [tuple(r.ratio_tap) for r in pf.sweep.get_outer_results()]
+        assert taps_a[0] != taps_b[0], (taps_a, taps_b)
+        amps = pf.compute_flows(V_a)["i_or_a"].cpu().numpy()
+        np.testing.assert_allclose(amps, amps_a, rtol=solver_atol, atol=solver_atol)
+        # a detached view of V_a is V_a's
+        amps_view = pf.compute_flows(V_a.detach()[:, :])["i_or_a"].cpu().numpy()
+        np.testing.assert_allclose(amps_view, amps_a, rtol=solver_atol, atol=solver_atol)
+        # a clone: no forward returned it
+        with pytest.raises(ValueError, match="taps_from"):
+            pf.compute_flows(V_a.clone())
+        amps_clone = pf.compute_flows(V_a.clone(), taps_from=V_a)["i_or_a"].cpu().numpy()
+        np.testing.assert_allclose(amps_clone, amps_a, rtol=solver_atol, atol=solver_atol)
 
 
 def test_capability_curve_slope():
@@ -309,6 +382,8 @@ def test_capability_curve_slope():
     assert torch.isfinite(V).all()
     res = pf.sweep.get_outer_results()
     assert any(r.gen_p_slope for r in res), [r.decisions for r in res]
+    # the slopes are those of the two generators with a curve
+    assert {g for r in res for g, _, _ in r.gen_p_slope} <= {0, 1}
     _check_all(pf, inputs, grads, names=("gen_p", "load_q"))
 
 
@@ -326,7 +401,8 @@ def test_distributed_slack_parked_at_a_check_that_does_not_resolve():
     V, grads = _grads(pf, inputs)
     assert torch.isfinite(V).all()
     res = pf.sweep.get_outer_results()
-    assert any("PARK" in d for r in res for d in r.decisions), [r.decisions for r in res]
+    # every row parks the capped unit (generator 0) at a check
+    assert all(any(" PARK, element 0," in d for d in r.decisions) for r in res), [r.decisions for r in res]
     assert all(r.nb_outer_iterations == 0 for r in res), [r.decisions for r in res]
     assert not any(r.gen_p_fixed for r in res), [r.gen_p_fixed for r in res]
     assert (grads["gen_p"][:, 0] != 0.).all()
@@ -345,8 +421,13 @@ def test_compute_flows_refuses_rows_it_cannot_match_to_their_taps():
     base_lp = np.asarray(grid.get_load_target_p(), dtype=float)
     with torch.no_grad():
         V = pf(load_p=_t(np.outer(np.array([1., 1.03, 1.06]), base_lp)))
-    assert pf._trafo_moved is not None and len(pf._trafo_moved[1]) > 0
+    found, moved = pf._outer_taps_of(V)
+    assert found and moved is not None and len(moved[1]) > 0
     full = pf.compute_flows(V)["i_or_a"]
+    # (a slice is not the forward's output: refused for that already)
     with pytest.raises(ValueError, match="taps"):
         pf.compute_flows(V[1:])
+    # named through taps_from: refused for its row count
+    with pytest.raises(ValueError, match="its forward 3 rows"):
+        pf.compute_flows(V[1:].clone(), taps_from=V)
     assert full.shape[0] == 3

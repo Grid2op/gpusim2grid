@@ -29,6 +29,9 @@
 // Kernels: gpu-security-analysis' engine/kernels/lu.cu (RTE-AssistFlux),
 // templated on the real type, plus the clamp counter and the refinement.
 // Not thread-safe; every launch on the stream given at init().
+//
+// Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
+// Nascimento (RTE), contributed from gpu-security-analysis.
 // =============================================================================
 
 #ifndef GPUSIM2GRID_OWN_LU_BATCHED_LU_CUH
@@ -44,21 +47,30 @@
 
 namespace own_lu {
 
+// The default relative pivot clamp (GPUSIM2GRID_OWN_LU_EPS overrides it):
+// 1e-12 in FP64; FP32 cannot resolve that (a clamped pivot then gives garbage
+// factors and refinement diverges), so 1e-5 there.
+constexpr double default_pivot_eps()
+{
+    return sizeof(cuda_real_type) == 4 ? 1e-5 : 1e-12;
+}
+
 class BatchedLu {
 public:
     // eps: relative pivot clamp (0 = none). split_chain / split_items: a level
     // with fewer than split_items items whose longest chain of contributions
     // exceeds split_chain shares each item over K warps (K = 2 ... 32).
-    void init(const LuPlan& plan, int batch, cudaStream_t stream, double eps = 1e-12,
+    void init(const LuPlan& plan, int batch, cudaStream_t stream, double eps = default_pivot_eps(),
               int split_chain = 16, int split_items = 256);
 
     // values: [B × nnz] slot-major, the pattern of the plan's A (CSR order);
     // the first active() matrices are read.
     void factorize(const cuda_real_type* values);
-    // b, x: [B × n] slot-major. x may alias b.
+    // b, x: [B × n] slot-major. x may alias b (but then b is gone: no refine()).
     void solve(const cuda_real_type* b, cuda_real_type* x);
     // x += LU^-1 (b - A x), `steps` times; A = values on (indptr, indices),
-    // device CSR of the plan's pattern.
+    // device CSR of the plan's pattern. Needs b intact: x must not alias b
+    // (std::invalid_argument when steps > 0).
     void refine(const cuda_real_type* values, const int* indptr, const int* indices,
                 const cuda_real_type* b, cuda_real_type* x, int steps);
 

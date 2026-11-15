@@ -77,15 +77,22 @@ Jacobian from the forward and rebuilds them in the backward (see below).
 .. autoclass:: gpusim2grid.RowStatus
    :members:
 
+.. _outer-loops:
+
 Outer loops
 ~~~~~~~~~~~
 
 With ``outer_loops=True`` the three batch facades run the grid's own outer
-loops on every row -- lightsim2grid's ``NROuter_*`` algorithm and its loops,
-OpenLoadFlow's defaults: ``DistributedSlack``, ``AcHvdcAcEmulationLimits``,
-``VoltageMonitoring``, ``ReactiveLimits``, with their parameters and the
-driver's (``max_outer_iterations``, the robust mode, the realistic voltage
-band). The grid must have been solved with that algorithm. Each row's inner
+loops on every row -- lightsim2grid's ``NROuter_*`` algorithm and its loops:
+OpenLoadFlow's defaults (``DistributedSlack``, ``AcHvdcAcEmulationLimits``,
+``VoltageMonitoring``, ``ReactiveLimits``) and ``PhaseControl``,
+``TransformerVoltageControl``, ``ShuntVoltageControl``, with their parameters
+and the driver's (``max_outer_iterations``, the robust mode, the realistic
+voltage band). The grid must have been solved with that algorithm; with an
+``NROuterDist_*`` one, the inner Newton shares the slack itself and
+``DistributedSlack`` only parks the units that sharing pushes past a limit.
+Pass ``ir_n_steps=1``: without cuDSS's iterative refinement a hard inner solve
+can diverge where lightsim2grid's KLU converges. Each row's inner
 Newton solves run on the GPU (the continuous schedule; ``nb_iter`` is the budget
 of each), its loops decide on the host after each one, and a row they change is
 re-solved in place from its voltages. With ``init_from_n_powerflow=True`` (the
@@ -97,10 +104,15 @@ lightsim2grid's batches with ``init_from_n_powerflow`` do.
 slack mismatch it could not share), ``OUTER_UNSTABLE`` (``max_outer_iterations``
 reached) and ``UNREALISTIC``, and ``get_outer_results()`` gives lightsim2grid's
 per-row ``OuterRowResult`` (``keep_outer_trace=True`` keeps the decision trace).
-A row's islanded buses (``handle_disconnected_grid``), its generator
-contingencies and its ``set_gen_v`` set-points are seen by its loops as
-lightsim2grid's batches show them. Not supported yet: ``redistribute_slack``
-(the ``DistributedSlack`` loop does that job), the physical checks, gradients.
+A row's islanded buses (``handle_disconnected_grid``), its element trips
+(generators, static generators, storage units, SVCs, HVDC lines) and its
+``set_gen_v`` set-points are seen by its loops as lightsim2grid's batches show
+them. With ``redistribute_slack``, the ``DistributedSlack`` loop shares what a
+row loses before its first solve. Gradients go through
+:class:`~gpusim2grid.differentiable.BatchPowerFlow` (``outer_loops=True``):
+the adjoint of each row's last inner solve, its loops' decisions held. Not
+supported yet: ``compute_physical_violations``, ``reactive_limits_outer_loop``,
+explicit-array (tuple) mode.
 
 .. code-block:: python
 
@@ -110,6 +122,33 @@ lightsim2grid's batches show them. Not supported yet: ``redistribute_slack``
     ca.add_contingencies_by_branch_id([[i] for i in range(n_branches)])
     ca.compute(batch_size=512)
     ca.get_outer_results()[0].nb_outer_iterations
+
+.. warning::
+
+   Use an FP64 build with ``outer_loops=True``. The loops decide on the state
+   each inner solve converges to, and match lightsim2grid's decisions only if
+   those solves stop where its double-precision Newton does: an FP32 build
+   cannot reach lightsim2grid's tolerances (at ``1e-6`` MVA the rows of an
+   ieee118 contingency analysis all end ``MAX_ITER``), and with a looser
+   ``tol`` its loops may decide differently.
+
+Element trips
+~~~~~~~~~~~~~
+
+Besides branches, a contingency (``ContingencyAnalysisGPU.add_contingencies``,
+lightsim2grid's ten lists) or a scenario-sweep row
+(``set_contingency_shunts`` / ``_loads`` / ``_gens`` / ``_sgens`` /
+``_storages`` / ``_svcs`` / ``_hvdcs``) can trip shunts, loads, generators,
+static generators, storage units, SVCs and HVDC lines, as lightsim2grid's
+batches do. An injection leaves the row's Sbus and a susceptance its
+admittance matrix; a generator or a storage unit leaves the distributed slack;
+a bus turns PQ when the row takes out every machine regulating it; a
+controller of a voltage-control group leaves its group, the regulated bus
+going free when nobody is left; an HVDC line in AC emulation carries no flow.
+A row the batch cannot solve yet is not an error for the batch: it comes back
+``NaN`` with a ``BATCH_UNSUPPORTED`` violation and status ``NOT_SIMULATED``,
+its reason in ``get_batch_unsupported_reasons()`` (the facades' docstrings list
+those cases).
 
 Contingency analysis
 --------------------

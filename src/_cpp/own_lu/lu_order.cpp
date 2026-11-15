@@ -42,6 +42,26 @@ std::vector<int> amd_order(int n, const std::vector<int>& indptr, const std::vec
     return std::vector<int>(pm.indices().data(), pm.indices().data() + n);
 }
 
+void check_config(ReorderingAlg alg, MatchingAlg matching)
+{
+    switch (alg) {
+    case ReorderingAlg::Default:
+    case ReorderingAlg::Amd:
+    case ReorderingAlg::None:
+    case ReorderingAlg::Ls2gConstrained:
+    case ReorderingAlg::Ls2gConstrainedNd:
+    case ReorderingAlg::Ls2gConstrainedMinFill:
+        break;
+    default:
+        throw std::invalid_argument(
+            "linear_solver='own_lu' takes reordering_alg 'default', 'amd', 'none', "
+            "'ls2g_constrained', 'ls2g_constrained_nd' or 'ls2g_constrained_minfill' (it never pivots: a symmetric order "
+            "computed on the host; cuDSS's 'nested_dissection' / 'colamd' / 'btf_colamd' are not)");
+    }
+    if (matching != MatchingAlg::None)
+        throw std::invalid_argument("linear_solver='own_lu' does not pivot: matching_alg must be 'none'");
+}
+
 std::vector<int> choose_order(ReorderingAlg alg, int n, const std::vector<int>& indptr,
                               const std::vector<int>& indices, const LedgerData* ord_ledger,
                               const std::vector<int>& user_perm)
@@ -66,10 +86,8 @@ std::vector<int> choose_order(ReorderingAlg alg, int n, const std::vector<int>& 
                                         "for this reordering_alg");
         return user_perm;
     default:
-        throw std::invalid_argument(
-            "linear_solver='own_lu' takes reordering_alg 'default', 'amd', 'none', "
-            "'ls2g_constrained', 'ls2g_constrained_nd' or 'ls2g_constrained_minfill' (it never pivots: a symmetric order "
-            "computed on the host; cuDSS's 'nested_dissection' / 'colamd' / 'btf_colamd' are not)");
+        check_config(alg, MatchingAlg::None);   // throws: not an own-LU order
+        throw std::logic_error("own_lu::choose_order: reordering_alg accepted but not handled");
     }
 }
 

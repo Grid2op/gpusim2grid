@@ -377,7 +377,7 @@ struct ScenarioSweepBatch {
     }
 
     // the controllers each row has lost (see SlotVcHold), on the live source
-    void set_vc_hold(int n_ctrl, const std::vector<std::vector<int>>& held_orig, int batch_capacity, cudaStream_t cs)
+    void set_vc_hold(int n_ctrl, const std::vector<std::vector<std::pair<int, double>>>& held_orig, int batch_capacity, cudaStream_t cs)
     {
         vc_hold_.set_host(n_ctrl, held_orig, active_to_orig_);
         vc_hold_.upload(batch_capacity, cs);

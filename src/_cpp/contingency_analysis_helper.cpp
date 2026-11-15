@@ -31,11 +31,18 @@ Contingency build_contingency_from_branch_ids(
 {
     const int n_branches = static_cast<int>(branch_from.size());
 
-    Contingency ctg;
-    ctg.tripped_branches = branch_ids;
-    ctg.triplets.reserve(branch_ids.size() * 4);
+    // a branch named twice is tripped once (lightsim2grid's contingency is a set): its
+    // admittance subtracted twice would leave -y in Ybus and the edge in the graph
+    std::vector<int> unique_ids;
+    unique_ids.reserve(branch_ids.size());
+    for (int l : branch_ids)
+        if (std::find(unique_ids.begin(), unique_ids.end(), l) == unique_ids.end()) unique_ids.push_back(l);
 
-    for (int l : branch_ids) {
+    Contingency ctg;
+    ctg.tripped_branches = unique_ids;
+    ctg.triplets.reserve(unique_ids.size() * 4);
+
+    for (int l : unique_ids) {
         if (l < 0 || l >= n_branches)
             throw std::runtime_error(
                 "build_contingency_from_branch_ids: branch index out of range");
@@ -919,9 +926,22 @@ void build_mask_entries(
                 out.jov_pos.push_back(pos);
                 out.jov_val.push_back(static_cast<cuda_real_type>(val));
             };
+            // (the groups the row loses a controller of hold their pins by value, SlotVcHold)
+            std::vector<char> held_by_value;
+            if (cfg.vc_hold_by_value && !ctg.vc_pinned_ctrl.empty()) {
+                held_by_value.assign(cfg.vc_grp_start.size(), 0);
+                for (int j : ctg.vc_tripped)
+                    if (j >= 0 && j < static_cast<int>(cfg.vc_group.size()))
+                        held_by_value[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])] = 1;
+                for (size_t j = 0; j < cfg.vc_bus.size(); ++j)
+                    if (std::find(ctg.masked_buses.begin(), ctg.masked_buses.end(), cfg.vc_bus[j]) !=
+                        ctg.masked_buses.end())
+                        held_by_value[static_cast<size_t>(cfg.vc_group[j])] = 1;
+            }
             for (const auto& pc : ctg.vc_pinned_ctrl) {
                 const int j = pc.first;
                 const int g = cfg.vc_group[static_cast<size_t>(j)];
+                if (!held_by_value.empty() && held_by_value[static_cast<size_t>(g)]) continue;
                 const int first = cfg.vc_grp_start[static_cast<size_t>(g)];
                 int row;
                 if (j == first) {

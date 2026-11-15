@@ -617,11 +617,13 @@ def test_ss_injection_change_needs_base_p_mw():
         data.shunt_p_mw, data.sn_mva, data.in_slack))
     sw.compute(batch_size=2)
     assert list(sw.get_slack_redistribution_report()["nb_rounds"]) == [0, 0]
+    assert list(sw.get_slack_redistribution_report()["mismatch_mw"]) == [0., 0.]
     sw.set_slack_redistribution_data((
         data.kind, data.el_id, data.bus_solver, data.weight, data.min_p_mw, data.max_p_mw,
         data.target_p_mw, data.gen_bus_solver, data.gens_target_p_mw, data.n_sto,
         data.shunt_p_mw, data.sn_mva, data.in_slack, data.base_p_mw))
     sw.compute(batch_size=2)
+    assert sw.get_slack_redistribution_report()["mismatch_mw"][0] == pytest.approx(0., abs=1e-8)
     assert sw.get_slack_redistribution_report()["mismatch_mw"][1] == pytest.approx(15., abs=1e-8)
 
 

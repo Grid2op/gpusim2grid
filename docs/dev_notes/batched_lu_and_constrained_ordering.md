@@ -217,7 +217,7 @@ agreeing with the GPU to 1.8e-12.
 
 ## 6. A third LU: gpu-security-analysis' (2026-11-05), and the go / no-go
 
-A colleague's batched LU (github.com/RTE-AssistFlux/gpu-security-analysis, private, `engine/lu.py`,
+Ralf Cortes Do Nascimento's batched LU (github.com/RTE-AssistFlux/gpu-security-analysis, private, `engine/lu.py`,
 `engine/kernels/lu.cu`, its `docs/own_lu.md`) differs from olf-gpu's on the point that matters here: it
 **computes its own symbolic factorization for any order it is given** (Cholesky fill of the symmetrized
 permuted pattern, level schedules, CPU, once per pattern), instead of borrowing cuDSS's. Same engine
@@ -264,7 +264,7 @@ shared pattern) or a slow path for that iteration (not done).
 - `src/_cpp/own_lu/batched_lu.{cuh,cu}`: their kernels templated on `real_t` (FP32 builds), the U steps
   counting the pivots they clamp per matrix, iterative refinement (`r = b − A x` on the slot's CSR, solve,
   add) for `ir_n_steps`.
-- `CudssBatchMode::OwnLu` (`GPUSIM2GRID_OWN_LU=1`, `GPUSIM2GRID_OWN_LU_EPS`, default 1e-12): cuDSS's
+- `CudssBatchMode::OwnLu` (`GPUSIM2GRID_OWN_LU=1`, `GPUSIM2GRID_OWN_LU_EPS`, default 1e-12; 1e-5 in an FP32 build, which cannot resolve 1e-12): cuDSS's
   uniform ANALYSIS still runs, for its order only (PERM_REORDER_ROW, i.e. the constrained order with
   `reordering_alg='ls2g_constrained'`); factor / refactor / solve / bind_slice go to the own LU, so the
   forward, the continuous tail, the Jᵀ adjoint and `benchmark_cudss_batch_raw` all use it. The single-system

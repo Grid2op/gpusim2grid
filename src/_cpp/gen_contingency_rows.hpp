@@ -172,6 +172,29 @@ inline std::vector<int> lost_controllers(const LedgerData& ld, const std::vector
     return out;
 }
 
+// What a row holds by value (SlotVcHold; (controller, Q pu) sorted by controller): in every
+// group it loses a controller of (`lost`, lost_controllers), the lost ones at 0 and the ones
+// it pins (Contingency::vc_pinned_ctrl) at their targets -- the holding formulation then picks
+// the group's reference among the others, and build_mask_entries leaves those pins to it
+// (MaskConfig::vc_hold_by_value). A pin wins over a loss, as the pin streams did.
+inline std::vector<std::pair<int, double>> held_by_value(const LedgerData& ld, const std::vector<int>& lost,
+                                                         const std::vector<std::pair<int, double>>& pins)
+{
+    std::map<int, double> held;
+    if (lost.empty()) return {};
+    std::set<int> groups;
+    for (int c : lost) {
+        if (c < 0 || c >= static_cast<int>(ld.vc_group.size())) continue;
+        groups.insert(ld.vc_group[static_cast<size_t>(c)]);
+        held[c] = 0.;
+    }
+    for (const auto& pc : pins)
+        if (pc.first >= 0 && pc.first < static_cast<int>(ld.vc_group.size()) &&
+            groups.count(ld.vc_group[static_cast<size_t>(pc.first)]))
+            held[pc.first] = pc.second;
+    return std::vector<std::pair<int, double>>(held.begin(), held.end());
+}
+
 // Per-row normalised slack weights ([n_rows * n_slack], ORIGINAL order) without
 // the participating generators each row takes out (row_slack_off), on the base
 // participant layout (`slack_bus`: the bus of each slack index). The storage

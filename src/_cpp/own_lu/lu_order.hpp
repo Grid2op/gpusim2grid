@@ -29,6 +29,7 @@
 
 #include <vector>
 
+#include "../matching_alg.hpp"
 #include "../reordering_alg.hpp"
 
 struct LedgerData;
@@ -37,6 +38,13 @@ namespace own_lu {
 
 // AMD of the pattern of A + A^T (new -> old).
 std::vector<int> amd_order(int n, const std::vector<int>& indptr, const std::vector<int>& indices);
+
+// What the own LU can take, std::invalid_argument otherwise (ValueError in
+// Python): it never pivots, so no matching, and its order is computed on the
+// host (not cuDSS's nested_dissection / colamd / btf_colamd). The single
+// definition, read by the facades' setters (check_own_lu_config) as soon as a
+// combination is made, by CudssBatchSolver and by choose_order.
+void check_config(ReorderingAlg alg, MatchingAlg matching);
 
 // ord_ledger: the J skeleton and the grid's ordering constraints (nullptr in
 // array mode); user_perm: AcPfNrState's order for the ls2g_* algorithms.

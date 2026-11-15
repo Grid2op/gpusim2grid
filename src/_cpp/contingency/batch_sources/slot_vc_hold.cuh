@@ -11,7 +11,9 @@
 // SlotVcHold — the controllers of the voltage-control groups each slot has lost
 // (lightsim2grid PR #292; shared by ContingencyBatch and ScenarioSweepBatch): one a
 // row trips, or on a bus it masks, is pinned at Q = 0 and never the reference of its
-// group's sharing, the regulated bus going free when nobody is left. This is the
+// group's sharing, the regulated bus going free when nobody is left. The controllers
+// the row pins in such a group (Contingency::vc_pinned_ctrl) are held here too, at
+// their targets (MaskConfig::vc_hold_by_value). This is the
 // outer loops' holding formulation (vc_hold_*_kernel) by value, on the entries
 // reserve_tripped_controller_slots reserved, so one analysis still serves the batch.
 // Nothing is allocated when no row trips one (the regular kernels run, bit-identical).
@@ -37,8 +39,9 @@ struct SlotVcHold {
 
     bool any() const { return !h_all.empty() && n_ctrl > 0; }
 
-    // `held_orig[r]`: the controllers row r has lost, ORIGINAL order (empty outer: none)
-    void set_host(int n_ctrl_, const std::vector<std::vector<int>>& held_orig,
+    // `held_orig[r]`: what row r holds by value, (controller, Q pu), ORIGINAL order (empty
+    // outer: none) -- gen_contingency::held_by_value
+    void set_host(int n_ctrl_, const std::vector<std::vector<std::pair<int, double>>>& held_orig,
                   const std::vector<int>& active_to_orig)
     {
         h_all.clear();
@@ -49,8 +52,10 @@ struct SlotVcHold {
         for (size_t a = 0; a < active_to_orig.size(); ++a) {
             const int o = active_to_orig[a];
             if (o < 0 || o >= static_cast<int>(held_orig.size())) continue;
-            for (int c : held_orig[static_cast<size_t>(o)])
-                h_all[a * static_cast<size_t>(n_ctrl) + static_cast<size_t>(c)] = static_cast<cuda_real_type>(0.);
+            for (const auto& cq : held_orig[static_cast<size_t>(o)])
+                if (cq.first >= 0 && cq.first < n_ctrl)
+                    h_all[a * static_cast<size_t>(n_ctrl) + static_cast<size_t>(cq.first)] =
+                        static_cast<cuda_real_type>(cq.second);
         }
     }
 

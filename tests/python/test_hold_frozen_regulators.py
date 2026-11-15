@@ -191,6 +191,51 @@ def test_release_is_lightsim2grids_regulator(branch, released, solver_atol):
     np.testing.assert_allclose(V[1], V_ref, atol=solver_atol, rtol=0, equal_nan=True)
 
 
+@pytest.mark.parametrize("kind", ["ca", "ss"])
+def test_tripped_first_controller_next_to_a_held_one(kind, solver_atol):
+    """The group regulating bus 2 is gen 2 (its first controller, free), gen 3 (held) and
+    gen 5 (free). A row tripping gen 2 leaves gen 5 the group's reference and gen 3 held at
+    its frozen output: lightsim2grid's own contingency analysis of that trip, which is also
+    its one-off solve of the grid without gen 2. The tripped controller is held by value
+    (SlotVcHold), which ties the held one to the new reference; the pin of the held one must
+    not then rewrite only part of that sharing row."""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU, ScenarioSweepGPU
+    TRIPPED, HELD, FREE = 2, 3, 5
+    extra = [(3, 10., 1.03, 0., False, -50., 50., 2)]           # gen 5, regulating bus 2
+    grid, _ = _grid(hold=True, released=(FREE,), extra_gens=extra)
+    ref, _ = _grid(hold=True, released=(FREE,), extra_gens=extra)
+    ref.deactivate_gen(TRIPPED)
+    ref.tell_solver_need_reset()
+    V_one_off = ref.ac_pf(np.full(8, 1.0 + 0j), 30, 1e-12)
+    assert V_one_off.shape[0] > 0
+    ls = ContingencyAnalysisCPP(grid)
+    ls.add_contingency_gen(TRIPPED)
+    ls.compute(np.full(grid.total_bus(), 1.0 + 0j), 30, 1e-12)
+    V_ls = np.asarray(ls.get_voltages())[0]
+    np.testing.assert_allclose(V_ls, V_one_off, atol=solver_atol, rtol=0)
+
+    if kind == "ca":
+        batch = ContingencyAnalysisGPU(grid, nb_iter=10)
+        batch.add_contingency_gen(TRIPPED)
+    else:
+        batch = ScenarioSweepGPU(grid, nb_iter=10)
+        batch.set_injections_from_elements(
+            np.array([[float(x.target_p_mw) for x in grid.get_loads()]]),
+            np.array([[float(x.target_q_mvar) for x in grid.get_loads()]]),
+            np.array([[float(x.target_p_mw) for x in grid.get_generators()]]))
+        gen_off = np.zeros((1, len(grid.get_generators())), dtype=bool)
+        gen_off[0, TRIPPED] = True
+        batch.set_contingency_gens(gen_off)
+    ctrl = _ctrl_of_gen(batch.solver._s) if kind == "ss" else None
+    if ctrl is not None:
+        assert ctrl[TRIPPED] < min(ctrl[HELD], ctrl[FREE])       # the case at hand: the first one
+    batch.compute(batch_size=1)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = batch.V_results.to_numpy().reshape(1, -1)[0]
+    np.testing.assert_allclose(V, V_ls[buses], atol=solver_atol, rtol=0)
+
+
 def test_release_leaving_the_first_held_is_refused():
     """A group of held machines only (gens 1 and 5 regulating bus 1): releasing
     its second one alone would leave the first pinning the voltage row."""
