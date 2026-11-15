@@ -368,11 +368,13 @@ class TestAdjointPrimitives:
         with pytest.raises(RuntimeError, match="one chunk"):
             sol.solve_JT_batch_dlpack(rhs.__dlpack__(), J.__dlpack__())
 
-    def test_failed_forward_invalidates_a_pending_alias_backward(self, ieee14_base_case):
-        # A forward that throws after the session already replaced its driver
-        # (here: keep_final_jacobian on a batch forced into two chunks) must
+    def test_failed_run_invalidates_a_pending_alias_backward(self, ieee14_base_case):
+        # A session run that throws after the session already replaced its driver
+        # (here: keep_final_jacobian on a batch forced into several chunks) must
         # still bump run_counter, or the pending backward would read the new
-        # driver's buffers as if they were its own.
+        # driver's buffers as if they were its own. The run is the session's own,
+        # not BatchPowerFlow's forward: that one sets the capacity back to n_scen
+        # and would not throw.
         grid = ieee14_base_case["grid"]
         pf = _pf(grid)
         n = 3
@@ -380,10 +382,14 @@ class TestAdjointPrimitives:
         lp = load_p.clone().requires_grad_(True)
         V = pf(load_p=lp, load_q=load_q, gen_p=gen_p)
 
-        pf.sweep.solver.batch_size = 1                  # cold rebuild, 3 chunks
-        lp2 = load_p.clone().requires_grad_(True)
+        # keep_final_jacobian is still on from the forward above
+        sol = pf.sweep.solver
+        runs, drivers = sol.run_counter, sol.driver_build_counter
+        sol.batch_size = 1                              # cold rebuild, 3 chunks
         with pytest.raises(RuntimeError, match="keep_final_jacobian"):
-            pf(load_p=lp2, load_q=load_q, gen_p=gen_p)
+            sol.run()
+        assert sol.driver_build_counter > drivers       # the driver was replaced...
+        assert sol.run_counter > runs                   # ...and the failed run counted
         with pytest.raises(RuntimeError, match="another forward"):
             V.real.sum().backward()
 

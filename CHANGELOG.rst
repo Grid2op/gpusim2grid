@@ -3,6 +3,10 @@ Change Log
 
 [0.3.0] 2026-xx-yy
 --------------------
+- [FIXED] ``benchmarks/contingency_analysis.py`` stopped on a ``NameError`` on grids with more branches
+  than ``nb_max_cont_cpu``, and ran some contingencies twice.
+- [FIXED] ``InjectionSweepGPU``: a reused driver ignored, or misapplied, the ``set_gen_v`` columns of
+  remote regulators added or changed since it was built.
 - [IMPROVED] ``outer_loops=True``: a row can trip an HVDC line with a station regulating a voltage
   (it was ``BATCH_UNSUPPORTED``).
 - [FIXED] ``outer_loops=True``: a tripped controller came back at a reactive limit when ``ReactiveLimits``
@@ -127,7 +131,6 @@ Change Log
   participants, resumed targets and reactive-limits plan are built once per grid, not per row.
 - [IMPROVED] ``compute_limit_violations``: the operational check runs one GPU block per row, not one thread,
   same records; it cost tens of ms per call on a real grid, every continuous round.
-
 - [FIXED] ``ContingencyAnalysisSession.overwrite_rows`` / ``ScenarioSweepSession.set_v_init_from`` (was
   ``set_v_init_from_ptr``) take the source session, not raw pointers: a source row past its rows is refused.
 - [FIXED] ``reactive_limits_outer_loop``: the second pass checks the limits given to the analysis
