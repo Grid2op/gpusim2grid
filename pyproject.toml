@@ -146,4 +146,4 @@ known-local-folder = ["conftest", "_topo_helpers"]
 # Pylance / pyright: stubs of the compiled modules (tools/generate_stubs.sh, git-ignored), and
 # the test helpers imported by name (conftest, _topo_helpers).
 stubPath = "typings"
-extraPaths = ["tests/python", "tests/python/topology_actions"]
+extraPaths = ["tests/python", "tests/python/topology_actions", "examples", "benchmarks/topology_actions"]
