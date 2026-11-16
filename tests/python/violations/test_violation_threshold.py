@@ -93,6 +93,7 @@ def _gpu(grid: LSGrid, threshold: float, cls_name: str = "ContingencyAnalysisGPU
 
     n_lines: int = len(grid.get_lines())
     obj = getattr(gpusim2grid, cls_name)(grid, nb_iter=MAX_IT, compute_limit_violations=True)
+    obj.solver.violation_capacity = 128  # every record (the default keeps the 16 most severe per type)
     if cls_name == "ContingencyAnalysisGPU":
         obj.add_contingencies_by_branch_id([[b] for b in range(n_lines)])
     else:
@@ -111,7 +112,7 @@ def _gpu(grid: LSGrid, threshold: float, cls_name: str = "ContingencyAnalysisGPU
 
 @pytest.mark.parametrize("cls_name", ["ContingencyAnalysisGPU", "ScenarioSweepGPU"])
 def test_property(cls_name: str):
-    """Default 1.0, validated to ]0, 1], forwarded to the engine."""
+    """Default 1.0, validated to ]0, 1]."""
     import gpusim2grid
 
     obj = getattr(gpusim2grid, cls_name)(_grid(), compute_limit_violations=True)
@@ -121,7 +122,6 @@ def test_property(cls_name: str):
             obj.violation_threshold = bad
     obj.violation_threshold = 0.8
     assert obj.violation_threshold == 0.8
-    assert obj.solver.violation_threshold == 0.8
 
 
 @pytest.mark.parametrize("threshold", [1.0, 0.9, 0.75])

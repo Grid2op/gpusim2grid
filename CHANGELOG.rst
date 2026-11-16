@@ -20,6 +20,8 @@ Change Log
   extra step changed the loops' decisions (a row cycling to ``max_outer_iterations``).
 - [ADDED] ``gpusim2grid.actions.Action``: a remedial action as element bus moves (lightsim2grid's
   ``change_bus_*`` convention), disconnections and transformer ratio / phase shift values.
+- [ADDED] ``violation_threshold`` on ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: lightsim2grid's
+  knob, limits moved towards a healthy anchor; records keep the configured limit.
 
 [0.3.0] 2026-11-16
 --------------------

@@ -25,6 +25,8 @@ adds lightsim2grid's third contingency axis (per-row generator disconnection,
 PV→PQ relabelling without changing the Jacobian pattern).
 """
 
+from __future__ import annotations
+
 import numpy as np
 
 from ..contingency_analysis._scheduling import check_linear_solver_args
@@ -52,6 +54,7 @@ from .._ls2g_utils import (
 )
 from .. import _gpusim2grid as _cpp
 from .._outer_loops import _check_outer_loops_args
+from ..contingency_analysis._violation_threshold import ViolationThresholdFacadeMixin
 
 __all__ = ["ScenarioSweepGPU"]
 
@@ -61,7 +64,8 @@ def _have_bridge():
 
 
 class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
-                       SchedulingFacadeMixin, LimitViolationsFacadeMixin):
+                       SchedulingFacadeMixin, LimitViolationsFacadeMixin,
+                       ViolationThresholdFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -822,6 +826,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                 "set_contingency_sgens / _storages / _svcs / _hvdcs take the elements out of the injections "
                 "given by set_injections_from_elements(); with per-bus set_injections(), take them out of "
                 "the arrays yourself (and do not call them).")
+        self._push_effective_limits()
+        self._violations_valid = True
         self._inner.batch_size = int(batch_size)
         if self._skip_rows_stale:
             self._update_skipped_rows()
@@ -899,6 +905,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines = \
             self._extract_limits_arrays()
         self._inner.set_limits(bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka, n_lines)
+        # the session has the configured limits again: violation_threshold re-applies them
+        self._limits_gen = getattr(self, "_limits_gen", 0) + 1
+        self._threshold_pushed = (1.0, self._limits_gen)
 
     @property
     def compute_limit_violations(self):
@@ -915,7 +924,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         """list[list[LimitViolation]]: one entry per scenario (row order
         matches set_injections()/set_topology()'s input rows). Requires
         compute() with compute_limit_violations=True."""
-        return self._inner.get_violations()
+        if not self._violations_valid:
+            raise RuntimeError("violation_threshold was lowered after compute(): compute() again")
+        return self._restore_limits(self._inner.get_violations())
 
     def get_violations_truncated(self):
         """(n_scenarios,) bool ndarray: True where more than violation_capacity
@@ -965,11 +976,16 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva = branch_args
         V_n = grid.get_V_solver()
 
-        return compute_violations_n(
-            V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-            branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
-            limit_a1_ka, limit_a2_ka, sn_mva, n_lines,
-            rel_tol=self._inner.violation_rel_tol)
+        def compute_n(vmin: np.ndarray | None, vmax: np.ndarray | None,
+                      a1: np.ndarray | None, a2: np.ndarray | None) -> list:
+            return compute_violations_n(
+                V_n, bus_vn_kv, vmin, vmax,
+                branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
+                a1, a2, sn_mva, n_lines,
+                rel_tol=self._inner.violation_rel_tol)
+
+        return self._threshold_violations_n(
+            compute_n, bus_vn_kv, (bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka), len(branch_from))
 
     # ----------------------------------------------------------- pass-through
     @property
