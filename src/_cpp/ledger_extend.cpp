@@ -284,6 +284,94 @@ void add_switchable_vm_buses(
     }
 }
 
+void extend_ledger_union(
+    LedgerData&                                                     ld,
+    int                                                             n_spare,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&    Ybus_union_rm,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&    Ybus_base_rm)
+{
+    static const char* who = "extend_ledger_union";
+    const int n_old = ld.n_bus;
+    if (n_spare < 0) throw std::runtime_error(std::string(who) + ": negative spare bus count");
+    if (static_cast<int>(Ybus_base_rm.rows()) != n_old || static_cast<int>(Ybus_base_rm.cols()) != n_old)
+        throw std::runtime_error(std::string(who) + ": the base Ybus is not n_bus x n_bus");
+    const int n_new = n_old + n_spare;
+    if (static_cast<int>(Ybus_union_rm.rows()) != n_new || static_cast<int>(Ybus_union_rm.cols()) != n_new)
+        throw std::runtime_error(std::string(who) + ": the union Ybus is not (n_bus + n_spare) square");
+
+    if (!Ybus_base_rm.isCompressed() || !Ybus_union_rm.isCompressed())
+        throw std::runtime_error(std::string(who) + ": the Ybus matrices must be compressed (sorted columns)");
+    // the entries the base PATTERN does not have (structural: an explicit zero counts as present)
+    const int* B_outer = Ybus_base_rm.outerIndexPtr();
+    const int* B_inner = Ybus_base_rm.innerIndexPtr();
+    const auto in_base = [&](int i, int j) {
+        if (i >= n_old || j >= n_old) return false;
+        return std::binary_search(B_inner + B_outer[i], B_inner + B_outer[i + 1], j);
+    };
+    std::vector<std::pair<int, int>> added;
+    const int* U_outer = Ybus_union_rm.outerIndexPtr();
+    const int* U_inner = Ybus_union_rm.innerIndexPtr();
+    for (int i = 0; i < n_new; ++i)
+        for (int idx = U_outer[i]; idx < U_outer[i + 1]; ++idx)
+            if (!in_base(i, U_inner[idx])) added.emplace_back(i, U_inner[idx]);
+    if (n_spare == 0 && added.empty()) return;   // the base pattern: nothing to do
+    materialize_vc_custom_rows(ld);
+
+    std::vector<std::vector<int>> rows(static_cast<size_t>(ld.dim_J));
+    for (int r = 0; r < ld.dim_J; ++r)
+        rows[static_cast<size_t>(r)].assign(
+            ld.J_inner.begin() + ld.J_outer[static_cast<size_t>(r)],
+            ld.J_inner.begin() + ld.J_outer[static_cast<size_t>(r) + 1]);
+
+    // every per-bus map grows to n_new (the spare buses own nothing yet)
+    for (auto* m : {&ld.p_row_of_bus, &ld.q_row_of_bus, &ld.theta_col_of_bus, &ld.vm_col_of_bus})
+        m->resize(static_cast<size_t>(n_new), -1);
+    if (!ld.q_col_of_bus.empty()) ld.q_col_of_bus.resize(static_cast<size_t>(n_new), -1);
+    if (!ld.slack_weights.empty()) ld.slack_weights.resize(static_cast<size_t>(n_new), 0.);
+
+    // each spare bus: a PQ bus, appended (P row / theta col, then Q row / Vm col)
+    for (int s = n_old; s < n_new; ++s) {
+        const int pt = ld.dim_J;
+        const int qv = ld.dim_J + 1;
+        ld.dim_J += 2;
+        rows.emplace_back();
+        rows.emplace_back();
+        ld.p_row_of_bus[static_cast<size_t>(s)]     = pt;
+        ld.theta_col_of_bus[static_cast<size_t>(s)] = pt;
+        ld.q_row_of_bus[static_cast<size_t>(s)]     = qv;
+        ld.vm_col_of_bus[static_cast<size_t>(s)]    = qv;
+        ld.p_buses.push_back(s);     ld.p_rows.push_back(pt);
+        ld.theta_buses.push_back(s); ld.theta_cols.push_back(pt);
+        ld.q_buses.push_back(s);     ld.q_rows.push_back(qv);
+        ld.vm_buses.push_back(s);    ld.vm_cols.push_back(qv);
+    }
+    ld.n_bus = n_new;
+    ld.n_spare_buses += n_spare;
+
+    // the dS pattern of every added Ybus entry (i, j): dP_i, dQ_i over theta_j, Vm_j
+    for (const auto& [i, j] : added) {
+        const int pr = ld.p_row_of_bus[static_cast<size_t>(i)];
+        const int qr = ld.q_row_of_bus[static_cast<size_t>(i)];
+        const int tc = ld.theta_col_of_bus[static_cast<size_t>(j)];
+        const int vc = ld.vm_col_of_bus[static_cast<size_t>(j)];
+        for (int r : {pr, qr}) {
+            if (r < 0) continue;
+            if (tc >= 0) rows[static_cast<size_t>(r)].push_back(tc);
+            if (vc >= 0) rows[static_cast<size_t>(r)].push_back(vc);
+        }
+    }
+
+    // re-serialise: sorted, de-duplicated columns per row
+    ld.J_outer.assign(1, 0);
+    ld.J_inner.clear();
+    for (auto& cols : rows) {
+        std::sort(cols.begin(), cols.end());
+        cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
+        ld.J_inner.insert(ld.J_inner.end(), cols.begin(), cols.end());
+        ld.J_outer.push_back(static_cast<int>(ld.J_inner.size()));
+    }
+}
+
 // ---- prototype: lightsim2grid's constrained order (user_ordering.hpp) --------
 ConstrainedOrderFn& constrained_order_hook()
 {

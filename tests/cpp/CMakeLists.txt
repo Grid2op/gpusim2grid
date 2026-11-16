@@ -4,7 +4,7 @@
 
 # C++/CUDA unit tests (GPUSIM2GRID_BUILD_TESTS=ON), run with ctest. No external
 # framework: tests/cpp/check.hpp. A test needing a GPU exits 77 (skipped) without one.
-foreach(_t test_v_groups_host test_v_groups_gather)
+foreach(_t test_v_groups_host test_v_groups_gather test_union_pattern)
     add_executable(${_t} ${_t}.cu)
     target_link_libraries(${_t} PRIVATE gpusim2grid_core)
     target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -73,6 +73,21 @@ void add_switchable_vm_buses(
     const std::vector<int>&                                         buses,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&    Ybus_rm);
 
+// The union pattern of the topology actions (bus moves, docs/dev_notes/
+// topology_actions_plan.md § 5.2): append n_spare buses after the ledger's n_bus,
+// each a PQ bus (a P equation + theta unknown, then a Q equation + Vm unknown, at
+// dim_J: no existing index moves), and, for every entry (i, j) of Ybus_union_rm
+// (n_bus + n_spare buses) that Ybus_base_rm (n_bus buses) does not have, the dS
+// pattern rows {p_row(i), q_row(i)} x cols {theta_col(j), vm_col(j)} where they
+// exist. Every base entry is kept, so the base pattern is a sub-pattern of the
+// result. n_spare == 0 and no new entry leave the ledger as it was. Calls
+// materialize_vc_custom_rows first; throws on inconsistent sizes.
+void extend_ledger_union(
+    LedgerData&                                                     ld,
+    int                                                             n_spare,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&    Ybus_union_rm,
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&    Ybus_base_rm);
+
 // Position of (row, col) in the ledger's CSR skeleton, -1 if absent.
 int ledger_find_J_pos(const LedgerData& ld, int row, int col);
 

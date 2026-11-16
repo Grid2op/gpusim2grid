@@ -161,6 +161,9 @@ struct LedgerData {
     // pinning by value (identity-pinned Q row when still PV, plain PQ when
     // their last local controller is off). Empty on every un-extended ledger.
     std::vector<int>    switchable_vm_buses;
+    // Spare buses appended by extend_ledger_union (topology actions, bus moves): the last
+    // n_spare_buses of the n_bus, each a PQ bus no element of the base case uses.
+    int                 n_spare_buses = 0;
 
     // ---- lightsim2grid's outer loops (the ledger of an NROuter_* solve) -------
     // The Jacobian is the union pattern every loop reserved: the switchable buses
