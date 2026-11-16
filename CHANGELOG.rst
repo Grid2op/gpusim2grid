@@ -9,6 +9,8 @@ Change Log
   4.6x faster in FP64 on an RTX A1000, same results to rounding.
 - [IMPROVED] The batched Newton loop computes Ybus·V and the P/Q mismatch in one kernel instead of cuSPARSE's SpMV
   and two fill kernels (an injection sweep reads one shared Ybus): 2x (time series) / 1.1x (N-1) faster.
+- [IMPROVED] ``InjectionSweepGPU(scheduling="continuous")`` keeps its driver across ``compute()`` calls, as the chunked
+  schedule: no Sbus rebuild, allocation or cuDSS analysis when only the injections change (-15 % per call).
 - [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's
   (``slack_absorbed`` recalibrated first); a change re-solved that way is settled. At loose tolerances the
   extra step changed the loops' decisions (a row cycling to ``max_outer_iterations``).

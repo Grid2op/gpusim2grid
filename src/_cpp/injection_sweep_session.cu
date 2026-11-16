@@ -222,11 +222,13 @@ void InjectionSweepSession::run()
     // Hot run: same settings and row count as the live driver -- keep it
     // (allocations, cuDSS ANALYSIS, the policy's factorization state); new
     // injections / gen_v, if any, go into its live source. Otherwise build a
-    // new one, as the first run() does. The continuous schedule always
-    // rebuilds (its reuse is a later step, docs/dev_notes/continuous_batching.md
-    // A.6).
+    // new one, as the first run() does. The continuous schedule reuses it too
+    // (each solve() reloads every slot from the queue; a hot run skips the Sbus
+    // rebuild and upload, the allocations and the cuDSS ANALYSIS, ~100 ms of an
+    // 800 ms time-series call on case2869), except with the outer loops, whose
+    // repeated runs on one driver are not tested yet.
     const BatchDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
+    const bool cold = !solver_ || cfg != driver_cfg_ || (continuous && outer_);
     const bool new_rows = cold || injections_dirty_ || gen_v_dirty_;
 
     std::vector<cudaComplexType> h_Sbus_all;

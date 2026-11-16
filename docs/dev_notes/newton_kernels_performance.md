@@ -158,7 +158,21 @@ path runs). The single-system solve and the adjoint keep cuSPARSE. Measured on a
   dominates). Results: max |dV| <= 5.5e-13 against the original build on the four configurations,
   identical iteration counts and NaN rows; full suite green.
 
-## 8. Next steps
+## 8. Step 3 (done, branch `perf_v_update`): the continuous injection sweep keeps its driver
+
+The Sbus rebuild of the profile was not a missing dirty check: chunk mode already skips it on a
+hot run. `InjectionSweepSession::run()` forced every continuous run cold (A.6 item 2 of
+`continuous_batching.md`), so each call rebuilt Sbus on the host (59 ms), uploaded it (21 ms),
+allocated (7 ms) and ran a cuDSS ANALYSIS (15 ms). `solve()` already reloads every slot from the
+queue and restores the tail's prefix, so the session now takes the hot path in continuous mode
+too (not with outer loops: their repeated runs on one driver are not tested). Time series
+continuous own LU: 820 -> 700 ms a call, same results (max |dV| 5.4e-13 against the original
+build, identical iteration counts). Pinned by `test_is_continuous_reuses_the_driver` (refills, a
+tail, new injections and gen_v, cuDSS and own LU). The contingency-analysis and scenario-sweep
+sessions still force continuous runs cold; `BatchPowerFlow`'s backward relies on that for the
+scenario sweep.
+
+## 9. Next steps
 
 - **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
   SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an
@@ -168,7 +182,6 @@ path runs). The single-system solve and the adjoint keep cuSPARSE. Measured on a
   droop, VoltageControl, BranchControl / ShuntControl, outer-loop pins and holds), the masks
   (`nr_apply_J_masks` / `nr_apply_F_masks`), `keep_final_jacobian` and the adjoint, which read J
   slot-major. cuDSS keeps the slot-major path.
-- **Skip the Sbus rebuild** of an injection sweep when its injections did not change (69 ms a call).
 - **Cheaper, independent of the J layout** (F side only):
   - *The continuous residual pass computes F twice*: `_residual_pass` runs SpMV, `fill_F`, the
     feature mismatch and the F masks at V_k, and the next round's Newton step runs the same sequence
