@@ -112,7 +112,8 @@ def oracle(
     (a callable on the copy, for tests that write the calls out), solve from a flat start.
 
     Returns ``(V_global, ref_grid)``: V over the ``total_bus()`` global buses (0 where a bus is
-    not in service), or ``(None, ref_grid)`` when the reference diverges."""
+    not in service -- lightsim2grid leaves the flat start there), or ``(None, ref_grid)`` when
+    the reference diverges."""
     ref = copy.deepcopy(grid)
     nl: int = _n_lines(grid)
     for br in branches:
@@ -126,7 +127,24 @@ def oracle(
         apply(ref)
     ref.tell_solver_need_reset()
     V: np.ndarray = ref.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, TOL)
-    return (V if V.shape[0] > 0 else None), ref
+    if V.shape[0] == 0:
+        return None, ref
+    in_service: np.ndarray = np.asarray(ref.get_bus_status(), dtype=bool)
+    return np.where(in_service, V, 0.0), ref
+
+
+def with_current_limits(grid: LSGrid, factor: float) -> LSGrid:
+    """``grid`` with every line / transformer current limit at ``factor`` x its base case
+    current (both sides), so that the loadings of the tests are known and finite."""
+    for res, setter in (
+        (grid.get_line_res1, grid.set_line_current_limit_side1),
+        (grid.get_line_res2, grid.set_line_current_limit_side2),
+        (grid.get_trafo_res1, grid.set_trafo_current_limit_side1),
+        (grid.get_trafo_res2, grid.set_trafo_current_limit_side2),
+    ):
+        amps_ka: np.ndarray = np.asarray(res()[3], dtype=float)
+        setter(factor * np.maximum(amps_ka, 1e-3))
+    return grid
 
 
 def batch_V(ca: ContingencyAnalysisGPU, n_rows: int) -> np.ndarray:

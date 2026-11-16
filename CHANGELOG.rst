@@ -22,6 +22,9 @@ Change Log
   ``change_bus_*`` convention), disconnections and transformer ratio / phase shift values.
 - [ADDED] ``violation_threshold`` on ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: lightsim2grid's
   knob, limits moved towards a healthy anchor; records keep the configured limit.
+- [ADDED] ``ContingencyAnalysisGPU`` strategies: ``set_actions`` / ``add_strategies`` (a contingency then
+  actions, solved as one more row), two phases with ``compute(rows=...)`` and ``select_strategies``,
+  ``strategy_warm_start`` (one start per contingency, kept on the device), ``get_max_loading``.
 - [ADDED] C++/CUDA unit tests (``tests/cpp``, ctest), opt-in with ``-DGPUSIM2GRID_BUILD_TESTS=ON``; a
   test needing a GPU is skipped without one.
 

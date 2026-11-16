@@ -10,12 +10,17 @@ CPU base-case (N) power flow, and runs the batched contingencies on the GPU.
 It is a thin, batch-oriented facade over :class:`_ContingencyAnalysisSolver`.
 """
 
+from __future__ import annotations
+
 import warnings
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
 from ._scheduling import check_linear_solver_args
 from . import (
+    DeviceBuffer,
     LimitViolationsFacadeMixin,
     _ContingencyAnalysisSolver,
     PhysicalChecksFacadeMixin,
@@ -36,6 +41,15 @@ from .._ls2g_utils import (
 from .. import _gpusim2grid as _cpp
 from .._outer_loops import _check_outer_loops_args
 from ._reactive_limits import ReactiveLimitsStatus
+from ._strategies import RowMap, compile_action, strategy_row
+from ._violation_threshold import ViolationThresholdFacadeMixin
+
+if TYPE_CHECKING:
+    from ..actions import Action
+    from ._strategies import CompiledAction, CtgElements, Strategy
+
+#: what ``compute(rows=...)`` runs
+Rows = Literal["contingencies", "strategies"]
 
 
 def _check_reactive_limits_outer_loop(value):
@@ -115,7 +129,8 @@ def optimize_reference_slack(grid, contingency_branch_ids, *, Vinit=None,
 
 
 class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
-                             SchedulingFacadeMixin, LimitViolationsFacadeMixin):
+                             SchedulingFacadeMixin, LimitViolationsFacadeMixin,
+                             ViolationThresholdFacadeMixin):
     """Batch N-k contingency analysis on the GPU, seeded from a CPU solve.
 
     By default (``use_bridge=None`` auto-detects the compiled lightsim2grid
@@ -565,6 +580,19 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._init_from_n_powerflow = bool(init_from_n_powerflow)
         self._last_residuals = None
 
+        # topology actions (docs/dev_notes/topology_actions_plan.md, step A): actions,
+        # strategies (contingency index, action indices), the strategies selected for the next
+        # rows="strategies" run, and the map from the rows the session solved to the caller's
+        self._actions: list[Action] = []
+        self._compiled: list[CompiledAction] = []
+        self._strategies: list[Strategy] = []
+        self._strategy_selected: np.ndarray | None = None
+        self._rowmap: RowMap | None = None
+        self._flows_done: bool = False
+        self._strategy_warm_start: bool = False
+        # phase 1's converged contingencies (their voltages are the session's start groups)
+        self._ctg_start_ok: np.ndarray | None = None
+
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                         bus_vn_kv, sn_mva):
@@ -737,7 +765,14 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def get_batch_unsupported_reasons(self):
         """list[str], per contingency: why the batch left it out (``""``: it did not), after
         :meth:`compute`. Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
-        return self._inner.get_batch_unsupported_reasons()
+        if self._rowmap is None:
+            return self._inner.get_batch_unsupported_reasons()
+        rm = self._rowmap
+        out = list(rm.reasons)
+        if len(rm.session_rows):
+            for i, why in enumerate(self._inner.get_batch_unsupported_reasons()):
+                out[int(rm.session_rows[i])] = why
+        return out
 
     def get_contingencies(self):
         """Every contingency registered, in row order: ``(branch_ids, shunt_ids,
@@ -759,7 +794,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             raise RuntimeError("get_outer_results() needs outer_loops=True")
         return self._inner._s.get_outer_results()
 
-    def compute(self, batch_size=512):
+    def compute(self, batch_size: int = 512, rows: Rows | None = None) -> Any:
         """Solve every contingency and return the batched voltages.
 
         Returns a DLPack capsule of shape ``(n_contingencies, n_bus)``,
@@ -770,7 +805,22 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         With :attr:`reactive_limits_outer_loop`, the contingencies it re-solves
         have their second-pass voltages and residuals in these buffers (see
         :meth:`get_outer_loop_status`).
+
+        With strategies (:meth:`add_strategies`), ``rows`` picks what runs: ``None`` the
+        contingencies and the selected strategies in one call, ``"contingencies"`` the
+        contingencies (phase 1), ``"strategies"`` the strategies :meth:`select_strategies`
+        kept (phase 2). The results then cover those rows (contingencies, then strategies;
+        NaN for a strategy that did not run) and the voltages come back as a host array
+        ``(n_rows, n_bus)``.
         """
+        if rows not in (None, "contingencies", "strategies"):
+            raise ValueError(f"rows must be None, 'contingencies' or 'strategies', not {rows!r}")
+        self._push_effective_limits()
+        self._violations_valid = True
+        self._flows_done = False
+        if rows is not None or self._strategies:
+            return self._compute_rows(int(batch_size), rows)
+        self._rowmap = None
         self._inner.batch_size = int(batch_size)
         self._rl_result = None
         self._inner.run()
@@ -778,6 +828,238 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._reactive_limits_outer_loop:
             self._run_outer_loop(int(batch_size))
         return self._inner.v_results_dlpack()
+
+
+    # ------------------------------------------------------ topology actions
+    # docs/dev_notes/topology_actions_plan.md, step A: strategy rows (a contingency and
+    # actions), two phases on one analysis, max loading, violation_threshold
+    def set_actions(self, actions: Sequence[Action]) -> None:
+        """The actions strategies refer to (:class:`gpusim2grid.actions.Action`, by index).
+        Validated against the grid; replaces the previous list (the strategies keep their
+        indices, which must stay in range)."""
+        from ..actions import Action
+
+        if self._grid is None:
+            raise RuntimeError("set_actions needs a grid-mode instance (a lightsim2grid grid)")
+        actions = list(actions)
+        for i, a in enumerate(actions):
+            if not isinstance(a, Action):
+                raise TypeError(f"actions[{i}] is a {type(a).__name__}, not a gpusim2grid.actions.Action")
+            a.validate(self._grid)
+        n_lines: int = len(self._grid.get_lines())
+        if any(max(acts, default=-1) >= len(actions) for _, acts in self._strategies):
+            raise ValueError("a strategy refers to an action index the new list does not have")
+        self._actions = actions
+        self._compiled = [compile_action(self._grid, a, n_lines) for a in actions]
+        self._rowmap = None
+
+    def add_strategies(
+        self,
+        strategies: Sequence[tuple[int, Sequence[int]]] | np.ndarray,
+        action_idx: np.ndarray | Sequence[int] | None = None,
+    ) -> None:
+        """Append strategies: ``[(ctg_index, [action indices]), ...]``, or two arrays
+        ``(ctg_idx, action_idx)`` of one action each (the product without a Python call per
+        row). A strategy's row is its contingency's plus its actions' disconnections."""
+        if action_idx is not None:
+            c = np.asarray(strategies, dtype=np.int64).ravel()
+            a = np.asarray(action_idx, dtype=np.int64).ravel()
+            if c.shape != a.shape:
+                raise ValueError("ctg_idx and action_idx must have the same length")
+            new: list[Strategy] = [(int(ci), (int(ai),)) for ci, ai in zip(c, a)]
+        else:
+            new = [(int(ci), tuple(int(x) for x in acts)) for ci, acts in strategies]
+        n_ctg: int = len(self._ctg_elements or [])
+        for ci, acts in new:
+            if not 0 <= ci < n_ctg:
+                raise ValueError(f"contingency index {ci} out of range [0, {n_ctg})")
+            if not acts or not all(0 <= x < len(self._actions) for x in acts):
+                raise ValueError(f"action indices {list(acts)} out of range [0, {len(self._actions)})")
+        self._strategies += new
+        self._strategy_selected = None
+        self._rowmap = None
+
+    @property
+    def n_strategies(self) -> int:
+        """int: the strategies registered (:meth:`add_strategies`)."""
+        return len(self._strategies)
+
+    @property
+    def n_spare_buses(self) -> int:
+        """int: buses the batch adds for bus moves (0: the base pattern, today's path)."""
+        return 0
+
+    @property
+    def batch_bus_ids(self) -> np.ndarray:
+        """(n_bus,) int ndarray: the global (lightsim2grid) bus id of every voltage column."""
+        if self._grid is None:
+            return np.arange(self.n_bus)
+        return np.asarray(self._grid.id_ac_solver_to_me(), dtype=np.int64)
+
+    def select_strategies(self, mask: np.ndarray | Sequence[bool]) -> None:
+        """(n_strategies,) bool: the strategies the next ``compute(rows="strategies")`` (or
+        ``rows=None``) runs; default every one."""
+        mask = np.asarray(mask, dtype=bool).ravel()
+        if mask.shape != (len(self._strategies),):
+            raise ValueError(f"the mask must have one entry per strategy ({len(self._strategies)})")
+        self._strategy_selected = mask
+
+    def get_strategy_ran(self) -> np.ndarray:
+        """(n_strategies,) bool: the strategies the last run solved."""
+        if self._rowmap is None:
+            raise RuntimeError("no strategy run yet")
+        ran = self._rowmap.ran
+        return ran[self._rowmap.n_out - len(self._strategies):] if self._last_rows != "contingencies" \
+            else np.zeros(len(self._strategies), dtype=bool)
+
+    @property
+    def strategy_warm_start(self) -> bool:
+        """bool: a strategy row starts from its contingency's converged voltages (the last
+        ``rows="contingencies"`` run) instead of the base case. Default False."""
+        return self._strategy_warm_start
+
+    @strategy_warm_start.setter
+    def strategy_warm_start(self, value: bool) -> None:
+        self._strategy_warm_start = bool(value)
+
+    def get_iterations(self) -> np.ndarray:
+        """(n_rows,) int: Newton iterations of every row of the last run (-1: not run)."""
+        it = np.asarray(self._inner._s.get_row_iterations(), dtype=np.int64) \
+            if self._rowmap is None or len(self._rowmap.session_rows) else np.zeros(0, dtype=np.int64)
+        return it if self._rowmap is None else self._rowmap.expand(it, -1)
+
+    def get_max_loading(self) -> tuple[np.ndarray, np.ndarray]:
+        """Per row of the last run: ``(rho, branch)``, the highest ``|I| / limit`` over the
+        branches and their two sides (the grid's current limits, not the threshold's; NaN
+        limits ignored) and the branch reaching it (lines then transformers). NaN / -1 for a
+        row that was not solved (did not run, skipped as islanded, unsupported, NaN residual)
+        or has no limit."""
+        if not self._flows_done:
+            self.compute_flows()
+        _, _, lim1, lim2, _ = self._configured_limits()
+        if self.n_branches is None:
+            raise RuntimeError("get_max_loading needs branch data (set_branch_data in array mode)")
+        nb: int = self.n_branches
+        i1: np.ndarray = self.or_amps.to_numpy().reshape(-1, nb) * 1e-3  # A -> kA, as the limits
+        i2: np.ndarray = self.ex_amps.to_numpy().reshape(-1, nb) * 1e-3
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r1 = np.where(np.asarray(lim1) > 0, i1 / lim1, np.nan)
+            r2 = np.where(np.asarray(lim2) > 0, i2 / lim2, np.nan)
+        r: np.ndarray = np.fmax(r1, r2)
+        # a row not solved (skipped, unsupported, not run) reads zero currents: no loading
+        r[~np.isfinite(self.last_residuals())] = np.nan
+        has: np.ndarray = ~np.all(np.isnan(r), axis=1)
+        branch: np.ndarray = np.full(r.shape[0], -1, dtype=np.int64)
+        rho: np.ndarray = np.full(r.shape[0], np.nan)
+        if has.any():
+            branch[has] = np.nanargmax(r[has], axis=1)
+            rho[has] = r[has, branch[has]]
+        return rho, branch
+
+    # ------------------------------------------------- topology actions, inside
+    _last_rows: Rows | None = None
+
+    def _compute_rows(self, batch_size: int, rows: Rows | None) -> np.ndarray:
+        """Run the contingency rows (``rows`` None / "contingencies") and the selected,
+        supported strategy rows (None / "strategies") through the session; map them back."""
+        if self._reactive_limits_outer_loop:
+            raise NotImplementedError("strategies with reactive_limits_outer_loop (deprecated): "
+                                      "use outer_loops=True")
+        warm: bool = self._strategy_warm_start and rows == "strategies"
+        if self._strategy_warm_start and rows is None:
+            raise NotImplementedError("strategy_warm_start runs in two phases: compute(rows='contingencies'), "
+                                      "then compute(rows='strategies')")
+        if warm and self._outer_loops:
+            raise NotImplementedError("strategy_warm_start with outer_loops=True: a row would need its "
+                                      "contingency's loop state too, not only its voltages (not yet)")
+        if warm and self._ctg_start_ok is None:
+            raise RuntimeError("strategy_warm_start: run compute(rows='contingencies') first")
+        ctg: list[CtgElements] = list(self._ctg_elements or [])
+        if not ctg:
+            raise RuntimeError("add contingencies before compute()")
+        n_lines: int = len(self._grid.get_lines()) if self._grid is not None else 0
+        out_ctg: bool = rows in (None, "contingencies")
+        out_str: bool = rows in (None, "strategies")
+        n_out: int = (len(ctg) if out_ctg else 0) + (len(self._strategies) if out_str else 0)
+        reasons: list[str] = [""] * n_out
+        session_rows: list[int] = []
+        session_list: list[CtgElements] = []
+        if out_ctg:
+            session_rows += range(len(ctg))
+            session_list += ctg
+        if out_str:
+            sel = self._strategy_selected
+            off: int = len(ctg) if out_ctg else 0
+            for k, (ci, acts) in enumerate(self._strategies):
+                if sel is not None and not sel[k]:
+                    continue
+                row, why = strategy_row(ctg[ci], [self._compiled[a] for a in acts], n_lines)
+                if row is None:
+                    reasons[off + k] = why
+                    continue
+                session_rows.append(off + k)
+                session_list.append(row)
+        self._rowmap = RowMap(n_out, np.asarray(session_rows, dtype=np.int64), reasons)
+        self._last_rows = rows
+        self._rl_result = None
+        session = self._inner._s
+        if session_list:
+            self._push_rows(session_list)
+            self._inner.batch_size = int(batch_size)
+            if rows == "strategies" and session.has_v_init_groups:
+                # the contingencies' voltages of phase 1 are groups 0..C-1 (-1: not converged)
+                ok: np.ndarray = self._ctg_start_ok if warm else np.zeros(len(ctg), dtype=bool)
+                ctg_of_row: list[int] = [self._strategies[r - off][0] for r in session_rows]
+                session.set_v_group_of_row([c if ok[c] else -1 for c in ctg_of_row])
+            elif session.has_v_init_groups:
+                session.clear_v_init_groups()
+                self._ctg_start_ok = None
+            self._inner.run()
+            self._last_residuals = self._inner.residuals
+            if rows == "contingencies" and self._strategies:
+                # keep the contingencies' voltages on the device for phase 2's warm start
+                session.set_v_init_groups_from(session, list(range(len(ctg))))
+                res: np.ndarray = self._last_residuals.to_numpy()
+                self._ctg_start_ok = np.isfinite(res) & (res <= self._inner.violation_tol)
+        else:
+            self._last_residuals = DeviceBuffer(lambda: np.zeros(0), (0,), "float64")
+        return self.V_results.to_numpy().reshape(n_out, -1)
+
+    def _push_rows(self, elements: Sequence[CtgElements]) -> None:
+        """Hand the session these rows (the ten lists each) without changing the
+        contingencies registered by the caller."""
+        saved = (self._ctg_elements, self._ctg_branch_ids)
+        try:
+            self._push_contingencies(list(elements))
+        finally:
+            self._ctg_elements, self._ctg_branch_ids = saved
+
+    def _expanded_buffer(self, buf: DeviceBuffer, width: int, fill: Any) -> DeviceBuffer:
+        """``buf`` (session rows x width, flat) on the caller's rows when a row map is live."""
+        rm = self._rowmap
+        if rm is None:
+            return buf
+
+        def fetch() -> np.ndarray:
+            vals = buf.to_numpy().reshape(-1, width) if len(rm.session_rows) else \
+                np.zeros((0, width), dtype=np.asarray(fill).dtype)
+            return rm.expand(vals, fill).ravel()
+
+        return DeviceBuffer(fetch, (rm.n_out * width,), buf.dtype)
+
+    def _session_array(self, getter: Callable[[], np.ndarray], fill: Any) -> np.ndarray:
+        if self._rowmap is None:
+            return getter()
+        rm = self._rowmap
+        vals = getter() if len(rm.session_rows) else np.zeros(0, dtype=np.asarray(fill).dtype)
+        return rm.expand(vals, fill)
+
+    def _session_rows_or_empty(self, getter: Callable[[], list[Any]], fill: Callable[[], Any]) -> list[Any]:
+        if self._rowmap is None:
+            return getter()
+        rm = self._rowmap
+        vals = getter() if len(rm.session_rows) else []
+        return rm.expand_list(vals, fill)
 
     # --------------------------------------------- reactive_limits_outer_loop
     @property
@@ -1026,11 +1308,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """``‖F‖∞`` per contingency from the most recent :meth:`compute`."""
         if self._last_residuals is None:
             raise RuntimeError("Call compute() before last_residuals().")
+        if self._rowmap is not None:
+            return self._rowmap.expand(self._last_residuals.to_numpy(), np.nan)
         return self._last_residuals.to_numpy()
 
     def compute_flows(self):
         """Compute branch currents (``or_amps`` / ``ex_amps``) after compute()."""
-        self._inner.compute_flows()
+        if self._rowmap is None or len(self._rowmap.session_rows):
+            self._inner.compute_flows()
+        self._flows_done = True
 
     # ------------------------------------------------- compute_limit_violations
     def _extract_limits_arrays(self):
@@ -1100,16 +1386,18 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         matches add_contingencies_by_branch_id). Requires compute() with
         compute_limit_violations=True. With reactive_limits_outer_loop, a
         RECOMPUTED contingency's entry is its second pass'."""
-        out = self._inner.get_violations()
+        if not self._violations_valid:
+            raise RuntimeError("violation_threshold was lowered after compute(): compute() again")
+        out = self._session_rows_or_empty(self._inner.get_violations, list)
         if self._rl_result is not None:
             for r, v in self._rl_result["viol"].items():
                 out[r] = v
-        return out
+        return self._restore_limits(out)
 
     def get_violations_truncated(self):
         """(n_ctg,) bool ndarray: True where more than violation_capacity
         violations were found for that contingency (clamped)."""
-        out = self._inner.get_violations_truncated()
+        out = self._session_array(self._inner.get_violations_truncated, False)
         if self._rl_result is not None:
             for r, v in self._rl_result["viol_trunc"].items():
                 out[r] = v
@@ -1121,7 +1409,12 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         each type per contingency (-1 = not simulated). Unlike
         get_violations()'s records (capped at violation_capacity), these
         totals stay exact even when get_violations_truncated() is True."""
-        out = self._inner.get_violation_counts()
+        if self._rowmap is None:
+            out = self._inner.get_violation_counts()
+        else:
+            raw = self._inner.get_violation_counts() if len(self._rowmap.session_rows) else None
+            out = {k: self._rowmap.expand(raw[k] if raw else np.zeros(0, dtype=np.int64), -1)
+                   for k in ("low_voltage", "high_voltage", "current")}
         if self._rl_result is not None:
             for r, cnt in self._rl_result["viol_counts"].items():
                 for k, v in cnt.items():
@@ -1150,6 +1443,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def converged(self, tol=None):
         """(n_ctg,) bool ndarray: residual <= tol (defaults to violation_tol).
         Independent of compute_limit_violations -- requires compute()."""
+        if self._rowmap is not None:
+            t = self._inner.violation_tol if tol is None else tol
+            res = self.last_residuals()
+            return np.isfinite(res) & (res <= t)
         return self._inner.converged(tol)
 
     def converged_n(self, tol=None):
@@ -1182,27 +1479,32 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva = branch_args
         V_n = grid.get_V_solver()
 
-        return compute_violations_n(
-            V_n, bus_vn_kv, bus_vmin_kv, bus_vmax_kv,
-            branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
-            limit_a1_ka, limit_a2_ka, sn_mva, n_lines,
-            rel_tol=self._inner.violation_rel_tol)
+        def compute_n(vmin: np.ndarray | None, vmax: np.ndarray | None,
+                      a1: np.ndarray | None, a2: np.ndarray | None) -> list:
+            return compute_violations_n(
+                V_n, bus_vn_kv, vmin, vmax,
+                branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
+                a1, a2, sn_mva, n_lines,
+                rel_tol=self._inner.violation_rel_tol)
+
+        return self._threshold_violations_n(
+            compute_n, bus_vn_kv, (bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka), len(branch_from))
 
     # ----------------------------------------------------------- pass-through
     @property
     def or_amps(self):
         """DeviceBuffer: (n_ctg * n_branches,) origin terminal amps."""
-        return self._inner.or_amps
+        return self._expanded_buffer(self._inner.or_amps, self.n_branches, np.nan)
 
     @property
     def ex_amps(self):
         """DeviceBuffer: (n_ctg * n_branches,) extremity terminal amps."""
-        return self._inner.ex_amps
+        return self._expanded_buffer(self._inner.ex_amps, self.n_branches, np.nan)
 
     @property
     def V_results(self):
         """DeviceBuffer: (n_ctg * n_bus,) complex voltages (lazy D->H)."""
-        return self._inner.V_results
+        return self._expanded_buffer(self._inner.V_results, self.n_bus, np.nan + 1j * np.nan)
 
     @property
     def strategy(self):
@@ -1265,7 +1567,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         return self._inner.timings
 
     @property
-    def n_branches(self):
+    def n_branches(self) -> int | None:
+        """int: branches (lines then transformers); None in array mode before set_branch_data()."""
         return self._n_branches
 
     @property

@@ -1928,6 +1928,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Number of buses in the grid.")
     .def_property_readonly("n_branches",      &ContingencyAnalysisSession::n_branches,
          "Number of branches (lines + trafos); available after set_branch_data().")
+    .def("set_v_init_groups_from",
+         [](ContingencyAnalysisSession& self, const ContingencyAnalysisSession& src,
+            const std::vector<int>& src_rows) {
+             self.set_v_init_groups_from_ptr(src.v_results_ptr(), src_rows, src.result_rows(), src.n_bus());
+         },
+         pybind11::arg("src"), pybind11::arg("src_rows"),
+         "Starting voltages by group: group g is row src_rows[g] of the last run() of src (this "
+         "session itself included), copied at once on the device. See set_v_group_of_row.")
+    .def("set_v_group_of_row", &ContingencyAnalysisSession::set_v_group_of_row, pybind11::arg("group_of_row"),
+         "The group every row of the next run() starts from (one per row; -1 = the base case); "
+         "a group's non-finite entries start from the base case.")
+    .def("clear_v_init_groups", &ContingencyAnalysisSession::clear_v_init_groups,
+         "Every row starts from the base-case voltages again.")
+    .def_property_readonly("has_v_init_groups", &ContingencyAnalysisSession::has_v_init_groups)
     .def_readonly("driver_build_counter", &ContingencyAnalysisSession::driver_build_counter_,
         "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
         "ANALYSIS, factorization state) while the settings it was built with "

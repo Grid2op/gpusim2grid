@@ -125,6 +125,24 @@ struct ContingencyBatch {
     // unconditionally (cheap: O(n_active + total_trips) ints) so it costs
     // nothing when nobody enables compute_limit_violations.
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Starting voltages by group (ContingencyAnalysisGPU.strategy_warm_start): a
+    // row of group g >= 0 starts from row g of d_V_groups_ (a contingency's
+    // converged V, owned by the session), its non-finite entries (masked buses)
+    // from the base case; group -1 starts from the base case. d_group_of_active
+    // is per ACTIVE row. Off (has_v_groups_ false) = today's base-case start.
+    // -------------------------------------------------------------------------
+    const cudaComplexType*     d_V_groups_   = nullptr;
+    const cudaComplexType*     d_V_fallback_ = nullptr;
+    thrust::device_vector<int> d_group_of_active;
+    bool                       has_v_groups_ = false;
+
+    // group_of_orig: one group per ORIGINAL row (-1 = base case), < n_groups
+    void set_v_groups(const cudaComplexType* d_groups, int n_groups,
+                      const std::vector<int>& group_of_orig,
+                      const cudaComplexType* d_fallback, cudaStream_t cs);
+    void clear_v_groups() { has_v_groups_ = false; }
+
     std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
     thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
 

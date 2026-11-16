@@ -83,7 +83,11 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     std::shared_ptr<AcPfNrState>               base_state_;   // shared: a v_base_dlpack() capsule co-owns it
     std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run(); then kept
-    std::unique_ptr<ContingencyAnalysisDeviceData> dev_;   // the generator mask of the physical checks
+    std::unique_ptr<ContingencyAnalysisDeviceData> dev_;
+    // set_v_init_groups_from_ptr / set_v_group_of_row (the buffer itself is in dev_)
+    bool             has_v_groups_ = false;
+    int              n_v_groups_   = 0;
+    std::vector<int> v_group_of_row_;   // the generator mask of the physical checks
 
     // =========================================================================
     // Driver persistence (see BatchDriverConfig): run() keeps solver_ -- its
@@ -444,6 +448,18 @@ struct ContingencyAnalysisSession {
     std::uintptr_t v_results_ptr() const;
     // Rows of the result buffers v_results_ptr() points to (0 before run()).
     int result_rows() const;
+
+    // Starting voltages by group (ContingencyAnalysisGPU.strategy_warm_start): copy rows
+    // src_rows[g] of a session's last results (device pointer, as v_results_ptr(), of
+    // n_src_rows rows of n_bus_src buses; this session itself included) into group g, then
+    // give every row of the next run()s its group (set_v_group_of_row, one per row, -1 = the
+    // base case). A group's non-finite entries (masked buses) start from the base case.
+    // clear_v_init_groups: every row from the base case again (today's start).
+    void set_v_init_groups_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows,
+                                    int n_src_rows, int n_bus_src);
+    void set_v_group_of_row(const std::vector<int>& group_of_row);
+    void clear_v_init_groups();
+    bool has_v_init_groups() const { return has_v_groups_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real
     BatchTimings get_timings() const { return timings_; }

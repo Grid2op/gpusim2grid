@@ -42,7 +42,16 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from lightsim2grid.lightsim2grid_cpp import LSGrid
 
-__all__ = ["BUS_FIELDS", "VALUE_FIELDS", "Action", "ElementRef", "FrozenMap", "substation_elements"]
+__all__ = [
+    "BUS_FIELDS",
+    "DISCONNECTED",
+    "VALUE_FIELDS",
+    "Action",
+    "ElementRef",
+    "FrozenMap",
+    "current_buses",
+    "substation_elements",
+]
 
 #: ``Action`` fields mapping an element id to a global bus id (``-1``: disconnected)
 BUS_FIELDS: tuple[str, ...] = (
@@ -174,7 +183,7 @@ class Action:
         bus in use now is kept by the group holding most of its elements (ties: the earlier
         group); a group keeps at most one bus; the groups left take the free local buses in
         order. Elements already where they go are not named in the action."""
-        current = _current_buses(grid)
+        current = current_buses(grid)
         listed: list[ElementRef] = [e for g in groups for e in g] + list(disconnected)
         expected = set(substation_elements(grid, sub))
         if len(set(listed)) != len(listed):
@@ -309,7 +318,8 @@ def _element_substations(grid: LSGrid) -> dict[ElementRef, int]:
     return {ref: int(sub) for ref, sub, _ in _element_ends(grid)}
 
 
-def _current_buses(grid: LSGrid) -> dict[ElementRef, int]:
+def current_buses(grid: LSGrid) -> dict[ElementRef, int]:
+    """The global bus of every element end of ``grid`` (``-1``: disconnected)."""
     return {ref: int(bus) for ref, _, bus in _element_ends(grid)}
 
 

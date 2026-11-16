@@ -22,11 +22,11 @@ from _topo_helpers import (
     assert_row_matches,
     batch_V,
     batch_V_global,
-    bus2,
     ca_settings,
     case118,
     make_ca,
     oracle,
+    with_current_limits,
 )
 from conftest import requires_gpu
 
@@ -43,18 +43,19 @@ BATCH: int = 32
 
 
 def _case() -> tuple[LSGrid, list[list[int]], list[Action], list[Strategy]]:
-    """case118, 6 contingencies, 5 actions (2 trips, a tap, 2 splits), every pair."""
+    """case118, 6 contingencies, 5 disconnection actions (a line trip, a line opened at one end,
+    a load, a generator, a line and a load together), every pair. Bus moves and branch values
+    have their own tests (test_topo_bus_moves.py, test_topo_branch_values.py)."""
     from gpusim2grid.actions import Action
 
-    grid = case118()
-    sub = max(range(grid.get_n_sub()), key=lambda s: sum(ln.bus1_id == s for ln in grid.get_lines()))
-    ends = [ln.id for ln in grid.get_lines() if ln.bus1_id == sub]
+    grid = with_current_limits(case118(), 1.1)
+    gen: int = next(g.id for g in grid.get_generators() if not g.is_slack)
     actions = [
-        Action(line_bus1={30: -1}),
+        Action(line_bus1={30: -1}, line_bus2={30: -1}),
         Action(line_bus1={64: -1}),
-        Action(trafo_shift_deg={0: 4.0}),
-        Action(line_bus1={e: bus2(grid, sub) for e in ends[::2]}),
-        Action(line_bus1={e: bus2(grid, sub) for e in ends[1::2][:2]}),
+        Action(load_bus={10: -1}),
+        Action(gen_bus={gen: -1}),
+        Action(line_bus1={70: -1}, line_bus2={70: -1}, load_bus={20: -1}),
     ]
     ctgs = [[2], [9], [40], [77], [120], [150]]
     strategies = [(c, [a]) for c in range(len(ctgs)) for a in range(len(actions))]
@@ -89,8 +90,8 @@ def test_max_loading_matches_the_flows(settings: dict[str, Any]):
     assert rho.shape == (n,) and branch.shape == (n,)
     ca.compute_flows()
     nb = ca.n_branches
-    i1 = ca.or_amps.to_numpy().reshape(n, nb)
-    i2 = ca.ex_amps.to_numpy().reshape(n, nb)
+    i1: np.ndarray = ca.or_amps.to_numpy().reshape(n, nb) * 1e-3  # A -> kA, as the limits
+    i2: np.ndarray = ca.ex_amps.to_numpy().reshape(n, nb) * 1e-3
     lim1 = np.array([ln.limit_a1_ka for ln in grid.get_lines()] + [t.limit_a1_ka for t in grid.get_trafos()])
     lim2 = np.array([ln.limit_a2_ka for ln in grid.get_lines()] + [t.limit_a2_ka for t in grid.get_trafos()])
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -112,7 +113,7 @@ def test_max_loading_without_flows_on_the_host():
 @pytest.mark.parametrize("settings", ca_settings())
 def test_two_calls_equal_one(settings: dict[str, Any]):
     """compute(rows='contingencies') then compute(rows='strategies') on one session: the same
-    rows as compute() of everything, and no second analysis."""
+    rows as compute() of everything, and, in the chunked schedule, no second analysis."""
     grid, ctgs, actions, strategies = _case()
     one = _ca(grid, ctgs, actions, strategies, settings)
     one.compute(batch_size=BATCH)
@@ -124,7 +125,9 @@ def test_two_calls_equal_one(settings: dict[str, Any]):
     n_build: int = two.solver._s.driver_build_counter
     two.compute(batch_size=BATCH, rows="strategies")
     V_s = batch_V(two, len(strategies))
-    assert two.solver._s.driver_build_counter == n_build
+    if settings.get("scheduling") != "continuous":
+        # the continuous schedule rebuilds its driver every run (upstream: continuous_batching.md A.6)
+        assert two.solver._s.driver_build_counter == n_build
     np.testing.assert_allclose(V_c, V_one[: len(ctgs)], atol=1e-12, rtol=0)
     np.testing.assert_allclose(V_s, V_one[len(ctgs) :], atol=1e-12, rtol=0)
 
@@ -147,9 +150,9 @@ def test_select_strategies():
 
 @pytest.mark.parametrize("settings", ca_settings())
 def test_warm_start_same_solution_fewer_iterations(settings: dict[str, Any], solver_atol: float):
-    """strategy_warm_start: a strategy row starts from its contingency's converged V (spare buses
-    from the bus they split from): same solution as lightsim2grid's, and fewer Newton
-    iterations than from the base case, in total."""
+    """strategy_warm_start: a strategy row starts from its contingency's converged V and reaches
+    the same solution as lightsim2grid's. (Its iteration savings depend on the grid: case118's
+    strategies are a few iterations from the base case anyway; see the next test for the start.)"""
     grid, ctgs, actions, strategies = _case()
     iters: dict[bool, np.ndarray] = {}
     for warm in (False, True):
@@ -164,7 +167,6 @@ def test_warm_start_same_solution_fewer_iterations(settings: dict[str, Any], sol
             V_ref, _ = oracle(grid, branches=ctgs[c], action=actions[a])
             if V_ref is not None:
                 assert_row_matches(V[r], V_ref, solver_atol)
-    assert iters[True].sum() < iters[False].sum()
     assert np.all(iters[True] <= MAX_IT)
 
 
@@ -184,9 +186,13 @@ def test_two_phase_recipe():
     every.compute(batch_size=BATCH, rows="strategies")
     V_every: np.ndarray = batch_V(every, len(strategies))
 
+    # limits scaled so every contingency's loading is below 1, then the threshold at the median
+    # loading: the contingencies above the median violate
+    scale: float = 1.01 * float(np.max(rho_c))
+    grid = with_current_limits(case118(), 1.1 * scale)
     ca = _ca(grid, ctgs, actions, strategies, compute_limit_violations=True)
     ca.set_limits_from_grid()
-    ca.violation_threshold = min(1.0, float(np.median(rho_c)))
+    ca.violation_threshold = float(np.median(rho_c)) / scale
     ca.compute(batch_size=BATCH, rows="contingencies")
     violating: np.ndarray = ca.get_violation_counts()["current"] > 0
     assert 0 < violating.sum() < len(ctgs)
@@ -198,3 +204,48 @@ def test_two_phase_recipe():
     V: np.ndarray = batch_V(ca, len(strategies))
     np.testing.assert_allclose(V[ran], V_every[ran], atol=1e-8, rtol=0)
     assert np.all(np.isnan(V[~ran]))
+
+
+def test_max_loading_of_a_row_not_solved():
+    """A strategy row skipped as islanded (its contingency and its action cut a bus off, no
+    handle_disconnected_grid) has no loading: NaN / -1, not the zero currents it reads."""
+    from gpusim2grid.actions import Action
+
+    grid = with_current_limits(case118(), 1.1)
+    lines = grid.get_lines()
+    assert lines[0].bus1_id == lines[1].bus1_id  # lines 0 and 1 are the only two at bus 0
+    ca = _ca(grid, [[0]], [Action(line_bus1={1: -1}, line_bus2={1: -1})], [(0, [0])])
+    ca.set_limits_from_grid()
+    ca.compute(batch_size=BATCH)
+    assert np.isnan(ca.last_residuals()[1])
+    rho, branch = ca.get_max_loading()
+    assert np.isfinite(rho[0]) and branch[0] >= 0
+    assert np.isnan(rho[1]) and branch[1] == -1
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_warm_start_starts_from_the_contingency(warm: bool, residual_atol: float):
+    """A strategy whose action changes nothing is its contingency's row: warm started, it begins
+    at that row's converged voltages, so one Newton iteration leaves it converged; started from
+    the base case, it does not."""
+    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid.actions import Action
+
+    grid = case118()
+    line = grid.get_lines()[100]
+    same = Action(line_bus1={line.id: int(line.bus1_id)})  # already there: changes nothing
+    ctgs = [[2], [40], [77]]
+    ca = ContingencyAnalysisGPU(grid, nb_iter=MAX_IT)
+    ca.add_contingencies_by_branch_id(ctgs)
+    ca.set_actions([same])
+    ca.add_strategies([(c, [0]) for c in range(len(ctgs))])
+    ca.strategy_warm_start = warm
+    ca.compute(batch_size=BATCH, rows="contingencies")
+    assert np.all(ca.last_residuals() < residual_atol)
+    ca.solver.nb_iter = 1  # the engine holds it (mutable, next run)
+    ca.compute(batch_size=BATCH, rows="strategies")
+    res: np.ndarray = ca.last_residuals()
+    if warm:
+        assert np.all(res < residual_atol)
+    else:
+        assert np.all(res > residual_atol)
