@@ -173,6 +173,16 @@ void warm_cudss(cudaStream_t cs, int ubatch_size)
 
 }  // namespace
 
+int cuda_driver_version()
+{
+    int v = 0;
+    if (cudaDriverGetVersion(&v) != cudaSuccess) {
+        cudaGetLastError();  // clear it
+        v = 0;
+    }
+    return v;
+}
+
 // =============================================================================
 // warmup
 // =============================================================================

@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-__version__ = "0.2.0-rc0"
+__version__ = "0.3.0"
 
 # Import lightsim2grid first so liblightsim2grid_core.so is loaded into the
 # process: the compiled _gpusim2grid extension links against it (the zero-copy
@@ -12,6 +12,11 @@ try:  # pragma: no cover - environment dependent
     import lightsim2grid as _lightsim2grid  # noqa: F401
 except ImportError:
     pass
+
+# The CUDA libraries, the driver and lightsim2grid must be the ones the extension
+# was built for (_build_checks.py); a clear ImportError rather than a crash later.
+from ._build_checks import check_build as _check_build
+_check_build()
 
 from .contingency_analysis import (ContingencyAnalysisGPU, optimize_reference_slack,
                                    ReactiveLimitsStatus, RowStatus)

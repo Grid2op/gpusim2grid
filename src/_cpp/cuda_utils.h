@@ -6,6 +6,7 @@
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
+#include "thread_locale_guard.hpp"
 
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <stdio.h>            // printf
@@ -386,7 +387,13 @@ private:
     void _execute(cudssPhase_t phase,
                   const CudssDescriptor& A, const CudssDescriptor& x, const CudssDescriptor& b,
                   const char* caller) {
-        cudssStatus_t s = cudssExecute(handle, phase, config, data, A.desc, x.desc, b.desc);
+        // NVRTC (cuDSS's JIT on a process' first execution) leaves the thread in
+        // the "C" locale: see thread_locale_guard.hpp.
+        cudssStatus_t s;
+        {
+            ThreadLocaleGuard keep_locale;
+            s = cudssExecute(handle, phase, config, data, A.desc, x.desc, b.desc);
+        }
         if (s != CUDSS_STATUS_SUCCESS)
             throw std::runtime_error(
                 std::string("CudssContext::") + caller + " failed: status=" + std::to_string(s));
