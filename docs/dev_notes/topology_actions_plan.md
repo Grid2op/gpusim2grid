@@ -200,10 +200,18 @@ condition between the phases usable with a security margin (pypowsybl's limit re
   by row).
 - **Connectivity** of `(c, a)`: the base DFS tree answers "removed edges" sets of any size
   (`compute_component_masks`), so a pair is one more query, no new graph search.
-- **Warm start (G5)**: phase 1 solves the C contingencies; phase 2 starts `(c, a)` from `V_c`
-  (ScenarioSweep already has a per-row start, `set_v_init_from_orig`). Opt-in
-  (`warm_start='contingency'`): it changes the iterates, not the solution. Expected: fewer
-  Newton iterations, since most actions are local.
+- **Warm start (G5)**: phase 1 solves the C contingencies; phase 2 starts `(c, a)` from `V_c`.
+  ScenarioSweep's per-row start (`set_v_init_from_orig`) holds a dense `n_rows × n_bus` buffer
+  on the device (17 GB for the French phase 2); every strategy of a contingency starts from the
+  same V, so the contingency session keeps **one start per contingency** (C × n_bus, 22 MB
+  there) and a row → contingency index, gathered at slot load. Opt-in
+  (`strategy_warm_start`): it changes the iterates, not the solution. Expected: fewer Newton
+  iterations, since most actions are local.
+- **Driver reuse between the phases**: the contingency session rebuilds its driver (and its
+  analysis) on any new row list today; it gets ScenarioSweep's warm path (new source on the
+  live driver, chunked schedule). The continuous schedule rebuilds its driver every run in
+  both sessions (`continuous_batching.md` A.6, not done upstream): one analysis per phase,
+  ~0.1 s on France, accepted for now.
 - **Reduction (G7)**: `get_max_loading()` → per row `(max |I|/I_max, branch id)` computed on the
   device from the slot's V, before eviction; flows only on request for selected rows.
 - **Perf settings** for every measurement here: `linear_solver='own_lu'`,
@@ -284,7 +292,9 @@ PRs**: its stable interface is the per-element bus move (`Action`, § 7).
 - An action (`gpusim2grid.actions.Action`, frozen): per element kind, `{element id: global bus
   id}` in lightsim2grid's own `change_bus_*` convention (local bus `k` of substation `s` is
   `s + (k − 1) · n_sub`), `-1` = disconnected: `line_bus1`, `line_bus2`, `trafo_bus1`,
-  `trafo_bus2`, `load_bus`, `gen_bus`, `sgen_bus`, `shunt_bus`, `storage_bus`; and branch values
+  `trafo_bus2`, `load_bus`, `gen_bus`, `sgen_bus`, `shunt_bus`, `storage_bus` (`-1` on one end of
+  a branch opens that end only, as a contingency's `branch_ids_side1` / OpenLoadFlow's breaker
+  at one end; on both ends the branch trips); and branch values
   `trafo_ratio` / `trafo_shift_deg` (`change_ratio_trafo` / `change_shift_trafo_deg`).
   `Action.apply_to(grid)` makes exactly those calls on an `LSGrid` (the oracle's semantics);
   `Action.validate(grid)` refuses an unknown element, a bus out of range or in another
