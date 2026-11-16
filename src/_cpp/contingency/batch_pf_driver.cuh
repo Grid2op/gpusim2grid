@@ -1055,6 +1055,13 @@ private:
     PinnedBuffer<cuda_real_type>          h_slot_res_;
     thrust::device_vector<cuda_real_type> d_slot_res_;
     CudaEvent                             sched_done_;
+    // The check before an inner solve's first step (outer loops, see
+    // _check_before_first_step): the slots it runs on (h_/d_check0_), their
+    // residual at the start, and the ones that take no step (d_/h_skip0_,
+    // NrIterBuffers::d_skip_step), brought back with the round's residuals.
+    PinnedBuffer<int>                     h_check0_, h_skip0_;
+    thrust::device_vector<int>            d_check0_, d_skip0_;
+    thrust::device_vector<cuda_real_type> d_res0_;
 
     int*       h_load_slot() { return h_sched_.ptr; }
     int*       h_load_row()  { return h_sched_.ptr + batch_size_; }
@@ -1167,6 +1174,8 @@ private:
     // chunk's own c_start + s.
     NrIterBuffers _make_nr_buffers();
     void _init_slot_state(const NrIterBuffers& buf, const SlotLoadView& L);
+    bool _check_before_first_step(NrIterBuffers& buf, int n_cur, const std::vector<int>& iters,
+                                  CudaTimer& timer, BatchTimings& t);
     void _residual_pass(const NrIterBuffers& buf, int n_slots, cuda_real_type* d_out,
                         int c_start, const int* d_result_map, const int* d_slot_active,
                         CudaTimer& timer, BatchTimings& t);

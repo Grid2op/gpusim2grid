@@ -265,6 +265,11 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         h_move_.resize(static_cast<size_t>(2) * batch_size_);
         d_move_.resize(static_cast<size_t>(2) * batch_size_);
         d_slot_res_.resize(static_cast<size_t>(batch_size_));
+        h_check0_.resize(static_cast<size_t>(batch_size_));
+        h_skip0_.resize(static_cast<size_t>(batch_size_));
+        d_check0_.resize(static_cast<size_t>(batch_size_));
+        d_skip0_.resize(static_cast<size_t>(batch_size_));
+        d_res0_.resize(static_cast<size_t>(batch_size_));
         sched_done_.record(cs);
 
         cs.synchronize();
@@ -2069,6 +2074,54 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
 }
 
 // =============================================================================
+// _check_before_first_step — continuous schedule with outer loops, before a
+// round: lightsim2grid's NRAlgo::newton checks its residual before its first
+// step (after recalibrating a distributed slack's slack_absorbed from it,
+// NRSystem::calibrate_slack_absorbed), so an inner solve that starts converged
+// -- a re-solve after DistributedSlack moved the units' targets by less than
+// the tolerance, typically -- takes none. The slots starting an inner solve
+// (a live row, no iteration yet: just loaded or re-solved in place) are
+// checked the same way, and those already below tol take no step this round
+// (NrIterBuffers::d_skip_step); the residual pass after it then finds them
+// converged with 0 iterations. Without this the GPU stepped once more: about
+// the tolerance on V, enough for the loops to decide otherwise at a loose one.
+// The other slots are left alone (calibrating them would let a slot stop
+// where lightsim2grid's Newton goes on). Returns whether some slot was checked
+// (d_skip0_ then holds the flags).
+// =============================================================================
+template <typename BatchSource>
+bool BatchPfDriver<BatchSource>::_check_before_first_step(NrIterBuffers& buf, int n_cur,
+                                                          const std::vector<int>& iters,
+                                                          CudaTimer& timer, BatchTimings& t)
+{
+    int n_check = 0;
+    for (int s = 0; s < n_cur; ++s) {
+        const int c = (h_slot_row()[s] >= 0 && iters[static_cast<size_t>(s)] == 0) ? 1 : 0;
+        h_check0_[static_cast<size_t>(s)] = c;
+        n_check += c;
+    }
+    buf.d_skip_step = nullptr;
+    if (n_check == 0) return false;
+    int* d_check = thrust::raw_pointer_cast(d_check0_.data());
+    int* d_skip  = thrust::raw_pointer_cast(d_skip0_.data());
+    cuda_real_type* d_res = thrust::raw_pointer_cast(d_res0_.data());
+    CHK_CUDA_BPF(cudaMemcpyAsync(d_check, h_check0_.ptr, static_cast<size_t>(n_cur) * sizeof(int),
+                                 cudaMemcpyHostToDevice, cs));
+    // F at the current V (the residual pass's own sequence; ‖F‖∞ unused when recalibrated)
+    _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t);
+    if (buf.slack_col >= 0 && buf.n_slack > 0) {
+        calibrate_slack_absorbed_slots_kernel<cuda_real_type><<<n_cur, BS, 0, cs>>>(
+            buf.d_slack_absorbed, buf.d_F, buf.d_p_rows, buf.n_p, buf.d_slack_w, buf.slack_w_stride,
+            buf.n_slack, base.dim_J, d_check, n_cur);
+        _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t);
+    }
+    skip_converged_slots_kernel<cuda_real_type><<<(n_cur + BS - 1) / BS, BS, 0, cs>>>(
+        d_skip, d_check, d_res, static_cast<double>(tol_), n_cur);
+    buf.d_skip_step = d_skip;
+    return true;
+}
+
+// =============================================================================
 // _evict — everything done to a finished slot, in this order: its masked
 // buses' voltages to NaN (in place: the slot must be reloaded before it
 // iterates again), the fused limit / physical checks on its converged state,
@@ -2867,6 +2920,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     while (n_live > 0) {
         rec_n_cur  = n_cur;
         rec_n_live = n_live;
+        const bool checked0 = hook != nullptr && _check_before_first_step(buf, n_cur, iters, timer, t);
         std::visit([&](auto& policy) {
             run_nr_loop(
                 policy, linear_solver_, _spmv(), buf,
@@ -2888,6 +2942,11 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         CHK_CUDA_BPF(cudaMemcpyAsync(h_slot_res_.ptr, thrust::raw_pointer_cast(d_slot_res_.data()),
                                      static_cast<size_t>(n_cur) * sizeof(cuda_real_type),
                                      cudaMemcpyDeviceToHost, cs));
+        if (checked0)
+            CHK_CUDA_BPF(cudaMemcpyAsync(h_skip0_.ptr, thrust::raw_pointer_cast(d_skip0_.data()),
+                                         static_cast<size_t>(n_cur) * sizeof(int),
+                                         cudaMemcpyDeviceToHost, cs));
+        buf.d_skip_step = nullptr;
         cs.synchronize();   // also retires the previous H->D of the staging block
         const auto t_sched1 = std::chrono::steady_clock::now();
         t.t_sched_res_sync += TimingEntry{0., std::chrono::duration<double, std::milli>(t_sched1 - t_sched0).count()};
@@ -2899,9 +2958,14 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             h_evict()[s] = -1;
             const int a = h_slot_row()[s];
             if (a < 0) continue;
-            iters[static_cast<size_t>(s)] += k;
-            useful += k;
             const double r = static_cast<double>(h_slot_res_[static_cast<size_t>(s)]);
+            // a slot converged before its first step took none (its V did not
+            // move, so the round's residual is the check's: below tol)
+            const bool no_step = checked0 && s < n_cur && h_skip0_[static_cast<size_t>(s)] != 0 && r < tol_;
+            if (!no_step) {
+                iters[static_cast<size_t>(s)] += k;
+                useful += k;
+            }
             RowStatus st;
             if (!std::isfinite(r))                          st = RowStatus::Diverged;
             else if (r < tol_)                              st = RowStatus::Converged;

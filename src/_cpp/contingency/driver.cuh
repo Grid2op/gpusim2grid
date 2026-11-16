@@ -103,6 +103,18 @@ struct TailSolve {
     }
 };
 
+// zero_skipped_steps_kernel -- dx = 0 on the slots NrIterBuffers::d_skip_step
+// flags (one block per slot): their V and every other unknown stay where they are.
+template <typename R>
+__global__ void zero_skipped_steps_kernel(R* __restrict__ d_dx, const int* __restrict__ d_skip,
+                                          int dim_J, int batch)
+{
+    const int b = blockIdx.x;
+    if (b >= batch || d_skip[b] == 0) return;
+    R* dx = d_dx + static_cast<size_t>(b) * dim_J;
+    for (int k = threadIdx.x; k < dim_J; k += blockDim.x) dx[k] = R(0);
+}
+
 // =============================================================================
 // run_nr_loop<Policy>
 //
@@ -214,6 +226,11 @@ inline void run_nr_loop(
             n_tail_refactor = tail->solve(buf.d_J_values, buf.d_F, buf.d_dx, timer, step);
         else
             did_refactor = policy.solve_iter(linear_solver, buf.d_J_values, cs, timer, step);
+
+        // ④a A slot found converged before its first step takes none
+        //     (NrIterBuffers::d_skip_step; nullptr = every slot steps).
+        if (buf.d_skip_step != nullptr)
+            zero_skipped_steps_kernel<<<batch_size, BS, 0, cs>>>(buf.d_dx, buf.d_skip_step, dim_J, batch_size);
 
         // ④b Step-scaling (MaxVoltageChange), if enabled -- rescale each
         //     batch slot's dx BEFORE applying it anywhere, so Va/Vm and any

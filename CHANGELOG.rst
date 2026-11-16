@@ -7,6 +7,9 @@ Change Log
   4x faster in FP64 on GPUs with a reduced FP64 rate, same results to rounding.
 - [IMPROVED] The Jacobian fill: fewer FP64 operations per entry and no warp divergence on the diagonal,
   4.6x faster in FP64 on an RTX A1000, same results to rounding.
+- [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's
+  (``slack_absorbed`` recalibrated first); a change re-solved that way is settled. At loose tolerances the
+  extra step changed the loops' decisions (a row cycling to ``max_outer_iterations``).
 
 [0.3.0] 2026-11-16
 --------------------

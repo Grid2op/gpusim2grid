@@ -214,6 +214,13 @@ struct NrIterBuffers {
     // slack participant re-weights the survivors (lightsim2grid PR #193).
     int                    slack_w_stride = 0;
 
+    // ---- slots that take no step this iteration ------------------------------
+    // [actual_batch], nullptr (default) = every slot steps. A slot at 1 has its
+    // dx zeroed right after the solve: the continuous schedule's check before an
+    // inner solve's first step found it converged already (lightsim2grid's
+    // NRAlgo::newton checks before it steps).
+    const int*             d_skip_step = nullptr;
+
     // ---- per-slot VoltageControl set-points ---------------------------------
     // 0 (default): d_vc_vset is the shared [n_vc_grp] base array. n_vc_grp:
     // d_vc_vset is per slot, [actual_batch * n_vc_grp] -- a batch row whose

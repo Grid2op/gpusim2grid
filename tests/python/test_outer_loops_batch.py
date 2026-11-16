@@ -1515,6 +1515,52 @@ def test_dist_contingency_analysis_matches_lightsim2grid(init_from_n, solver_ato
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
+def test_dist_resolve_may_converge_without_a_step(init_from_n, solver_atol):
+    """a loose tolerance (OpenLoadFlow's default is 1e-4 pu): after DistributedSlack moved the
+    units' targets, lightsim2grid's Newton recalibrates slack_absorbed and checks before its
+    first step, so a re-solve often converges in none. The GPU must stop there too: one more
+    step changes V by about the tolerance, and the loops then decide on another state (other
+    outer iteration counts, a row cycling until max_outer_iterations)"""
+    from lightsim2grid.lightsim2grid_cpp import ContingencyAnalysisCPP
+    from gpusim2grid import ContingencyAnalysisGPU
+    if init_from_n and not getattr(_cpp, "have_ls2g_outer_resume", False):
+        pytest.skip("lightsim2grid without its loops' state accessors")
+    tol_mva = 0.1
+    grid = _case14_dist()
+    if init_from_n:
+        # lightsim2grid's batch resumes from its own "n" solve, from the start it is given at
+        # the batch's tolerance: the grid's must be that one (at a loose tolerance, where a
+        # solve stops depends on it)
+        assert grid.ac_pf(_v_batch(grid, True), MAX_IT, tol_mva).size > 0
+    n_br = len(grid.get_lines()) + len(grid.get_trafos())
+    batch = ContingencyAnalysisCPP(grid)
+    batch.change_algorithm(DIST)
+    batch.init_from_n_powerflow = init_from_n
+    batch.handle_disconnected_grid = True
+    batch.add_all_n1()
+    batch.compute(_v_batch(grid, init_from_n), MAX_IT, tol_mva)
+    ca = ContingencyAnalysisGPU(grid, outer_loops=True, nb_iter=MAX_IT, keep_outer_trace=True,
+                                handle_disconnected_grid=True, init_from_n_powerflow=init_from_n,
+                                tol=tol_mva / grid.get_sn_mva(), tol_base=tol_mva / grid.get_sn_mva())
+    ca.add_contingencies_by_branch_id([[i] for i in range(n_br)])
+    ca.compute(batch_size=4)
+    n_bus = grid.get_Ybus_solver().shape[0]
+    V = ca.V_results.to_numpy().reshape(n_br, n_bus)
+    V_ls = np.asarray(batch.get_voltages())[:, np.asarray(grid.id_ac_solver_to_me(), dtype=int)]
+    status = np.asarray(ca.get_row_status())
+    conv = np.asarray(batch.converged_mask(), dtype=bool)
+    res, res_ls = ca.get_outer_results(), batch.get_outer_results()
+    for i in range(n_br):
+        msg = f"branch {i}: " + "\n".join(res[i].decisions)
+        assert (status[i] == CONVERGED) == bool(conv[i]), msg
+        assert res[i].nb_outer_iterations == res_ls[i].nb_outer_iterations, msg
+        assert res[i].nb_nr_iterations == res_ls[i].nb_nr_iterations, msg
+        if conv[i]:
+            fin = np.isfinite(V[i])
+            np.testing.assert_allclose(V[i][fin], V_ls[i][fin], rtol=0., atol=solver_atol, err_msg=msg)
+
+
+@pytest.mark.parametrize("init_from_n", [False, True])
 def test_dist_injection_sweep_matches_lightsim2grid(init_from_n, solver_atol):
     """rows with more load, DistributedSlack the only loop, against lightsim2grid's
     InjectionSweep of the same algorithm: statuses, outer iterations, V and moved targets"""

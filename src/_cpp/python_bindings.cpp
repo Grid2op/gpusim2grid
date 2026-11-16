@@ -1587,7 +1587,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
       .def_readonly("failed_loop", &outer::RowResult::failed_loop)
       .def_readonly("nb_outer_iterations", &outer::RowResult::nb_outer_iterations)
       .def_readonly("nb_nr_iterations", &outer::RowResult::nb_nr_iterations,
-                    "Newton iterations summed over every inner solve, at least 1 per solve")
+                    "Newton steps summed over every inner solve (0 for a solve within tolerance from its start, as lightsim2grid's batch counts them)")
       .def_property_readonly("gen_target_p", [](const outer::RowResult& r) { return r.gen_targets(); }, "(generator id, MW): the target a loop (DistributedSlack) moved it to")
       .def_property_readonly("storage_target_p", [](const outer::RowResult& r) {
             std::vector<std::pair<int, double>> out;
