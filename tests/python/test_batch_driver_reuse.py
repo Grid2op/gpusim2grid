@@ -114,6 +114,34 @@ def test_ca_nb_iter_change_keeps_the_driver(ieee14_base_case, solver_atol):
     _assert_same(ca.V_results.to_numpy(), _ca_V(grid, range(10), nb_iter=5), 1e-3 * solver_atol)
 
 
+@pytest.mark.parametrize("linear_solver", ["cudss", "own_lu"])
+def test_ca_continuous_reuses_the_driver(ieee14_base_case, solver_atol, linear_solver):
+    """The continuous schedule keeps its driver and source too: every N-1
+    (islanding ones masked), 3 slots and a tail of 1-slot groups, run three
+    times -- each run what a fresh session gives, iteration counts included."""
+    grid = ieee14_base_case["grid"]
+    n_br = len(grid.get_lines()) + len(grid.get_trafos())
+    kw = dict(scheduling="continuous", handle_disconnected_grid=True, linear_solver=linear_solver)
+
+    def make():
+        ca = _ca(grid, range(n_br), **kw)
+        ca.tail_max_groups, ca.tail_group_size = 2, 1
+        return ca
+
+    ref = make()
+    ref.compute(batch_size=3)
+    V_ref, it_ref = ref.V_results.to_numpy(), np.asarray(ref.get_row_iterations())
+    ca = make()
+    for _ in range(3):
+        ca.compute(batch_size=3)
+        _assert_same(ca.V_results.to_numpy(), V_ref, 1e-3 * solver_atol)
+        np.testing.assert_array_equal(np.asarray(ca.get_row_iterations()), it_ref)
+    assert _session(ca).driver_build_counter == 1
+    assert ca.timings.t_analysis_ms == 0.0
+    assert ca.timings.n_tail_rounds > 0
+    assert ca.timings.n_disconnected == ref.timings.n_disconnected
+
+
 def test_ca_hot_run_keeps_disconnected_rows(ieee14_base_case):
     """The per-row islanding flags describe the live source: a hot run must
     report the same disconnected rows (it skips the connectivity pass)."""

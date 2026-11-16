@@ -196,7 +196,17 @@ its rows converge in lockstep, so a third of the rounds reload nearly every slot
 with outer loops (200 contingencies, loose / tight × NROuter / NROuterDist): still identical to
 lightsim2grid (statuses, outer counts, max |dV| <= 5.1e-12).
 
-## 10. Next steps
+## 10. Continuous reuse in the contingency analysis and scenario sweep sessions (done)
+
+Step 3's change for the two other sessions (A.6 item 2 of `continuous_batching.md`): a hot run
+keeps driver and source, a warm scenario sweep swaps its source on the live driver, unless its
+topology leaves more active rows than the live slots and `batch_size` allows more. Not with the
+outer loops. `BatchPowerFlow`'s continuous backward now refuses any forward in between through
+`run_counter` instead of relying on every forward building a new source. N-1 continuous own LU
+(case2869, 3 779 rows): 819 -> 772 ms a call, same results (max |dV| 5.3e-13 against the
+original build, identical iteration counts and NaN rows).
+
+## 11. Next steps
 
 - **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
   SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an

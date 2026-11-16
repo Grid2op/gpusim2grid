@@ -196,9 +196,9 @@ its slack weights and its masked / pinned rows all come from the source),
 then solves Jᵀ chunk by chunk. Nothing is copied in the forward and nothing
 but ``V`` is kept until the backward, whatever ``n_scen``; the extra cost is
 one reload + Jacobian fill per ``batch_size`` rows in each backward. With
-``snapshot_jacobian=True`` the snapshot is just ``V``, but every continuous
-forward still rebuilds the batch source today, so a backward must come before
-the next forward in both modes (and ``torch.autograd.gradcheck``, which runs
+``snapshot_jacobian=True`` the snapshot is just ``V``, but any forward may change
+the batch source the backward reads (a hot one too: the slack weights follow
+the injections), so a backward must come before the next forward in both modes (and ``torch.autograd.gradcheck``, which runs
 several forwards first, cannot be used: check with central differences).
 """
 
@@ -1140,13 +1140,14 @@ class _BatchPowerFlowOp(torch.autograd.Function):
                 "gradient belongs to, overwriting its Jacobians on the GPU. Call "
                 "backward() before the next forward(), or build the model with "
                 "snapshot_jacobian=True to keep a copy per forward.")
+        if ctx.snapshot and ctx.continuous and solver.run_counter != ctx.run_id:
+            raise RuntimeError(
+                "BatchPowerFlow.backward: another forward() ran after the one this "
+                "gradient belongs to. With scheduling='continuous' the backward rebuilds "
+                "the Jacobians from the session's batch source, which any forward may "
+                "change (slack weights, masks, topology): call backward() before the "
+                "next forward().")
         if ctx.snapshot and solver.source_build_counter != ctx.source_id:
-            if ctx.continuous:
-                raise RuntimeError(
-                    "BatchPowerFlow.backward: another forward() ran after the one this "
-                    "gradient belongs to. With scheduling='continuous' every forward "
-                    "rebuilds the session's batch source, which the backward needs: "
-                    "call backward() before the next forward().")
             raise RuntimeError(
                 "BatchPowerFlow.backward: another forward() with a different "
                 "topology, generator mask or number of rows ran after the one this "

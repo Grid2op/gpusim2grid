@@ -1473,9 +1473,12 @@ void ScenarioSweepSession::run()
     // (get_disconnected(), n_disconnected, get_row_stranded_vc_groups()).
     // -------------------------------------------------------------------------
     const ScenarioSweepDriverConfig cfg = _current_config();
-    // The continuous schedule always rebuilds its driver (its warm / hot reuse
-    // is a later step, docs/dev_notes/continuous_batching.md A.6).
-    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
+    // The continuous schedule reuses its driver too (each solve() reloads every
+    // slot from the source), except with the outer loops, whose repeated runs on
+    // one driver are not tested yet. BatchPowerFlow's continuous backward
+    // rebuilds J from the live source, so it refuses any forward in between
+    // (run_counter), hot ones included.
+    const bool cold = !solver_ || cfg != driver_cfg_ || (continuous && outer_);
     const bool warm = !cold && (topology_dirty_ || gen_off_dirty_ || skip_dirty_ || switches_dirty_);
     const bool new_source = cold || warm;
 
@@ -1604,7 +1607,11 @@ void ScenarioSweepSession::run()
         const bool too_many_chunks =
             chunks_live > 2 * chunks_fresh
             || (keep_final_jacobian_ && chunks_live > 1 && chunks_fresh <= 1);
-        if (!fixed_batch_capacity_ && too_many_chunks) {
+        // Continuous: S = min(batch_size, active rows) slots, no chunks. Fewer
+        // active rows than S: the extra slots run the base case; more than S
+        // while batch_size allows more: a fresh driver would have more slots.
+        const bool too_few_slots = std::min(batch_size_, n_active) > live_capacity;
+        if (continuous ? too_few_slots : (!fixed_batch_capacity_ && too_many_chunks)) {
             build_driver = true;
             reset_rows();          // the cold source below recomputes them
         } else {

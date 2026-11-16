@@ -519,11 +519,12 @@ void ContingencyAnalysisSession::run()
     // keep it (allocations, block-diagonal structure, cuDSS ANALYSIS, the
     // policy's factorization state) and its source (connectivity, masks,
     // patches already on the device); only solve() runs again. Otherwise
-    // build both, as the first run() does. The continuous schedule always
-    // rebuilds (its reuse is a later step, docs/dev_notes/continuous_batching.md
-    // A.6).
+    // build both, as the first run() does. The continuous schedule reuses them
+    // too (each solve() reloads every slot from the source's per-row data),
+    // except with the outer loops, whose repeated runs on one driver are not
+    // tested yet.
     const BatchDriverConfig cfg = _current_config();
-    const bool cold = !solver_ || cfg != driver_cfg_ || continuous;
+    const bool cold = !solver_ || cfg != driver_cfg_ || (continuous && outer_);
     const double t_sess_ref_ms = ms_since(t_run0);
     double t_sess_source_ms = 0., t_sess_prepass_ms = 0., t_sess_driver_ctor_ms = 0.;
 

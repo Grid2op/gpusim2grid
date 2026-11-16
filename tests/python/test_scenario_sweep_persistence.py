@@ -338,6 +338,65 @@ class TestColdPath:
         assert np.all(np.isnan(V[0])) and np.all(np.isnan(V[2]))
 
 
+class TestContinuous:
+    """scheduling="continuous" persists its driver too: hot (injections) and warm
+    (topology) runs on the live driver, each what a fresh session gives."""
+
+    @pytest.mark.parametrize("linear_solver", ["cudss", "own_lu"])
+    def test_hot_and_warm_reuse_the_driver(self, ieee14_base_case, solver_atol, linear_solver):
+        from gpusim2grid import ScenarioSweepGPU
+        grid = ieee14_base_case["grid"]
+        kw = dict(scheduling="continuous", linear_solver=linear_solver)
+        s1, s2 = np.linspace(0.9, 1.1, 7), np.linspace(1.08, 0.92, 7)
+        t1 = [[i] for i in range(7)]
+        t2 = [[i + 5] for i in range(7)]
+
+        def tail(sw):
+            sw.tail_max_groups, sw.tail_group_size = 2, 1
+            return sw
+
+        sw = tail(ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL, **kw))
+        topo = None
+        # (injections, topology, expected (driver, source) builds)
+        for scales, top, builds in ((s1, t1, (1, 1)), (s1, t1, (1, 1)), (s2, t1, (1, 1)),
+                                    (s2, t2, (1, 2)), (s1, t2, (1, 2))):
+            sw.set_injections_from_elements(*_rows(grid, scales))
+            if top is not topo:
+                sw.set_topology(top)
+                topo = top
+            V = _np(sw.compute(batch_size=3))
+            assert (sw.driver_build_counter, sw.source_build_counter) == builds
+            ref = tail(ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL, **kw))
+            ref.set_injections_from_elements(*_rows(grid, scales))
+            ref.set_topology(top)
+            V_ref = _np(ref.compute(batch_size=3))
+            np.testing.assert_allclose(V, V_ref, atol=1e-3 * solver_atol)
+            np.testing.assert_array_equal(sw.get_row_iterations(), ref.get_row_iterations())
+        _one_time_costs_zero(sw.timings)
+        assert sw.timings.n_tail_rounds > 0
+
+    @needs_bridge
+    def test_warm_run_with_more_active_rows_than_slots_rebuilds(self, solver_atol):
+        """The continuous driver has min(batch_size, active rows) slots: a warm run
+        leaving more rows active than that builds a new driver (a fresh one would have
+        more slots), one leaving fewer keeps it (its extra slots run the base case)."""
+        from gpusim2grid import ScenarioSweepGPU
+        grid, _, spur, _ = _solved_spur_grid(distributed_slack=False)
+        spur = int(spur)
+        scales = [1.0, 1.05, 0.95, 1.1, 1.02]
+        few = [[spur], [spur], [spur], [], []]          # 2 rows active
+        none = [[], [], [], [], []]                       # 5 rows active
+        some = [[spur], [], [spur], [], []]              # 3 rows active
+        sw = ScenarioSweepGPU(grid, nb_iter=NB_ITER, tol_base=TOL, scheduling="continuous")
+        sw.set_injections_from_elements(*_rows(grid, scales))
+        for top, builds in ((few, (1, 1)), (none, (2, 2)), (some, (2, 3))):
+            sw.set_topology(top)
+            V = _np(sw.compute(batch_size=5))
+            assert (sw.driver_build_counter, sw.source_build_counter) == builds
+            ref = _fresh(grid, scales, topology=top, scheduling="continuous")[0]
+            np.testing.assert_allclose(V, ref, atol=1e-3 * solver_atol)   # NaN rows alike
+
+
 class TestDevicePath:
     def test_set_injections_dlpack_matches_numpy(self, ieee14_base_case, solver_atol):
         torch = pytest.importorskip("torch")
