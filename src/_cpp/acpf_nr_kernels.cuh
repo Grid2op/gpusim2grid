@@ -317,7 +317,7 @@ __global__ void apply_step_scale_kernel(
 //
 // Applies angle corrections to each bus owning a theta unknown.
 //   Va_new = Va_old + dx[b * dim_J + theta_cols[k]],   bus = theta_buses[k]
-//   V_new  = |V| * exp(j * Va_new)
+//   V_new  = |V| * exp(j * Va_new), applied as V *= exp(j * dx) (no atan2)
 // Ledger-driven: the (bus, col) pairs come from the NRLedger's theta-unknown
 // list. Feature-free: theta_buses == sorted(pvpq), theta_cols == [0, n_pvpq).
 // Must complete before update_Vm_kernel (same stream → implicit order).
@@ -337,7 +337,7 @@ __global__ void update_Va_kernel(
 //
 // Applies magnitude corrections to each bus owning a vm unknown.
 //   Vm_new = Vm_old + dx[b * dim_J + vm_cols[k]],   bus = vm_buses[k]
-//   V_new  = Vm_new * exp(j * Va)
+//   V_new  = Vm_new * exp(j * Va), applied as V *= 1 + dx / |V| (no atan2)
 // Feature-free: vm_buses == pq, vm_cols == [n_pvpq, n_pvpq + n_pq).
 // Reads Va from d_V after update_Va_kernel has written it (same stream).
 // ---------------------------------------------------------------------------

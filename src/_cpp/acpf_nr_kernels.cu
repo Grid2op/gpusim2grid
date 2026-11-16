@@ -723,8 +723,25 @@ __global__ void apply_step_scale_kernel(
 }
 
 // =============================================================================
-// update_Va_kernel
+// update_Va_kernel / update_Vm_kernel
+//
+// V is kept as a complex number, so a step in polar coordinates is applied as
+// a product, never through atan2 / |V| / sin / cos of the full angle:
+//   Va += dva  <=>  V *= exp(j dva)          (one sincos of the small step)
+//   Vm += dvm  <=>  V *= 1 + dvm / |V|       (one rsqrt of |V|^2)
+// The former formulation (atan2 + hypot + sin + cos, in each of the two
+// kernels) was limited by FP64 arithmetic on GPUs with a reduced FP64 rate:
+// ~10x slower than FP32 on an RTX A1000, where every other kernel of the
+// Newton loop is ~2x (memory). Same values to rounding; a zero step leaves
+// V bit-identical (masked buses, identity rows).
 // =============================================================================
+namespace {
+__device__ __forceinline__ void v_sincos(double x, double* s, double* c) { sincos(x, s, c); }
+__device__ __forceinline__ void v_sincos(float x, float* s, float* c)    { sincosf(x, s, c); }
+__device__ __forceinline__ double v_rsqrt(double x) { return rsqrt(x); }
+__device__ __forceinline__ float  v_rsqrt(float x)  { return rsqrtf(x); }
+}  // namespace
+
 __global__ void update_Va_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,
@@ -741,22 +758,14 @@ __global__ void update_Va_kernel(
     const int       k   = static_cast<int>(tid % n_theta);
     if (b >= actual_batch) return;
 
-    const int bus = theta_buses[k];
-    const int col = theta_cols[k];
-    const cudaComplexType V = d_V[b * n_bus + bus];
-    const cuda_real_type vm = CudaFunHelper::my_cuCabs(V);
-    const cuda_real_type va = CudaFunHelper::my_atan2(
-        CudaFunHelper::my_cuCimag(V),
-        CudaFunHelper::my_cuCreal(V)) + d_dx[b * dim_J + col];
-
-    d_V[b * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
-        vm * CudaFunHelper::my_cos(va),
-        vm * CudaFunHelper::my_sin(va));
+    const cuda_real_type dva = d_dx[b * dim_J + theta_cols[k]];
+    if (dva == static_cast<cuda_real_type>(0)) return;
+    cuda_real_type s, c;
+    v_sincos(dva, &s, &c);
+    cudaComplexType& V = d_V[b * n_bus + theta_buses[k]];
+    V = CudaFunHelper::my_cuCmul(V, CudaFunHelper::my_make_cuComplex(c, s));
 }
 
-// =============================================================================
-// update_Vm_kernel
-// =============================================================================
 __global__ void update_Vm_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,
@@ -773,18 +782,19 @@ __global__ void update_Vm_kernel(
     const int       k   = static_cast<int>(tid % n_vm);
     if (b >= actual_batch) return;
 
-    const int bus = vm_buses[k];
-    const int col = vm_cols[k];
-    const cudaComplexType V = d_V[b * n_bus + bus];
-    // Vm_new = Vm_old + dx[vm col];  Va unchanged (already updated)
-    const cuda_real_type vm = CudaFunHelper::my_cuCabs(V) + d_dx[b * dim_J + col];
-    const cuda_real_type va = CudaFunHelper::my_atan2(
-        CudaFunHelper::my_cuCimag(V),
-        CudaFunHelper::my_cuCreal(V));
-
-    d_V[b * n_bus + bus] = CudaFunHelper::my_make_cuComplex(
-        vm * CudaFunHelper::my_cos(va),
-        vm * CudaFunHelper::my_sin(va));
+    const cuda_real_type dvm = d_dx[b * dim_J + vm_cols[k]];
+    if (dvm == static_cast<cuda_real_type>(0)) return;
+    cudaComplexType& V = d_V[b * n_bus + vm_buses[k]];
+    const cuda_real_type re = CudaFunHelper::my_cuCreal(V);
+    const cuda_real_type im = CudaFunHelper::my_cuCimag(V);
+    const cuda_real_type n2 = re * re + im * im;
+    if (n2 == static_cast<cuda_real_type>(0)) {
+        // |V| = 0: no angle to keep; the former atan2(0, 0) = 0 gave V = dvm.
+        V = CudaFunHelper::my_make_cuComplex(dvm, static_cast<cuda_real_type>(0));
+        return;
+    }
+    const cuda_real_type scale = static_cast<cuda_real_type>(1) + dvm * v_rsqrt(n2);
+    V = CudaFunHelper::my_make_cuComplex(scale * re, scale * im);
 }
 
 // =============================================================================
