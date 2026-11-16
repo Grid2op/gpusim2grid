@@ -9,6 +9,25 @@ contingency, and the rows that disagree (outer iterations, status, voltages).
 The grid comes from pypowsybl: a built-in network (``--network ieee300``) or an IIDM file
 (``--network path/to/snapshot.xiidm``, e.g. one of ``$LS2G_SNAPSHOTS``), loaded with
 OpenLoadFlow's default outer loops (``init_from_pypowsybl(olf_rules=True)``).
+
+Convergence criteria (``--loose``, the default, or ``--tight``), the ones of
+``expe_gpus/bench_n1.sh`` so the two benchmarks measure the same thing:
+
+- ``--loose``: OpenLoadFlow's own defaults, read from the installed pypowsybl (1.16.1: 30 outer
+  iterations, 30 Newton iterations per inner solve, ``newtonRaphsonConvEpsPerEq`` 1e-4 pu,
+  ``slackBusPMaxMismatch`` 1 MW);
+- ``--tight``: ``expe_gpus/src/test_launch.py``'s (30 outer, 50 Newton, eps 1e-10 pu,
+  ``slackBusPMaxMismatch`` 1e-6 MW).
+
+OpenLoadFlow stops on max |mismatch| < eps (``UNIFORM_CRITERIA``, per unit on its 100 MVA base),
+so lightsim2grid gets ``tol = eps * 100`` MVA and gpusim2grid ``tol = eps * 100 / sn_mva`` per unit,
+both the same Newton budget; the outer-loop limits (outer iterations, slack mismatch, reactive
+mismatch) reach both through the grid (``set_olf_outer_loops``). The 'n' solve uses the same.
+``--nb_iter`` / ``--tol_mva`` override the preset's Newton budget / tolerance.
+
+``--distributed_slack_inner_loop``: the grid (and lightsim2grid's reference) runs ``NROuterDist_KLU``
+instead of ``NROuter_KLU``, the slack shared inside each inner Newton (gpusim2grid picks that
+inner system from the grid's algorithm) rather than by the DistributedSlack outer loop alone.
 """
 
 import argparse
@@ -27,8 +46,16 @@ def get_parser():
     parser.add_argument("--n_ctg", type=int, default=1000, help="contingencies (lines closed at both ends, at random)")
     parser.add_argument("--seed", type=int, default=0, help="which lines")
     parser.add_argument("--batch_size", type=int, default=256, help="GPU slots")
-    parser.add_argument("--nb_iter", type=int, default=30, help="iteration budget of each inner solve")
-    parser.add_argument("--tol_mva", type=float, default=1e-6, help="Newton tolerance, MVA (lightsim2grid's unit)")
+    conv = parser.add_mutually_exclusive_group()
+    conv.add_argument("--loose", dest="conv", action="store_const", const="loose",
+                      help="OpenLoadFlow's default convergence criteria (the default)")
+    conv.add_argument("--tight", dest="conv", action="store_const", const="tight",
+                      help="tight criteria: 50 Newton iterations, 1e-10 pu, slack mismatch 1e-6 MW")
+    parser.set_defaults(conv="loose")
+    parser.add_argument("--nb_iter", type=int, default=None,
+                        help="iteration budget of each inner solve (default: the criteria's)")
+    parser.add_argument("--tol_mva", type=float, default=None,
+                        help="Newton tolerance, MVA (lightsim2grid's unit; default: the criteria's)")
     parser.add_argument("--ir_n_steps", type=int, default=1,
                         help="cuDSS iterative refinement steps per solve (gpusim2grid's default is 0; "
                              "1 keeps hard inner solves at lightsim2grid's iteration counts)")
@@ -51,20 +78,49 @@ def get_parser():
     parser.add_argument("--linear_solver", default="cudss",
                         help="batch linear solver: 'cudss' or 'own_lu' (the batched LU of our own; its order "
                              "from --reordering_alg, 'default' = lightsim2grid's constrained order)")
-    parser.add_argument("--cpu_algo", default="NROuter_KLU",
-                        help="lightsim2grid's reference algorithm (NROuter_KLUStaticPivot: its fallback "
+    parser.add_argument("--distributed_slack_inner_loop", action="store_true",
+                        help="NROuterDist_KLU: the slack shared inside each inner Newton (grid and reference)")
+    parser.add_argument("--cpu_algo", default=None,
+                        help="lightsim2grid's reference algorithm (default NROuter_KLU, NROuterDist_KLU with "
+                             "--distributed_slack_inner_loop; *_KLUStaticPivot: its fallback "
                              "factorizations predict the GPU's frozen-pivot failures)")
     return parser
 
 
-def load(network):
+# --tight: expe_gpus/src/test_launch.py's OLF_TIGHT_* (maxOuterLoopIterations stays OpenLoadFlow's)
+TIGHT = {"newtonRaphsonConvEpsPerEq": "1e-10", "slackBusPMaxMismatch": "1e-6",
+         "maxNewtonRaphsonIterations": "50"}
+OLF_KEYS = ("maxOuterLoopIterations", "maxNewtonRaphsonIterations", "newtonRaphsonConvEpsPerEq",
+            "slackBusPMaxMismatch")
+
+
+def convergence(mode):
+    """OpenLoadFlow parameters of the criteria (``loose`` or ``tight``), as bench_n1.sh builds
+    them, and what lightsim2grid / gpusim2grid get from them: (parameters, Newton budget,
+    tolerance in MVA, the criteria for printing)."""
+    import pypowsybl as pp
+    default = pp.loadflow.get_provider_parameters("OpenLoadFlow")["default"]
+    prov = {k: str(default[k]) for k in OLF_KEYS}
+    if mode == "tight":
+        prov.update(TIGHT)
+    elif mode != "loose":
+        raise ValueError(f"criteria {mode}: loose or tight")
+    prov["newtonRaphsonStoppingCriteriaType"] = "UNIFORM_CRITERIA"
+    params = pp.loadflow.Parameters(provider_parameters=prov)
+    tol_mva = float(prov["newtonRaphsonConvEpsPerEq"]) * 100.   # per unit on OLF's 100 MVA -> MVA
+    return params, int(prov["maxNewtonRaphsonIterations"]), tol_mva, {"mode": mode} | prov
+
+
+def load(network, params, algo="NROuter_KLU"):
     """The grid as lightsim2grid's own outer-loop comparison builds it
     (utils/olf_outer_compare.py): its default slack generator, half-open lines kept,
     zero-impedance branches fused, OpenLoadFlow's loading rules, its max-voltage-change
-    step scaling, NROuter_KLU with the default loops. Returns the grid and its start
+    step scaling, ``algo`` (NROuter_KLU or NROuterDist_KLU) with the default loops, their limits from the OpenLoadFlow
+    parameters ``params`` (set_olf_outer_loops, as bench_n1.sh). Returns the grid and its start
     (OpenLoadFlow's DC_VALUES: the angles of a DC load flow, 1 pu)."""
     import pypowsybl as pp
-    from lightsim2grid.network.from_pypowsybl import init as init_from_pypowsybl, OlfLoadingParameters
+    from lightsim2grid.network.from_pypowsybl import (init as init_from_pypowsybl, OlfLoadingParameters,
+                                                      set_olf_outer_loops)
     from lightsim2grid.network.from_pypowsybl._aux_add_slack import _default_distributed_slack
     from lightsim2grid.lightsim2grid_cpp import ScalingPolicyType
     if network.endswith((".xiidm", ".iidm", ".xz", ".zip")):
@@ -77,7 +133,8 @@ def load(network):
         grid = init_from_pypowsybl(net, gen_slack_id=gen_slack_id, sort_index=False, buses_for_sub=False,
                                    keep_half_open_lines=True, fuse_zero_impedance_branches=True, init_vm_pu=1.,
                                    olf_rules=OlfLoadingParameters(reactive_limits=True, svc_voltage_monitoring=True))
-    grid.change_algorithm("NROuter_KLU")
+    grid.change_algorithm(algo)
+    set_olf_outer_loops(grid, params)   # after the algorithm: changing it resets its loops
     grid.set_keep_vinit_at_group_controlled_buses(True)
     cfg = grid.get_ac_algo_config()
     ip, rp = list(cfg.int_params), list(cfg.real_params)
@@ -126,13 +183,19 @@ def print_breakdown(t, compute_ms):
 
 
 def main(args):
-    grid, v0 = load(args.network)
+    params, nb_iter, tol_mva, crit = convergence(args.conv)
+    args.nb_iter = nb_iter if args.nb_iter is None else args.nb_iter
+    args.tol_mva = tol_mva if args.tol_mva is None else args.tol_mva
+    print(f"convergence: {crit}, Newton budget {args.nb_iter}, tol {args.tol_mva:g} MVA")
+    algo = "NROuterDist_KLU" if args.distributed_slack_inner_loop else "NROuter_KLU"
+    args.cpu_algo = args.cpu_algo or algo
+    grid, v0 = load(args.network, params, algo)
     t0 = time.perf_counter()
     if grid.ac_pf(v0, args.nb_iter, args.tol_mva).size == 0:
         raise RuntimeError("the 'n' solve did not converge")
     print(f"n solve: {1e3 * (time.perf_counter() - t0):.1f} ms, "
           f"{grid.get_algo().get_outer_loop_stats().nb_outer_iterations} outer iterations, "
-          f"loops {[l.name() for l in grid.get_outer_loops()]}")
+          f"loops {[l.name() for l in grid.get_outer_loops()]}, algorithm {grid.get_algo_name()}")
     # lines closed at both ends, drawn at random (the same ones for a seed)
     closed = [i for i, line in enumerate(grid.get_lines()) if line.connected_global]
     rng = np.random.default_rng(args.seed)
@@ -145,6 +208,11 @@ def main(args):
                                 init_from_n_powerflow=args.init_from_n,
                                 handle_disconnected_grid=args.handle_disconnected_grid,
                                 tol=args.tol_mva / grid.get_sn_mva(), ir_n_steps=args.ir_n_steps,
+                                # the 'n' state is checked against tol_base (pu): never tighter than 1e-8
+                                # (tight: the 'n' solve stops right at tol, a recomputed mismatch may be an
+                                # ulp above it), as bench_n1.sh
+                                max_iter_base=args.nb_iter,
+                                tol_base=max(args.tol_mva / grid.get_sn_mva(), 1e-8),
                                 reordering_alg=args.reordering_alg, linear_solver=args.linear_solver)
     ca.tail_max_groups, ca.tail_group_size = args.tail_max_groups, args.tail_group_size
     ca.add_contingencies_by_branch_id([[c] for c in ctgs])
