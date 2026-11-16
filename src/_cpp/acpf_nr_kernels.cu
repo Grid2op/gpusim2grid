@@ -555,7 +555,24 @@ __global__ void fill_FQ_kernel(
 
 // =============================================================================
 // fill_J_kernel
+//
+// One thread per Ybus entry k (blockIdx.x), the batch slots on blockIdx.y
+// (grid-stride past the 65535 limit): no 64-bit div/mod per thread, and the
+// row search / map loads are done once for all the slots a thread visits.
+// With t = V_i * conj(Y_ij * V_j) and inv = 1 / |V|:
+//   dS/dVa = -j t,  dS/dVm = t * inv_j          (off-diagonal)
+//   diagonal (j == i), with c = V_i conj(I_i): dS/dVa += j c, dS/dVm += c * inv_i
+// the same derivatives as before (lightsim2grid's dSbus_dV), with 2 (resp. 3)
+// complex products and one rsqrt instead of 4 products, a hypot and two
+// divisions, and with the diagonal as a short added branch instead of a second
+// full path (warp divergence): that arithmetic, not memory, set the cost in
+// FP64 on GPUs with a reduced FP64 rate (~10x the FP32 time on an RTX A1000).
 // =============================================================================
+namespace {
+__device__ __forceinline__ double j_rsqrt(double x) { return rsqrt(x); }
+__device__ __forceinline__ float  j_rsqrt(float x)  { return rsqrtf(x); }
+}  // namespace
+
 __global__ void fill_J_kernel(
           cuda_real_type*  __restrict__ d_J_values,
     const cudaComplexType* __restrict__ d_V,
@@ -572,85 +589,56 @@ __global__ void fill_J_kernel(
     int nnz_J,
     int actual_batch)
 {
-    // tid/b promoted to 64-bit: actual_batch * nnz_Y (the total thread count
-    // for this launch) can exceed INT32_MAX/UINT32_MAX on large grids well
-    // before it exceeds any CUDA hardware grid-size limit, and blockIdx.x /
-    // blockDim.x / threadIdx.x are native 32-bit CUDA types -- tid itself
-    // would silently wrap before ever reaching the b*nnz_J offset below.
-    // Every downstream `b * <stride>` (n_bus, nnz_Y, nnz_J) promotes to
-    // ptrdiff_t automatically once b is ptrdiff_t, so nothing past this line
-    // needs its own cast. k stays plain int: it indexes single-system arrays
-    // of width nnz_Y, which fits int32 by construction.
-    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const ptrdiff_t b   = tid / nnz_Y;   // contingency index
-    const int       k   = static_cast<int>(tid % nnz_Y);   // nnz slot within one system
-    if (b >= actual_batch) return;
+    const int k = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;   // entry of one system
+    if (k >= nnz_Y || static_cast<int>(blockIdx.y) >= actual_batch) return;
 
-    // Row recovery: binary search on the single-system outer array using k.
-    // Row recovery uses the single-system outer array — no b offset needed.
+    const int m11 = d_map_j11[k], m12 = d_map_j12[k], m21 = d_map_j21[k], m22 = d_map_j22[k];
+    if ((m11 & m12 & m21 & m22) < 0) return;   // all four < 0: the entry feeds no J position
+
+    // Row recovery: binary search on the single-system outer array (once per
+    // thread, whatever the number of slots it visits; a precomputed row array
+    // measured no faster).
     int lo = 0, hi = n_bus;
     while (lo < hi) {
         const int mid = (lo + hi) / 2;
         if (d_Ybus_outer[mid + 1] <= k) lo = mid + 1;
         else                            hi = mid;
     }
-    const int i = lo;                  // local row within one system
-    const int j = d_Ybus_inner[k];    // local col within one system
+    const int i = lo;
+    const int j = d_Ybus_inner[k];
 
-    const cudaComplexType V_i  = d_V[b * n_bus + i];
-    const cudaComplexType V_j  = d_V[b * n_bus + j];
-    const cudaComplexType Y_ij = d_Ybus_values_batch[b * nnz_Y + k];  // patched value
-    const cudaComplexType I_i  = d_Ibus[b * n_bus + i];
+    using H = CudaFunHelper;
+    for (ptrdiff_t b = blockIdx.y; b < actual_batch; b += gridDim.y) {
+        const cudaComplexType V_i  = d_V[b * n_bus + i];
+        const cudaComplexType Y_ij = d_Ybus_values_batch[b * nnz_Y + k];  // patched value
 
-    // ---- dS/dVa ---------------------------------------------------------------
-    cudaComplexType dSdVa;
-    if (i == j) {
-        cudaComplexType tmp = CudaFunHelper::my_cuConj(
-            CudaFunHelper::my_cuCsub(I_i, CudaFunHelper::my_cuCmul(Y_ij, V_i)));
-        tmp = CudaFunHelper::my_cuCmul(V_i, tmp);
-        // multiply by j: (a + jb) * j = -b + ja
-        dSdVa = CudaFunHelper::my_make_cuComplex(
-            -CudaFunHelper::my_cuCimag(tmp),
-             CudaFunHelper::my_cuCreal(tmp));
-    } else {
-        cudaComplexType tmp = CudaFunHelper::my_cuConj(
-            CudaFunHelper::my_cuCmul(Y_ij, V_j));
-        tmp = CudaFunHelper::my_cuCmul(V_i, tmp);
-        // multiply by -j: (a + jb) * (-j) = b - ja
-        dSdVa = CudaFunHelper::my_make_cuComplex(
-             CudaFunHelper::my_cuCimag(tmp),
-            -CudaFunHelper::my_cuCreal(tmp));
+        // Off-diagonal and diagonal share t = V_i conj(Y_ij V_j) (j == i on the
+        // diagonal); the diagonal only adds c = V_i conj(I_i): one short
+        // divergent branch instead of two full ones (a warp holds ~8 diagonal
+        // entries out of 32 and ran both paths).
+        const cudaComplexType V_j = d_V[b * n_bus + j];
+        const cudaComplexType t = H::my_cuCmul(V_i, H::my_cuConj(H::my_cuCmul(Y_ij, V_j)));
+        const cuda_real_type re = H::my_cuCreal(V_j), im = H::my_cuCimag(V_j);
+        const cuda_real_type inv = j_rsqrt(re * re + im * im);
+        cuda_real_type dPa =  H::my_cuCimag(t);   // Re/Im of dS/dVa = -j t (+ j c)
+        cuda_real_type dQa = -H::my_cuCreal(t);
+        cuda_real_type pm  =  H::my_cuCreal(t);   // dS/dVm = (t (+ c)) * inv
+        cuda_real_type qm  =  H::my_cuCimag(t);
+        if (i == j) {
+            const cudaComplexType c = H::my_cuCmul(V_i, H::my_cuConj(d_Ibus[b * n_bus + i]));
+            dPa -= H::my_cuCimag(c);
+            dQa += H::my_cuCreal(c);
+            pm  += H::my_cuCreal(c);
+            qm  += H::my_cuCimag(c);
+        }
+        const cuda_real_type dPm = pm * inv, dQm = qm * inv;
+
+        cuda_real_type* J = d_J_values + b * nnz_J;
+        if (m11 >= 0) J[m11] = dPa;
+        if (m12 >= 0) J[m12] = dPm;
+        if (m21 >= 0) J[m21] = dQa;
+        if (m22 >= 0) J[m22] = dQm;
     }
-
-    // ---- dS/dVm ------------------------------------------------------------
-    cudaComplexType dSdVm;
-    if (i == j) {
-        const cuda_real_type absVi = CudaFunHelper::my_cuCabs(V_i);
-        const cudaComplexType Vnorm_i = CudaFunHelper::my_make_cuComplex(
-            CudaFunHelper::my_cuCreal(V_i) / absVi,
-            CudaFunHelper::my_cuCimag(V_i) / absVi);
-        const cudaComplexType t1 = CudaFunHelper::my_cuCmul(
-            V_i, CudaFunHelper::my_cuConj(CudaFunHelper::my_cuCmul(Y_ij, Vnorm_i)));
-        const cudaComplexType t2 = CudaFunHelper::my_cuCmul(
-            CudaFunHelper::my_cuConj(I_i), Vnorm_i);
-        dSdVm = CudaFunHelper::my_cuCadd(t1, t2);
-    } else {
-        const cuda_real_type absVj = CudaFunHelper::my_cuCabs(V_j);
-        const cudaComplexType Vnorm_j = CudaFunHelper::my_make_cuComplex(
-            CudaFunHelper::my_cuCreal(V_j) / absVj,
-            CudaFunHelper::my_cuCimag(V_j) / absVj);
-        dSdVm = CudaFunHelper::my_cuCmul(
-            V_i, CudaFunHelper::my_cuConj(CudaFunHelper::my_cuCmul(Y_ij, Vnorm_j)));
-    }
-
-    // ---- Scatter into d_J_values (batch-offset by b * nnz_J) --------------
-    // b is already ptrdiff_t (see tid/b above), so this product is computed
-    // in 64-bit -- no separate cast needed.
-    const ptrdiff_t J_base = b * nnz_J;
-    if (d_map_j11[k] >= 0) d_J_values[J_base + d_map_j11[k]] = CudaFunHelper::my_cuCreal(dSdVa);
-    if (d_map_j12[k] >= 0) d_J_values[J_base + d_map_j12[k]] = CudaFunHelper::my_cuCreal(dSdVm);
-    if (d_map_j21[k] >= 0) d_J_values[J_base + d_map_j21[k]] = CudaFunHelper::my_cuCimag(dSdVa);
-    if (d_map_j22[k] >= 0) d_J_values[J_base + d_map_j22[k]] = CudaFunHelper::my_cuCimag(dSdVm);
 }
 
 // =============================================================================

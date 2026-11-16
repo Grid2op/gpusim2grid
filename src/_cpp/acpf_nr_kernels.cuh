@@ -254,7 +254,8 @@ __global__ void fill_FQ_kernel(
 // fill_J_kernel
 //
 // Fills the Jacobian for a batch of systems (actual_batch=1 for single-system NR).
-// One thread per (contingency b, Ybus nnz k).
+// Ybus nnz k on blockIdx.x * blockDim.x + threadIdx.x, batch slot b on blockIdx.y
+// (grid-stride over b: launch with gridDim.y = min(actual_batch, 65535)).
 //
 // Row recovery: binary search on the SINGLE-SYSTEM d_Ybus_outer using k.
 //   Reusing the single-system outer avoids repeating the n_bus-wide search

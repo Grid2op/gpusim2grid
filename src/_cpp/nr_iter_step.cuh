@@ -516,7 +516,9 @@ inline void nr_fill_J_at_current_V(
     cudaStream_t cs)
 {
     nr_feature_zero_J(buf, nnz_J, batch, cs);
-    fill_J_kernel<<<nr_grid_size((long long)batch * nnz_Y, BS), BS, 0, cs>>>(
+    // 2D grid: Ybus entries on x, batch slots on y (the kernel strides past 65535).
+    const dim3 fill_J_grid((nnz_Y + BS - 1) / BS, static_cast<unsigned>(batch < 65535 ? batch : 65535));
+    fill_J_kernel<<<fill_J_grid, BS, 0, cs>>>(
         buf.d_J_values, buf.d_V, buf.d_Ibus,
         buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,

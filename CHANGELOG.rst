@@ -5,6 +5,8 @@ Change Log
 --------------------
 - [IMPROVED] The Newton voltage update applies its step as a product (no ``atan2``/``sin``/``cos`` per bus):
   4x faster in FP64 on GPUs with a reduced FP64 rate, same results to rounding.
+- [IMPROVED] The Jacobian fill: fewer FP64 operations per entry and no warp divergence on the diagonal,
+  4.6x faster in FP64 on an RTX A1000, same results to rounding.
 
 [0.3.0] 2026-11-16
 --------------------

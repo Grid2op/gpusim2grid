@@ -102,17 +102,53 @@ for step 2, where `fill_J` would stop paying its own hypot and divisions.
   continuous): max |dV| 5.8e-13 on converged rows, identical iteration counts and NaN pattern (one
   N-1 row diverges both ways). Full suite green.
 
-## 6. Next steps
+## 6. Step 2, first part (done, branch `perf_v_update`): `fill_J`'s arithmetic
 
-2. **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
-   SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an
-   injection sweep, like `sbus_stride`), J written in own LU's interleaved layout (which removes
-   `lu_tr_in` for J and lets `lu_scaled_tol` read J where it is written). The design cost is
-   everything else that writes J or F by slot-major position: the feature stamps (MultiSlack, HVDC
-   droop, VoltageControl, BranchControl / ShuntControl, outer-loop pins and holds), the masks
-   (`nr_apply_J_masks` / `nr_apply_F_masks`), `keep_final_jacobian` and the adjoint, which read J
-   slot-major. cuDSS keeps the slot-major path.
-3. **Skip the Sbus rebuild** of an injection sweep when its injections did not change (69 ms a call).
+Kept the slot-major output and the signature; three changes, each measured (chunked `nb_iter=4`,
+`fill_J` alone, 347 ms before):
+
+- **Fewer FP64 operations**: with `t = V_i·conj(Y_ij·V_j)` and `inv = 1/|V|`, dS/dVa = −j·t and
+  dS/dVm = t·inv_j off the diagonal; the diagonal adds `c = V_i·conj(I_i)` (dS/dVa += j·c,
+  dS/dVm += c·inv_i). 2 complex products and one `rsqrt` per entry instead of 4, a `hypot` and two
+  divisions. Plus a 2D grid (entries on x, slots on y, grid-stride past 65 535): no 64-bit div/mod
+  per thread, and an entry feeding no J position leaves at once. → 131 ms.
+- **The diagonal as an added term, not a second path**: a warp holds ~8 diagonal entries out of 32
+  and ran both full branches serially. → 76 ms, at the FP64 memory bound (~65-70 ms: 2x the FP32
+  time).
+- Tried and dropped: a precomputed row index per Ybus entry instead of the binary search (75.6 vs
+  76.5 ms). A first experiment pointed at the search, but it had changed the diagonal pattern too:
+  divergence was the cost.
+
+Same checks as step 1 (max |dV| 6.3e-13 against the original build, identical iteration counts and
+NaN pattern, full suite green).
+
+**Where a call stands** (time series continuous, 3 779 rows): whole call 1 167 → 894 ms; kernels
+996 → 711 ms: LU factor 257 + solves 111 (52 %), SpMV 77, `fill_F` 58, `fill_J` 58, V update 27,
+residual 9, `lu_tr_in` 64, `lu_scaled_tol` 27, `lu_tr_out` 8.
+
+## 7. Next steps
+
+- **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
+  SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an
+  injection sweep, like `sbus_stride`), J written in own LU's interleaved layout (which removes
+  `lu_tr_in` for J and lets `lu_scaled_tol` read J where it is written). The design cost is
+  everything else that writes J or F by slot-major position: the feature stamps (MultiSlack, HVDC
+  droop, VoltageControl, BranchControl / ShuntControl, outer-loop pins and holds), the masks
+  (`nr_apply_J_masks` / `nr_apply_F_masks`), `keep_final_jacobian` and the adjoint, which read J
+  slot-major. cuDSS keeps the slot-major path.
+- **Skip the Sbus rebuild** of an injection sweep when its injections did not change (69 ms a call).
+- **Cheaper, independent of the J layout** (F side only; features and masks write F after `fill_F`,
+  so nothing else moves):
+  - *SpMV + `fill_F` as one kernel* (135 ms of a call): the injection, `Ibus` (still read by
+    `fill_J`'s diagonal) and the P/Q mismatch in one pass, Ybus through a stride. cuSPARSE runs at the
+    memory bound on the block-diagonal matrix (88 MB of values + 22 MB of column indices per round);
+    a shared Ybus (time series) leaves mostly V / Ibus / Sbus traffic, a per-slot one at least drops
+    the block-diagonal indices and the second read of V and Ibus by `fill_F`.
+  - *The continuous residual pass computes F twice*: `_residual_pass` runs SpMV, `fill_F`, the
+    feature mismatch and the F masks at V_k, and the next round's Newton step runs the same sequence
+    at the same V_k for every slot that was not reloaded (or re-controlled by the outer loops):
+    ~half of the SpMV + `fill_F` time in continuous mode. Reusing F needs either a per-slot dirty
+    flag in those kernels or recomputing only on rounds that reloaded a slot.
 
 Then the LU itself (fusing factor and solve, interleaved storage end to end).
 
