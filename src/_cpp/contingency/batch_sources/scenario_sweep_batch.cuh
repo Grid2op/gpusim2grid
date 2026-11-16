@@ -95,6 +95,8 @@ struct ScenarioSweepBatch {
     // sbus_stride = n_bus → per-scenario row indexing in fill_FP/FQ kernels,
     // identical to InjectionBatch.
     static int sbus_stride(int n_bus) { return n_bus; }
+    // Each slot's Ybus is patched by its own row (tripped branches).
+    static constexpr bool ybus_same_in_every_slot() { return false; }
 
     // -------------------------------------------------------------------------
     // Host-side Ybus-patch preprocessing (filled in the ctor; uploaded in

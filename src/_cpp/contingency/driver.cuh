@@ -170,19 +170,15 @@ inline void run_nr_loop(
     for (int iter = 0; iter < nb_iter; ++iter) {
         NrIterTimings step;
 
-        // ①  SpMV: d_Ibus_batch = Ybus_batch · d_V_batch
+        // ①+②  d_Ibus_batch = Ybus_batch · d_V_batch and −[ΔP, ΔQ] into the
+        //       ledger P/Q rows (one fused kernel when possible, nr_spmv_fill_F;
+        //       timed as t_spmv, t_fill_F then holds the feature mismatch + masks)
         timer.start();
-        spmv.spmv();
+        nr_spmv_fill_F(spmv, buf, n_bus, nnz_Y, dim_J, batch_size, cs);
         step.t_spmv = timer.stop_ms();
 
-        // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
+        // ②  F: feature contributions and masks
         timer.start();
-        fill_FP_kernel<<<nr_grid_size((long long)batch_size * buf.n_p, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
-            buf.n_p, n_bus, dim_J, batch_size, buf.sbus_stride);
-        fill_FQ_kernel<<<nr_grid_size((long long)batch_size * buf.n_q, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
-            buf.n_q, n_bus, dim_J, batch_size, buf.sbus_stride);
         nr_feature_mismatch(buf, n_bus, dim_J, batch_size, cs);
         // handle_disconnected_grid / PV pins / stranded controllers: rewrite
         // the stranded voltage rows, then zero the masked rows of F (the J

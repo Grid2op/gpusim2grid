@@ -515,6 +515,41 @@ __global__ void hvdc_fill_feature_kernel(
     int nnz_J,
     int actual_batch);
 
+// ---------------------------------------------------------------------------
+// spmv_fill_F_kernel
+//
+// The batched SpMV and fill_FP / fill_FQ in one pass: per (bus i, slot b),
+//   Ibus[b, i] = Σ_k Y[b, k] · V[b, inner[k]]   over row i of the slot's Ybus
+//   F[b, p_row_of_bus[i]] = −(Re(V_i·conj(Ibus_i)) − Re(Sbus_i))   if ≥ 0
+//   F[b, q_row_of_bus[i]] = −(Im(V_i·conj(Ibus_i)) − Im(Sbus_i))   if ≥ 0
+// i.e. what cuSPARSE's block-diagonal SpMV followed by the two fill kernels
+// write, without the block-diagonal column indices and without reading V and
+// Ibus back. Only valid when no bus owns two P rows or two Q rows
+// (AcPfNrState::fused_F_ok). Ybus values per slot, stride nnz_Y (the patched
+// copy fill_J reads) or, ybus_stride 0, one copy shared by every slot; Sbus
+// as fill_FP (stride 0 = shared).
+// Thread t handles bus d_bus_order[t] (nullptr: bus t). With a shared Ybus,
+// the buses by row length: a warp otherwise waits for its longest row (2.7x
+// the useful FP64 work on case2869: 1.97 -> 1.27 ms per 512-slot launch on an
+// RTX A1000). Not with a per-slot Ybus: the sorted rows of one warp are then
+// scattered over the slot's copy and the reads stop coalescing (3.1 ms).
+// Grid: buses on x, slots on y (grid-stride: gridDim.y = min(n_slots, 65535)).
+// ---------------------------------------------------------------------------
+__global__ void spmv_fill_F_kernel(
+          cuda_real_type*  __restrict__ d_F,
+          cudaComplexType* __restrict__ d_Ibus,
+    const cudaComplexType* __restrict__ d_V,
+    const cudaComplexType* __restrict__ d_Sbus,
+    int sbus_stride,
+    const int*             __restrict__ d_Ybus_outer,
+    const int*             __restrict__ d_Ybus_inner,
+    const cudaComplexType* __restrict__ d_Ybus_values_batch,
+    int ybus_stride,
+    const int*             __restrict__ d_p_row_of_bus,
+    const int*             __restrict__ d_q_row_of_bus,
+    const int*             __restrict__ d_bus_order,
+    int n_bus, int dim_J, int n_slots);
+
 // ===========================================================================
 // VoltageControl (remote gen + SVC) — Phase 4 (bordered formulation)
 //

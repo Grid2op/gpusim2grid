@@ -554,6 +554,53 @@ __global__ void fill_FQ_kernel(
 }
 
 // =============================================================================
+// spmv_fill_F_kernel -- see the header. One thread per (bus row, slot), a
+// warp being 32 consecutive rows of one slot.
+// =============================================================================
+__global__ void spmv_fill_F_kernel(
+          cuda_real_type*  __restrict__ d_F,
+          cudaComplexType* __restrict__ d_Ibus,
+    const cudaComplexType* __restrict__ d_V,
+    const cudaComplexType* __restrict__ d_Sbus,
+    int sbus_stride,
+    const int*             __restrict__ d_Ybus_outer,
+    const int*             __restrict__ d_Ybus_inner,
+    const cudaComplexType* __restrict__ d_Ybus_values_batch,
+    int ybus_stride,
+    const int*             __restrict__ d_p_row_of_bus,
+    const int*             __restrict__ d_q_row_of_bus,
+    const int*             __restrict__ d_bus_order,
+    int n_bus, int dim_J, int n_slots)
+{
+    const int t = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= n_bus || static_cast<int>(blockIdx.y) >= n_slots) return;
+    const int i = d_bus_order != nullptr ? d_bus_order[t] : t;
+    const int k0 = d_Ybus_outer[i], k1 = d_Ybus_outer[i + 1];
+    const int pr = d_p_row_of_bus[i], qr = d_q_row_of_bus[i];
+
+    using H = CudaFunHelper;
+    for (ptrdiff_t b = blockIdx.y; b < n_slots; b += gridDim.y) {
+        const cudaComplexType* V = d_V + b * n_bus;
+        const cudaComplexType* Y = d_Ybus_values_batch + b * ybus_stride;
+        cuda_real_type ir = 0, ii = 0;
+        for (int k = k0; k < k1; ++k) {
+            const cudaComplexType y = Y[k];
+            const cudaComplexType v = V[d_Ybus_inner[k]];
+            ir += H::my_cuCreal(y) * H::my_cuCreal(v) - H::my_cuCimag(y) * H::my_cuCimag(v);
+            ii += H::my_cuCreal(y) * H::my_cuCimag(v) + H::my_cuCimag(y) * H::my_cuCreal(v);
+        }
+        d_Ibus[b * n_bus + i] = H::my_make_cuComplex(ir, ii);
+        if ((pr & qr) < 0) continue;   // both < 0: no P nor Q row
+        const cudaComplexType Vi = V[i];
+        const cudaComplexType sb = d_Sbus[b * sbus_stride + i];
+        const cuda_real_type vr = H::my_cuCreal(Vi), vi = H::my_cuCimag(Vi);
+        // S = V_i * conj(I_i)
+        if (pr >= 0) d_F[b * dim_J + pr] = -((vr * ir + vi * ii) - H::my_cuCreal(sb));
+        if (qr >= 0) d_F[b * dim_J + qr] = -((vi * ir - vr * ii) - H::my_cuCimag(sb));
+    }
+}
+
+// =============================================================================
 // fill_J_kernel
 //
 // One thread per Ybus entry k (blockIdx.x), the batch slots on blockIdx.y

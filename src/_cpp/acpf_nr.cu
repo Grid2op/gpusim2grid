@@ -798,6 +798,30 @@ AcPfNrState::AcPfNrState(
     upload_h2d(d_theta_cols,  theta_cols.data(),  n_theta, cs);
     upload_h2d(d_vm_buses,    vm_buses.data(),    n_vm,    cs);
     upload_h2d(d_vm_cols,     vm_cols.data(),     n_vm,    cs);
+    {
+        // Per-bus P / Q rows for the fused SpMV + fill_F of the batch loop:
+        // only when each bus owns at most one P row and one Q row (the
+        // ledger's compact lists normally guarantee it; otherwise the batch
+        // keeps cuSPARSE + fill_FP / fill_FQ, which write every pair).
+        std::vector<int> pr(n_bus, -1), qr(n_bus, -1);
+        bool ok = true;
+        for (int i = 0; i < n_p && ok; ++i) { int& r = pr[p_buses[i]]; ok = (r < 0); r = p_rows[i]; }
+        for (int i = 0; i < n_q && ok; ++i) { int& r = qr[q_buses[i]]; ok = (r < 0); r = q_rows[i]; }
+        fused_F_ok = ok;
+        if (ok) {
+            upload_h2d(d_p_row_of_bus, pr.data(), n_bus, cs);
+            upload_h2d(d_q_row_of_bus, qr.data(), n_bus, cs);
+            // Buses by Ybus row length (stable): a warp of the fused kernel
+            // then holds rows of (nearly) one length instead of waiting for
+            // its longest row (2.7x the useful FP64 work on case2869).
+            std::vector<int> order(n_bus);
+            for (int i = 0; i < n_bus; ++i) order[i] = i;
+            const int* yo = Ybus_rm.outerIndexPtr();
+            std::stable_sort(order.begin(), order.end(),
+                             [yo](int a, int b) { return yo[a + 1] - yo[a] < yo[b + 1] - yo[b]; });
+            upload_h2d(d_bus_order, order.data(), n_bus, cs);
+        }
+    }
 
     // Scatter maps (H→D)
     upload_h2d(d_map_j11, h_map_j11.data(), nnz_Y, cs);

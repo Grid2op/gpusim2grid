@@ -189,6 +189,12 @@ struct AcPfNrState {
     thrust::device_vector<int> d_q_buses,     d_q_rows;      // Q equations
     thrust::device_vector<int> d_theta_buses, d_theta_cols;  // theta unknowns
     thrust::device_vector<int> d_vm_buses,    d_vm_cols;     // vm unknowns
+    // Per-bus P / Q row (-1: none), [n_bus]: the batched spmv_fill_F_kernel.
+    // Uploaded only when no bus owns two P rows or two Q rows (fused_F_ok).
+    thrust::device_vector<int> d_p_row_of_bus, d_q_row_of_bus;
+    // [n_bus] the buses by Ybus row length: the fused kernel's thread order.
+    thrust::device_vector<int> d_bus_order;
+    bool fused_F_ok = false;
 
     // -------------------------------------------------------------------------
     // Host-side masking tables (handle_disconnected_grid). Built once in the

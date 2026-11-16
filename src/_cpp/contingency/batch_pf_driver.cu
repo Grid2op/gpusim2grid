@@ -1473,6 +1473,17 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
         thrust::raw_pointer_cast(base.d_vc_feat_val.data()),
         thrust::raw_pointer_cast(d_vc_q_batch.data()),
     };
+    if (base.fused_F_ok) {   // see spmv_fill_F_kernel
+        buf.d_p_row_of_bus = thrust::raw_pointer_cast(base.d_p_row_of_bus.data());
+        buf.d_q_row_of_bus = thrust::raw_pointer_cast(base.d_q_row_of_bus.data());
+        // Every slot the same Ybus: the source's own tile, and nothing patches
+        // a slot (BranchControl / ShuntControl only exist with the outer loops).
+        if (BatchSource::ybus_same_in_every_slot() && outer_hook_ == nullptr
+            && base.n_bc == 0 && base.n_sc == 0) {
+            buf.ybus_shared = true;
+            buf.d_bus_order = thrust::raw_pointer_cast(base.d_bus_order.data());
+        }
+    }
 
     // NR step-scaling (MaxVoltageChange) -- off (nullptr scratch) unless
     // enabled, matching every other opt-in extension above.
@@ -2033,27 +2044,11 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
     const int nnz_J = base.nnz_J;
     timer.start();
     {
-        _spmv().spmv();
+        // SpMV + the P/Q rows of F (buf's d_F / d_V / d_Ibus are d_F_batch /
+        // d_V_batch / d_Ibus_batch)
+        nr_spmv_fill_F(_spmv(), buf, n_bus, base.nnz_Y, dim_J, n_slots, cs);
 
         if (n_slots > 0) {
-            fill_FP_kernel<<<
-                nr_grid_size((long long)n_slots * base.n_p, BS), BS, 0, cs>>>(
-                thrust::raw_pointer_cast(d_F_batch.data()),
-                thrust::raw_pointer_cast(d_V_batch.data()),
-                thrust::raw_pointer_cast(d_Ibus_batch.data()),
-                buf.d_Sbus,
-                thrust::raw_pointer_cast(base.d_p_buses.data()),
-                thrust::raw_pointer_cast(base.d_p_rows.data()),
-                base.n_p, n_bus, dim_J, n_slots, buf.sbus_stride);
-            fill_FQ_kernel<<<
-                nr_grid_size((long long)n_slots * base.n_q, BS), BS, 0, cs>>>(
-                thrust::raw_pointer_cast(d_F_batch.data()),
-                thrust::raw_pointer_cast(d_V_batch.data()),
-                thrust::raw_pointer_cast(d_Ibus_batch.data()),
-                buf.d_Sbus,
-                thrust::raw_pointer_cast(base.d_q_buses.data()),
-                thrust::raw_pointer_cast(base.d_q_rows.data()),
-                base.n_q, n_bus, dim_J, n_slots, buf.sbus_stride);
             // Augmented-feature contributions to the final residual (slack /
             // HVDC mismatch + VC bordered custom rows), using the converged state.
             nr_feature_mismatch(buf, n_bus, dim_J, n_slots, cs);

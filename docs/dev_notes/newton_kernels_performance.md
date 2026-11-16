@@ -126,7 +126,39 @@ NaN pattern, full suite green).
 996 → 711 ms: LU factor 257 + solves 111 (52 %), SpMV 77, `fill_F` 58, `fill_J` 58, V update 27,
 residual 9, `lu_tr_in` 64, `lu_scaled_tol` 27, `lu_tr_out` 8.
 
-## 7. Next steps
+## 7. Step 2, second part (done, branch `perf_v_update`): SpMV + `fill_F` in one kernel
+
+`spmv_fill_F_kernel` (`acpf_nr_kernels.cu`, called through `nr_spmv_fill_F` by the batched loop and
+`_residual_pass`): one thread per (bus, slot) sums its Ybus row against V, writes `Ibus` (still read
+by `fill_J`'s diagonal) and both mismatch rows of its bus. Needs each bus to own at most one P row
+and one Q row (`AcPfNrState::fused_F_ok`, built from the ledger's pair lists; otherwise the old
+path runs). The single-system solve and the adjoint keep cuSPARSE. Measured on an idle machine
+(case2869, 3 779 rows, 512 slots, kernel time per call, nsys):
+
+| | cuSPARSE SpMV + `fill_FP` + `fill_FQ` | fused | fused, shared Ybus, sorted rows |
+|---|---|---|---|
+| time series, continuous, own LU | 67 + 30 + 28 = 127 ms | 98 ms | **64 ms** |
+| N-1, continuous, own LU | 66 + 21 + 20 = 108 ms | **96 ms** | (per-slot Ybus) |
+
+- Per launch the fused kernel moves ~350 KB per slot (Ybus values 173 KB, V, `Ibus`, Sbus and F
+  ~45 KB each), ~1 ms of DRAM traffic on this GPU, but took 2 ms: it is FP64-bound by
+  **divergence**. A warp waits for its longest row, 2.7x the useful work on this grid (row lengths
+  1 to 16, mean 3.8); 2, 4 or 8 lanes per row only bring that to 2.3-2.4x.
+- **Rows sorted by length** (`AcPfNrState::d_bus_order`, the thread order) bring it near 1x, but
+  only pay when Ybus is shared: with a per-slot copy a warp's sorted rows are scattered over it and
+  the reads stop coalescing (3.1 ms per launch, worse than unsorted).
+- **A shared Ybus** alone gives little (1.97 -> 1.88 ms); with the sorted order, 1.27 ms. An
+  injection sweep tiles one Ybus into every slot and only the outer loops patch it
+  (BranchControl / ShuntControl), so `NrIterBuffers::ybus_shared` is set when the source says so
+  (`ybus_same_in_every_slot()`, `InjectionBatch` only), there is no outer hook and no
+  BranchControl / ShuntControl. `fill_J` with the shared copy: 60.4 -> 58.9 ms, not kept (its cost
+  is the J writes).
+- Whole call (3 runs each, same session of measurements): time series continuous own LU 891-904 ->
+  820-824 ms, N-1 continuous own LU 872-885 -> 844 ms, the cuDSS configurations ~1-2 % (their LU
+  dominates). Results: max |dV| <= 5.5e-13 against the original build on the four configurations,
+  identical iteration counts and NaN rows; full suite green.
+
+## 8. Next steps
 
 - **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
   SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an
@@ -137,13 +169,7 @@ residual 9, `lu_tr_in` 64, `lu_scaled_tol` 27, `lu_tr_out` 8.
   (`nr_apply_J_masks` / `nr_apply_F_masks`), `keep_final_jacobian` and the adjoint, which read J
   slot-major. cuDSS keeps the slot-major path.
 - **Skip the Sbus rebuild** of an injection sweep when its injections did not change (69 ms a call).
-- **Cheaper, independent of the J layout** (F side only; features and masks write F after `fill_F`,
-  so nothing else moves):
-  - *SpMV + `fill_F` as one kernel* (135 ms of a call): the injection, `Ibus` (still read by
-    `fill_J`'s diagonal) and the P/Q mismatch in one pass, Ybus through a stride. cuSPARSE runs at the
-    memory bound on the block-diagonal matrix (88 MB of values + 22 MB of column indices per round);
-    a shared Ybus (time series) leaves mostly V / Ibus / Sbus traffic, a per-slot one at least drops
-    the block-diagonal indices and the second read of V and Ibus by `fill_F`.
+- **Cheaper, independent of the J layout** (F side only):
   - *The continuous residual pass computes F twice*: `_residual_pass` runs SpMV, `fill_F`, the
     feature mismatch and the F masks at V_k, and the next round's Newton step runs the same sequence
     at the same V_k for every slot that was not reloaded (or re-controlled by the outer loops):
