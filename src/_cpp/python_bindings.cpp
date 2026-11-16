@@ -1939,6 +1939,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("set_v_group_of_row", &ContingencyAnalysisSession::set_v_group_of_row, pybind11::arg("group_of_row"),
          "The group every row of the next run() starts from (one per row; -1 = the base case); "
          "a group's non-finite entries start from the base case.")
+    .def("add_row_triplets", &ContingencyAnalysisSession::add_row_triplets, pybind11::arg("rows"),
+         "Per-row Ybus value changes after build_contingencies*(): one list of (row, col, re, im) per "
+         "row, solver numbering, subtracted from the row's Ybus as the trips' own (a change to y_new is "
+         "y_base - y_new). Every entry must be in the base pattern.")
     .def("clear_v_init_groups", &ContingencyAnalysisSession::clear_v_init_groups,
          "Every row starts from the base-case voltages again.")
     .def_property_readonly("has_v_init_groups", &ContingencyAnalysisSession::has_v_init_groups)

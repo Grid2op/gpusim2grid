@@ -25,6 +25,8 @@ Change Log
 - [ADDED] ``ContingencyAnalysisGPU`` strategies: ``set_actions`` / ``add_strategies`` (a contingency then
   actions, solved as one more row), two phases with ``compute(rows=...)`` and ``select_strategies``,
   ``strategy_warm_start`` (one start per contingency, kept on the device), ``get_max_loading``.
+- [ADDED] Strategy actions may change transformer values (``trafo_ratio`` / ``trafo_shift_deg``): per-row
+  Ybus values on the base pattern; the changed transformer's flows and current violations use the row's.
 - [ADDED] C++/CUDA unit tests (``tests/cpp``, ctest), opt-in with ``-DGPUSIM2GRID_BUILD_TESTS=ON``; a
   test needing a GPU is skipped without one.
 

@@ -56,6 +56,7 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 // Forward-declare CUDA-dependent types to avoid pulling CUDA headers
@@ -458,6 +459,13 @@ struct ContingencyAnalysisSession {
     void set_v_init_groups_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows,
                                     int n_src_rows, int n_bus_src);
     void set_v_group_of_row(const std::vector<int>& group_of_row);
+    // Per-row Ybus value changes on top of the rows build_contingencies*() made (a
+    // transformer's ratio / phase shift: its four entries, step B.1 of the topology actions):
+    // one list of (row, col, re, im) per row, in solver bus numbering, SUBTRACTED from the
+    // row's Ybus like the trips' own triplets (so a change to y_new is y_base - y_new). Every
+    // (row, col) must be in the base pattern. Call after build_contingencies*(); the next
+    // run() builds a new source.
+    void add_row_triplets(const std::vector<std::vector<std::tuple<int, int, double, double>>>& rows);
     void clear_v_init_groups();
     bool has_v_init_groups() const { return has_v_groups_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real

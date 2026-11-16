@@ -41,11 +41,12 @@ from .._ls2g_utils import (
 from .. import _gpusim2grid as _cpp
 from .._outer_loops import _check_outer_loops_args
 from ._reactive_limits import ReactiveLimitsStatus
-from ._strategies import RowMap, compile_action, strategy_row
+from ._strategies import BranchY, RowMap, compile_action, strategy_row
 from ._violation_threshold import ViolationThresholdFacadeMixin
 
 if TYPE_CHECKING:
     from ..actions import Action
+    from ._limit_violations import LimitViolation
     from ._strategies import CompiledAction, CtgElements, Strategy
 
 #: what ``compute(rows=...)`` runs
@@ -590,6 +591,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._rowmap: RowMap | None = None
         self._flows_done: bool = False
         self._strategy_warm_start: bool = False
+        # the rows of the last run whose actions change branch values: {row: {branch: new y}}
+        self._row_branch_y: dict[int, dict[int, BranchY]] = {}
+        self._branch_args: tuple[Any, ...] | None = None
         # phase 1's converged contingencies (their voltages are the session's start groups)
         self._ctg_start_ok: np.ndarray | None = None
 
@@ -851,6 +855,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             raise ValueError("a strategy refers to an action index the new list does not have")
         self._actions = actions
         self._compiled = [compile_action(self._grid, a, n_lines) for a in actions]
+        # branch ends (solver numbering), nominal voltages, sn_mva: row triplets and flow fix-ups
+        self._branch_args = extract_branch_data(self._grid)[0]
         self._rowmap = None
 
     def add_strategies(
@@ -982,33 +988,47 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         out_str: bool = rows in (None, "strategies")
         n_out: int = (len(ctg) if out_ctg else 0) + (len(self._strategies) if out_str else 0)
         reasons: list[str] = [""] * n_out
+        off: int = 0
         session_rows: list[int] = []
         session_list: list[CtgElements] = []
+        # per session row, its Ybus value changes (the contingency rows have none)
+        session_triplets: list[list[tuple[int, int, float, float]]] = []
+        self._row_branch_y = {}
         if out_ctg:
             session_rows += range(len(ctg))
             session_list += ctg
+            session_triplets += [[] for _ in ctg]
         if out_str:
             sel = self._strategy_selected
             off: int = len(ctg) if out_ctg else 0
             for k, (ci, acts) in enumerate(self._strategies):
                 if sel is not None and not sel[k]:
                     continue
-                row, why = strategy_row(ctg[ci], [self._compiled[a] for a in acts], n_lines)
-                if row is None:
-                    reasons[off + k] = why
+                assert self._branch_args is not None  # set by set_actions
+                bf, bt = self._branch_args[0], self._branch_args[1]
+                row = strategy_row(ctg[ci], [self._compiled[a] for a in acts], n_lines, bf, bt)
+                if row.elements is None:
+                    reasons[off + k] = row.reason
                     continue
                 session_rows.append(off + k)
-                session_list.append(row)
+                session_list.append(row.elements)
+                session_triplets.append(row.triplets)
+                if row.branch_y:
+                    self._row_branch_y[off + k] = row.branch_y
         self._rowmap = RowMap(n_out, np.asarray(session_rows, dtype=np.int64), reasons)
         self._last_rows = rows
         self._rl_result = None
         session = self._inner._s
         if session_list:
             self._push_rows(session_list)
+            if any(session_triplets):
+                session.add_row_triplets(session_triplets)
             self._inner.batch_size = int(batch_size)
             if rows == "strategies" and session.has_v_init_groups:
                 # the contingencies' voltages of phase 1 are groups 0..C-1 (-1: not converged)
-                ok: np.ndarray = self._ctg_start_ok if warm else np.zeros(len(ctg), dtype=bool)
+                ok: np.ndarray = (
+                    self._ctg_start_ok if warm and self._ctg_start_ok is not None else np.zeros(len(ctg), dtype=bool)
+                )
                 ctg_of_row: list[int] = [self._strategies[r - off][0] for r in session_rows]
                 session.set_v_group_of_row([c if ok[c] else -1 for c in ctg_of_row])
             elif session.has_v_init_groups:
@@ -1033,6 +1053,86 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             self._push_contingencies(list(elements))
         finally:
             self._ctg_elements, self._ctg_branch_ids = saved
+
+    def _changed_branch_violations(
+        self, rows: list[list[LimitViolation]]
+    ) -> tuple[list[list[LimitViolation]], dict[int, int]]:
+        """``rows`` with the CURRENT records of the branches whose values a row changes replaced
+        by the ones of the row's own admittance (the device check uses the base one), and the
+        change of each such row's current count. Records keep the effective limit here
+        (``_restore_limits`` puts the configured one back); a row's current records stay most
+        severe first."""
+        from ._limit_violations import LimitViolation, LimitViolationType, ViolationElementType
+
+        if not self._row_branch_y:
+            return rows, {}
+        _, _, lim1, lim2, n_lines = self._configured_limits()
+        t: float = self._violation_threshold
+        rel_tol: float = float(self._inner.violation_rel_tol)
+        V: np.ndarray = self.V_results.to_numpy().reshape(len(rows), -1)
+        delta: dict[int, int] = {}
+        for r, changed in self._row_branch_y.items():
+
+            def branch_of(v: LimitViolation) -> int:
+                return v.element_id + (int(n_lines) if v.element_type == ViolationElementType.TRAFO else 0)
+
+            current = LimitViolationType.CURRENT
+            kept = [v for v in rows[r] if not (v.violation_type == current and branch_of(v) in changed)]
+            added: list[LimitViolation] = []
+            for b, y in changed.items():
+                is_trafo: bool = b >= int(n_lines)
+                for side, lim in ((1, lim1), (2, lim2)):
+                    limit_ka = float(lim[b]) * t
+                    if not np.isfinite(limit_ka):
+                        continue
+                    ka: float = self._branch_amps(V[r], b, y, side) * 1e-3
+                    if ka > limit_ka * (1.0 + rel_tol):
+                        added.append(LimitViolation(
+                            ViolationElementType.TRAFO if is_trafo else ViolationElementType.LINE,
+                            b - int(n_lines) if is_trafo else b, side, current, ka, limit_ka))
+            removed: int = len(rows[r]) - len(kept)
+            currents = sorted([v for v in kept if v.violation_type == current] + added,
+                              key=lambda v: -abs(v.value / v.limit - 1.0))
+            others = [v for v in kept if v.violation_type != current]
+            rows[r] = currents + others
+            delta[r] = len(added) - removed
+        return rows, delta
+
+    def _flow_buffer(self, buf: DeviceBuffer, side: int) -> DeviceBuffer:
+        """The amps of one side on the caller's rows, the branches whose values a row changes
+        recomputed with the row's own admittance (the session's flows use the base one)."""
+        nb: int | None = self.n_branches
+        if nb is None:
+            return buf
+        expanded = self._expanded_buffer(buf, nb, np.nan)
+        if not self._row_branch_y:
+            return expanded
+
+        def fetch() -> np.ndarray:
+            amps: np.ndarray = expanded.to_numpy().reshape(-1, nb).copy()
+            V: np.ndarray = self.V_results.to_numpy().reshape(amps.shape[0], -1)
+            for r, changed in self._row_branch_y.items():
+                for b, y in changed.items():
+                    amps[r, b] = self._branch_amps(V[r], b, y, side)
+            return amps.ravel()
+
+        return DeviceBuffer(fetch, expanded.shape, expanded.dtype)
+
+    def _branch_amps(self, V: np.ndarray, b: int, y: BranchY, side: int) -> float:
+        """|I| (A) at ``side`` of branch ``b`` with admittance ``y``, as compute_branch_flows_kernel:
+        a Kron-reduced end has V = 0 and no current; the base current uses the nominal voltage of
+        the side's bus (the other end's when it is Kron-reduced)."""
+        assert self._branch_args is not None
+        branch_from, branch_to, _, _, _, _, bus_vn_kv, sn_mva = self._branch_args
+        f, t = int(branch_from[b]), int(branch_to[b])
+        own, other = (f, t) if side == 1 else (t, f)
+        if own < 0:
+            return 0.0
+        vf: complex = complex(V[f]) if f >= 0 else 0j
+        vt: complex = complex(V[t]) if t >= 0 else 0j
+        i_pu: complex = y[0] * vf + y[1] * vt if side == 1 else y[2] * vf + y[3] * vt
+        vn: float = float(bus_vn_kv[own] if own >= 0 else bus_vn_kv[other])
+        return abs(i_pu) * float(sn_mva) * 1e3 / (np.sqrt(3.0) * vn)
 
     def _expanded_buffer(self, buf: DeviceBuffer, width: int, fill: Any) -> DeviceBuffer:
         """``buf`` (session rows x width, flat) on the caller's rows when a row map is live."""
@@ -1392,6 +1492,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._rl_result is not None:
             for r, v in self._rl_result["viol"].items():
                 out[r] = v
+        out, _ = self._changed_branch_violations(out)
         return self._restore_limits(out)
 
     def get_violations_truncated(self):
@@ -1415,6 +1516,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             raw = self._inner.get_violation_counts() if len(self._rowmap.session_rows) else None
             out = {k: self._rowmap.expand(raw[k] if raw else np.zeros(0, dtype=np.int64), -1)
                    for k in ("low_voltage", "high_voltage", "current")}
+            if self._row_branch_y:
+                rows = self._session_rows_or_empty(self._inner.get_violations, list)
+                _, delta = self._changed_branch_violations(rows)
+                for r, d in delta.items():
+                    out["current"][r] += d
         if self._rl_result is not None:
             for r, cnt in self._rl_result["viol_counts"].items():
                 for k, v in cnt.items():
@@ -1494,12 +1600,12 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     @property
     def or_amps(self):
         """DeviceBuffer: (n_ctg * n_branches,) origin terminal amps."""
-        return self._expanded_buffer(self._inner.or_amps, self.n_branches, np.nan)
+        return self._flow_buffer(self._inner.or_amps, side=1)
 
     @property
     def ex_amps(self):
         """DeviceBuffer: (n_ctg * n_branches,) extremity terminal amps."""
-        return self._expanded_buffer(self._inner.ex_amps, self.n_branches, np.nan)
+        return self._flow_buffer(self._inner.ex_amps, side=2)
 
     @property
     def V_results(self):

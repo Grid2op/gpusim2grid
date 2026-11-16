@@ -371,10 +371,10 @@ plan), factor / solve time per batch, before and after.
 | D | `Action` format (`set_bus`-style moves, branch values), results | 1 | done |
 | A | strategy rows (union of trips), two phases (`rows=`, `select_strategies`), max loading, `violation_threshold` | 1 | done (Python row map over today's session; max loading reduced on the host for now) |
 | A2 | warm start: one start V per contingency on the device, gathered at slot load | 1 | done (C++ unit tests for the gather) |
-| A3 | device-side max loading at eviction, `store_voltages` | 1 | designed (`_evict` hook, shared current helper) |
 | A4 | the contingency session's warm path (new rows on the live driver, chunked) | 1 | to do (continuous rebuilds anyway, upstream A.6) |
-| B.1 | per-row branch admittance (taps) | 2 | to do |
+| B.1 | per-row branch admittance (taps) | 2 | done (row triplets in C++; the changed branch's flows / current violations recomputed on the host) |
 | B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | to do |
+| A3 | device-side max loading at eviction, `store_voltages` (user: at the end of the roadmap) | last | designed (`_evict` hook, shared current helper) |
 | — | switch actions → moves (lightsim2grid detailed topology), pattern banks; outer loops / groups / gradients with moves | later | |
 
 The tests come first (`tests/python/topology_actions/`, red until their step lands), one file

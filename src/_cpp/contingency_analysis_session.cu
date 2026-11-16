@@ -7,6 +7,8 @@
 // =============================================================================
 
 #include "contingency_analysis_session.hpp"
+
+#include <tuple>
 #include "gen_contingency_rows.hpp"   // gen_contingency::prepare_rows / check_rows / row_slack_weights
 #include "ledger_extend.hpp"     // move_reference, ledger_reference_bus, add_switchable_vm_buses
 #include "contingency/physical_checks_impl.cuh"
@@ -1377,6 +1379,28 @@ void ContingencyAnalysisSession::set_v_group_of_row(const std::vector<int>& grou
             throw std::runtime_error("ContingencyAnalysisSession::set_v_group_of_row: group "
                                      + std::to_string(g) + " outside [-1, " + std::to_string(n_v_groups_) + ")");
     v_group_of_row_ = group_of_row;
+}
+
+void ContingencyAnalysisSession::add_row_triplets(
+    const std::vector<std::vector<std::tuple<int, int, double, double>>>& rows)
+{
+    static const char* who = "ContingencyAnalysisSession::add_row_triplets";
+    if (!has_contingencies_)
+        throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
+    if (rows.size() != contingencies_.size())
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(rows.size()) + " lists for "
+                                 + std::to_string(contingencies_.size()) + " rows");
+    const int n_bus = base_state_->n_bus;
+    for (const auto& row : rows)
+        for (const auto& t : row)
+            if (std::get<0>(t) < 0 || std::get<0>(t) >= n_bus || std::get<1>(t) < 0 || std::get<1>(t) >= n_bus)
+                throw std::runtime_error(std::string(who) + ": entry (" + std::to_string(std::get<0>(t)) + ", "
+                                         + std::to_string(std::get<1>(t)) + ") outside the " + std::to_string(n_bus)
+                                         + " solver buses");
+    for (size_t c = 0; c < rows.size(); ++c)
+        for (const auto& t : rows[c])
+            contingencies_[c].triplets.push_back({std::get<0>(t), std::get<1>(t), std::get<2>(t), std::get<3>(t)});
+    ++contingencies_generation_;   // the live driver's source is stale now
 }
 
 void ContingencyAnalysisSession::clear_v_init_groups()
