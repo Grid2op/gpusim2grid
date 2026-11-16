@@ -132,6 +132,7 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
     # lightsim2grid_core_MARCH_NATIVE / _O3_OPTIM are exported by its CMake
     # config (lightsim2grid_coreConfig.cmake.in) with exactly this in mind.
     if(NOT MSVC)
+        set(_g2g_march_flags "")
         if(lightsim2grid_core_MARCH_NATIVE)
             message(STATUS "[gpusim2grid] lightsim2grid_core was built with "
                            "-march=native -- matching it on gpusim2grid_core "
@@ -139,7 +140,13 @@ if(GPUSIM2GRID_LS2G_CORE_FOUND)
             target_compile_options(gpusim2grid_core PUBLIC
                 $<$<COMPILE_LANGUAGE:CXX>:-march=native>
                 $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-march=native>)
+            set(_g2g_march_flags -march=native)
         endif()
+        # Without -march=native the core has its own compiler's default ISA, which need
+        # not be ours (the PyPI wheel is baseline x86-64; a compiler may default to AVX2):
+        # read the core's Eigen ABI tag off the library and match it, see the module.
+        include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/MatchLs2gEigenAbi.cmake)
+        g2g_match_ls2g_eigen_abi(gpusim2grid_core ${_g2g_march_flags})
         if(lightsim2grid_core_O3_OPTIM)
             message(STATUS "[gpusim2grid] lightsim2grid_core was built with "
                            "-O3 -- matching it on gpusim2grid_core")
