@@ -37,6 +37,7 @@
 #include "acpf_nr.hpp"      // AcPfNrSession
 #include "ledger_data.hpp"  // LedgerData
 #include "gen_contingency_data.hpp"  // GenContingencyData
+#include "element_trip_data.hpp"     // ElementTripData
 #include "contingency/bus_q_check_data.hpp"  // BusQPlanData
 #include "contingency/gen_p_check_data.hpp"  // GenPPlanData
 
@@ -101,6 +102,12 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
 // solver bus. See slack_redistribution.hpp.
 SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver);
 
+// What tripping each shunt (its diagonal Ybus coefficient), load (its power)
+// and generator (its active set-point) changes, for the contingencies that trip
+// them (ContingencyAnalysisSession::build_contingencies_full,
+// ScenarioSweepSession::set_contingency_shunts). See element_trip_data.hpp.
+ElementTripData extract_element_trip_data(const ls2g::LSGrid& grid, int n_bus_solver);
+
 // The reference slack bus the caller forced on the grid
 // (LSGrid::set_reference_slack_bus), in solver numbering; -1 when none.
 int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver);
@@ -134,6 +141,7 @@ make_acpf_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic (see AcPfNrState's own doc): force the pre-ground-truth
     // cuDSS-solve derivation of slack_absorbed/vc_q even when lightsim2grid's
     // own converged values are available. No-op unless init_from_n_powerflow.
@@ -163,7 +171,8 @@ make_acpf_session_from_lsgrid_with_sbus(
     int    device,
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
-    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default);
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0);
 
 // Build a ContingencyAnalysisSession from a solved LSGrid (branch data set).
 // When compute_limit_violations=true, also pulls bus/branch limits off the
@@ -184,6 +193,7 @@ make_ca_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
     bool   debug_base_case = false,
     // NR step-scaling (MaxVoltageChange): by default (-1 / negative sentinels)
@@ -262,13 +272,21 @@ GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
 // (solver bus numbering), followed by the idle standby SVCs the caller flagged
 // with LSGrid::set_svc_standby (lightsim2grid's own build_svc_standby_plan, two
 // entries each, el_type SVC; only when the lightsim2grid built against has
-// SvcStandbyCheck.hpp). Empty when nothing is flagged. Throws when the
+// SvcStandbyCheck.hpp), then the generators holding a remote bus when the
+// caller set a realistic range (LSGrid::set_remote_voltage_control_vm_range,
+// lightsim2grid's own build_remote_voltage_control_plan, one entry per bound,
+// standby = 2; only when the lightsim2grid built against has
+// RemoteVoltageControlCheck.hpp). Empty when nothing is flagged. Throws when the
 // lightsim2grid built against predates PR #216.
 GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid& grid,
                                                              int n_bus_solver, double tol_mva);
 // Whether the lightsim2grid built against has the release check (PR #216):
 // extract_gen_pv_release_plan_from_lsgrid throws otherwise.
 bool bridge_has_gen_pv_release();
+// lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators, PR #220)
+bool bridge_has_hold_frozen();
+// lightsim2grid's outer loops (NROuter_*, branch dev_outer_batch_perf)
+bool bridge_has_outer_loops();
 
 // Build an InjectionSweepSession from a solved LSGrid (branch data set when
 // with_branch_data=true so compute_flows() works without extra setup).
@@ -287,6 +305,7 @@ make_is_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
     bool   debug_base_case = false,
     // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
@@ -320,6 +339,7 @@ make_ss_session_from_lsgrid(
     ReorderingAlg reordering_alg = ReorderingAlg::Default,
     MatchingAlg matching_alg = MatchingAlg::None,
     PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
     // Opt-in diagnostic forwarded to base_state_ -- see AcPfNrState's own doc.
     bool   debug_base_case = false,
     // NR step-scaling (MaxVoltageChange) -- see make_ca_session_from_lsgrid's
@@ -329,5 +349,64 @@ make_ss_session_from_lsgrid(
     double max_dVm_override = -1.0,
     // See the use_distributed_slack note above make_ca_session_from_lsgrid.
     bool   use_distributed_slack = true);
+
+// What a batch running lightsim2grid's outer loops solves, read off a solved
+// NROuter_* grid: its single-slack inner Newton (the reference alone P-free, the
+// other slack buses PV), its ledger as it is (the union pattern every loop
+// reserved, LedgerData::outer_loops) with the switchable buses, and the rows'
+// starting V (the grid's, its generator buses at their set-points).
+struct OuterInputs {
+    Eigen::SparseMatrix<eigen_cplx_type> Ybus;
+    CplxVect        V0, Sbus;
+    Eigen::VectorXi slack, pv, pq;
+    RealVect        slack_weights;
+    LedgerData      ledger;
+};
+OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n = false);
+
+// A ScenarioSweepSession running lightsim2grid's outer loops (the grid's own,
+// an NROuter_* grid, solved): continuous scheduling, the rows starting from the
+// grid's voltages (generator buses at their set-points) and default controls.
+// keep_trace: each row's decision trace in its OuterRowResult.
+std::shared_ptr<ScenarioSweepSession>
+make_ss_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid,
+    int    batch_size,
+    int    nb_iter,
+    int    device,
+    bool   compute_limit_violations = false,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
+    bool   keep_trace = false,
+    // every row resumes from where the grid's own solve left its loops (lightsim2grid's
+    // init_from_n_powerflow), starting from its voltages as they are
+    bool   resume_from_n = false,
+    // the step scaling of the inner Newton: -1 / negative = the grid's own
+    int scaling_max_voltage_change_override = -1, double max_dVa_override = -1.0, double max_dVm_override = -1.0);
+
+// The same for a contingency analysis (each contingency keeps the grid's targets)
+// and an injection sweep (set_outer_gen_p_rows: the rows' own).
+std::shared_ptr<ContingencyAnalysisSession>
+make_ca_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid, int batch_size, int nb_iter, int device,
+    bool compute_limit_violations = false,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
+    bool keep_trace = false, bool resume_from_n = false,
+    int scaling_max_voltage_change_override = -1, double max_dVa_override = -1.0, double max_dVm_override = -1.0);
+std::shared_ptr<InjectionSweepSession>
+make_is_outer_session_from_lsgrid(
+    const ls2g::LSGrid& grid, int batch_size, int nb_iter, int device,
+    bool with_branch_data = true,
+    ReorderingAlg reordering_alg = ReorderingAlg::Default,
+    MatchingAlg matching_alg = MatchingAlg::None,
+    PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+    int ir_n_steps = 0,   // CUDSS_CONFIG_IR_N_STEPS
+    bool keep_trace = false, bool resume_from_n = false,
+    int scaling_max_voltage_change_override = -1, double max_dVa_override = -1.0, double max_dVm_override = -1.0);
 
 #endif  // LS2G_BRIDGE_HPP

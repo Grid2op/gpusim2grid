@@ -44,12 +44,16 @@
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"   // ContingencySolverType, Contingency
 #include "gen_contingency_data.hpp"          // GenContingencyData
+#include "element_trip_data.hpp"             // ElementTripData
 #include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "reordering_alg.hpp"
+#include "linear_solver.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
 #include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
+#include "outer/outer_hook.hpp"                  // outer::OuterHook
 
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -102,6 +106,8 @@ struct ScenarioSweepSession {
     //                         rebalancing for the plain sweep API.
     //   keep_final_jacobian_ : refill J at the converged V after the NR loop
     //                         (forwarded to the driver; see BatchPfDriver).
+    //                         Chunked runs only: a continuous one needs nothing
+    //                         kept (solve_JT_batch rebuilds J per row).
     //   run_counter_ etc.   : observability for callers/tests (a torch
     //                         autograd backward checks run_counter_ against
     //                         the forward it belongs to).
@@ -132,9 +138,29 @@ struct ScenarioSweepSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_ = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // row runs nb_iter_ iterations) or continuous (nb_iter_ is each row's
+    // budget, checked every nb_iter_per_round_ iterations against tol_; every
+    // run() then takes the cold path, and fixed_batch_capacity_ and
+    // keep_final_jacobian_ are ignored: the adjoint rebuilds each row's J from
+    // its converged V). Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
+    // Continuous scheduling, the tail (BatchPfDriver::tail_max_groups_): once
+    // the queue is empty and the live rows fit in tail_max_groups_ groups of
+    // tail_group_size_ slots, the rounds run on those groups only, their
+    // linear solve on a cuDSS handle of tail_group_size_ matrices (0 = off).
+    // Mutable, taken by the next run().
+    int             tail_max_groups_   = 16;
+    int             tail_group_size_   = 15;
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
+    // Who factorizes / solves the batch Jacobians (linear_solver.hpp); the base
+    // case always stays on cuDSS. Next run(); a change builds a new driver.
+    LinearSolver linear_solver_ = LinearSolver::Cudss;
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see the other
@@ -227,6 +253,9 @@ struct ScenarioSweepSession {
     std::vector<Contingency>      contingencies_;
     std::vector<std::vector<int>> tripped_branches_per_scenario_;
     bool has_topology_ = false;
+    // the trip lists are the "none" set_contingency_shunts() filled in, not the caller's:
+    // a later mask on another row count resizes them instead of refusing them as stale
+    bool topology_implicit_ = false;
 
     // Caller-declared not-simulable rows (set_skipped_rows(); ORIGINAL row
     // order, n_scenarios entries). Copied into Contingency::skip by run(); a
@@ -262,6 +291,69 @@ struct ScenarioSweepSession {
     // start value there, so its gen_v gradient is 0 on that row.
     std::vector<std::vector<int>> row_pv_to_pq_;
 
+    // Shunt and load contingencies (lightsim2grid's set_contingency_shunts /
+    // set_contingency_loads): the shunts each row trips (one more diagonal triplet
+    // of its Ybus patch, appended by set_topology) and the loads each row trips --
+    // their injection side is the caller's, like a generator's (the Python facade
+    // zeroes them in set_injections_from_elements); kept here for the outer loops'
+    // view of the row only.
+    ElementTripData               trip_data_;
+    bool                          has_trip_data_ = false;
+    std::vector<std::vector<int>> shunt_off_;
+    bool                          has_shunt_off_ = false;
+    // lightsim2grid PR #292: what each row trips beyond those, and why a row is left out
+    std::vector<MoreTrips>        more_off_;
+    bool                          has_more_off_ = false;
+    std::vector<std::string>      row_unsupported_;
+    // the controllers of the voltage-control groups each row trips, and whether the base
+    // ledger carries the entries that takes (reserve_tripped_controller_slots)
+    std::vector<std::vector<int>> row_vc_tripped_;
+    bool                          reserved_vc_trip_ = false;
+    void _set_more_off(Eigen::Ref<const BoolMat> mask, int n_el, std::vector<int> MoreTrips::*member, const char* who);
+    std::vector<std::string> _row_unsupported_reasons() const;
+    bool _row_trips(int r, std::vector<int> MoreTrips::*member, int el) const {
+        if (!has_more_off_ || static_cast<size_t>(r) >= more_off_.size()) return false;
+        const std::vector<int>& ids = more_off_[static_cast<size_t>(r)].*member;
+        return std::binary_search(ids.begin(), ids.end(), el);
+    }
+    BoolMat                       load_off_;
+    bool                          has_load_off_ = false;
+
+    // =========================================================================
+    // Reactive-limit outer loop (the second pass ContingencyAnalysisGPU runs
+    // with reactive_limits_outer_loop): per row, ORIGINAL order, the Vm-fixed
+    // buses it solves as PQ (sw_to_pq_: they join the reserved switchable set
+    // exactly like a generator contingency's) and the PQ buses it holds PV at
+    // a given |V| (sw_to_pv_: Q row pinned, |V| re-seeded). The injection side
+    // (the limit a switched bus' machines produce, the frozen Q a released
+    // machine no longer injects) is the caller's, through set_injections.
+    // =========================================================================
+    std::vector<std::vector<int>>                    sw_to_pq_;
+    std::vector<std::vector<std::pair<int, double>>> sw_to_pv_;
+    // per row, (controller, Q pu) of the VoltageControl controllers held at a
+    // fixed reactive injection (set_vc_controller_pins); empty = none
+    std::vector<std::vector<std::pair<int, double>>> sw_vc_pins_;
+    // the final pins of row r: the held controllers it does not release, then the
+    // caller's (set_vc_controller_pins); validated (see there)
+    std::vector<std::pair<int, double>> _row_vc_pins(int r) const;
+    // per row, the held controllers (lightsim2grid's set_hold_frozen_regulators)
+    // released there: every other row pins them at their frozen output
+    std::vector<std::vector<int>>                    sw_vc_release_;
+    bool has_switches_   = false;
+    bool has_vc_pins_    = false;
+    bool has_vc_release_ = false;
+    // set_v_init_from_ptr: rows held in ScenarioSweepDeviceData::d_V_init_orig
+    bool has_v_init_ = false;
+    int  v_init_rows_ = 0;
+    bool switches_dirty_ = false;
+    // per-row skip masks of the reactive / release plans' entries (uint8,
+    // (n_rows x n_entries) row-major; empty = none), see set_bus_q_row_skip
+    std::vector<unsigned char> bus_q_row_skip_, gen_pv_release_row_skip_;
+    int  bus_q_row_skip_cols_ = 0, gen_pv_release_row_skip_cols_ = 0;
+    bool bus_q_row_skip_dirty_ = false, gen_pv_release_row_skip_dirty_ = false;
+    // the release skip mask the driver got last (the caller's plus the SVCs the rows trip)
+    std::vector<unsigned char> gr_skip_last_;
+
     // =========================================================================
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
     // the OLF-style pre-pass of what each row loses, recomputed every run().
@@ -273,16 +365,25 @@ struct ScenarioSweepSession {
     // hot run puts the plain weights back).
     // =========================================================================
     bool                    redistribute_slack_ = false;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
     SlackRedistributionData slack_rd_;
     bool                    has_slack_rd_ = false;
     RealMatRM               gen_p_rows_;
     std::vector<slack_redistribution::RowResult> slack_rows_;
+    // with the outer loops: per row, what it loses (MW, NaN: nothing), which its
+    // DistributedSlack loop shares (outer::RowOverrides::lost_p_mw)
+    std::vector<double> row_lost_p_mw_;
     bool                    rd_applied_ = false;
     // The saturated units of every row, handed in by a caller that ran the
     // pre-pass itself (BatchPowerFlow, whose Sbus already carries the
     // correction): only the row weights are rebuilt from them.
     std::vector<std::vector<int>> ext_sat_units_;
     bool                    has_ext_sat_ = false;
+    // ... and, with the outer loops, what each row loses (MW, NaN: nothing), which
+    // takes the place of row_lost_p_mw_ (BatchPowerFlow, whose injections are on the
+    // device where the pre-pass cannot read them)
+    std::vector<double>     ext_lost_p_mw_;
+    bool                    has_ext_lost_ = false;
     bool                    rd_gp_last_ = false;   // the gen-P check got pre-pass targets last run
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
@@ -343,6 +444,7 @@ struct ScenarioSweepSession {
         ReorderingAlg reordering_alg = ReorderingAlg::Default,
         MatchingAlg matching_alg = MatchingAlg::None,
         PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int ir_n_steps = 0,
         bool   debug_base_case = false,
         bool   scaling_max_voltage_change = false,
         double max_dVa = 0.5,
@@ -484,6 +586,12 @@ struct ScenarioSweepSession {
     // clear_external_slack_saturation drops it.
     void set_external_slack_saturation(const std::vector<std::vector<int>>& sat_units_per_row);
     void clear_external_slack_saturation() { ext_sat_units_.clear(); has_ext_sat_ = false; }
+    // With the outer loops, the caller's measure of what each row loses (MW, generator
+    // convention, ORIGINAL order, NaN: nothing), for the rows' DistributedSlack loop to
+    // share (outer::RowOverrides::lost_p_mw). Takes the place of redistribute_slack's
+    // own measure (which must be off); clear_external_lost_p drops it.
+    void set_external_lost_p(const std::vector<double>& lost_p_mw);
+    void clear_external_lost_p() { ext_lost_p_mw_.clear(); has_ext_lost_ = false; }
 
     // The masked (stranded) solver buses and the "not simulated" flag each row
     // of `branch_ids_per_row` would get, computed on a copy (host only, the
@@ -511,6 +619,118 @@ struct ScenarioSweepSession {
     // if needed) by the next run().
     // =========================================================================
     void set_contingency_gens(Eigen::Ref<const BoolMat> mask);
+
+    // =========================================================================
+    // set_contingency_shunts / set_contingency_loads — row i, column j True:
+    // row i disconnects shunt / load j (n_scenarios x n_shunt / n_load). A shunt
+    // is an admittance: its diagonal Ybus coefficient joins the row's patch (needs
+    // set_element_trip_data, the bridge factory sets it); refused with the outer
+    // loops for a shunt that regulates a voltage. A load is an injection: the
+    // CALLER takes it out of the row's Sbus (set_injections*); the mask given here
+    // is what the outer loops' view of the row reads (TransformerVoltageControl).
+    // =========================================================================
+    void set_element_trip_data(const ElementTripData& data) { trip_data_ = data; has_trip_data_ = true; }
+    bool has_element_trip_data() const { return has_trip_data_; }
+    void set_contingency_shunts(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_loads(Eigen::Ref<const BoolMat> mask);
+    // lightsim2grid PR #292: (n_scenarios x n_element) bool, True = the row disconnects it
+    void set_contingency_sgens(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_storages(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_svcs(Eigen::Ref<const BoolMat> mask);
+    void set_contingency_hvdcs(Eigen::Ref<const BoolMat> mask);
+    bool has_more_trips() const { return has_more_off_; }
+    // (n_scenarios x n_bus) MW and MVAr each row's tripped static generators, storage units,
+    // SVCs and hvdc stations add to its injection (the facade adds it to set_injections')
+    std::pair<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
+              Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+    more_trips_injection_delta() const;
+    // per row, why the batch left it out ("": it did not), set by run()
+    const std::vector<std::string>& get_batch_unsupported_reasons() const { return row_unsupported_; }
+
+    // =========================================================================
+    // set_pv_pq_switches — the labelling side of one reactive-limit outer-loop
+    // pass, row-aligned with set_injections() (n_scenarios entries each, in
+    // ORIGINAL row order):
+    //   to_pq[r] : Vm-fixed buses (a local PV / slack bus, not one a
+    //              VoltageControl group holds) that row r solves as PQ -- they
+    //              get a reserved Vm column + Q equation like a generator
+    //              contingency's (one base-state rebuild when the union
+    //              changes), every other row keeping them PV;
+    //   to_pv[r] : (bus, |V| pu) of PQ buses (a Vm unknown and a Q equation in
+    //              the base ledger, no VoltageControl group) that row r holds
+    //              PV: its Q row is identity-pinned and |V| re-seeded to the
+    //              value before the solve.
+    // The injections are the caller's (the Q the switched machines produce at
+    // their limit, the frozen Q a released one no longer injects). A change is
+    // a warm source rebuild. clear_pv_pq_switches drops them.
+    // =========================================================================
+    void set_pv_pq_switches(const std::vector<std::vector<int>>& to_pq,
+                            const std::vector<std::vector<std::pair<int, double>>>& to_pv);
+    void clear_pv_pq_switches();
+    bool has_pv_pq_switches() const { return has_switches_; }
+
+    // The VoltageControl side of the same pass, row-aligned with set_injections():
+    // pins[r] lists (controller index, reactive injection pu, generator
+    // convention) of the generator controllers row r holds at a fixed Q -- a
+    // group whose controllers reached a reactive limit (each other controller's
+    // sharing row, and the group's voltage row for its first one, are rewritten
+    // by value; the structure is unchanged). With lightsim2grid's held
+    // controllers pinned too (below), a row whose pins reach a group's first
+    // controller must pin every controller of that group (checked at run()).
+    // A change is a warm source rebuild. clear_vc_controller_pins drops them.
+    void set_vc_controller_pins(const std::vector<std::vector<std::pair<int, double>>>& pins);
+    void clear_vc_controller_pins();
+    // lightsim2grid's held controllers (LedgerData::vc_held) are pinned at their
+    // frozen output on every row; releases[r] lists the ones row r releases (they
+    // then take part in their group like any controller). Only held controllers
+    // can be listed. A change is a warm source rebuild.
+    void set_vc_controller_releases(const std::vector<std::vector<int>>& releases);
+    void clear_vc_controller_releases();
+    std::vector<int>    vc_ctrl_held() const;
+    std::vector<double> vc_ctrl_q_held() const;
+
+    // The VoltageControl groups of the base ledger, per controller (bus, kind:
+    // 0 GEN / 1 SVC / 2-3 HVDC station, group, element id) and per group
+    // (first controller, count, regulated bus, v_set pu); all empty without a
+    // ledger.
+    std::vector<int>    vc_ctrl_bus() const;
+    std::vector<int>    vc_ctrl_kind() const;
+    std::vector<int>    vc_ctrl_group() const;
+    std::vector<int>    vc_ctrl_elem_id() const;
+    std::vector<int>    vc_grp_start() const;
+    std::vector<int>    vc_grp_count() const;
+    std::vector<int>    vc_reg_bus() const;
+
+    // Per-row skip masks of the reactive-capability / release plans' entries
+    // ((n_scenarios x n_entries) bool, True = that entry is not checked on
+    // that row; an empty matrix drops the mask): the outer loop's second pass
+    // does not check a bus it switched to PQ at its limit for LOW_Q / HIGH_Q,
+    // nor a machine it released for its release. Validated against the plan
+    // at run().
+    void set_bus_q_row_skip(Eigen::Ref<const BoolMat> mask);
+    void set_gen_pv_release_row_skip(Eigen::Ref<const BoolMat> mask);
+
+    // Device pointers of the last run's results (row-major (n_scenarios x
+    // n_bus) complex voltages / (n_scenarios,) residuals, ORIGINAL row order),
+    // for a caller copying rows into another session (0 before run()).
+    std::uintptr_t v_results_ptr() const;
+    std::uintptr_t residuals_ptr() const;
+    // Rows of the result buffers those point to (0 before run()).
+    int result_rows() const;
+
+    // Per-row starting voltages, row-aligned with set_injections(): row i
+    // starts from row src_rows[i] of a row-major (* x n_bus) complex device
+    // buffer (e.g. ContingencyAnalysisSession::v_results_ptr), copied at once;
+    // a non-finite entry (a bus that solve masked) starts from the base case.
+    // The reactive-limit outer loop's second pass continues each contingency
+    // from its first-pass solution this way. A hot change (no source rebuild).
+    // clear_v_init: back to the base-case V.
+    // The source holds n_src_rows rows of n_bus_src buses: every source row is
+    // checked against it.
+    void set_v_init_from_ptr(std::uintptr_t d_V_src, const std::vector<int>& src_rows,
+                             int n_src_rows, int n_bus_src);
+    void clear_v_init();
+    bool has_v_init() const { return has_v_init_; }
 
     // Current augmented Jacobian dimension of the base state (grows by one per
     // reserved switchable bus) and the reserved buses themselves -- lets a
@@ -558,9 +778,12 @@ struct ScenarioSweepSession {
     // =========================================================================
     // solve_JT_batch — batched adjoint (see BatchPfDriver::solve_JT_batch;
     // pointer arguments are device buffers of the documented shapes, nullptr
-    // where optional). Requires the last run() to have been made with
-    // keep_final_jacobian_ = true (alias mode) or an external J snapshot.
-    // Builds the transposed system lazily on the first call.
+    // where optional). After a chunked run(): requires it to have been made
+    // with keep_final_jacobian_ = true (alias mode) or an external J snapshot.
+    // After a continuous one: J is rebuilt from the converged V (d_V_ext_orig,
+    // else the run's own results) and this run's batch source; J / Ybus
+    // snapshots are refused. Builds the transposed system lazily on the first
+    // call.
     // =========================================================================
     void solve_JT_batch(const void* d_rhs_orig, const void* d_J_ext,
                         bool want_gen_v_grad,
@@ -633,6 +856,10 @@ struct ScenarioSweepSession {
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_scenarios * n_bus,)      complex
     RealVect get_residuals()  const;   // (n_scenarios,)               real
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_scenarios,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
     RealVect get_or_amps()    const;   // (n_scenarios * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_scenarios * n_branches,) real
     BatchTimings get_timings() const;  // run() timings + cumulative adjoint counters
@@ -675,6 +902,20 @@ struct ScenarioSweepSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; docs/dev_notes/continuous_batching.md
+    // Part B): the model deciding on every row, built by the bridge off an
+    // NROuter_* grid (its session is built on that grid's own ledger). With it,
+    // run() needs the continuous schedule and refuses what the first version
+    // leaves out (generator contingencies, handle_disconnected_grid, gen_v,
+    // redistribute_slack, the reactive-limit switches, the physical checks, a
+    // strategy other than direct_refactor_every). The rows start from the
+    // grid's voltages, their loops from the grid's state.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);
@@ -749,7 +990,9 @@ private:
     int  _reference_bus() const;
     int  _wanted_reference_bus();
     void _check_redistribute_slack() const;
-    std::vector<slack_redistribution::RowResult> _slack_prepass() const;
+    // the pre-pass of every row; with the outer loops, only what each row loses, into
+    // row_lost_p_mw_ (an empty result: the DistributedSlack loop shares it)
+    std::vector<slack_redistribution::RowResult> _slack_prepass();
 };
 
 #endif // SCENARIO_SWEEP_SESSION_HPP

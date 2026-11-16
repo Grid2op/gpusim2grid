@@ -6,17 +6,28 @@
 #include "cuda_utils.h"
 #include "dtypes.hpp"
 #include "contingency/strategies/cudss_batch_solver.cuh"
+#include "acpf_nr_state.cuh"
+#include "own_lu/lu_order.hpp"
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
+#include <thrust/fill.h>
+#include <thrust/functional.h>
+#include <thrust/transform.h>
+#include <thrust/execution_policy.h>
 
 #include <cudss.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <exception>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #define CHK_CUDA_RAW(call)                                                    \
     do {                                                                      \
@@ -45,7 +56,8 @@ std::vector<double> solve_cudss_raw(
     int device,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg)
+    PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps)
 {
     if (dim <= 0)
         throw std::runtime_error("solve_cudss_raw: dim must be > 0");
@@ -88,6 +100,7 @@ std::vector<double> solve_cudss_raw(
     dss.set_reordering_alg(reordering_alg);
     dss.set_matching_alg(matching_alg);
     dss.set_pivot_epsilon_alg(pivot_epsilon_alg);
+    dss.set_ir_n_steps(ir_n_steps);
 
     CudssDescriptor dss_A, dss_x, dss_b;
     dss_A.create_csr(dim, nnz,
@@ -119,11 +132,29 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     int device,
     ReorderingAlg reordering_alg,
     MatchingAlg matching_alg,
-    PivotEpsilonAlg pivot_epsilon_alg)
+    PivotEpsilonAlg pivot_epsilon_alg,
+    int ir_n_steps,
+    int n_groups,
+    int n_handles,
+    const std::string& handle_launch,
+    LinearSolver linear_solver,
+    int n_active)
 {
-    if (dim <= 0 || batch_size <= 0 || n_refactorize < 0)
+    if (dim <= 0 || batch_size <= 0 || n_refactorize < 0 || n_groups <= 0 || n_handles <= 0)
         throw std::runtime_error(
-            "benchmark_cudss_batch_raw: dim and batch_size must be > 0, n_refactorize >= 0");
+            "benchmark_cudss_batch_raw: dim, batch_size, n_groups and n_handles must be > 0, "
+            "n_refactorize >= 0");
+    if (n_groups > 1 && n_handles > 1)
+        throw std::runtime_error("benchmark_cudss_batch_raw: n_groups and n_handles are exclusive");
+    if (n_active != 0 && (linear_solver != LinearSolver::OwnLu || n_groups > 1 || n_handles > 1
+                          || n_active < 1 || n_active > batch_size))
+        throw std::runtime_error(
+            "benchmark_cudss_batch_raw: n_active needs linear_solver=OwnLu, n_groups = n_handles = 1 "
+            "and 1 <= n_active <= batch_size");
+    if (handle_launch != "serial" && handle_launch != "streams" && handle_launch != "threads")
+        throw std::runtime_error(
+            "benchmark_cudss_batch_raw: handle_launch must be 'serial', 'streams' or 'threads', got '"
+            + handle_launch + "'");
     if (static_cast<int>(indptr.size()) != dim + 1)
         throw std::runtime_error("benchmark_cudss_batch_raw: indptr size must be dim+1");
     if (indices.size() != data.size())
@@ -131,21 +162,47 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     const int nnz = static_cast<int>(data.size());
     if (indptr[static_cast<size_t>(dim)] != nnz)
         throw std::runtime_error("benchmark_cudss_batch_raw: indptr[dim] must equal nnz");
+    // every later loop walks rows through indptr and reads x / b through indices:
+    // a pattern outside the matrix reads past the host arrays, and cuDSS gets it too
+    if (indptr[0] != 0)
+        throw std::runtime_error("benchmark_cudss_batch_raw: indptr[0] must be 0");
+    for (int r = 0; r < dim; ++r)
+        if (indptr[static_cast<size_t>(r) + 1] < indptr[static_cast<size_t>(r)])
+            throw std::runtime_error("benchmark_cudss_batch_raw: indptr must be non-decreasing (row " +
+                                     std::to_string(r) + ")");
+    for (int k = 0; k < nnz; ++k)
+        if (indices[static_cast<size_t>(k)] < 0 || indices[static_cast<size_t>(k)] >= dim)
+            throw std::runtime_error("benchmark_cudss_batch_raw: column index " +
+                                     std::to_string(indices[static_cast<size_t>(k)]) + " out of [0, dim)");
+    // the own LU's order: what reordering_alg names, chosen on the host (no grid:
+    // no constraints, so 'default' is AMD) -- after the checks above: it walks the
+    // pattern through indptr / indices
+    std::vector<int> own_perm;
+    if (linear_solver == LinearSolver::OwnLu)
+        own_perm = own_lu::choose_order(reordering_alg, dim, indptr, indices, nullptr, {});
+    const std::vector<int>* perm = own_perm.empty() ? nullptr : &own_perm;
     if (device >= 0) CHK_CUDA_RAW(cudaSetDevice(device));
 
     const size_t B = static_cast<size_t>(batch_size);
+    const size_t G = static_cast<size_t>(n_groups);
+    const size_t H = static_cast<size_t>(n_handles);
+    const size_t NS = std::max(G, H);   // slices of batch_size matrices in the buffers
     const size_t n = static_cast<size_t>(dim), m = static_cast<size_t>(nnz);
 
-    // b = A * 1 (exact solution: ones), computed once on the host.
+    // b = A * 1 (exact solution: ones), computed once on the host. Slice g's
+    // right-hand side is (g + 1)·b, so its exact solution is g + 1: a slice
+    // solved against another slice's b (a rebinding that did not take) shows.
     std::vector<double> b(n, 0.);
     for (size_t r = 0; r < n; ++r)
         for (int k = indptr[r]; k < indptr[r + 1]; ++k)
             b[r] += data[static_cast<size_t>(k)];
 
-    std::vector<cuda_real_type> h_vals(B * m), h_rhs(B * n);
-    for (size_t i = 0; i < B; ++i) {
+    std::vector<cuda_real_type> h_vals(NS * B * m), h_rhs(NS * B * n);
+    for (size_t i = 0; i < NS * B; ++i) {
+        const double scale = static_cast<double>(i / B + 1);
         std::copy(data.begin(), data.end(), h_vals.begin() + i * m);
-        std::copy(b.begin(), b.end(), h_rhs.begin() + i * n);
+        for (size_t r = 0; r < n; ++r)
+            h_rhs[i * n + r] = static_cast<cuda_real_type>(scale * b[r]);
     }
 
     CudaStream cs;
@@ -153,7 +210,10 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     thrust::device_vector<int>            d_inner(indices.begin(), indices.end());
     thrust::device_vector<cuda_real_type> d_vals(h_vals.begin(), h_vals.end());
     thrust::device_vector<cuda_real_type> d_rhs0(h_rhs.begin(), h_rhs.end());
-    thrust::device_vector<cuda_real_type> d_rhs(B * n), d_x(B * n, cuda_real_type(0));
+    thrust::device_vector<cuda_real_type> d_rhs(NS * B * n), d_x(NS * B * n, cuda_real_type(0));
+    cuda_real_type* vals = thrust::raw_pointer_cast(d_vals.data());
+    cuda_real_type* rhs  = thrust::raw_pointer_cast(d_rhs.data());
+    cuda_real_type* x    = thrust::raw_pointer_cast(d_x.data());
 
     using clk = std::chrono::steady_clock;
     auto ms_since = [](clk::time_point t0) {
@@ -161,7 +221,8 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     };
 
     CudssBatchBenchResult res;
-    res.dim = dim; res.nnz = nnz; res.batch_size = batch_size;
+    res.dim = dim; res.nnz = nnz; res.batch_size = batch_size; res.n_groups = n_groups;
+    res.n_handles = n_handles; res.handle_launch = handle_launch;
 
     CudssBatchSolver solver;
     cs.synchronize();
@@ -169,11 +230,9 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     solver.initialize(batch_size, dim, nnz,
                       thrust::raw_pointer_cast(d_outer.data()),
                       thrust::raw_pointer_cast(d_inner.data()),
-                      thrust::raw_pointer_cast(d_vals.data()),
-                      thrust::raw_pointer_cast(d_rhs.data()),
-                      thrust::raw_pointer_cast(d_x.data()),
-                      cs, reordering_alg, matching_alg, pivot_epsilon_alg);
-    solver.set_values(thrust::raw_pointer_cast(d_vals.data()));
+                      vals, rhs, x,
+                      cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, perm, linear_solver);
+    solver.set_values(vals);
     solver.prepare_factorization();   // non-uniform modes: the deferred ANALYSIS
     cs.synchronize();
     res.context_init_ms = solver.context_init_ms();
@@ -186,15 +245,26 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     res.mem_host_permanent   = fs.mem_host_permanent;
     res.mem_host_peak        = fs.mem_host_peak;
 
+    // Point the handle at group g (n_groups > 1 only: uniform mode).
+    auto bind = [&](size_t g) {
+        if (G > 1) solver.bind_slice(vals + g * B * m, rhs + g * B * n, x + g * B * n);
+    };
+    // cuDSS may use b as workspace: restore it before every SOLVE (untimed).
+    auto restore_rhs = [&]() {
+        thrust::copy(d_rhs0.begin(), d_rhs0.end(), d_rhs.begin());
+        cs.synchronize();
+    };
+
+    restore_rhs();
     t0 = clk::now();
     solver.factor();
     cs.synchronize();
     res.factorize_ms = ms_since(t0);
 
-    // cuDSS may use b as workspace: restore it before every SOLVE (untimed).
+    // Per-phase timings, stream-synchronized after every call: the first
+    // group only (the one the handle was analysed and factorized on).
     auto run_solve = [&]() {
-        thrust::copy(d_rhs0.begin(), d_rhs0.end(), d_rhs.begin());
-        cs.synchronize();
+        restore_rhs();
         auto ts = clk::now();
         solver.solve();
         cs.synchronize();
@@ -214,24 +284,282 @@ CudssBatchBenchResult benchmark_cudss_batch_raw(
     if (n_refactorize > 0) res.refactorize_ms /= n_refactorize;
     res.solve_ms = t_solve / n_solve;
 
-    // Sanity check of every slot's solution against b (host, double).
+    // The cycle a tail round does: for every group, rebind + REFACTORIZATION
+    // + SOLVE, one stream synchronization at the end of the cycle (what the
+    // NR loop pays, host launch overhead included). Every slice's solution
+    // is then the last cycle's.
+    const int n_cycles = std::max(1, n_refactorize);
+    double t_cycles = 0.;
+    for (int it = 0; it < n_cycles; ++it) {
+        restore_rhs();
+        t0 = clk::now();
+        for (size_t g = 0; g < G; ++g) {
+            bind(g);
+            solver.refactor();
+            solver.solve();
+        }
+        cs.synchronize();
+        t_cycles += ms_since(t0);
+    }
+    bind(0);
+    res.group_cycle_ms = t_cycles / (static_cast<double>(n_cycles) * static_cast<double>(G));
+
+    // Independent handles (n_handles > 1): handle 0 is the one above, on cs
+    // and slice 0; handle h owns slice h, its own stream unless "serial".
+    if (H > 1) {
+        const bool own_streams = handle_launch != "serial";
+        const cuda_real_type* rhs0 = thrust::raw_pointer_cast(d_rhs0.data());
+        std::vector<CudaStream> streams(own_streams ? H - 1 : 0);
+        std::vector<cudaStream_t> st(H, cs);
+        for (size_t h = 1; h < H && own_streams; ++h) st[h] = streams[h - 1];
+        std::vector<std::unique_ptr<CudssBatchSolver>> hs(H);
+        restore_rhs();
+        t0 = clk::now();
+        for (size_t h = 1; h < H; ++h) {
+            hs[h] = std::make_unique<CudssBatchSolver>();
+            hs[h]->initialize(batch_size, dim, nnz,
+                              thrust::raw_pointer_cast(d_outer.data()),
+                              thrust::raw_pointer_cast(d_inner.data()),
+                              vals + h * B * m, rhs + h * B * n, x + h * B * n,
+                              st[h], reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, perm,
+                              linear_solver);
+            hs[h]->set_values(vals + h * B * m);
+            hs[h]->prepare_factorization();
+            hs[h]->factor();
+        }
+        for (cudaStream_t s : st) CHK_CUDA_RAW(cudaStreamSynchronize(s));
+        res.handle_setup_ms = ms_since(t0);
+        auto handle = [&](size_t h) -> CudssBatchSolver& { return h == 0 ? solver : *hs[h]; };
+
+        // One handle's share of a round. The rhs copy stands for the NR
+        // loop's refill of F (cuDSS may use b as workspace).
+        auto round = [&](size_t h) {
+            CHK_CUDA_RAW(cudaMemcpyAsync(rhs + h * B * n, rhs0 + h * B * n,
+                                         B * n * sizeof(cuda_real_type),
+                                         cudaMemcpyDeviceToDevice, st[h]));
+            handle(h).refactor();
+            handle(h).solve();
+        };
+
+        if (handle_launch == "threads") {
+            int dev = 0;
+            CHK_CUDA_RAW(cudaGetDevice(&dev));
+            std::atomic<bool> go{false};
+            std::vector<std::exception_ptr> err(H);
+            std::vector<std::thread> workers;
+            // a spawn that throws midway must not leave joinable threads spinning on `go`
+            // (their destructors would call std::terminate)
+            struct JoinGuard {
+                std::atomic<bool>& go; std::vector<std::thread>& w;
+                ~JoinGuard() { go.store(true, std::memory_order_release); for (auto& t : w) if (t.joinable()) t.join(); }
+            } guard{go, workers};
+            workers.reserve(H);
+            for (size_t h = 0; h < H; ++h)
+                workers.emplace_back([&, h]() {
+                    try {
+                        CHK_CUDA_RAW(cudaSetDevice(dev));
+                        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                        for (int it = 0; it < n_cycles; ++it) {
+                            round(h);
+                            CHK_CUDA_RAW(cudaStreamSynchronize(st[h]));
+                        }
+                    } catch (...) { err[h] = std::current_exception(); }
+                });
+            t0 = clk::now();
+            go.store(true, std::memory_order_release);
+            for (auto& w : workers) w.join();
+            res.handle_round_ms = ms_since(t0) / n_cycles;
+            for (auto& e : err) if (e) std::rethrow_exception(e);
+        } else {
+            t0 = clk::now();
+            for (int it = 0; it < n_cycles; ++it) {
+                for (size_t h = 0; h < H; ++h) round(h);
+                for (size_t h = 0; h < (own_streams ? H : 1); ++h)
+                    CHK_CUDA_RAW(cudaStreamSynchronize(st[h]));
+            }
+            res.handle_round_ms = ms_since(t0) / n_cycles;
+        }
+    }
+
+    // Sanity check of every slot's solution against its b (host, double).
     thrust::host_vector<cuda_real_type> h_x(d_x);
     double bnorm = 0.;
     for (double v : b) bnorm = std::max(bnorm, std::abs(v));
     if (bnorm == 0.) bnorm = 1.;
-    for (size_t i = 0; i < B; ++i) {
-        const cuda_real_type* x = &h_x[i * n];
+    for (size_t i = 0; i < NS * B; ++i) {
+        const double scale = static_cast<double>(i / B + 1);
+        const cuda_real_type* xi = &h_x[i * n];
         bool finite = true;
-        for (size_t r = 0; r < n && finite; ++r) finite = std::isfinite(x[r]);
+        for (size_t r = 0; r < n && finite; ++r) finite = std::isfinite(xi[r]);
         if (!finite) { ++res.n_nonfinite_slots; continue; }
         double worst = 0.;
         for (size_t r = 0; r < n; ++r) {
             double ax = 0.;
             for (int k = indptr[r]; k < indptr[r + 1]; ++k)
-                ax += data[static_cast<size_t>(k)] * static_cast<double>(x[indices[static_cast<size_t>(k)]]);
-            worst = std::max(worst, std::abs(ax - b[r]));
+                ax += data[static_cast<size_t>(k)] * static_cast<double>(xi[indices[static_cast<size_t>(k)]]);
+            worst = std::max(worst, std::abs(ax - scale * b[r]));
         }
-        res.max_rel_residual = std::max(res.max_rel_residual, worst / bnorm);
+        res.max_rel_residual = std::max(res.max_rel_residual, worst / (scale * bnorm));
     }
+
+    // The own LU's active prefix (n_groups = 1: slice 0 is the whole buffer).
+    if (n_active > 0) {
+        res.n_active = n_active;
+        const cuda_real_type sentinel = cuda_real_type(7);
+        const size_t A = static_cast<size_t>(n_active);
+        // residual of slot i's solution against (a_scale * A) x = b
+        auto slot_residual = [&](const thrust::host_vector<cuda_real_type>& hx, size_t i, double a_scale) {
+            double worst = 0.;
+            for (size_t r = 0; r < n; ++r) {
+                double ax = 0.;
+                for (int k = indptr[r]; k < indptr[r + 1]; ++k)
+                    ax += data[static_cast<size_t>(k)]
+                          * static_cast<double>(hx[i * n + static_cast<size_t>(indices[static_cast<size_t>(k)])]);
+                worst = std::max(worst, std::abs(a_scale * ax - b[r]));
+            }
+            return std::isfinite(worst) ? worst / bnorm : std::numeric_limits<double>::infinity();
+        };
+        restore_rhs();
+        thrust::fill(d_x.begin(), d_x.end(), sentinel);
+        // new values everywhere: x3 in the prefix (its solution is right only if
+        // the prefix call refactorized them), x2 past it (never factorized)
+        thrust::transform(d_vals.begin(), d_vals.begin() + A * m, d_vals.begin(),
+                          thrust::placeholders::_1 * cuda_real_type(3));
+        thrust::transform(d_vals.begin() + A * m, d_vals.begin() + B * m, d_vals.begin() + A * m,
+                          thrust::placeholders::_1 * cuda_real_type(2));
+        solver.set_active_count(n_active);
+        solver.refactor();
+        solver.solve();
+        solver.set_active_count(batch_size);
+        cs.synchronize();
+        thrust::host_vector<cuda_real_type> hx(d_x);
+        res.active_max_rel_residual = 0.;
+        for (size_t i = 0; i < A; ++i)
+            res.active_max_rel_residual = std::max(res.active_max_rel_residual, slot_residual(hx, i, 3.));
+        res.n_inactive_touched = 0;
+        for (size_t k = A * n; k < B * n; ++k) res.n_inactive_touched += hx[k] != sentinel;
+        // the whole batch on the factors it holds, no refinement (it would
+        // read the new values): past the prefix, the original matrices'
+        restore_rhs();
+        solver.set_ir_n_steps(0);
+        solver.solve();
+        solver.set_ir_n_steps(ir_n_steps);
+        cs.synchronize();
+        hx = d_x;
+        res.inactive_max_rel_residual = 0.;
+        for (size_t i = A; i < B; ++i)
+            res.inactive_max_rel_residual = std::max(res.inactive_max_rel_residual, slot_residual(hx, i, 1.));
+    }
+    return res;
+}
+
+// dst[b * n + i] = src[i], b < batch
+__global__ static void tile_values_kernel(cuda_real_type* __restrict__ dst,
+                                          const cuda_real_type* __restrict__ src,
+                                          int n, int batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<ptrdiff_t>(n) * batch) return;
+    dst[tid] = src[tid % n];
+}
+
+TailCalibration calibrate_tail_groups(
+    const AcPfNrState& base, int batch_size, int group_size, int n_repeat,
+    ReorderingAlg reordering_alg, MatchingAlg matching_alg,
+    PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, LinearSolver linear_solver)
+{
+    const std::vector<int>* perm = linear_solver == LinearSolver::OwnLu
+        ? &base.own_lu_perm(reordering_alg) : base.user_perm(reordering_alg);
+    if (batch_size < 1 || group_size < 1 || n_repeat < 1)
+        throw std::invalid_argument(
+            "calibrate_tail_groups: batch_size, group_size and n_repeat must be >= 1");
+    const int dim = base.dim_J, nnz = base.nnz_J;
+    const thrust::device_vector<cuda_real_type>& J =
+        base.d_J_values_base.empty() ? base.d_J_values : base.d_J_values_base;
+    if (dim <= 0 || static_cast<int>(J.size()) < nnz)
+        throw std::runtime_error("calibrate_tail_groups: the base state holds no Jacobian");
+
+    TailCalibration res;
+    res.batch_size = batch_size;
+    res.group_size = group_size;
+    res.n_repeat   = n_repeat;
+
+    const size_t S = static_cast<size_t>(batch_size);
+    CudaStream cs;
+    thrust::device_vector<cuda_real_type> d_vals(S * nnz), d_rhs(S * dim), d_x(S * dim);
+    const int BS_T = 256;
+    tile_values_kernel<<<static_cast<unsigned>((S * nnz + BS_T - 1) / BS_T), BS_T, 0, static_cast<cudaStream_t>(cs)>>>(
+        thrust::raw_pointer_cast(d_vals.data()), thrust::raw_pointer_cast(J.data()), nnz, batch_size);
+    CHK_CUDA_RAW(cudaGetLastError());
+    int* outer = const_cast<int*>(thrust::raw_pointer_cast(base.d_J_outer.data()));
+    int* inner = const_cast<int*>(thrust::raw_pointer_cast(base.d_J_inner.data()));
+
+    using clk = std::chrono::steady_clock;
+    // one handle of B matrices on the first B systems, factorized once; timed()
+    // is the mean of n_repeat REFACTORIZATION + SOLVE (b refilled untimed: cuDSS
+    // may use it as workspace) on the handle's first `active` matrices (0 = all;
+    // own LU only: its active prefix, what the tail runs on).
+    auto make_handle = [&](CudssBatchSolver& solver, int B) {
+        solver.initialize(B, dim, nnz, outer, inner,
+                          thrust::raw_pointer_cast(d_vals.data()),
+                          thrust::raw_pointer_cast(d_rhs.data()),
+                          thrust::raw_pointer_cast(d_x.data()),
+                          cs, reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, perm,
+                          linear_solver);
+        thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)), d_rhs.begin(), d_rhs.end(), cuda_real_type(1));
+        solver.factor();
+        solver.solve();
+    };
+    auto timed = [&](CudssBatchSolver& solver, int active) {
+        if (active > 0) solver.set_active_count(active);
+        cs.synchronize();
+        double total = 0.;
+        for (int it = 0; it < n_repeat; ++it) {
+            thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)), d_rhs.begin(), d_rhs.end(), cuda_real_type(1));
+            cs.synchronize();
+            const auto t0 = clk::now();
+            solver.refactor();
+            solver.solve();
+            cs.synchronize();
+            total += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        }
+        if (active > 0) solver.set_active_count(batch_size);   // own LU: one solver of batch_size
+        return total / n_repeat;
+    };
+    const int G = std::min(group_size, batch_size);
+    if (linear_solver == LinearSolver::OwnLu) {
+        // one solver: the full batch, then its prefix (no second plan / factors)
+        CudssBatchSolver solver;
+        make_handle(solver, batch_size);
+        res.t_full_ms  = timed(solver, 0);
+        res.t_group_ms = timed(solver, G);
+        // k groups are ONE prefix call of k·G matrices (TailSolve::prefix), far
+        // cheaper than k · t_group: the largest k with k·G < batch_size whose
+        // prefix is still faster than the full batch, bisected (prefix time
+        // grows with k)
+        const int k_max = group_size < batch_size ? (batch_size - 1) / G : 0;
+        int lo = 0, hi = k_max;   // t(lo·G) < t_full (lo = 0 trivially); answer in [lo, hi]
+        if (k_max >= 1 && res.t_group_ms < res.t_full_ms) {
+            lo = 1;
+            // the common case first: every prefix short of the batch pays
+            if (k_max > 1 && timed(solver, k_max * G) < res.t_full_ms) lo = k_max;
+            else if (k_max > 1) hi = k_max - 1;
+            while (lo < hi) {
+                const int mid = lo + (hi - lo + 1) / 2;
+                if (timed(solver, mid * G) < res.t_full_ms) lo = mid;
+                else                                         hi = mid - 1;
+            }
+        }
+        res.max_groups = lo;
+        return res;
+    } else {
+        CudssBatchSolver full, group;
+        make_handle(full, batch_size);
+        res.t_full_ms = timed(full, 0);
+        make_handle(group, G);
+        res.t_group_ms = timed(group, 0);
+    }
+    res.max_groups = (group_size < batch_size && res.t_group_ms > 0.)
+        ? static_cast<int>(std::floor(res.t_full_ms / res.t_group_ms)) : 0;
     return res;
 }

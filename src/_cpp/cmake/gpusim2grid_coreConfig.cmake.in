@@ -1,0 +1,25 @@
+@PACKAGE_INIT@
+
+# gpusim2grid_core: gpusim2grid's solvers as a C++ shared library (no Python), imported
+# target gpusim2grid::core. Locate it with
+#   cmake -Dgpusim2grid_core_DIR=$(python -c "import gpusim2grid; print(gpusim2grid.get_cmake_dir())")
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(CUDAToolkit COMPONENTS cusparse)
+# cuDSS: found from cudss_ROOT / CMAKE_PREFIX_PATH, else from where it was at build time.
+find_dependency(cudss HINTS "@cudss_DIR@")
+
+# The target links lightsim2grid::core (ls2g_bridge.hpp: sessions made from an
+# ls2g::LSGrid, the outer loops) and carries its -march / -O3 flags, which a consumer
+# must match (see lightsim2grid's docs/solver_plugin.rst).
+find_dependency(lightsim2grid_core CONFIG HINTS "@LIGHTSIM2GRID_CMAKE_DIR@")
+
+if(NOT TARGET gpusim2grid::core)
+    include("${CMAKE_CURRENT_LIST_DIR}/gpusim2grid_coreTargets.cmake")
+endif()
+
+set(gpusim2grid_core_LIBRARIES gpusim2grid::core)
+set(gpusim2grid_core_FP32 @USE_FLOAT_PRECISION@)
+
+check_required_components(gpusim2grid_core)

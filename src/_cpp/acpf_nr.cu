@@ -41,6 +41,8 @@
 // See acpf_nr_state.cuh for the full class declaration and design notes.
 // =============================================================================
 
+#include "user_ordering.hpp"   // prototype: ls2g_constrained_perm
+#include "own_lu/lu_order.hpp"
 #include "acpf_nr_state.cuh"
 #include "acpf_nr.hpp"
 #include "acpf_nr_kernels.cuh"
@@ -315,6 +317,58 @@ static void build_scatter_maps_aug(
 // §2c  Single-system NR loop helpers  (shared by the ctor and resolve())
 // =============================================================================
 
+// CtlGroupsDevice from a ledger's groups (BranchControl's ratio groups, ShuntControl's groups):
+// per group its regulated bus, that bus' Vm column, its target, its members (entries of the
+// control, whose unknowns are `entry_col`) and one row per member; the J positions resolved
+// against the skeleton (J_outer / J_inner, CSR)
+static void build_ctl_groups(CtlGroupsDevice& out, const std::vector<int>& bus, const std::vector<int>& vm_col,
+                             const std::vector<double>& target, const std::vector<std::vector<int>>& members,
+                             const std::vector<std::vector<int>>& rows, const std::vector<int>& entry_col,
+                             const int* J_outer, const int* J_inner, cudaStream_t cs)
+{
+    auto find_pos = [&](int row, int col) -> int {
+        if (row < 0 || col < 0) return -1;
+        const int* b = J_inner + J_outer[row];
+        const int* e = J_inner + J_outer[row + 1];
+        const int* it = std::lower_bound(b, e, col);
+        return (it == e || *it != col) ? -1 : static_cast<int>(it - J_inner);
+    };
+    out.n_grp = static_cast<int>(bus.size());
+    std::vector<int> gs{0}, gm, gr, gjvm, gjs, gjc;
+    std::vector<cuda_real_type> gt;
+    for (int g = 0; g < out.n_grp; ++g) {
+        const auto& mem = members[static_cast<size_t>(g)];
+        const auto& rw = rows[static_cast<size_t>(g)];
+        if (rw.size() != mem.size())
+            throw std::runtime_error("AcPfNrState: a control group's rows are not its members'");
+        const int n = static_cast<int>(mem.size());
+        gjs.push_back(static_cast<int>(gjc.size()));
+        for (int j = 0; j < n; ++j) {
+            gm.push_back(mem[static_cast<size_t>(j)]);
+            gr.push_back(rw[static_cast<size_t>(j)]);
+            gjvm.push_back(find_pos(rw[static_cast<size_t>(j)], vm_col[static_cast<size_t>(g)]));
+            for (int m = 0; m < n; ++m)
+                gjc.push_back(find_pos(rw[static_cast<size_t>(j)], entry_col[static_cast<size_t>(mem[static_cast<size_t>(m)])]));
+        }
+        gs.push_back(static_cast<int>(gm.size()));
+        gt.push_back(static_cast<cuda_real_type>(target[static_cast<size_t>(g)]));
+    }
+    std::vector<int> gb = bus;
+    // placeholders keep the pointers valid when there is no group
+    if (gm.empty()) { gm.push_back(-1); gr.push_back(-1); gjvm.push_back(-1); gjc.push_back(-1); }
+    if (gjs.empty()) gjs.push_back(0);
+    if (gt.empty()) gt.push_back(0);
+    if (gb.empty()) gb.push_back(-1);
+    upload_h2d(out.start, gs.data(), gs.size(), cs);
+    upload_h2d(out.member, gm.data(), gm.size(), cs);
+    upload_h2d(out.row, gr.data(), gr.size(), cs);
+    upload_h2d(out.jvm, gjvm.data(), gjvm.size(), cs);
+    upload_h2d(out.jstart, gjs.data(), gjs.size(), cs);
+    upload_h2d(out.jcol, gjc.data(), gjc.size(), cs);
+    upload_h2d(out.bus, gb.data(), gb.size(), cs);
+    upload_h2d(out.target, gt.data(), gt.size(), cs);
+}
+
 // Non-owning pointer bundle — views into the single-system device vectors.
 // Not const: the NR step-scaling and pin fields are set via post-init
 // assignment (positional aggregate init can't skip over the trailing
@@ -421,6 +475,30 @@ static NrIterBuffers make_single_system_buffers(AcPfNrState& s)
         buf.d_mask_diag    = thrust::raw_pointer_cast(s.d_pin_diag.data());
         buf.n_mask_rows    = s.n_pin;
     }
+    // BranchControl: the base solve's own state (nothing patched into its Ybus)
+    if (s.n_bc > 0) {
+        buf.bc   = s.bc_static();
+        buf.bcs  = s.bc_base_slots();
+    }
+    if (s.n_sc > 0) {
+        buf.sc   = s.sc_static();
+        buf.scs  = s.sc_base_slots();
+    }
+    // Held controllers: offset out of the mismatch, pinned in this base solve.
+    if (s.has_vc_held) {
+        buf.d_vc_qoff    = thrust::raw_pointer_cast(s.d_vc_qoff.data());
+        buf.d_vcp_slot   = thrust::raw_pointer_cast(s.d_hold_vcp_slot.data());
+        buf.d_vcp_row    = thrust::raw_pointer_cast(s.d_hold_vcp_row.data());
+        buf.d_vcp_ctrl   = thrust::raw_pointer_cast(s.d_hold_vcp_ctrl.data());
+        buf.d_vcp_target = thrust::raw_pointer_cast(s.d_hold_vcp_target.data());
+        buf.n_vcp        = s.n_hold_vcp;
+        if (s.n_hold_jov > 0) {
+            buf.d_jov_slot = thrust::raw_pointer_cast(s.d_hold_jov_slot.data());
+            buf.d_jov_pos  = thrust::raw_pointer_cast(s.d_hold_jov_pos.data());
+            buf.d_jov_val  = thrust::raw_pointer_cast(s.d_hold_jov_val.data());
+            buf.n_jov      = s.n_hold_jov;
+        }
+    }
     return buf;
 }
 
@@ -501,6 +579,7 @@ AcPfNrState::AcPfNrState(
     ReorderingAlg                                reordering_alg,
     MatchingAlg                                  matching_alg,
     PivotEpsilonAlg                              pivot_epsilon_alg,
+    int                                          ir_n_steps,
     bool                                         debug_base_case,
     bool                                         base_case_only,
     bool                                         scaling_max_voltage_change,
@@ -510,6 +589,7 @@ AcPfNrState::AcPfNrState(
     reordering_alg_    = reordering_alg;
     matching_alg_      = matching_alg;
     pivot_epsilon_alg_ = pivot_epsilon_alg;
+    ir_n_steps_        = ir_n_steps;
     debug_base_case_   = debug_base_case;
     base_case_only_    = base_case_only;
     max_iter_          = max_iter;
@@ -584,6 +664,11 @@ AcPfNrState::AcPfNrState(
     std::vector<int> theta_buses, theta_cols, vm_buses, vm_cols;
 
     if (ledger == nullptr) {
+        if (reordering_alg_ == ReorderingAlg::Ls2gConstrained
+            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedNd
+            || reordering_alg_ == ReorderingAlg::Ls2gConstrainedMinFill)
+            throw std::runtime_error("reordering_alg 'ls2g_constrained[_nd|_minfill]' needs a lightsim2grid "
+                                     "grid (its ordering constraints), not array mode");
         build_J_structure(J_outer_h, J_inner_h,
                           h_map_j11, h_map_j12, h_map_j21, h_map_j22,
                           Ybus_rm, pvpq_host, pq_in);
@@ -662,8 +747,13 @@ AcPfNrState::AcPfNrState(
         h_switchable_buses.clear();
         if (ledger != nullptr) h_switchable_buses = ledger->switchable_vm_buses;
         std::vector<int> h_pin_slot, h_pin_row, h_pin_diag;
-        for (int bus : h_switchable_buses) {
+        h_sw_qrow.assign(h_switchable_buses.size(), -1);
+        h_sw_qdiag.assign(h_switchable_buses.size(), -1);
+        for (size_t k = 0; k < h_switchable_buses.size(); ++k) {
+            const int bus = h_switchable_buses[k];
             if (bus < 0 || bus >= n_bus || h_q_row_of_bus[bus] < 0) continue;
+            h_sw_qrow[k]  = h_q_row_of_bus[bus];
+            h_sw_qdiag[k] = h_q_diag_pos[bus];
             h_pin_slot.push_back(0);
             h_pin_row.push_back(h_q_row_of_bus[bus]);
             h_pin_diag.push_back(h_q_diag_pos[bus]);
@@ -673,6 +763,10 @@ AcPfNrState::AcPfNrState(
             upload_h2d(d_pin_slot, h_pin_slot.data(), n_pin, cs);
             upload_h2d(d_pin_row,  h_pin_row.data(),  n_pin, cs);
             upload_h2d(d_pin_diag, h_pin_diag.data(), n_pin, cs);
+        }
+        if (!h_sw_qrow.empty()) {
+            upload_h2d(d_sw_qrow,  h_sw_qrow.data(),  h_sw_qrow.size(),  cs);
+            upload_h2d(d_sw_qdiag, h_sw_qdiag.data(), h_sw_qdiag.size(), cs);
         }
     }
 
@@ -726,26 +820,34 @@ AcPfNrState::AcPfNrState(
             auto it = std::lower_bound(in + s, in + e, col);
             return (it == in + e || *it != col) ? -1 : static_cast<int>(it - in);
         };
-        for (int bus = 0; bus < n_bus; ++bus) {
-            const double w = ledger->slack_weights[bus];
-            if (w == 0.0) continue;
+        // the participants: every reserved bus, whatever its weight (an NROuterDist_*
+        // ledger, the weights then per slot), else the buses with a weight
+        std::vector<int> buses;
+        if (!ledger->slack_participant_buses.empty()) {
+            buses = ledger->slack_participant_buses;
+        } else {
+            for (int bus = 0; bus < n_bus; ++bus)
+                if (ledger->slack_weights[bus] != 0.0 && ledger->p_row_of_bus[bus] >= 0) buses.push_back(bus);
+        }
+        h_slack_bus.clear();
+        for (int bus : buses) {
+            const double w = static_cast<size_t>(bus) < ledger->slack_weights.size() ? ledger->slack_weights[bus] : 0.0;
             const int prow = ledger->p_row_of_bus[bus];
             if (prow < 0) continue;   // defensive: a weighted bus must own a P row
+            const int pos = find_J_pos(prow, slack_col);
+            if (pos < 0)
+                throw std::runtime_error("AcPfNrState: slack participant bus " + std::to_string(bus) +
+                                         " has no entry in the slack_absorbed column of J");
             h_prow.push_back(prow);
             h_w.push_back(static_cast<cuda_real_type>(w));
-            h_feat_pos.push_back(find_J_pos(prow, slack_col));
+            h_feat_pos.push_back(pos);
+            h_slack_bus.push_back(bus);
         }
         n_slack = static_cast<int>(h_prow.size());
         upload_h2d(d_slack_prow,     h_prow.data(),     n_slack, cs);
         upload_h2d(d_slack_w,        h_w.data(),        n_slack, cs);
         upload_h2d(d_slack_feat_pos, h_feat_pos.data(), n_slack, cs);
         h_slack_w = h_w;
-        h_slack_bus.clear();
-        for (int bus = 0; bus < n_bus; ++bus) {
-            const double w = ledger->slack_weights[bus];
-            if (w == 0.0 || ledger->p_row_of_bus[bus] < 0) continue;
-            h_slack_bus.push_back(bus);
-        }
 
         // slack_absorbed initial value = Re(Σ Sbus) (mirrors MultiSlack::update_state)
         cuda_real_type sa0 = static_cast<cuda_real_type>(0.);
@@ -758,6 +860,21 @@ AcPfNrState::AcPfNrState(
     // HVDC angle-droop: per-line raw data + the end P rows / theta-col feature J
     // positions derived from the ledger maps + skeleton. (mirrors Hvdc::register_in
     // / declare_feature_entries; an end at a slack drops the missing row/col.)
+    n_hvdc_frz = ledger != nullptr ? static_cast<int>(ledger->hvdc_frz_bus1.size()) : 0;
+    if (n_hvdc_frz > 0) {
+        auto to_real = [](const std::vector<double>& v) {
+            return std::vector<cuda_real_type>(v.begin(), v.end());
+        };
+        const std::vector<cuda_real_type> p0 = to_real(ledger->hvdc_frz_p0), kk = to_real(ledger->hvdc_frz_k),
+                                          lim = to_real(ledger->hvdc_frz_limit);
+        upload_h2d(d_hvdc_frz_bus1,  ledger->hvdc_frz_bus1.data(), n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_bus2,  ledger->hvdc_frz_bus2.data(), n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_dir,   ledger->hvdc_frz_dir.data(),  n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_id,    ledger->hvdc_frz_id.data(),   n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_p0,    p0.data(),  n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_k,     kk.data(),  n_hvdc_frz, cs);
+        upload_h2d(d_hvdc_frz_limit, lim.data(), n_hvdc_frz, cs);
+    }
     if (ledger != nullptr && ledger->has_hvdc()) {
         // Defensive filter: a droop line should NEVER reach here with either
         // side individually open -- lightsim2grid's own
@@ -803,6 +920,8 @@ AcPfNrState::AcPfNrState(
         upload_h2d(d_hvdc_bus2,   bus2.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_status, status.data(), n_hvdc, cs);
         upload_h2d(d_hvdc_id,     hid.data(),    n_hvdc, cs);
+        h_hvdc_id = hid;
+        h_hvdc_status = status;
         upload_h2d(d_hvdc_p0,     p0.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_k,      kk.data(),   n_hvdc, cs);
         upload_h2d(d_hvdc_lf1,    lf1.data(),  n_hvdc, cs);
@@ -928,6 +1047,9 @@ AcPfNrState::AcPfNrState(
         h_vc_vrow_qcol_pos.assign(n_vc_grp, -1);
         h_vc_vrow_vmcol_pos.assign(n_vc_grp, -1);
         h_vc_ctrl_vrow_qcol_pos.assign(n_vc_ctrl, -1);
+        h_vc_ctrl_sh_row.assign(n_vc_ctrl, -1);
+        h_vc_ctrl_sh_self_pos.assign(n_vc_ctrl, -1);
+        h_vc_ctrl_sh_first_pos.assign(n_vc_ctrl, -1);
         for (int j = 0; j < n_vc_ctrl; ++j)
             h_vc_ctrl_vrow_qcol_pos[j] = find_J_pos(vrow[ledger->vc_group[j]], qcol[j]);
         for (int g = 0; g < n_vc_grp; ++g) {
@@ -943,11 +1065,43 @@ AcPfNrState::AcPfNrState(
                 const int row = share[g][k];
                 sh_row.push_back(row); sh_first.push_back(first); sh_other.push_back(other);
                 sh_wfirst.push_back(w_first); sh_wother.push_back(w_other);
+                h_vc_ctrl_sh_row[other]       = row;
+                h_vc_ctrl_sh_self_pos[other]  = find_J_pos(row, qcol[other]);
+                h_vc_ctrl_sh_first_pos[other] = find_J_pos(row, qcol[first]);
                 push_feat(find_J_pos(row, qcol[other]), w_first);   // (share_row, q_col_{k+1})
                 push_feat(find_J_pos(row, qcol[first]), -w_other);  // (share_row, q_col_1)
             }
         }
         n_vc_feat = static_cast<int>(feat_pos.size());
+
+        // the outer loops' may_hold_ formulation: every position it writes per slot
+        // (see vc_hold_fill_J_kernel), read off lightsim2grid's union pattern
+        vc_may_hold = ledger->outer_loops || ledger->vc_may_trip;
+        if (vc_may_hold) {
+            std::vector<cuda_real_type> w(n_vc_ctrl);
+            std::vector<int> sh_row_c(n_vc_ctrl, -1);
+            h_vch_rowpos_off.assign(n_vc_ctrl, -1);
+            h_vch_rowpos.clear();
+            for (int j = 0; j < n_vc_ctrl; ++j) w[j] = static_cast<cuda_real_type>(ledger->vc_weight[j]);
+            for (int g = 0; g < n_vc_grp; ++g) {
+                const int first = ledger->vc_grp_start[g];
+                const int cnt   = ledger->vc_grp_count[g];
+                for (int k = 0; k < cnt - 1; ++k) {
+                    const int j = first + (k + 1);
+                    sh_row_c[j] = share[g][k];
+                    h_vch_rowpos_off[j] = static_cast<int>(h_vch_rowpos.size());
+                    for (int o = 0; o < cnt; ++o)
+                        h_vch_rowpos.push_back(find_J_pos(share[g][k], qcol[first + o]));
+                }
+            }
+            if (h_vch_rowpos.empty()) h_vch_rowpos.push_back(-1);   // never read; keeps the pointer valid
+            upload_h2d(d_vc_weight,      w.data(),                       n_vc_ctrl, cs);
+            upload_h2d(d_vch_slope_pos,  h_vc_ctrl_vrow_qcol_pos.data(), n_vc_ctrl, cs);
+            upload_h2d(d_vch_vm_pos,     h_vc_vrow_vmcol_pos.data(),     n_vc_grp,  cs);
+            upload_h2d(d_vch_sh_row,     sh_row_c.data(),                n_vc_ctrl, cs);
+            upload_h2d(d_vch_rowpos_off, h_vch_rowpos_off.data(),        n_vc_ctrl, cs);
+            upload_h2d(d_vch_rowpos,     h_vch_rowpos.data(),            h_vch_rowpos.size(), cs);
+        }
         if (n_vc_share > 0) {
             upload_h2d(d_vc_sh_row,    sh_row.data(),    n_vc_share, cs);
             upload_h2d(d_vc_sh_first,  sh_first.data(),  n_vc_share, cs);
@@ -961,6 +1115,203 @@ AcPfNrState::AcPfNrState(
         // running reactive injection per controller, reset to 0 each solve
         d_vc_q.resize(n_vc_ctrl);
         zero_d(d_vc_q, cs);
+
+        // lightsim2grid's held controllers (set_hold_frozen_regulators): their frozen
+        // output, offset out of the mismatch, is where they start; this base solve
+        // pins them the way a batch row does (build_mask_entries' vcp / jov rewrite:
+        // a group's first controller through its voltage row -- only when every
+        // controller is held --, any other one through its sharing row)
+        h_vc_held.assign(n_vc_ctrl, 0);
+        h_vc_q_held.assign(n_vc_ctrl, 0.);
+        has_vc_held = false;
+        if (static_cast<int>(ledger->vc_held.size()) == n_vc_ctrl &&
+            static_cast<int>(ledger->vc_q_held.size()) == n_vc_ctrl) {
+            for (int j = 0; j < n_vc_ctrl; ++j) {
+                h_vc_held[j] = ledger->vc_held[j] ? 1 : 0;
+                h_vc_q_held[j] = ledger->vc_held[j] ? ledger->vc_q_held[j] : 0.;
+                has_vc_held = has_vc_held || h_vc_held[j];
+            }
+        }
+        if (has_vc_held) {
+            std::vector<cuda_real_type> qoff(n_vc_ctrl);
+            for (int j = 0; j < n_vc_ctrl; ++j) qoff[j] = static_cast<cuda_real_type>(h_vc_q_held[j]);
+            upload_h2d(d_vc_qoff, qoff.data(), n_vc_ctrl, cs);
+            copy_d2d(d_vc_q, d_vc_qoff, cs);
+            std::vector<int> vs, vr, vc, js, jp;
+            std::vector<cuda_real_type> vt, jv;
+            auto jov = [&](int pos, cuda_real_type val) {
+                if (pos < 0) return;
+                js.push_back(0); jp.push_back(pos); jv.push_back(val);
+            };
+            for (int j = 0; j < n_vc_ctrl; ++j) {
+                if (!h_vc_held[j]) continue;
+                const int g = ledger->vc_group[j];
+                const int first = ledger->vc_grp_start[g];
+                int row;
+                if (j == first) {
+                    row = h_vc_vrow[g];
+                    jov(h_vc_vrow_qcol_pos[g], 1);
+                    jov(h_vc_vrow_vmcol_pos[g], 0);
+                    for (int k = first + 1; k < first + ledger->vc_grp_count[g]; ++k)
+                        jov(h_vc_ctrl_vrow_qcol_pos[k], 0);
+                } else {
+                    row = h_vc_ctrl_sh_row[j];
+                    jov(h_vc_ctrl_sh_self_pos[j], 1);
+                    jov(h_vc_ctrl_sh_first_pos[j], 0);
+                }
+                vs.push_back(0); vr.push_back(row); vc.push_back(j);
+                vt.push_back(static_cast<cuda_real_type>(h_vc_q_held[j]));
+            }
+            n_hold_vcp = static_cast<int>(vs.size());
+            n_hold_jov = static_cast<int>(js.size());
+            upload_h2d(d_hold_vcp_slot, vs.data(), vs.size(), cs);
+            upload_h2d(d_hold_vcp_row, vr.data(), vr.size(), cs);
+            upload_h2d(d_hold_vcp_ctrl, vc.data(), vc.size(), cs);
+            upload_h2d(d_hold_vcp_target, vt.data(), vt.size(), cs);
+            if (n_hold_jov > 0) {
+                upload_h2d(d_hold_jov_slot, js.data(), js.size(), cs);
+                upload_h2d(d_hold_jov_pos, jp.data(), jp.size(), cs);
+                upload_h2d(d_hold_jov_val, jv.data(), jv.size(), cs);
+            }
+        }
+    }
+
+    // BranchControl (outer loops: PhaseControl, TransformerVoltageControl): per
+    // transformer, its Ybus value positions, the J positions of its shift column / row,
+    // its grid data; and the base solve's own state (one slot, at the grid's taps, its
+    // controls off -- this base solve trusts V0 and patches nothing)
+    if (ledger != nullptr && ledger->n_bc() > 0) {
+        n_bc = ledger->n_bc();
+        h_bc_trafo = ledger->bc_trafo;
+        bc_n_lines = ledger->bc_n_lines;
+        auto find_pos = [](const int* outer, const int* inner, int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int* b = inner + outer[row];
+            const int* e = inner + outer[row + 1];
+            const int* it = std::lower_bound(b, e, col);
+            return (it == e || *it != col) ? -1 : static_cast<int>(it - inner);
+        };
+        std::vector<int> ypos(4 * static_cast<size_t>(n_bc)), jpos(9 * static_cast<size_t>(n_bc), -1),
+                         row(n_bc, -1), col(n_bc, -1), rcol(n_bc, -1),
+                         jpos_r(4 * static_cast<size_t>(n_bc), -1);
+        for (int e = 0; e < n_bc; ++e) {
+            const int b1 = ledger->bc_bus1[e], b2 = ledger->bc_bus2[e];
+            const int yp[4] = {find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b1, b1),
+                               find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b1, b2),
+                               find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b2, b1),
+                               find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), b2, b2)};
+            for (int k = 0; k < 4; ++k) {
+                if (yp[k] < 0)
+                    throw std::runtime_error("AcPfNrState: a BranchControl transformer has no Ybus coefficient");
+                ypos[4 * e + k] = yp[k];
+            }
+            const int c = ledger->bc_shift_col[e], r = ledger->bc_shift_row[e];
+            const int* Jo = J_outer_h.data();
+            const int* Ji = J_inner_h.data();
+            const int p1 = ledger->p_row_of_bus[b1], q1 = ledger->q_row_of_bus[b1];
+            const int p2 = ledger->p_row_of_bus[b2], q2 = ledger->q_row_of_bus[b2];
+            const int rc = ledger->bc_ratio_col[e];
+            if (rc >= 0) {
+                rcol[e] = rc;
+                jpos_r[4 * e + 0] = find_pos(Jo, Ji, p1, rc);
+                jpos_r[4 * e + 1] = find_pos(Jo, Ji, q1, rc);
+                jpos_r[4 * e + 2] = find_pos(Jo, Ji, p2, rc);
+                jpos_r[4 * e + 3] = find_pos(Jo, Ji, q2, rc);
+            }
+            if (c < 0) continue;
+            col[e] = c;
+            row[e] = r;
+            const int jp[9] = {find_pos(Jo, Ji, p1, c), find_pos(Jo, Ji, q1, c),
+                               find_pos(Jo, Ji, p2, c), find_pos(Jo, Ji, q2, c),
+                               find_pos(Jo, Ji, r, c),
+                               find_pos(Jo, Ji, r, ledger->theta_col_of_bus[b1]),
+                               find_pos(Jo, Ji, r, ledger->theta_col_of_bus[b2]),
+                               find_pos(Jo, Ji, r, ledger->vm_col_of_bus[b1]),
+                               find_pos(Jo, Ji, r, ledger->vm_col_of_bus[b2])};
+            if (jp[4] < 0)
+                throw std::runtime_error("AcPfNrState: a phase shifter's row has no entry on its shift column");
+            for (int k = 0; k < 9; ++k) jpos[9 * e + k] = jp[k];
+        }
+        auto to_real = [](const std::vector<double>& v) {
+            return std::vector<cuda_real_type>(v.begin(), v.end());
+        };
+        auto to_cplx = [](const std::vector<double>& v) {
+            std::vector<cudaComplexType> out(v.size() / 2);
+            for (size_t k = 0; k < out.size(); ++k)
+                out[k] = CudaFunHelper::my_make_cuComplex(static_cast<cuda_real_type>(v[2 * k]),
+                                                          static_cast<cuda_real_type>(v[2 * k + 1]));
+            return out;
+        };
+        upload_h2d(d_bc_b1, ledger->bc_bus1.data(), n_bc, cs);
+        upload_h2d(d_bc_b2, ledger->bc_bus2.data(), n_bc, cs);
+        upload_h2d(d_bc_side, ledger->bc_side.data(), n_bc, cs);
+        upload_h2d(d_bc_row, row.data(), n_bc, cs);
+        upload_h2d(d_bc_col, col.data(), n_bc, cs);
+        upload_h2d(d_bc_ypos, ypos.data(), ypos.size(), cs);
+        upload_h2d(d_bc_jpos, jpos.data(), jpos.size(), cs);
+        upload_h2d(d_bc_rcol, rcol.data(), n_bc, cs);
+        upload_h2d(d_bc_jpos_r, jpos_r.data(), jpos_r.size(), cs);
+        // the solved ratio groups (BranchControl's RatioGroup)
+        build_ctl_groups(bc_groups, ledger->bc_grp_bus, ledger->bc_grp_vm_col, ledger->bc_grp_target,
+                         ledger->bc_grp_members, ledger->bc_grp_rows, ledger->bc_ratio_col,
+                         J_outer_h.data(), J_inner_h.data(), cs);
+        const auto sign = to_real(ledger->bc_sign), rexp = to_real(ledger->bc_rexp),
+                   pt = to_real(ledger->bc_p_target), at = to_real(ledger->bc_a_tap0),
+                   rt = to_real(ledger->bc_rho_tap0);
+        upload_h2d(d_bc_sign, sign.data(), n_bc, cs);
+        upload_h2d(d_bc_rexp, rexp.data(), n_bc, cs);
+        upload_h2d(d_bc_p_target, pt.data(), n_bc, cs);
+        upload_h2d(d_bc_a_tap0, at.data(), n_bc, cs);
+        upload_h2d(d_bc_rho_tap0, rt.data(), n_bc, cs);
+        const auto tap0 = to_cplx(ledger->bc_tap0), yeff0 = to_cplx(ledger->bc_yeff0);
+        upload_h2d(d_bc_tap0, tap0.data(), tap0.size(), cs);
+        upload_h2d(d_bc_yeff0, yeff0.data(), yeff0.size(), cs);
+        // the base solve's state: BranchControl::_reset at the grid's taps
+        d_bcs_a.assign(at.begin(), at.end());
+        d_bcs_a_target.assign(at.begin(), at.end());
+        d_bcs_a_tap.assign(at.begin(), at.end());
+        d_bcs_rho.assign(rt.begin(), rt.end());
+        d_bcs_rho_tap.assign(rt.begin(), rt.end());
+        d_bcs_tap.assign(tap0.begin(), tap0.end());
+        d_bcs_applied.assign(yeff0.begin(), yeff0.end());
+        d_bcs_rho_target.assign(rt.begin(), rt.end());
+        d_bcs_on.assign(static_cast<size_t>(n_bc), 0);
+        d_bcs_ron.assign(static_cast<size_t>(n_bc), 0);
+        d_bcs_out.assign(static_cast<size_t>(n_bc), 0);
+    }
+
+    // ShuntControl (outer loops: ShuntVoltageControl): per controller its bus' Ybus diagonal
+    // position, the J position of its column in its bus' Q row, the grid's susceptance; its
+    // groups; and the base solve's own state (nothing patched into its Ybus)
+    if (ledger != nullptr && ledger->n_sc() > 0) {
+        n_sc = ledger->n_sc();
+        std::vector<int> jq(n_sc, -1), ypos(n_sc, -1);
+        auto find_pos = [](const int* outer, const int* inner, int row, int col) -> int {
+            if (row < 0 || col < 0) return -1;
+            const int* b = inner + outer[row];
+            const int* e = inner + outer[row + 1];
+            const int* it = std::lower_bound(b, e, col);
+            return (it == e || *it != col) ? -1 : static_cast<int>(it - inner);
+        };
+        for (int e = 0; e < n_sc; ++e) {
+            const int bus = ledger->sc_bus[e];
+            ypos[e] = find_pos(Ybus_rm.outerIndexPtr(), Ybus_rm.innerIndexPtr(), bus, bus);
+            if (ypos[e] < 0) throw std::runtime_error("AcPfNrState: a shunt controller's bus has no Ybus diagonal");
+            jq[e] = find_pos(J_outer_h.data(), J_inner_h.data(), ledger->sc_q_row[e], ledger->sc_col[e]);
+        }
+        const std::vector<cuda_real_type> b0(ledger->sc_b0.begin(), ledger->sc_b0.end());
+        upload_h2d(d_sc_bus, ledger->sc_bus.data(), n_sc, cs);
+        upload_h2d(d_sc_col, ledger->sc_col.data(), n_sc, cs);
+        upload_h2d(d_sc_jq, jq.data(), n_sc, cs);
+        upload_h2d(d_sc_ypos, ypos.data(), n_sc, cs);
+        upload_h2d(d_sc_b0, b0.data(), n_sc, cs);
+        build_ctl_groups(sc_groups, ledger->sc_grp_bus, ledger->sc_grp_vm_col, ledger->sc_grp_target,
+                         ledger->sc_grp_members, ledger->sc_grp_rows, ledger->sc_col,
+                         J_outer_h.data(), J_inner_h.data(), cs);
+        d_scs_b.assign(b0.begin(), b0.end());
+        d_scs_b_applied.assign(b0.begin(), b0.end());
+        d_scs_b_target.assign(b0.begin(), b0.end());
+        d_scs_on.assign(static_cast<size_t>(n_sc), 0);
     }
 
     // Ybus (RowMajor CSR, FP32 complex)  (H→D)
@@ -1004,6 +1355,25 @@ AcPfNrState::AcPfNrState(
     // Jacobian skeleton (H→D) — augmented or trivial, both in J_outer_h/J_inner_h
     upload_h2d(d_J_outer, J_outer_h.data(), dim_J + 1, cs);
     upload_h2d(d_J_inner, J_inner_h.data(), nnz_J,     cs);
+    // own LU (linear_solver OwnLu): the skeleton and the grid's ordering
+    // constraints, for own_lu_perm() (orders computed on first use only)
+    h_ord_ledger = std::make_shared<LedgerData>();
+    h_ord_ledger->dim_J   = dim_J;
+    h_ord_ledger->J_outer = J_outer_h;
+    h_ord_ledger->J_inner = J_inner_h;
+    if (ledger != nullptr && ledger->ord_constraints_read) {
+        h_ord_ledger->ord_constraints_read = true;
+        h_ord_ledger->ord_follow_ptr = ledger->ord_follow_ptr;
+        h_ord_ledger->ord_follow     = ledger->ord_follow;
+        h_ord_ledger->ord_lead_ptr   = ledger->ord_lead_ptr;
+        h_ord_ledger->ord_lead       = ledger->ord_lead;
+        h_ord_ledger->ord_in_order   = ledger->ord_in_order;
+        h_ord_ledger->ord_fill_reducing = ledger->ord_fill_reducing;
+    }
+    // the construction value's constrained order, now: a grid without lightsim2grid's
+    // ordering constraints is refused here rather than at the first run (user_perm
+    // computes any other alg a session is later switched to on first use)
+    (void)user_perm(reordering_alg_);
     d_J_values.resize(nnz_J);  zero_d(d_J_values, cs);
 
     timings.t_upload_ms = ms_since(t_upload_start);
@@ -1106,6 +1476,7 @@ AcPfNrState::AcPfNrState(
         dss.set_reordering_alg(reordering_alg_);
         dss.set_matching_alg(matching_alg_);
         dss.set_pivot_epsilon_alg(pivot_epsilon_alg_);
+        dss.set_ir_n_steps(ir_n_steps_);
 
         // Sparse J descriptor — values pointer is updated each iteration via
         // cudssMatrixSetValues(); the shape and structure pointers are fixed.
@@ -1387,6 +1758,7 @@ AcPfNrSession::AcPfNrSession(
     ReorderingAlg                                reordering_alg,
     MatchingAlg                                  matching_alg,
     PivotEpsilonAlg                              pivot_epsilon_alg,
+    int                                          ir_n_steps,
     bool                                         debug_base_case,
     bool                                         scaling_max_voltage_change,
     double                                       max_dVa,
@@ -1399,7 +1771,7 @@ AcPfNrSession::AcPfNrSession(
                                             max_iter, tol, device, ledger,
                                             presolved_v, diag_stop_before_state_correction,
                                             reordering_alg, matching_alg,
-                                            pivot_epsilon_alg, debug_base_case,
+                                            pivot_epsilon_alg, ir_n_steps, debug_base_case,
                                             /*base_case_only=*/false,
                                             scaling_max_voltage_change, max_dVa, max_dVm);
 }
@@ -1541,6 +1913,7 @@ void AcPfNrState::ensure_JT()
         dss_T.set_reordering_alg(reordering_alg_);
         dss_T.set_matching_alg(matching_alg_);
         dss_T.set_pivot_epsilon_alg(pivot_epsilon_alg_);
+        dss_T.set_ir_n_steps(ir_n_steps_);
 
         dss_AT.create_csr(static_cast<int64_t>(dim_J),
                           static_cast<int64_t>(nnz_J),
@@ -1674,4 +2047,49 @@ std::tuple<std::vector<int>, std::vector<int>, std::vector<double>> AcPfNrSessio
         std::vector<int>(h_inner.begin(), h_inner.end()),
         std::vector<double>(h_vals.begin(), h_vals.end())
     };
+}
+// own LU: its elimination order (acpf_nr_state.cuh, own_lu/lu_order.hpp)
+// lightsim2grid's constrained order of this J skeleton for `alg` (the batch
+// solvers' user permutation, acpf_nr_state.cuh); nullptr for any other alg.
+// Computed on first use, once per alg: reordering_alg is mutable on the
+// sessions, so the order cannot be the construction value's.
+const std::vector<int>* AcPfNrState::user_perm(ReorderingAlg alg) const
+{
+    if (alg != ReorderingAlg::Ls2gConstrained && alg != ReorderingAlg::Ls2gConstrainedNd
+        && alg != ReorderingAlg::Ls2gConstrainedMinFill)
+        return nullptr;
+    auto it = user_perms_.find(static_cast<int>(alg));
+    if (it != user_perms_.end()) return &it->second;
+    if (!h_ord_ledger)
+        throw std::logic_error("AcPfNrState::user_perm: no J skeleton kept");
+    const LedgerData& led = *h_ord_ledger;
+    std::vector<int> perm;
+    if (alg == ReorderingAlg::Ls2gConstrained) {
+        perm = ls2g_constrained_perm(led);   // prototype, throws if unavailable
+    } else if (alg == ReorderingAlg::Ls2gConstrainedMinFill) {
+        perm = ls2g_constrained_perm(led, Ls2gFillReducing::MinFill);
+    } else {
+        // prototype: cuDSS's own order of this skeleton, post-moved by lightsim2grid's
+        // constraints (GPUSIM2GRID_ND_NO_POSTMOVE, diagnostic: cuDSS's order unchanged)
+        std::vector<int> nd = cudss_reorder_perm(dim_J, static_cast<int>(led.J_inner.size()),
+                                                 thrust::raw_pointer_cast(d_J_outer.data()),
+                                                 thrust::raw_pointer_cast(d_J_inner.data()), cs,
+                                                 ReorderingAlg::Default);
+        const char* raw = std::getenv("GPUSIM2GRID_ND_NO_POSTMOVE");
+        perm = (raw && raw[0] && raw[0] != '0') ? std::move(nd) : apply_ordering_constraints(std::move(nd), led);
+    }
+    return &user_perms_.emplace(static_cast<int>(alg), std::move(perm)).first->second;
+}
+
+const std::vector<int>& AcPfNrState::own_lu_perm(ReorderingAlg alg) const
+{
+    auto it = own_lu_perms_.find(static_cast<int>(alg));
+    if (it != own_lu_perms_.end()) return it->second;
+    if (!h_ord_ledger)
+        throw std::logic_error("AcPfNrState::own_lu_perm: no J skeleton kept");
+    const std::vector<int>* up = user_perm(alg);
+    std::vector<int> perm = own_lu::choose_order(alg, h_ord_ledger->dim_J, h_ord_ledger->J_outer,
+                                                 h_ord_ledger->J_inner, h_ord_ledger.get(),
+                                                 up ? *up : std::vector<int>{});
+    return own_lu_perms_.emplace(static_cast<int>(alg), std::move(perm)).first->second;
 }

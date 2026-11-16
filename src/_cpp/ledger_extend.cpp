@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "ledger_extend.hpp"
+#include "user_ordering.hpp"
 
 #include <algorithm>
 #include <set>
@@ -115,6 +116,22 @@ void move_reference(
     const int r_old = ld.p_row_of_bus[static_cast<size_t>(old_ref)];
     const int r_new = ld.p_row_of_bus[static_cast<size_t>(new_ref)];
     std::swap(rows[static_cast<size_t>(r_old)], rows[static_cast<size_t>(r_new)]);
+    // lightsim2grid's ordering constraints name Vm columns (their leads), controller
+    // unknowns and custom rows (their follows): never a theta column, a P row or the
+    // slack_absorbed column, the only indices whose unknown / equation changes here, so
+    // they stay those of lightsim2grid's own ledger for this reference. Should one ever
+    // name such an index, it would constrain another unknown than the one it was
+    // declared for: no constraint then, as when indices are deleted
+    // (drop_multislack_augmentation), rather than a wrong order.
+    {
+        const auto moved = [&](int i) { return i == col || i == r_old || i == r_new; };
+        if (std::any_of(ld.ord_follow.begin(), ld.ord_follow.end(), moved) ||
+            std::any_of(ld.ord_lead.begin(), ld.ord_lead.end(), moved)) {
+            ld.ord_constraints_read = false;
+            ld.ord_follow_ptr.clear(); ld.ord_follow.clear();
+            ld.ord_lead_ptr.clear();   ld.ord_lead.clear(); ld.ord_in_order.clear();
+        }
+    }
     ld.p_row_of_bus[static_cast<size_t>(old_ref)] = r_new;
     ld.p_row_of_bus[static_cast<size_t>(new_ref)] = r_old;
     // the registrations keep their order (and rows): the two buses trade
@@ -164,6 +181,26 @@ void reserve_stranded_controller_slots(LedgerData& ld)
         if (v_row < 0 || q_col < 0) continue;
         csr_insert_sorted(ld.J_outer, ld.J_inner, v_row, q_col);
     }
+}
+
+void reserve_tripped_controller_slots(LedgerData& ld)
+{
+    if (!ld.has_voltage_control()) return;
+    reserve_stranded_controller_slots(ld);
+    const int ng = ld.vc_n_groups();
+    for (int g = 0; g < ng; ++g) {
+        const int first = ld.vc_grp_start[static_cast<size_t>(g)];
+        const int cnt   = ld.vc_grp_count[static_cast<size_t>(g)];
+        const std::vector<int>& share = ld.vc_share_rows[static_cast<size_t>(g)];
+        for (int row : share) {
+            if (row < 0) continue;
+            for (int o = 0; o < cnt; ++o) {
+                const int q_col = ld.vc_q_col[static_cast<size_t>(first + o)];
+                if (q_col >= 0) csr_insert_sorted(ld.J_outer, ld.J_inner, row, q_col);
+            }
+        }
+    }
+    ld.vc_may_trip = true;
 }
 
 void add_switchable_vm_buses(
@@ -245,4 +282,88 @@ void add_switchable_vm_buses(
         ld.J_inner.insert(ld.J_inner.end(), cols.begin(), cols.end());
         ld.J_outer.push_back(static_cast<int>(ld.J_inner.size()));
     }
+}
+
+// ---- prototype: lightsim2grid's constrained order (user_ordering.hpp) --------
+ConstrainedOrderFn& constrained_order_hook()
+{
+    static ConstrainedOrderFn fn = nullptr;
+    return fn;
+}
+
+std::vector<int> ls2g_constrained_perm(const LedgerData& ledger)
+{
+    return ls2g_constrained_perm(ledger, ledger.ord_fill_reducing == 1 ? Ls2gFillReducing::MinFill
+                                                                       : Ls2gFillReducing::Amd);
+}
+
+std::vector<int> ls2g_constrained_perm(const LedgerData& ledger, Ls2gFillReducing fill)
+{
+    if (!constrained_order_hook())
+        throw std::runtime_error("reordering_alg 'ls2g_constrained' needs gpusim2grid built "
+                                 "with the lightsim2grid bridge");
+    if (!ledger.ord_constraints_read)
+        throw std::runtime_error("reordering_alg 'ls2g_constrained': no lightsim2grid ordering "
+                                 "constraints for this Jacobian (array mode, "
+                                 "use_distributed_slack=False, which renumbers J, or a moved "
+                                 "angle reference they name)");
+    std::vector<int> perm;
+    if (!constrained_order_hook()(ledger.dim_J, ledger.J_outer.data(), ledger.J_inner.data(),
+                                  ledger, fill, perm)
+        || static_cast<int>(perm.size()) != ledger.dim_J)
+        throw std::runtime_error("reordering_alg 'ls2g_constrained': lightsim2grid's "
+                                 "constrained_order failed");
+    return perm;
+}
+
+std::vector<int> apply_ordering_constraints(std::vector<int> perm, const LedgerData& ledger)
+{
+    if (!ledger.ord_constraints_read)
+        throw std::runtime_error("reordering_alg 'ls2g_constrained_nd': no lightsim2grid ordering "
+                                 "constraints for this Jacobian (array mode, "
+                                 "use_distributed_slack=False, which renumbers J, or a moved "
+                                 "angle reference they name)");
+    const int n = static_cast<int>(perm.size());
+    if (n == 0 || ledger.ord_n_constraints() == 0) return perm;
+    std::vector<int> pos(n);
+    for (int k = 0; k < n; ++k) pos[perm[k]] = k;
+    // verbatim port of the key rule: twice the base position; a follow index before
+    // its last lead gets the odd key right after it; an in_order constraint gives all
+    // its follows the odd key after the last of its leads and follows, ranked in order
+    std::vector<long> key(n);
+    std::vector<int>  rank(n, 0);
+    for (int i = 0; i < n; ++i) key[i] = 2L * pos[i];
+    for (int c = 0; c < ledger.ord_n_constraints(); ++c) {
+        const int f0 = ledger.ord_follow_ptr[c], f1 = ledger.ord_follow_ptr[c + 1];
+        const int l0 = ledger.ord_lead_ptr[c],   l1 = ledger.ord_lead_ptr[c + 1];
+        int last_lead = -1;
+        for (int p = l0; p < l1; ++p) {
+            const int i = ledger.ord_lead[p];
+            if (i >= 0 && i < n && pos[i] > last_lead) last_lead = pos[i];
+        }
+        if (last_lead < 0) continue;
+        if (ledger.ord_in_order[c]) {
+            int last = last_lead;
+            for (int p = f0; p < f1; ++p) {
+                const int i = ledger.ord_follow[p];
+                if (i >= 0 && i < n) last = std::max(last, pos[i]);
+            }
+            int r = 0;
+            for (int p = f0; p < f1; ++p) {
+                const int i = ledger.ord_follow[p];
+                if (i < 0 || i >= n) continue;
+                key[i] = 2L * last + 1;
+                rank[i] = r++;
+            }
+            continue;
+        }
+        for (int p = f0; p < f1; ++p) {
+            const int i = ledger.ord_follow[p];
+            if (i >= 0 && i < n && pos[i] < last_lead) key[i] = std::max(key[i], 2L * last_lead + 1);
+        }
+    }
+    std::stable_sort(perm.begin(), perm.end(), [&key, &rank](int a, int b) {
+        return key[a] < key[b] || (key[a] == key[b] && rank[a] < rank[b]);
+    });
+    return perm;
 }

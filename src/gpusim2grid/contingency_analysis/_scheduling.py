@@ -1,0 +1,358 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+"""Scheduling of the batched solves: chunked (every row runs ``nb_iter``
+Newton iterations) or continuous (a row leaves as soon as it is done and its
+slot is refilled from the queue), and the per-row outcome of a run.
+
+Workload-agnostic like ``_limit_violations.py``: the three batch engines and
+facades share it (``SchedulingEngineMixin`` expects ``self._s``, the compiled
+session; ``SchedulingFacadeMixin`` expects ``self._inner``, the engine). See
+docs/dev_notes/continuous_batching.md.
+"""
+
+import warnings
+from enum import IntEnum
+
+import numpy as np
+
+from .._gpusim2grid import BatchScheduling as _BatchScheduling, is_fp32 as _is_fp32
+from .._gpusim2grid import LinearSolver as _LinearSolver
+from .._gpusim2grid import check_own_lu_config as _check_own_lu_config
+
+_SCHEDULING_MAP = {
+    "chunked":    _BatchScheduling.Chunked,
+    "continuous": _BatchScheduling.Continuous,
+}
+_SCHEDULING_NAME = {v: k for k, v in _SCHEDULING_MAP.items()}
+
+# strategies the continuous schedule refuses (see check_continuous_scheduling
+# in batch_pf_driver.cuh, which raises at run() whatever the order of the
+# settings)
+_CONTINUOUS_REFUSED_STRATEGIES = ("direct_iter0_only", "direct_refactor_every_n")
+
+
+_LINEAR_SOLVER_MAP = {
+    "cudss":  _LinearSolver.Cudss,
+    "own_lu": _LinearSolver.OwnLu,
+}
+_LINEAR_SOLVER_NAME = {v: k for k, v in _LINEAR_SOLVER_MAP.items()}
+
+
+def resolve_linear_solver(value):
+    """'cudss' / 'own_lu' (or the LinearSolver enum) -> enum."""
+    if isinstance(value, _LinearSolver):
+        return value
+    if value not in _LINEAR_SOLVER_MAP:
+        raise ValueError(f"Unknown linear_solver {value!r}. Choose from: {list(_LINEAR_SOLVER_MAP)}")
+    return _LINEAR_SOLVER_MAP[value]
+
+
+def check_linear_solver_args(linear_solver, reordering_alg=None, matching_alg=None):
+    """Facade constructors: refuse what ``linear_solver='own_lu'`` cannot
+    take before any base case is solved (ValueError). None = the default."""
+    from . import _resolve_matching_alg, _resolve_reordering_alg
+    if resolve_linear_solver(linear_solver) == _LinearSolver.OwnLu:
+        _check_own_lu_config(_resolve_reordering_alg("default" if reordering_alg is None else reordering_alg),
+                             _resolve_matching_alg("none" if matching_alg is None else matching_alg))
+
+
+class RowStatus(IntEnum):
+    """Outcome of one row of a batched solve (``get_row_status()``); mirrors
+    the C++ ``RowStatus`` (contingency/row_status.hpp)."""
+    #: ``||F||inf < tol``
+    CONVERGED = 0
+    #: the ``nb_iter`` budget used up, residual finite but ``>= tol``
+    MAX_ITER = 1
+    #: residual not finite
+    DIVERGED = 2
+    #: dropped by the pre-check (would disconnect the grid, strands the angle
+    #: reference, ...), never solved
+    NOT_SIMULATED = 3
+    #: the outer loops (``outer_loops=True``): a loop failed, e.g. a slack
+    #: mismatch it could not share (lightsim2grid's ``OuterLoopStatus.FAILED``)
+    OUTER_FAILED = 4
+    #: the outer loops: ``max_outer_iterations`` reached (``UNSTABLE``)
+    OUTER_UNSTABLE = 5
+    #: the outer loops: converged to an unrealistic voltage
+    UNREALISTIC = 6
+
+
+# the rows the outer loops gave up on: their last inner solve converged, so the violation
+# kernel scanned a state no engine accepts (get_violations reports them as diverged)
+OUTER_FAILURE_STATUSES = frozenset((RowStatus.OUTER_FAILED, RowStatus.OUTER_UNSTABLE, RowStatus.UNREALISTIC))
+
+
+def outer_failure_rows(session, n_rows):
+    """(n_rows,) bool ndarray: the rows the outer loops gave up on (OUTER_FAILURE_STATUSES).
+    Their last inner solve converged, but lightsim2grid keeps no state for them: no
+    violation is counted, nothing is truncated and they are not converged."""
+    status = np.asarray(session.get_row_status(), dtype=int)
+    out = np.zeros(int(n_rows), dtype=bool)
+    m = min(len(status), out.shape[0])
+    out[:m] = np.isin(status[:m], [int(s) for s in OUTER_FAILURE_STATUSES])
+    return out
+
+
+def default_tol():
+    """Per unit: 1e-8 in double precision; 1e-3 in an FP32 build, whose
+    residual floor is around 1e-4 already on case118 (with a tighter tol the
+    rows near it would end MAX_ITER)."""
+    return 1e-3 if _is_fp32 else 1e-8
+
+
+def resolve_scheduling(value):
+    """'chunked' / 'continuous' (or the BatchScheduling enum) -> enum."""
+    if isinstance(value, _BatchScheduling):
+        return value
+    if value not in _SCHEDULING_MAP:
+        raise ValueError(f"Unknown scheduling {value!r}. Choose from: {list(_SCHEDULING_MAP)}")
+    return _SCHEDULING_MAP[value]
+
+
+class SchedulingEngineMixin:
+    """For the engine classes (``_ContingencyAnalysisSolver`` & co): expects
+    ``self._s`` to be the compiled session and ``self.strategy`` its strategy
+    name."""
+
+    def _init_scheduling(self, scheduling="chunked", nb_iter_per_round=1, tol=None):
+        self.nb_iter_per_round = nb_iter_per_round
+        self.tol = tol
+        self.scheduling = scheduling
+
+    @property
+    def scheduling(self):
+        """``'chunked'`` (default: ``ceil(n_rows / batch_size)`` chunks, every
+        row runs exactly ``nb_iter`` iterations) or ``'continuous'``
+        (``batch_size`` slots; every ``nb_iter_per_round`` iterations a row
+        that converged (``residual < tol``), diverged or used its ``nb_iter``
+        budget leaves and its slot is refilled at once). Continuous refuses
+        the ``'direct_iter0_only'`` / ``'direct_refactor_every_n'`` strategies.
+        Takes effect on the next run()."""
+        return _SCHEDULING_NAME[self._s.scheduling]
+
+    @scheduling.setter
+    def scheduling(self, value):
+        sched = resolve_scheduling(value)
+        if (sched == _BatchScheduling.Continuous
+                and getattr(self, "strategy", None) in _CONTINUOUS_REFUSED_STRATEGIES):
+            raise ValueError(
+                f"scheduling='continuous' does not support strategy {self.strategy!r}")
+        self._s.scheduling = sched
+
+    @property
+    def nb_iter_per_round(self):
+        """Continuous scheduling: Newton iterations every slot runs between two
+        convergence checks (k >= 1; a row then runs a multiple of k
+        iterations, at least k). Takes effect on the next run()."""
+        return self._s.nb_iter_per_round
+
+    @nb_iter_per_round.setter
+    def nb_iter_per_round(self, value):
+        value = int(value)
+        if value < 1:
+            raise ValueError("nb_iter_per_round must be >= 1")
+        self._s.nb_iter_per_round = value
+
+    @property
+    def tail_max_groups(self):
+        """Continuous scheduling, the tail: once the queue is empty and the live
+        rows fit in this many groups of ``tail_group_size`` slots, they are
+        moved into the first slots and every later round runs on those groups
+        only, its linear solve on a cuDSS handle of ``tail_group_size``
+        matrices cycled over them (cuDSS 0.8.0's uniform batch costs over an
+        order of magnitude more from 16 matrices on, so the full batch only
+        pays while many rows are live). Default 16; 0 turns the tail off.
+        :meth:`calibrate_tail_max_groups` measures the value for a GPU and a
+        grid. Only with ``strategy='direct_refactor_every'``. A moved row's
+        result is its own up to cuDSS's rounding. Takes effect on the next
+        run()."""
+        return self._s.tail_max_groups
+
+    @tail_max_groups.setter
+    def tail_max_groups(self, value):
+        value = int(value)
+        if value < 0:
+            raise ValueError("tail_max_groups must be >= 0 (0 turns the tail off)")
+        self._s.tail_max_groups = value
+
+    @property
+    def tail_group_size(self):
+        """Continuous scheduling: matrices of the tail's cuDSS handle (see
+        :attr:`tail_max_groups`). Default 15, the largest uniform batch before
+        cuDSS 0.8.0's cost cliff. Takes effect on the next run()."""
+        return self._s.tail_group_size
+
+    @tail_group_size.setter
+    def tail_group_size(self, value):
+        value = int(value)
+        if value < 1:
+            raise ValueError("tail_group_size must be >= 1")
+        self._s.tail_group_size = value
+
+    @property
+    def linear_solver(self):
+        """str: who factorizes and solves the batch Jacobians -- forward, the
+        continuous tail and the adjoint; the base case always stays on cuDSS.
+
+        - ``'cudss'`` (default): cuDSS's uniform batch.
+        - ``'own_lu'`` (experimental): the batched LU of our own
+          (docs/dev_notes/batched_lu_and_constrained_ordering.md). It never
+          pivots: its elimination order is chosen on the host from
+          :attr:`reordering_alg` -- ``'default'`` is lightsim2grid's constrained
+          order when the grid declares ordering constraints (a row the outer
+          loops switch by value keeps a valid pivot), started from the grid's
+          own fill-reducing order (AMD or MinFill), AMD otherwise; ``'amd'``,
+          ``'none'``, ``'ls2g_constrained'`` (same as the default),
+          ``'ls2g_constrained_nd'`` and ``'ls2g_constrained_minfill'`` (MinFill
+          whatever the grid's setting) are taken too. A pivot below ``1e-12 * max|J|`` (``1e-5`` in an FP32 build) is clamped (counted by
+          ``timings.cudss_npivots_*`` with ``GPUSIM2GRID_COUNT_PIVOTS=1``);
+          ``ir_n_steps`` refines. ``matching_alg`` must stay ``'none'``.
+
+        Takes effect on the next run (a new driver)."""
+        return _LINEAR_SOLVER_NAME[self._s.linear_solver]
+
+    @linear_solver.setter
+    def linear_solver(self, value):
+        ls = resolve_linear_solver(value)
+        self._check_own_lu(linear_solver=ls)
+        self._s.linear_solver = ls
+
+    def _check_own_lu(self, linear_solver=None, reordering_alg=None, matching_alg=None):
+        """ValueError if the session's settings, with the given ones (enums)
+        replacing theirs, ask the own LU for what it cannot take: called by the
+        setters before they assign, so a refused value changes nothing."""
+        ls = self._s.linear_solver if linear_solver is None else linear_solver
+        if ls != _LinearSolver.OwnLu:
+            return
+        _check_own_lu_config(self._s.reordering_alg if reordering_alg is None else reordering_alg,
+                             self._s.matching_alg if matching_alg is None else matching_alg)
+
+    def calibrate_tail_max_groups(self, n_repeat=5, batch_size=None):
+        """Measure a :attr:`tail_max_groups` for this grid on this GPU: the
+        base case's Jacobian refactorized and solved ``n_repeat`` times on a
+        cuDSS handle of ``batch_size`` matrices (None: :attr:`batch_size`) and
+        on one of :attr:`tail_group_size` matrices. Returns the
+        ``TailCalibration`` (``t_full_ms``, ``t_group_ms``, ``max_groups =
+        floor(t_full_ms / t_group_ms)``, what the tail's rule compares); sets
+        nothing. With ``linear_solver='own_lu'`` the tail runs k groups as one
+        solve on the first k·``tail_group_size`` matrices, so ``max_groups`` is
+        the largest k whose such prefix is still faster than the full batch
+        (bisected; ``t_group_ms`` is the one-group prefix). The tail also runs
+        the Newton kernels on fewer slots, so ``max_groups`` is conservative.
+        Allocates ``batch_size`` systems and their factors while it runs."""
+        return self._s.calibrate_tail_max_groups(
+            int(n_repeat), -1 if batch_size is None else int(batch_size))
+
+    @property
+    def tol(self):
+        """A row has converged when ``||F||inf < tol``, the residual in per unit
+        (what ``residuals`` / ``last_residuals()`` report and ``violation_tol``
+        compares): decides when it leaves (continuous) and its
+        :class:`RowStatus` (both schedules). lightsim2grid's comparison, but
+        not its unit: its ``tol`` is in MVA (``||F||inf < tol / sn_mva``).
+        ``None`` restores the default (1e-8, 1e-3 in an FP32 build). Takes
+        effect on the next run()."""
+        return self._s.tol
+
+    @tol.setter
+    def tol(self, value):
+        value = default_tol() if value is None else float(value)
+        if not (value > 0.0 and np.isfinite(value)):
+            raise ValueError("tol must be a positive finite number")
+        self._s.tol = value
+
+    def get_row_iterations(self):
+        """(n_rows,) int ndarray: Newton iterations each row ran in the last
+        run() (``nb_iter`` for every simulated row of a chunked run; a
+        multiple of ``nb_iter_per_round`` in a continuous one; 0 for a row
+        never simulated)."""
+        return np.asarray(self._s.get_row_iterations(), dtype=np.int64)
+
+    def get_row_status(self):
+        """(n_rows,) int ndarray of :class:`RowStatus` codes of the last
+        run()."""
+        return np.asarray(self._s.get_row_status(), dtype=np.int64)
+
+    def _warn_tol_above_violation_tol(self):
+        vt = getattr(self, "violation_tol", None)
+        if (vt is not None and self.scheduling == "continuous"
+                and getattr(self, "compute_limit_violations", False) and self.tol > vt):
+            warnings.warn(
+                f"tol ({self.tol:g}) > violation_tol ({vt:g}): a row that leaves "
+                "CONVERGED with a residual above violation_tol still gets a DIVERGENCE "
+                "record", RuntimeWarning, stacklevel=3)
+
+
+class SchedulingFacadeMixin:
+    """For the ``*GPU`` facades: expects ``self._inner`` (an engine carrying
+    :class:`SchedulingEngineMixin`)."""
+
+    @property
+    def linear_solver(self):
+        """See :attr:`SchedulingEngineMixin.linear_solver`."""
+        return self._inner.linear_solver
+
+    @linear_solver.setter
+    def linear_solver(self, value):
+        self._inner.linear_solver = value
+
+    @property
+    def scheduling(self):
+        """See :attr:`SchedulingEngineMixin.scheduling`."""
+        return self._inner.scheduling
+
+    @scheduling.setter
+    def scheduling(self, value):
+        self._inner.scheduling = value
+
+    @property
+    def nb_iter_per_round(self):
+        """See :attr:`SchedulingEngineMixin.nb_iter_per_round`."""
+        return self._inner.nb_iter_per_round
+
+    @nb_iter_per_round.setter
+    def nb_iter_per_round(self, value):
+        self._inner.nb_iter_per_round = value
+
+    @property
+    def tail_max_groups(self):
+        """See :attr:`SchedulingEngineMixin.tail_max_groups`."""
+        return self._inner.tail_max_groups
+
+    @tail_max_groups.setter
+    def tail_max_groups(self, value):
+        self._inner.tail_max_groups = value
+
+    @property
+    def tail_group_size(self):
+        """See :attr:`SchedulingEngineMixin.tail_group_size`."""
+        return self._inner.tail_group_size
+
+    @tail_group_size.setter
+    def tail_group_size(self, value):
+        self._inner.tail_group_size = value
+
+    def calibrate_tail_max_groups(self, n_repeat=5, batch_size=None):
+        """See :meth:`SchedulingEngineMixin.calibrate_tail_max_groups`."""
+        return self._inner.calibrate_tail_max_groups(n_repeat, batch_size)
+
+    @property
+    def tol(self):
+        """See :attr:`SchedulingEngineMixin.tol`."""
+        return self._inner.tol
+
+    @tol.setter
+    def tol(self, value):
+        self._inner.tol = value
+
+    def get_row_iterations(self):
+        """(n_rows,) int ndarray: Newton iterations each row ran in the last
+        compute() (see :meth:`SchedulingEngineMixin.get_row_iterations`)."""
+        return self._inner.get_row_iterations()
+
+    def get_row_status(self):
+        """(n_rows,) int ndarray of :class:`RowStatus` codes of the last
+        compute()."""
+        return self._inner.get_row_status()

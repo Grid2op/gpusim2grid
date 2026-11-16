@@ -27,15 +27,19 @@ PV→PQ relabelling without changing the Jacobian pattern).
 
 import numpy as np
 
+from ..contingency_analysis._scheduling import check_linear_solver_args
+
 from . import (
     LimitViolationsFacadeMixin,
     PhysicalChecksFacadeMixin,
     SlackRedistributionFacadeMixin,
+    SchedulingFacadeMixin,
     _ScenarioSweepSolver,
     _normalize_device,
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from .._ls2g_utils import (
     extract_grid_arrays,
@@ -47,6 +51,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
+from .._outer_loops import _check_outer_loops_args
 
 __all__ = ["ScenarioSweepGPU"]
 
@@ -56,7 +61,7 @@ def _have_bridge():
 
 
 class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin,
-                       LimitViolationsFacadeMixin):
+                       SchedulingFacadeMixin, LimitViolationsFacadeMixin):
     """Batch row-aligned topology + injection sweep on the GPU, seeded from a
     CPU base-case solve.
 
@@ -93,6 +98,23 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         single source of truth. ``None`` (default) leaves each at the
         session's own default. See :class:`InjectionSweepGPU` for the full
         description of each knob (identical semantics here).
+    ir_n_steps : int, default 0
+        cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: steps of iterative refinement after
+        each linear solve, base case and batch (forward and adjoint). ``0``
+        (default) solves without refinement. Static pivoting can leave the
+        Jacobian's factors a little inexact, which Newton usually absorbs.
+        **With** ``outer_loops=True`` **use 1**: each inner solve must stop at
+        the iteration lightsim2grid's does, and a hard one (e.g. after
+        TransformerVoltageControl releases a held remote voltage controller)
+        can diverge without refinement where lightsim2grid's KLU converges.
+        One step costs one more residual and solve per Newton iteration. Mutable:
+        takes effect on the next :meth:`compute` (the base case keeps the
+        construction value).
+    linear_solver : {'cudss', 'own_lu'}, default 'cudss'
+        Who factorizes and solves the batch Jacobians (forward, continuous tail,
+        adjoint); ``'own_lu'`` is the batched LU of our own, its order chosen on
+        the host from ``reordering_alg`` (lightsim2grid's constrained order by
+        default). See :attr:`linear_solver`; mutable, next run.
     debug_base_case : bool, default False
         Opt-in diagnostic; see :class:`InjectionSweepGPU`.
     scaling_max_voltage_change, max_dVa, max_dVm : bool/float or None
@@ -100,6 +122,63 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     use_distributed_slack : bool, default True
         Selects which of the two slack formulations the GPU solves; see
         :class:`InjectionSweepGPU`.
+    scheduling, nb_iter_per_round, tol
+        Batch scheduling (chunked / continuous) and the convergence tolerance
+        of a row; see :class:`ContingencyAnalysisGPU`. A continuous run always
+        rebuilds its batch driver; its batched adjoint rebuilds each row's
+        Jacobian from the converged voltages (``keep_final_jacobian`` is not
+        needed there). ``None`` (default): ``"chunked"``, or ``"continuous"``
+        with ``outer_loops``, which supports only ``"continuous"`` and
+        ``nb_iter_per_round=1`` (by design, see ``outer_loops``).
+    outer_loops : bool, default False
+        Run the grid's own outer loops on every row: lightsim2grid's
+        ``NROuter_*`` algorithm (``grid.change_algorithm("NROuter_KLU")``, the
+        grid solved with it) and its loops -- DistributedSlack,
+        AcHvdcAcEmulationLimits, VoltageMonitoring, ReactiveLimits -- with
+        their parameters and the driver's (``max_outer_iterations``, the
+        robust mode, the realistic voltage band). The rows are solved on the
+        GPU by its single-slack inner Newton -- or, for a grid solved with an
+        ``NROuterDist_*`` algorithm, by its distributed-slack one: the Newton
+        shares the slack on the units DistributedSlack takes, by weights each
+        solve sets, and the loop only caps (parks) the units that sharing
+        pushes past a limit, as lightsim2grid; their loops decide on the host
+        after each converged inner solve, and a row their loops change is
+        re-solved in place from its voltages; ``nb_iter`` is the budget of
+        each inner solve (pass ``ir_n_steps=1``, see there). Each row starts from
+        the grid's voltages (its generator buses at their set-points) and the
+        grid's controls, as a lightsim2grid batch without
+        ``init_from_n_powerflow`` -- or, with ``init_from_n_powerflow=True``
+        (the default), from where the grid's own solve left its loops, as
+        lightsim2grid's batch with it: the grid's voltages as they are, the
+        buses its loops froze (frozen again at each row's own limit), the
+        SVCs switched on, the hvdc regimes, the targets they moved (but where
+        the row sets its own: :meth:`set_injections_from_elements` sets every
+        generator's). The loops read the rows' generator targets from
+        :meth:`set_injections_from_elements`; with the per-bus
+        :meth:`set_injections` they start from the grid's (DistributedSlack's
+        units, the capability curves ReactiveLimits reads), whatever the rows'
+        Sbus carries. A row's masked buses
+        (``handle_disconnected_grid``), the generators it disconnects
+        (:meth:`set_contingency_gens`, which may only release a bus the loops
+        reserved -- ReactiveLimits reserves every bus its own machines hold) and
+        its voltage set-points (:meth:`set_gen_v`) are seen by its loops as
+        lightsim2grid's batch shows them. With ``redistribute_slack``, the
+        DistributedSlack loop shares what a row loses before its first solve, as
+        lightsim2grid's batch does. Gradients: through
+        :class:`gpusim2grid.differentiable.BatchPowerFlow` (``outer_loops=True``),
+        lightsim2grid's -- each row's last inner solve, its loops' decisions held.
+        Not supported yet: ``compute_physical_violations``. See :meth:`get_outer_results`.
+        Requires ``scheduling="continuous"`` (the default with it) and
+        ``nb_iter_per_round=1``, by design -- neither ``"chunked"`` nor another
+        ``nb_iter_per_round`` is supported, nor planned to be: a row the loops
+        change is re-solved in its own slot while the others go on, which a
+        chunk (every row the same ``nb_iter`` iterations) cannot do, and each
+        inner solve must stop at the iteration lightsim2grid's does, so that
+        the loops decide on the same state.
+    keep_outer_trace : bool, default False
+        With ``outer_loops``: keep each row's decision trace
+        (``get_outer_results()[i].decisions``, lightsim2grid's
+        ``OuterLoopStats.decisions``).
 
     Examples
     --------
@@ -137,17 +216,26 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  nb_iter=4, max_iter_base=10, tol_base=1e-8, device=None,
                  use_bridge=None, handle_disconnected_grid=False,
                  compute_limit_violations=False, reordering_alg=None,
-                 matching_alg=None, pivot_epsilon_alg=None,
-                 debug_base_case=False,
+                 matching_alg=None, pivot_epsilon_alg=None, ir_n_steps=0,
+                 linear_solver="cudss", debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
-                 reference_slack="auto"):
+                 reference_slack="auto", scheduling=None, nb_iter_per_round=1,
+                 tol=None, outer_loops=False, keep_outer_trace=False):
         _validate_precision(precision)
+        check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
+        self._outer_loops = bool(outer_loops)
+        if scheduling is None:
+            scheduling = "continuous" if self._outer_loops else "chunked"
+        if self._outer_loops:
+            _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
+                                    compute_physical_violations=compute_physical_violations)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
         _pivot_epsilon_alg = 'default' if pivot_epsilon_alg is None else pivot_epsilon_alg
+        _ir_n_steps = _check_ir_n_steps(ir_n_steps)
 
         if isinstance(grid, (tuple, list)):
             # Explicit-array mode: no grid to seed/extract branch data from.
@@ -164,6 +252,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                 presolved_v=bool(init_from_n_powerflow),
                 reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                 pivot_epsilon_alg=_pivot_epsilon_alg,
+                ir_n_steps=_ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 scaling_max_voltage_change=bool(scaling_max_voltage_change),
                 max_dVa=0.5 if max_dVa is None else float(max_dVa),
@@ -183,7 +272,31 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             if use_bridge is None:
                 use_bridge = _have_bridge()
 
-            if use_bridge:
+            if self._outer_loops:
+                # The grid's own outer loops (lightsim2grid's NROuter_*): the session
+                # poses its inner Newton's system, the model decides on every row --
+                # see ls2g_bridge.cpp:make_ss_outer_session_from_lsgrid.
+                session = _cpp._make_ss_outer_session_from_lsgrid(
+                    grid, 100, int(nb_iter), _normalize_device(device),
+                    bool(compute_limit_violations),
+                    reordering_alg=_resolve_reordering_alg(_reordering_alg),
+                    matching_alg=_resolve_matching_alg(_matching_alg),
+                    pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
+                    keep_trace=bool(keep_outer_trace),
+                    resume_from_n=bool(init_from_n_powerflow),
+                    # None => the grid's own step scaling, as without the outer loops
+                    scaling_max_voltage_change_override=(
+                        -1 if scaling_max_voltage_change is None
+                        else int(bool(scaling_max_voltage_change))),
+                    max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
+                self._inner = _ScenarioSweepSolver._wrap_session(
+                    session, max_iter_base=max_iter_base, tol_base=tol_base,
+                    reordering_alg=_reordering_alg, matching_alg=_matching_alg,
+                    pivot_epsilon_alg=_pivot_epsilon_alg)
+                self._n_branches = self._inner._s.n_branches
+            elif use_bridge:
                 # Branch data is always set -- set_topology() needs it, not
                 # just compute_flows() -- see ls2g_bridge.cpp:make_ss_session_from_lsgrid.
                 # When compute_limit_violations is True, the bridge also pulls
@@ -195,6 +308,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     reordering_alg=_resolve_reordering_alg(_reordering_alg),
                     matching_alg=_resolve_matching_alg(_matching_alg),
                     pivot_epsilon_alg=_resolve_pivot_epsilon_alg(_pivot_epsilon_alg),
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     scaling_max_voltage_change_override=(
                         -1 if scaling_max_voltage_change is None
@@ -219,6 +333,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                     presolved_v=init_from_n_powerflow,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
                     pivot_epsilon_alg=_pivot_epsilon_alg,
+                    ir_n_steps=_ir_n_steps,
                     debug_base_case=bool(debug_base_case),
                     scaling_max_voltage_change=bool(scaling_max_voltage_change),
                     max_dVa=0.5 if max_dVa is None else float(max_dVa),
@@ -256,6 +371,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         self._last_residuals = None
 
         # Post-solve physical checks -- see PhysicalChecksFacadeMixin.
+        # Batch scheduling (chunked / continuous), see SchedulingEngineMixin.
+        # Who factorizes / solves the batch Jacobians, see
+        # SchedulingFacadeMixin.linear_solver (the base case stays on cuDSS).
+        self._inner.linear_solver = linear_solver
+        self._inner._init_scheduling(scheduling, nb_iter_per_round, tol)
+
         self._apply_physical_checks_kwargs(compute_physical_violations)
 
         # set_injections_from_elements() inputs, kept so a later
@@ -263,6 +384,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # disconnected generators taken out, whatever the call order.
         self._pending_elements = None
         self._gen_off = None
+        self._load_off = None   # set_contingency_loads(), applied the same way
+        # per-row (rows, buses, MVAr) reactive changes added on top of the
+        # assembled injections -- private, set by ContingencyAnalysisGPU's
+        # reactive_limits_outer_loop second pass (None = none)
+        self._q_delta = None
         # set_gen_v() input, kept so a later set_contingency_gens() (or vice
         # versa) can re-derive which rows ask one bus for two different |V|.
         self._gen_v = None
@@ -279,6 +405,28 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         if redistribute_slack:
             self.redistribute_slack = True
         self.reference_slack = reference_slack
+
+    # ------------------------------------------------------------ outer loops
+    @property
+    def outer_loops(self):
+        """bool: whether the grid's own outer loops (lightsim2grid's NROuter_* / NROuterDist_*:
+        DistributedSlack, AcHvdcAcEmulationLimits, VoltageMonitoring,
+        ReactiveLimits) run on every row (construction-time only)."""
+        return self._outer_loops
+
+    def get_outer_results(self):
+        """Per row, the outcome of its outer loops after the last
+        :meth:`compute` -- lightsim2grid's ``OuterRowResult``: ``status``
+        (0 STABLE, 1 UNSTABLE, 2 FAILED), ``unrealistic_state``,
+        ``failed_loop``, ``nb_outer_iterations``, ``nb_nr_iterations`` and what
+        the loops moved, as ``(id, value)`` pairs (``gen_target_p``,
+        ``storage_target_p``, ``hvdc_regime``). Needs
+        ``outer_loops=True``. A row's :class:`RowStatus` (:meth:`get_row_status`)
+        says the same in one value: CONVERGED, OUTER_FAILED, OUTER_UNSTABLE,
+        UNREALISTIC, or MAX_ITER / DIVERGED for its last inner solve."""
+        if not self._outer_loops:
+            raise RuntimeError("get_outer_results() needs outer_loops=True")
+        return self._inner._s.get_outer_results()
 
     # ------------------------------------------------------------------ spec
     def set_branch_data(self, branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
@@ -348,9 +496,23 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             # Row counts disagree: leave the check to the C++ session at
             # compute() (same rule as set_topology), assemble without the mask.
             gen_off = None
+        load_off = self._load_off
+        if load_off is not None and load_off.shape[0] != load_p.shape[0]:
+            load_off = None   # (same rule as gen_off above)
         p_mw, q_mvar = build_bus_injections(self._elements,
                                             load_p, load_q, gen_p,
-                                            gen_off=gen_off)
+                                            gen_off=gen_off, load_off=load_off)
+        if self._inner._s.has_more_trips:
+            # what the rows' static generators, storage units, SVCs and hvdc stations stamped
+            dp, dq = self._inner._s.more_trips_injection_delta()
+            if dp.shape[0] == p_mw.shape[0]:   # (else the C++ session refuses it at compute())
+                p_mw = p_mw + dp
+                q_mvar = q_mvar + dq
+        if self._q_delta is not None:
+            # ContingencyAnalysisGPU's reactive_limits_outer_loop second pass:
+            # (row, bus, MVAr) changes of the switched / released machines
+            rows, buses, dq = self._q_delta
+            np.add.at(q_mvar, (rows, buses), dq)
         self._inner.set_injections(p_mw, q_mvar, self._elements.sn_mva)
         self._n_injection_rows = int(p_mw.shape[0])
         self._skip_rows_stale = self._gen_v is not None
@@ -388,10 +550,15 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         reuses it otherwise. :attr:`dim_J` / :attr:`reserved_switchable_buses`
         show the current structure.
 
-        Only generators regulating their **own** bus are supported: raises
-        for a generator regulating a remote bus, or one whose bus a control
-        group holds (a remote generator, an SVC or an HVDC converter station),
-        and in explicit-array (tuple) mode (no generator data).
+        A controller of a voltage-control group (a generator regulating a
+        remote bus, or one whose bus a group holds) leaves its group on that
+        row, the regulated bus going free when nobody is left. Such a row is
+        reported BATCH_UNSUPPORTED (see :meth:`get_batch_unsupported_reasons`)
+        with ``compute_physical_violations`` or ``keep_final_jacobian``, when
+        the generator is held at a reactive limit (lightsim2grid's held
+        regulators), or when it takes out every controller of a group
+        regulating a slack bus. Raises in explicit-array (tuple) mode (no
+        generator data).
         """
         if self._elements is None:
             raise RuntimeError(
@@ -541,12 +708,120 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         """
         self._inner.set_topology(branch_ids_per_scenario)
 
+    def set_contingency_shunts(self, mask):
+        """Per-row shunt contingency mask, shape ``(n_scenarios, n_shunt)``,
+        dtype bool. ``True`` means "disconnect this shunt for this row".
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_contingency_shunts``: a shunt
+        is an admittance, so the row loses its diagonal coefficient of the
+        admittance matrix, as :meth:`set_topology` edits it for a branch (both
+        are kept together). With the outer loops, a shunt that regulates a
+        voltage is refused (its sections are the ShuntVoltageControl loop's).
+        Needs a lightsim2grid grid.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_contingency_shunts() needs a lightsim2grid grid; "
+                "explicit-array (tuple) mode has no shunts to read.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(f"'mask' must be 2-D (n_scenarios, n_shunt), got shape {mask.shape}.")
+        self._inner._s.set_contingency_shunts(np.ascontiguousarray(mask, dtype=bool))
+
+    def set_contingency_loads(self, mask):
+        """Per-row load contingency mask, shape ``(n_scenarios, n_load)``,
+        dtype bool. ``True`` means "disconnect this load for this row".
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_contingency_loads``: the
+        row's own load (:meth:`set_injections_from_elements`) leaves its
+        injection, whichever of the two is called first, and the distributed
+        slack makes up the balance. A caller giving per-bus injections
+        (:meth:`set_injections`) takes the loads out of its arrays itself:
+        :meth:`compute` refuses a mask disconnecting a load there. A mask
+        disconnecting nothing (all ``False``) clears a previous one. Needs a
+        lightsim2grid grid.
+        """
+        if self._elements is None:
+            raise RuntimeError(
+                "set_contingency_loads() needs a lightsim2grid grid; "
+                "explicit-array (tuple) mode has no loads to read.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(f"'mask' must be 2-D (n_scenarios, n_load), got shape {mask.shape}.")
+        if mask.shape[1] != self._elements.n_load:
+            raise ValueError(
+                f"The number of loads on the grid ({self._elements.n_load}) "
+                f"differs from the number of columns of the mask ({mask.shape[1]}).")
+        mask = np.ascontiguousarray(mask, dtype=bool)
+        self._inner._s.set_contingency_loads(mask)   # what the outer loops' view reads
+        # no load disconnected = no mask: compute() must not refuse the per-bus
+        # injections of a caller who cleared it
+        self._load_off = mask if mask.any() else None
+        if self._pending_elements is not None:
+            self._assemble_injections()
+
+    def _set_more_trip(self, name, mask):
+        if self._elements is None:
+            raise RuntimeError(f"{name}() needs a lightsim2grid grid; explicit-array (tuple) mode has no such element.")
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError(f"'mask' must be 2-D (n_scenarios, n_element), got shape {mask.shape}.")
+        getattr(self._inner._s, name)(np.ascontiguousarray(mask, dtype=bool))
+        if self._pending_elements is not None:
+            self._assemble_injections()
+
+    def set_contingency_sgens(self, mask):
+        """Per-row static generator mask ``(n_scenarios, n_sgen)``, ``True`` = disconnected:
+        its power leaves the row's injection (lightsim2grid's ``set_contingency_sgens``).
+        Whichever of it and :meth:`set_injections_from_elements` comes first; with per-bus
+        :meth:`set_injections`, take it out of the arrays yourself."""
+        self._set_more_trip("set_contingency_sgens", mask)
+
+    def set_contingency_storages(self, mask):
+        """Per-row storage unit mask ``(n_scenarios, n_storage)``: the unit leaves the row's
+        injection and distributed slack; the last controller of a bus turns it PQ. A unit on
+        a bus a control group holds, or one the physical checks look at with
+        ``compute_physical_violations``, is reported BATCH_UNSUPPORTED, see
+        :meth:`get_batch_unsupported_reasons`."""
+        self._set_more_trip("set_contingency_storages", mask)
+
+    def set_contingency_svcs(self, mask):
+        """Per-row static var compensator mask ``(n_scenarios, n_svc)``: its fixed reactive
+        injection and its b0 leave the row. One in voltage mode leaves its control group, one
+        with a standby automaton its automaton's check and the VoltageMonitoring loop
+        (lightsim2grid leaves that row out). One frozen at a reactive limit, or one in voltage
+        mode with ``compute_physical_violations``, is reported BATCH_UNSUPPORTED."""
+        self._set_more_trip("set_contingency_svcs", mask)
+
+    def set_contingency_hvdcs(self, mask):
+        """Per-row HVDC line mask ``(n_scenarios, n_hvdc)``: both converter stations leave the
+        row. A line in AC emulation carries no flow any more, a station in a control group leaves
+        it, and the bus a regulating station was the last to hold turns PQ. With
+        ``compute_physical_violations``, a line in AC emulation or with a regulating station is
+        reported BATCH_UNSUPPORTED (those checks cannot leave it out of a row yet)."""
+        self._set_more_trip("set_contingency_hvdcs", mask)
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per row: why the batch left it out (``""``: it did not), after
+        :meth:`compute`. Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return self._inner.get_batch_unsupported_reasons()
+
     def compute(self, batch_size=512):
         """Solve every scenario; return DLPack (n_scenarios, n_bus) complex.
 
         The capsule aliases live GPU memory; clone before the next ``compute()``
         for a snapshot.  Residuals are cached for :meth:`last_residuals`.
         """
+        if self._load_off is not None and self._pending_elements is None:
+            raise RuntimeError(
+                "set_contingency_loads() takes the loads out of the injections given by "
+                "set_injections_from_elements(); with per-bus set_injections(), take them "
+                "out of the arrays yourself (and do not call set_contingency_loads).")
+        if self._inner._s.has_more_trips and self._pending_elements is None:
+            raise RuntimeError(
+                "set_contingency_sgens / _storages / _svcs / _hvdcs take the elements out of the injections "
+                "given by set_injections_from_elements(); with per-bus set_injections(), take them out of "
+                "the arrays yourself (and do not call them).")
         self._inner.batch_size = int(batch_size)
         if self._skip_rows_stale:
             self._update_skipped_rows()
@@ -788,6 +1063,16 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
     @pivot_epsilon_alg.setter
     def pivot_epsilon_alg(self, value):
         self._inner.pivot_epsilon_alg = value
+
+    @property
+    def ir_n_steps(self):
+        """int: cuDSS ``CUDSS_CONFIG_IR_N_STEPS``, iterative refinement steps per
+        batch solve (0 = none). Takes effect on the next :meth:`compute`."""
+        return self._inner.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._inner.ir_n_steps = value
 
     @property
     def timings(self):

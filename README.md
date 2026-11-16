@@ -75,68 +75,67 @@ Coming soon:
 
 ## ⚠️ Important warning
 
-**This is a raw Newton-Raphson solver. There is no outer loop.** It does not enforce
-reactive-power limits (no PV→PQ switching), adjust tap / phase-shifter setpoints, or
-perform any other outer-loop correction. The *in-Jacobian* controls that
+**By default this is a raw Newton-Raphson solver, with no outer loop.** It does not
+enforce reactive-power limits (no PV→PQ switching), adjust tap / phase-shifter setpoints,
+or perform any other outer-loop correction. The *in-Jacobian* controls that
 lightsim2grid models — distributed slack, HVDC angle-droop, SVC, and remote
 generator voltage control — **are** solved when you go through the lightsim2grid
-bridge (the default facade path), and then match lightsim2grid. But if your problem
-relies on outer-loop behaviour (Q limits, tap changing, …), results will differ from
-a full load-flow tool. See [`DISCLAIMER.md`](DISCLAIMER.md) for the full list of
-limitations and for pointers to other open-source tools that cover them.
+bridge (the default facade path), and then match lightsim2grid. The three batch
+facades can also run the grid's own lightsim2grid outer loops on every row
+(`outer_loops=True`, a grid solved with an `NROuter_*` algorithm: OpenLoadFlow's
+reactive limits, distributed slack, HVDC AC-emulation limits, voltage monitoring,
+phase / transformer / shunt voltage control); the single solve (`AcPfGPU`) cannot.
+Without them, if your problem relies on outer-loop behaviour (Q limits, tap
+changing, …), results will differ from a full load-flow tool. See
+[`DISCLAIMER.md`](DISCLAIMER.md) for the full list of limitations and for pointers
+to other open-source tools that cover them.
 
 ## Requirements
 
-- A **CUDA-capable NVIDIA GPU**.
-- The **[NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)**
-  12.x+.
-- **[cuDSS](https://developer.nvidia.com/cudss) >= 0.8.0** — required for the sparse
-  direct solve.
-- **cuSPARSE** (ships with the CUDA Toolkit).
-- Python 3.9+, a C++17 compiler, CMake >= 3.15.
-- **[`lightsim2grid`](https://github.com/Grid2op/lightsim2grid) (hard dependency)** —
-  CPU preprocessing and reference oracle. <!--REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER  Integration with `lightsim2grid` is expected to deepen in future releases. -->
-
-> NVIDIA libraries (cuDSS, cuSPARSE) are **not redistributed** with this package.
-> Install the CUDA Toolkit and cuDSS yourself before building, using the links above.
+- A **CUDA-capable NVIDIA GPU** and its driver.
+- Python 3.9+ and a C++17 compiler.
+- Everything else comes from PyPI:
+  - **[`lightsim2grid`](https://github.com/Grid2op/lightsim2grid) >= 1.3.1 (hard
+    dependency)** — CPU preprocessing and reference oracle. Its wheel ships the C++
+    core and headers (KLU's included) that gpusim2grid's bridge compiles against.
+    <!--REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER  Integration with `lightsim2grid` is expected to deepen in future releases. -->
+  - **[cuDSS](https://developer.nvidia.com/cudss) 1.x** (`nvidia-cudss-cu12` /
+    `nvidia-cudss-cu13`) — the sparse direct solve.
+  - the **CUDA 13 toolkit** (`cuda-toolkit`), compiler included. PyPI has no
+    CUDA 12 compiler: with CUDA 12, `nvcc` (12.4 or later) comes from the
+    [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) installer,
+    the libraries and cuDSS from PyPI.
 
 ## Installation
 
-Install from source (no PyPI release yet):
+Install from source (no PyPI release of gpusim2grid yet). With CUDA 13, everything
+it builds against comes from PyPI:
 
 ```bash
 git clone https://github.com/Grid2Op/gpusim2grid.git
 cd gpusim2grid
-pip install --no-build-isolation .
+pip install "lightsim2grid>=1.3.1" "nvidia-cudss-cu13>=1.0.0.35,<2" \
+    "cuda-toolkit[nvcc,crt,cudart,cccl,cublas,cusolver,cusparse,nvjitlink,nvvm]>=13,<14" \
+    scikit-build-core pybind11 cmake
+CUDA_ROOT=$(python -c "import nvidia.cu13 as m; print(list(m.__path__)[0])")
+CUDACXX=$CUDA_ROOT/bin/nvcc CUDAToolkit_ROOT=$CUDA_ROOT cudss_DIR=$PWD/ci/cmake/cudss \
+    pip install --no-build-isolation .
+export LD_LIBRARY_PATH=$CUDA_ROOT/lib:$LD_LIBRARY_PATH   # cuDSS / cuSPARSE at runtime
 ```
 
-This automatically builds the zero-copy C++ bridge to `lightsim2grid`
-(`lightsim2grid_core`) — CMake locates it via the Python interpreter it is
-building against, since `lightsim2grid` is a build-system requirement. No
-`CMAKE_ARGS` needed for the common case; see the
-[installation docs](#building-the-docs) if you need to point at a different
-`lightsim2grid` install. `--no-build-isolation` matters here too: it makes
-gpusim2grid's own build use the `lightsim2grid` already installed in your
-current environment (matching Eigen/SuiteSparse/compile flags) instead of
-pip resolving a fresh, isolated one that may not match.
+With CUDA 12, install `"nvidia-cudss-cu12>=1.0.0.35,<2"` instead and keep the
+toolkit's own `nvcc` on your `PATH`; `cudss_DIR` is the same, `LD_LIBRARY_PATH`
+needs the wheel's `nvidia/cu12/lib`. `pip install ".[cuda12]"` / `".[cuda13]"`
+lists the runtime libraries.
 
-> **`lightsim2grid` should also be built from source.** The PyPI wheel does
-> not ship the C++ headers (`LSGrid.hpp` and friends) the bridge needs, only
-> the compiled extension — so build it yourself first, with
-> `--no-build-isolation` so it's built against the same environment
-> gpusim2grid will use. It also needs its own submodules (SuiteSparse,
-> Eigen) checked out, or it won't compile:
-> ```bash
-> git clone --recurse-submodules https://github.com/Grid2op/lightsim2grid.git
-> cd lightsim2grid
-> pip install --no-build-isolation .
-> ```
-> (or the equivalent `uv pip install --no-build-isolation .`). See the
-> [installation docs](#building-the-docs) for details on matching Eigen /
-> SuiteSparse versions between the two builds.
+This builds the zero-copy C++ bridge to `lightsim2grid` (`lightsim2grid_core`):
+CMake locates it, and the KLU headers it ships, via the Python interpreter it is
+building against. `--no-build-isolation` makes the build use the `lightsim2grid`
+installed in your environment instead of a fresh, isolated one pip would resolve.
+`ci/cmake/cudss/` is a small CMake package for the cuDSS wheel, which ships none.
 
-For detailed installation options — selecting float precision, linking against a
-specific CUDA version, and other build customization — see the dedicated installation
+For detailed installation options — selecting float precision, a CUDA toolkit or
+cuDSS not from PyPI, and other build customization — see the dedicated installation
 page in the [documentation](#building-the-docs).
 
 ## Quickstart
@@ -303,8 +302,9 @@ Copyright © "DOUBLE BLINDE REMOVED" DO NOT DISTRIBUTE THIS ANONYMISED VERSION !
 [Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem. 
 
 NVIDIA CUDA libraries (CUDA Toolkit, cuDSS, cuSPARSE) are dependencies, not
-redistributed components, and remain under their respective NVIDIA licenses. DLPack is
-used under its own [license](https://github.com/dmlc/dlpack/blob/main/LICENSE).
+redistributed components, and remain under their respective NVIDIA licenses. The vendored
+DLPack header (`src/_cpp/dlpack/dlpack.h`) is under the Apache License 2.0, its
+[license](src/_cpp/dlpack/LICENSE) next to it.
 
 <!-- ## Acknowledgements
 
@@ -313,4 +313,5 @@ REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
 Developed at RTE. Part of the [Grid2Op](https://github.com/Grid2Op) ecosystem and built
 on [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid). Uses
 [Eigen](https://eigen.tuxfamily.org), [KLU](https://github.com/DrTimothyAldenDavis/SuiteSparse),
-[cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. -->
+[cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. The batched LU behind
+`linear_solver='own_lu'` is Ralf Cortes Do Nascimento's contribution. -->

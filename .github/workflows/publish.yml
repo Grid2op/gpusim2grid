@@ -1,0 +1,157 @@
+name: Publish to PyPI
+
+# Modelled on lightsim2grid's publish.yml: triggered when you click "Publish
+# release" in the GitHub UI on a release that points to a v*.*.* tag, uploaded by
+# PyPI trusted publishing (OIDC, no token stored here).
+#
+# gpusim2grid is published as an sdist only (pip compiles it on the user's
+# machine, see docs/installation.rst), so the sdist is built here rather than
+# downloaded from another workflow, and installed the way a user would --
+# `pip install "gpusim2grid-X.tar.gz[cuda13]"`, isolated build, PyPI's CUDA 13
+# toolkit -- before anything is uploaded: a sdist that does not build never
+# reaches PyPI. The runner has no GPU, so nothing is run on one; build.yml and
+# the gpu-tests job cover that on the commit itself.
+#
+# Manual dispatch ("Run workflow") does the same against TestPyPI, to rehearse a
+# release: a version already there is skipped, not an error.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sdist:
+    name: Build the sdist
+    runs-on: ubuntu-latest
+    # Only releases that point to a version tag (a release on another tag, e.g.
+    # a "latest" pointer, is ignored); a manual dispatch from any ref.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # ── GUARD 1: the release tag is v<__version__> ──────────────────────────
+      # __version__ in src/gpusim2grid/__init__.py is what scikit-build-core stamps
+      # on the sdist ([tool.scikit-build.metadata.version] in pyproject.toml).
+      - name: Check version consistency (tag vs src/gpusim2grid/__init__.py)
+        if: github.event_name == 'release'
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG_VERSION=$(sed -nE 's/^__version__\s*=\s*"([^"]+)"$/\1/p' src/gpusim2grid/__init__.py)
+          echo "Git tag     : ${TAG}"
+          echo "__version__ : ${PKG_VERSION}"
+          if [ -z "${PKG_VERSION}" ] || [ "${TAG}" != "v${PKG_VERSION}" ]; then
+            echo "::error::Tag '${TAG}' does not match __version__ = '${PKG_VERSION}' in src/gpusim2grid/__init__.py. Did you forget to bump the version before tagging?"
+            exit 1
+          fi
+          echo "✓ Tag matches __version__."
+
+      - name: Build the sdist
+        run: |
+          pip install -q build twine
+          # Building an sdist needs no CUDA: the backend adds the CUDA requirements
+          # to wheel builds only.
+          python -m build --sdist -o dist .
+          ls -l dist
+
+      # ── GUARD 2: what the sdist holds ────────────────────────────────────────
+      # Exactly the tracked build inputs (pyproject.toml's sdist.exclude), and
+      # valid metadata.
+      - name: Check the sdist
+        run: |
+          twine check --strict dist/*.tar.gz
+          SDIST=$(ls dist/*.tar.gz)
+          ROOT=$(basename "${SDIST}" .tar.gz)
+          diff <(tar tzf "${SDIST}" | sed "s#^${ROOT}/##" | grep -v '/$' | grep -vx PKG-INFO | sort) \
+               <(git ls-files src ci/cmake _build_backend CMakeLists.txt pyproject.toml \
+                   README.md LICENSE AUTHORS.txt CHANGELOG.rst DISCLAIMER.md | sort) \
+            || { echo "::error::the sdist does not hold exactly the tracked build inputs"; exit 1; }
+          echo "✓ $(tar tzf "${SDIST}" | grep -vc '/$') files, $(du -h "${SDIST}" | cut -f1)."
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: gpusim2grid-sdist
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  install-check:
+    name: Install the sdist as a user would (CUDA 13, no GPU)
+    needs: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: gpusim2grid-sdist
+          path: dist
+
+      # No checkout: only the sdist is installed, from outside any source tree.
+      # sm_75 only, to keep the compile short (no nvidia-smi here: the default
+      # would be every architecture from sm_75 on).
+      - name: pip install "gpusim2grid-*.tar.gz[cuda13]"
+        env:
+          CMAKE_ARGS: -DCMAKE_CUDA_ARCHITECTURES=75
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+        run: |
+          python -m venv /tmp/venv
+          SDIST=$(ls "$PWD"/dist/*.tar.gz)
+          /tmp/venv/bin/pip install -q -U pip
+          /tmp/venv/bin/pip install --no-cache-dir "gpusim2grid[cuda13] @ file://${SDIST}"
+
+      - name: Import it
+        run: |
+          cd /
+          /tmp/venv/bin/python - <<'EOF'
+          import gpusim2grid
+          from gpusim2grid import _gpusim2grid as m, compilation_options as c
+          print("gpusim2grid", gpusim2grid.__version__, "CUDA", c.cuda_version,
+                "cuDSS", c.cudss_version, "lightsim2grid", c.lightsim2grid_version)
+          assert c.cuda_major == 13, c.cuda_major
+          assert hasattr(m, "_make_ca_session_from_lsgrid"), "ls2g bridge not built"
+          EOF
+
+  publish:
+    name: Publish to ${{ github.event_name == 'release' && 'PyPI' || 'TestPyPI' }}
+    needs: install-check
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'release' && 'pypi' || 'testpypi' }}
+      url: ${{ github.event_name == 'release' && 'https://pypi.org/p/gpusim2grid' || 'https://test.pypi.org/p/gpusim2grid' }}
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: gpusim2grid-sdist
+          path: dist
+
+      # No token needed. Configure trusted publishing on PyPI (and TestPyPI):
+      #   Owner:     Grid2op
+      #   Repo:      gpusim2grid
+      #   Workflow:  publish.yml
+      #   Env name:  pypi (testpypi on TestPyPI)
+      - name: Publish to PyPI
+        if: github.event_name == 'release'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2 (release/v1 branch head)
+
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2 (release/v1 branch head)
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true

@@ -42,6 +42,7 @@ from ..contingency_analysis import (
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 from ..contingency_analysis._limit_violations import (
     ViolationElementType,
@@ -60,6 +61,8 @@ from ..contingency_analysis._slack_redistribution import (
     SlackRedistributionEngineMixin,
     SlackRedistributionFacadeMixin,
 )
+from ..contingency_analysis._scheduling import (OUTER_FAILURE_STATUSES, SchedulingEngineMixin, outer_failure_rows,
+                                                SchedulingFacadeMixin)
 from ..injection_sweep import _normalize_device, _DeviceBuffer
 
 
@@ -89,7 +92,7 @@ def _resolve_strategy(strategy):
 
 
 class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
-                           LimitViolationsEngineMixin):
+                           SchedulingEngineMixin, LimitViolationsEngineMixin):
     """Stateful GPU row-aligned combined topology + injection sweep.
 
     The base-case Newton-Raphson is solved once at construction; subsequent
@@ -134,9 +137,10 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
                  device=None, handle_disconnected_grid=False, presolved_v=False,
                  reordering_alg='default',
-                 matching_alg='none', pivot_epsilon_alg='default',
+                 matching_alg='none', pivot_epsilon_alg='default', ir_n_steps=0,
                  debug_base_case=False,
-                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
+                 scheduling='chunked', nb_iter_per_round=1, tol=None):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -150,10 +154,12 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
             reordering_alg=_resolve_reordering_alg(reordering_alg),
             matching_alg=_resolve_matching_alg(matching_alg),
             pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            ir_n_steps=_check_ir_n_steps(ir_n_steps),
             debug_base_case=bool(debug_base_case),
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
+        self._init_scheduling(scheduling, nb_iter_per_round, tol)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -243,6 +249,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
 
     @reordering_alg.setter
     def reordering_alg(self, value):
+        self._check_own_lu(reordering_alg=_resolve_reordering_alg(value))
         self._s.reordering_alg = _resolve_reordering_alg(value)
         self._reordering_alg = value if isinstance(value, str) else str(value)
 
@@ -260,6 +267,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
 
     @matching_alg.setter
     def matching_alg(self, value):
+        self._check_own_lu(matching_alg=_resolve_matching_alg(value))
         self._s.matching_alg = _resolve_matching_alg(value)
         self._matching_alg = value if isinstance(value, str) else str(value)
 
@@ -274,6 +282,17 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     def pivot_epsilon_alg(self, value):
         self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
         self._pivot_epsilon_alg = value if isinstance(value, str) else str(value)
+
+    @property
+    def ir_n_steps(self):
+        """cuDSS CUDSS_CONFIG_IR_N_STEPS: steps of iterative refinement per batch
+        solve (int >= 0, 0 = none). Takes effect on the next run(); the base case
+        keeps the construction value."""
+        return self._s.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._s.ir_n_steps = _check_ir_n_steps(value)
 
     @property
     def handle_disconnected_grid(self):
@@ -407,6 +426,7 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
 
     def run(self):
         """Run all scenarios; fills V_results and residuals on device."""
+        self._warn_tol_above_violation_tol()
         self._s.run()
 
     def compute_flows(self):
@@ -448,7 +468,10 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         not-simulated (disconnected / masked-skip) scenario gets a single
         GRID/NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
-        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol), and
+        one the outer loops gave up on (``RowStatus.OUTER_FAILED``,
+        ``OUTER_UNSTABLE``, ``UNREALISTIC``) a GRID/DIVERGENCE entry with
+        value=limit=nan, as lightsim2grid.
         Otherwise the records of a scenario come type after type -- CURRENT,
         then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
         violation_capacity) most severe violations, most severe first.
@@ -467,15 +490,24 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         # row c owns slots [c*stride, c*stride + count[c]) -- stride is
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
+        status = self._s.get_row_status()
+        unsupported = self._s.get_batch_unsupported_reasons()
         out = []
         for c, cnt in enumerate(counts):
+            if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.DIVERGENCE,
+                                            float('nan'), float('nan'))])
+                continue
             if cnt < 0:
                 # Pre-check (graph connectivity) dropped this scenario before
                 # it ever reached check_limit_violations_kernel -- the solver
                 # was never invoked (BatchPfDriver's d_violation_count -1
                 # sentinel). Never written by the kernel itself.
                 out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
-                                            LimitViolationType.NOT_SIMULATED,
+                                            LimitViolationType.BATCH_UNSUPPORTED
+                                            if c < len(unsupported) and unsupported[c]
+                                            else LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
             base = c * stride
@@ -493,7 +525,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
         scenario (only the most severe were kept -- raise violation_capacity
         if this matters for your use case; get_violation_counts() has the
         exact totals). Requires run() with compute_limit_violations=True."""
-        return self._s.get_violation_truncated().astype(bool)
+        out = self._s.get_violation_truncated().astype(bool)
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     def get_violation_counts(self):
         """dict of (n_scenarios,) int ndarrays with keys 'low_voltage',
@@ -510,19 +544,29 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
             raise RuntimeError(
                 "get_violation_counts() requires compute_limit_violations=True "
                 "(set solver.compute_limit_violations = True before run()).")
-        return {
-            "low_voltage":  self._s.get_violation_count_low_voltage(),
-            "high_voltage": self._s.get_violation_count_high_voltage(),
-            "current":      self._s.get_violation_count_current(),
+        out = {
+            "low_voltage":  np.array(self._s.get_violation_count_low_voltage()),
+            "high_voltage": np.array(self._s.get_violation_count_high_voltage()),
+            "current":      np.array(self._s.get_violation_count_current()),
         }
+        # a row the outer loops gave up on has one DIVERGENCE record and nothing counted
+        # (get_violations), not the violations of the state they rejected
+        failed = outer_failure_rows(self._s, out["current"].shape[0])
+        for v in out.values():
+            v[failed] = 0
+        return out
 
     def converged(self, tol=None):
         """(n_scenarios,) bool ndarray: residual <= tol (defaults to
-        violation_tol). Independent of compute_limit_violations -- residuals
+        violation_tol), False on a row the outer loops gave up on
+        (``OUTER_FAILURE_STATUSES``). Independent of compute_limit_violations -- residuals
         are always O(n_scenarios) and always computed (see residuals);
         this does not require compute_limit_violations to be enabled."""
         t = self.violation_tol if tol is None else tol
-        return self.residuals.to_numpy() <= t
+        out = self.residuals.to_numpy() <= t
+        # a row the outer loops gave up on solved its last inner powerflow, but is no solution
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     # --- results ---
     @property
@@ -566,6 +610,11 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     def timings(self):
         """BatchTimings from the most recent run() / compute_flows()."""
         return self._s.get_timings()
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per row: why the batch left it out (``""``: it did not). Such a row
+        has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return list(self._s.get_batch_unsupported_reasons())
 
     def get_disconnected(self):
         """Per-scenario disconnected flag: (n_scenarios,) int array, 1 == the
@@ -612,7 +661,9 @@ class _ScenarioSweepSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineM
     @property
     def keep_final_jacobian(self):
         """bool: refill the batched Jacobian at the converged voltages after
-        each run() so solve_JT_batch_dlpack() can use it. Default False."""
+        each chunked run() so solve_JT_batch_dlpack() can use it (a continuous
+        run needs nothing kept: the adjoint rebuilds the Jacobians from the
+        converged voltages). Default False."""
         return self._s.keep_final_jacobian
 
     @keep_final_jacobian.setter

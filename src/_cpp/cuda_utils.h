@@ -6,6 +6,7 @@
 #include "reordering_alg.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
+#include "thread_locale_guard.hpp"
 
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <stdio.h>            // printf
@@ -166,6 +167,8 @@ static void _init_vector_device_real(
     _upload_eigen_cplx(d_vec, h_vec, EigenCplxToCudaReal(), stream);
 }
 
+// (cudss_reorder_perm is defined after CudssContext, below)
+
 // ---------------------------------------------------------------------------
 // RAII wrapper for a single cudss descriptor (cudssMatrix_t).
 // ---------------------------------------------------------------------------
@@ -312,6 +315,19 @@ struct CudssContext {
                 + std::to_string(static_cast<int>(s)));
     }
 
+    // A user permutation (CUDSS_DATA_USER_PERM, host array of n ints) used by
+    // the next ANALYSIS instead of cuDSS's own reordering. Prototype for
+    // ReorderingAlg::Ls2gConstrained (docs/dev_notes/batched_lu_and_constrained_ordering.md).
+    void set_user_perm(const std::vector<int>& perm) {
+        cudssStatus_t s = cudssDataSet(handle, data, CUDSS_DATA_USER_PERM,
+                                       const_cast<int*>(perm.data()),
+                                       perm.size() * sizeof(int));
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(
+                std::string("CudssContext::set_user_perm failed: status=")
+                + std::to_string(static_cast<int>(s)));
+    }
+
     // Must be called after cudssConfigCreate() and before analyze() to take
     // effect (CUDSS_CONFIG_MATCHING_ALG is read during CUDSS_PHASE_ANALYSIS).
     void set_matching_alg(MatchingAlg alg) {
@@ -333,6 +349,19 @@ struct CudssContext {
         if (s != CUDSS_STATUS_SUCCESS)
             throw std::runtime_error(
                 std::string("CudssContext::set_pivot_epsilon_alg failed: status=")
+                + std::to_string(static_cast<int>(s)));
+    }
+
+    // CUDSS_CONFIG_IR_N_STEPS: steps of iterative refinement per SOLVE (0 = none). Read
+    // during CUDSS_PHASE_SOLVE, so it may be changed between two solves.
+    void set_ir_n_steps(int n) {
+        if (n < 0)
+            throw std::invalid_argument("CudssContext::set_ir_n_steps: ir_n_steps must be >= 0, got "
+                                        + std::to_string(n));
+        cudssStatus_t s = cudssConfigSet(config, CUDSS_CONFIG_IR_N_STEPS, &n, sizeof(n));
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(
+                std::string("CudssContext::set_ir_n_steps failed: status=")
                 + std::to_string(static_cast<int>(s)));
     }
 
@@ -358,12 +387,59 @@ private:
     void _execute(cudssPhase_t phase,
                   const CudssDescriptor& A, const CudssDescriptor& x, const CudssDescriptor& b,
                   const char* caller) {
-        cudssStatus_t s = cudssExecute(handle, phase, config, data, A.desc, x.desc, b.desc);
+        // NVRTC (cuDSS's JIT on a process' first execution) leaves the thread in
+        // the "C" locale: see thread_locale_guard.hpp.
+        cudssStatus_t s;
+        {
+            ThreadLocaleGuard keep_locale;
+            s = cudssExecute(handle, phase, config, data, A.desc, x.desc, b.desc);
+        }
         if (s != CUDSS_STATUS_SUCCESS)
             throw std::runtime_error(
                 std::string("CudssContext::") + caller + " failed: status=" + std::to_string(s));
     }
 };
+
+// ---------------------------------------------------------------------------
+// cudss_reorder_perm -- prototype (docs/dev_notes/batched_lu_and_constrained_ordering.md)
+// The elimination order cuDSS's ANALYSIS picks for a square CSR pattern under
+// `alg` (CUDSS_DATA_PERM_REORDER_ROW, new -> old), from a throwaway single-system
+// context (ANALYSIS is symbolic: the values are never read). Synchronizes `cs`.
+// Throws if cuDSS's row and column orders differ: without matching they should
+// not, and the constraints assume a symmetric order.
+// ---------------------------------------------------------------------------
+inline std::vector<int> cudss_reorder_perm(int n, int nnz, const int* d_outer, const int* d_inner,
+                                           cudaStream_t cs, ReorderingAlg alg)
+{
+    thrust::device_vector<cuda_real_type> d_vals(static_cast<size_t>(nnz), 1.0);
+    thrust::device_vector<cuda_real_type> d_x(static_cast<size_t>(n), 0.0), d_b(static_cast<size_t>(n), 0.0);
+    CudssContext dss;
+    auto chk = [](cudssStatus_t s, const char* what) {
+        if (s != CUDSS_STATUS_SUCCESS)
+            throw std::runtime_error(std::string("cudss_reorder_perm: ") + what
+                                     + " failed: status=" + std::to_string(static_cast<int>(s)));
+    };
+    chk(cudssCreate(&dss.handle), "cudssCreate");
+    chk(cudssSetStream(dss.handle, cs), "cudssSetStream");
+    chk(cudssConfigCreate(&dss.config), "cudssConfigCreate");
+    chk(cudssDataCreate(dss.handle, &dss.data), "cudssDataCreate");
+    dss.set_reordering_alg(alg);
+    CudssDescriptor A, x, b;
+    A.create_csr(n, nnz, d_outer, d_inner, thrust::raw_pointer_cast(d_vals.data()));
+    x.create_dn(n, thrust::raw_pointer_cast(d_x.data()));
+    b.create_dn(n, thrust::raw_pointer_cast(d_b.data()));
+    dss.analyze(A, x, b);
+    cudaStreamSynchronize(cs);
+    std::vector<int> row(static_cast<size_t>(n)), col(static_cast<size_t>(n));
+    size_t written = 0;
+    chk(cudssDataGet(dss.handle, dss.data, CUDSS_DATA_PERM_REORDER_ROW, row.data(),
+                     row.size() * sizeof(int), &written), "PERM_REORDER_ROW");
+    chk(cudssDataGet(dss.handle, dss.data, CUDSS_DATA_PERM_REORDER_COL, col.data(),
+                     col.size() * sizeof(int), &written), "PERM_REORDER_COL");
+    if (row != col)
+        throw std::runtime_error("cudss_reorder_perm: cuDSS's row and column orders differ");
+    return row;
+}
 
 // ---------------------------------------------------------------------------
 // Helper macro

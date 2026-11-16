@@ -38,6 +38,72 @@
 #include "strategies/cudss_batch_solver.cuh"
 
 // =============================================================================
+// TailSolve — the linear solve of a continuous run's tail (BatchPfDriver::
+// _compact_tail): the live rows sit in the first n_groups * G slots.
+//
+//   cuDSS    one more handle analysed for G matrices is pointed at each group
+//            of G slots in turn (CudssBatchSolver::bind_slice), refactorized
+//            and solved. Nothing has to survive between groups since every
+//            iteration refactorizes (the policy is PolicyRefactorEvery).
+//            cuDSS 0.8.0's uniform batch costs over an order of magnitude more
+//            from 16 matrices on (docs/dev_notes/outer_loops_performance.md),
+//            whence groups of at most 15.
+//   own LU   (prefix) the forward's own solver on its first n_groups * G
+//            matrices (CudssBatchSolver::set_active_count), one call: no
+//            second plan, no groups to cycle; G is only the compaction's
+//            granularity. The full batch is restored before returning.
+//
+// Same timing buckets as the policy's.
+// =============================================================================
+struct TailSolve {
+    CudssBatchSolver* solver   = nullptr;
+    int               G        = 0;
+    int               n_groups = 0;
+    int               dim_J    = 0;
+    int               nnz_J    = 0;
+    bool              prefix   = false;
+
+    // Returns the REFACTORIZATIONs done (a fresh handle FACTORIZES first).
+    int solve(cuda_real_type* d_J, cuda_real_type* d_F, cuda_real_type* d_dx,
+              CudaTimer& timer, NrIterTimings& t)
+    {
+        if (prefix) {
+            // the full batch back on every way out: a throw from refactor() /
+            // solve() must not leave a reused driver's forward solver on the prefix
+            struct RestoreActive {
+                CudssBatchSolver* s; int full;
+                ~RestoreActive() { s->set_active_count(full); }
+            } restore{solver, solver->active_count()};
+            solver->bind_slice(d_J, d_F, d_dx);   // the forward's own buffers (pointers only)
+            solver->set_active_count(n_groups * G);
+            const bool refac = solver->factorized_since_analysis_;
+            timer.start();
+            solver->refactor();
+            if (refac) t.t_refactorize += timer.stop_ms();
+            else       t.t_first_factorize += timer.stop_ms();
+            timer.start();
+            solver->solve();
+            t.t_solve += timer.stop_ms();
+            return refac ? 1 : 0;
+        }
+        int n_refac = 0;
+        for (int g = 0; g < n_groups; ++g) {
+            const size_t s0 = static_cast<size_t>(g) * static_cast<size_t>(G);
+            solver->bind_slice(d_J + s0 * nnz_J, d_F + s0 * dim_J, d_dx + s0 * dim_J);
+            const bool refac = solver->factorized_since_analysis_;
+            timer.start();
+            solver->refactor();
+            if (refac) { t.t_refactorize += timer.stop_ms(); ++n_refac; }
+            else       { t.t_first_factorize += timer.stop_ms(); }
+            timer.start();
+            solver->solve();
+            t.t_solve += timer.stop_ms();
+        }
+        return n_refac;
+    }
+};
+
+// =============================================================================
 // run_nr_loop<Policy>
 //
 // Executes nb_iter fixed Newton-Raphson iterations on the current chunk buffers.
@@ -56,11 +122,16 @@
 //   nnz_Y         — non-zeros in Ybus (per system)
 //   nnz_J         — non-zeros in J   (per system)
 //   batch_size    — number of systems per chunk (ALWAYS the full batch, including
-//                   phantom slots padded to batch_size in the last chunk)
+//                   phantom slots padded to batch_size in the last chunk; a
+//                   continuous run's compacted tail: the first n_groups * G slots)
 //   nb_iter       — number of NR iterations (fixed; no convergence check)
 //   cs            — CUDA stream (all kernels launched on this stream)
 //   timer         — stream-bound CudaTimer (reused across phases)
 //   t             — BatchTimings accumulator (updated in-place)
+//   tail          — null, or the continuous tail's solve (a small cuDSS handle
+//                   cycled over groups, or the own LU's active prefix): it then
+//                   does the linear solve instead of the policy (and spmv is
+//                   the prefix one, over batch_size slots)
 // =============================================================================
 template <typename Policy>
 inline void run_nr_loop(
@@ -78,7 +149,8 @@ inline void run_nr_loop(
     int                  nb_iter,
     cudaStream_t         cs,
     CudaTimer&           timer,
-    BatchTimings&  t)
+    BatchTimings&  t,
+    TailSolve*           tail = nullptr)
 {
     policy.begin_chunk();
     linear_solver.begin_chunk();
@@ -133,8 +205,15 @@ inline void run_nr_loop(
         //     • SOLVE: d_dx_batch = J^{-1} * d_F_batch
         //
         //   Returns true if REFACTORIZATION was done (false = first FACTORIZATION).
-        const bool did_refactor = policy.solve_iter(
-            linear_solver, buf.d_J_values, cs, timer, step);
+        //   With `tail` (a continuous run's compacted tail), the solve goes
+        //   through it instead (TailSolve: small handle per group, or the own
+        //   LU's active prefix).
+        bool did_refactor = false;
+        int  n_tail_refactor = 0;
+        if (tail != nullptr)
+            n_tail_refactor = tail->solve(buf.d_J_values, buf.d_F, buf.d_dx, timer, step);
+        else
+            did_refactor = policy.solve_iter(linear_solver, buf.d_J_values, cs, timer, step);
 
         // ④b Step-scaling (MaxVoltageChange), if enabled -- rescale each
         //     batch slot's dx BEFORE applying it anywhere, so Va/Vm and any
@@ -142,22 +221,21 @@ inline void run_nr_loop(
         //     apply_step(coeff*F). Computed PER SLOT (own max|dtheta|/max|dvm|,
         //     own alpha) -- a "hard" contingency in the batch gets damped on
         //     its own terms, not by whatever the worst slot in the batch needs.
-        //     Folded into the same t.t_solve bucket (no new timing field).
+        //     Timed with the update of V (no new timing field).
+        timer.start();
         if (buf.scaling_max_voltage_change) {
             cudaMemsetAsync(buf.d_scale_max_dtheta, 0, batch_size * sizeof(cuda_real_type), cs);
             cudaMemsetAsync(buf.d_scale_max_dvm,    0, batch_size * sizeof(cuda_real_type), cs);
-            const int total = buf.n_theta + buf.n_vm;
-            reduce_step_norms_kernel<<<nr_grid_size((long long)batch_size * total, BS), BS, 0, cs>>>(
+            reduce_step_norms_kernel<<<nr_grid_size((long long)batch_size * BS, BS), BS, 0, cs>>>(
                 buf.d_dx, buf.d_theta_cols, buf.d_vm_cols, buf.n_theta, buf.n_vm,
                 dim_J, batch_size, buf.d_scale_max_dtheta, buf.d_scale_max_dvm);
-            apply_step_scale_kernel<<<nr_grid_size((long long)batch_size * dim_J, BS), BS, 0, cs>>>(
+            apply_step_scale_kernel<<<nr_grid_size((long long)batch_size * BS, BS), BS, 0, cs>>>(
                 buf.d_dx, buf.d_scale_max_dtheta, buf.d_scale_max_dvm,
                 buf.max_dVa, buf.max_dVm, dim_J, batch_size);
         }
 
         // ⑤  Update V: Va (pvpq) then Vm (pq) — both on cs, CUDA stream ordering
         //     serialises them without an explicit CPU event.
-        timer.start();
         update_Va_kernel<<<nr_grid_size((long long)batch_size * buf.n_theta, BS), BS, 0, cs>>>(
             buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
             buf.n_theta, n_bus, dim_J, batch_size);
@@ -174,6 +252,7 @@ inline void run_nr_loop(
         t.t_first_factorize += step.t_first_factorize;
         t.t_refactorize     += step.t_refactorize;
         if (did_refactor) t.n_refactorize++;
+        t.n_refactorize += n_tail_refactor;
         t.t_solve           += step.t_solve;
         t.t_update_V        += step.t_update_V;
     }

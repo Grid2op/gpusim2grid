@@ -20,7 +20,7 @@ flow, contingency analysis, and injection sweeps on the GPU.
 
 This simulator is free and uses CUDA, cuDSS, cuSPARSE, Eigen and KLU for performance.
 It is not meant to be used as an independent tool for power-system-focused analysis.
-In particular, **it implements a raw Newton-Raphson with no outer loop.**
+In particular, **by default it implements a raw Newton-Raphson with no outer loop.**
 Some of its limitations include, but are not limited to:
 
 - it does not enforce reactive power limits on generators (no PV→PQ switching)
@@ -28,6 +28,12 @@ Some of its limitations include, but are not limited to:
 - shunts have fixed tap during the Newton-Raphson algorithm (though it can be changed at the initialization of the solver)
 - it does not apply any outer-loop correction (Q limits, tap changing, …)
 - only powerflow ("steady state") can be performed
+
+The batch solvers (contingency analysis, injection and scenario sweeps) can instead run
+the grid's own lightsim2grid outer loops on every row (`outer_loops=True`, on a grid
+solved with an `NROuter_*` algorithm), which lifts the first four points there; their
+results then follow lightsim2grid's port of the OpenLoadFlow outer loops, with the
+limitations of that port. The single solve has no outer loop.
 
 The *in-Jacobian* power-system controls that lightsim2grid models — distributed
 slack, HVDC angle-droop, SVC, and remote generator voltage control — **are**

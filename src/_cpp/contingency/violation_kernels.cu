@@ -10,6 +10,10 @@
 
 #include <math.h>   // isnan
 
+#include <type_traits>   // std::conditional
+
+#include <cub/block/block_scan.cuh>
+
 namespace {
 
 // Element-type / violation-type raw codes, mirrored from
@@ -37,9 +41,9 @@ constexpr int VIOL_DIVERGENCE   = 4;
 // compute_physical_violations (check_bus_q_violations_kernel)
 constexpr int VIOL_LOW_Q        = 5;
 constexpr int VIOL_HIGH_Q       = 6;
-// compute_physical_violations (check_hvdc_p_violations_kernel) writes no type
-// code at all: every record it emits is element type HVDC (=4), violation type
-// HVDC_P_SATURATION (=7), stamped by the Python session layer.
+// compute_physical_violations (check_hvdc_p_violations_kernel): element type HVDC
+// (=4), violation type HVDC_P_SATURATION (=7, VIOL_HIGH_P below) or, for a line
+// frozen at its limit, VIOL_HVDC_AC_EMULATION_RELEASE.
 // compute_physical_violations (check_gen_p_violations_kernel): HIGH_P is the
 // same code as HVDC_P_SATURATION (lightsim2grid's one name for both).
 constexpr int VIOL_HIGH_P       = 7;
@@ -50,6 +54,13 @@ constexpr int VIOL_HIGH_VOLTAGE_AT_MAX_Q = 10;
 // the standby SVC check, on the SVC entries of the same plan (see limit_violation_types.hpp)
 constexpr int VIOL_LOW_VOLTAGE_SVC_STANDBY  = 11;
 constexpr int VIOL_HIGH_VOLTAGE_SVC_STANDBY = 12;
+// the remote voltage control check, on the remote control entries of the same plan
+constexpr int VIOL_LOW_VOLTAGE_REMOTE_CONTROL  = 13;
+constexpr int VIOL_HIGH_VOLTAGE_REMOTE_CONTROL = 14;
+constexpr int VIOL_HVDC_AC_EMULATION_RELEASE = 15;
+// the `standby` column of the release plan (GenPvReleasePlanData::CHECK_*)
+constexpr int CHECK_SVC_STANDBY    = 1;
+constexpr int CHECK_REMOTE_CONTROL = 2;
 
 // check_limit_violations_kernel's record groups, in output order (one per
 // type; see N_OPERATIONAL_VIOLATION_GROUPS)
@@ -155,9 +166,135 @@ struct SevAbs {
     }
 };
 
+// ---- check_limit_violations_kernel's helpers ------------------------------------
+
+// The read-only inputs of one row, gathered once per block.
+struct ViolRowArgs {
+    const cudaComplexType* V;            // the slot's voltages, [n_bus]
+    const cuda_real_type*  vn_kv;
+    const cuda_real_type*  vmin_kv;
+    const cuda_real_type*  vmax_kv;
+    const int*             from;
+    const int*             to;
+    const cudaComplexType* yff;
+    const cudaComplexType* yft;
+    const cudaComplexType* ytf;
+    const cudaComplexType* ytt;
+    const cuda_real_type*  base_A;
+    const cuda_real_type*  base_ex_A;
+    const cuda_real_type*  lim1;
+    const cuda_real_type*  lim2;
+    const int*             trip;         // the row's tripped branches
+    int                    t_count;
+    const int*             branch_bc;    // null: every branch has its shared *_eff block
+    const cudaComplexType* bc_applied;   // the slot's own blocks, [n_bc * 4]
+    cuda_real_type         up;           // 1 + rel_tol (HIGH_VOLTAGE / CURRENT)
+    cuda_real_type         dn;           // 1 - rel_tol (LOW_VOLTAGE)
+};
+
+// The CURRENT violations of branch l: bit s of the result set when side s+1
+// violates, its value / limit / severity in value[s] / limit[s] / sev[s].
+// noinline, as eval_bus: every pass of the kernel evaluates an element through
+// this one function, so the passes agree on each severity to the last bit
+// (inlined at several call sites, the compiler could contract the complex
+// products into FMAs differently).
+__device__ __noinline__ int eval_branch(const ViolRowArgs& a, int l, cuda_real_type* value,
+                                        cuda_real_type* limit, cuda_real_type* sev)
+{
+    for (int ti = 0; ti < a.t_count; ++ti)
+        if (a.trip[ti] == l) return 0;   // Ybus was patched but yff_eff/yft_eff/ytf_eff/ytt_eff weren't -- would report a phantom current
+
+    const cuda_real_type lim1 = a.lim1[l];
+    const cuda_real_type lim2 = a.lim2[l];
+    if (isnan(lim1) && isnan(lim2)) return 0;   // no limit configured for this branch
+
+    // branch_from/branch_to are in AC-solver bus numbering (see
+    // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
+    // Kron-reduced away (isolated / half-open line, keep_half_open_lines)
+    // is relabeled to -1. That bus has no voltage in the solved system --
+    // treat it as V=0 -- and no terminal current on that side to report --
+    // 0, not computed from the pi-model formula, since the terminal
+    // itself doesn't exist. Reading V[-1] without this guard is an
+    // out-of-bounds read (confirmed via compute-sanitizer on a real
+    // half-open-line grid).
+    const int bf = a.from[l];
+    const int bt = a.to[l];
+    const cudaComplexType Vi = (bf >= 0) ? a.V[bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType Vj = (bt >= 0) ? a.V[bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
+    // a transformer whose taps the outer loops move: the block the slot holds now
+    cudaComplexType yff = a.yff[l], yft = a.yft[l], ytf = a.ytf[l], ytt = a.ytt[l];
+    if (a.branch_bc != nullptr && a.branch_bc[l] >= 0) {
+        const cudaComplexType* y = a.bc_applied + 4 * a.branch_bc[l];
+        yff = y[0]; yft = y[1]; ytf = y[2]; ytt = y[3];
+    }
+    const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
+        CudaFunHelper::my_cuCmul(yff, Vi), CudaFunHelper::my_cuCmul(yft, Vj))
+        : CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
+        CudaFunHelper::my_cuCmul(ytf, Vi), CudaFunHelper::my_cuCmul(ytt, Vj))
+        : CudaFunHelper::my_make_cuComplex(0., 0.);
+    // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
+    const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * a.base_A[l] * cuda_real_type(0.001);
+    const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * a.base_ex_A[l] * cuda_real_type(0.001);
+
+    // beyond the limit by more than rel_tol (violation_rel_tol, lightsim2grid's
+    // OperationalCheck.hpp): a value ON its limit up to rounding is not reported
+    int m = 0;
+    if (!isnan(lim1) && ka_or > lim1 * a.up) {
+        value[0] = ka_or; limit[0] = lim1; sev[0] = SevRatio{}(ka_or, lim1); m |= 1;
+    }
+    if (!isnan(lim2) && ka_ex > lim2 * a.up) {
+        value[1] = ka_ex; limit[1] = lim2; sev[1] = SevRatio{}(ka_ex, lim2); m |= 2;
+    }
+    return m;
+}
+
+// The voltage violation of bus b: its group (GRP_LOW_VOLTAGE / GRP_HIGH_VOLTAGE)
+// with its value / limit / severity, or -1.
+__device__ __noinline__ int eval_bus(const ViolRowArgs& a, int b, cuda_real_type* value,
+                                     cuda_real_type* limit, cuda_real_type* sev)
+{
+    const cuda_real_type vmin = a.vmin_kv[b];
+    const cuda_real_type vmax = a.vmax_kv[b];
+    if (isnan(vmin) && isnan(vmax)) return -1;   // no limit configured for this bus
+
+    // vm_kv is NaN when V[b] is NaN (masked bus, written by nr_mask_v_nan
+    // before this kernel launches) -- NaN comparisons below are false in
+    // IEEE754, so masked buses are excluded for free.
+    const cuda_real_type vm_kv = CudaFunHelper::my_cuCabs(a.V[b]) * a.vn_kv[b];
+    if (!isnan(vmin) && vm_kv < vmin * a.dn) {
+        value[0] = vm_kv; limit[0] = vmin; sev[0] = SevRatio{}(vm_kv, vmin);
+        return GRP_LOW_VOLTAGE;
+    }
+    if (!isnan(vmax) && vm_kv > vmax * a.up) {
+        value[0] = vm_kv; limit[0] = vmax; sev[0] = SevRatio{}(vm_kv, vmax);
+        return GRP_HIGH_VOLTAGE;
+    }
+    return -1;
+}
+
+// A severity is >= 0 and never NaN (a zero limit gives +inf), so its bit
+// pattern, read as an unsigned integer of the same width, orders as it does.
+using sev_bits_t = std::conditional<sizeof(cuda_real_type) == 8, unsigned long long, unsigned int>::type;
+__device__ __forceinline__ sev_bits_t sev_bits(cuda_real_type s) {
+    if constexpr (sizeof(cuda_real_type) == 8)
+        return static_cast<sev_bits_t>(__double_as_longlong(s));
+    else
+        return static_cast<sev_bits_t>(__float_as_uint(s));
+}
+
+constexpr int VIOL_RADIX_BITS = 8;
+constexpr int VIOL_RADIX = 1 << VIOL_RADIX_BITS;
+
+__device__ __forceinline__ int warp_sum(int x) {
+    for (int o = 16; o > 0; o >>= 1) x += __shfl_down_sync(0xffffffffu, x, o);
+    return x;
+}
+
 }  // namespace
 
-__global__ void check_limit_violations_kernel(
+// One block per row (see violation_kernels.cuh): count, select, collect, emit.
+__global__ void __launch_bounds__(VIOL_BLOCK) check_limit_violations_kernel(
     const cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_residuals,
     cuda_real_type          tol,
@@ -181,6 +318,7 @@ __global__ void check_limit_violations_kernel(
     int n_bus, int n_branches, int n_lines,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_side,
@@ -191,50 +329,37 @@ __global__ void check_limit_violations_kernel(
           int*             __restrict__ d_out_truncated,
           int*             __restrict__ d_out_count_low_voltage,
           int*             __restrict__ d_out_count_high_voltage,
-          int*             __restrict__ d_out_count_current)
+          int*             __restrict__ d_out_count_current,
+          cuda_real_type*  __restrict__ d_scratch_real,
+          int*             __restrict__ d_scratch_key,
+    const int*             __restrict__ d_branch_bc,
+    const cudaComplexType* __restrict__ d_bc_applied,
+    int n_bc)
 {
     // local_c widened to ptrdiff_t: local_c * n_bus below (the d_V offset) is
     // the same at-risk product as fill_J_kernel's own J_base once
     // actual_batch * n_bus grows large (see acpf_nr_kernels.cu's note). base
     // (out_c * K, the per-contingency output slice offset) gets the same
     // treatment below.
-    const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t local_c = blockIdx.x;
     if (local_c >= actual_batch) return;
+    const int tid = threadIdx.x;
 
-    const int slot_global = c_start + static_cast<int>(local_c);   // GLOBAL active-slot id (tripped-branch table)
+    // GLOBAL active-slot id (tripped-branch table): the slot's own row when
+    // d_slot_active is given (continuous batching; -1 = not leaving), else
+    // the chunk's c_start + local_c. Uniform over the block, as every early
+    // return below.
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     // base widened to ptrdiff_t: out_c * K (this contingency's output slice
     // offset) is the same at-risk product as fill_J_kernel's own J_base once
     // n_contingencies * K grows large.
-    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_OPERATIONAL_VIOLATION_GROUPS * K);
-    // TRUE, uncapped per-type totals -- incremented on every violation found,
-    // independent of whether a detail record could still be kept.
-    int n_low = 0, n_high = 0, n_current = 0;
+    constexpr int NG = N_OPERATIONAL_VIOLATION_GROUPS;
+    const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (NG * K);
 
-    // The K most severe records of each type (groups: GRP_CURRENT,
-    // GRP_LOW_VOLTAGE, GRP_HIGH_VOLTAGE), in this contingency's exclusive
-    // output slice -- single-thread-owned, no atomics.
-    auto topk = make_topk<N_OPERATIONAL_VIOLATION_GROUPS>(
-        base, K, d_out_value, d_out_limit, SevRatio{},
-        [&](ptrdiff_t dst, ptrdiff_t src) {
-            d_out_element_type[dst] = d_out_element_type[src];
-            d_out_element_id[dst]   = d_out_element_id[src];
-            d_out_side[dst]         = d_out_side[src];
-            d_out_type[dst]         = d_out_type[src];
-        });
-    auto push = [&](int group, int etype, int eid, int side, int vtype,
-                    cuda_real_type value, cuda_real_type limit) {
-        const ptrdiff_t at = topk.reserve(group, SevRatio{}(value, limit));
-        if (at < 0) return;
-        d_out_element_type[at] = etype;
-        d_out_element_id[at]   = eid;
-        d_out_side[at]         = side;
-        d_out_type[at]         = vtype;
-        d_out_value[at]        = value;
-        d_out_limit[at]        = limit;
-    };
-
-    // ---- 1. DIVERGENCE --------------------------------------------------
+    // ---- DIVERGENCE --------------------------------------------------------
     // V is unreliable for a diverged system; do not scan buses/branches on it.
     // isnan(residual) is included alongside residual > tol: this kernel only
     // ever runs for a contingency that WAS actually solved (NR iterations
@@ -245,95 +370,240 @@ __global__ void check_limit_violations_kernel(
     // session layer instead -- see this file's own top-of-file note).
     const cuda_real_type residual = d_residuals[out_c];
     if (isnan(residual) || residual > tol) {
-        d_out_element_type[base] = ELEM_GRID;
-        d_out_element_id[base]   = -1;
-        d_out_side[base]         = 0;
-        d_out_type[base]         = VIOL_DIVERGENCE;
-        d_out_value[base]        = residual;
-        d_out_limit[base]        = tol;
-        d_out_count[out_c]              = 1;
-        d_out_truncated[out_c]          = 0;
-        d_out_count_low_voltage[out_c]  = 0;
-        d_out_count_high_voltage[out_c] = 0;
-        d_out_count_current[out_c]      = 0;
+        if (tid == 0) {
+            d_out_element_type[base] = ELEM_GRID;
+            d_out_element_id[base]   = -1;
+            d_out_side[base]         = 0;
+            d_out_type[base]         = VIOL_DIVERGENCE;
+            d_out_value[base]        = residual;
+            d_out_limit[base]        = tol;
+            d_out_count[out_c]              = 1;
+            d_out_truncated[out_c]          = 0;
+            d_out_count_low_voltage[out_c]  = 0;
+            d_out_count_high_voltage[out_c] = 0;
+            d_out_count_current[out_c]      = 0;
+        }
         return;
     }
 
-    // ---- 2. Branch current (checked first: thermal/current violations are
-    // generally first-order operational concerns, voltage second-order) ----
-    // Scans every branch whatever is already kept, so n_current stays exact
-    // (and the kept records are the most severe ones).
     const int t_start = d_trip_start ? d_trip_start[slot_global] : 0;
-    const int t_count = d_trip_count ? d_trip_count[slot_global] : 0;
-    const cuda_real_type up = cuda_real_type(1) + rel_tol;   // HIGH_VOLTAGE / CURRENT
-    const cuda_real_type dn = cuda_real_type(1) - rel_tol;   // LOW_VOLTAGE
-    for (int l = 0; l < n_branches; ++l) {
-        bool tripped = false;
-        for (int ti = 0; ti < t_count; ++ti)
-            if (d_trip_branch_flat[t_start + ti] == l) { tripped = true; break; }
-        if (tripped) continue;   // Ybus was patched but yff_eff/yft_eff/ytf_eff/ytt_eff weren't -- would report a phantom current
+    ViolRowArgs a;
+    a.V = d_V + local_c * n_bus;
+    a.vn_kv = d_bus_vn_kv; a.vmin_kv = d_bus_vmin_kv; a.vmax_kv = d_bus_vmax_kv;
+    a.from = d_branch_from; a.to = d_branch_to;
+    a.yff = d_yff_eff; a.yft = d_yft_eff; a.ytf = d_ytf_eff; a.ytt = d_ytt_eff;
+    a.base_A = d_base_current_A; a.base_ex_A = d_base_current_ex_A;
+    a.lim1 = d_branch_limit_a1_ka; a.lim2 = d_branch_limit_a2_ka;
+    a.trip = d_trip_branch_flat ? d_trip_branch_flat + t_start : nullptr;
+    a.t_count = d_trip_count ? d_trip_count[slot_global] : 0;
+    a.branch_bc = d_branch_bc;
+    a.bc_applied = d_bc_applied ? d_bc_applied + 4 * local_c * n_bc : nullptr;
+    a.up = cuda_real_type(1) + rel_tol;
+    a.dn = cuda_real_type(1) - rel_tol;
 
-        const cuda_real_type lim1 = d_branch_limit_a1_ka[l];
-        const cuda_real_type lim2 = d_branch_limit_a2_ka[l];
-        if (isnan(lim1) && isnan(lim2)) continue;   // no limit configured for this branch
-
-        // branch_from/branch_to are in AC-solver bus numbering (see
-        // concat_busids_to_solver, ls2g_bridge.cpp): a side that lightsim2grid
-        // Kron-reduced away (isolated / half-open line, keep_half_open_lines)
-        // is relabeled to -1. That bus has no voltage in the solved system --
-        // treat it as V=0 -- and no terminal current on that side to report --
-        // 0, not computed from the pi-model formula, since the terminal
-        // itself doesn't exist. Reading d_V[... + (-1)] without this guard is
-        // an out-of-bounds read (confirmed via compute-sanitizer on a real
-        // half-open-line grid).
-        const int bf = d_branch_from[l];
-        const int bt = d_branch_to[l];
-        const cudaComplexType Vi = (bf >= 0) ? d_V[local_c * n_bus + bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
-        const cudaComplexType Vj = (bt >= 0) ? d_V[local_c * n_bus + bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
-        const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_yff_eff[l], Vi), CudaFunHelper::my_cuCmul(d_yft_eff[l], Vj))
-            : CudaFunHelper::my_make_cuComplex(0., 0.);
-        const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
-            CudaFunHelper::my_cuCmul(d_ytf_eff[l], Vi), CudaFunHelper::my_cuCmul(d_ytt_eff[l], Vj))
-            : CudaFunHelper::my_make_cuComplex(0., 0.);
-        // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
-        const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l] * cuda_real_type(0.001);
-        const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l] * cuda_real_type(0.001);
-
-        const int etype = (l < n_lines) ? ELEM_LINE : ELEM_TRAFO;
-        const int eid    = (l < n_lines) ? l : (l - n_lines);
-        // beyond the limit by more than rel_tol (violation_rel_tol, lightsim2grid's
-        // OperationalCheck.hpp): a value ON its limit up to rounding is not reported
-        if (!isnan(lim1) && ka_or > lim1 * up) { ++n_current; push(GRP_CURRENT, etype, eid, 1, VIOL_CURRENT, ka_or, lim1); }
-        if (!isnan(lim2) && ka_ex > lim2 * up) { ++n_current; push(GRP_CURRENT, etype, eid, 2, VIOL_CURRENT, ka_ex, lim2); }
+    using BlockScan = cub::BlockScan<int, VIOL_BLOCK>;
+    __shared__ typename BlockScan::TempStorage s_scan;
+    __shared__ int        s_cnt[NG];        // TRUE, uncapped per-type totals
+    __shared__ int        s_kept[NG];       // records collected so far
+    __shared__ int        s_need[NG];       // ties at the threshold still to keep
+    __shared__ int        s_tie_base[NG];   // ties seen in the previous tiles
+    __shared__ bool       s_sel[NG];        // more than K: keep only the K most severe
+    __shared__ sev_bits_t s_prefix[NG];     // the threshold's bits found so far
+    __shared__ sev_bits_t s_mask[NG];
+    __shared__ int        s_hist[NG][VIOL_RADIX];
+    if (tid < NG) {
+        s_cnt[tid] = 0; s_kept[tid] = 0; s_tie_base[tid] = 0;
+        s_prefix[tid] = 0; s_mask[tid] = 0;
     }
+    __syncthreads();
 
-    // ---- 3. Bus voltage --------------------------------------------------
-    // Scans every bus, same reason as above.
-    for (int b = 0; b < n_bus; ++b) {
-        const cuda_real_type vmin = d_bus_vmin_kv[b];
-        const cuda_real_type vmax = d_bus_vmax_kv[b];
-        if (isnan(vmin) && isnan(vmax)) continue;   // no limit configured for this bus
+    cuda_real_type val[2], lim[2], sv[2];
 
-        const cudaComplexType Vb = d_V[local_c * n_bus + b];
-        // vm_kv is NaN when Vb is NaN (masked bus, written by nr_mask_v_nan
-        // before this kernel launches) -- NaN comparisons below are false in
-        // IEEE754, so masked buses are excluded for free.
-        const cuda_real_type vm_kv = CudaFunHelper::my_cuCabs(Vb) * d_bus_vn_kv[b];
-        if (!isnan(vmin) && vm_kv < vmin * dn) {
-            ++n_low;
-            push(GRP_LOW_VOLTAGE, ELEM_BUS, b, 0, VIOL_LOW_VOLTAGE, vm_kv, vmin);
-        } else if (!isnan(vmax) && vm_kv > vmax * up) {
-            ++n_high;
-            push(GRP_HIGH_VOLTAGE, ELEM_BUS, b, 0, VIOL_HIGH_VOLTAGE, vm_kv, vmax);
+    // ---- 1. count ------------------------------------------------------------
+    // Every branch end and bus, whatever is kept, so the totals stay exact.
+    {
+        int c[NG] = {0, 0, 0};
+        for (int l = tid; l < n_branches; l += VIOL_BLOCK)
+            c[GRP_CURRENT] += __popc(eval_branch(a, l, val, lim, sv));
+        for (int b = tid; b < n_bus; b += VIOL_BLOCK) {
+            const int g = eval_bus(a, b, val, lim, sv);
+            if (g >= 0) ++c[g];
+        }
+        for (int g = 0; g < NG; ++g) {
+            const int w = warp_sum(c[g]);
+            if ((tid & 31) == 0 && w != 0) atomicAdd(&s_cnt[g], w);
+        }
+    }
+    __syncthreads();
+    if (tid < NG) { s_sel[tid] = s_cnt[tid] > K; s_need[tid] = K; }
+    __syncthreads();
+    const bool sel_cur = s_sel[GRP_CURRENT];
+    const bool sel_v   = s_sel[GRP_LOW_VOLTAGE] || s_sel[GRP_HIGH_VOLTAGE];
+
+    // ---- 2. select -----------------------------------------------------------
+    // Per type with more than K: the bits of the K-th largest severity T, by an
+    // MSD radix select (one digit per pass, the three types at once); s_need
+    // ends as K - #{sev > T}, the ties at T to keep.
+    if (sel_cur || sel_v) {
+        for (int shift = 8 * static_cast<int>(sizeof(sev_bits_t)) - VIOL_RADIX_BITS; shift >= 0;
+             shift -= VIOL_RADIX_BITS) {
+            for (int i = tid; i < NG * VIOL_RADIX; i += VIOL_BLOCK) (&s_hist[0][0])[i] = 0;
+            __syncthreads();
+            if (sel_cur) {
+                for (int l = tid; l < n_branches; l += VIOL_BLOCK) {
+                    const int m = eval_branch(a, l, val, lim, sv);
+                    for (int s = 0; s < 2; ++s) {
+                        if (!((m >> s) & 1)) continue;
+                        const sev_bits_t u = sev_bits(sv[s]);
+                        if ((u & s_mask[GRP_CURRENT]) == s_prefix[GRP_CURRENT])
+                            atomicAdd(&s_hist[GRP_CURRENT][(u >> shift) & (VIOL_RADIX - 1)], 1);
+                    }
+                }
+            }
+            if (sel_v) {
+                for (int b = tid; b < n_bus; b += VIOL_BLOCK) {
+                    const int g = eval_bus(a, b, val, lim, sv);
+                    if (g < 0 || !s_sel[g]) continue;
+                    const sev_bits_t u = sev_bits(sv[0]);
+                    if ((u & s_mask[g]) == s_prefix[g])
+                        atomicAdd(&s_hist[g][(u >> shift) & (VIOL_RADIX - 1)], 1);
+                }
+            }
+            __syncthreads();
+            if (tid < NG && s_sel[tid]) {
+                // the digit holding the s_need-th largest, from the top
+                const int need = s_need[tid];
+                int cum = 0, d = VIOL_RADIX - 1;
+                for (; d > 0; --d) {
+                    const int h = s_hist[tid][d];
+                    if (cum + h >= need) break;
+                    cum += h;
+                }
+                s_need[tid]    = need - cum;
+                s_prefix[tid] |= static_cast<sev_bits_t>(d) << shift;
+                s_mask[tid]   |= static_cast<sev_bits_t>(VIOL_RADIX - 1) << shift;
+            }
+            __syncthreads();
         }
     }
 
-    d_out_count[out_c]              = topk.finish();
-    d_out_truncated[out_c]          = topk.truncated ? 1 : 0;
-    d_out_count_low_voltage[out_c]  = n_low;
-    d_out_count_high_voltage[out_c] = n_high;
-    d_out_count_current[out_c]      = n_current;
+    // ---- 3. collect ----------------------------------------------------------
+    // The kept records -- all of a type with at most K, else those above T and
+    // the first s_need ties at T in scan order (tiles in element order, a block
+    // scan inside each) -- go to the slot's scratch, in any order: (severity,
+    // value, limit) and the scan key (2*l + side - 1 for CURRENT, b for a bus).
+    const ptrdiff_t sbase = local_c * (NG * K);
+    cuda_real_type* scr_sev = d_scratch_real;
+    cuda_real_type* scr_val = d_scratch_real + static_cast<ptrdiff_t>(actual_batch) * NG * K;
+    cuda_real_type* scr_lim = scr_val + static_cast<ptrdiff_t>(actual_batch) * NG * K;
+    auto collect = [&](int g, int key, cuda_real_type s, cuda_real_type v, cuda_real_type lm) {
+        const int pos = atomicAdd(&s_kept[g], 1);
+        if (pos >= K) return;   // cannot happen (the passes agree bit for bit); never overflow
+        const ptrdiff_t at = sbase + static_cast<ptrdiff_t>(g) * K + pos;
+        scr_sev[at] = s; scr_val[at] = v; scr_lim[at] = lm; d_scratch_key[at] = key;
+    };
+    for (int t0 = 0; t0 < n_branches; t0 += VIOL_BLOCK) {
+        const int l = t0 + tid;
+        const int m = (l < n_branches) ? eval_branch(a, l, val, lim, sv) : 0;
+        int r = 0, agg = 0;
+        if (sel_cur) {
+            int ties = 0;
+            for (int s = 0; s < 2; ++s)
+                if (((m >> s) & 1) && sev_bits(sv[s]) == s_prefix[GRP_CURRENT]) ++ties;
+            BlockScan(s_scan).ExclusiveSum(ties, r, agg);
+            r += s_tie_base[GRP_CURRENT];
+        }
+        for (int s = 0; s < 2; ++s) {
+            if (!((m >> s) & 1)) continue;
+            bool keep = true;
+            if (sel_cur) {
+                const sev_bits_t u = sev_bits(sv[s]);
+                keep = u > s_prefix[GRP_CURRENT]
+                    || (u == s_prefix[GRP_CURRENT] && r++ < s_need[GRP_CURRENT]);
+            }
+            if (keep) collect(GRP_CURRENT, 2 * l + s, sv[s], val[s], lim[s]);
+        }
+        if (sel_cur) {
+            __syncthreads();
+            if (tid == 0) s_tie_base[GRP_CURRENT] += agg;
+            __syncthreads();
+        }
+    }
+    for (int t0 = 0; t0 < n_bus; t0 += VIOL_BLOCK) {
+        const int b = t0 + tid;
+        const int g = (b < n_bus) ? eval_bus(a, b, val, lim, sv) : -1;
+        const bool tie = g >= 0 && s_sel[g] && sev_bits(sv[0]) == s_prefix[g];
+        // LOW_VOLTAGE ties in the low half, HIGH_VOLTAGE ones in the high half
+        // (at most VIOL_BLOCK of each per tile)
+        int r = 0, agg = 0;
+        if (sel_v) BlockScan(s_scan).ExclusiveSum(tie ? (g == GRP_LOW_VOLTAGE ? 1 : 1 << 16) : 0, r, agg);
+        if (g >= 0) {
+            bool keep = true;
+            if (s_sel[g]) {
+                const int rank = s_tie_base[g] + (g == GRP_LOW_VOLTAGE ? (r & 0xffff) : (r >> 16));
+                const sev_bits_t u = sev_bits(sv[0]);
+                keep = u > s_prefix[g] || (tie && rank < s_need[g]);
+            }
+            if (keep) collect(g, b, sv[0], val[0], lim[0]);
+        }
+        if (sel_v) {
+            __syncthreads();
+            if (tid == 0) {
+                s_tie_base[GRP_LOW_VOLTAGE]  += agg & 0xffff;
+                s_tie_base[GRP_HIGH_VOLTAGE] += agg >> 16;
+            }
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+
+    // ---- 4. emit -------------------------------------------------------------
+    // Each kept record goes straight to its final place: the types packed to
+    // the front of the row's slice in group order, each sorted most severe
+    // first, ties in scan order (its rank among its type's kept records).
+    int kept[NG], off[NG];
+    for (int g = 0, o = 0; g < NG; ++g) {
+        kept[g] = min(s_kept[g], K);
+        off[g] = o;
+        o += kept[g];
+    }
+    const int n_kept = off[NG - 1] + kept[NG - 1];
+    for (int j = tid; j < n_kept; j += VIOL_BLOCK) {
+        int g = NG - 1;
+        while (j < off[g]) --g;
+        const ptrdiff_t gs = sbase + static_cast<ptrdiff_t>(g) * K;
+        const ptrdiff_t at = gs + (j - off[g]);
+        const cuda_real_type s = scr_sev[at];
+        const int key = d_scratch_key[at];
+        int rank = 0;
+        for (int q = 0; q < kept[g]; ++q) {
+            const cuda_real_type sq = scr_sev[gs + q];
+            rank += (sq > s) || (sq == s && d_scratch_key[gs + q] < key);
+        }
+        const ptrdiff_t o = base + off[g] + rank;
+        if (g == GRP_CURRENT) {
+            const int l = key >> 1;
+            d_out_element_type[o] = (l < n_lines) ? ELEM_LINE : ELEM_TRAFO;
+            d_out_element_id[o]   = (l < n_lines) ? l : (l - n_lines);
+            d_out_side[o]         = (key & 1) + 1;
+            d_out_type[o]         = VIOL_CURRENT;
+        } else {
+            d_out_element_type[o] = ELEM_BUS;
+            d_out_element_id[o]   = key;
+            d_out_side[o]         = 0;
+            d_out_type[o]         = (g == GRP_LOW_VOLTAGE) ? VIOL_LOW_VOLTAGE : VIOL_HIGH_VOLTAGE;
+        }
+        d_out_value[o] = scr_val[at];
+        d_out_limit[o] = scr_lim[at];
+    }
+
+    if (tid == 0) {
+        d_out_count[out_c]              = n_kept;
+        d_out_truncated[out_c]          = (s_sel[GRP_CURRENT] || sel_v) ? 1 : 0;
+        d_out_count_low_voltage[out_c]  = s_cnt[GRP_LOW_VOLTAGE];
+        d_out_count_high_voltage[out_c] = s_cnt[GRP_HIGH_VOLTAGE];
+        d_out_count_current[out_c]      = s_cnt[GRP_CURRENT];
+    }
 }
 
 
@@ -362,11 +632,14 @@ __global__ void check_bus_q_violations_kernel(
     const cuda_real_type*  __restrict__ d_gen_qmax,
     const unsigned char*   __restrict__ d_gen_off,
     int                                 n_gen,
+    const unsigned char*   __restrict__ d_row_skip,
+    int                                 skip_stride,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mvar,
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_bus_id,
           int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
@@ -378,7 +651,9 @@ __global__ void check_bus_q_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_BUS_Q_VIOLATION_GROUPS * K);
 
@@ -392,6 +667,7 @@ __global__ void check_bus_q_violations_kernel(
     const cudaComplexType* Yv = d_Yvals + local_c * nnz_Y;
     const cudaComplexType* Sb = d_Sbus  + local_c * sbus_stride;
     const unsigned char*   off = d_gen_off ? d_gen_off + static_cast<ptrdiff_t>(out_c) * n_gen : nullptr;
+    const unsigned char*   skip = d_row_skip ? d_row_skip + static_cast<ptrdiff_t>(out_c) * skip_stride : nullptr;
 
     // the K largest excesses of each type (groups: LOW_Q, then HIGH_Q)
     auto topk = make_topk<N_BUS_Q_VIOLATION_GROUPS>(
@@ -415,6 +691,7 @@ __global__ void check_bus_q_violations_kernel(
     };
 
     for (int kk = 0; kk < n_check; ++kk) {
+        if (skip != nullptr && skip[kk]) continue;   // not held by its machines on this row
         const int b = d_bus_solver[kk];
         const cudaComplexType Vb = V[b];
         if (!isfinite(Vb.x) || !isfinite(Vb.y)) continue;   // masked (stranded) bus
@@ -474,13 +751,23 @@ __global__ void check_hvdc_p_violations_kernel(
     const cuda_real_type*  __restrict__ d_pmax12,
     const cuda_real_type*  __restrict__ d_pmax21,
     const int*             __restrict__ d_hvdc_id,
+    int                                 n_frz,
+    const int*             __restrict__ d_frz_bus1,
+    const int*             __restrict__ d_frz_bus2,
+    const int*             __restrict__ d_frz_dir,
+    const int*             __restrict__ d_frz_id,
+    const cuda_real_type*  __restrict__ d_frz_p0,
+    const cuda_real_type*  __restrict__ d_frz_k,
+    const cuda_real_type*  __restrict__ d_frz_limit,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_pu,
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_hvdc_id,
           int*             __restrict__ d_out_side,
+          int*             __restrict__ d_out_type,
           cuda_real_type*  __restrict__ d_out_value,
           cuda_real_type*  __restrict__ d_out_limit,
           int*             __restrict__ d_out_count,
@@ -489,7 +776,9 @@ __global__ void check_hvdc_p_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_HVDC_P_VIOLATION_GROUPS * K);
 
@@ -500,18 +789,20 @@ __global__ void check_hvdc_p_violations_kernel(
     }
 
     const cudaComplexType* V = d_V + local_c * n_bus;
-    // the K largest excesses (one type: HIGH_P, either side)
+    // the K largest excesses per type: HIGH_P (either side), then the releases
     auto topk = make_topk<N_HVDC_P_VIOLATION_GROUPS>(
         base, K, d_out_value, d_out_limit, SevAbs{},
         [&](ptrdiff_t dst, ptrdiff_t src) {
             d_out_hvdc_id[dst] = d_out_hvdc_id[src];
             d_out_side[dst]    = d_out_side[src];
+            d_out_type[dst]    = d_out_type[src];
         });
-    auto push = [&](int hid, int side, cuda_real_type value, cuda_real_type limit) {
-        const ptrdiff_t at = topk.reserve(0, SevAbs{}(value, limit));
+    auto push = [&](int hid, int side, cuda_real_type value, cuda_real_type limit, int grp = 0) {
+        const ptrdiff_t at = topk.reserve(grp, SevAbs{}(value, limit));
         if (at < 0) return;
         d_out_hvdc_id[at] = hid;
         d_out_side[at]    = side;
+        d_out_type[at]    = grp == 0 ? VIOL_HIGH_P : VIOL_HVDC_AC_EMULATION_RELEASE;
         d_out_value[at]   = value;
         d_out_limit[at]   = limit;
     };
@@ -535,6 +826,21 @@ __global__ void check_hvdc_p_violations_kernel(
             if (isfinite(pmax) && p2_flow > pmax + tol_pu)
                 push(d_hvdc_id[e], 2, p2_flow * sn_mva, pmax * sn_mva);
         }
+    }
+
+    // the lines frozen at their limit: released when their droop asks for less
+    for (int e = 0; e < n_frz; ++e) {
+        const cudaComplexType V1 = V[d_frz_bus1[e]];
+        const cudaComplexType V2 = V[d_frz_bus2[e]];
+        if (!isfinite(V1.x) || !isfinite(V1.y) || !isfinite(V2.x) || !isfinite(V2.y)) continue;
+        const cuda_real_type th1 = CudaFunHelper::my_atan2(CudaFunHelper::my_cuCimag(V1), CudaFunHelper::my_cuCreal(V1));
+        const cuda_real_type th2 = CudaFunHelper::my_atan2(CudaFunHelper::my_cuCimag(V2), CudaFunHelper::my_cuCreal(V2));
+        const cuda_real_type raw = d_frz_p0[e] + d_frz_k[e] * (th1 - th2);
+        const int dir = d_frz_dir[e];
+        const cuda_real_type flow  = dir > 0 ? raw : -raw;
+        const cuda_real_type limit = d_frz_limit[e];
+        if (isfinite(flow) && isfinite(limit) && flow < limit - tol_pu)
+            push(d_frz_id[e], dir > 0 ? 1 : 2, flow * sn_mva, limit * sn_mva, 1);
     }
 
     d_out_count[out_c]     = topk.finish();
@@ -563,10 +869,13 @@ __global__ void check_gen_pv_release_violations_kernel(
     int                                 n_gen,
     const cuda_real_type*  __restrict__ d_targets,
     int                                 target_stride,
+    const unsigned char*   __restrict__ d_row_skip,
+    int                                 skip_stride,
     cuda_real_type                      tol_vm_pu,
     int n_bus,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_gen_id,
           int*             __restrict__ d_out_type,
           int*             __restrict__ d_out_el_type,
@@ -579,7 +888,9 @@ __global__ void check_gen_pv_release_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_GEN_PV_RELEASE_VIOLATION_GROUPS * K);
 
@@ -592,9 +903,11 @@ __global__ void check_gen_pv_release_violations_kernel(
     const cudaComplexType* V = d_V + local_c * n_bus;
     const unsigned char* off = d_gen_off ? d_gen_off + static_cast<ptrdiff_t>(out_c) * n_gen : nullptr;
     const cuda_real_type* tgt = d_targets ? d_targets + static_cast<ptrdiff_t>(out_c) * target_stride : nullptr;
+    const unsigned char* skip = d_row_skip ? d_row_skip + static_cast<ptrdiff_t>(out_c) * skip_stride : nullptr;
     // groups: LOW_VOLTAGE_AT_MIN_Q (0), HIGH_VOLTAGE_AT_MAX_Q (1) on the generators and
     // the frozen SVCs, LOW_VOLTAGE_SVC_STANDBY (2), HIGH_VOLTAGE_SVC_STANDBY (3) on the
-    // standby SVCs
+    // standby SVCs, LOW_VOLTAGE_REMOTE_CONTROL (4), HIGH_VOLTAGE_REMOTE_CONTROL (5) on the
+    // remote controllers
     auto topk = make_topk<N_GEN_PV_RELEASE_VIOLATION_GROUPS>(
         base, K, d_out_value, d_out_limit, SevRatio{},
         [&](ptrdiff_t dst, ptrdiff_t src) {
@@ -615,12 +928,17 @@ __global__ void check_gen_pv_release_violations_kernel(
     };
 
     for (int k = 0; k < n_entries; ++k) {
+        if (skip != nullptr && skip[k]) continue;   // not pinned at a limit on this row
         const int gid = d_gen_id[k];
         // an SVC entry (frozen at a limit, or standby) or an HVDC one (a frozen VSC
         // station): no row disconnects it nor moves its target / thresholds
         const int el = (d_el_type != nullptr) ? d_el_type[k] : ELEM_GENERATOR;
         const bool is_gen = (el == ELEM_GENERATOR);
-        const bool is_standby = (el == ELEM_SVC) && (d_standby != nullptr) && (d_standby[k] != 0);
+        const int check = (d_standby != nullptr) ? d_standby[k] : 0;
+        const bool is_standby = (el == ELEM_SVC) && (check == CHECK_SVC_STANDBY);
+        // a generator holding a remote bus: its own bus (d_reg_bus) against a fixed bound,
+        // the remote one (d_gen_bus) only for its mask
+        const bool is_remote = is_gen && (check == CHECK_REMOTE_CONTROL);
         const int side = (d_side != nullptr) ? d_side[k] : 0;
         if (is_gen && off != nullptr && gid < n_gen && off[gid]) continue;   // disconnected by the row
         const cudaComplexType Vr = V[d_reg_bus[k]];
@@ -628,7 +946,7 @@ __global__ void check_gen_pv_release_violations_kernel(
         // masked (stranded) regulated bus or own bus: nothing to release
         if (!isfinite(Vr.x) || !isfinite(Vr.y) || !isfinite(Vg.x) || !isfinite(Vg.y)) continue;
         cuda_real_type target = d_target_base[k];
-        if (is_gen && tgt != nullptr) {
+        if (is_gen && !is_remote && tgt != nullptr) {
             const cuda_real_type t_row = tgt[k];
             if (!isnan(t_row)) target = t_row;
         }
@@ -639,12 +957,14 @@ __global__ void check_gen_pv_release_violations_kernel(
             // a generator absorbing all it can, still below the target: absorbs too
             // much; an idle SVC below its low threshold: its automaton switches it on
             if (vm < target - tol_vm_pu) {
-                if (is_standby) push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
-                else            push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, el, side, vm * vn, target * vn);
+                if (is_standby)     push(2, gid, VIOL_LOW_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
+                else if (is_remote) push(4, gid, VIOL_LOW_VOLTAGE_REMOTE_CONTROL, el, side, vm * vn, target * vn);
+                else                push(0, gid, VIOL_LOW_VOLTAGE_AT_MIN_Q, el, side, vm * vn, target * vn);
             }
         } else if (vm > target + tol_vm_pu) {
-            if (is_standby) push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
-            else            push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, el, side, vm * vn, target * vn);
+            if (is_standby)     push(3, gid, VIOL_HIGH_VOLTAGE_SVC_STANDBY, el, side, vm * vn, target * vn);
+            else if (is_remote) push(5, gid, VIOL_HIGH_VOLTAGE_REMOTE_CONTROL, el, side, vm * vn, target * vn);
+            else                push(1, gid, VIOL_HIGH_VOLTAGE_AT_MAX_Q, el, side, vm * vn, target * vn);
         }
     }
 
@@ -704,6 +1024,7 @@ __global__ void check_gen_p_violations_kernel(
     int n_bus, int nnz_Y,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
+    const int* __restrict__ d_slot_active,
           int*             __restrict__ d_out_element_type,
           int*             __restrict__ d_out_element_id,
           int*             __restrict__ d_out_type,
@@ -716,7 +1037,9 @@ __global__ void check_gen_p_violations_kernel(
     const ptrdiff_t local_c = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local_c >= actual_batch) return;
 
-    const int slot_global = c_start + static_cast<int>(local_c);
+    const int slot_global = d_slot_active ? d_slot_active[local_c]
+                                          : c_start + static_cast<int>(local_c);
+    if (slot_global < 0) return;
     const int out_c = d_result_map ? d_result_map[slot_global] : slot_global;
     const ptrdiff_t base = static_cast<ptrdiff_t>(out_c) * (N_GEN_P_VIOLATION_GROUPS * K);
 

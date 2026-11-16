@@ -18,6 +18,7 @@ from ..contingency_analysis import (
     _resolve_reordering_alg,
     _resolve_matching_alg,
     _resolve_pivot_epsilon_alg,
+    _check_ir_n_steps,
 )
 
 __all__ = ["AcPfGPU"]
@@ -84,6 +85,10 @@ class AcPfGPU:
         (once-only) cuDSS ANALYSIS phase. One of ``"default"``, ``"scaled"``,
         ``"static"``. Construction-time only, same reason as
         ``reordering_alg``.
+    ir_n_steps : int, default 0
+        cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: steps of iterative refinement after
+        each linear solve (forward and adjoint). ``0`` (default) solves
+        without refinement. Construction-time only.
     debug_base_case : bool, default False
         Only meaningful with ``init_from_n_powerflow=True`` and a MultiSlack/
         VoltageControl extension active (bridge path). By default, that
@@ -160,13 +165,14 @@ class AcPfGPU:
     def __init__(self, grid, *, precision="fp64", max_iter=10, tol=1e-8,
                  device=None, init_from_n_powerflow=True, use_bridge=None,
                  reordering_alg="default", matching_alg="none",
-                 pivot_epsilon_alg="default", debug_base_case=False,
+                 pivot_epsilon_alg="default", ir_n_steps=0, debug_base_case=False,
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True):
         _validate_precision(precision)
         reordering_alg_enum = _resolve_reordering_alg(reordering_alg)
         matching_alg_enum = _resolve_matching_alg(matching_alg)
         pivot_epsilon_alg_enum = _resolve_pivot_epsilon_alg(pivot_epsilon_alg)
+        ir_n_steps = _check_ir_n_steps(ir_n_steps)
         # (mask, |V|) of the Vm-fixed buses, read off the construction solve by
         # the first resolve() -- see _vm_setpoints().
         self._vm_fixed = None
@@ -184,6 +190,7 @@ class AcPfGPU:
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
                 pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                ir_n_steps=ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 # No grid to inherit a scaling policy from -- None means off.
                 scaling_max_voltage_change=bool(scaling_max_voltage_change),
@@ -203,6 +210,7 @@ class AcPfGPU:
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
                 pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                ir_n_steps=ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 # None => -1/-1.0 sentinels: inherit the grid's own
                 # get_ac_algo_config() (opt-in by construction). True/False
@@ -226,6 +234,7 @@ class AcPfGPU:
                 reordering_alg=reordering_alg_enum,
                 matching_alg=matching_alg_enum,
                 pivot_epsilon_alg=pivot_epsilon_alg_enum,
+                ir_n_steps=ir_n_steps,
                 debug_base_case=bool(debug_base_case),
                 # No grid config to inherit here either (Python-side fallback,
                 # not the bridge) -- None means off.

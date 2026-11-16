@@ -451,7 +451,7 @@ def conflicting_gen_v_rows(gen_v, gen_bus, is_vm_fixed_bus, gen_off=None,
     return out
 
 
-def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None):
+def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None, load_off=None):
     """Assemble per-bus (p_mw, q_mvar) from per-element injection matrices.
 
     Parameters
@@ -468,6 +468,9 @@ def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None):
         -- dropping its voltage pinning is the solver's job
         (``ScenarioSweepGPU.set_contingency_gens``). Mirrors lightsim2grid's
         ``SbusPolicy::Vary`` generator-contingency correction.
+    load_off : (n_steps, n_load) bool array, optional
+        ``True`` takes that load out of that step's injection: its active and
+        reactive power leave Sbus (lightsim2grid's ``set_contingency_loads``).
 
     Returns
     -------
@@ -499,6 +502,15 @@ def build_bus_injections(elements, load_p, load_q, gen_p, gen_off=None):
                 f"'{name}' has {mat.shape[0]} rows (time steps) while 'gen_p' "
                 f"has {n_steps}. All injection matrices must share the same "
                 f"number of rows.")
+
+    if load_off is not None:
+        load_off = np.asarray(load_off, dtype=bool)
+        if load_off.shape != load_p.shape:
+            raise ValueError(
+                f"'load_off' has shape {load_off.shape} while 'load_p' has "
+                f"{load_p.shape}; both are (n_steps, n_load).")
+        load_p = np.where(load_off, 0.0, load_p)
+        load_q = np.where(load_off, 0.0, load_q)
 
     if gen_off is not None:
         gen_off = np.asarray(gen_off, dtype=bool)

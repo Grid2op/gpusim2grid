@@ -58,6 +58,11 @@ void materialize_vc_custom_rows(LedgerData& ld);
 // materialize_vc_custom_rows first.
 void reserve_stranded_controller_slots(LedgerData& ld);
 
+// lightsim2grid PR #292: a batch row may trip controllers of a group. Every sharing row gets
+// an entry on every controller of its group (structure only, filled by value through the
+// holding formulation, vc_hold_fill_J_kernel) and vc_may_trip is set. Idempotent.
+void reserve_tripped_controller_slots(LedgerData& ld);
+
 // Append a Vm column + a Q equation for every bus in `buses` (sorted, unique,
 // AC-solver numbering) that does not already own one, with the dS pattern
 // derived from Ybus_rm's structure (the same RowMajor Ybus AcPfNrState's

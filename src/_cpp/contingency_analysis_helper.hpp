@@ -36,6 +36,7 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <utility>
 #include <vector>
 #include <tuple>
 
@@ -127,6 +128,26 @@ struct Contingency {
     // in both gets the same identity Q row twice -- harmless).
     std::vector<int> pinned_buses;
 
+    // ScenarioSweep reactive-limit outer loop (second pass): (solver bus, |V|
+    // pu) pairs whose magnitude is re-seeded right after the V tile, keeping
+    // the tiled angle -- a PQ bus this row holds PV again (its Q row is in
+    // pinned_buses, so |V| stays at the value set here). Empty otherwise.
+    std::vector<std::pair<int, double>> vm_reseed;
+
+    // ScenarioSweep reactive-limit outer loop (second pass): (controller index,
+    // reactive injection pu, generator convention) of VoltageControl
+    // controllers this row holds at a fixed Q -- every controller of a group
+    // that saturated (build_mask_entries rewrites the group's voltage row into
+    // "Q_first = t" and each other controller's sharing row into "Q_c = t", by
+    // value: the regulated bus floats). Empty otherwise.
+    std::vector<std::pair<int, double>> vc_pinned_ctrl;
+    // The held controllers (MaskConfig::vc_held) this row releases. A held one
+    // not listed here is pinned whatever vc_pinned_ctrl says, so a row built
+    // without pins (a preview of its masks) still sees it pinned.
+    std::vector<int> vc_released;
+    // The controllers of the voltage-control groups this row trips: gone (lightsim2grid PR #292)
+    std::vector<int> vc_tripped;
+
     // Branch ids (lines-then-trafos) tripped by this contingency, populated
     // verbatim from build_contingencies()'s branch_ids_per_ctg[c] argument.
     // Used ONLY by compute_limit_violations' fused per-contingency current
@@ -168,6 +189,29 @@ struct ChunkPatchRange {
 // ---------------------------------------------------------------------------
 Contingency build_contingency_from_branch_ids(
     const std::vector<int>&   branch_ids,
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff);
+
+// ---------------------------------------------------------------------------
+// append_one_side_trips
+//   Opens `branch_ids` at side `open_side` (1: from, 2: to) only, appending to
+//   `ctg`: the branch's block leaves the row's Ybus and the end it keeps gets its
+//   Kron-reduced part back (lightsim2grid's BranchContainer stamp for a branch
+//   open at one end, and YbusPolicy::Contingency::_append_one_side_trips), so it
+//   still carries its charging from there. A branch already open at that end in
+//   the base grid (negative endpoint) changes nothing, one open at its other end
+//   goes entirely, one off (zero block) is left alone. Each branch is appended to
+//   ctg.tripped_branches: its flows read 0, its current is not checked and the
+//   outer loops see it as open, as for a branch opened at both ends.
+// ---------------------------------------------------------------------------
+void append_one_side_trips(
+    Contingency&              ctg,
+    const std::vector<int>&   branch_ids,
+    int                       open_side,
     Eigen::Ref<const Eigen::VectorXi> branch_from,
     Eigen::Ref<const Eigen::VectorXi> branch_to,
     Eigen::Ref<const CplxVect> yff_eff,
@@ -336,6 +380,19 @@ struct MaskConfig {
     std::vector<int> vc_vrow;            // per group: the bordered voltage row
     std::vector<int> vc_vrow_qcol_pos;   // per group: nnz pos of (v_row, q_col_first), -1 if none
     std::vector<int> vc_vrow_vmcol_pos;  // per group: nnz pos of (v_row, vm_col(reg_bus)), -1 if none
+    // per controller: its sharing row and the nnz pos of that row's (own q_col)
+    // and (first controller's q_col) entries, -1 for a group's first controller
+    // -- what holding a controller at a fixed reactive injection rewrites
+    std::vector<int> vc_ctrl_sh_row, vc_ctrl_sh_self_pos, vc_ctrl_sh_first_pos;
+    // per controller, 1 for a held one (LedgerData::vc_held): pinned on every row
+    // that does not release it (Contingency::vc_released); empty = none
+    std::vector<int> vc_held;
+    // The rows' lost controllers (tripped, or on a masked bus) are held by value through
+    // the holding formulation (SlotVcHold, LedgerData::vc_may_trip): in a group where a row
+    // loses one, its pinned controllers (Contingency::vc_pinned_ctrl) are held there too,
+    // at their targets, and get no jov / vcp entries -- those rewrite only two entries of a
+    // sharing row the holding formulation may have taken against another reference.
+    bool vc_hold_by_value = false;
 
     MaskRowInfo       row_info;
 };
@@ -351,6 +408,9 @@ struct MaskConfig {
 //     • jov    : per-slot J value overrides (slot, nnz pos, value) — the
 //                repurposed stranded-controller row;
 //     • str    : stranded rows (slot, group) — F[v_row] = -Q_c per slot.
+//     • vcp    : controller rows held at a fixed Q (slot, J row, controller,
+//                target) — F[row] = -(Q_c - target) per slot (the reactive-
+//                limit outer loop, Contingency::vc_pinned_ctrl).
 // ---------------------------------------------------------------------------
 struct MaskEntries {
     std::vector<int>            slot, row, diag;
@@ -362,9 +422,13 @@ struct MaskEntries {
     std::vector<ChunkPatchRange> jov_ranges;
     std::vector<int>            str_slot, str_grp;
     std::vector<ChunkPatchRange> str_ranges;
+    std::vector<int>            vcp_slot, vcp_row, vcp_ctrl;
+    std::vector<cuda_real_type> vcp_target;
+    std::vector<ChunkPatchRange> vcp_ranges;
 
     bool any() const {
-        return !slot.empty() || !v_slot.empty() || !jov_slot.empty() || !str_slot.empty();
+        return !slot.empty() || !v_slot.empty() || !jov_slot.empty() || !str_slot.empty()
+            || !vcp_slot.empty();
     }
 };
 

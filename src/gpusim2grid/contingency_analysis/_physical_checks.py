@@ -7,8 +7,9 @@ the three batch engines and their ``*GPU`` facades expose them (one mixin
 each, so the API is written once). Same names and contract as lightsim2grid's:
 one flag for the whole category, every record of ``get_physical_violations()``
 has ``category == ViolationCategory.PHYSICAL`` -- the converged solution
-assumes a control the equipment cannot hold -- and the next physical limit
-needs no new flag.
+assumes a control the equipment cannot hold -- or ``CONTROL`` for the releases
+(a frozen machine, an idle standby SVC, a saturated hvdc droop an outer loop
+would put back), and the next physical limit needs no new flag.
 
 Today the category holds five checks, all detection-only (no bus is switched
 PV -> PQ or back, no line is saturated, no machine is taken out of the slack,
@@ -36,6 +37,12 @@ no row is re-solved):
   ``can_be_pv``); routed through the release plan (two entries per SVC, see
   ``GenPvReleasePlanData``), value / limit in kV, compared with
   ``physical_violation_tol_vm_pu``;
+- the own bus of the generators holding a remote bus, when the grid carries a
+  realistic range (``LOW_VOLTAGE_REMOTE_CONTROL`` / ``HIGH_VOLTAGE_REMOTE_CONTROL``
+  on a ``GENERATOR``, lightsim2grid's ``RemoteVoltageControlCheck``, range set
+  with ``LSGrid.set_remote_voltage_control_vm_range``): OpenLoadFlow's robust
+  remote voltage control switches such a controller to PQ. Routed through the
+  release plan too (one entry per bound), value / limit in kV;
 - droop hvdc P-saturation (``HVDC_P_SATURATION`` on an ``HVDC``):
   OpenLoadFlow's ``HvdcAcEmulationLimits`` outer loop;
 - per-machine active power of the distributed slack (``LOW_P`` / ``HIGH_P``
@@ -94,7 +101,8 @@ class PhysicalChecksEngineMixin:
         the generators / storage units carrying the distributed slack whose
         converged active power left their [min_p, max_p] (``LOW_P`` /
         ``HIGH_P``). Same contract as lightsim2grid's flag of the same name:
-        every record has ``category == PHYSICAL``. Detection only, nothing is
+        every record has ``category == PHYSICAL`` (``CONTROL`` for the
+        releases). Detection only, nothing is
         enforced. Needs :meth:`set_bus_q_capability` (the facades do it from
         the grid); :meth:`set_gen_p_capability` is optional. Default False;
         changing it drops the previous report; takes effect on the next
@@ -178,7 +186,11 @@ class PhysicalChecksEngineMixin:
         its end in the optional ``side``) and, with the optional ``standby`` (1
         for such an entry), the idle
         standby SVCs, two entries each (the low threshold with at_min 1, the
-        high one with at_min 0). OPTIONAL: left unset, nothing is flagged and
+        high one with at_min 0); with ``standby`` 2 on a GENERATOR entry, a
+        generator holding a remote bus (``LSGrid.set_remote_voltage_control_vm_range``):
+        its OWN bus as ``reg_bus_solver``, the remote one as ``gen_bus_solver``, one
+        entry per realistic bound, reported as ``LOW_VOLTAGE_REMOTE_CONTROL`` /
+        ``HIGH_VOLTAGE_REMOTE_CONTROL``. OPTIONAL: left unset, nothing is flagged and
         nothing is reported. Validated against n_bus; drops any previous
         report.
 

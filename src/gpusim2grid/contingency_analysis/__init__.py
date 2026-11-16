@@ -8,7 +8,13 @@ __all__ = [
     "ViolationCategory",
     "violation_category",
     "LimitViolation",
+    "ReactiveLimitsStatus",
+    "RowStatus",
 ]
+
+import operator
+
+import numpy as np
 
 from .._gpusim2grid import (
     ContingencyAnalysisSession as _ContingencyAnalysisSession,
@@ -23,6 +29,9 @@ from ._limit_violations import (ViolationElementType, LimitViolationType, Violat
                                 LimitViolationsEngineMixin, LimitViolationsFacadeMixin)
 from ._physical_checks import PhysicalChecksEngineMixin, PhysicalChecksFacadeMixin
 from ._slack_redistribution import SlackRedistributionEngineMixin, SlackRedistributionFacadeMixin
+from ._reactive_limits import ReactiveLimitsStatus
+from ._scheduling import (RowStatus, OUTER_FAILURE_STATUSES, SchedulingEngineMixin, SchedulingFacadeMixin,
+                          outer_failure_rows)
 
 def _normalize_device(device):
     """Normalize a device specifier to an int for the C++ ctor.
@@ -64,6 +73,10 @@ _REORDERING_ALG_MAP = {
     'amd':               _ReorderingAlg.Amd,
     'nested_dissection': _ReorderingAlg.NestedDissection,
     'none':              _ReorderingAlg.NoReordering,
+    # prototype, docs/dev_notes/batched_lu_and_constrained_ordering.md
+    'ls2g_constrained':  _ReorderingAlg.Ls2gConstrained,
+    'ls2g_constrained_nd': _ReorderingAlg.Ls2gConstrainedNd,
+    'ls2g_constrained_minfill': _ReorderingAlg.Ls2gConstrainedMinFill,
 }
 
 
@@ -141,6 +154,19 @@ def _resolve_pivot_epsilon_alg(value):
         f"{type(value).__name__}")
 
 
+def _check_ir_n_steps(value):
+    """cuDSS ``CUDSS_CONFIG_IR_N_STEPS``: a non-negative int (0 = no refinement)."""
+    if isinstance(value, bool):
+        raise TypeError("ir_n_steps must be an int, got bool")
+    try:
+        n = operator.index(value)
+    except TypeError:
+        raise TypeError(f"ir_n_steps must be an int, got {type(value).__name__}") from None
+    if n < 0:
+        raise ValueError(f"ir_n_steps must be >= 0, got {n}")
+    return n
+
+
 class DeviceBuffer:
     """Handle to GPU-resident data; transfers to host on demand via to_numpy()."""
 
@@ -166,7 +192,7 @@ class DeviceBuffer:
 
 
 class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionEngineMixin,
-                                 LimitViolationsEngineMixin):
+                                 SchedulingEngineMixin, LimitViolationsEngineMixin):
     """Stateful GPU N-k contingency analysis solver.
 
     Parameters
@@ -224,7 +250,11 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
     :meth:`run` call:
 
     - ``batch_size`` (*int*): Contingencies per GPU chunk.
-    - ``nb_iter`` (*int*): Fixed NR iterations per chunk.
+    - ``nb_iter`` (*int*): NR iterations every contingency runs (chunked), or
+      each contingency's budget (continuous).
+    - ``scheduling`` (*str*), ``nb_iter_per_round`` (*int*), ``tol`` (*float*):
+      chunked / continuous batching and the convergence tolerance of a row
+      (see :class:`~gpusim2grid.contingency_analysis._scheduling.SchedulingEngineMixin`).
     - ``strategy`` (*str*): Linear-solve strategy.  One of
       ``'direct_refactor_every'`` (default), ``'direct_base_case_factors'``,
       ``'direct_iter0_only'``, ``'direct_refactor_every_n'``.
@@ -245,6 +275,8 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
       have been observed to silently produce NaN voltages.
     - ``pivot_epsilon_alg`` (*str*): cuDSS ``CUDSS_CONFIG_PIVOT_EPSILON_ALG``
       choice. One of ``'default'`` (default), ``'scaled'``, ``'static'``.
+    - ``ir_n_steps`` (*int*): cuDSS ``CUDSS_CONFIG_IR_N_STEPS``, steps of
+      iterative refinement per solve, base case and batch. Default 0 (none).
     - ``max_iter_base``, ``tol_base``: Stored for reference only; do not
       rerun the base case.
     - ``compute_limit_violations`` (*bool*): Fused per-chunk voltage/current/
@@ -284,8 +316,9 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
                  batch_size=100, nb_iter=4, max_iter_base=10, tol_base=1e-6,
                  device=None, handle_disconnected_grid=False, presolved_v=False,
                  reordering_alg='default', matching_alg='none',
-                 pivot_epsilon_alg='default', debug_base_case=False,
-                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1):
+                 pivot_epsilon_alg='default', ir_n_steps=0, debug_base_case=False,
+                 scaling_max_voltage_change=False, max_dVa=0.5, max_dVm=0.1,
+                 scheduling='chunked', nb_iter_per_round=1, tol=None):
         self._max_iter_base = int(max_iter_base)
         self._tol_base = float(tol_base)
         self._strategy = 'direct_refactor_every'
@@ -304,10 +337,12 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
             reordering_alg=_resolve_reordering_alg(reordering_alg),
             matching_alg=_resolve_matching_alg(matching_alg),
             pivot_epsilon_alg=_resolve_pivot_epsilon_alg(pivot_epsilon_alg),
+            ir_n_steps=_check_ir_n_steps(ir_n_steps),
             debug_base_case=bool(debug_base_case),
             scaling_max_voltage_change=bool(scaling_max_voltage_change),
             max_dVa=float(max_dVa), max_dVm=float(max_dVm))
         self._s.handle_disconnected_grid = bool(handle_disconnected_grid)
+        self._init_scheduling(scheduling, nb_iter_per_round, tol)
 
     @classmethod
     def _wrap_session(cls, session, max_iter_base=1, tol_base=1e-6,
@@ -412,6 +447,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     @reordering_alg.setter
     def reordering_alg(self, value):
+        self._check_own_lu(reordering_alg=_resolve_reordering_alg(value))
         self._reordering_alg = value
         self._s.reordering_alg = _resolve_reordering_alg(value)
 
@@ -429,6 +465,7 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 
     @matching_alg.setter
     def matching_alg(self, value):
+        self._check_own_lu(matching_alg=_resolve_matching_alg(value))
         self._matching_alg = value
         self._s.matching_alg = _resolve_matching_alg(value)
 
@@ -443,6 +480,17 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
     def pivot_epsilon_alg(self, value):
         self._pivot_epsilon_alg = value
         self._s.pivot_epsilon_alg = _resolve_pivot_epsilon_alg(value)
+
+    @property
+    def ir_n_steps(self):
+        """cuDSS CUDSS_CONFIG_IR_N_STEPS: steps of iterative refinement per batch
+        solve (int >= 0, 0 = none). Takes effect on the next run(); the base case
+        keeps the construction value."""
+        return self._s.ir_n_steps
+
+    @ir_n_steps.setter
+    def ir_n_steps(self, value):
+        self._s.ir_n_steps = _check_ir_n_steps(value)
 
     @property
     def handle_disconnected_grid(self):
@@ -503,12 +551,33 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         """
         self._s.build_contingencies(branch_ids_per_ctg)
 
+    def build_contingencies_full(self, branch_ids_per_ctg, shunt_ids_per_ctg,
+                                 load_ids_per_ctg, gen_ids_per_ctg,
+                                 branch_ids_side1_per_ctg=(), branch_ids_side2_per_ctg=(),
+                                 sgen_ids_per_ctg=(), storage_ids_per_ctg=(),
+                                 svc_ids_per_ctg=(), hvdc_ids_per_ctg=()):
+        """Build contingencies tripping branches, shunts, loads and generators
+        together: aligned list-of-lists, one entry per contingency (see
+        ContingencyAnalysisSession.build_contingencies_full). The last two (empty,
+        or one entry per contingency): the branches opened at that end only."""
+        self._s.build_contingencies_full(branch_ids_per_ctg, shunt_ids_per_ctg,
+                                         load_ids_per_ctg, gen_ids_per_ctg,
+                                         list(branch_ids_side1_per_ctg), list(branch_ids_side2_per_ctg),
+                                         list(sgen_ids_per_ctg), list(storage_ids_per_ctg),
+                                         list(svc_ids_per_ctg), list(hvdc_ids_per_ctg))
+
+    def get_batch_unsupported_reasons(self):
+        """list[str], per contingency: why the batch left it out (``""``: it did not).
+        Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        return list(self._s.get_batch_unsupported_reasons())
+
     def run(self):
         """Run all contingencies.  Fills V_results and residuals on device.
 
         Does not return timings — call solver.timings after compute_flows()
         for a complete breakdown including flow computation time.
         """
+        self._warn_tol_above_violation_tol()
         self._s.run()
 
     def compute_flows(self):
@@ -550,7 +619,10 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         (disconnected / masked-skip) contingency gets a single GRID/
         NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
-        single GRID/DIVERGENCE entry instead (value=residual, limit=tol).
+        single GRID/DIVERGENCE entry instead (value=residual, limit=tol), and
+        one the outer loops gave up on (``RowStatus.OUTER_FAILED``,
+        ``OUTER_UNSTABLE``, ``UNREALISTIC``) a GRID/DIVERGENCE entry with
+        value=limit=nan, as lightsim2grid.
         Otherwise the records of a contingency come type after type -- CURRENT,
         then LOW_VOLTAGE, then HIGH_VOLTAGE -- each type holding its (at most
         violation_capacity) most severe violations, most severe first.
@@ -571,15 +643,24 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         # row c owns slots [c*stride, c*stride + count[c]) -- stride is
         # 3 * the violation_capacity of the run that produced the buffers
         stride = len(etype) // max(len(counts), 1)
+        status = self._s.get_row_status()
+        unsupported = self._s.get_batch_unsupported_reasons()
         out = []
         for c, cnt in enumerate(counts):
+            if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
+                out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
+                                            LimitViolationType.DIVERGENCE,
+                                            float('nan'), float('nan'))])
+                continue
             if cnt < 0:
                 # Pre-check (graph connectivity) dropped this contingency
                 # before it ever reached check_limit_violations_kernel -- the
                 # solver was never invoked (BatchPfDriver's d_violation_count
                 # -1 sentinel). Never written by the kernel itself.
                 out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
-                                            LimitViolationType.NOT_SIMULATED,
+                                            LimitViolationType.BATCH_UNSUPPORTED
+                                            if c < len(unsupported) and unsupported[c]
+                                            else LimitViolationType.NOT_SIMULATED,
                                             float('nan'), float('nan'))])
                 continue
             base = c * stride
@@ -597,7 +678,9 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         contingency (only the most severe were kept -- raise violation_capacity
         if this matters for your use case; get_violation_counts() has the
         exact totals). Requires run() with compute_limit_violations=True."""
-        return self._s.get_violation_truncated().astype(bool)
+        out = self._s.get_violation_truncated().astype(bool)
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     def get_violation_counts(self):
         """dict of (n_contingencies,) int ndarrays with keys 'low_voltage',
@@ -614,19 +697,29 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
             raise RuntimeError(
                 "get_violation_counts() requires compute_limit_violations=True "
                 "(set solver.compute_limit_violations = True before run()).")
-        return {
-            "low_voltage":  self._s.get_violation_count_low_voltage(),
-            "high_voltage": self._s.get_violation_count_high_voltage(),
-            "current":      self._s.get_violation_count_current(),
+        out = {
+            "low_voltage":  np.array(self._s.get_violation_count_low_voltage()),
+            "high_voltage": np.array(self._s.get_violation_count_high_voltage()),
+            "current":      np.array(self._s.get_violation_count_current()),
         }
+        # a row the outer loops gave up on has one DIVERGENCE record and nothing counted
+        # (get_violations), not the violations of the state they rejected
+        failed = outer_failure_rows(self._s, out["current"].shape[0])
+        for v in out.values():
+            v[failed] = 0
+        return out
 
     def converged(self, tol=None):
         """(n_contingencies,) bool ndarray: residual <= tol (defaults to
-        violation_tol). Independent of compute_limit_violations -- residuals
+        violation_tol), False on a row the outer loops gave up on
+        (``OUTER_FAILURE_STATUSES``). Independent of compute_limit_violations -- residuals
         are always O(n_contingencies) and always computed (see residuals);
         this does not require compute_limit_violations to be enabled."""
         t = self.violation_tol if tol is None else tol
-        return self.residuals.to_numpy() <= t
+        out = self.residuals.to_numpy() <= t
+        # a row the outer loops gave up on solved its last inner powerflow, but is no solution
+        out[outer_failure_rows(self._s, out.shape[0])] = False
+        return out
 
     @property
     def V_results(self):

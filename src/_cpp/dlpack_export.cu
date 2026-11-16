@@ -93,12 +93,16 @@ export_jt_solve_dlpack(std::shared_ptr<AcPfNrSession> self,
     // Sync stream, solve, sync again so the result is visible to the caller.
     // ensure_JT() first: Jᵀ (and d_JT_sol, whose pointer is taken below) is
     // only built by the first adjoint solve.
-    self->state_->cs.synchronize();
-    self->state_->ensure_JT();
-    self->state_->solve_JT(
-        rhs_ptr,
-        thrust::raw_pointer_cast(self->state_->d_JT_sol.data()));
-    self->state_->cs.synchronize();
+    // No Python object is touched until the export below: let other threads run.
+    {
+        pybind11::gil_scoped_release nogil;
+        self->state_->cs.synchronize();
+        self->state_->ensure_JT();
+        self->state_->solve_JT(
+            rhs_ptr,
+            thrust::raw_pointer_cast(self->state_->d_JT_sol.data()));
+        self->state_->cs.synchronize();
+    }
 
     // Export d_JT_sol as a real-float DLPack capsule.
     // The DLPackCtx captures the session shared_ptr as owner, keeping the
@@ -377,6 +381,8 @@ export_solve_jt_batch_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self,
                                 kDLComplex, kDLPackComplexBits, {n_scen, n_bus});
             inputs.push_back(&vv);
         }
+        // The GIL is back before the catch below releases the capsules.
+        pybind11::gil_scoped_release nogil;
         self->solve_JT_batch(rhs.data, jv.data, want_gen_v_grad, yv.data, vv.data,
                              producer_stream);
     } catch (...) {
@@ -408,6 +414,11 @@ export_j_values_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
     if (!self->solver_)
         throw std::runtime_error(
             "ScenarioSweepSession: run() must be called before j_values_dlpack()");
+    if (self->solver_->last_continuous_)
+        throw std::invalid_argument(
+            "ScenarioSweepSession::j_values_dlpack: after a continuous run no chunk buffer "
+            "holds every row's values; solve_JT_batch_dlpack() rebuilds them from "
+            "the converged voltages (pass v=)");
     self->solver_->synchronize();
     void*   ptr = const_cast<void*>(static_cast<const void*>(self->solver_->j_values_ptr()));
     int     dev = self->solver_->device_id();
@@ -423,6 +434,11 @@ export_ybus_values_dlpack_ss(std::shared_ptr<ScenarioSweepSession> self)
     if (!self->solver_)
         throw std::runtime_error(
             "ScenarioSweepSession: run() must be called before ybus_values_dlpack()");
+    if (self->solver_->last_continuous_)
+        throw std::invalid_argument(
+            "ScenarioSweepSession::ybus_values_dlpack: after a continuous run no chunk buffer "
+            "holds every row's values; solve_JT_batch_dlpack() rebuilds them from "
+            "the converged voltages (pass v=)");
     self->solver_->synchronize();
     void*   ptr = const_cast<void*>(static_cast<const void*>(self->solver_->ybus_values_ptr()));
     int     dev = self->solver_->device_id();

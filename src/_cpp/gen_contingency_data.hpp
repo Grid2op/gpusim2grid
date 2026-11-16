@@ -38,10 +38,16 @@ struct GenContingencyData {
     std::vector<char>   vreg_on;           // [n_gen] voltage regulator on (its Q is NOT in Sbus)
     std::vector<double> target_q_mvar;     // [n_gen] reactive setpoint of a non-regulating one
     // [n_bus_solver] raw slack weight of the storage units taking part in the
-    // distributed slack, summed per bus: no row disconnects a storage unit, so
-    // this share survives every row's re-weighting (lightsim2grid's
-    // LSGrid::get_slack_weights_solver_without)
+    // distributed slack, summed per bus: the share that survives the re-weighting of a
+    // row taking no storage unit out (lightsim2grid's LSGrid::get_slack_weights_solver_without)
     std::vector<double> storage_slack_weight_bus;
+    // the other local regulators of a bus: it turns PQ only when a row takes out all of them
+    int n_storage = 0, n_hvdc = 0;
+    std::vector<int>    storage_vreg_bus;  // [n_storage] the bus it pins, -1 for none
+    std::vector<int>    station_vreg_bus;  // [2 * n_hvdc] the bus each station pins, side 1 then 2, -1 for none
+    // the storage units taking part in the distributed slack, by id (bus -1: not one)
+    std::vector<int>    storage_bus;           // [n_storage]
+    std::vector<double> storage_slack_weight;  // [n_storage]
 
     bool empty() const { return n_gen == 0; }
 };

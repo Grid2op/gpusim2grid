@@ -6,6 +6,7 @@
 #define TIMING_UTILS_H
 
 #include <chrono>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Helper: duration between two steady_clock time points, in milliseconds.
@@ -214,6 +215,17 @@ struct AcPfTimings {
 // Add this struct to timing_utils.hpp after AcPfTimings
 // =============================================================================
 
+// One round of the continuous schedule, its times in wall ms: the Newton phases (and their
+// GPU time), the residual pass, its D->H, the gather of the rows that converged, the outer
+// model's decisions, its loads and the controls written, the compaction. t_round_ms is the
+// whole round; what it has beyond those parts is the eviction and the launches.
+struct RoundRecord {
+    int n_cur = 0, n_live = 0, n_leave = 0, n_resolve = 0, n_load_real = 0, n_load_base = 0, n_moves = 0;
+    double t_round_ms = 0., t_newton_wall_ms = 0., t_newton_gpu_ms = 0., t_residual_ms = 0.;
+    double t_res_sync_ms = 0., t_gather_ms = 0., t_decide_ms = 0., t_load_ms = 0.;
+    double t_controls_ms = 0., t_compact_ms = 0.;
+};
+
 // ---------------------------------------------------------------------------
 // ContingencyTimings
 //
@@ -294,7 +306,7 @@ struct AcPfTimings {
 //   t_first_factorize — cuDSS FACTORIZATION, single call at chunk 0 / iter 0
 //   t_refactorize     — cuDSS REFACTORIZATION, all subsequent calls (accumulated)
 //   t_solve          — cuDSS SOLVE
-//   t_update_V       — update_Va_kernel + update_Vm_kernel
+//   t_update_V       — step scaling (MaxVoltageChange) + update_Va_kernel + update_Vm_kernel
 //   t_residual       — final SpMV + fill_F + compute_residuals_kernel (post-loop)
 //   t_store_V        — cudaMemcpyAsync: chunk d_V_batch → d_V_results
 //   t_flow_computation — compute_branch_flows_kernel (+ a small incidental H→D
@@ -385,6 +397,42 @@ struct BatchTimings {
     TimingEntry t_gen_p_check;       // check_gen_p_violations_kernel, same gate
     TimingEntry t_gen_pv_release_check;   // check_gen_pv_release_violations_kernel, same gate
     TimingEntry t_flow_computation;
+    // continuous batching only: the per-round host work of the scheduler --
+    // the D->H of the slots' residuals, the decisions, the H->D of the
+    // eviction map and the load list (wall time; gpu_ms stays 0).
+    TimingEntry t_schedule;
+    // its breakdown (wall; NOT added again to any total): the D->H of the S
+    // residuals and the sync it waits on; with outer loops, the gather of the
+    // converged leaving slots (kernels, D->H, sync) and the host model's
+    // decisions (OuterHook::on_solved); the rest (decision loop, eviction map,
+    // load list, H->D) is t_schedule minus these three.
+    TimingEntry t_sched_res_sync;
+    TimingEntry t_oc_gather;
+    TimingEntry t_oc_decide;
+    // outer loops: the controls of the re-entering / loaded slots
+    // (_oc_write_controls: host packing, H->D, Sbus re-read, sync), wall.
+    TimingEntry t_oc_controls;
+    // outer loops: the host model's own setup of the run and of every slot
+    // (OuterHook::begin, _oc_setup, OuterHook::load on each (re)load), wall.
+    TimingEntry t_oc_load;
+    // continuous batching, the tail (tail_max_groups): the moves of the live
+    // rows into the first slots (host bookkeeping, H->D of the move list, the
+    // row copies, OuterHook::move) and the prefix SpMV / G-matrix cuDSS
+    // handle set up on the way, wall.
+    TimingEntry t_tail_compact;
+
+    // Whole-call wall clocks (ms), to find what no phase above covers:
+    // BatchPfDriver::solve() from entry to return, and the session's run()
+    // around it (source build, driver build + cuDSS ANALYSIS of a cold run,
+    // the outer loops' row inputs, the post-solve folding). Not added to any
+    // total.
+    double t_driver_solve_wall_ms = 0.;
+    double t_session_run_wall_ms  = 0.;
+    // Continuous scheduling, how the rounds split (ms, not added to any total): every slot
+    // in use, from the initial load to the tail's first compaction (to the end of the rounds
+    // without a tail), and the tail, from that compaction to the end of the rounds.
+    double t_main_phase_wall_ms = 0.;
+    double t_tail_phase_wall_ms = 0.;
 
     // --- metadata ---
     //
@@ -397,6 +445,37 @@ struct BatchTimings {
     int nb_iter          = 0;
     int n_refactorize    = 0;   // number of refactorize calls (n_chunks * nb_iter - 1)
     int n_disconnected   = 0;   // contingencies skipped (would disconnect the grid)
+    // scheduling (BatchScheduling: 0 = chunked, 1 = continuous). For the
+    // continuous schedule n_chunks is 0, chunk_size the slot count S, nb_iter
+    // the per-row budget, and these three describe the run:
+    int    scheduling        = 0;
+    int    nb_iter_per_round = 0;   // k
+    int    n_rounds          = 0;   // rounds of k iterations
+    double occupancy         = 0.;  // useful row-iterations / slot-iterations run (S per round, n_cur in the tail)
+    // the tail: rounds run on the compacted live rows with the G-matrix cuDSS
+    // handle (tail_max_groups), and the slot moves that compaction made
+    int    n_tail_rounds     = 0;
+    int    n_slot_moves      = 0;
+    // the live rows summed over the rounds, before the tail and in it (phantom slots not
+    // counted): what t_main_phase_wall_ms / t_tail_phase_wall_ms solved
+    long long n_main_row_rounds = 0;
+    long long n_tail_row_rounds = 0;
+    // base-case loads of freed slots once the queue is empty, and those the tail made
+    // unnecessary (the slot overwritten by a moved row, or out of the rounds)
+    long long n_base_loads = 0;
+    long long n_base_loads_skipped = 0;
+    // continuous: one record per round (the first one includes the initial load)
+    std::vector<RoundRecord> round_records;
+    // what ContingencyAnalysisSession::run does around the driver's solve (wall, ms): the
+    // reference choice and checks, the source (connectivity, masks, patches), the
+    // redistribute_slack pre-pass, the driver's construction (allocations, ANALYSIS), the
+    // outer model's row overrides, and what follows the solve
+    double t_sess_ref_ms = 0.;
+    double t_sess_source_ms = 0.;
+    double t_sess_prepass_ms = 0.;
+    double t_sess_driver_ctor_ms = 0.;
+    double t_sess_overrides_ms = 0.;
+    double t_sess_after_ms = 0.;
 
     // --- batched adjoint (ScenarioSweepSession::solve_JT_batch, differentiable
     //     wrapper) -- CUMULATIVE over the life of the batch driver, all zero
@@ -406,6 +485,7 @@ struct BatchTimings {
     TimingEntry t_adjoint_first_factorize; // single FACTORIZATION of Jᵀ (first backward only)
     TimingEntry t_adjoint_refactorize;     // REFACTORIZATION of Jᵀ (every later backward after a new forward)
     TimingEntry t_adjoint_solve;           // SOLVE with Jᵀ (every backward)
+    TimingEntry t_adjoint_rebuild_J;       // continuous runs: reload of the rows + J at their converged V (every backward)
     int adjoint_n_analysis    = 0;         // 0 or 1 per driver life
     int adjoint_n_factorize   = 0;         // 0 or 1 per driver life
     int adjoint_n_refactorize = 0;
@@ -421,6 +501,20 @@ struct BatchTimings {
     long long cudss_mem_host_permanent_bytes   = -1;  // [2]
     long long cudss_mem_host_peak_bytes        = -1;  // [3]
 
+    // --- prototype (docs/dev_notes/batched_lu_and_constrained_ordering.md) ---
+    // Whether cuDSS's CUDSS_DATA_PERM_REORDER_ROW/COL after ANALYSIS equal the
+    // user permutation handed over (reordering_alg Ls2gConstrained): 1 yes,
+    // 0 no, -1 no user permutation.
+    int       cudss_user_perm_honoured         = -1;
+    // CUDSS_DATA_NPIVOTS (pivots cuDSS perturbed), read after every
+    // factorization of the forward batch (the continuous tail's handle
+    // included) when GPUSIM2GRID_COUNT_PIVOTS is set (host sync per
+    // factorization); -1 otherwise. Summed over this run (not the driver's
+    // life), the largest single read, and the number of reads.
+    long long cudss_npivots_total              = -1;
+    long long cudss_npivots_max                = -1;
+    long long cudss_npivots_reads              = 0;
+
     // Total wall-clock time for all chunks (excludes one-time setup).
     double t_chunks_total_wall_ms() const {
         return (t_tile_V         + t_tile_Ybus      + t_patch_Ybus
@@ -429,7 +523,8 @@ struct BatchTimings {
               + t_solve          + t_update_V       + t_residual
               + t_store_V        + t_violation_check + t_bus_q_check
               + t_hvdc_p_check   + t_gen_p_check     + t_gen_pv_release_check
-              + t_flow_computation).wall_ms;
+              + t_flow_computation + t_schedule + t_oc_controls
+              + t_oc_load + t_tail_compact).wall_ms;
     }
 
     // Mean wall time per contingency (across all chunks).

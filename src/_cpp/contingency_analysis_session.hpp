@@ -37,9 +37,14 @@
 #include "timing_utils.hpp"
 #include "contingency_analysis_helper.hpp"
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
+#include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
+#include "outer/outer_hook.hpp"                  // outer::OuterHook
 #include "ledger_data.hpp"                      // LedgerData (the stored base ledger)
 #include "slack_redistribution.hpp"              // SlackRedistributionData, slack_redistribution::RowResult
+#include "element_trip_data.hpp"                 // ElementTripData
+#include "gen_contingency_data.hpp"              // GenContingencyData
 #include "reordering_alg.hpp"
+#include "linear_solver.hpp"
 #include "matching_alg.hpp"
 #include "pivot_epsilon_alg.hpp"
 #include "contingency/batch_driver_config.hpp"   // BatchDriverConfig
@@ -47,7 +52,10 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <complex>
+#include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 // Forward-declare CUDA-dependent types to avoid pulling CUDA headers
@@ -60,6 +68,7 @@
 struct AcPfNrState;
 struct LedgerData;
 struct ContingencyBatch;
+struct ContingencyAnalysisDeviceData;   // session-owned device buffers (defined in the .cu)
 template <typename BatchSource> struct BatchPfDriver;
 using ContingencyAnalysisSolver = BatchPfDriver<ContingencyBatch>;
 
@@ -74,6 +83,7 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     std::shared_ptr<AcPfNrState>               base_state_;   // shared: a v_base_dlpack() capsule co-owns it
     std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run(); then kept
+    std::unique_ptr<ContingencyAnalysisDeviceData> dev_;   // the generator mask of the physical checks
 
     // =========================================================================
     // Driver persistence (see BatchDriverConfig): run() keeps solver_ -- its
@@ -105,9 +115,27 @@ struct ContingencyAnalysisSession {
     int        nb_iter_         = 0;
     int        refactor_period_ = 1;
     ContingencySolverType strategy_type_   = ContingencySolverType::DirectRefactorEvery;
+    // Scheduling of the batch (see contingency/row_status.hpp): chunked (every
+    // contingency runs nb_iter_ iterations) or continuous (nb_iter_ is each
+    // contingency's budget, checked every nb_iter_per_round_ iterations
+    // against tol_). Mutable, taken by the next run().
+    BatchScheduling scheduling_        = BatchScheduling::Chunked;
+    int             nb_iter_per_round_ = 1;
+    double          tol_               = default_row_tol(sizeof(cuda_real_type) == 4);
+    // Continuous scheduling, the tail (BatchPfDriver::tail_max_groups_): once
+    // the queue is empty and the live rows fit in tail_max_groups_ groups of
+    // tail_group_size_ slots, the rounds run on those groups only, their
+    // linear solve on a cuDSS handle of tail_group_size_ matrices (0 = off).
+    // Mutable, taken by the next run().
+    int             tail_max_groups_   = 16;
+    int             tail_group_size_   = 15;
     ReorderingAlg reordering_alg_ = ReorderingAlg::Default;
     MatchingAlg matching_alg_ = MatchingAlg::None;
     PivotEpsilonAlg pivot_epsilon_alg_ = PivotEpsilonAlg::Default;
+    int ir_n_steps_ = 0;   // CUDSS_CONFIG_IR_N_STEPS (base case and batch, forward and adjoint)
+    // Who factorizes / solves the batch Jacobians (linear_solver.hpp); the base
+    // case always stays on cuDSS. Next run(); a change builds a new driver.
+    LinearSolver linear_solver_ = LinearSolver::Cudss;
 
     // NR step-scaling (MaxVoltageChange), forwarded to BOTH base_state_'s
     // AcPfNrState AND the batch driver used by run() -- see AcPfNrState's own
@@ -179,6 +207,7 @@ struct ContingencyAnalysisSession {
 
     // post-solve physical checks (see physical_checks() above)
     PhysicalChecksConfig phys_;
+    std::shared_ptr<outer::OuterHook> outer_;   // see set_outer_model
 
     // redistribute_slack (lightsim2grid PR #216, see slack_redistribution.hpp):
     // the participants snapshot, the base injections the pre-pass reads a
@@ -188,6 +217,9 @@ struct ContingencyAnalysisSession {
     bool                    has_slack_rd_ = false;
     CplxVect                h_Sbus_base_;
     std::vector<slack_redistribution::RowResult> slack_rows_;
+    // with the outer loops: per contingency, what it loses (MW, NaN: nothing), which its
+    // DistributedSlack loop shares (outer::RowOverrides::lost_p_mw)
+    std::vector<double> row_lost_p_mw_;
 
     // =========================================================================
     // Contingency data (populated by build_contingencies())
@@ -195,6 +227,28 @@ struct ContingencyAnalysisSession {
     std::vector<Contingency>      contingencies_;
     std::vector<std::vector<int>> disconnected_per_ctg_;  // tripped branch IDs per ctg
     bool has_contingencies_ = false;
+
+    // What each contingency trips beyond branches, shunts, loads and generators
+    std::vector<MoreTrips> ctg_more_;
+    std::vector<std::string> row_unsupported_;
+    // The shunts, loads and generators each contingency trips (build_contingencies_full;
+    // empty lists otherwise): a shunt is one more diagonal triplet of the row's Ybus
+    // patch (in contingencies_), a load / generator a per-row Sbus correction
+    // (ctg_sbus_ds_, see element_trip_data.hpp), a generator also the PV -> PQ
+    // release of a bus it held alone and its distributed-slack share (the same
+    // machinery as ScenarioSweepSession::set_contingency_gens, gen_contingency_rows.hpp).
+    ElementTripData    trip_data_;
+    bool               has_trip_data_ = false;
+    GenContingencyData gen_data_;
+    bool               has_gen_data_ = false;
+    std::vector<std::vector<int>> ctg_shunts_, ctg_loads_, ctg_gens_;
+    std::vector<std::vector<std::pair<int, std::complex<double>>>> ctg_sbus_ds_;
+    bool has_gen_trips_ = false;
+    // the buses the base ledger was extended with (a generator trip releases them
+    // on some row), and the ones each row releases
+    bool                          reserved_vc_trip_ = false;   // the base ledger carries reserve_tripped_controller_slots
+    std::vector<int>              reserved_buses_;
+    std::vector<std::vector<int>> row_pv_to_pq_;
 
     // Base-case NR time captured at construction (before run() is called).
     double t_base_case_ms_ = 0.;
@@ -231,6 +285,7 @@ struct ContingencyAnalysisSession {
         ReorderingAlg reordering_alg = ReorderingAlg::Default,
         MatchingAlg matching_alg = MatchingAlg::None,
         PivotEpsilonAlg pivot_epsilon_alg = PivotEpsilonAlg::Default,
+        int ir_n_steps = 0,
         // Opt-in diagnostic forwarded to base_state_ (see AcPfNrState's own
         // doc): force the pre-ground-truth cuDSS-solve derivation of
         // slack_absorbed/vc_q even when lightsim2grid's own converged values
@@ -267,6 +322,37 @@ struct ContingencyAnalysisSession {
     // Requires set_branch_data() to have been called.
     // =========================================================================
     void build_contingencies(const std::vector<std::vector<int>>& branch_ids_per_ctg);
+
+    // =========================================================================
+    // build_contingencies_full
+    // The same, each contingency tripping branches, shunts, loads and
+    // generators together (lightsim2grid's ContingencyAnalysis::add_contingency):
+    // the lists are aligned, one entry per contingency. Shunts, loads and
+    // generators need set_element_trip_data() (generators also
+    // set_gen_contingency_data()); the bridge factories set both.
+    // `branch_ids_side1_per_ctg` / `_side2_`: the branches each contingency opens
+    // at that end only (see append_one_side_trips); empty (no entry at all), or one
+    // entry per contingency.
+    // =========================================================================
+    void build_contingencies_full(const std::vector<std::vector<int>>& branch_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& shunt_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& load_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& gen_ids_per_ctg,
+                                  const std::vector<std::vector<int>>& branch_ids_side1_per_ctg = {},
+                                  const std::vector<std::vector<int>>& branch_ids_side2_per_ctg = {},
+                                  const std::vector<std::vector<int>>& sgen_ids_per_ctg = {},
+                                  const std::vector<std::vector<int>>& storage_ids_per_ctg = {},
+                                  const std::vector<std::vector<int>>& svc_ids_per_ctg = {},
+                                  const std::vector<std::vector<int>>& hvdc_ids_per_ctg = {});
+    // per contingency, why the batch left it out ("": it did not), set by run()
+    const std::vector<std::string>& get_batch_unsupported_reasons() const { return row_unsupported_; }
+    void set_element_trip_data(const ElementTripData& data) { trip_data_ = data; has_trip_data_ = true; }
+    bool has_element_trip_data() const { return has_trip_data_; }
+    void set_gen_contingency_data(const GenContingencyData& data) { gen_data_ = data; has_gen_data_ = data.n_gen > 0; }
+    // what contingency c trips beyond its branches
+    const std::vector<std::vector<int>>& ctg_shunts() const { return ctg_shunts_; }
+    const std::vector<std::vector<int>>& ctg_loads()  const { return ctg_loads_; }
+    const std::vector<std::vector<int>>& ctg_gens()   const { return ctg_gens_; }
 
     // =========================================================================
     // run
@@ -334,6 +420,30 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_contingencies * n_bus,)  complex
     RealVect get_residuals()  const;   // (n_contingencies,)           real
+
+    // Overwrite the voltages and residuals of rows dst_rows[i] with row
+    // src_rows[i] of another session's result buffers (device pointers: a
+    // row-major (* x n_bus) complex voltage buffer and a (*,) residual one,
+    // e.g. ScenarioSweepSession::v_results_ptr / residuals_ptr, holding
+    // n_src_rows rows of n_bus_src buses -- every source row is checked against
+    // it): the reactive-limit outer loop's second pass. Requires run().
+    void overwrite_rows(const std::vector<int>& dst_rows, const std::vector<int>& src_rows,
+                        std::uintptr_t d_V_src, std::uintptr_t d_res_src,
+                        int n_src_rows, int n_bus_src);
+    // ... and their per-row outcome (iterations, RowStatus), given for those
+    // dst rows. Requires run().
+    void overwrite_row_outcomes(const std::vector<int>& rows, const std::vector<int>& iterations,
+                                const std::vector<int>& status);
+    // Per-row outcome of the last run(): Newton iterations run and RowStatus
+    // (contingency/row_status.hpp), (n_contingencies,); empty before any run().
+    Eigen::VectorXi get_row_iterations() const;
+    Eigen::VectorXi get_row_status()     const;
+    // Device pointer of the last run's row-major (n_contingencies x n_bus)
+    // complex voltages (0 before run()): the reactive-limit outer loop's second
+    // pass starts each row from it (ScenarioSweepSession::set_v_init_from_ptr).
+    std::uintptr_t v_results_ptr() const;
+    // Rows of the result buffers v_results_ptr() points to (0 before run()).
+    int result_rows() const;
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
@@ -371,6 +481,14 @@ struct ContingencyAnalysisSession {
     // caller in array mode). The get_* accessors are synchronous D->H copies
     // and throw unless the last run() had the corresponding flag on.
     // =========================================================================
+    // =========================================================================
+    // Outer loops (outer/outer_hook.hpp; see ScenarioSweepSession's): the model
+    // deciding on every row, built by the bridge off an NROuter_* grid.
+    // =========================================================================
+    void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
+    bool has_outer_model() const { return static_cast<bool>(outer_); }
+    const outer::OuterHook* outer_model() const { return outer_.get(); }
+
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
     void set_bus_q_capability(const BusQPlanData& plan);
@@ -429,8 +547,9 @@ private:
     // redistribute_slack's preconditions (run() refuses without them)
     void _check_redistribute_slack() const;
     // (Re)build base_state_ / mask_cfg_ on the stored inputs, the ledger's
-    // reference moved to ref_bus_; and the reference run() wants.
-    void _build_base_state();
+    // reference moved to ref_bus_ and extended with `switchable_buses` (a Vm
+    // column + Q row each, see ledger_extend.hpp); and the reference run() wants.
+    void _build_base_state(const std::vector<int>& switchable_buses = std::vector<int>());
     int  _wanted_reference_bus();
 };
 

@@ -31,11 +31,18 @@ Contingency build_contingency_from_branch_ids(
 {
     const int n_branches = static_cast<int>(branch_from.size());
 
-    Contingency ctg;
-    ctg.tripped_branches = branch_ids;
-    ctg.triplets.reserve(branch_ids.size() * 4);
+    // a branch named twice is tripped once (lightsim2grid's contingency is a set): its
+    // admittance subtracted twice would leave -y in Ybus and the edge in the graph
+    std::vector<int> unique_ids;
+    unique_ids.reserve(branch_ids.size());
+    for (int l : branch_ids)
+        if (std::find(unique_ids.begin(), unique_ids.end(), l) == unique_ids.end()) unique_ids.push_back(l);
 
-    for (int l : branch_ids) {
+    Contingency ctg;
+    ctg.tripped_branches = unique_ids;
+    ctg.triplets.reserve(unique_ids.size() * 4);
+
+    for (int l : unique_ids) {
         if (l < 0 || l >= n_branches)
             throw std::runtime_error(
                 "build_contingency_from_branch_ids: branch index out of range");
@@ -71,6 +78,51 @@ Contingency build_contingency_from_branch_ids(
         }
     }
     return ctg;
+}
+
+// ---------------------------------------------------------------------------
+// append_one_side_trips
+// ---------------------------------------------------------------------------
+void append_one_side_trips(
+    Contingency&              ctg,
+    const std::vector<int>&   branch_ids,
+    int                       open_side,
+    Eigen::Ref<const Eigen::VectorXi> branch_from,
+    Eigen::Ref<const Eigen::VectorXi> branch_to,
+    Eigen::Ref<const CplxVect> yff_eff,
+    Eigen::Ref<const CplxVect> yft_eff,
+    Eigen::Ref<const CplxVect> ytf_eff,
+    Eigen::Ref<const CplxVect> ytt_eff)
+{
+    if (open_side != 1 && open_side != 2)
+        throw std::runtime_error("append_one_side_trips: the side opened is 1 or 2");
+    const int n_branches = static_cast<int>(branch_from.size());
+    for (int l : branch_ids) {
+        if (l < 0 || l >= n_branches)
+            throw std::runtime_error("append_one_side_trips: branch index out of range");
+        ctg.tripped_branches.push_back(l);
+        const int b_open = open_side == 1 ? branch_from(l) : branch_to(l);
+        const int b_kept = open_side == 1 ? branch_to(l) : branch_from(l);
+        if (b_open < 0) continue;   // already open at that end
+        if (b_kept < 0) {
+            // open at its other end in the base grid: it goes entirely (its stamped
+            // block is the open end's Kron-reduced diagonal)
+            const auto y = open_side == 1 ? yff_eff(l) : ytt_eff(l);
+            ctg.triplets.push_back({b_open, b_open, y.real(), y.imag()});
+            continue;
+        }
+        // both ends closed: the stamped block is the raw one
+        const auto y_oo = open_side == 1 ? yff_eff(l) : ytt_eff(l);
+        const auto y_ok = open_side == 1 ? yft_eff(l) : ytf_eff(l);
+        const auto y_ko = open_side == 1 ? ytf_eff(l) : yft_eff(l);
+        if (std::abs(y_oo) == 0.) continue;   // off in the base grid: nothing stamped
+        // y_kk - (y_kk - y_ko * y_ok / y_oo): the kept end keeps its Kron-reduced part
+        const auto y_kept = y_ko * y_ok / y_oo;
+        ctg.triplets.push_back({b_open, b_open, y_oo.real(), y_oo.imag()});
+        ctg.triplets.push_back({b_kept, b_kept, y_kept.real(), y_kept.imag()});
+        ctg.triplets.push_back({b_open, b_kept, y_ok.real(), y_ok.imag()});
+        ctg.triplets.push_back({b_kept, b_open, y_ko.real(), y_ko.imag()});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +667,8 @@ void compute_component_masks(
     const int n_grp  = static_cast<int>(cfg.vc_grp_count.size());
     const int n_ctrl = static_cast<int>(cfg.vc_bus.size());
     std::vector<int>  n_masked_ctrl(static_cast<size_t>(n_grp), 0);
+    std::vector<int>  n_active_ctrl(static_cast<size_t>(n_grp), 0);
+    std::vector<char> pinned_ctrl(static_cast<size_t>(n_ctrl), 0);
     std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
 
     for (auto& ctg : contingencies) {
@@ -661,16 +715,35 @@ void compute_component_masks(
         //   some of several masked          → nothing to do (the live ones hold
         //                                     the bus, the sharing rows keep
         //                                     the masked columns coupled)
+        // A controller the row holds at a fixed Q (Contingency::vc_pinned_ctrl, and
+        // a held one -- lightsim2grid's set_hold_frozen_regulators -- the row does
+        // not release) holds no bus: only the free ones count, and a group with
+        // none is neither stranded nor a reason to skip.
         if (!skip && n_grp > 0) {
             std::fill(n_masked_ctrl.begin(), n_masked_ctrl.end(), 0);
+            std::fill(n_active_ctrl.begin(), n_active_ctrl.end(), 0);
+            std::fill(pinned_ctrl.begin(), pinned_ctrl.end(), 0);
+            if (!cfg.vc_held.empty()) {
+                for (int j = 0; j < n_ctrl; ++j)
+                    pinned_ctrl[static_cast<size_t>(j)] = cfg.vc_held[static_cast<size_t>(j)] ? 1 : 0;
+                for (int j : ctg.vc_released)
+                    if (j >= 0 && j < n_ctrl) pinned_ctrl[static_cast<size_t>(j)] = 0;
+            }
+            for (const auto& pc : ctg.vc_pinned_ctrl)
+                if (pc.first >= 0 && pc.first < n_ctrl) pinned_ctrl[static_cast<size_t>(pc.first)] = 1;
+            for (int j : ctg.vc_tripped)
+                if (j >= 0 && j < n_ctrl) pinned_ctrl[static_cast<size_t>(j)] = 1;
             for (int j = 0; j < n_ctrl; ++j) {
+                if (pinned_ctrl[static_cast<size_t>(j)]) continue;
+                const int grp = cfg.vc_group[static_cast<size_t>(j)];
+                ++n_active_ctrl[static_cast<size_t>(grp)];
                 const int b = cfg.vc_bus[static_cast<size_t>(j)];
                 if (b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)])
-                    ++n_masked_ctrl[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])];
+                    ++n_masked_ctrl[static_cast<size_t>(grp)];
             }
             for (int g = 0; g < n_grp && !skip; ++g) {
                 const int nm  = n_masked_ctrl[static_cast<size_t>(g)];
-                const int cnt = cfg.vc_grp_count[static_cast<size_t>(g)];
+                const int cnt = n_active_ctrl[static_cast<size_t>(g)];
                 const int reg = cfg.vc_reg_bus.empty() ? -1 : cfg.vc_reg_bus[static_cast<size_t>(g)];
                 const bool reg_masked = reg >= 0 && reg < n_bus && is_masked[static_cast<size_t>(reg)];
                 if (cnt > 0 && nm >= cnt) {
@@ -682,7 +755,7 @@ void compute_component_masks(
                         skip = true;
                     else
                         ctg.stranded_groups.push_back(g);
-                } else if (reg_masked) {
+                } else if (reg_masked && cnt > nm) {
                     skip = true;
                 }
             }
@@ -768,6 +841,7 @@ void build_mask_entries(
     out.v_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
     out.jov_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
     out.str_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
+    out.vcp_ranges.assign(static_cast<size_t>(n_chunks), ChunkPatchRange{0, 0});
 
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
         const int a_start   = chunk * batch_size;
@@ -776,6 +850,7 @@ void build_mask_entries(
         const int v_start   = static_cast<int>(out.v_slot.size());
         const int jov_start = static_cast<int>(out.jov_slot.size());
         const int str_start = static_cast<int>(out.str_slot.size());
+        const int vcp_start = static_cast<int>(out.vcp_slot.size());
 
         for (int local_c = 0; local_c < a_end - a_start; ++local_c) {
             const Contingency& ctg = contingencies[active_to_orig[a_start + local_c]];
@@ -838,6 +913,54 @@ void build_mask_entries(
                 out.str_slot.push_back(local_c);
                 out.str_grp.push_back(g);
             }
+            // Controllers held at a fixed reactive injection (the reactive-limit
+            // outer loop): a group's first controller through its voltage row
+            // ("Q_first = t": 1 on its q_col, 0 on the regulated magnitude and on
+            // the other controllers' slope slots -- the stranded-group rewrite
+            // with a target), any other one through its sharing row ("Q_c = t":
+            // 1 on its own q_col, 0 on the first controller's). The regulated
+            // bus floats once every controller of the group is held.
+            auto jov = [&](int pos, double val) {
+                if (pos < 0) return;
+                out.jov_slot.push_back(local_c);
+                out.jov_pos.push_back(pos);
+                out.jov_val.push_back(static_cast<cuda_real_type>(val));
+            };
+            // (the groups the row loses a controller of hold their pins by value, SlotVcHold)
+            std::vector<char> held_by_value;
+            if (cfg.vc_hold_by_value && !ctg.vc_pinned_ctrl.empty()) {
+                held_by_value.assign(cfg.vc_grp_start.size(), 0);
+                for (int j : ctg.vc_tripped)
+                    if (j >= 0 && j < static_cast<int>(cfg.vc_group.size()))
+                        held_by_value[static_cast<size_t>(cfg.vc_group[static_cast<size_t>(j)])] = 1;
+                for (size_t j = 0; j < cfg.vc_bus.size(); ++j)
+                    if (std::find(ctg.masked_buses.begin(), ctg.masked_buses.end(), cfg.vc_bus[j]) !=
+                        ctg.masked_buses.end())
+                        held_by_value[static_cast<size_t>(cfg.vc_group[j])] = 1;
+            }
+            for (const auto& pc : ctg.vc_pinned_ctrl) {
+                const int j = pc.first;
+                const int g = cfg.vc_group[static_cast<size_t>(j)];
+                if (!held_by_value.empty() && held_by_value[static_cast<size_t>(g)]) continue;
+                const int first = cfg.vc_grp_start[static_cast<size_t>(g)];
+                int row;
+                if (j == first) {
+                    row = cfg.vc_vrow[static_cast<size_t>(g)];
+                    jov(cfg.vc_vrow_qcol_pos[static_cast<size_t>(g)], 1.);
+                    jov(cfg.vc_vrow_vmcol_pos[static_cast<size_t>(g)], 0.);
+                    const int cnt = cfg.vc_grp_count[static_cast<size_t>(g)];
+                    for (int k = first + 1; k < first + cnt; ++k)
+                        jov(cfg.vc_ctrl_vrow_qcol_pos[static_cast<size_t>(k)], 0.);
+                } else {
+                    row = cfg.vc_ctrl_sh_row[static_cast<size_t>(j)];
+                    jov(cfg.vc_ctrl_sh_self_pos[static_cast<size_t>(j)], 1.);
+                    jov(cfg.vc_ctrl_sh_first_pos[static_cast<size_t>(j)], 0.);
+                }
+                out.vcp_slot.push_back(local_c);
+                out.vcp_row.push_back(row);
+                out.vcp_ctrl.push_back(j);
+                out.vcp_target.push_back(static_cast<cuda_real_type>(pc.second));
+            }
         }
 
         out.row_ranges[static_cast<size_t>(chunk)] =
@@ -848,6 +971,8 @@ void build_mask_entries(
             {jov_start, static_cast<int>(out.jov_slot.size()) - jov_start};
         out.str_ranges[static_cast<size_t>(chunk)] =
             {str_start, static_cast<int>(out.str_slot.size()) - str_start};
+        out.vcp_ranges[static_cast<size_t>(chunk)] =
+            {vcp_start, static_cast<int>(out.vcp_slot.size()) - vcp_start};
     }
 }
 

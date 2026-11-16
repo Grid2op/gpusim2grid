@@ -22,6 +22,10 @@
 
 #include <vector>
 
+// A line in AC emulation a batch row trips: no flow, no slope. Next to its regimes
+// (0 linear, 1 / -1 saturated either way) in the per-slot status arrays.
+constexpr int HVDC_STATUS_TRIPPED = 2;
+
 struct LedgerData {
     int n_bus = 0;
     int dim_J = 0;   // augmented Jacobian dimension (== NRLedger size)
@@ -61,6 +65,12 @@ struct LedgerData {
     // Re(sum Sbus), computed by AcPfNrState from the per-system Sbus.
     int                 slack_col = -1;
     std::vector<double> slack_weights;   // size n_bus (empty when inactive)
+    // The buses with an entry in the slack_absorbed column whatever their weight, sorted:
+    // set for the ledger of an NROuterDist_* solve (outer loops around a distributed-slack
+    // Newton), where the reference and every bus a unit may share the slack from are
+    // reserved and a unit at a bound has weight 0 (MultiSlack::set_slack_participant_buses).
+    // Empty: the participants are the buses with a nonzero weight.
+    std::vector<int>    slack_participant_buses;
 
     bool has_multislack() const { return slack_col >= 0; }
     int  nnz_J()          const { return static_cast<int>(J_inner.size()); }
@@ -88,6 +98,14 @@ struct LedgerData {
     // (array/tuple mode, where there is no other numbering).
     std::vector<int>    hvdc_id;
 
+    // HVDC lines an outer loop froze at their AC-emulation limit (droop off, set-point at
+    // the limit; lightsim2grid's LSGrid::set_hvdc_ac_emulation_frozen). Not part of the
+    // solve: only checked for their release (HVDC_AC_EMULATION_RELEASE). Solver bus
+    // numbering, per-unit; dir +1 frozen 1->2, -1 frozen 2->1, limit the pmax of that
+    // direction; id the grid hvdc id. Empty when none.
+    std::vector<int>    hvdc_frz_bus1, hvdc_frz_bus2, hvdc_frz_dir, hvdc_frz_id;
+    std::vector<double> hvdc_frz_p0, hvdc_frz_k, hvdc_frz_limit;
+
     int  n_hvdc()       const { return static_cast<int>(hvdc_bus1.size()); }
     bool has_hvdc()     const { return !hvdc_bus1.empty(); }
 
@@ -101,6 +119,15 @@ struct LedgerData {
     // J positions. kind: 0 = GEN, 1 = SVC (sloped).
     std::vector<int>    vc_bus, vc_kind, vc_group;       // per controller
     std::vector<double> vc_slope, vc_weight;             // per controller
+    // id of each controller in its own container (generator / svc id, the hvdc
+    // LINE id for a station); empty in array mode
+    std::vector<int>    vc_elem_id;                      // per controller
+    // lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators): 1 for a
+    // generator frozen at a reactive limit kept in its group, its reactive injection
+    // pinned at vc_q_held (pu, generator convention) -- which its Sbus entry already
+    // carries, so the mismatch only sees what it moves away from it. Empty = none.
+    std::vector<int>    vc_held;                         // per controller
+    std::vector<double> vc_q_held;                       // per controller, 0 unless held
     // J column of each controller's own Q unknown (controller-registration
     // order, from LSGrid::get_controller_q_col_solver() -- NOT the bus-keyed
     // q_col_of_bus map: that map collides whenever two controllers regulate
@@ -111,6 +138,11 @@ struct LedgerData {
     // Q-balance equation per bus.
     std::vector<int>    vc_q_col;                        // per controller
     std::vector<int>    vc_reg_bus, vc_grp_start, vc_grp_count;  // per group
+    // a batch row may trip controllers: the sharing rows carry an entry on every controller of
+    // their group, filled by value (reserve_tripped_controller_slots)
+    bool                vc_may_trip = false;
+    // the slack buses nothing pins locally: a group regulating one cannot lose all its controllers
+    std::vector<int>    vc_free_vm_slack_buses;
     std::vector<double> vc_v_set;                        // per group
     // Explicit custom-row indices (per group: the voltage row, then its
     // count-1 sharing rows). EMPTY means "reconstruct as the last
@@ -130,6 +162,55 @@ struct LedgerData {
     // their last local controller is off). Empty on every un-extended ledger.
     std::vector<int>    switchable_vm_buses;
 
+    // ---- lightsim2grid's outer loops (the ledger of an NROuter_* solve) -------
+    // The Jacobian is the union pattern every loop reserved: the switchable buses
+    // above (PV ones pinned per slot), every droop hvdc regime and, when a loop may
+    // hold a controller (VoltageControl::set_may_hold_controllers), each group's
+    // (v_row, q_col_first) slot and every sharing row's entry on every controller.
+    // The batch then fills VoltageControl in its may_hold_ formulation (outer/
+    // outer_kernels.cuh). Single slack (NROuter_*): slack_col is -1. Around a
+    // distributed-slack Newton (NROuterDist_*): slack_col >= 0, the reference's P row and
+    // slack_participant_buses' entries in its column, the weights per slot (the model's).
+    bool                outer_loops = false;
+
+    // ---- lightsim2grid's BranchControl (outer loops: PhaseControl, TransformerVoltageControl)
+    // Per transformer it handles, in its order (OuterControlLayout::branches, read off the
+    // grid's NROuter_* solve): the grid trafo id, its two solver buses, the shift column +
+    // row it owns when a phase controller solving for its shift (-1 otherwise), the ratio
+    // column when in a solved ratio group (-1 otherwise), and TrafoContainer's shift_sign /
+    // ratio_exponent. Its pi block is patched per slot at every Newton iteration
+    // (contingency/branch_control_kernels.cuh). Empty when no such loop runs.
+    std::vector<int>    bc_trafo, bc_bus1, bc_bus2;
+    int                 bc_n_lines = 0;               // the branches before the trafos (lines-then-trafos)
+    std::vector<int>    bc_phase, bc_ratio;           // 1: handled for its phase / its ratio
+    std::vector<int>    bc_shift_col, bc_shift_row, bc_ratio_col;
+    std::vector<double> bc_sign, bc_rexp;
+    // as the grid has it (BranchControl::_reset): the phase controller's regulated side
+    // (1, 2) and active power target (pu), the block at the grid's taps and the taps' shift
+    // and ratio, and the block the container stamps in Ybus (yac_eff), each block 8 doubles
+    // (re, im of y11 y12 y21 y22)
+    std::vector<int>    bc_side;
+    std::vector<double> bc_p_target, bc_a_tap0, bc_rho_tap0, bc_tap0, bc_yeff0;
+    // its solved ratio groups: the regulated bus, its Vm column and target (pu), the members
+    // (indices into the bc_* entries) and one row per member
+    std::vector<int>    bc_grp_bus, bc_grp_vm_col;
+    std::vector<double> bc_grp_target;
+    std::vector<std::vector<int>> bc_grp_members, bc_grp_rows;
+
+    // ---- lightsim2grid's ShuntControl (outer loops: ShuntVoltageControl) -------------------
+    // Per shunt controller (the regulating shunts of one bus, OuterControlLayout::shunts): its
+    // solver bus, its shunts (grid ids), the susceptance column of a solved group (-1
+    // otherwise) and its bus' Q row; then its solved groups, as the ratio groups above.
+    std::vector<int>              sc_bus, sc_col, sc_q_row;
+    std::vector<std::vector<int>> sc_shunts;
+    std::vector<double>           sc_b0;          // its susceptance as the grid has it (ShuntControl::_reset), pu
+    std::vector<int>              sc_grp_bus, sc_grp_vm_col;
+    std::vector<double>           sc_grp_target;
+    std::vector<std::vector<int>> sc_grp_members, sc_grp_rows;
+
+    int  n_bc() const { return static_cast<int>(bc_trafo.size()); }
+    int  n_sc() const { return static_cast<int>(sc_bus.size()); }
+
     int  vc_n_controllers() const { return static_cast<int>(vc_bus.size()); }
     int  vc_n_groups()      const { return static_cast<int>(vc_reg_bus.size()); }
     bool has_voltage_control() const { return !vc_bus.empty(); }
@@ -147,6 +228,27 @@ struct LedgerData {
     double               slack_absorbed_gt = 0.0;   // valid iff has_ext_state_ground_truth && slack_col>=0
     std::vector<double>  vc_q_gt;                    // size vc_n_controllers(); valid iff has_ext_state_ground_truth
     double               t_ground_truth_check_ms = 0.0;  // check_solution() wall time
+
+    // ---- lightsim2grid's ordering constraints (prototype) --------------------
+    // NRSystem::ordering_constraints() of the grid's solver, read by
+    // extract_ledger_data (BaseAlgo::get_ordering_constraints), flattened:
+    // constraint c's follow indices are ord_follow[ord_follow_ptr[c] ..
+    // ord_follow_ptr[c+1]), its leads likewise, ord_in_order[c] its flag. J
+    // indices of THIS ledger: valid as long as no index they name moved --
+    // extensions that only append (add_switchable_vm_buses) keep them, and so does
+    // move_reference, which only changes a theta column, two P rows and nothing
+    // the constraints name (Vm columns, controller unknowns, custom rows; it
+    // checks, and clears them otherwise); drop_multislack_augmentation clears them
+    // (ord_constraints_read = false). Used by ReorderingAlg::Ls2gConstrained, see
+    // docs/dev_notes/batched_lu_and_constrained_ordering.md.
+    bool                 ord_constraints_read = false;
+    std::vector<int>     ord_follow_ptr, ord_follow, ord_lead_ptr, ord_lead;
+    std::vector<char>    ord_in_order;
+    // The fill-reducing ordering the grid's Newton is set to (lightsim2grid's
+    // FillReducingOrdering, bit 1 of its config's ordering flags): 0 AMD, 1 MinFill.
+    // What ReorderingAlg::Default / Ls2gConstrained post-move with the constraints.
+    int                  ord_fill_reducing = 0;
+    int  ord_n_constraints() const { return static_cast<int>(ord_in_order.size()); }
 };
 
 #endif  // LEDGER_DATA_HPP

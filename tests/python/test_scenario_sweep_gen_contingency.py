@@ -537,32 +537,52 @@ def test_with_handle_disconnected_grid(solver_atol):
 
 @requires_gpu
 @needs_bridge
-def test_remote_controller_is_refused():
+def test_remote_controller_off_matches_one_off_powerflow(solver_atol):
+    """A mask taking out a remote controller (gen 3, the only one regulating bus 9) is
+    accepted and its row simulated: the regulated bus goes free, as in a one-off solve of
+    the grid without that generator; so is a row taking out a local regulator (gen 0)."""
     pp = pytest.importorskip("pandapower")  # noqa: F841
     import pandapower.networks as pn
     from lightsim2grid.gridmodel import init_from_pandapower
     from lightsim2grid.lightsim2grid_cpp import AlgorithmType
     from gpusim2grid import ScenarioSweepGPU
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        net = pn.case14()
-        model = init_from_pandapower(net)
-        model.set_gen_regulated_bus(3, 9)   # gen 3 (bus 7) regulates bus 9
-        model.tell_solver_need_reset()
-        model.change_algorithm(AlgorithmType.NR_KLU)
-        V = model.ac_pf(np.ones(net.bus.shape[0], dtype=complex), 40, 1e-11)
-        assert V.shape[0] > 0
+    def make():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            net = pn.case14()
+            model = init_from_pandapower(net)
+            model.set_gen_regulated_bus(3, 9)   # gen 3 (bus 7) regulates bus 9
+            model.tell_solver_need_reset()
+            model.change_algorithm(AlgorithmType.NR_KLU)
+            V = model.ac_pf(np.ones(net.bus.shape[0], dtype=complex), 40, 1e-11)
+            assert V.shape[0] > 0
+        return model, V
+
+    model, V0 = make()
     n_gen = len(model.get_generators())
     sw = ScenarioSweepGPU(model, nb_iter=8, tol_base=1e-10)
-    mask = np.zeros((1, n_gen), dtype=bool)
+    mask = np.zeros((2, n_gen), dtype=bool)
     mask[0, 3] = True
-    with pytest.raises(RuntimeError, match="remote"):
-        sw.set_contingency_gens(mask)
-    # a generator that is NOT a remote controller is still fine on this grid
-    mask[:] = False
-    mask[0, 0] = True
+    mask[1, 0] = True
+    sw.set_injections_from_elements(
+        np.tile([float(x.target_p_mw) for x in model.get_loads()], (2, 1)),
+        np.tile([float(x.target_q_mvar) for x in model.get_loads()], (2, 1)),
+        np.tile([float(x.target_p_mw) for x in model.get_generators()], (2, 1)))
     sw.set_contingency_gens(mask)
+    sw.compute(batch_size=2)
+    assert list(sw.get_batch_unsupported_reasons()) == ["", ""]
+    assert list(sw.get_disconnected()) == [0, 0]
+    V = _V(sw, 2, V0.shape[0])
+    buses = np.asarray(model.id_ac_solver_to_me(), dtype=int)
+    for r, g in enumerate((3, 0)):
+        ref, _ = make()
+        ref.deactivate_gen(g)
+        ref.tell_solver_need_reset()
+        V_ref = ref.ac_pf(V0.copy(), 40, 1e-11)
+        assert V_ref.shape[0] > 0
+        np.testing.assert_allclose(V[r], V_ref[buses], atol=solver_atol, err_msg=f"gen {g} off")
+        assert np.abs(V_ref - V0).max() > 100 * solver_atol   # the trip does move the state
 
 
 @requires_gpu
@@ -666,3 +686,53 @@ def test_set_gen_v_with_released_bus(case, solver_atol):
     ref = grid2.ac_pf(v1.copy(), MAX_IT, TOL)
     assert ref.shape[0] > 0
     np.testing.assert_allclose(V, ref[case["buses"]], atol=10 * solver_atol)
+
+
+# ----- a generator tripped next to another regulator of its bus ------------------------
+def _grid_gen_next_to_regulator(kind):
+    """case14 with something else regulating the bus of a non-slack generator, at that
+    generator's set-point: a storage unit, or two HVDC converter stations. Returns (grid, the
+    generator, its bus, the set-point)."""
+    grid, _ = _make_grid()
+    gen = next(g for g in grid.get_generators() if not g.is_slack)
+    if kind == "storage":
+        grid.init_storages_full(np.array([0.]), np.array([0.]), [True], np.array([gen.target_vm_pu]),
+                                np.array([-500.]), np.array([500.]), np.array([gen.bus_id], dtype=np.int32))
+    else:
+        big = np.full(2, 1e3)
+        grid.init_hvdc_lines(np.array([gen.bus_id, gen.bus_id], dtype=np.int32), np.array([13, 12], dtype=np.int32),
+                             [0, 0], [0, 0], np.ones(2), np.ones(2), [True, True], [False, False],
+                             np.full(2, gen.target_vm_pu), np.ones(2), np.zeros(2), np.zeros(2), -big, big, -big, big,
+                             np.ones(2), np.ones(2), [0, 0], np.array([1., 2.]), np.ones(2), np.full(2, 12.),
+                             [False, False], np.zeros(2), np.zeros(2), np.full(2, 100.), np.full(2, 100.))
+    grid.tell_solver_need_reset()
+    v0 = np.ones(grid.total_bus(), dtype=complex)
+    assert grid.ac_pf(v0, MAX_IT, TOL).shape[0] > 0
+    return grid, gen.id, gen.bus_id, gen.target_vm_pu
+
+
+@requires_gpu
+@needs_bridge
+@pytest.mark.parametrize("kind", ["storage", "hvdc"])
+def test_gen_tripped_next_to_another_regulator_keeps_the_bus_pv(kind, solver_atol):
+    """The other regulator still holds the bus: tripping the generator must not turn it PQ
+    (lightsim2grid's _maybe_prepare_gen_contingency counts the storage units and converter
+    stations regulating a bus)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid, gen_id, bus, vm = _grid_gen_next_to_regulator(kind)
+    v1 = np.asarray(grid.get_V(), dtype=complex)
+    ref_grid = grid.copy()
+    ref_grid.deactivate_gen(gen_id)
+    ref_grid.tell_solver_need_reset()
+    V_ref = ref_grid.ac_pf(v1.copy(), MAX_IT, TOL)
+    assert V_ref.shape[0] > 0
+    assert abs(V_ref[bus]) == pytest.approx(vm, abs=solver_atol)
+
+    ca = ContingencyAnalysisGPU(grid, nb_iter=10)   # (the precision's default tol_base)
+    ca.add_contingency_gen(gen_id)
+    ca.compute(batch_size=1)
+    buses = np.asarray(grid.id_ac_solver_to_me(), dtype=int)
+    V = ca.V_results.to_numpy().reshape(1, buses.shape[0])[0]
+    assert abs(V[list(buses).index(bus)]) == pytest.approx(vm, abs=solver_atol)
+    np.testing.assert_allclose(V, V_ref[buses], rtol=0., atol=solver_atol)

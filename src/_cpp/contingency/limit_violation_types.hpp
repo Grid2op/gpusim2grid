@@ -89,16 +89,38 @@ enum class LimitViolationType  : int {
     LOW_VOLTAGE_SVC_STANDBY = 11,
     // ... and the mirror: regulated bus ABOVE the high threshold.
     HIGH_VOLTAGE_SVC_STANDBY = 12,
-    // lightsim2grid 1.2's remote voltage control and HVDC AC-emulation release
-    // checks (LimitViolation.hpp). Mirrored so the codes stay in sync; no
-    // gpusim2grid kernel writes them yet.
-    // A GENERATOR regulating a REMOTE bus whose own bus leaves the realistic
-    // range (LSGrid::set_remote_voltage_control_vm_range), value/limit in kV.
+    // A generator regulating a REMOTE bus whose OWN bus sits BELOW the
+    // realistic range the caller set (lightsim2grid's
+    // LSGrid::set_remote_voltage_control_vm_range): OpenLoadFlow's robust
+    // remote voltage control would switch it to PQ. element_type GENERATOR,
+    // value its own bus' voltage and limit the bound, both in kV. Written by
+    // check_gen_pv_release_violations_kernel (the remote control entries of
+    // its plan).
     LOW_VOLTAGE_REMOTE_CONTROL = 13,
+    // ... and the mirror: own bus ABOVE the range.
     HIGH_VOLTAGE_REMOTE_CONTROL = 14,
-    // A droop HVDC line frozen at its active power limit whose droop would now
-    // ask for less (LSGrid::set_hvdc_ac_emulation_frozen), value/limit in MW.
-    HVDC_AC_EMULATION_RELEASE = 15
+    // An HVDC line an outer loop froze at its AC-emulation limit (lightsim2grid's
+    // LSGrid::set_hvdc_ac_emulation_frozen) whose droop, from this row's angles, asks for
+    // less than that limit: OpenLoadFlow would have left it in AC emulation. element_type
+    // HVDC, side the direction it is frozen in, value that flow, limit the pmax, MW.
+    // Written by check_hvdc_p_violations_kernel.
+    HVDC_AC_EMULATION_RELEASE = 15,
+    // The types 16-20 mirror lightsim2grid's outer-loop detection (LimitViolation.hpp,
+    // ViolationCategory::CONTROL); no gpusim2grid kernel writes them yet.
+    // The single slack bus absorbed more than OpenLoadFlow's slackBusPMaxMismatch: its
+    // DistributedSlack loop would share it. element_type GRID, value the mismatch and
+    // limit the threshold, MW.
+    SLACK_MISMATCH = 16,
+    // A phase tap changer regulating the active power of one side off its target by more
+    // than its deadband (TRAFO, value / limit in MW).
+    PHASE_CONTROL_P = 17,
+    // A phase tap changer limiting the current of one side above that limit (TRAFO, A).
+    PHASE_LIMITER_CURRENT = 18,
+    // A bus that ratio tap changers regulate off their target by more than half the
+    // deadband (BUS, kV).
+    TRANSFORMER_VOLTAGE_DEADBAND = 19,
+    // A bus that shunt sections regulate off its target (BUS, kV).
+    SHUNT_VOLTAGE_CONTROL = 20
 };
 
 // What KIND of statement a violation is -- a pure function of its type, so the
@@ -107,12 +129,14 @@ enum class LimitViolationType  : int {
 //   PHYSICAL    : a limit of the equipment itself, which nothing can leave: the
 //                 converged solution is not physically realizable (LOW_Q,
 //                 HIGH_Q, HIGH_P / HVDC_P_SATURATION, LOW_P,
-//                 LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
-//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
-//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL,
-//                 HVDC_AC_EMULATION_RELEASE).
+//                 LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL).
 //   SOLVER      : not a limit at all (NOT_SIMULATED, DIVERGENCE).
-enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2 };
+//   CONTROL     : a control or automaton the solution did not apply; the state is
+//                 reachable, just not the one the controls settle in
+//                 (LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q,
+//                 LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY,
+//                 HVDC_AC_EMULATION_RELEASE and the types 16-20).
+enum class ViolationCategory : int { OPERATIONAL = 0, PHYSICAL = 1, SOLVER = 2, CONTROL = 3 };
 
 inline ViolationCategory violation_category(LimitViolationType t) noexcept
 {
@@ -125,14 +149,20 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
         case LimitViolationType::HIGH_Q:
         case LimitViolationType::HVDC_P_SATURATION:   // == HIGH_P
         case LimitViolationType::LOW_P:
+        case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
+        case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
+            return ViolationCategory::PHYSICAL;
         case LimitViolationType::LOW_VOLTAGE_AT_MIN_Q:
         case LimitViolationType::HIGH_VOLTAGE_AT_MAX_Q:
         case LimitViolationType::LOW_VOLTAGE_SVC_STANDBY:
         case LimitViolationType::HIGH_VOLTAGE_SVC_STANDBY:
-        case LimitViolationType::LOW_VOLTAGE_REMOTE_CONTROL:
-        case LimitViolationType::HIGH_VOLTAGE_REMOTE_CONTROL:
         case LimitViolationType::HVDC_AC_EMULATION_RELEASE:
-            return ViolationCategory::PHYSICAL;
+        case LimitViolationType::SLACK_MISMATCH:
+        case LimitViolationType::PHASE_CONTROL_P:
+        case LimitViolationType::PHASE_LIMITER_CURRENT:
+        case LimitViolationType::TRANSFORMER_VOLTAGE_DEADBAND:
+        case LimitViolationType::SHUNT_VOLTAGE_CONTROL:
+            return ViolationCategory::CONTROL;
         default:  // NOT_SIMULATED, DIVERGENCE
             return ViolationCategory::SOLVER;
     }
@@ -146,10 +176,11 @@ inline ViolationCategory violation_category(LimitViolationType t) noexcept
 // replacing everything else) needs no group of its own.
 constexpr int N_OPERATIONAL_VIOLATION_GROUPS = 3;   // CURRENT, LOW_VOLTAGE, HIGH_VOLTAGE
 constexpr int N_BUS_Q_VIOLATION_GROUPS       = 2;   // LOW_Q, HIGH_Q
-constexpr int N_HVDC_P_VIOLATION_GROUPS      = 1;   // HIGH_P (either side)
+constexpr int N_HVDC_P_VIOLATION_GROUPS      = 2;   // HIGH_P (either side), HVDC_AC_EMULATION_RELEASE
 constexpr int N_GEN_P_VIOLATION_GROUPS       = 2;   // LOW_P, HIGH_P (generators and storage units together)
 // LOW_VOLTAGE_AT_MIN_Q, HIGH_VOLTAGE_AT_MAX_Q (generators), then
-// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan)
-constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 4;
+// LOW_VOLTAGE_SVC_STANDBY, HIGH_VOLTAGE_SVC_STANDBY (the SVC entries of the same plan),
+// then LOW_VOLTAGE_REMOTE_CONTROL, HIGH_VOLTAGE_REMOTE_CONTROL (its remote control entries)
+constexpr int N_GEN_PV_RELEASE_VIOLATION_GROUPS = 6;
 
 #endif  // LIMIT_VIOLATION_TYPES_HPP

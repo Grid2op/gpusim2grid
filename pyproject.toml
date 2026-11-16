@@ -1,6 +1,17 @@
 [build-system]
-requires = ["scikit-build-core", "pybind11", "lightsim2grid>=1.0.0rc1"]
-build-backend = "scikit_build_core.build"
+# The CUDA build requirements (PyPI's CUDA 13 toolkit, nvcc included, and cuDSS
+# for the CUDA major of the build) are not listed here: an extra never reaches
+# the build, so the in-tree backend _build_backend/gpusim2grid_build.py picks
+# them from the environment (GPUSIM2GRID_CUDA, CUDACXX, CUDAToolkit_ROOT;
+# default CUDA 13). See docs/installation.rst.
+requires = [
+  "scikit-build-core>=0.11",  # PEP 639 license-files
+  # PyPI's lightsim2grid 1.3.1 is built with pybind11 3.1: the bridge must match it.
+  "pybind11>=3.1",
+  "lightsim2grid>=1.3.1",
+]
+build-backend = "gpusim2grid_build"
+backend-path = ["_build_backend"]
 
 [project]
 name = "gpusim2grid"
@@ -14,7 +25,10 @@ maintainers = [
 description = "GPU-accelerated, batched AC power flow for the Grid2Op ecosystem"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MPL-2.0"
+# MPL-2.0, but for the vendored DLPack header (src/_cpp/dlpack/dlpack.h,
+# github.com/dmlc/dlpack), which is Apache-2.0 and ships its license next to it.
+license = "MPL-2.0 AND Apache-2.0"
+license-files = ["LICENSE", "AUTHORS.txt", "src/_cpp/dlpack/LICENSE"]
 classifiers = [
   "Development Status :: 3 - Alpha",
 
@@ -37,7 +51,9 @@ classifiers = [
 dependencies = [
   "numpy",
   "scipy",
-  "lightsim2grid>=1.0.0rc1",
+  # >= 1.3.1: its wheel ships lightsim2grid_core, its headers and the KLU
+  # headers the bridge compiles against, and the API the bridge uses.
+  "lightsim2grid>=1.3.1",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +67,21 @@ docs = [
   "sphinx-rtd-theme>=2",
   "myst-parser>=2",
 ]
+# The CUDA libraries and cuDSS from PyPI, for the CUDA major the extension was
+# built with (also what .github/workflows/build.yml installs; `import gpusim2grid`
+# refuses libraries of another major). Building with CUDA 13 also needs
+# cuda-toolkit's nvcc, crt, cccl and nvvm; PyPI has no CUDA 12 compiler (see
+# docs/installation.rst). Keep in sync with _build_backend/gpusim2grid_build.py.
+cuda12 = [
+  "cuda-toolkit[cudart,cublas,cusolver,cusparse,nvjitlink]>=12.4,<13",
+  "nvidia-cudss-cu12>=1.0.0.35",
+  "nvidia-cudss-cu12<2",
+]
+cuda13 = [
+  "cuda-toolkit[cudart,cublas,cusolver,cusparse,nvjitlink]>=13,<14",
+  "nvidia-cudss-cu13>=1.0.0.35",
+  "nvidia-cudss-cu13<2",
+]
 # gpusim2grid.differentiable (BatchPowerFlow / PowerFlowFunction) needs a
 # CUDA-enabled PyTorch; everything else works without it.
 torch = [
@@ -63,7 +94,26 @@ Repository = "https://github.com/Grid2Op/gpusim2grid"
 Issues = "https://github.com/Grid2Op/gpusim2grid/issues"
 
 [tool.scikit-build]
+minimum-version = "build-system.requires"
 wheel.packages = ["./src/gpusim2grid"]
+# The sdist carries what the build needs and nothing else (the repository also
+# holds experiments, results and notebooks). Gitignore syntax: everything at the
+# top level is left out, then the build inputs are put back.
+sdist.exclude = [
+  "/*",
+  "!/src/",
+  "!/_build_backend/",
+  "!/ci/",
+  "/ci/*",
+  "!/ci/cmake/",
+  "!/CMakeLists.txt",
+  "!/pyproject.toml",
+  "!/README.md",
+  "!/LICENSE",
+  "!/AUTHORS.txt",
+  "!/CHANGELOG.rst",
+  "!/DISCLAIMER.md",
+]
 wheel.expand-macos-universal-tags = true
 
 [tool.scikit-build.metadata.version]
