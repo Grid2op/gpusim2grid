@@ -172,7 +172,31 @@ tail, new injections and gen_v, cuDSS and own LU). The contingency-analysis and 
 sessions still force continuous runs cold; `BatchPowerFlow`'s backward relies on that for the
 scenario sweep.
 
-## 9. Next steps
+## 9. F once per continuous round (done, branch `perf_v_update`)
+
+`_residual_pass` computes F at V_k (fused kernel, feature mismatch, F masks), and the next round's
+first Newton iteration recomputed the same F at the same V_k for every slot nothing touched in
+between. Teaching every F writer to skip such slots would be invasive (the feature kernels add to
+the P/Q rows in place, the mask streams are slot-tagged), but only the fused SpMV is costly. So:
+
+- the residual pass's fused kernel also stores its raw P/Q rows (`NrIterBuffers::d_F_raw`,
+  `[slot][thread][P, Q]`); the next round's first iteration copies them back for the slots
+  `d_F_clean` flags (Ibus is still the pass's), and the feature mismatch and the masks run on every
+  slot as before: the result is bitwise the same (own LU: max |dV| 0 against the previous build);
+- a slot is dirty when it is loaded (rows and base loads), re-solved in place by the outer loops,
+  or moved by a tail compaction (every slot); the check before the first step stores every
+  slot's F, so a round after it starts all clean;
+- `d_F_raw` indexed by the bus' position in the slot's F (dim_J layout) made the residual pass
+  1.27 -> 1.92 ms per launch on a time series: in the sorted bus order those writes scatter.
+  Indexed by thread they are coalesced: 1.65 ms (+0.25 to store), 0.36 ms for an all-clean copy.
+
+Kernel time per call of the fused kernel (case2869, 3 779 rows, own LU, continuous): N-1 96 -> 67
+ms (call 844 -> 819 ms), time series 64 -> 55 ms (call 700 -> 692 ms). A time series gains less:
+its rows converge in lockstep, so a third of the rounds reload nearly every slot. French snapshot
+with outer loops (200 contingencies, loose / tight × NROuter / NROuterDist): still identical to
+lightsim2grid (statuses, outer counts, max |dV| <= 5.1e-12).
+
+## 10. Next steps
 
 - **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
   SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an
@@ -182,12 +206,6 @@ scenario sweep.
   droop, VoltageControl, BranchControl / ShuntControl, outer-loop pins and holds), the masks
   (`nr_apply_J_masks` / `nr_apply_F_masks`), `keep_final_jacobian` and the adjoint, which read J
   slot-major. cuDSS keeps the slot-major path.
-- **Cheaper, independent of the J layout** (F side only):
-  - *The continuous residual pass computes F twice*: `_residual_pass` runs SpMV, `fill_F`, the
-    feature mismatch and the F masks at V_k, and the next round's Newton step runs the same sequence
-    at the same V_k for every slot that was not reloaded (or re-controlled by the outer loops):
-    ~half of the SpMV + `fill_F` time in continuous mode. Reusing F needs either a per-slot dirty
-    flag in those kernels or recomputing only on rounds that reloaded a slot.
 
 Then the LU itself (fusing factor and solve, interleaved storage end to end).
 

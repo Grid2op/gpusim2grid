@@ -292,6 +292,15 @@ struct NrIterBuffers {
     // 0's copy of d_Ybus_values for every slot (Ybus stride 0). fill_J keeps
     // the per-slot read: its cost is the J writes (60.4 -> 58.9 ms shared).
     bool                   ybus_shared    = false;
+
+    // The continuous schedule's F computed once per round (fused path only,
+    // BatchPfDriver::_solve_continuous): the residual pass stores the P/Q rows
+    // of F into d_F_raw [actual_batch × n_bus × 2] (spmv_fill_F_kernel's layout), and the next round's first
+    // Newton iteration copies them back for the slots d_F_clean flags (nothing
+    // changed their V, Ybus or Sbus since) instead of recomputing. The feature
+    // mismatch and the masks still run on every slot. nullptr: always compute.
+    cuda_real_type*        d_F_raw        = nullptr;
+    const int*             d_F_clean      = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -559,9 +568,12 @@ inline void nr_fill_J_at_current_V(
 // the per-bus row maps, else cuSPARSE's SpMV then fill_FP / fill_FQ. The feature
 // mismatch and the F masks still follow (the caller's).
 // -----------------------------------------------------------------------------
+// store_raw: also store the P/Q rows into buf.d_F_raw (when set); use_clean:
+// copy them back from it for the slots buf.d_F_clean flags (when set).
 inline void nr_spmv_fill_F(
     CuSpMV& spmv, const NrIterBuffers& buf,
-    int n_bus, int nnz_Y, int dim_J, int n_slots, cudaStream_t cs)
+    int n_bus, int nnz_Y, int dim_J, int n_slots, cudaStream_t cs,
+    bool store_raw = false, bool use_clean = false)
 {
     if (buf.d_p_row_of_bus != nullptr && buf.d_q_row_of_bus != nullptr) {
         if (n_slots <= 0) return;
@@ -569,7 +581,9 @@ inline void nr_spmv_fill_F(
         spmv_fill_F_kernel<<<grid, BS, 0, cs>>>(
             buf.d_F, buf.d_Ibus, buf.d_V, buf.d_Sbus, buf.sbus_stride,
             buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values, buf.ybus_shared ? 0 : nnz_Y,
-            buf.d_p_row_of_bus, buf.d_q_row_of_bus, buf.d_bus_order, n_bus, dim_J, n_slots);
+            buf.d_p_row_of_bus, buf.d_q_row_of_bus, buf.d_bus_order,
+            buf.d_F_raw, use_clean && buf.d_F_raw != nullptr ? buf.d_F_clean : nullptr,
+            store_raw && buf.d_F_raw != nullptr ? 1 : 0, n_bus, dim_J, n_slots);
         return;
     }
     spmv.spmv();

@@ -533,6 +533,12 @@ __global__ void hvdc_fill_feature_kernel(
 // the useful FP64 work on case2869: 1.97 -> 1.27 ms per 512-slot launch on an
 // RTX A1000). Not with a per-slot Ybus: the sorted rows of one warp are then
 // scattered over the slot's copy and the reads stop coalescing (3.1 ms).
+// d_F_raw [n_slots × n_bus × 2] (nullable), by thread (P, Q of the bus thread t
+// handles: coalesced in the sorted order too): write_raw = 1 also stores the
+// P/Q rows there; a slot with d_F_clean[b] != 0 copies them back into F instead of
+// computing (its V, Ybus and Sbus unchanged since they were stored: the
+// continuous schedule's residual pass stores, the next round's first Newton
+// iteration copies; Ibus is left as that pass wrote it).
 // Grid: buses on x, slots on y (grid-stride: gridDim.y = min(n_slots, 65535)).
 // ---------------------------------------------------------------------------
 __global__ void spmv_fill_F_kernel(
@@ -548,6 +554,9 @@ __global__ void spmv_fill_F_kernel(
     const int*             __restrict__ d_p_row_of_bus,
     const int*             __restrict__ d_q_row_of_bus,
     const int*             __restrict__ d_bus_order,
+          cuda_real_type*  __restrict__ d_F_raw,
+    const int*             __restrict__ d_F_clean,
+    int write_raw,
     int n_bus, int dim_J, int n_slots);
 
 // ===========================================================================

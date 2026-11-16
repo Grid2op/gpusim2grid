@@ -570,6 +570,9 @@ __global__ void spmv_fill_F_kernel(
     const int*             __restrict__ d_p_row_of_bus,
     const int*             __restrict__ d_q_row_of_bus,
     const int*             __restrict__ d_bus_order,
+          cuda_real_type*  __restrict__ d_F_raw,
+    const int*             __restrict__ d_F_clean,
+    int write_raw,
     int n_bus, int dim_J, int n_slots)
 {
     const int t = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -580,6 +583,14 @@ __global__ void spmv_fill_F_kernel(
 
     using H = CudaFunHelper;
     for (ptrdiff_t b = blockIdx.y; b < n_slots; b += gridDim.y) {
+        // F_raw by thread: [slot][t][P, Q], coalesced whatever the bus order
+        cuda_real_type* raw = d_F_raw + (b * n_bus + t) * 2;
+        if (d_F_clean != nullptr && d_F_clean[b] != 0) {
+            // F_raw holds this slot's rows at its current state (Ibus too)
+            if (pr >= 0) d_F[b * dim_J + pr] = raw[0];
+            if (qr >= 0) d_F[b * dim_J + qr] = raw[1];
+            continue;
+        }
         const cudaComplexType* V = d_V + b * n_bus;
         const cudaComplexType* Y = d_Ybus_values_batch + b * ybus_stride;
         cuda_real_type ir = 0, ii = 0;
@@ -595,8 +606,16 @@ __global__ void spmv_fill_F_kernel(
         const cudaComplexType sb = d_Sbus[b * sbus_stride + i];
         const cuda_real_type vr = H::my_cuCreal(Vi), vi = H::my_cuCimag(Vi);
         // S = V_i * conj(I_i)
-        if (pr >= 0) d_F[b * dim_J + pr] = -((vr * ir + vi * ii) - H::my_cuCreal(sb));
-        if (qr >= 0) d_F[b * dim_J + qr] = -((vi * ir - vr * ii) - H::my_cuCimag(sb));
+        if (pr >= 0) {
+            const cuda_real_type f = -((vr * ir + vi * ii) - H::my_cuCreal(sb));
+            d_F[b * dim_J + pr] = f;
+            if (write_raw) raw[0] = f;
+        }
+        if (qr >= 0) {
+            const cuda_real_type f = -((vi * ir - vr * ii) - H::my_cuCimag(sb));
+            d_F[b * dim_J + qr] = f;
+            if (write_raw) raw[1] = f;
+        }
     }
 }
 

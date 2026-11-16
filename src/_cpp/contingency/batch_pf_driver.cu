@@ -270,6 +270,11 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         d_check0_.resize(static_cast<size_t>(batch_size_));
         d_skip0_.resize(static_cast<size_t>(batch_size_));
         d_res0_.resize(static_cast<size_t>(batch_size_));
+        if (base.fused_F_ok) {
+            d_F_raw_.resize(static_cast<size_t>(batch_size_) * base.n_bus * 2);
+            h_fclean_.resize(static_cast<size_t>(batch_size_));
+            d_fclean_.resize(static_cast<size_t>(batch_size_));
+        }
         sched_done_.record(cs);
 
         cs.synchronize();
@@ -2046,7 +2051,7 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
     {
         // SpMV + the P/Q rows of F (buf's d_F / d_V / d_Ibus are d_F_batch /
         // d_V_batch / d_Ibus_batch)
-        nr_spmv_fill_F(_spmv(), buf, n_bus, base.nnz_Y, dim_J, n_slots, cs);
+        nr_spmv_fill_F(_spmv(), buf, n_bus, base.nnz_Y, dim_J, n_slots, cs, /*store_raw=*/true);
 
         if (n_slots > 0) {
             // Augmented-feature contributions to the final residual (slack /
@@ -2793,6 +2798,19 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     TailSolve tail;
     std::chrono::steady_clock::time_point t_tail_start;   // its first compaction
     spmv_live_ = nullptr;
+    // F once per round (NrIterBuffers::d_F_raw): the slots whose F the residual
+    // pass computed at their current state. Cleared for a slot loaded, re-solved
+    // by the outer loops or moved by the tail between that pass and the next round.
+    const bool f_cache = !d_F_raw_.empty();
+    auto set_clean = [&](int from, int to, int v) {
+        if (f_cache) std::fill(h_fclean_.ptr + from, h_fclean_.ptr + to, v);
+    };
+    auto bind_f_cache = [&](NrIterBuffers& b) {
+        if (!f_cache) return;
+        b.d_F_raw   = thrust::raw_pointer_cast(d_F_raw_.data());
+        b.d_F_clean = thrust::raw_pointer_cast(d_fclean_.data());
+    };
+    set_clean(0, S, 0);
     // Once the queue is empty: shrink the rounds to the groups the live rows
     // fit in, when there are few enough of them and that is fewer slots.
     // (the groups to shrink to, 0 = no shrink)
@@ -2807,6 +2825,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         const auto t_c0 = std::chrono::steady_clock::now();
         if (!in_tail) t_tail_start = t_c0;
         _compact_tail(groups * G, n_cur, iters, t);
+        set_clean(0, S, 0);   // rows moved: every slot's F is recomputed
         n_cur = groups * G;
         if (!spmv_tail_) spmv_tail_ = std::make_unique<CuSpMV>();
         if (spmv_tail_n_ != n_cur) {
@@ -2908,6 +2927,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     }
     enter_tail(n_live);   // fewer rows than slots: the queue is empty already
     NrIterBuffers buf = _bound_nr_buffers(_table_view(-1));
+    bind_f_cache(buf);
 
     std::vector<int> reenter, conv, loaded;
     std::vector<RowStatus> leave_st(static_cast<size_t>(S));
@@ -2916,6 +2936,11 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         rec_n_cur  = n_cur;
         rec_n_live = n_live;
         const bool checked0 = hook != nullptr && _check_before_first_step(buf, n_cur, iters, timer, t);
+        if (checked0) set_clean(0, n_cur, 1);   // its residual pass just stored every slot's F
+        if (f_cache)   // (the previous upload retired at the last round's sync)
+            CHK_CUDA_BPF(cudaMemcpyAsync(thrust::raw_pointer_cast(d_fclean_.data()), h_fclean_.ptr,
+                                         static_cast<size_t>(n_cur) * sizeof(int),
+                                         cudaMemcpyHostToDevice, cs));
         std::visit([&](auto& policy) {
             run_nr_loop(
                 policy, linear_solver_, _spmv(), buf,
@@ -2943,6 +2968,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                                          cudaMemcpyDeviceToHost, cs));
         buf.d_skip_step = nullptr;
         cs.synchronize();   // also retires the previous H->D of the staging block
+        set_clean(0, n_cur, 1);   // the residual pass stored every slot's F
         const auto t_sched1 = std::chrono::steady_clock::now();
         t.t_sched_res_sync += TimingEntry{0., std::chrono::duration<double, std::milli>(t_sched1 - t_sched0).count()};
 
@@ -3072,6 +3098,8 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         }
         t.t_schedule += TimingEntry{0., std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_sched0).count()};
+        for (int s : reenter) set_clean(s, s + 1, 0);
+        for (int s : loaded)  set_clean(s, s + 1, 0);
         if (!reenter.empty()) {
             const auto t_c0 = std::chrono::steady_clock::now();
             _oc_write_controls(reenter, /*reload_sbus=*/true);
@@ -3128,6 +3156,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         }
         enter_tail(n_live);
         buf = _bound_nr_buffers(_table_view(-1));
+        bind_f_cache(buf);
         push_round(n_leave, static_cast<int>(reenter.size()), n_load_real);
     }
     {

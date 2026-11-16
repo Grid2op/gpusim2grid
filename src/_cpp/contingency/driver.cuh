@@ -174,7 +174,8 @@ inline void run_nr_loop(
         //       ledger P/Q rows (one fused kernel when possible, nr_spmv_fill_F;
         //       timed as t_spmv, t_fill_F then holds the feature mismatch + masks)
         timer.start();
-        nr_spmv_fill_F(spmv, buf, n_bus, nnz_Y, dim_J, batch_size, cs);
+        nr_spmv_fill_F(spmv, buf, n_bus, nnz_Y, dim_J, batch_size, cs,
+                       /*store_raw=*/false, /*use_clean=*/iter == 0);
         step.t_spmv = timer.stop_ms();
 
         // ②  F: feature contributions and masks

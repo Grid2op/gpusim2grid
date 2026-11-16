@@ -1060,6 +1060,12 @@ private:
     // residual at the start, and the ones that take no step (d_/h_skip0_,
     // NrIterBuffers::d_skip_step), brought back with the round's residuals.
     PinnedBuffer<int>                     h_check0_, h_skip0_;
+    // F computed once per round (continuous, fused path; NrIterBuffers::d_F_raw):
+    // the residual pass's P/Q rows of F, and the slots nothing changed since
+    // (1 = the next round's first Newton iteration copies them back).
+    thrust::device_vector<cuda_real_type> d_F_raw_;
+    PinnedBuffer<int>                     h_fclean_;
+    thrust::device_vector<int>            d_fclean_;
     thrust::device_vector<int>            d_check0_, d_skip0_;
     thrust::device_vector<cuda_real_type> d_res0_;
 
