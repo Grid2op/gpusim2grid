@@ -13,6 +13,8 @@ Change Log
   another lightsim2grid version than the bridge's.
 - [ADDED] CI: one build leg and a GPU test subset pin lightsim2grid to 1.3.1, the minimum supported, so a
   change needing a newer one is caught.
+- [FIXED] build: Eigen's SIMD settings are read off ``lightsim2grid_core`` and matched, not only ``-march=native``:
+  a compiler defaulting to AVX2 (ubuntu-26.04 runner) built an extension PyPI's lightsim2grid refused to load.
 - [FIXED] the first cuDSS call of a process (``warmup()`` or any session) left the calling thread in the "C"
   locale (NVRTC, cuDSS's JIT, never restores it): Python then read ASCII as its default file encoding.
 - [FIXED] ``ContingencyAnalysisGPU.add_contingenc*``: a refused contingency (an id out of range) stayed in the
