@@ -137,10 +137,38 @@ OpenLoadFlow's model):
 - its France 200 × 800 inputs and per-situation results (statuses, max rho, worst branch) as the
   end-to-end reference (§ 8).
 
+### Side question: result buffers, DLPack and CuPy
+
+Results reach Python two ways today: `DeviceBuffer` (a lazy handle whose `to_numpy()` copies
+device → host through the session) and DLPack capsules (`compute()`'s voltages, the
+differentiable layer). DLPack is not a library but an exchange format (a C struct: pointer,
+device, dtype, shape, strides; gpusim2grid vendors its one header): `cupy.from_dlpack`,
+`torch.from_dlpack`, `jax.dlpack.from_dlpack` take a capsule **without copying**, so the caller
+keeps the data on the GPU with the array library of its choice. The capsule aliases live
+session memory: the next `compute()` overwrites it.
+
+CuPy is **not** a dependency of gpusim2grid (numpy, scipy, lightsim2grid; PyTorch optional) and
+should not become one: its wheels are per CUDA major, and DLPack already gives any caller a
+CuPy array. What this work changes:
+
+| result | size per row | today | with topology actions |
+|---|---|---|---|
+| residuals, reasons, max loading, iterations | O(1) | `DeviceBuffer` / numpy | same; the row map expands them on the host (cheap) |
+| V | n_bus (7 400 on France) | stored for every row on the device (`d_V_results`, 19 GB at 160 k rows) | optional, only for chosen rows (phase 1: all, 22 MB, the warm start needs them; phase 2: none) |
+| branch currents | 2 × n_branch (22 000) | `compute_flows()`: every row on the device (28.7 GB), copied whole | reduced at eviction by a processor (max loading, ~60-100 ms for 160 k rows, estimated); per-row flows only on request |
+
+The first version of `get_max_loading()` reduces on the host from `compute_flows()`. The
+device-side reduction ("result processor", as the prototype's `MaxRho`) hooks in `_evict`, the
+one place every schedule evicts a row, right after the violation check, reusing its per-branch
+current computation (shared helper, identical numbers).
+
 ## 3. Principles
 
-1. **Bit-identical no-op.** A batch without the new features takes exactly today's path: same
-   pattern, same kernels, same results to the bit (pinned by tests). Each feature is opt-in by
+1. **No-op = today's path.** A batch without the new features takes exactly today's code path:
+   same pattern, same analysis, same kernels, no extra work (pinned by tests). Results compare
+   up to rounding, not to the bit: gpusim2grid's first session of a process already differs
+   from the later ones by ~3e-15, with no action at all. A strategy whose action changes
+   nothing is its contingency's row up to rounding (another slot or chunk). Each feature is opt-in by
    the data the caller gives, not by a flag, and costs nothing when unused.
 2. **Bus-branch in the solver, switches outside it.** The solver sees per-row *element → bus*
    assignments in lightsim2grid's own bus labelling (`n_busbar_per_sub`, `change_bus_*`), i.e.
@@ -337,14 +365,17 @@ plan), factor / solve time per batch, before and after.
 
 ## 9. Order of work and PRs
 
-| step | content | PR |
-|---|---|---|
-| 0 | this note; build + suite on this machine; § 8.2 measurement script | 1 |
-| A | product rows (union of trips), pairs, no materialization, two phases (`rows=`, selection, warm start), max loading, `violation_threshold` | 1 |
-| B.1 | per-row branch admittance (taps) | 2 |
-| B.2 | union pattern + spare buses + moves (splits / merges), no-op bit-identical | 3 |
-| D | `Action` format (`set_bus`-style moves, branch values), results | 1 |
-| — | switch actions → moves (lightsim2grid detailed topology), pattern banks; outer loops / groups / gradients with moves | later |
+| step | content | PR | status (2026-11-16) |
+|---|---|---|---|
+| 0 | this note; build + suite on this machine; § 8.2 measurement script | 1 | note, tests, tooling done; § 8.2 waits for a free GPU |
+| D | `Action` format (`set_bus`-style moves, branch values), results | 1 | done |
+| A | strategy rows (union of trips), two phases (`rows=`, `select_strategies`), max loading, `violation_threshold` | 1 | done (Python row map over today's session; max loading reduced on the host for now) |
+| A2 | warm start: one start V per contingency on the device, gathered at slot load | 1 | done (C++ unit tests for the gather) |
+| A3 | device-side max loading at eviction, `store_voltages` | 1 | designed (`_evict` hook, shared current helper) |
+| A4 | the contingency session's warm path (new rows on the live driver, chunked) | 1 | to do (continuous rebuilds anyway, upstream A.6) |
+| B.1 | per-row branch admittance (taps) | 2 | to do |
+| B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | to do |
+| — | switch actions → moves (lightsim2grid detailed topology), pattern banks; outer loops / groups / gradients with moves | later | |
 
 The tests come first (`tests/python/topology_actions/`, red until their step lands), one file
 per step:
@@ -352,7 +383,7 @@ per step:
 | file | step | pins |
 |---|---|---|
 | `test_topo_action_api.py` | D | `Action`: frozen, `apply_to` = lightsim2grid's calls, `validate`, `from_partition`, `combine` |
-| `test_topo_noop.py` | principle 1 | no actions / no-op actions: bit-identical, no spare bus |
+| `test_topo_noop.py` | principle 1 | no actions / no-op actions: today's path, no spare bus |
 | `test_topo_trips.py` | A | strategy rows = union of trips, lightsim2grid, a trip counted once, conflicts per row, array input |
 | `test_topo_branch_values.py` | B.1 | taps / ratios vs lightsim2grid, flows with the row's admittance |
 | `test_topo_bus_moves.py` | B.2 | splits, merges, a generator moved (PV), islands, 8 splits in one union pattern, flows, unsupported moves, analysis reuse |

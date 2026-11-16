@@ -30,6 +30,51 @@ callers without a lightsim2grid grid.
 
 .. autofunction:: gpusim2grid.optimize_reference_slack
 
+Contingency x action screening
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A remedial action is a :class:`gpusim2grid.actions.Action`: per element, the global bus it goes
+to in lightsim2grid's own ``change_bus_*`` convention (local bus ``k`` of substation ``s`` is
+``s + (k - 1) * n_sub``), ``-1`` for disconnected (on one end of a branch: that end only, the
+branch stays energized from the other), and transformer values. ``ContingencyAnalysisGPU``
+runs **strategies** -- a contingency followed by actions -- next to its contingencies, in two
+phases on one session: the contingencies first, then the strategies a condition of the
+caller's keeps (here pypowsybl's "at least one violation"), each strategy row being its
+contingency's disconnections plus its actions'.
+
+.. code-block:: python
+
+    import numpy as np
+    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid.actions import Action
+
+    ca = ContingencyAnalysisGPU(grid, compute_limit_violations=True, linear_solver="own_lu")
+    ca.violation_threshold = 0.95                      # limits at 95 % (lightsim2grid's knob)
+    ca.add_contingencies_by_branch_id([[3], [7], [12]])
+    ca.set_actions([
+        Action(line_bus1={5: -1}, line_bus2={5: -1}),  # open line 5
+        Action(load_bus={2: -1}),                      # shed load 2
+    ])
+    ca.add_strategies([(c, [a]) for c in range(3) for a in range(2)])   # or two index arrays
+    ctg_of = np.array([c for c in range(3) for _ in range(2)])
+
+    ca.compute(batch_size=512, rows="contingencies")   # phase 1
+    violating = ca.get_violation_counts()["current"] > 0
+    ca.select_strategies(violating[ctg_of])            # the condition is the caller's
+    ca.compute(batch_size=512, rows="strategies")      # phase 2
+    rho, branch = ca.get_max_loading()                 # per strategy row: max |I| / limit
+    ran = ca.get_strategy_ran()                        # which strategies were solved
+
+``compute()`` without ``rows`` runs the contingencies and the strategies in one call. A
+strategy the batch cannot run yet (an action putting back an element its contingency trips;
+bus moves and transformer values until they land, see
+``docs/dev_notes/topology_actions_plan.md``) is reported in
+``get_batch_unsupported_reasons()`` with NaN results, never raised for the batch. The full
+example is ``examples/contingency_x_actions.py``.
+
+.. automodule:: gpusim2grid.actions
+   :members: Action, substation_elements
+
 Batch scheduling
 ~~~~~~~~~~~~~~~~
 
