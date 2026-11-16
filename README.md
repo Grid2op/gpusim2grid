@@ -265,8 +265,13 @@ pytest
 
 The IEEE 14-bus case is the canonical regression grid.
 
-> C++/CUDA unit tests are not set up yet — contributions welcome (see
-> [roadmap](#roadmap)).
+C++/CUDA unit tests (`tests/cpp`, no external framework) are opt-in, in a separate build
+directory; a test needing a GPU is skipped without one:
+
+```bash
+cmake -S . -B build_cpptests -DGPUSIM2GRID_BUILD_TESTS=ON -DSKBUILD_PROJECT_NAME=gpusim2grid
+cmake --build build_cpptests && ctest --test-dir build_cpptests
+```
 
 ## Building the docs
 

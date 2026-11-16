@@ -109,3 +109,11 @@ else()
 endif()
 
 add_subdirectory(src)
+
+# C++/CUDA unit tests (ctest), off by default: the Python build (pip / scikit-build) is unchanged.
+#   cmake -S . -B build_cpptests -DGPUSIM2GRID_BUILD_TESTS=ON && cmake --build build_cpptests && ctest --test-dir build_cpptests
+option(GPUSIM2GRID_BUILD_TESTS "Build the C++/CUDA unit tests (tests/cpp, run with ctest)" OFF)
+if(GPUSIM2GRID_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests/cpp)
+endif()
