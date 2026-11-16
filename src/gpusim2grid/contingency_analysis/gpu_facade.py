@@ -940,27 +940,49 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         limits ignored) and the branch reaching it (lines then transformers). NaN / -1 for a
         row that was not solved (did not run, skipped as islanded, unsupported, NaN residual)
         or has no limit."""
+        if self._last_residuals is None:
+            raise RuntimeError("Call compute() before get_max_loading().")
         if not self._flows_done:
             self.compute_flows()
         _, _, lim1, lim2, _ = self._configured_limits()
         if self.n_branches is None:
             raise RuntimeError("get_max_loading needs branch data (set_branch_data in array mode)")
         nb: int = self.n_branches
-        i1: np.ndarray = self.or_amps.to_numpy().reshape(-1, nb) * 1e-3  # A -> kA, as the limits
-        i2: np.ndarray = self.ex_amps.to_numpy().reshape(-1, nb) * 1e-3
+        rm = self._rowmap
+        residuals: DeviceBuffer = self._last_residuals
+        # reduce the rows the session solved only, then expand the two per-row results: the flows
+        # of the caller's rows that did not run would be n_rows x n_branches of NaN
+        n_session: int = len(rm.session_rows) if rm is not None else int(residuals.shape[0])
+        if n_session == 0:
+            assert rm is not None
+            return np.full(rm.n_out, np.nan), np.full(rm.n_out, -1, dtype=np.int64)
+        i1: np.ndarray = self._inner.or_amps.to_numpy().reshape(n_session, nb) * 1e-3  # A -> kA, as the limits
+        i2: np.ndarray = self._inner.ex_amps.to_numpy().reshape(n_session, nb) * 1e-3
+        if rm is not None and self._row_branch_y:
+            # the branches whose values a row changes: its own admittance (the session's is the base one)
+            V: np.ndarray = self._inner.V_results.to_numpy().reshape(n_session, -1)
+            pos: dict[int, int] = {int(r): k for k, r in enumerate(rm.session_rows)}
+            for row, changed in self._row_branch_y.items():
+                k = pos[row]
+                for b, y in changed.items():
+                    i1[k, b] = self._branch_amps(V[k], b, y, 1) * 1e-3
+                    i2[k, b] = self._branch_amps(V[k], b, y, 2) * 1e-3
         with np.errstate(divide="ignore", invalid="ignore"):
-            r1 = np.where(np.asarray(lim1) > 0, i1 / lim1, np.nan)
-            r2 = np.where(np.asarray(lim2) > 0, i2 / lim2, np.nan)
-        r: np.ndarray = np.fmax(r1, r2)
-        # a row not solved (skipped, unsupported, not run) reads zero currents: no loading
-        r[~np.isfinite(self.last_residuals())] = np.nan
+            r: np.ndarray = np.fmax(
+                np.where(np.asarray(lim1) > 0, i1 / lim1, np.nan), np.where(np.asarray(lim2) > 0, i2 / lim2, np.nan)
+            )
+        del i1, i2
+        # a row not solved (skipped, unsupported, NaN residual) reads zero currents: no loading
+        r[~np.isfinite(residuals.to_numpy())] = np.nan
         has: np.ndarray = ~np.all(np.isnan(r), axis=1)
-        branch: np.ndarray = np.full(r.shape[0], -1, dtype=np.int64)
-        rho: np.ndarray = np.full(r.shape[0], np.nan)
+        branch: np.ndarray = np.full(n_session, -1, dtype=np.int64)
+        rho: np.ndarray = np.full(n_session, np.nan)
         if has.any():
             branch[has] = np.nanargmax(r[has], axis=1)
             rho[has] = r[has, branch[has]]
-        return rho, branch
+        if rm is None:
+            return rho, branch
+        return rm.expand(rho, np.nan), rm.expand(branch, -1)
 
     # ------------------------------------------------- topology actions, inside
     _last_rows: Rows | None = None
