@@ -18,6 +18,8 @@ Change Log
 - [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's
   (``slack_absorbed`` recalibrated first); a change re-solved that way is settled. At loose tolerances the
   extra step changed the loops' decisions (a row cycling to ``max_outer_iterations``).
+- [ADDED] ``gpusim2grid.actions.Action``: a remedial action as element bus moves (lightsim2grid's
+  ``change_bus_*`` convention), disconnections and transformer ratio / phase shift values.
 
 [0.3.0] 2026-11-16
 --------------------

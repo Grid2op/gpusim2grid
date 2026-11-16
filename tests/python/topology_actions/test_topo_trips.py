@@ -55,17 +55,21 @@ def _actions() -> list[Action]:
     ]
 
 
-def _equivalent_trips(
-    grid: LSGrid, ctg_branches: list[int], action: Action
-) -> tuple[list[int], list[int], list[int]]:
-    """The (branch ids, load ids, gen ids) one contingency would trip for the same row."""
-    br, loads, gens = set(ctg_branches), set(), set()
-    br |= {int(i) for i, b in {**action.line_bus1, **action.line_bus2}.items() if b == -1}
-    trafo_ends = {**action.trafo_bus1, **action.trafo_bus2}
-    br |= {branch_id_of_trafo(grid, i) for i, b in trafo_ends.items() if b == -1}
-    loads |= {int(i) for i, b in action.load_bus.items() if b == -1}
-    gens |= {int(i) for i, b in action.gen_bus.items() if b == -1}
-    return sorted(br), sorted(loads), sorted(gens)
+def _equivalent_trips(grid: LSGrid, ctg_branches: list[int], action: Action) -> dict[str, list[int]]:
+    """The ``add_contingency`` arguments of one contingency tripping the same elements: a
+    branch opened at one end is ``branch_ids_side1`` / ``_side2``, at both ends a trip."""
+    side1: set[int] = {int(i) for i, b in action.line_bus1.items() if b == -1}
+    side1 |= {branch_id_of_trafo(grid, i) for i, b in action.trafo_bus1.items() if b == -1}
+    side2: set[int] = {int(i) for i, b in action.line_bus2.items() if b == -1}
+    side2 |= {branch_id_of_trafo(grid, i) for i, b in action.trafo_bus2.items() if b == -1}
+    both: set[int] = set(ctg_branches) | (side1 & side2)
+    return {
+        "branch_ids": sorted(both),
+        "branch_ids_side1": sorted(side1 - both),
+        "branch_ids_side2": sorted(side2 - both),
+        "load_ids": sorted(int(i) for i, b in action.load_bus.items() if b == -1),
+        "gen_ids": sorted(int(i) for i, b in action.gen_bus.items() if b == -1),
+    }
 
 
 @pytest.mark.parametrize("settings", ca_settings())
@@ -85,8 +89,7 @@ def test_strategy_rows_equal_the_union_of_trips(settings: dict[str, Any]):
 
     ref = make_ca(grid, settings, batch_size=BATCH)
     for c, (a,) in strategies:
-        br, loads, gens = _equivalent_trips(grid, ctgs[c], actions[a])
-        ref.add_contingency(branch_ids=br, load_ids=loads, gen_ids=gens)
+        ref.add_contingency(**_equivalent_trips(grid, ctgs[c], actions[a]))
     ref.compute(batch_size=BATCH)
     V_ref = batch_V(ref, len(strategies))
     np.testing.assert_allclose(V[len(ctgs) :], V_ref, atol=1e-12, rtol=0)

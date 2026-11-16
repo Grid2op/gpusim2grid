@@ -59,12 +59,18 @@ def test_apply_to_makes_the_change_bus_calls():
 
 
 def test_minus_one_disconnects():
+    """-1 on one end opens that end only (the line stays energized from the other one, as
+    lightsim2grid's deactivate_powerline_side1); on both ends the line trips."""
     from gpusim2grid.actions import Action
 
     grid = case14()
     V_a, _ = oracle(grid, action=Action(line_bus1={5: -1}))
-    V_h, _ = oracle(grid, apply=lambda g: g.deactivate_powerline(5))
+    V_h, _ = oracle(grid, apply=lambda g: g.deactivate_powerline_side1(5))
     np.testing.assert_array_equal(V_a, V_h)
+    V_both, _ = oracle(grid, action=Action(line_bus1={5: -1}, line_bus2={5: -1}))
+    V_trip, _ = oracle(grid, apply=lambda g: g.deactivate_powerline(5))
+    assert V_both is not None and V_trip is not None
+    np.testing.assert_allclose(V_both, V_trip, atol=1e-12, rtol=0)
 
 
 def test_trafo_values_apply():
@@ -109,22 +115,25 @@ def test_validate_accepts_both_busbars_of_the_substation():
 
 
 def test_from_partition():
-    """The prototype's nodal action: a target partition of a substation. Each group keeps the
-    bus holding most of its elements now; the others go to free local buses; listed
-    disconnected elements get -1. Every element of the substation must be listed."""
+    """The prototype's nodal action: a target partition of a substation. A bus in use is kept
+    by the group holding most of its elements (ties: the earlier group); the others go to free
+    local buses; listed disconnected elements get -1. Every element of the substation must be
+    listed."""
     from gpusim2grid.actions import Action, substation_elements
 
     grid = case14()
     sub = 3
     elems = substation_elements(grid, sub)  # [("line_bus2", 3), ("trafo_bus1", 0), ...]
     assert len(elems) >= 4
-    g1, g2 = elems[: len(elems) // 2], elems[len(elems) // 2 :]
+    g1, g2 = elems[:-2], elems[-2:]  # g1 holds most of the bus: it keeps it
     a = Action.from_partition(grid, sub, [g1, g2])
-    moved = [e for e in g2 if e not in g1]
-    for kind, el in moved:
+    for kind, el in g2:
         assert getattr(a, kind)[el] == bus2(grid, sub)
     for kind, el in g1:
-        assert el not in getattr(a, kind) or getattr(a, kind)[el] == sub
+        assert el not in getattr(a, kind)  # already on the bus it keeps
+    # the larger group listed second still keeps the bus
+    b = Action.from_partition(grid, sub, [g2, g1])
+    assert b == a
 
     d = Action.from_partition(grid, sub, [elems[1:]], disconnected=[elems[0]])
     kind, el = elems[0]
