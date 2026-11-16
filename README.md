@@ -1,15 +1,12 @@
 # gpusim2grid
 
-GPU-accelerated power flow. <!-- for the [Grid2Op](https://github.com/Grid2Op) ecosystem. REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER 
+GPU-accelerated power flow for the [Grid2Op](https://github.com/Grid2Op) ecosystem.
 
 `gpusim2grid` runs AC power flow on the GPU and scales it to large batches, so that
 thousands of scenarios can be solved in parallel on a single device. It is built
-around batched sparse direct factorization (cuDSS). 
-<!-- REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
-, and is the GPU companion to
+around batched sparse direct factorization (cuDSS), and is the GPU companion to
 [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid), which it uses for CPU
 preprocessing and as a reference oracle.
--->
 
 > **Status:** research code, early release, distributed on PyPI as a source
 > distribution that `pip` compiles on your machine (see [installation](#installation)).
@@ -33,7 +30,8 @@ In order of maturity:
    scenarios (varying loads/generation) in a single batched call.
 4. **Scenario sweep on the GPU** — row-aligned combination of the two: row `i`'s
    injection profile is solved together with row `i`'s own set of tripped
-   branches, independently of every other row. Mirrors <!-- REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER lightsim2grid's own `ScenarioSweep`. -->
+   branches, independently of every other row. Mirrors lightsim2grid's own
+   `ScenarioSweep`.
 
 The three batch workloads run in one of two schedules: **chunked** (every row of a
 chunk runs the same number of iterations) or **continuous** (`scheduling="continuous"`:
@@ -53,14 +51,12 @@ poses**, including the in-Jacobian power-system controls modelled there:
 - **SVC** (static var compensator, voltage mode with optional slope),
 - **remote generator voltage control** (a generator regulating a non-local bus).
 
-<!-- 
-REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER 
-These match the lightsim2grid CPU solution bit-for-bit, on both the single solve
-and the batched contingency / injection-sweep / scenario-sweep paths. The
-low-level array entry points (`acpf_nr_gpu`, the `*Session` classes constructed
-from raw NumPy/SciPy arrays) solve only the bare `[pvpq | pq]` system without
-these controls.
--->
+These match the lightsim2grid CPU solution to rounding (~1e-15), on both the single
+solve and the batched contingency / injection-sweep / scenario-sweep paths (a droop
+HVDC line with a resistance matches to the Newton tolerance: gpusim2grid takes its
+Jacobian slope exactly). The low-level array entry points (`acpf_nr_gpu`, the
+`*Session` classes constructed from raw NumPy/SciPy arrays) solve only the bare
+`[pvpq | pq]` system without these controls.
 
 ## Alpha features
 
@@ -116,7 +112,7 @@ to other open-source tools that cover them.
   - **[`lightsim2grid`](https://github.com/Grid2op/lightsim2grid) >= 1.3.1 (hard
     dependency)** — CPU preprocessing and reference oracle. Its wheel ships the C++
     core and headers (KLU's included) that gpusim2grid's bridge compiles against.
-    <!--REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER  Integration with `lightsim2grid` is expected to deepen in future releases. -->
+    Integration with `lightsim2grid` is expected to deepen in future releases.
   - **[cuDSS](https://developer.nvidia.com/cudss) 1.x** (`nvidia-cudss-cu12` /
     `nvidia-cudss-cu13`) — the sparse direct solve.
   - the **CUDA 13 toolkit** (`cuda-toolkit`), compiler included. PyPI has no
@@ -322,20 +318,18 @@ simply have not had the time to implement them yet:
 Licensed under the **Mozilla Public License 2.0 (MPL-2.0)** — see [`LICENSE`](LICENSE)
 and [`DISCLAIMER.md`](DISCLAIMER.md).
 
-Copyright © "DOUBLE BLINDE REMOVED" DO NOT DISTRIBUTE THIS ANONYMISED VERSION ! <!--RTE (<https://www.rte-france.com>) REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER --> . Released as part of the
-[Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem. 
+Copyright © RTE (<https://www.rte-france.com>). Released as part of the
+[Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem.
 
 NVIDIA CUDA libraries (CUDA Toolkit, cuDSS, cuSPARSE) are dependencies, not
 redistributed components, and remain under their respective NVIDIA licenses. The vendored
 DLPack header (`src/_cpp/dlpack/dlpack.h`) is under the Apache License 2.0, its
 [license](src/_cpp/dlpack/LICENSE) next to it.
 
-<!-- ## Acknowledgements
-
-REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
+## Acknowledgements
 
 Developed at RTE. Part of the [Grid2Op](https://github.com/Grid2Op) ecosystem and built
 on [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid). Uses
 [Eigen](https://eigen.tuxfamily.org), [KLU](https://github.com/DrTimothyAldenDavis/SuiteSparse),
 [cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. The batched LU behind
-`linear_solver='own_lu'` is Ralf Cortes Do Nascimento's contribution. -->
+`linear_solver='own_lu'` is Ralf Cortes Do Nascimento's contribution.
