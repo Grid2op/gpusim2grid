@@ -173,6 +173,19 @@ struct ContingencyAnalysisSession {
     bool   presolved_v_     = false;
     bool   debug_base_case_ = false;
     std::unique_ptr<LedgerData> base_ledger_;   // null in array/tuple mode
+    // set_spare_buses: the spare buses' parents and the union entries; the base inputs
+    // before any spare (restored by an empty call); n_orig_bus_ = their bus count.
+    std::vector<int>                 spare_parents_;
+    std::vector<std::pair<int, int>> spare_entries_;
+    bool                             union_active_ = false;   // spare buses or union entries (a merge)
+    int                              n_orig_bus_ = 0;
+    Eigen::SparseMatrix<eigen_cplx_type>                  Ybus_cm_orig_;
+    Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm_orig_;
+    CplxVect        Vinit_orig_, Sbus_base_orig_;
+    Eigen::VectorXi pq_orig_;
+    // a per-bus array of the n original buses, for the n+m of the batch: a spare bus takes
+    // its parent's value (nominal voltage) or `fill` (limits: NaN, not checked)
+    RealVect _bus_array_with_spares(const RealVect& a, bool from_parent, double fill) const;
     bool auto_reference_slack_ = false;
     int  forced_ref_bus_       = -1;
     int  grid_ref_bus_         = -1;
@@ -466,6 +479,28 @@ struct ContingencyAnalysisSession {
     // (row, col) must be in the base pattern. Call after build_contingencies*(); the next
     // run() builds a new source.
     void add_row_triplets(const std::vector<std::vector<std::tuple<int, int, double, double>>>& rows);
+
+    // ---- topology actions, bus moves on a union pattern (step B.2) ----------
+    // set_spare_buses: m = parents.size() spare buses appended after the n solver buses
+    // (ids n .. n+m-1), spare k starting from the voltage of solver bus parents[k]; entries:
+    // the Ybus entries (i, j) over the n+m buses the batch's rows need (explicit zeros in the
+    // base case; base entries are fine). The base state is rebuilt at once on that union
+    // (Ybus, V, Sbus, PQ spares, the ledger through extend_ledger_union, the spare buses'
+    // P / Q rows pinned in the base solve): n_bus() is n+m afterwards, and the contingency
+    // rows' triplets resolve on the union at the next run(). Empty lists restore the
+    // original base (today's path). Grid (ledger) mode only.
+    void set_spare_buses(const std::vector<int>& parents, const std::vector<std::pair<int, int>>& entries);
+    int  n_spare_buses() const { return static_cast<int>(spare_parents_.size()); }
+    // Masking per row: a spare bus is masked in a row by DEFAULT, unless the row uses it --
+    // one of its add_row_triplets entries (row or col) or one of its add_row_sbus_deltas
+    // buses is that spare (derived on the host when the source is built, nothing to send).
+    // set_row_empty_buses: after build_contingencies*(), one list per row of the BASE buses
+    // its moves leave without any element (rare: [] for most rows; the call may be omitted
+    // when no row empties a base bus), masked too (Contingency::empty_buses).
+    void set_row_empty_buses(const std::vector<std::vector<int>>& rows);
+    // add_row_sbus_deltas: after build_contingencies*(), per row (bus, dS pu) ADDED to the
+    // row's Sbus (an injection moved between buses), merged per bus with the row's trips.
+    void add_row_sbus_deltas(const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows);
     void clear_v_init_groups();
     bool has_v_init_groups() const { return has_v_groups_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real

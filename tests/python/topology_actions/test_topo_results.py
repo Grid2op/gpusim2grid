@@ -111,9 +111,11 @@ def test_max_loading_without_flows_on_the_host():
 
 
 @pytest.mark.parametrize("settings", ca_settings())
-def test_two_calls_equal_one(settings: dict[str, Any]):
+def test_two_calls_equal_one(settings: dict[str, Any], solver_atol: float):
     """compute(rows='contingencies') then compute(rows='strategies') on one session: the same
-    rows as compute() of everything."""
+    rows as compute() of everything. Chunked: every row runs the same iterations, equal up to
+    rounding. Continuous: a row stops when its residual is below tol, and one near that boundary
+    may take one more iteration in one run than in the other: equal up to the solver tolerance."""
     grid, ctgs, actions, strategies = _case()
     one = _ca(grid, ctgs, actions, strategies, settings)
     one.compute(batch_size=BATCH)
@@ -124,8 +126,9 @@ def test_two_calls_equal_one(settings: dict[str, Any]):
     V_c = batch_V(two, len(ctgs))
     two.compute(batch_size=BATCH, rows="strategies")
     V_s = batch_V(two, len(strategies))
-    np.testing.assert_allclose(V_c, V_one[: len(ctgs)], atol=1e-12, rtol=0)
-    np.testing.assert_allclose(V_s, V_one[len(ctgs) :], atol=1e-12, rtol=0)
+    atol: float = solver_atol if settings.get("scheduling") == "continuous" else 1e-12
+    np.testing.assert_allclose(V_c, V_one[: len(ctgs)], atol=atol, rtol=0)
+    np.testing.assert_allclose(V_s, V_one[len(ctgs) :], atol=atol, rtol=0)
 
 
 def test_select_strategies():

@@ -1943,6 +1943,22 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Per-row Ybus value changes after build_contingencies*(): one list of (row, col, re, im) per "
          "row, solver numbering, subtracted from the row's Ybus as the trips' own (a change to y_new is "
          "y_base - y_new). Every entry must be in the base pattern.")
+    .def("set_spare_buses", &ContingencyAnalysisSession::set_spare_buses,
+         pybind11::arg("parents"), pybind11::arg("entries"),
+         "Bus moves (topology actions): m = len(parents) spare buses appended after the n solver "
+         "buses (ids n..n+m-1), spare k starting from solver bus parents[k]'s voltage; entries: the "
+         "Ybus entries (i, j) over the n+m buses the rows need (explicit zeros in the base case). "
+         "Rebuilds the base state on that union at once (n_bus is n+m afterwards); empty lists "
+         "restore the original base. Grid mode only.")
+    .def_property_readonly("n_spare_buses", &ContingencyAnalysisSession::n_spare_buses)
+    .def("set_row_empty_buses", &ContingencyAnalysisSession::set_row_empty_buses, pybind11::arg("rows"),
+         "After build_contingencies*(): per row, the BASE buses its moves leave without any element, "
+         "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
+         "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
+         "and no add_row_sbus_deltas bus on it), with no call.")
+    .def("add_row_sbus_deltas", &ContingencyAnalysisSession::add_row_sbus_deltas, pybind11::arg("rows"),
+         "After build_contingencies*(): per row, (bus, dS pu) added to the row's Sbus (an injection "
+         "moved between buses), merged per bus with the row's trips.")
     .def("clear_v_init_groups", &ContingencyAnalysisSession::clear_v_init_groups,
          "Every row starts from the base-case voltages again.")
     .def_property_readonly("has_v_init_groups", &ContingencyAnalysisSession::has_v_init_groups)

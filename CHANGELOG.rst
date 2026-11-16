@@ -27,6 +27,8 @@ Change Log
   ``strategy_warm_start`` (one start per contingency, kept on the device), ``get_max_loading``.
 - [ADDED] Strategy actions may change transformer values (``trafo_ratio`` / ``trafo_shift_deg``): per-row
   Ybus values on the base pattern; the changed transformer's flows and current violations use the row's.
+- [ADDED] Strategy actions may move elements between the buses of a substation (bus splits and merges):
+  spare buses and one union sparsity pattern for the run, unused spares masked per row.
 - [ADDED] C++/CUDA unit tests (``tests/cpp``, ctest), opt-in with ``-DGPUSIM2GRID_BUILD_TESTS=ON``; a
   test needing a GPU is skipped without one.
 

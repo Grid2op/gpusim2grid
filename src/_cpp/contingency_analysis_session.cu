@@ -8,6 +8,7 @@
 
 #include "contingency_analysis_session.hpp"
 
+#include <map>
 #include <tuple>
 #include "gen_contingency_rows.hpp"   // gen_contingency::prepare_rows / check_rows / row_slack_weights
 #include "ledger_extend.hpp"     // move_reference, ledger_reference_bus, add_switchable_vm_buses
@@ -117,9 +118,15 @@ void ContingencyAnalysisSession::_build_base_state(const std::vector<int>& switc
     LedgerData moved;
     if (base_ledger_) {
         ledger_ptr = base_ledger_.get();
-        if ((ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) || !switchable_buses.empty() || reserved_vc_trip_) {
+        if ((ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) || !switchable_buses.empty() || reserved_vc_trip_
+                || union_active_) {
             moved = *base_ledger_;
-            if (ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) move_reference(moved, ref_bus_, Ybus_rm_);
+            // the ledger has the original buses until extend_ledger_union: their Ybus first
+            const auto& Ybus_base_rm = union_active_ ? Ybus_rm_orig_ : Ybus_rm_;
+            if (ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) move_reference(moved, ref_bus_, Ybus_base_rm);
+            // bus moves (set_spare_buses): the spare buses and the union pattern, appended
+            if (union_active_)
+                extend_ledger_union(moved, static_cast<int>(spare_parents_.size()), Ybus_rm_, Ybus_rm_orig_);
             // a generator trip releasing a bus it held alone: a Vm column + Q row for it,
             // pinned on the rows that keep it PV (see run())
             if (!switchable_buses.empty()) add_switchable_vm_buses(moved, switchable_buses, Ybus_rm_);
@@ -153,6 +160,9 @@ int ContingencyAnalysisSession::_wanted_reference_bus()
 {
     if (grid_ref_bus_ < 0 || !auto_reference_slack_ || !handle_disconnected_grid_ || !has_contingencies_)
         return grid_ref_bus_;
+    // bus moves (set_spare_buses): the rows' triplets name spare buses the base ledger the
+    // choice reads does not have -- the grid's own reference is kept
+    if (union_active_) return grid_ref_bus_;
     if (!auto_ref_valid_) {
         auto_ref_choice_ = choose_reference_bus_from_ledger(contingencies_, Ybus_rm_, *base_ledger_,
                                                             forced_ref_bus_, grid_ref_bus_);
@@ -571,14 +581,20 @@ void ContingencyAnalysisSession::run()
         // size over the ACTIVE (simulated) count; we read it back so the
         // driver chunks consistently with the source.
         const auto t_source0 = std::chrono::steady_clock::now();
+        // bus moves (set_spare_buses): every row has empty buses (the spare ones it does not
+        // use, at least), always masked
+        bool any_empty = !spare_parents_.empty();
+        for (const auto& ctg : contingencies_) any_empty = any_empty || !ctg.empty_buses.empty();
         ContingencyBatch source(
             contingencies_,
             Ybus_rm_.outerIndexPtr(),
             Ybus_rm_.innerIndexPtr(),
             Ybus_rm_,
             batch_size_,
-            (handle_disconnected_grid_ || !held_pins.empty() || any_gen_pin) ? &mask_cfg_ : nullptr,
-            handle_disconnected_grid_);
+            (handle_disconnected_grid_ || !held_pins.empty() || any_gen_pin || any_empty) ? &mask_cfg_ : nullptr,
+            handle_disconnected_grid_,
+            static_cast<int>(spare_parents_.size()),
+            union_active_);
         t_sess_source_ms = ms_since(t_source0);
         const auto t_prepass0 = std::chrono::steady_clock::now();
         // Continuous: batch_size_ slots, never more than the simulated rows.
@@ -753,11 +769,12 @@ void ContingencyAnalysisSession::run()
 
         solver_->upload_branch_admittances(
             h_branch_from_, h_branch_to_, h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_,
-            h_bus_vn_kv_, sn_mva_);
+            _bus_array_with_spares(h_bus_vn_kv_, /*from_parent=*/true, 0.), sn_mva_);
         t_admittance_upload_ms = solver_->branch_data_upload_ms();
 
+        const double nan = std::numeric_limits<double>::quiet_NaN();
         solver_->set_violation_limits(
-            h_bus_vmin_kv_, h_bus_vmax_kv_,
+            _bus_array_with_spares(h_bus_vmin_kv_, false, nan), _bus_array_with_spares(h_bus_vmax_kv_, false, nan),
             h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
             violation_tol_, violation_rel_tol_, violation_capacity_, n_lines_);
         t_limits_setup_ms = solver_->violation_setup_ms();
@@ -951,7 +968,7 @@ void ContingencyAnalysisSession::compute_flows()
     solver_->set_branch_data(
         h_branch_from_, h_branch_to_,
         h_yff_eff_, h_yft_eff_, h_ytf_eff_, h_ytt_eff_,
-        h_bus_vn_kv_, sn_mva_);
+        _bus_array_with_spares(h_bus_vn_kv_, /*from_parent=*/true, 0.), sn_mva_);
     timings_.t_branch_data_upload_ms += solver_->branch_data_upload_ms();
 
     // Launch one kernel over ALL contingencies using d_V_results as input.
@@ -1029,7 +1046,10 @@ void ContingencyAnalysisSession::set_limits(
     int n_lines)
 {
     const int n_bus = base_state_->n_bus;
-    if (bus_vmin_kv.size() != n_bus || bus_vmax_kv.size() != n_bus)
+    // with spare buses, limits over the original buses are fine: the spare ones get none
+    const bool orig_size = !spare_parents_.empty() && bus_vmin_kv.size() == n_orig_bus_
+                           && bus_vmax_kv.size() == n_orig_bus_;
+    if ((bus_vmin_kv.size() != n_bus || bus_vmax_kv.size() != n_bus) && !orig_size)
         throw std::runtime_error(
             "ContingencyAnalysisSession::set_limits: bus_vmin_kv/bus_vmax_kv "
             "must have size n_bus");
@@ -1401,6 +1421,145 @@ void ContingencyAnalysisSession::add_row_triplets(
         for (const auto& t : rows[c])
             contingencies_[c].triplets.push_back({std::get<0>(t), std::get<1>(t), std::get<2>(t), std::get<3>(t)});
     ++contingencies_generation_;   // the live driver's source is stale now
+}
+
+// =============================================================================
+// set_spare_buses / set_row_empty_buses / add_row_sbus_deltas -- topology actions,
+// bus moves on a union pattern (docs/dev_notes/topology_actions_plan.md, step B.2)
+// =============================================================================
+void ContingencyAnalysisSession::set_spare_buses(const std::vector<int>& parents,
+                                                 const std::vector<std::pair<int, int>>& entries)
+{
+    static const char* who = "ContingencyAnalysisSession::set_spare_buses";
+    if (!base_ledger_)
+        throw std::runtime_error(std::string(who) + ": needs a session built from a lightsim2grid grid (a ledger)");
+    if (!union_active_) {   // the original base, kept to restore it
+        n_orig_bus_      = static_cast<int>(Ybus_cm_.rows());
+        Ybus_cm_orig_    = Ybus_cm_;
+        Ybus_rm_orig_    = Ybus_rm_;
+        Vinit_orig_      = Vinit_;
+        Sbus_base_orig_  = h_Sbus_base_;
+        pq_orig_         = pq_;
+    }
+    const int n = n_orig_bus_;
+    const int m = static_cast<int>(parents.size());
+    for (int b : parents)
+        if (b < 0 || b >= n)
+            throw std::runtime_error(std::string(who) + ": parent bus " + std::to_string(b) + " outside [0, "
+                                     + std::to_string(n) + ")");
+    for (const auto& [i, j] : entries)
+        if (i < 0 || j < 0 || i >= n + m || j >= n + m)
+            throw std::runtime_error(std::string(who) + ": entry (" + std::to_string(i) + ", " + std::to_string(j)
+                                     + ") outside the " + std::to_string(n + m) + " buses");
+    const bool active = m > 0 || !entries.empty();   // a merge needs entries, no spare bus
+    // the same union as now: keep the pattern, the analysis and the driver (no rebuild)
+    if (active == union_active_ && parents == spare_parents_ && entries == spare_entries_) return;
+    if (!active) {   // back to the original base: today's path
+        Ybus_cm_ = Ybus_cm_orig_;
+        Ybus_rm_ = Ybus_rm_orig_;
+        Vinit_ = Vinit_orig_;
+        h_Sbus_base_ = Sbus_base_orig_;
+        pq_ = pq_orig_;
+    } else {
+        // the union: every base entry (its value), every requested entry and every spare
+        // diagonal as an explicit zero (setFromTriplets sums, never prunes)
+        std::vector<Eigen::Triplet<eigen_cplx_type>> t;
+        t.reserve(static_cast<size_t>(Ybus_cm_orig_.nonZeros()) + entries.size() + static_cast<size_t>(m));
+        for (int c = 0; c < Ybus_cm_orig_.outerSize(); ++c)
+            for (Eigen::SparseMatrix<eigen_cplx_type>::InnerIterator it(Ybus_cm_orig_, c); it; ++it)
+                t.emplace_back(static_cast<int>(it.row()), static_cast<int>(it.col()), it.value());
+        for (const auto& [i, j] : entries) t.emplace_back(i, j, eigen_cplx_type(0.));
+        for (int k = 0; k < m; ++k) t.emplace_back(n + k, n + k, eigen_cplx_type(0.));
+        Eigen::SparseMatrix<eigen_cplx_type> Y(n + m, n + m);
+        Y.setFromTriplets(t.begin(), t.end());
+        Y.makeCompressed();
+        Ybus_cm_ = Y;
+        Ybus_rm_ = Y;
+        Ybus_rm_.makeCompressed();
+        // a spare bus starts from its parent's voltage, injects nothing, is PQ
+        Vinit_.resize(n + m);
+        Vinit_.head(n) = Vinit_orig_;
+        h_Sbus_base_.resize(n + m);
+        h_Sbus_base_.head(n) = Sbus_base_orig_;
+        for (int k = 0; k < m; ++k) {
+            Vinit_(n + k) = Vinit_orig_(parents[static_cast<size_t>(k)]);
+            h_Sbus_base_(n + k) = eigen_cplx_type(0., 0.);
+        }
+        pq_.resize(pq_orig_.size() + m);
+        pq_.head(pq_orig_.size()) = pq_orig_;
+        for (int k = 0; k < m; ++k) pq_(pq_orig_.size() + k) = n + k;
+    }
+    spare_parents_ = parents;
+    spare_entries_ = entries;
+    union_active_  = active;
+    ++contingencies_generation_;          // the rows resolve on the new Ybus at the next run()
+    _build_base_state(reserved_buses_);   // the base state (and no driver) on the new buses
+}
+
+void ContingencyAnalysisSession::set_row_empty_buses(const std::vector<std::vector<int>>& rows)
+{
+    static const char* who = "ContingencyAnalysisSession::set_row_empty_buses";
+    if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
+    if (rows.size() != contingencies_.size())
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(rows.size()) + " lists for "
+                                 + std::to_string(contingencies_.size()) + " rows");
+    // base buses only: a spare bus is masked by default in every row that does not use it
+    const int n_base = base_state_->n_bus - static_cast<int>(spare_parents_.size());
+    for (size_t c = 0; c < rows.size(); ++c) {
+        std::vector<int> buses = rows[c];
+        for (int b : buses)
+            if (b < 0 || b >= n_base)
+                throw std::runtime_error(std::string(who) + ": bus " + std::to_string(b) + " is not one of the "
+                                         + std::to_string(n_base) + " base buses (spare buses are masked by "
+                                         "default where a row does not use them)");
+        std::sort(buses.begin(), buses.end());
+        buses.erase(std::unique(buses.begin(), buses.end()), buses.end());
+        contingencies_[c].empty_buses = std::move(buses);
+    }
+    ++contingencies_generation_;
+}
+
+void ContingencyAnalysisSession::add_row_sbus_deltas(
+    const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows)
+{
+    static const char* who = "ContingencyAnalysisSession::add_row_sbus_deltas";
+    if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
+    if (rows.size() != contingencies_.size())
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(rows.size()) + " lists for "
+                                 + std::to_string(contingencies_.size()) + " rows");
+    const int n_bus = base_state_->n_bus;
+    if (ctg_sbus_ds_.size() != contingencies_.size()) ctg_sbus_ds_.resize(contingencies_.size());
+    for (size_t c = 0; c < rows.size(); ++c) {
+        if (rows[c].empty()) continue;
+        // one entry per bus, sorted (the device adds them without atomics): merge with the trips'
+        std::map<int, std::complex<double>> merged(ctg_sbus_ds_[c].begin(), ctg_sbus_ds_[c].end());
+        for (const auto& [b, ds] : rows[c]) {
+            if (b < 0 || b >= n_bus)
+                throw std::runtime_error(std::string(who) + ": bus " + std::to_string(b) + " outside the "
+                                         + std::to_string(n_bus) + " solver buses");
+            merged[b] += ds;
+            contingencies_[c].injection_buses.push_back(b);
+        }
+        ctg_sbus_ds_[c].assign(merged.begin(), merged.end());
+        auto& inj = contingencies_[c].injection_buses;
+        std::sort(inj.begin(), inj.end());
+        inj.erase(std::unique(inj.begin(), inj.end()), inj.end());
+    }
+    ++contingencies_generation_;
+}
+
+RealVect ContingencyAnalysisSession::_bus_array_with_spares(const RealVect& a, bool from_parent, double fill) const
+{
+    const int n_bus = base_state_ ? base_state_->n_bus : static_cast<int>(a.size());
+    if (spare_parents_.empty() || a.size() >= n_bus) return a;
+    RealVect out(n_bus);
+    out.head(a.size()) = a;
+    for (int b = static_cast<int>(a.size()); b < n_bus; ++b) {
+        const int k = b - n_orig_bus_;
+        out(b) = (from_parent && k >= 0 && k < static_cast<int>(spare_parents_.size()))
+                     ? a(spare_parents_[static_cast<size_t>(k)]) : fill;
+    }
+    return out;
 }
 
 void ContingencyAnalysisSession::clear_v_init_groups()

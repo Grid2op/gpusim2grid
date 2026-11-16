@@ -41,7 +41,9 @@ from .._ls2g_utils import (
 from .. import _gpusim2grid as _cpp
 from .._outer_loops import _check_outer_loops_args
 from ._reactive_limits import ReactiveLimitsStatus
-from ._strategies import BranchY, RowMap, compile_action, strategy_row
+from ..actions import current_buses
+from ._strategies import (BranchY, RowMap, TopologyContext, UnionPlan, compile_action, plan_union,
+                          strategy_row, topology_context)
 from ._violation_threshold import ViolationThresholdFacadeMixin
 
 if TYPE_CHECKING:
@@ -591,6 +593,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._rowmap: RowMap | None = None
         self._flows_done: bool = False
         self._strategy_warm_start: bool = False
+        # the union pattern the session holds for the bus moves (None: the base pattern)
+        self._union: UnionPlan | None = None
         # the rows of the last run whose actions change branch values: {row: {branch: new y}}
         self._row_branch_y: dict[int, dict[int, BranchY]] = {}
         self._branch_args: tuple[Any, ...] | None = None
@@ -854,7 +858,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if any(max(acts, default=-1) >= len(actions) for _, acts in self._strategies):
             raise ValueError("a strategy refers to an action index the new list does not have")
         self._actions = actions
-        self._compiled = [compile_action(self._grid, a, n_lines) for a in actions]
+        current = current_buses(self._grid)  # once: it walks every element end of the grid
+        self._compiled = [compile_action(self._grid, a, n_lines, current) for a in actions]
         # branch ends (solver numbering), nominal voltages, sn_mva: row triplets and flow fix-ups
         self._branch_args = extract_branch_data(self._grid)[0]
         self._rowmap = None
@@ -893,14 +898,17 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     @property
     def n_spare_buses(self) -> int:
         """int: buses the batch adds for bus moves (0: the base pattern, today's path)."""
-        return 0
+        return self._union.n_spare if self._union is not None else 0
 
     @property
     def batch_bus_ids(self) -> np.ndarray:
         """(n_bus,) int ndarray: the global (lightsim2grid) bus id of every voltage column."""
         if self._grid is None:
             return np.arange(self.n_bus)
-        return np.asarray(self._grid.id_ac_solver_to_me(), dtype=np.int64)
+        base = np.asarray(self._grid.id_ac_solver_to_me(), dtype=np.int64)
+        if self._union is None:
+            return base
+        return np.concatenate([base, np.asarray(self._union.spare_global, dtype=np.int64)])
 
     def select_strategies(self, mask: np.ndarray | Sequence[bool]) -> None:
         """(n_strategies,) bool: the strategies the next ``compute(rows="strategies")`` (or
@@ -1006,6 +1014,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if not ctg:
             raise RuntimeError("add contingencies before compute()")
         n_lines: int = len(self._grid.get_lines()) if self._grid is not None else 0
+        topo: TopologyContext | None = self._prepare_union(n_lines)
         out_ctg: bool = rows in (None, "contingencies")
         out_str: bool = rows in (None, "strategies")
         n_out: int = (len(ctg) if out_ctg else 0) + (len(self._strategies) if out_str else 0)
@@ -1015,11 +1024,16 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         session_list: list[CtgElements] = []
         # per session row, its Ybus value changes (the contingency rows have none)
         session_triplets: list[list[tuple[int, int, float, float]]] = []
+        # per session row, the buses it leaves empty (always masked) and its Sbus moves
+        session_empty: list[list[int]] = []
+        session_sbus: list[list[tuple[int, complex]]] = []
         self._row_branch_y = {}
         if out_ctg:
             session_rows += range(len(ctg))
             session_list += ctg
             session_triplets += [[] for _ in ctg]
+            session_empty += [[] for _ in ctg]  # the session masks the spares a row does not use
+            session_sbus += [[] for _ in ctg]
         if out_str:
             sel = self._strategy_selected
             off: int = len(ctg) if out_ctg else 0
@@ -1028,13 +1042,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                     continue
                 assert self._branch_args is not None  # set by set_actions
                 bf, bt = self._branch_args[0], self._branch_args[1]
-                row = strategy_row(ctg[ci], [self._compiled[a] for a in acts], n_lines, bf, bt)
+                row = strategy_row(ctg[ci], [self._compiled[a] for a in acts], n_lines, bf, bt, topo)
                 if row.elements is None:
                     reasons[off + k] = row.reason
                     continue
                 session_rows.append(off + k)
                 session_list.append(row.elements)
                 session_triplets.append(row.triplets)
+                session_empty.append(row.empty_buses)
+                session_sbus.append(row.sbus)
                 if row.branch_y:
                     self._row_branch_y[off + k] = row.branch_y
         self._rowmap = RowMap(n_out, np.asarray(session_rows, dtype=np.int64), reasons)
@@ -1045,6 +1061,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             self._push_rows(session_list)
             if any(session_triplets):
                 session.add_row_triplets(session_triplets)
+            if any(session_empty):
+                session.set_row_empty_buses(session_empty)
+            if any(session_sbus):
+                session.add_row_sbus_deltas(session_sbus)
             self._inner.batch_size = int(batch_size)
             if rows == "strategies" and session.has_v_init_groups:
                 # the contingencies' voltages of phase 1 are groups 0..C-1 (-1: not converged)
@@ -1066,6 +1086,31 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         else:
             self._last_residuals = DeviceBuffer(lambda: np.zeros(0), (0,), "float64")
         return self.V_results.to_numpy().reshape(n_out, -1)
+
+    def _prepare_union(self, n_lines: int) -> TopologyContext | None:
+        """The union pattern of every registered strategy's bus moves, set on the session when it
+        changes (both phases see the same one: no rebuild between them); None: no move, the base
+        pattern (today's path). Built once, upfront, for the whole run: see plan_union for why,
+        and for streaming it while the GPU works (a join of patterns)."""
+        if self._grid is None or not any(a.moves for a in self._compiled):
+            return self._prepare_union_none()
+        assert self._branch_args is not None  # set by set_actions
+        bf, bt = self._branch_args[0], self._branch_args[1]
+        combos = {acts for _, acts in self._strategies}
+        plan = plan_union(self._grid, self._compiled, combos, n_lines, bf, bt)
+        if plan.is_empty():
+            return self._prepare_union_none()
+        if self._union is None or (plan.parents, plan.entries) != (self._union.parents, self._union.entries):
+            self._inner._s.set_spare_buses(plan.parents, plan.entries)
+        self._union = plan
+        return topology_context(self._grid, plan, n_lines, bf, bt)
+
+    def _prepare_union_none(self) -> None:
+        """Back to the base pattern (today's path) if the session holds a union."""
+        if self._union is not None:
+            self._inner._s.set_spare_buses([], [])
+            self._union = None
+        return None
 
     def _push_rows(self, elements: Sequence[CtgElements]) -> None:
         """Hand the session these rows (the ten lists each) without changing the

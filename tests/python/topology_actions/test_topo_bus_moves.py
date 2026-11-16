@@ -191,15 +191,18 @@ def test_many_splits_in_one_batch_union_pattern(settings: dict[str, Any], solver
     for sub in by_degree[:8]:
         ends = _branch_ends(grid, sub)
         actions.append(_move(grid, sub, ends[1::2]))  # every other branch end to bus 2
-    ctgs = [[], [20], [101]]
+    # contingencies on lines no action moves (a strategy moving the line its contingency trips
+    # would put it back: reported per row, test_topo_trips covers that)
+    moved: set[int] = {el for a in actions for el in (*a.line_bus1, *a.line_bus2)}
+    ctgs = [[]] + [[b] for b in (20, 101, 30, 64, 150) if b not in moved][:2]
+    assert len(ctgs) == 3
     strategies = [(c, [a]) for c in range(len(ctgs)) for a in range(len(actions))]
     ca, V = _run(grid, settings, ctgs, actions, strategies)
     assert ca.n_spare_buses == len(actions)
     checked = 0
     for r, (c, (a,)) in enumerate(strategies):
         V_ref, _ = oracle(grid, branches=ctgs[c], action=actions[a])
-        if V_ref is None:
-            assert not np.isfinite(ca.last_residuals()[len(ctgs) + r]) or True
+        if V_ref is None:  # lightsim2grid diverges on this row: not compared
             continue
         assert_row_matches(V[len(ctgs) + r], V_ref, solver_atol)
         checked += 1

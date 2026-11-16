@@ -27,7 +27,10 @@
 //   segment per ACTIVE row (patch_seg_)
 // =============================================================================
 
+#include <algorithm>
 #include <chrono>
+#include <iterator>
+#include <stdexcept>
 #include <complex>
 #include <thrust/device_vector.h>
 #include <vector>
@@ -171,6 +174,11 @@ struct ContingencyBatch {
     //   max_batch_size: upper bound on systems per chunk (the user batch_size).
     //                   The effective per-chunk size is rebalanced over the
     //                   ACTIVE (connected) count and exposed via used_batch_size().
+    //   n_spare       : spare buses of the union pattern (the last n_spare of Ybus_rm's,
+    //                   topology actions' bus moves): left out of the connectivity graph;
+    //                   every row's empty buses (Contingency::empty_effective) are masked.
+    //   union_pattern : Ybus_rm is a union pattern (spare buses or merge entries): its
+    //                   explicit zeros are no edges of the connectivity graph.
     // -------------------------------------------------------------------------
     ContingencyBatch(std::vector<Contingency>& contingencies,
                      const int*                Ybus_rm_outer,
@@ -178,7 +186,9 @@ struct ContingencyBatch {
                      const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                      int                       max_batch_size,
                      const MaskConfig*         mask_cfg = nullptr,
-                     bool                      mask_mode = true)
+                     bool                      mask_mode = true,
+                     int                       n_spare = 0,
+                     bool                      union_pattern = false)
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
@@ -190,10 +200,23 @@ struct ContingencyBatch {
         // mask_cfg without mask_mode: no largest-component masking, only the
         // per-row pins (lightsim2grid's held controllers) need its positions
         mask_mode_ = (mask_cfg != nullptr) && mask_mode;
+        const int n_graph = static_cast<int>(Ybus_rm.rows()) - n_spare;
         if (mask_mode_)
-            compute_component_masks(contingencies, Ybus_rm, *mask_cfg);
+            compute_component_masks(contingencies, Ybus_rm, *mask_cfg, n_graph, union_pattern);
         else
-            check_connectivity(contingencies, Ybus_rm);
+            check_connectivity(contingencies, Ybus_rm, n_graph, union_pattern);
+        // empty buses (no element in the row): masked whatever the mode, with the islands
+        bool any_empty = false;
+        for (auto& ctg : contingencies) {
+            if (ctg.disconnected || ctg.empty_effective.empty()) continue;
+            any_empty = true;
+            std::vector<int> merged;
+            std::set_union(ctg.masked_buses.begin(), ctg.masked_buses.end(),
+                           ctg.empty_effective.begin(), ctg.empty_effective.end(), std::back_inserter(merged));
+            ctg.masked_buses.swap(merged);
+        }
+        if (any_empty && mask_cfg == nullptr)
+            throw std::runtime_error("ContingencyBatch: rows with empty buses need the mask configuration");
 
         // Rebalance the chunk size over the ACTIVE (simulated) contingencies —
         // the ones actually solved — rather than the full input count.  This
@@ -217,7 +240,7 @@ struct ContingencyBatch {
         bool any_pins = false;
         for (const auto& ctg : contingencies)
             if (!ctg.pinned_buses.empty() || !ctg.vc_pinned_ctrl.empty()) { any_pins = true; break; }
-        if (mask_mode_ || (mask_cfg != nullptr && any_pins))
+        if (mask_mode_ || (mask_cfg != nullptr && (any_pins || any_empty)))
             build_mask_entries(contingencies, active_to_orig_, /*batch_size=*/1,
                                *mask_cfg, mask_.h);
 

@@ -758,6 +758,23 @@ AcPfNrState::AcPfNrState(
             h_pin_row.push_back(h_q_row_of_bus[bus]);
             h_pin_diag.push_back(h_q_diag_pos[bus]);
         }
+        // Spare buses of the topology actions' union pattern (extend_ledger_union, the last
+        // n_spare_buses): no element in the base case, an all-zero Ybus row -- both their P
+        // and their Q rows identity-pinned in the base solve (F 0 there: the base residual
+        // is unchanged). The batch rows mask them per row (Contingency::empty_buses).
+        const int n_spare = ledger != nullptr ? ledger->n_spare_buses : 0;
+        for (int bus = n_bus - n_spare; bus < n_bus; ++bus) {
+            if (h_p_row_of_bus[bus] >= 0 && h_p_diag_pos[bus] >= 0) {
+                h_pin_slot.push_back(0);
+                h_pin_row.push_back(h_p_row_of_bus[bus]);
+                h_pin_diag.push_back(h_p_diag_pos[bus]);
+            }
+            if (h_q_row_of_bus[bus] >= 0 && h_q_diag_pos[bus] >= 0) {
+                h_pin_slot.push_back(0);
+                h_pin_row.push_back(h_q_row_of_bus[bus]);
+                h_pin_diag.push_back(h_q_diag_pos[bus]);
+            }
+        }
         n_pin = static_cast<int>(h_pin_slot.size());
         if (n_pin > 0) {
             upload_h2d(d_pin_slot, h_pin_slot.data(), n_pin, cs);

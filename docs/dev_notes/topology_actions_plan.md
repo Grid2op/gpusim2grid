@@ -283,7 +283,12 @@ it the **union** of what the batch's rows need:
 6. **Efficient no-op.** No spare bus and no new entry ⇒ the union is the base pattern, the
    ledger is not extended, the analysis is the one of today: bit-identical (test). Above that,
    the extra cost is the fill of the union pattern, paid by every row of the batch.
-7. **Pattern banks (later).** When the union grows too much (many splits spread over the grid),
+7. **Built once, upfront.** The union covers every strategy registered on the analysis and is
+   built before the first run; phase 1, phase 2 and every chunk solve on it. (The prototype
+   builds a smaller union per block of strategies.) If building it upfront ever shows, it can be
+   streamed while the GPU works on the first rows, which needs a join of patterns: one that only
+   grows, with a new analysis when it does.
+8. **Pattern banks (later).** When the union grows too much (many splits spread over the grid),
    group the rows by pattern signature into banks, one analysis each (the prototype's
    "one pattern per bank"). Not in the first version: measure the union's fill first (§ 8.3).
 

@@ -157,6 +157,20 @@ struct Contingency {
     // is a second, independent index space from Triplet::k (CSR flat index
     // into Ybus) — no interaction with resolve_indices()/build_flat_patches().
     std::vector<int> tripped_branches;
+
+    // Topology actions, bus moves on the union pattern (ContingencyAnalysisSession::
+    // set_spare_buses): buses with no element in this row -- an unused spare bus, a bus a
+    // move or merge emptied. They are ALWAYS masked (identity P / Q rows, V NaN), whatever
+    // handle_disconnected_grid, and left out of the connectivity check: a row whose only
+    // "islands" are its empty buses is connected. Given by the caller (set_row_empty_buses).
+    std::vector<int> empty_buses;
+    // Buses this row's Sbus deltas touch (add_row_sbus_deltas): an injection moved onto a
+    // spare bus makes it used, not empty.
+    std::vector<int> injection_buses;
+    // Output of check_connectivity / compute_component_masks: empty_buses plus every spare
+    // bus (index >= the connectivity graph's n_graph) no triplet and no injection of the row
+    // touches; sorted. The batch source masks them.
+    std::vector<int> empty_effective;
 };
 
 // ---------------------------------------------------------------------------
@@ -328,9 +342,20 @@ void build_flat_patches(
 //   contingencies : contingencies to inspect; disconnected field written in-place
 //   Ybus_rm       : RowMajor sparse admittance matrix (base case, with values)
 // ---------------------------------------------------------------------------
+//   n_graph: the buses of the connectivity graph, the first n_graph of Ybus_rm's (-1: all).
+//   The others are spare buses of the topology actions' union pattern (bus moves): no
+//   element in the base case, left out of the graph; a row whose triplets / injections
+//   touch one, or whose triplets add a stamp where the base value is 0 (a merge), is
+//   labelled on its own edge set instead. With spare buses the graph's edges are the
+//   NONZERO off-diagonal entries (the union's are explicit zeros in the base case); without,
+//   every off-diagonal entry of the pattern, as before.
+//   union_pattern: Ybus_rm carries explicit zeros of a union pattern (bus moves) even without
+//   spare buses (a merge): its zero off-diagonal entries are no edges either.
 void check_connectivity(
     std::vector<Contingency>&                                          contingencies,
-    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&      Ybus_rm);
+    const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&      Ybus_rm,
+    int                                                                n_graph = -1,
+    bool                                                               union_pattern = false);
 
 // ---------------------------------------------------------------------------
 // MaskRowInfo
@@ -450,7 +475,9 @@ struct MaskEntries {
 void compute_component_masks(
     std::vector<Contingency>&                                     contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
-    const MaskConfig&                                             cfg);
+    const MaskConfig&                                             cfg,
+    int                                                           n_graph = -1,    // see check_connectivity
+    bool                                                          union_pattern = false);
 
 // ---------------------------------------------------------------------------
 // choose_reference_bus  (handle_disconnected_grid, automatic reference slack)

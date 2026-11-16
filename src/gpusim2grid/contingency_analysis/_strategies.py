@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -61,6 +61,12 @@ class CompiledAction:
     placed: frozenset[ElementRef]
     branch_y: dict[int, BranchY] = dataclasses.field(default_factory=dict)
     base_y: dict[int, BranchY] = dataclasses.field(default_factory=dict)
+    #: element ends it moves to another bus: {end: global bus} (step B.2)
+    moves: dict[ElementRef, int] = dataclasses.field(default_factory=dict)
+    #: the injection (pu, generator convention) of every load / static generator it moves
+    injection: dict[ElementRef, complex] = dataclasses.field(default_factory=dict)
+    #: the Ybus diagonal admittance (pu) of every shunt it moves
+    shunt_y: dict[int, complex] = dataclasses.field(default_factory=dict)
     unsupported: str = ""
 
 
@@ -68,11 +74,18 @@ def _empty() -> list[list[int]]:
     return [[] for _ in range(10)]
 
 
-def compile_action(grid: LSGrid, action: Action, n_lines: int) -> CompiledAction:
-    """``action`` against ``grid`` (its current buses and transformer values)."""
-    current = current_buses(grid)
+def compile_action(
+    grid: LSGrid, action: Action, n_lines: int, current: dict[ElementRef, int] | None = None
+) -> CompiledAction:
+    """``action`` against ``grid`` (its current buses and transformer values). ``current``: the
+    grid's ``current_buses``, read once for many actions (it walks every element end)."""
+    if current is None:
+        current = current_buses(grid)
     trips = _empty()
     placed: set[ElementRef] = set()
+    moves: dict[ElementRef, int] = {}
+    injection: dict[ElementRef, complex] = {}
+    shunt_y: dict[int, complex] = {}
     why = ""
     for name, el, bus in action.bus_items():
         now = current[(name, el)]
@@ -86,11 +99,24 @@ def compile_action(grid: LSGrid, action: Action, n_lines: int) -> CompiledAction
                 trips[_SLOT[name]].append(el)
         else:
             placed.add((name, el))
-            if bus != now and not why:
-                why = (
-                    f"{name}[{el}] moves from bus {now} to bus {bus}: bus moves need the union "
-                    "sparsity pattern (step B.2), not available yet"
-                )
+            if bus == now:
+                continue
+            if now == DISCONNECTED:
+                why = why or f"{name}[{el}] is disconnected now: reconnecting an element is not supported yet"
+            elif name in _MOVE_UNSUPPORTED:
+                why = why or f"{name}[{el}]: {_MOVE_UNSUPPORTED[name]}"
+            else:
+                moves[(name, el)] = int(bus)
+    sn_mva: float = float(grid.get_sn_mva())
+    for (name, el), _ in moves.items():
+        if name == "load_bus":
+            ld = grid.get_loads()[el]
+            injection[(name, el)] = -complex(ld.target_p_mw, ld.target_q_mvar) / sn_mva
+        elif name == "sgen_bus":
+            sg = grid.get_static_generators()[el]
+            injection[(name, el)] = complex(sg.target_p_mw, sg.target_q_mvar) / sn_mva
+        elif name == "shunt_bus":
+            shunt_y[el] = _shunt_admittance(grid, el)
     branch_y: dict[int, BranchY] = {}
     base_y: dict[int, BranchY] = {}
     trafos = grid.get_trafos()
@@ -111,7 +137,27 @@ def compile_action(grid: LSGrid, action: Action, n_lines: int) -> CompiledAction
         for el in sorted(changed):
             branch_y[n_lines + el] = _y(new_trafos[el])
             base_y[n_lines + el] = _y(trafos[el])
-    return CompiledAction(tuple(sorted(set(t)) for t in trips), frozenset(placed), branch_y, base_y, why)
+    lists: CtgElements = tuple(sorted(set(t)) for t in trips)
+    return CompiledAction(lists, frozenset(placed), branch_y, base_y, moves, injection, shunt_y, why)
+
+
+#: element kinds whose moves the first version leaves out (reported per row)
+_MOVE_UNSUPPORTED: dict[str, str] = {
+    "gen_bus": "generator moves (a PV bus per row) are not supported yet",
+    "storage_bus": "storage unit moves are not supported yet",
+}
+
+
+def _shunt_admittance(grid: LSGrid, shunt: int) -> complex:
+    """The shunt's Ybus diagonal admittance (pu): lightsim2grid's own, the solver Ybus with the
+    shunt minus without it (no sign convention to guess)."""
+    bus: int = int(grid.id_me_to_ac_solver()[grid.get_shunts()[shunt].bus_id])
+    without = copy.deepcopy(grid)
+    without.deactivate_shunt(shunt)
+    without.tell_solver_need_reset()
+    with_v = np.asarray(grid.get_V(), dtype=complex)
+    without.ac_pf(with_v.copy(), 30, 1e-8)
+    return complex(grid.get_Ybus_solver()[bus, bus] - without.get_Ybus_solver()[bus, bus])
 
 
 def _y(branch: Any) -> BranchY:
@@ -145,6 +191,127 @@ def _ctg_ends(ctg: CtgElements, n_lines: int) -> set[ElementRef]:
 
 
 @dataclasses.dataclass(frozen=True)
+class UnionPlan:
+    """The spare buses and union Ybus entries the moves of a batch need (solver numbering: the
+    n base solver buses, then the spares). Empty: today's base pattern."""
+
+    n_solver: int
+    spare_global: list[int]
+    parents: list[int]
+    entries: list[tuple[int, int]]
+    #: global bus -> solver bus, spares included
+    solver_of_global: dict[int, int]
+
+    @property
+    def n_spare(self) -> int:
+        return len(self.spare_global)
+
+    def is_empty(self) -> bool:
+        return not self.spare_global and not self.entries
+
+
+def plan_union(
+    grid: LSGrid,
+    compiled: Sequence[CompiledAction],
+    combos: Iterable[tuple[int, ...]],
+    n_lines: int,
+    branch_from: np.ndarray,
+    branch_to: np.ndarray,
+) -> UnionPlan:
+    """Spare buses (moved-to buses no base solver bus is) and the union entries of every action
+    combination a strategy uses (the moved stamps of each branch, a moved injection's diagonal).
+
+    The pattern is built ONCE, over every strategy registered on the analysis, before the first
+    run: phase 1, phase 2 and every chunk of either solve on it (a row whose actions move nothing
+    carries zeros at the extra entries), and it is rebuilt only when the actions / strategies
+    change. The prototype (gpu-security-analysis) builds a smaller union per block of strategies
+    instead: less fill per row, one pattern per block. If building it upfront ever shows (many
+    actions, a large grid), it could be streamed while the GPU works on the first rows -- but
+    rows already on the device were analysed on the pattern known when they were loaded, so that
+    needs a join of patterns (a pattern that only grows, and a new analysis when it does), not
+    just a background thread."""
+    me_to_solver = np.asarray(grid.id_me_to_ac_solver(), dtype=np.int64)
+    n_solver: int = int(grid.get_Ybus_solver().shape[0])
+    current = current_buses(grid)
+    solver_of_global: dict[int, int] = {}
+    spare_global: list[int] = []
+    parents: list[int] = []
+    for a in compiled:
+        for ref, g in a.moves.items():
+            if g in solver_of_global or me_to_solver[g] >= 0:
+                continue
+            solver_of_global[g] = n_solver + len(spare_global)
+            spare_global.append(g)
+            parents.append(int(me_to_solver[current[ref]]))
+
+    def solver(g: int) -> int:
+        return solver_of_global[g] if g in solver_of_global else int(me_to_solver[g])
+
+    entries: set[tuple[int, int]] = {(s, s) for s in solver_of_global.values()}
+    for combo in combos:
+        moves: dict[ElementRef, int] = {}
+        for k in combo:
+            moves.update(compiled[k].moves)
+        for f, t in _moved_branch_ends(moves, n_lines, branch_from, branch_to, solver).values():
+            ends = [x for x in (f, t) if x >= 0]
+            entries |= {(i, j) for i in ends for j in ends}
+        for (name, _), g in moves.items():
+            if not name.startswith(("line", "trafo")):
+                entries.add((solver(g), solver(g)))
+    if not spare_global:
+        # merges only: the entries the base pattern already has are not new
+        Y = grid.get_Ybus_solver()
+        entries = {(i, j) for i, j in entries if Y[i, j] == 0}
+    return UnionPlan(n_solver, spare_global, parents, sorted(entries), {**solver_of_global})
+
+
+def _moved_branch_ends(
+    moves: dict[ElementRef, int], n_lines: int, branch_from: np.ndarray, branch_to: np.ndarray, solver: Any
+) -> dict[int, tuple[int, int]]:
+    """{branch: (new from, new to)} in solver numbering for every branch an end of which moves."""
+    out: dict[int, tuple[int, int]] = {}
+    for (name, el), g in moves.items():
+        if not name.startswith(("line", "trafo")):
+            continue
+        b = el + (n_lines if name.startswith("trafo") else 0)
+        f, t = out.get(b, (int(branch_from[b]), int(branch_to[b])))
+        out[b] = (solver(g), t) if name.endswith("1") else (f, solver(g))
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class TopologyContext:
+    """What the rows' moves need of the grid, once per run: the union plan, branch ends and
+    admittances (solver numbering), the element ends per solver bus in the base case."""
+
+    plan: UnionPlan
+    n_lines: int
+    branch_from: np.ndarray
+    branch_to: np.ndarray
+    branch_y: list[BranchY]
+    occupancy: np.ndarray
+    me_to_solver: np.ndarray
+    current: dict[ElementRef, int]
+
+    def solver(self, g: int) -> int:
+        return self.plan.solver_of_global[g] if g in self.plan.solver_of_global else int(self.me_to_solver[g])
+
+
+def topology_context(
+    grid: LSGrid, plan: UnionPlan, n_lines: int, branch_from: np.ndarray, branch_to: np.ndarray
+) -> TopologyContext:
+    """The context of a run's rows (``plan``: its union, set on the session)."""
+    me_to_solver = np.asarray(grid.id_me_to_ac_solver(), dtype=np.int64)
+    occupancy = np.zeros(plan.n_solver + plan.n_spare, dtype=np.int64)
+    for _, bus in current_buses(grid).items():
+        if bus >= 0 and me_to_solver[bus] >= 0:
+            occupancy[me_to_solver[bus]] += 1
+    branch_y: list[BranchY] = [_y(ln) for ln in grid.get_lines()] + [_y(t) for t in grid.get_trafos()]
+    current = current_buses(grid)
+    return TopologyContext(plan, n_lines, branch_from, branch_to, branch_y, occupancy, me_to_solver, current)
+
+
+@dataclasses.dataclass(frozen=True)
 class StrategyRow:
     """The session row of a strategy: ``elements`` (the ten contingency lists, ``None`` when it
     cannot run, ``reason`` saying why), ``triplets`` (its Ybus value changes, subtracted) and
@@ -154,6 +321,11 @@ class StrategyRow:
     triplets: list[Triplet] = dataclasses.field(default_factory=list)
     branch_y: dict[int, BranchY] = dataclasses.field(default_factory=dict)
     reason: str = ""
+    #: BASE buses its moves leave with no element: always masked (a spare bus the row does not
+    #: use is masked by the session itself, so it is never listed here)
+    empty_buses: list[int] = dataclasses.field(default_factory=list)
+    #: (bus, dS pu) added to the row's Sbus (moved injections)
+    sbus: list[tuple[int, complex]] = dataclasses.field(default_factory=list)
 
 
 def strategy_row(
@@ -162,6 +334,7 @@ def strategy_row(
     n_lines: int,
     branch_from: np.ndarray,
     branch_to: np.ndarray,
+    topo: TopologyContext | None = None,
 ) -> StrategyRow:
     """The session row of a strategy: its contingency's elements and its actions' trips, and the
     Ybus changes of the branch values its actions set (``branch_from`` / ``branch_to``: solver
@@ -203,7 +376,58 @@ def strategy_row(
             if i >= 0 and j >= 0:
                 d = y0 - y1  # subtracted from the row's Ybus: base - new
                 triplets.append((i, j, d.real, d.imag))
-    return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y)
+    # bus moves (step B.2): stamps from the old ends to the new, moved injections, empty buses
+    moves: dict[ElementRef, int] = {}
+    injection: dict[ElementRef, complex] = {}
+    shunt_y: dict[int, complex] = {}
+    for a in actions:
+        for ref, g in a.moves.items():
+            if moves.get(ref, g) != g:
+                name, el = ref
+                return StrategyRow(None, reason=f"two of its actions move {name}[{el}] to different buses")
+            moves[ref] = g
+        injection.update(a.injection)
+        shunt_y.update(a.shunt_y)
+    if not moves:
+        return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y)
+    if topo is None:
+        return StrategyRow(None, reason="bus moves need the union pattern of the batch")
+    occupancy: np.ndarray = topo.occupancy.copy()
+    sbus: list[tuple[int, complex]] = []
+    moved = _moved_branch_ends(moves, topo.n_lines, topo.branch_from, topo.branch_to, topo.solver)
+    for b, (f2, t2) in moved.items():
+        if b in opened:
+            continue  # the row opens it: nothing left to move
+        if b in branch_y:
+            return StrategyRow(None, reason=f"branch {b} is moved and its value changed by one strategy")
+        f, t = int(topo.branch_from[b]), int(topo.branch_to[b])
+        if f < 0 or t < 0:
+            return StrategyRow(None, reason=f"branch {b} is half-open: moving it is not supported")
+        y = topo.branch_y[b]
+        for (i, j), yv in zip(((f, f), (f, t), (t, f), (t, t)), y):
+            triplets.append((i, j, yv.real, yv.imag))  # subtracted: out of the old ends
+        for (i, j), yv in zip(((f2, f2), (f2, t2), (t2, f2), (t2, t2)), y):
+            triplets.append((i, j, -yv.real, -yv.imag))  # added at the new ones
+        for old, new in ((f, f2), (t, t2)):
+            if old != new:
+                occupancy[old] -= 1
+                occupancy[new] += 1
+    for (name, el), g in moves.items():
+        if name.startswith(("line", "trafo")):
+            continue
+        old = int(topo.me_to_solver[topo.current[(name, el)]])
+        new = topo.solver(g)
+        if name == "shunt_bus":
+            y_sh = shunt_y[el]
+            triplets += [(old, old, y_sh.real, y_sh.imag), (new, new, -y_sh.real, -y_sh.imag)]
+        else:
+            s_inj = injection[(name, el)]
+            sbus += [(old, -s_inj), (new, s_inj)]
+        occupancy[old] -= 1
+        occupancy[new] += 1
+    # the base buses its moves empty (the spares are masked by the session unless used)
+    empty = [int(b) for b in np.flatnonzero(occupancy[: topo.plan.n_solver] == 0)]
+    return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y, empty_buses=empty, sbus=sbus)
 
 
 @dataclasses.dataclass
