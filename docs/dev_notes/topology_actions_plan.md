@@ -358,6 +358,23 @@ Disconnection-only strategies through `ContingencyAnalysisGPU` as plain continge
 time, iterations, statuses and flows vs the prototype. Gives the baseline of everything else
 and the share of time spent outside the GPU (host prep of 160 000 rows).
 
+**Result (2026-11-16, after steps A, A2, B.1)**, `benchmarks/topology_actions/conti_x_actions_pypowsybl.py`
+on a French snapshot (2024-05-20 07:00, 190 contingencies, 152 000 strategies, 800 action sets
+translated in 79 s), against the prototype's per-situation results (OpenLoadFlow parity, no
+contingency propagation); gpusim2grid with OpenLoadFlow's loading rules and the outer loops on
+every row, the permanent current limits of the network:
+
+| kind | situations | not run yet | status agrees | \|Δ max rho\| p50 | p99 | max | same worst branch |
+|---|---|---|---|---|---|---|---|
+| contingency | 185 | 0 | 100 % | 1.6e-8 | 1.3e-6 | 1.0e-5 | 100 % |
+| disconnection | 71 780 | 0 | 100 % | 1.9e-8 | 9.4e-6 | 1.8e-4 | 100 % |
+| no change | 58 275 | 0 | 100 % | 1.5e-8 | 1.6e-6 | 1.0e-5 | 100 % |
+| phase shifter tap | 740 | 0 | 100 % | 1.5e-8 | 8.0e-7 | 1.0e-5 | 100 % |
+| bus split / merge | 11 840 | 11 840 (B.2) | | | | | |
+
+29 action sets name elements this snapshot lacks. Times (a GPU shared with another job:
+indicative only): phase 1 0.4 s, phase 2 115 s for 146 490 strategies in chunks of 10 000.
+
 ### 8.3 Union pattern cost
 
 On the French case: base nnz(J) vs union nnz(J) with all the case's splits, LU fill (own LU
