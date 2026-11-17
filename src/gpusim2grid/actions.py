@@ -259,18 +259,38 @@ class Action:
 
     def apply_to(self, grid: LSGrid) -> None:
         """Make the action's lightsim2grid calls on ``grid`` (``change_bus*``, ``deactivate_*``,
-        ``change_ratio_trafo``, ``change_shift_trafo_deg``): what a row of the batch solves."""
+        ``change_ratio_trafo``, ``change_shift_trafo_deg``): what a row of the batch solves.
+
+        A branch end the action moves never closes the other end: a half-open branch stays
+        half-open, as a switch move leaves it (lightsim2grid's ``change_bus*`` alone would
+        reconnect it, grid2op's ``set_bus``); that end is opened again after the move."""
+        placed: set[ElementRef] = {(name, el) for name, el, bus in self.bus_items() if bus != DISCONNECTED}
+        moved_branches: set[ElementRef] = {
+            (_OTHER_END[name], el) for name, el in placed if name in _OTHER_END
+        } - placed
+        open_before: set[ElementRef] = {
+            ref for ref, _, bus in _element_ends(grid) if ref in moved_branches and bus == DISCONNECTED
+        }
         for name, el, bus in self.bus_items():
             if bus == DISCONNECTED:
                 getattr(grid, _DEACTIVATE[name])(int(el))
             else:
                 getattr(grid, _CHANGE_BUS[name])(int(el), int(bus))
+        for name, el in sorted(open_before):
+            getattr(grid, _DEACTIVATE[name])(int(el))
         for el, ratio in self.trafo_ratio.items():
             grid.change_ratio_trafo(int(el), float(ratio))
         for el, deg in self.trafo_shift_deg.items():
             grid.change_shift_trafo_deg(int(el), float(deg))
 
 
+#: the other end of a branch end
+_OTHER_END: dict[str, str] = {
+    "line_bus1": "line_bus2",
+    "line_bus2": "line_bus1",
+    "trafo_bus1": "trafo_bus2",
+    "trafo_bus2": "trafo_bus1",
+}
 _CHANGE_BUS: dict[str, str] = {
     "line_bus1": "change_bus1_powerline",
     "line_bus2": "change_bus2_powerline",

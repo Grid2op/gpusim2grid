@@ -1964,12 +1964,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "row, solver numbering, subtracted from the row's Ybus as the trips' own (a change to y_new is "
          "y_base - y_new). Every entry must be in the base pattern.")
     .def("set_spare_buses", &ContingencyAnalysisSession::set_spare_buses,
-         pybind11::arg("parents"), pybind11::arg("entries"),
+         pybind11::arg("parents"), pybind11::arg("entries"), pybind11::arg("spare_grid_bus") = std::vector<int>(),
          "Bus moves (topology actions): m = len(parents) spare buses appended after the n solver "
          "buses (ids n..n+m-1), spare k starting from solver bus parents[k]'s voltage; entries: the "
          "Ybus entries (i, j) over the n+m buses the rows need (explicit zeros in the base case). "
          "Rebuilds the base state on that union at once (n_bus is n+m afterwards); empty lists "
-         "restore the original base. Grid mode only.")
+         "restore the original base. Grid mode only. spare_grid_bus: each spare's grid bus (an empty "
+         "busbar), needed with the outer loops.")
     .def_property_readonly("n_spare_buses", &ContingencyAnalysisSession::n_spare_buses)
     .def("set_row_empty_buses", &ContingencyAnalysisSession::set_row_empty_buses, pybind11::arg("rows"),
          "After build_contingencies*(): per row, the BASE buses its moves leave without any element, "
@@ -1978,10 +1979,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "and no add_row_sbus_deltas bus on it), with no call.")
     .def("set_row_pv_moves", &ContingencyAnalysisSession::set_row_pv_moves,
          pybind11::arg("release"), pybind11::arg("pv"),
+         pybind11::arg("gen_bus") = std::vector<std::vector<std::pair<int, int>>>(),
          "After build_contingencies*(): per row, the voltage control of its moved generators: "
          "`release` the base PV buses it leaves without a regulator (PQ on that row), `pv` the "
-         "(bus, |V| pu) it holds PV (Q row pinned, |V| seeded at the set-point). Not with the outer "
-         "loops (such a row is unsupported).")
+         "(bus, |V| pu) it holds PV (Q row pinned, |V| seeded at the set-point); gen_bus the "
+         "(generator, solver bus) placements, for the outer loops.")
     .def("add_row_sbus_deltas", &ContingencyAnalysisSession::add_row_sbus_deltas, pybind11::arg("rows"),
          "After build_contingencies*(): per row, (bus, dS pu) added to the row's Sbus (an injection "
          "moved between buses), merged per bus with the row's trips.")

@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+struct LedgerData;
+
 namespace outer {
 
 // The device layout of the controls, fixed for the life of a model (solver
@@ -140,6 +142,9 @@ struct RowOverrides {
     std::vector<std::vector<int>> hvdc_off;
     // n_rows x n_storage, row-major: 1 = the row disconnects the storage unit
     std::vector<char> storage_off;
+    // per row, the (generator id, solver bus) it places on another bus of its substation (a
+    // topological action, OuterRowView::Units::bus_solver)
+    std::vector<std::vector<std::pair<int, int>>> gen_bus;
     // per row, the active power its contingency loses (MW, generator convention, at the
     // grid's targets) that DistributedSlack shares before its first solve (redistribute_slack,
     // lightsim2grid's OuterRowView::lost_p_mw); NaN: nothing to share
@@ -249,6 +254,13 @@ public:
     }
     // how many points the last run that kept them kept (its number of rows)
     virtual int n_row_points() const { return 0; }
+    // The session's buses grew by spare buses (topology actions, the last ones), or went back
+    // to the base (none): `ledger` the session's (spares included, switchable: PQ unless a row
+    // holds one PV), `spare_grid_bus` each spare's grid bus (an empty busbar of the grid).
+    virtual void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) {
+        (void)ledger;
+        if (!spare_grid_bus.empty()) throw std::runtime_error("this outer model cannot take spare buses");
+    }
 };
 
 }  // namespace outer

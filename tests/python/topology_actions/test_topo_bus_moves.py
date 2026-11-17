@@ -317,17 +317,59 @@ def test_generator_moves_lightsim2grid_refuses_are_unsupported():
     assert "slack" in reasons[1], reasons
 
 
-def test_generator_move_under_the_outer_loops_is_reported():
-    """With the outer loops, a strategy moving a generator is not run yet: reported per row."""
-    from gpusim2grid import RowStatus
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_closed_end_of_a_half_open_branch_moves(settings: dict[str, Any], solver_atol: float):
+    """A line open at one end in the base case: its closed end moves to bus 2 of its substation
+    with another branch end (its admittance, Kron-reduced onto the closed end, moves with it);
+    voltages and that end's current are lightsim2grid's."""
+    from gpusim2grid.actions import Action
 
     grid = case14()
-    grid.change_algorithm("NROuter_KLU")
+    # a line whose side-1 substation keeps a meshed bus 1 once two of its branch ends leave
+    line: int = next(ln.id for ln in grid.get_lines() if len(_branch_ends(grid, ln.bus1_id)) >= 4)
+    Action(line_bus2={line: -1}).apply_to(grid)
     grid.tell_solver_need_reset()
     assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), 30, 1e-8).size > 0
-    gen = next(g for g in grid.get_generators() if not g.is_slack)
-    a = _move(grid, gen.bus_id, [("gen_bus", gen.id), _branch_ends(grid, gen.bus_id)[0]])
-    ca, _ = _run(grid, dict(scheduling="continuous"), [[]], [a], [(0, [0])], outer_loops=True,
-                 init_from_n_powerflow=False)
-    assert ca.get_row_status()[1] == RowStatus.NOT_SIMULATED
-    assert "outer loops" in ca.get_batch_unsupported_reasons()[1]
+    sub: int = grid.get_lines()[line].bus1_id
+    others = [e for e in _branch_ends(grid, sub) if e != ("line_bus1", line)]
+    a = _move(grid, sub, [("line_bus1", line), others[0]])
+    ca, V = _run(grid, settings, [[]], [a], [(0, [0])])
+    assert not ca.get_batch_unsupported_reasons()[1]
+    V_ref, ref = oracle(grid, action=a)
+    assert_row_matches(V[1], V_ref, solver_atol)
+    ca.compute_flows()
+    or_ka = ca.or_amps.to_numpy().reshape(2, ca.n_branches)[1] * 1e-3
+    np.testing.assert_allclose(or_ka[line], ref.get_line_res1()[3][line], atol=10 * solver_atol, rtol=0)
+
+
+def _case14_with_group() -> LSGrid:
+    """The two-busbar case14 with a second generator on bus 1, at the same set-point: the two
+    regulate that bus together (a voltage-control group)."""
+    import pandapower as pp
+    import pandapower.networks as pn
+
+    from _topo_helpers import _two_busbars
+
+    net = pn.case14()
+    first = net.gen.index[net.gen.bus == 1][0]
+    pp.create_gen(net, bus=1, p_mw=10.0, vm_pu=float(net.gen.vm_pu[first]), min_q_mvar=-50.0, max_q_mvar=50.0)
+    return _two_busbars(net)
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_generator_of_a_group_moved_to_a_new_bus(settings: dict[str, Any], solver_atol: float):
+    """One of two generators regulating bus 1 together moves to bus 2 of the substation with a
+    branch end: it holds the new bus alone, the other one regulates bus 1 on (lightsim2grid's
+    one-off solve; its ScenarioSweep refuses this move)."""
+    grid = _case14_with_group()
+    on_bus1 = [g for g in grid.get_generators() if g.bus_id == 1 and not g.is_slack]
+    assert len(on_bus1) == 2
+    gen = on_bus1[1]
+    a = _move(grid, 1, [("gen_bus", gen.id), _branch_ends(grid, 1)[0]])
+    ca, V = _run(grid, settings, [[]], [a], [(0, [0])])
+    assert not ca.get_batch_unsupported_reasons()[1]
+    V_ref, _ = oracle(grid, action=a)
+    assert_row_matches(V[1], V_ref, solver_atol)
+    np.testing.assert_allclose(abs(V[1, bus2(grid, 1)]), gen.target_vm_pu, atol=solver_atol)
+    np.testing.assert_allclose(abs(V[1, 1]), on_bus1[0].target_vm_pu, atol=solver_atol)

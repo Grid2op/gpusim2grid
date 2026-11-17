@@ -171,9 +171,9 @@ _MOVE_UNSUPPORTED: dict[str, str] = {
 
 
 def _gen_move_unsupported(grid: LSGrid, el: int) -> str:
-    """Why generator ``el`` cannot move to another bus ("" when it can), as lightsim2grid's
-    ScenarioSweep refuses: the slack, a slack participant, a regulator of a remote bus or one
-    sharing the control of its bus with others (a voltage-control group)."""
+    """Why generator ``el`` cannot move to another bus ("" when it can): the slack, a slack
+    participant, a regulator of a remote bus (lightsim2grid's ScenarioSweep refuses them too; it
+    also refuses a member of a voltage-control group, which moves here)."""
     gens = grid.get_generators()
     gen = gens[el]
     name = f"gen_bus[{el}]"
@@ -185,10 +185,8 @@ def _gen_move_unsupported(grid: LSGrid, el: int) -> str:
         return ""
     if gen.regulated_bus_id != gen.bus_id:
         return f"{name}: a generator regulating a remote bus cannot move"
-    shared = [g.id for g in gens if g.id != el and g.connected and g.voltage_regulator_on
-              and g.regulated_bus_id == gen.regulated_bus_id]
-    if shared:
-        return f"{name}: it shares the voltage control of its bus with generator {shared[0]} (a group)"
+    # one of a voltage-control group (other machines regulating its bus) leaves the group and
+    # holds its new bus alone: the session drops it from the group on that row
     return ""
 
 
@@ -386,6 +384,8 @@ class StrategyRow:
     pv_release: list[int] = dataclasses.field(default_factory=list)
     #: (bus, |V| pu) its moved generators hold PV
     pv_set: list[tuple[int, float]] = dataclasses.field(default_factory=list)
+    #: (generator, solver bus) of every generator it moves (the outer loops see it there)
+    gen_bus: list[tuple[int, int]] = dataclasses.field(default_factory=list)
 
 
 def strategy_row(
@@ -465,15 +465,18 @@ def strategy_row(
         if b in branch_y:
             return StrategyRow(None, reason=f"branch {b} is moved and its value changed by one strategy")
         f, t = int(topo.branch_from[b]), int(topo.branch_to[b])
-        if f < 0 or t < 0:
-            return StrategyRow(None, reason=f"branch {b} is half-open: moving it is not supported")
+        # a half-open branch (an end open in the base case, -1): its block is lightsim2grid's
+        # effective one, Kron-reduced onto the closed end, (y, 0, 0, 0) -- only that end moves
+        # (placing the open one is a reconnection, refused by compile_action)
         y = topo.branch_y[b]
         for (i, j), yv in zip(((f, f), (f, t), (t, f), (t, t)), y):
-            triplets.append((i, j, yv.real, yv.imag))  # subtracted: out of the old ends
+            if i >= 0 and j >= 0:
+                triplets.append((i, j, yv.real, yv.imag))  # subtracted: out of the old ends
         for (i, j), yv in zip(((f2, f2), (f2, t2), (t2, f2), (t2, t2)), y):
-            triplets.append((i, j, -yv.real, -yv.imag))  # added at the new ones
+            if i >= 0 and j >= 0:
+                triplets.append((i, j, -yv.real, -yv.imag))  # added at the new ones
         for old, new in ((f, f2), (t, t2)):
-            if old != new:
+            if old != new and old >= 0 and new >= 0:
                 occupancy[old] -= 1
                 occupancy[new] += 1
     for (name, el), g in moves.items():
@@ -494,8 +497,9 @@ def strategy_row(
     pv_release, pv_set, why = _voltage_control_of_moves(moves, gen_vm, lists, topo)
     if why:
         return StrategyRow(None, reason=why)
+    gen_bus = sorted((el, topo.solver(g)) for (name, el), g in moves.items() if name == "gen_bus")
     return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y, empty_buses=empty, sbus=sbus,
-                       branch_ends=branch_ends, pv_release=pv_release, pv_set=pv_set)
+                       branch_ends=branch_ends, pv_release=pv_release, pv_set=pv_set, gen_bus=gen_bus)
 
 
 def _voltage_control_of_moves(

@@ -155,3 +155,18 @@ def test_combine_two_actions():
     assert Action.combine([a, a]) == a
     with pytest.raises(ValueError):
         Action.combine([Action(load_bus={2: 17}), Action(load_bus={2: 3})])
+
+
+def test_apply_to_leaves_a_half_open_branch_half_open():
+    """Moving the closed end of a branch open at its other end does not close that end (a switch
+    move does not; lightsim2grid's change_bus alone would reconnect the branch)."""
+    from gpusim2grid.actions import Action
+
+    grid = case14()
+    Action(line_bus2={2: -1}).apply_to(grid)
+    line = grid.get_lines()[2]
+    assert line.connected1 and not line.connected2
+    Action(line_bus1={2: bus2(grid, line.sub1_id)}).apply_to(grid)
+    moved = grid.get_lines()[2]
+    assert moved.connected1 and not moved.connected2
+    assert moved.bus1_id == bus2(grid, line.sub1_id)

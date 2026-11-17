@@ -458,6 +458,7 @@ public:
     void keep_row_points(bool keep) override { keep_points_ = keep; }
     void set_row_resume(std::vector<int> point_of_row) override;
     int n_row_points() const override { return static_cast<int>(row_points_.size()); }
+    void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) override;
 
 private:
     // ---- static data -------------------------------------------------------------
@@ -475,6 +476,15 @@ private:
     Layout layout_;
     double sn_ = 1.;
     int n_bus_ = 0, n_gen_ = 0, n_sto_ = 0;
+    // the base buses' tables (set_spare_buses appends the spares to copies of them)
+    struct BaseBuses {
+        bool saved = false;
+        int n_bus = 0;
+        ls2g::SolverBusLayout sbl;
+        std::vector<int> pin_bus, watch_bus, q_row_of_bus, pin_of_bus, sc_of_bus, slack_idx_of_bus, widx;
+        std::vector<std::vector<int>> vc_at_bus;
+        std::vector<char> hvdc_at_bus;
+    } base_buses_;
     int slack_bus_ = -1;
     std::vector<int> widx_;                  // solver bus -> watch index
     // per generator, the target P its reactive limits were last read at (gen_limits_at_outer_target)
@@ -1078,6 +1088,10 @@ void Ls2gOuterModel::build_slot0()
     SlotState& st = slot0_;
     st = SlotState();
     st.pq.assign(layout_.pin_bus.size(), 0);
+    // a spare bus (set_spare_buses) is PQ unless a row holds it PV (a generator moved onto it)
+    const int n_base = base_buses_.saved ? base_buses_.n_bus : n_bus_;
+    for (size_t k = 0; k < layout_.pin_bus.size(); ++k)
+        if (layout_.pin_bus[k] >= n_base) st.pq[k] = 1;
     st.held_q.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
     st.svc_on.assign(static_cast<size_t>(layout_.n_ctrl), NaN);
     st.hvdc_regime.assign(static_cast<size_t>(layout_.n_hvdc), 2);
@@ -1195,6 +1209,27 @@ void Ls2gOuterModel::load(int slot, int row)
                 if (br >= 0 && br < n_line_) st.rowv.lines.off[static_cast<size_t>(br)] = 1;
                 else if (br >= n_line_ && br < n_line_ + n_trafo_) st.rowv.trafos.off[static_cast<size_t>(br - n_line_)] = 1;
             }
+        }
+        // the generators it places on another bus (a topological action): the loops see them
+        // there (their own ReactiveLimits plan, DistributedSlack units); a regulating one
+        // holds its new bus PV at its set-point -- that bus' Q row pinned, |V| reset to it
+        if (r < ov_.gen_bus.size() && !ov_.gen_bus[r].empty()) {
+            st.rowv.gens.bus_solver.assign(static_cast<size_t>(n_gen_), ls2g::OuterRowView::Units::GRID_BUS);
+            const auto& gens = grid_->get_generators();
+            for (const auto& [g, bus] : ov_.gen_bus[r]) {
+                if (g < 0 || g >= n_gen_ || bus < 0 || bus >= n_bus_)
+                    throw std::runtime_error("outer model: generator " + std::to_string(g) + " placed on bus "
+                                             + std::to_string(bus) + ", outside the solver buses");
+                st.rowv.gens.bus_solver[static_cast<size_t>(g)] = bus;
+                if (!gens.get_voltage_regulator_on(g)) continue;
+                const int k = pin_of_bus_[static_cast<size_t>(bus)];
+                if (k < 0)
+                    throw std::runtime_error("outer model: generator " + std::to_string(g) + " moved onto bus "
+                                             + std::to_string(bus) + ", which the outer loops' ledger has not reserved");
+                st.pq[static_cast<size_t>(k)] = 0;
+                reset_vm(st, bus, static_cast<double>(gens.get_target_vm_pu(g)));
+            }
+            changes_units = true;
         }
         // the switchable buses a generator contingency leaves without a regulator start PQ
         if (r < ov_.pq_buses.size())
@@ -3171,6 +3206,82 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status, co
         r.gens_target_p_mw = std::move(st.gen_target_p);
     }
     return Next::Done;
+}
+
+void Ls2gOuterModel::set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus)
+{
+    BaseBuses& b = base_buses_;
+    if (!b.saved) {
+        b.n_bus = n_bus_;
+        b.sbl = sbl_;
+        b.pin_bus = layout_.pin_bus;
+        b.watch_bus = layout_.watch_bus;
+        b.q_row_of_bus = q_row_of_bus_;
+        b.pin_of_bus = pin_of_bus_;
+        b.sc_of_bus = sc_of_bus_;
+        b.slack_idx_of_bus = slack_idx_of_bus_;
+        b.widx = widx_;
+        b.vc_at_bus = vc_at_bus_;
+        b.hvdc_at_bus = hvdc_at_bus_;
+        b.saved = true;
+    }
+    // back to the base ...
+    n_bus_ = b.n_bus;
+    sbl_ = b.sbl;
+    layout_.pin_bus = b.pin_bus;
+    layout_.watch_bus = b.watch_bus;
+    q_row_of_bus_ = b.q_row_of_bus;
+    pin_of_bus_ = b.pin_of_bus;
+    sc_of_bus_ = b.sc_of_bus;
+    slack_idx_of_bus_ = b.slack_idx_of_bus;
+    widx_ = b.widx;
+    vc_at_bus_ = b.vc_at_bus;
+    hvdc_at_bus_ = b.hvdc_at_bus;
+    const int m = static_cast<int>(spare_grid_bus.size());
+    if (m > 0) {
+        // ... then the spares appended: each its own grid bus in the labelling (an empty busbar
+        // of the base grid, as lightsim2grid's union layout keeps it), PQ, no slack share
+        const int n0 = b.n_bus;
+        if (ledger.n_bus != n0 + m)
+            throw std::runtime_error("outer model: the ledger has " + std::to_string(ledger.n_bus) + " buses, not "
+                                     + std::to_string(n0) + " + " + std::to_string(m) + " spares");
+        using SolverId = std::decay_t<decltype(std::as_const(sbl_.id_me_to_solver)[0])>;
+        using GlobalId = std::decay_t<decltype(std::as_const(sbl_.id_solver_to_me)[0])>;
+        for (int k = 0; k < m; ++k) {
+            const int me = spare_grid_bus[static_cast<size_t>(k)];
+            if (me < 0 || static_cast<size_t>(me) >= sbl_.id_me_to_solver.size()
+                    || sbl_.id_me_to_solver[me].cast_int() != ls2g::BaseConstants::_deactivated_bus_id)
+                throw std::runtime_error("outer model: spare bus " + std::to_string(n0 + k) + " on grid bus "
+                                         + std::to_string(me) + ", which is not an empty bus of the grid");
+            sbl_.id_me_to_solver[me] = SolverId(n0 + k);
+            sbl_.id_solver_to_me.push_back(GlobalId(me));
+            sbl_.bus_pq.push_back(SolverId(n0 + k));
+        }
+        for (ls2g::RealVect* w : {&sbl_.slack_weights, &sbl_.slack_raw_weights})
+            if (w->size() == n0) { w->conservativeResize(n0 + m); w->tail(m).setZero(); }
+        n_bus_ = n0 + m;
+        q_row_of_bus_ = ledger.q_row_of_bus;
+        // switchable: the base ones, then the spares (PQ by default, see build_slot0)
+        if (ledger.switchable_vm_buses.size() != b.pin_bus.size() + static_cast<size_t>(m)
+                || !std::equal(b.pin_bus.begin(), b.pin_bus.end(), ledger.switchable_vm_buses.begin()))
+            throw std::runtime_error("outer model: the ledger's switchable buses are not the base ones and the spares");
+        layout_.pin_bus = ledger.switchable_vm_buses;
+        pin_of_bus_.assign(static_cast<size_t>(n_bus_), -1);
+        for (size_t k = 0; k < layout_.pin_bus.size(); ++k)
+            pin_of_bus_[static_cast<size_t>(layout_.pin_bus[k])] = static_cast<int>(k);
+        sc_of_bus_.resize(static_cast<size_t>(n_bus_), -1);
+        if (!slack_idx_of_bus_.empty()) slack_idx_of_bus_.resize(static_cast<size_t>(n_bus_), -1);
+        vc_at_bus_.resize(static_cast<size_t>(n_bus_));
+        hvdc_at_bus_.resize(static_cast<size_t>(n_bus_), 0);
+        // watched: a moved generator's ReactiveLimits reads its new bus
+        widx_.resize(static_cast<size_t>(n_bus_), -1);
+        for (int k = 0; k < m; ++k) {
+            widx_[static_cast<size_t>(n0 + k)] = static_cast<int>(layout_.watch_bus.size());
+            layout_.watch_bus.push_back(n0 + k);
+        }
+    }
+    hvdc_va_scratch_ = ls2g::RealVect::Zero(n_bus_);
+    vm_v_scratch_ = ls2g::CplxVect::Zero(n_bus_);
 }
 
 void Ls2gOuterModel::set_row_resume(std::vector<int> point_of_row)

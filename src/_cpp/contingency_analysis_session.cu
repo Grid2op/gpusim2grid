@@ -125,8 +125,14 @@ void ContingencyAnalysisSession::_build_base_state(const std::vector<int>& switc
             const auto& Ybus_base_rm = union_active_ ? Ybus_rm_orig_ : Ybus_rm_;
             if (ref_bus_ >= 0 && ref_bus_ != grid_ref_bus_) move_reference(moved, ref_bus_, Ybus_base_rm);
             // bus moves (set_spare_buses): the spare buses and the union pattern, appended
-            if (union_active_)
+            if (union_active_) {
                 extend_ledger_union(moved, static_cast<int>(spare_parents_.size()), Ybus_rm_, Ybus_rm_orig_);
+                // the outer loops: every spare switchable (PQ unless a row's moved generator
+                // holds it PV, the model's controls per slot)
+                if (outer_)
+                    for (size_t k = 0; k < spare_parents_.size(); ++k)
+                        moved.switchable_vm_buses.push_back(n_orig_bus_ + static_cast<int>(k));
+            }
             // a generator trip releasing a bus it held alone: a Vm column + Q row for it,
             // pinned on the rows that keep it PV (see run())
             if (!switchable_buses.empty()) add_switchable_vm_buses(moved, switchable_buses, Ybus_rm_);
@@ -154,6 +160,8 @@ void ContingencyAnalysisSession::_build_base_state(const std::vector<int>& switc
     // consulted by run() when handle_disconnected_grid_ is enabled.
     mask_cfg_ = build_mask_config(*base_state_, ledger_ptr);
     reserved_buses_ = base_state_->h_switchable_buses;
+    if (outer_ && ledger_ptr != nullptr)
+        outer_->set_spare_buses(*ledger_ptr, union_active_ ? spare_grid_bus_ : std::vector<int>());
 }
 
 int ContingencyAnalysisSession::_wanted_reference_bus()
@@ -371,6 +379,7 @@ void ContingencyAnalysisSession::build_contingencies_full(
     ctg_sbus_ds_          = std::move(ctg_sbus_ds);
     row_pv_release_.clear();
     row_pv_set_.clear();
+    row_gen_bus_.clear();
     ctg_shunts_ = shunt_ids_per_ctg;
     ctg_loads_  = load_ids_per_ctg;
     ctg_gens_   = gen_ids_per_ctg;
@@ -455,7 +464,15 @@ void ContingencyAnalysisSession::run()
                 }
         std::vector<int> vc_tripped;
         if (why.empty() && base_ledger_) {
-            vc_tripped = gen_contingency::tripped_controllers(*base_ledger_, ctg_gens_[c], ctg_more_[c].svcs, ctg_more_[c].hvdcs);
+            // ... and the generators its actions move to another bus (set_row_pv_moves): one of a
+            // voltage-control group leaves the group (the others regulate its bus on), and holds
+            // its new bus on its own (a local PV bus, pinned per row)
+            std::vector<int> gens = ctg_gens_[c];
+            if (c < row_gen_bus_.size())
+                for (const auto& gb : row_gen_bus_[c]) gens.push_back(gb.first);
+            std::sort(gens.begin(), gens.end());
+            gens.erase(std::unique(gens.begin(), gens.end()), gens.end());
+            vc_tripped = gen_contingency::tripped_controllers(*base_ledger_, gens, ctg_more_[c].svcs, ctg_more_[c].hvdcs);
             why = gen_contingency::tripped_controllers_unsupported(*base_ledger_, vc_tripped);
         }
         if (!why.empty()) vc_tripped.clear();
@@ -521,12 +538,21 @@ void ContingencyAnalysisSession::run()
                             || (r < row_pv_set_.size() && !row_pv_set_[r].empty());
             if (!moves || !unsupported[r].empty()) continue;
             if (outer_) {
-                unsupported[r] = "a generator moved to another bus is not supported with the outer loops yet";
-                continue;
+                // the outer loops' ledger reserved its switchable buses up front: a released bus
+                // and a bus held PV must be among them (a moved generator's own bus is: every bus
+                // a machine holds, every spare)
+                const std::vector<int>& sw = base_state_->h_switchable_buses;
+                const auto reserved = [&sw](int b) { return std::binary_search(sw.begin(), sw.end(), b); };
+                for (int b : r < row_pv_release_.size() ? row_pv_release_[r] : std::vector<int>())
+                    if (!reserved(b)) { unsupported[r] = "releases bus " + std::to_string(b) + ", which the outer loops' ledger has not reserved"; break; }
+                for (const auto& bv : r < row_pv_set_.size() ? row_pv_set_[r] : std::vector<std::pair<int, double>>())
+                    if (unsupported[r].empty() && !reserved(bv.first))
+                        unsupported[r] = "holds bus " + std::to_string(bv.first) + " PV, which the outer loops' ledger has not reserved";
+                if (!unsupported[r].empty()) continue;
             }
             if (r >= row_pv_release_.size()) continue;
             std::vector<int>& to_pq = row_pv_to_pq_[r];
-            for (int b : row_pv_release_[r]) { to_pq.push_back(b); required.push_back(b); }
+            for (int b : row_pv_release_[r]) { to_pq.push_back(b); if (!outer_) required.push_back(b); }
             std::sort(to_pq.begin(), to_pq.end());
             to_pq.erase(std::unique(to_pq.begin(), to_pq.end()), to_pq.end());
         }
@@ -892,7 +918,13 @@ void ContingencyAnalysisSession::run()
             for (size_t r = 0; r < ctg_gens_.size(); ++r)
                 for (int g : ctg_gens_[r]) ov.gen_off[r * static_cast<size_t>(n_gen) + static_cast<size_t>(g)] = 1;
         }
-        if (any_controller_trip) ov.pq_buses = row_pv_to_pq_;
+        if (any_controller_trip || !row_pv_release_.empty()) ov.pq_buses = row_pv_to_pq_;
+        // ... and the generators it places on another bus (topology actions)
+        if (!row_gen_bus_.empty()) {
+            ov.gen_bus.assign(contingencies_.size(), {});
+            for (size_t r = 0; r < row_gen_bus_.size() && r < contingencies_.size(); ++r)
+                if (row_unsupported_[r].empty()) ov.gen_bus[r] = row_gen_bus_[r];
+        }
         // ... and the controllers of the voltage-control groups it trips
         ov.vc_tripped.resize(contingencies_.size());
         for (size_t r = 0; r < contingencies_.size(); ++r) ov.vc_tripped[r] = contingencies_[r].vc_tripped;
@@ -1468,7 +1500,8 @@ void ContingencyAnalysisSession::add_row_triplets(
 // bus moves on a union pattern (docs/dev_notes/topology_actions_plan.md, step B.2)
 // =============================================================================
 void ContingencyAnalysisSession::set_spare_buses(const std::vector<int>& parents,
-                                                 const std::vector<std::pair<int, int>>& entries)
+                                                 const std::vector<std::pair<int, int>>& entries,
+                                                 const std::vector<int>& spare_grid_bus)
 {
     static const char* who = "ContingencyAnalysisSession::set_spare_buses";
     if (!base_ledger_)
@@ -1491,6 +1524,9 @@ void ContingencyAnalysisSession::set_spare_buses(const std::vector<int>& parents
         if (i < 0 || j < 0 || i >= n + m || j >= n + m)
             throw std::runtime_error(std::string(who) + ": entry (" + std::to_string(i) + ", " + std::to_string(j)
                                      + ") outside the " + std::to_string(n + m) + " buses");
+    if (outer_ && m > 0 && spare_grid_bus.size() != parents.size())
+        throw std::runtime_error(std::string(who) + ": with the outer loops, each spare bus needs its grid bus "
+                                 "(spare_grid_bus)");
     const bool active = m > 0 || !entries.empty();   // a merge needs entries, no spare bus
     // the same union as now: keep the pattern, the analysis and the driver (no rebuild)
     if (active == union_active_ && parents == spare_parents_ && entries == spare_entries_) return;
@@ -1531,9 +1567,12 @@ void ContingencyAnalysisSession::set_spare_buses(const std::vector<int>& parents
     }
     spare_parents_ = parents;
     spare_entries_ = entries;
+    spare_grid_bus_ = active ? spare_grid_bus : std::vector<int>();
     union_active_  = active;
     ++contingencies_generation_;          // the rows resolve on the new Ybus at the next run()
-    _build_base_state(reserved_buses_);   // the base state (and no driver) on the new buses
+    // the base state (and no driver) on the new buses; the outer loops' ledger carries its
+    // own switchable buses (spares included, below)
+    _build_base_state(outer_ ? std::vector<int>() : reserved_buses_);
 }
 
 void ContingencyAnalysisSession::set_row_empty_buses(const std::vector<std::vector<int>>& rows)
@@ -1560,7 +1599,8 @@ void ContingencyAnalysisSession::set_row_empty_buses(const std::vector<std::vect
 }
 
 void ContingencyAnalysisSession::set_row_pv_moves(const std::vector<std::vector<int>>& release,
-                                                  const std::vector<std::vector<std::pair<int, double>>>& pv)
+                                                  const std::vector<std::vector<std::pair<int, double>>>& pv,
+                                                  const std::vector<std::vector<std::pair<int, int>>>& gen_bus)
 {
     static const char* who = "ContingencyAnalysisSession::set_row_pv_moves";
     if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
@@ -1585,6 +1625,14 @@ void ContingencyAnalysisSession::set_row_pv_moves(const std::vector<std::vector<
         rel.erase(std::unique(rel.begin(), rel.end()), rel.end());
     }
     row_pv_set_ = pv;
+    if (!gen_bus.empty() && gen_bus.size() != contingencies_.size())
+        throw std::runtime_error(std::string(who) + ": one gen_bus list per row");
+    for (const auto& row : gen_bus)
+        for (const auto& [g, b] : row)
+            if (g < 0 || b < 0 || b >= n_bus)
+                throw std::runtime_error(std::string(who) + ": generator " + std::to_string(g) + " placed on bus "
+                                         + std::to_string(b) + ", outside the solver buses");
+    row_gen_bus_ = gen_bus;
     ++contingencies_generation_;
 }
 

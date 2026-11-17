@@ -176,6 +176,7 @@ struct ContingencyAnalysisSession {
     // set_spare_buses: the spare buses' parents and the union entries; the base inputs
     // before any spare (restored by an empty call); n_orig_bus_ = their bus count.
     std::vector<int>                 spare_parents_;
+    std::vector<int>                 spare_grid_bus_;
     std::vector<std::pair<int, int>> spare_entries_;
     bool                             union_active_ = false;   // spare buses or union entries (a merge)
     int                              n_orig_bus_ = 0;
@@ -264,6 +265,7 @@ struct ContingencyAnalysisSession {
     // set_row_pv_moves, per row (empty: no row has one)
     std::vector<std::vector<int>> row_pv_release_;
     std::vector<std::vector<std::pair<int, double>>> row_pv_set_;
+    std::vector<std::vector<std::pair<int, int>>> row_gen_bus_;
     bool has_gen_trips_ = false;
     // the buses the base ledger was extended with (a generator trip releases them
     // on some row), and the ones each row releases
@@ -492,7 +494,10 @@ struct ContingencyAnalysisSession {
     // P / Q rows pinned in the base solve): n_bus() is n+m afterwards, and the contingency
     // rows' triplets resolve on the union at the next run(). Empty lists restore the
     // original base (today's path). Grid (ledger) mode only.
-    void set_spare_buses(const std::vector<int>& parents, const std::vector<std::pair<int, int>>& entries);
+    // spare_grid_bus: each spare's grid bus (an empty busbar of the grid), needed with the
+    // outer loops (their labelling has the spares under it); may be empty otherwise.
+    void set_spare_buses(const std::vector<int>& parents, const std::vector<std::pair<int, int>>& entries,
+                         const std::vector<int>& spare_grid_bus = {});
     int  n_spare_buses() const { return static_cast<int>(spare_parents_.size()); }
     // Masking per row: a spare bus is masked in a row by DEFAULT, unless the row uses it --
     // one of its add_row_triplets entries (row or col) or one of its add_row_sbus_deltas
@@ -508,8 +513,11 @@ struct ContingencyAnalysisSession {
     // control: `release` the PV buses it leaves without a regulator (PQ for that row: reserved
     // like a generator trip's), `pv` the (bus, |V| pu) it holds PV (Q row pinned, |V| seeded at
     // the set-point). Not with the outer loops (such a row is reported unsupported).
+    // gen_bus: per row, the (generator, solver bus) placements of its moved generators, for
+    // the outer loops (they see each generator on its row's bus); may be empty without them.
     void set_row_pv_moves(const std::vector<std::vector<int>>& release,
-                          const std::vector<std::vector<std::pair<int, double>>>& pv);
+                          const std::vector<std::vector<std::pair<int, double>>>& pv,
+                          const std::vector<std::vector<std::pair<int, int>>>& gen_bus = {});
     void clear_v_init_groups();
     bool has_v_init_groups() const { return has_v_groups_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real

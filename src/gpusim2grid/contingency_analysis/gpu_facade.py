@@ -1045,6 +1045,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         # per session row, the voltage control of its moved generators
         session_release: list[list[int]] = []
         session_pv: list[list[tuple[int, float]]] = []
+        session_gen_bus: list[list[tuple[int, int]]] = []
         self._row_branch = {}
         if out_ctg:
             session_rows += range(len(ctg))
@@ -1054,6 +1055,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             session_sbus += [[] for _ in ctg]
             session_release += [[] for _ in ctg]
             session_pv += [[] for _ in ctg]
+            session_gen_bus += [[] for _ in ctg]
         if out_str:
             sel = self._strategy_selected
             off: int = len(ctg) if out_ctg else 0
@@ -1073,6 +1075,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 session_sbus.append(row.sbus)
                 session_release.append(row.pv_release)
                 session_pv.append(row.pv_set)
+                session_gen_bus.append(row.gen_bus)
                 changed: dict[int, RowBranch] = {b: (y, int(bf[b]), int(bt[b])) for b, y in row.branch_y.items()}
                 if row.branch_ends:
                     assert topo is not None  # moves run on the union pattern
@@ -1091,8 +1094,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 session.set_row_empty_buses(session_empty)
             if any(session_sbus):
                 session.add_row_sbus_deltas(session_sbus)
-            if any(session_release) or any(session_pv):
-                session.set_row_pv_moves(session_release, session_pv)
+            if any(session_release) or any(session_pv) or any(session_gen_bus):
+                session.set_row_pv_moves(session_release, session_pv, session_gen_bus)
             self._inner.batch_size = int(batch_size)
             if self._outer_loops:
                 # the outer loops resume as the voltages do: phase 1 keeps where each contingency's
@@ -1139,7 +1142,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if plan.is_empty():
             return self._prepare_union_none()
         if self._union is None or (plan.parents, plan.entries) != (self._union.parents, self._union.entries):
-            self._inner._s.set_spare_buses(plan.parents, plan.entries)
+            self._inner._s.set_spare_buses(plan.parents, plan.entries, plan.spare_global)
         self._union = plan
         return topology_context(self._grid, plan, n_lines, bf, bt)
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import pytest
 
+from gpusim2grid import RowStatus
 from gpusim2grid.actions import Action
 
 from _topo_helpers import batch_V_global, make_ca
@@ -262,7 +263,8 @@ def _start(grid: LSGrid, V: np.ndarray) -> np.ndarray:
 
 
 def _topo_action(grid: LSGrid, action: Action) -> Any:
-    """``action``'s branch moves as a lightsim2grid TopoAction (grid2op set_bus, local busbars)."""
+    """``action``'s branch and generator moves as a lightsim2grid TopoAction (grid2op set_bus,
+    local busbars)."""
     import lightsim2grid.lightsim2grid_cpp as cpp
 
     ta = cpp.TopoAction()
@@ -272,6 +274,7 @@ def _topo_action(grid: LSGrid, action: Action) -> Any:
         ("line_bus2", cpp.ElementType.line_ex),
         ("trafo_bus1", cpp.ElementType.trafo_hv),
         ("trafo_bus2", cpp.ElementType.trafo_lv),
+        ("gen_bus", cpp.ElementType.gen),
     ):
         for el, bus in getattr(action, name).items():
             ta.add_element(kind, int(el), int(bus) // n_sub + 1)
@@ -312,8 +315,6 @@ def test_bus_splits_under_the_outer_loops(case14_two_busbars: LSGrid, settings: 
     row resumed from the contingency's solve (warm), or its one-off solve; a row lightsim2grid
     does not converge does not converge either. A strategy moving the line its contingency trips
     is not run (it would put it back)."""
-    from gpusim2grid import RowStatus
-
     grid: LSGrid = case14_two_busbars
     actions: list[Action] = _splits(grid)
     strategies = [(c, [a]) for c in range(len(SPLIT_CONTINGENCIES)) for a in range(len(actions))]
@@ -348,3 +349,147 @@ def test_bus_splits_under_the_outer_loops(case14_two_busbars: LSGrid, settings: 
         np.testing.assert_allclose(V[r][on], V_ref[on], atol=1e-9, rtol=0, err_msg=f"strategy {r}")
         compared += 1
     assert compared >= 6
+
+
+# ---- generator moves under the outer loops ----------------------------------------------------
+def _case14_gen_moves() -> LSGrid:
+    """The two-busbar outer-loop case14 whose generators 1-3 take no part in the slack (a slack
+    participant does not move, in lightsim2grid either): generator 0 and the slack share it."""
+    import pandapower.networks as pn
+
+    from _topo_helpers import _two_busbars
+
+    net = cast("pandapowerNet", pn.case14())
+    net.gen["min_q_mvar"] = -15.0
+    net.gen["max_q_mvar"] = 15.0
+    grid: LSGrid = _two_busbars(net)
+    n_gen: int = len(grid.get_generators())
+    grid.set_gen_p_limits(np.zeros(n_gen), np.full(n_gen, 300.0))
+    participates: list[bool] = [g.id == 0 or g.is_slack for g in grid.get_generators()]
+    grid.set_gen_can_participate_slack(participates, np.full(n_gen, 300.0))
+    grid.change_algorithm(OUTER)
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    return grid
+
+
+@pytest.fixture(scope="module")
+def case14_gen_moves() -> LSGrid:
+    return _case14_gen_moves()
+
+
+def _gen_moves(grid: LSGrid) -> list[Action]:
+    """Generators 1-3 each moved to busbar 2 of their substation with one branch end (a new bus
+    the generator holds PV, its former one left PQ)."""
+    from test_topo_bus_moves import _branch_ends, _move
+
+    out: list[Action] = []
+    for gen in (grid.get_generators()[g] for g in (1, 2, 3)):
+        out.append(_move(grid, gen.bus_id, [("gen_bus", int(gen.id)), _branch_ends(grid, gen.bus_id)[0]]))
+    return out
+
+
+def _frozen_at_end(decisions: list[str]) -> set[int]:
+    """The buses a row's ReactiveLimits trace leaves frozen (PV_TO_PQ taken, not released since)."""
+    frozen: set[int] = set()
+    for d in decisions:
+        if "not taken" in d or "ReactiveLimits" not in d:
+            continue
+        bus = int(d.split("element ")[1].split(",")[0])
+        if " PV_TO_PQ" in d:
+            frozen.add(bus)
+        elif " PQ_TO_PV" in d:
+            frozen.discard(bus)
+    return frozen
+
+
+@pytest.mark.parametrize("settings", SETTINGS)
+def test_generator_moves_under_the_outer_loops(case14_gen_moves: LSGrid, settings: dict[str, Any]):
+    """From scratch, a generator moved to another bus under the outer loops is lightsim2grid's
+    one-off solve: its new bus regulated (ReactiveLimits on it), its former one PQ."""
+    grid: LSGrid = case14_gen_moves
+    actions: list[Action] = _gen_moves(grid)
+    strategies = [(c, [a]) for c in range(len(SPLIT_CONTINGENCIES)) for a in range(len(actions))]
+    ca = make_ca(
+        grid,
+        settings,
+        batch_size=4,
+        outer_loops=True,
+        init_from_n_powerflow=False,
+        tol=TOL_MVA / grid.get_sn_mva(),
+    )
+    ca.add_contingencies_by_branch_id(SPLIT_CONTINGENCIES)
+    ca.set_actions(actions)
+    ca.add_strategies(strategies)
+    ca.compute(batch_size=4, rows="contingencies")
+    ca.compute(batch_size=4, rows="strategies")
+    V: np.ndarray = batch_V_global(ca, len(strategies), grid.total_bus())
+    status: np.ndarray = ca.get_row_status()
+    reasons: list[str] = ca.get_batch_unsupported_reasons()
+    compared: int = 0
+    for r, (c, (a,)) in enumerate(strategies):
+        lines: list[int] = SPLIT_CONTINGENCIES[c]
+        assert not reasons[r], reasons[r]
+        V_ref = _split_reference(grid, lines, actions[a], False)
+        if V_ref is None:
+            assert status[r] != RowStatus.CONVERGED, f"strategy {r}"
+            continue
+        on: np.ndarray = np.abs(V_ref) > 0
+        np.testing.assert_allclose(V[r][on], V_ref[on], atol=1e-9, rtol=0, err_msg=f"strategy {r}")
+        compared += 1
+    assert compared >= 6
+
+
+@pytest.mark.parametrize("settings", SETTINGS)
+def test_generator_moves_resume_their_contingency(case14_gen_moves: LSGrid, settings: dict[str, Any]):
+    """Warm-started, a strategy moving a generator resumes from its contingency's outer state: a
+    bus its contingency left frozen (still holding a machine) is not frozen again, and the moved
+    generator's new bus is at its set-point unless the row's own check froze it.
+
+    No lightsim2grid reference here: its ScenarioSweep with the outer loops leaves a moved
+    generator's new bus unregulated (Q = 0, PQ; its one-off solve and its ScenarioSweep without
+    outer loops do regulate it), and the batch is its only solve resuming a row."""
+    grid: LSGrid = case14_gen_moves
+    actions: list[Action] = _gen_moves(grid)
+    strategies = [(c, [a]) for c in range(len(SPLIT_CONTINGENCIES)) for a in range(len(actions))]
+    ca = make_ca(
+        grid,
+        settings,
+        batch_size=4,
+        outer_loops=True,
+        init_from_n_powerflow=False,
+        tol=TOL_MVA / grid.get_sn_mva(),
+        keep_outer_trace=True,
+    )
+    ca.add_contingencies_by_branch_id(SPLIT_CONTINGENCIES)
+    ca.set_actions(actions)
+    ca.add_strategies(strategies)
+    ca.strategy_warm_start = True
+    ca.compute(batch_size=4, rows="contingencies")
+    ctg_frozen: list[set[int]] = [_frozen_at_end(r.decisions) for r in ca.get_outer_results()]
+    ca.compute(batch_size=4, rows="strategies")
+    V: np.ndarray = batch_V_global(ca, len(strategies), grid.total_bus())
+    status: np.ndarray = ca.get_row_status()
+    results = ca.get_outer_results()
+    gens = grid.get_generators()
+    solver_of: dict[int, int] = {int(b): k for k, b in enumerate(ca.batch_bus_ids)}
+    checked: int = 0
+    for r, (c, (a,)) in enumerate(strategies):
+        if _split_reference(grid, SPLIT_CONTINGENCIES[c], actions[a], False) is None:
+            continue  # lightsim2grid does not converge it either, from scratch
+        assert status[r] == RowStatus.CONVERGED, f"strategy {r}"
+        ((g, new_bus),) = actions[a].gen_bus.items()
+        # the traces name buses as the solver does (spares after the base buses)
+        new_solver: int = solver_of[new_bus]
+        old_bus: int = solver_of[gens[g].bus_id]
+        decisions: list[str] = results[r].decisions
+        refrozen = {
+            int(d.split("element ")[1].split(",")[0])
+            for d in decisions
+            if " PV_TO_PQ" in d and "not taken" not in d
+        }
+        assert not (refrozen & (ctg_frozen[c] - {old_bus})), (r, refrozen, ctg_frozen[c])
+        if new_solver not in _frozen_at_end(decisions):
+            assert abs(V[r][new_bus]) == pytest.approx(gens[g].target_vm_pu, abs=1e-9), r
+        checked += 1
+    assert checked >= 6
