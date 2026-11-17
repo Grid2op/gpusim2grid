@@ -634,3 +634,59 @@ def test_current_counts_of_moved_branches_past_the_capacity(settings: dict[str, 
     # the most severe two of lightsim2grid's
     sev = np.sort(np.concatenate([i1 / lim1, i2 / lim2]) - 1.0)[::-1]
     np.testing.assert_allclose(sorted((v.value / v.limit - 1.0 for v in currents), reverse=True), sev[:2], rtol=1e-6)
+
+
+def _case14_two_shunts() -> LSGrid:
+    """The two-busbar case14 (its shunt on bus 8) with a second shunt on bus 4 drawing active
+    power too, so both parts of the admittance are exercised."""
+    import pandapower as pp
+    import pandapower.networks as pn
+
+    from _topo_helpers import _two_busbars
+
+    net = pn.case14()
+    pp.create_shunt(net, bus=4, q_mvar=-6.0, p_mw=1.5)
+    return _two_busbars(net)
+
+
+def _shunt_admittance_reference(grid: LSGrid, shunt: int) -> complex:
+    """lightsim2grid's own Ybus diagonal contribution of a shunt: the solver Ybus of the grid
+    minus the one of a copy without the shunt (the definition, no convention to guess)."""
+    import copy
+
+    bus: int = int(grid.id_me_to_ac_solver()[grid.get_shunts()[shunt].bus_id])
+    without = copy.deepcopy(grid)
+    without.deactivate_shunt(shunt)
+    without.tell_solver_need_reset()
+    assert without.ac_pf(np.asarray(grid.get_V(), dtype=complex), 30, 1e-8).size > 0
+    return complex(grid.get_Ybus_solver()[bus, bus] - without.get_Ybus_solver()[bus, bus])
+
+
+def test_shunt_admittance_is_lightsim2grids():
+    """The admittance a moved shunt carries is the one lightsim2grid stamps (p and q parts)."""
+    from gpusim2grid.contingency_analysis._strategies import _shunt_admittance
+
+    grid = _case14_two_shunts()
+    assert len(grid.get_shunts()) == 2
+    for s in range(len(grid.get_shunts())):
+        y_ref = _shunt_admittance_reference(grid, s)
+        assert abs(y_ref.real) > 0 or s == 0
+        np.testing.assert_allclose(_shunt_admittance(grid, s), y_ref, rtol=1e-12, atol=0)
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_shunt_moves_match_lightsim2grid(settings: dict[str, Any], solver_atol: float):
+    """Each shunt moved to bus 2 of its substation with a branch end, with and without a
+    contingency: every row is lightsim2grid's one-off solve."""
+    grid = _case14_two_shunts()
+    actions = []
+    for sh in grid.get_shunts():
+        # its second branch end ([0] with contingency [7] islands part of the grid)
+        actions.append(_move(grid, sh.bus_id, [("shunt_bus", sh.id), _branch_ends(grid, sh.bus_id)[1]]))
+    ctgs = [[], [7]]
+    strategies = [(c, [a]) for c in range(len(ctgs)) for a in range(len(actions))]
+    ca, V = _run(grid, settings, ctgs, actions, strategies)
+    for r, (c, (a,)) in enumerate(strategies):
+        assert not ca.get_batch_unsupported_reasons()[len(ctgs) + r]
+        V_ref, _ = oracle(grid, branches=ctgs[c], action=actions[a])
+        assert_row_matches(V[len(ctgs) + r], V_ref, solver_atol)
