@@ -373,3 +373,37 @@ def test_generator_of_a_group_moved_to_a_new_bus(settings: dict[str, Any], solve
     assert_row_matches(V[1], V_ref, solver_atol)
     np.testing.assert_allclose(abs(V[1, bus2(grid, 1)]), gen.target_vm_pu, atol=solver_atol)
     np.testing.assert_allclose(abs(V[1, 1]), on_bus1[0].target_vm_pu, atol=solver_atol)
+
+
+@pytest.mark.parametrize("threshold", [1.0, 0.95], ids=["t1", "t095"])
+@pytest.mark.parametrize("reread", [False, True], ids=["ctor_limits", "set_limits_from_grid_after_union"])
+def test_spare_bus_has_its_substation_voltage_limits(threshold: float, reread: bool):
+    """A spare bus is a busbar of its substation: it is checked against the voltage limits of
+    its parent bus (lightsim2grid's limits of that voltage level), at ``violation_threshold``
+    too, and its records carry the configured limit -- also when the limits are read off the
+    grid again once the union is live."""
+    grid = case14()
+    vn: np.ndarray = np.asarray(grid.get_bus_vn_kv(), dtype=float)
+    vmin, vmax = 0.5 * vn, 1.5 * vn
+    for b in (SUB, bus2(grid, SUB)):  # every bus of substation SUB below its vmin
+        vmin[b], vmax[b] = 1.2 * vn[b], 1.3 * vn[b]
+    grid.set_bus_voltage_limits(vmin, vmax)
+    a = _split_sub3(grid)
+    ca = make_ca(grid, {}, batch_size=BATCH, compute_limit_violations=True, violation_threshold=threshold)
+    ca.add_contingencies_by_branch_id([[]])
+    ca.set_actions([a])
+    ca.add_strategies([(0, [0])])
+    ca.compute(batch_size=BATCH)
+    if reread:
+        ca.set_limits_from_grid()
+        ca.compute(batch_size=BATCH)
+    spare: int = int(np.flatnonzero(np.asarray(ca.batch_bus_ids) == bus2(grid, SUB))[0])
+    low = {v.element_id: v for v in ca.get_violations()[1] if v.violation_type.name == "LOW_VOLTAGE"}
+    assert set(low) == {SUB, spare}, low
+    np.testing.assert_allclose(low[spare].limit, vmin[bus2(grid, SUB)], rtol=1e-12)
+    V_ref, _ = oracle(grid, action=a)
+    assert V_ref is not None
+    np.testing.assert_allclose(low[spare].value, abs(V_ref[bus2(grid, SUB)]) * vn[SUB], rtol=1e-6)
+    assert ca.get_violation_counts()["low_voltage"][1] == 2
+    # the contingency row has no spare bus: only bus SUB
+    assert {v.element_id for v in ca.get_violations()[0] if v.violation_type.name == "LOW_VOLTAGE"} == {SUB}

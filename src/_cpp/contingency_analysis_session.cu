@@ -840,9 +840,11 @@ void ContingencyAnalysisSession::run()
             _bus_array_with_spares(h_bus_vn_kv_, /*from_parent=*/true, 0.), sn_mva_);
         t_admittance_upload_ms = solver_->branch_data_upload_ms();
 
+        // a spare bus is a busbar of its parent's substation: its voltage limits
         const double nan = std::numeric_limits<double>::quiet_NaN();
         solver_->set_violation_limits(
-            _bus_array_with_spares(h_bus_vmin_kv_, false, nan), _bus_array_with_spares(h_bus_vmax_kv_, false, nan),
+            _bus_array_with_spares(h_bus_vmin_kv_, /*from_parent=*/true, nan),
+            _bus_array_with_spares(h_bus_vmax_kv_, /*from_parent=*/true, nan),
             h_branch_limit_a1_ka_, h_branch_limit_a2_ka_,
             violation_tol_, violation_rel_tol_, violation_capacity_, n_lines_);
         t_limits_setup_ms = solver_->violation_setup_ms();
@@ -1222,7 +1224,8 @@ void ContingencyAnalysisSession::set_limits(
     int n_lines)
 {
     const int n_bus = base_state_->n_bus;
-    // with spare buses, limits over the original buses are fine: the spare ones get none
+    // with spare buses, limits over the original buses are fine: each spare one gets its
+    // parent's (a busbar of the same substation)
     const bool orig_size = !spare_parents_.empty() && bus_vmin_kv.size() == n_orig_bus_
                            && bus_vmax_kv.size() == n_orig_bus_;
     if ((bus_vmin_kv.size() != n_bus || bus_vmax_kv.size() != n_bus) && !orig_size)

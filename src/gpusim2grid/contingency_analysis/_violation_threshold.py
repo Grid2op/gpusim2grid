@@ -131,6 +131,7 @@ class ThresholdHost(Protocol):
 
     def _extract_limits_arrays(self) -> Limits: ...
     def _configured_limits(self) -> Limits: ...
+    def _with_spare_buses(self, bus_values: np.ndarray) -> np.ndarray: ...
     def _restore_limits(self, rows: Sequence[Sequence[LimitViolation]]) -> list[list[LimitViolation]]: ...
 
 
@@ -150,6 +151,11 @@ class ViolationThresholdFacadeMixin:
 
     def _init_violation_threshold(self, value: Any) -> None:
         self._violation_threshold = check_threshold(value)
+
+    def _with_spare_buses(self, bus_values: np.ndarray) -> np.ndarray:
+        """A per-bus limit array extended to the buses the batch adds to the grid's (a facade
+        with spare buses overrides it); as it is here."""
+        return bus_values
 
     @property
     def violation_threshold(self) -> float:
@@ -189,6 +195,8 @@ class ViolationThresholdFacadeMixin:
         if self._violation_threshold == 1.0:
             return [list(r) for r in rows]
         vmin, vmax, a1, a2, n_lines = self._configured_limits()
+        # a record of a spare bus (a bus split) carries its parent's limit
+        vmin, vmax = self._with_spare_buses(vmin), self._with_spare_buses(vmax)
         return restore_limits(rows, vmin, vmax, a1, a2, int(n_lines))
 
     def _threshold_violations_n(

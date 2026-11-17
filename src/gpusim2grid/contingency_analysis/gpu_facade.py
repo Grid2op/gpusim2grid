@@ -1234,6 +1234,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         i_pu: complex = y[0] * vf + y[1] * vt if side == 1 else y[2] * vf + y[3] * vt
         return abs(i_pu) * float(sn_mva) * 1e3 / (np.sqrt(3.0) * self._bus_vn_kv(bus_vn_kv, own if own >= 0 else other))
 
+    def _with_spare_buses(self, bus_values: np.ndarray) -> np.ndarray:
+        """A per-bus array over the base solver buses extended to the spare ones, each with its
+        parent's value (a busbar of the same substation); as it is otherwise."""
+        u = self._union
+        bus_values = np.asarray(bus_values)
+        if u is None or not u.n_spare or len(bus_values) != u.n_solver:
+            return bus_values
+        return np.concatenate([bus_values, bus_values[np.asarray(u.parents, dtype=np.int64)]])
+
     def _bus_vn_kv(self, bus_vn_kv: np.ndarray, bus: int) -> float:
         """The nominal voltage of a solver bus, a spare bus (past the base ones) its parent's."""
         n_base: int = len(bus_vn_kv)
@@ -1539,7 +1548,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 "an explicit-array tuple); use set_limits() instead.")
         grid = self._grid
         n_lines = len(grid.get_lines())
-        n_bus_solver = self._inner._s.n_bus
+        # the base solver buses: the session gives a spare bus its parent's limits
+        n_bus_solver = self._inner._s.n_bus - self.n_spare_buses
         if _have_bridge():
             bus_vmin_kv, bus_vmax_kv, limit_a1_ka, limit_a2_ka = \
                 _cpp._extract_limits_from_lsgrid(grid, n_bus_solver)
