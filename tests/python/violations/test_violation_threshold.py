@@ -184,3 +184,30 @@ def test_scenario_sweep_matches_contingency_analysis():
     a = _gpu(grid, 0.85)
     b = _gpu(grid, 0.85, "ScenarioSweepGPU")
     assert [_keys(r) for r in a.get_violations()] == [_keys(r) for r in b.get_violations()]
+
+
+@pytest.mark.parametrize("threshold", [1.0, 0.85])
+def test_array_mode(threshold: float):
+    """``violation_threshold`` with a ``(Ybus, Vinit, Sbus, ...)`` tuple as ``grid`` (no
+    lightsim2grid grid: the nominal voltages are set_branch_data's, the limits set_limits'):
+    the same records as the grid-mode analysis."""
+    import gpusim2grid
+    from gpusim2grid._ls2g_utils import extract_branch_data, extract_grid_arrays
+
+    grid = _grid()
+    ref = _gpu(grid, threshold)
+    limits = ref._configured_limits()
+    d = extract_grid_arrays(_solved_copy(grid))
+    ca = gpusim2grid.ContingencyAnalysisGPU(
+        (d["Ybus"], d["v_converged"], d["Sbus"], d["slack"], d["slack_weights"], d["pv"], d["pq"]),
+        nb_iter=MAX_IT, compute_limit_violations=True, violation_threshold=threshold,
+    )
+    ca.solver.violation_capacity = 128
+    ca.set_branch_data(*extract_branch_data(grid)[0])
+    ca.set_limits(*limits)
+    n_lines: int = len(grid.get_lines())
+    ca.add_contingencies_by_branch_id([[b] for b in range(n_lines)])
+    ca.compute(batch_size=n_lines)
+    assert [_keys(r) for r in ca.get_violations()] == [_keys(r) for r in ref.get_violations()]
+    for got, want in zip(ca.get_violations(), ref.get_violations()):
+        np.testing.assert_allclose(sorted(v.limit for v in got), sorted(v.limit for v in want), rtol=1e-12)

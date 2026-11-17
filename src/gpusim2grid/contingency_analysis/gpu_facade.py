@@ -646,6 +646,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._inner.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                     bus_vn_kv, sn_mva)
         self._n_branches = len(branch_from)
+        # kept for what needs them without a grid (violation_threshold's voltage anchor)
+        self._branch_data_args = (branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva)
 
     def set_limits(self, bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
                   branch_limit_a2_ka, n_lines):

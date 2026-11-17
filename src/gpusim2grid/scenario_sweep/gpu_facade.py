@@ -449,6 +449,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         self._inner.set_branch_data(branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff,
                                     bus_vn_kv, sn_mva)
         self._n_branches = len(branch_from)
+        # kept for what needs them without a grid (violation_threshold's voltage anchor)
+        self._branch_data_args = (branch_from, branch_to, yff_eff, yft_eff, ytf_eff, ytt_eff, bus_vn_kv, sn_mva)
 
     def set_injections(self, p_mw, q_mvar, sn_mva):
         """Store the (n_scenarios, n_bus) MW / MVAr injection arrays.

@@ -132,6 +132,7 @@ class ThresholdHost(Protocol):
     def _extract_limits_arrays(self) -> Limits: ...
     def _configured_limits(self) -> Limits: ...
     def _with_spare_buses(self, bus_values: np.ndarray) -> np.ndarray: ...
+    def _nominal_voltages(self) -> np.ndarray: ...
     def _restore_limits(self, rows: Sequence[Sequence[LimitViolation]]) -> list[list[LimitViolation]]: ...
 
 
@@ -151,6 +152,19 @@ class ViolationThresholdFacadeMixin:
 
     def _init_violation_threshold(self, value: Any) -> None:
         self._violation_threshold = check_threshold(value)
+
+    def _nominal_voltages(self: ThresholdHost) -> np.ndarray:
+        """The solver buses' nominal voltages (kV), the voltage anchor: set_branch_data's in
+        array mode (no grid), else the grid's."""
+        given = getattr(self, "_branch_data_args", None)
+        if given is not None:
+            return np.asarray(given[6], dtype=float)
+        if self._grid is None:
+            raise RuntimeError("violation_threshold < 1 needs the buses' nominal voltages: "
+                               "call set_branch_data() first")
+        from .._ls2g_utils import extract_branch_data
+
+        return np.asarray(extract_branch_data(self._grid)[0][6], dtype=float)
 
     def _with_spare_buses(self, bus_values: np.ndarray) -> np.ndarray:
         """A per-bus limit array extended to the buses the batch adds to the grid's (a facade
@@ -180,12 +194,9 @@ class ViolationThresholdFacadeMixin:
         key = (t, int(getattr(self, "_limits_gen", 0)))
         if key == self._threshold_pushed or (t == 1.0 and self._threshold_pushed[0] == 1.0):
             return
-        from .._ls2g_utils import extract_branch_data
-
         vmin, vmax, a1, a2, n_lines = self._configured_limits()
         if t != 1.0:
-            branch_args, _, _ = extract_branch_data(self._grid)
-            vmin, vmax, a1, a2 = effective_limits(t, branch_args[6], vmin, vmax, a1, a2)
+            vmin, vmax, a1, a2 = effective_limits(t, self._nominal_voltages(), vmin, vmax, a1, a2)
         self._inner.set_limits(vmin, vmax, a1, a2, int(n_lines))
         self._threshold_pushed = key
 
