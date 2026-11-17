@@ -3155,6 +3155,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 if (row < 0) break;
                 h_slot_row()[s] = row;
                 iters[static_cast<size_t>(s)] = 0;
+                set_clean(s, s + 1, 0);   // a new row: the stored F is the previous row's
                 ++n_live;
                 topped = true;
                 int i = 0;
