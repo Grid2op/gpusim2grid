@@ -110,6 +110,16 @@ struct ContingencyBatch {
     thrust::device_vector<cuda_real_type> d_flat_delta_re;
     thrust::device_vector<cuda_real_type> d_flat_delta_im;
     SegmentGather                         patch_gather_;
+    // Per-row |V| reseeds (Contingency::vm_reseed: a bus a strategy row holds PV -- a generator
+    // moved onto it -- at its set-point, its Q row pinned), one segment per ACTIVE row
+    std::vector<int>                      h_vr_bus_;
+    std::vector<cuda_real_type>           h_vr_vm_;
+    RowSegments                           vr_seg_;
+    thrust::device_vector<int>            d_vr_bus;
+    thrust::device_vector<cuda_real_type> d_vr_vm;
+    SegmentGather                         vr_gather_;
+    thrust::device_vector<int>            b_vr_bus;
+    thrust::device_vector<cuda_real_type> b_vr_vm;
     thrust::device_vector<int>            b_flat_k;
     thrust::device_vector<cuda_real_type> b_flat_delta_re;
     thrust::device_vector<cuda_real_type> b_flat_delta_im;
@@ -246,8 +256,31 @@ struct ContingencyBatch {
 
         build_tripped_branch_table(contingencies, active_to_orig_,
                                    h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+        _build_vm_reseed(contingencies);
 
         t_preprocess_ms = cb_ms_since(t_start);
+    }
+
+    // Flatten the rows' Contingency::vm_reseed into the per-row h_vr_* stream (one segment
+    // per ACTIVE row), as ScenarioSweepBatch.
+    void _build_vm_reseed(const std::vector<Contingency>& contingencies)
+    {
+        h_vr_bus_.clear(); h_vr_vm_.clear(); vr_seg_.clear();
+        bool any = false;
+        for (int o : active_to_orig_)
+            if (!contingencies[static_cast<size_t>(o)].vm_reseed.empty()) { any = true; break; }
+        if (!any) return;
+        std::vector<ChunkPatchRange> ranges(active_to_orig_.size(), ChunkPatchRange{0, 0});
+        for (size_t a = 0; a < active_to_orig_.size(); ++a) {
+            const int start = static_cast<int>(h_vr_bus_.size());
+            for (const auto& bv : contingencies[static_cast<size_t>(active_to_orig_[a])].vm_reseed) {
+                if (bv.first < 0) throw std::runtime_error("[contingency_batch] vm_reseed: negative bus");
+                h_vr_bus_.push_back(bv.first);
+                h_vr_vm_.push_back(static_cast<cuda_real_type>(bv.second));
+            }
+            ranges[a] = ChunkPatchRange{start, static_cast<int>(h_vr_bus_.size()) - start};
+        }
+        vr_seg_.from_ranges(ranges);
     }
 
     // Effective per-chunk size (rebalanced over the active/simulated count).

@@ -78,6 +78,8 @@ class CompiledAction:
     injection: dict[ElementRef, complex] = dataclasses.field(default_factory=dict)
     #: the Ybus diagonal admittance (pu) of every shunt it moves
     shunt_y: dict[int, complex] = dataclasses.field(default_factory=dict)
+    #: the voltage set-point (pu) of every voltage-regulating generator it moves
+    gen_vm: dict[int, float] = dataclasses.field(default_factory=dict)
     unsupported: str = ""
 
 
@@ -119,8 +121,18 @@ def compile_action(
             else:
                 moves[(name, el)] = int(bus)
     sn_mva: float = float(grid.get_sn_mva())
+    gen_vm: dict[int, float] = {}
     for (name, el), _ in moves.items():
-        if name == "load_bus":
+        if name == "gen_bus":
+            gen = grid.get_generators()[el]
+            why = why or _gen_move_unsupported(grid, el)
+            if gen.voltage_regulator_on:
+                # its reactive output is free where it regulates: only its active power moves
+                injection[(name, el)] = complex(gen.target_p_mw, 0.0) / sn_mva
+                gen_vm[el] = float(gen.target_vm_pu)
+            else:
+                injection[(name, el)] = complex(gen.target_p_mw, gen.target_q_mvar) / sn_mva
+        elif name == "load_bus":
             ld = grid.get_loads()[el]
             injection[(name, el)] = -complex(ld.target_p_mw, ld.target_q_mvar) / sn_mva
         elif name == "sgen_bus":
@@ -149,14 +161,35 @@ def compile_action(
             branch_y[n_lines + el] = _y(new_trafos[el])
             base_y[n_lines + el] = _y(trafos[el])
     lists: CtgElements = tuple(sorted(set(t)) for t in trips)
-    return CompiledAction(lists, frozenset(placed), branch_y, base_y, moves, injection, shunt_y, why)
+    return CompiledAction(lists, frozenset(placed), branch_y, base_y, moves, injection, shunt_y, gen_vm, why)
 
 
 #: element kinds whose moves the first version leaves out (reported per row)
 _MOVE_UNSUPPORTED: dict[str, str] = {
-    "gen_bus": "generator moves (a PV bus per row) are not supported yet",
     "storage_bus": "storage unit moves are not supported yet",
 }
+
+
+def _gen_move_unsupported(grid: LSGrid, el: int) -> str:
+    """Why generator ``el`` cannot move to another bus ("" when it can), as lightsim2grid's
+    ScenarioSweep refuses: the slack, a slack participant, a regulator of a remote bus or one
+    sharing the control of its bus with others (a voltage-control group)."""
+    gens = grid.get_generators()
+    gen = gens[el]
+    name = f"gen_bus[{el}]"
+    if gen.is_slack:
+        return f"{name}: the slack generator cannot move"
+    if gen.can_participate_slack:
+        return f"{name}: a generator taking part in the slack cannot move"
+    if not gen.voltage_regulator_on:
+        return ""
+    if gen.regulated_bus_id != gen.bus_id:
+        return f"{name}: a generator regulating a remote bus cannot move"
+    shared = [g.id for g in gens if g.id != el and g.connected and g.voltage_regulator_on
+              and g.regulated_bus_id == gen.regulated_bus_id]
+    if shared:
+        return f"{name}: it shares the voltage control of its bus with generator {shared[0]} (a group)"
+    return ""
 
 
 def _shunt_admittance(grid: LSGrid, shunt: int) -> complex:
@@ -303,6 +336,8 @@ class TopologyContext:
     occupancy: np.ndarray
     me_to_solver: np.ndarray
     current: dict[ElementRef, int]
+    #: solver bus -> the voltage regulators on it in the base case (generators, SVCs)
+    regulators: dict[int, frozenset[ElementRef]] = dataclasses.field(default_factory=dict)
 
     def solver(self, g: int) -> int:
         return self.plan.solver_of_global[g] if g in self.plan.solver_of_global else int(self.me_to_solver[g])
@@ -319,7 +354,15 @@ def topology_context(
             occupancy[me_to_solver[bus]] += 1
     branch_y: list[BranchY] = [_y(ln) for ln in grid.get_lines()] + [_y(t) for t in grid.get_trafos()]
     current = current_buses(grid)
-    return TopologyContext(plan, n_lines, branch_from, branch_to, branch_y, occupancy, me_to_solver, current)
+    regulators: dict[int, set[ElementRef]] = {}
+    for g in grid.get_generators():
+        if g.connected and g.voltage_regulator_on and g.bus_id >= 0 and me_to_solver[g.bus_id] >= 0:
+            regulators.setdefault(int(me_to_solver[g.bus_id]), set()).add(("gen_bus", int(g.id)))
+    for sv in grid.get_svcs():
+        if sv.connected and sv.bus_id >= 0 and me_to_solver[sv.bus_id] >= 0:
+            regulators.setdefault(int(me_to_solver[sv.bus_id]), set()).add(("svc", int(sv.id)))
+    return TopologyContext(plan, n_lines, branch_from, branch_to, branch_y, occupancy, me_to_solver, current,
+                           {b: frozenset(r) for b, r in regulators.items()})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -339,6 +382,10 @@ class StrategyRow:
     sbus: list[tuple[int, complex]] = dataclasses.field(default_factory=list)
     #: the new (from, to) solver buses of the branches its moves move (for their flows)
     branch_ends: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    #: base PV buses its moved generators leave without a regulator (PQ on this row)
+    pv_release: list[int] = dataclasses.field(default_factory=list)
+    #: (bus, |V| pu) its moved generators hold PV
+    pv_set: list[tuple[int, float]] = dataclasses.field(default_factory=list)
 
 
 def strategy_row(
@@ -393,7 +440,9 @@ def strategy_row(
     moves: dict[ElementRef, int] = {}
     injection: dict[ElementRef, complex] = {}
     shunt_y: dict[int, complex] = {}
+    gen_vm: dict[int, float] = {}
     for a in actions:
+        gen_vm.update(a.gen_vm)
         for ref, g in a.moves.items():
             if moves.get(ref, g) != g:
                 name, el = ref
@@ -442,8 +491,39 @@ def strategy_row(
         occupancy[new] += 1
     # the base buses its moves empty (the spares are masked by the session unless used)
     empty = [int(b) for b in np.flatnonzero(occupancy[: topo.plan.n_solver] == 0)]
+    pv_release, pv_set, why = _voltage_control_of_moves(moves, gen_vm, lists, topo)
+    if why:
+        return StrategyRow(None, reason=why)
     return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y, empty_buses=empty, sbus=sbus,
-                       branch_ends=branch_ends)
+                       branch_ends=branch_ends, pv_release=pv_release, pv_set=pv_set)
+
+
+def _voltage_control_of_moves(
+    moves: dict[ElementRef, int], gen_vm: dict[int, float], lists: list[set[int]], topo: TopologyContext
+) -> tuple[list[int], list[tuple[int, float]], str]:
+    """The PV buses a row's moved regulating generators leave without a regulator (released),
+    the buses they hold PV at their set-point, and why the row cannot run ("" when it can): a
+    bus another regulator holds, or two set-points on one bus."""
+    moved: dict[int, int] = {
+        el: topo.solver(g) for (name, el), g in moves.items() if name == "gen_bus" and el in gen_vm
+    }
+    if not moved:
+        return [], [], ""
+    gone: set[ElementRef] = {("gen_bus", el) for el in moved} | {("gen_bus", g) for g in lists[3]}
+    gone |= {("svc", s) for s in lists[8]}
+    release: list[int] = []
+    for el in moved:
+        old = int(topo.me_to_solver[topo.current[("gen_bus", el)]])
+        if old in topo.regulators and not (topo.regulators[old] - gone):
+            release.append(old)
+    pv: dict[int, float] = {}
+    for el, new in moved.items():
+        if topo.regulators.get(new, frozenset()) - gone:
+            return [], [], f"gen_bus[{el}] is moved onto a bus another regulator holds"
+        if new in pv and pv[new] != gen_vm[el]:
+            return [], [], f"two generators moved onto bus {new} hold different set-points"
+        pv[new] = gen_vm[el]
+    return sorted(set(release)), sorted(pv.items()), ""
 
 
 @dataclasses.dataclass

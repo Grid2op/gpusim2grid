@@ -304,3 +304,30 @@ def test_pattern_reused_across_runs_when_the_union_is_unchanged():
     ca.add_strategies([(0, [1])])
     ca.compute(batch_size=BATCH)
     assert ca.solver._s.driver_build_counter == n0 + 1
+
+
+def test_generator_moves_lightsim2grid_refuses_are_unsupported():
+    """The slack generator and a generator taking part in the slack do not move (lightsim2grid's
+    ScenarioSweep refuses them too): their strategy rows are not run, with the reason."""
+    grid = case14()
+    slack = next(g for g in grid.get_generators() if g.is_slack)
+    a = _move(grid, slack.bus_id, [("gen_bus", slack.id)])
+    ca, _ = _run(grid, {}, [[]], [a], [(0, [0])])
+    reasons = ca.get_batch_unsupported_reasons()
+    assert "slack" in reasons[1], reasons
+
+
+def test_generator_move_under_the_outer_loops_is_reported():
+    """With the outer loops, a strategy moving a generator is not run yet: reported per row."""
+    from gpusim2grid import RowStatus
+
+    grid = case14()
+    grid.change_algorithm("NROuter_KLU")
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), 30, 1e-8).size > 0
+    gen = next(g for g in grid.get_generators() if not g.is_slack)
+    a = _move(grid, gen.bus_id, [("gen_bus", gen.id), _branch_ends(grid, gen.bus_id)[0]])
+    ca, _ = _run(grid, dict(scheduling="continuous"), [[]], [a], [(0, [0])], outer_loops=True,
+                 init_from_n_powerflow=False)
+    assert ca.get_row_status()[1] == RowStatus.NOT_SIMULATED
+    assert "outer loops" in ca.get_batch_unsupported_reasons()[1]

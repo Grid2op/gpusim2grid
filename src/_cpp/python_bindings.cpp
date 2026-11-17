@@ -1976,6 +1976,12 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
          "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
          "and no add_row_sbus_deltas bus on it), with no call.")
+    .def("set_row_pv_moves", &ContingencyAnalysisSession::set_row_pv_moves,
+         pybind11::arg("release"), pybind11::arg("pv"),
+         "After build_contingencies*(): per row, the voltage control of its moved generators: "
+         "`release` the base PV buses it leaves without a regulator (PQ on that row), `pv` the "
+         "(bus, |V| pu) it holds PV (Q row pinned, |V| seeded at the set-point). Not with the outer "
+         "loops (such a row is unsupported).")
     .def("add_row_sbus_deltas", &ContingencyAnalysisSession::add_row_sbus_deltas, pybind11::arg("rows"),
          "After build_contingencies*(): per row, (bus, dS pu) added to the row's Sbus (an injection "
          "moved between buses), merged per bus with the row's trips.")

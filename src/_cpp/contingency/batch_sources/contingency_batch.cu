@@ -22,6 +22,10 @@
 void ContingencyBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
 {
     initialize_patches(cs);
+    if (!h_vr_bus_.empty()) {
+        upload_h2d(d_vr_bus, h_vr_bus_.data(), h_vr_bus_.size(), cs);
+        upload_h2d(d_vr_vm,  h_vr_vm_.data(),  h_vr_vm_.size(),  cs);
+    }
     if (slack_.has_weights() && slack_.n_slack != ctx.base.n_slack)
         throw std::runtime_error(
             "[contingency_batch] per-row slack weight count does not match the base "
@@ -75,6 +79,18 @@ void ContingencyBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadView&
         launch_gather_rows_to_slots(ctx.d_V_batch, static_cast<const cudaComplexType*>(nullptr),
                                     thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
                                     L, ctx.n_bus, cs);
+    }
+    // ... the |V| of the buses a row holds PV (a generator moved there), its Q row pinned
+    vr_gather_.plan(vr_seg_, L.h_slot, L.h_row, L.n, cs);
+    if (vr_gather_.total > 0) {
+        vr_gather_.gather(b_vr_bus, d_vr_bus, cs);
+        vr_gather_.gather(b_vr_vm, d_vr_vm, cs);
+        apply_vm_reseed_kernel<<<(vr_gather_.total + BS - 1) / BS, BS, 0, cs>>>(
+            ctx.d_V_batch, vr_gather_.out_slot(),
+            thrust::raw_pointer_cast(b_vr_bus.data()),
+            thrust::raw_pointer_cast(b_vr_vm.data()),
+            vr_gather_.total, ctx.n_bus);
+        cb_chk_cuda(cudaGetLastError(), "vm reseed");
     }
     t.t_tile_V += timer.stop_ms();
 

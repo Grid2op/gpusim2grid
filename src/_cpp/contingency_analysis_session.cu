@@ -369,6 +369,8 @@ void ContingencyAnalysisSession::build_contingencies_full(
     contingencies_        = std::move(contingencies);
     disconnected_per_ctg_ = std::move(disconnected_per_ctg);
     ctg_sbus_ds_          = std::move(ctg_sbus_ds);
+    row_pv_release_.clear();
+    row_pv_set_.clear();
     ctg_shunts_ = shunt_ids_per_ctg;
     ctg_loads_  = load_ids_per_ctg;
     ctg_gens_   = gen_ids_per_ctg;
@@ -510,6 +512,32 @@ void ContingencyAnalysisSession::run()
                 "'direct_iter0_only', or 'direct_refactor_every_n'.");
     }
 
+    // generator moves (set_row_pv_moves): the PV buses a row releases are reserved as a
+    // generator trip's (PQ on that row, pinned PV on the others); the buses it holds PV are
+    // pinned below
+    if (!row_pv_release_.empty() || !row_pv_set_.empty()) {
+        for (size_t r = 0; r < contingencies_.size(); ++r) {
+            const bool moves = (r < row_pv_release_.size() && !row_pv_release_[r].empty())
+                            || (r < row_pv_set_.size() && !row_pv_set_[r].empty());
+            if (!moves || !unsupported[r].empty()) continue;
+            if (outer_) {
+                unsupported[r] = "a generator moved to another bus is not supported with the outer loops yet";
+                continue;
+            }
+            if (r >= row_pv_release_.size()) continue;
+            std::vector<int>& to_pq = row_pv_to_pq_[r];
+            for (int b : row_pv_release_[r]) { to_pq.push_back(b); required.push_back(b); }
+            std::sort(to_pq.begin(), to_pq.end());
+            to_pq.erase(std::unique(to_pq.begin(), to_pq.end()), to_pq.end());
+        }
+        std::sort(required.begin(), required.end());
+        required.erase(std::unique(required.begin(), required.end()), required.end());
+        if (!required.empty() && strategy_type_ == ContingencySolverType::DirectBaseCaseFactors)
+            throw std::runtime_error("ContingencyAnalysisSession: a generator moved off its bus is incompatible "
+                                     "with the 'direct_base_case_factors' strategy (it cannot release a bus' "
+                                     "voltage pinning per row)");
+    }
+
     // a row's status is settled with its masks: a change means a new source
     if (unsupported != row_unsupported_) { row_unsupported_ = unsupported; ++contingencies_generation_; }
     for (size_t c = 0; c < contingencies_.size(); ++c) contingencies_[c].skip = !row_unsupported_[c].empty();
@@ -559,6 +587,7 @@ void ContingencyAnalysisSession::run()
             ctg.masked_buses.clear();
             ctg.stranded_groups.clear();
             ctg.pinned_buses.clear();
+            ctg.vm_reseed.clear();
             ctg.vc_pinned_ctrl = held_pins;
         }
         // the generator trips: every reserved bus stays PV (identity Q row) on a
@@ -573,6 +602,17 @@ void ContingencyAnalysisSession::run()
                 if (!pinned.empty()) any_gen_pin = true;
             }
         }
+        // ... and the buses a row's moved generators hold PV: Q row pinned, |V| at the set-point
+        if (!outer_)
+            for (size_t r = 0; r < row_pv_set_.size() && r < contingencies_.size(); ++r) {
+                if (!row_unsupported_[r].empty()) continue;
+                Contingency& ctg = contingencies_[r];
+                for (const auto& bv : row_pv_set_[r]) {
+                    ctg.pinned_buses.push_back(bv.first);
+                    ctg.vm_reseed.push_back(bv);
+                    any_gen_pin = true;
+                }
+            }
 
         // Host preprocessing (resolve_indices + connectivity/masking +
         // build_flat_patches) captured by the BatchSource; mutates
@@ -1516,6 +1556,35 @@ void ContingencyAnalysisSession::set_row_empty_buses(const std::vector<std::vect
         buses.erase(std::unique(buses.begin(), buses.end()), buses.end());
         contingencies_[c].empty_buses = std::move(buses);
     }
+    ++contingencies_generation_;
+}
+
+void ContingencyAnalysisSession::set_row_pv_moves(const std::vector<std::vector<int>>& release,
+                                                  const std::vector<std::vector<std::pair<int, double>>>& pv)
+{
+    static const char* who = "ContingencyAnalysisSession::set_row_pv_moves";
+    if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
+    if (release.size() != contingencies_.size() || pv.size() != contingencies_.size())
+        throw std::runtime_error(std::string(who) + ": one release list and one pv list per row ("
+                                 + std::to_string(contingencies_.size()) + " rows)");
+    const int n_bus = base_state_->n_bus;
+    const int n_base = n_bus - static_cast<int>(spare_parents_.size());
+    for (size_t r = 0; r < release.size(); ++r) {
+        for (int b : release[r])
+            if (b < 0 || b >= n_base)
+                throw std::runtime_error(std::string(who) + ": released bus " + std::to_string(b)
+                                         + " is not one of the " + std::to_string(n_base) + " base buses");
+        for (const auto& bv : pv[r])
+            if (bv.first < 0 || bv.first >= n_bus || !(bv.second > 0.))
+                throw std::runtime_error(std::string(who) + ": PV bus " + std::to_string(bv.first)
+                                         + " out of range or a non-positive set-point");
+    }
+    row_pv_release_ = release;
+    for (auto& rel : row_pv_release_) {
+        std::sort(rel.begin(), rel.end());
+        rel.erase(std::unique(rel.begin(), rel.end()), rel.end());
+    }
+    row_pv_set_ = pv;
     ++contingencies_generation_;
 }
 

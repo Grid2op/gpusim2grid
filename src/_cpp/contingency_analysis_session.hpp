@@ -261,6 +261,9 @@ struct ContingencyAnalysisSession {
     bool               has_gen_data_ = false;
     std::vector<std::vector<int>> ctg_shunts_, ctg_loads_, ctg_gens_;
     std::vector<std::vector<std::pair<int, std::complex<double>>>> ctg_sbus_ds_;
+    // set_row_pv_moves, per row (empty: no row has one)
+    std::vector<std::vector<int>> row_pv_release_;
+    std::vector<std::vector<std::pair<int, double>>> row_pv_set_;
     bool has_gen_trips_ = false;
     // the buses the base ledger was extended with (a generator trip releases them
     // on some row), and the ones each row releases
@@ -501,6 +504,12 @@ struct ContingencyAnalysisSession {
     // add_row_sbus_deltas: after build_contingencies*(), per row (bus, dS pu) ADDED to the
     // row's Sbus (an injection moved between buses), merged per bus with the row's trips.
     void add_row_sbus_deltas(const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows);
+    // set_row_pv_moves: after build_contingencies*(), per row, the generator moves' voltage
+    // control: `release` the PV buses it leaves without a regulator (PQ for that row: reserved
+    // like a generator trip's), `pv` the (bus, |V| pu) it holds PV (Q row pinned, |V| seeded at
+    // the set-point). Not with the outer loops (such a row is reported unsupported).
+    void set_row_pv_moves(const std::vector<std::vector<int>>& release,
+                          const std::vector<std::vector<std::pair<int, double>>>& pv);
     void clear_v_init_groups();
     bool has_v_init_groups() const { return has_v_groups_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
