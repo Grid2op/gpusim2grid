@@ -394,3 +394,49 @@ def test_violations_of_strategies_not_released_are_not_simulated():
         assert _grid_record(viol[r]) == "NOT_SIMULATED", (r, viol[r])
     for r in np.flatnonzero(ran):
         assert _grid_record(viol[r]) is None, (r, viol[r])
+
+
+_RESULT_QUERIES: dict[str, Any] = {
+    "get_violations": lambda ca: ca.get_violations(),
+    "get_violation_counts": lambda ca: ca.get_violation_counts(),
+    "get_violations_truncated": lambda ca: ca.get_violations_truncated(),
+    "get_max_loading": lambda ca: ca.get_max_loading(),
+    "last_residuals": lambda ca: ca.last_residuals(),
+    "converged": lambda ca: ca.converged(),
+    "V_results": lambda ca: ca.V_results.to_numpy(),
+    "get_row_status": lambda ca: ca.get_row_status(),
+    "get_row_iterations": lambda ca: ca.get_row_iterations(),
+    "get_iterations": lambda ca: ca.get_iterations(),
+    "get_batch_unsupported_reasons": lambda ca: ca.get_batch_unsupported_reasons(),
+    "get_strategy_ran": lambda ca: ca.get_strategy_ran(),
+    "compute_flows": lambda ca: ca.compute_flows(),
+}
+
+
+@pytest.mark.parametrize("change", ["add_strategies", "set_actions", "add_contingencies"])
+def test_results_are_not_read_across_a_change_of_the_rows(change: str):
+    """Once the rows change (new strategies, new actions, new contingencies), the last run's
+    results no longer line up with them: every result query raises until the next compute(),
+    instead of returning the old session rows labelled as the new ones; that compute() gives
+    one entry per new row."""
+    grid, ctgs, actions, strategies = _case()
+    ca = _ca(grid, ctgs, actions, strategies[:10], dict(scheduling="continuous"),
+             compute_limit_violations=True)
+    ca.set_limits_from_grid()
+    ca.compute(batch_size=BATCH)
+    if change == "add_strategies":
+        ca.add_strategies(strategies[10:20])
+    elif change == "set_actions":
+        ca.set_actions(list(reversed(actions)))
+    else:
+        ca.add_contingency(branch_ids=[3])
+    for name, query in _RESULT_QUERIES.items():
+        with pytest.raises(RuntimeError, match="compute"):
+            query(ca)
+            pytest.fail(f"{name} read the previous run's results")
+    ca.compute(batch_size=BATCH)
+    n: int = len(ca.get_contingencies()) + ca.n_strategies
+    assert len(ca.get_violations()) == n
+    assert ca.get_max_loading()[0].shape == (n,)
+    assert ca.last_residuals().shape == (n,)
+    assert ca.V_results.to_numpy().size == n * ca.n_bus

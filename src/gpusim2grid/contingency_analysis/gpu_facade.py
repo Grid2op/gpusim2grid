@@ -620,6 +620,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._compiled: list[CompiledAction] = []
         self._strategies: list[Strategy] = []
         self._rowmap: RowMap | None = None
+        # the rows changed since the last compute() (strategies, actions, contingencies): its
+        # results no longer line up with them and are not read (_check_results)
+        self._results_stale: bool = False
         self._flows_done: bool = False
         self._strategy_warm_start: bool = bool(strategy_warm_start)
         self._strategy_condition: StrategyCondition = strategy_condition
@@ -672,6 +675,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         # a branch named twice is tripped once (the session does the same)
         self._ctg_branch_ids = [list(dict.fromkeys(map(int, ids))) for ids in branch_ids_per_ctg]
         self._ctg_elements = [(list(ids),) + tuple([] for _ in range(9)) for ids in self._ctg_branch_ids]
+        if self._strategies:   # the session's rows are no longer the last run's
+            self._invalidate_results()
 
     # ------------------------------------- shunts, loads and generators tripped
     @staticmethod
@@ -763,6 +768,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 raise ValueError("a contingency must trip something (every list is empty)")
             new.append(cont)
         self._push_contingencies(self._ctg_elements + new)
+        if self._strategies:   # the session's rows are no longer the last run's
+            self._invalidate_results()
 
     def add_contingency(self, branch_ids=(), shunt_ids=(), load_ids=(), gen_ids=(),
                         branch_ids_side1=(), branch_ids_side2=(), sgen_ids=(), storage_ids=(),
@@ -803,6 +810,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def get_batch_unsupported_reasons(self):
         """list[str], per contingency: why the batch left it out (``""``: it did not), after
         :meth:`compute`. Such a row has NaN voltages and a ``BATCH_UNSUPPORTED`` violation."""
+        self._check_results()
         if self._rowmap is None:
             return self._inner.get_batch_unsupported_reasons()
         rm = self._rowmap
@@ -866,6 +874,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """
         self._push_effective_limits()
         self._flows_done = False
+        self._results_stale = False
         if self._strategies:
             return self._compute_rows(int(batch_size))
         self._rowmap = None
@@ -902,7 +911,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._compiled = [compile_action(self._grid, a, n_lines, current) for a in actions]
         # branch ends (solver numbering), nominal voltages, sn_mva: row triplets and flow fix-ups
         self._branch_args = extract_branch_data(self._grid)[0]
-        self._rowmap = None
+        self._invalidate_results()
 
     def add_strategies(
         self,
@@ -927,7 +936,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             if not acts or not all(0 <= x < len(self._actions) for x in acts):
                 raise ValueError(f"action indices {list(acts)} out of range [0, {len(self._actions)})")
         self._strategies += new
-        self._rowmap = None
+        self._invalidate_results()
 
     @property
     def n_strategies(self) -> int:
@@ -951,6 +960,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     def get_strategy_ran(self) -> np.ndarray:
         """(n_strategies,) bool: the strategies the last run solved."""
+        self._check_results()
         if self._rowmap is None:
             raise RuntimeError("no strategy run yet")
         return self._rowmap.ran[self._rowmap.n_out - len(self._strategies):]
@@ -968,6 +978,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     def get_iterations(self) -> np.ndarray:
         """(n_rows,) int: Newton iterations of every row of the last run (-1: not run)."""
+        self._check_results()
         it = np.asarray(self._inner._s.get_row_iterations(), dtype=np.int64) \
             if self._rowmap is None or len(self._rowmap.session_rows) else np.zeros(0, dtype=np.int64)
         return it if self._rowmap is None else self._rowmap.expand(it, -1)
@@ -978,6 +989,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         limits ignored) and the branch reaching it (lines then transformers). NaN / -1 for a
         row that was not solved (did not run, skipped as islanded, unsupported, NaN residual)
         or has no limit."""
+        self._check_results()
         if self._last_residuals is None:
             raise RuntimeError("Call compute() before get_max_loading().")
         _, _, lim1, lim2, _ = self._configured_limits()
@@ -1257,6 +1269,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     def _expanded_buffer(self, buf: DeviceBuffer, width: int, fill: Any) -> DeviceBuffer:
         """``buf`` (session rows x width, flat) on the caller's rows when a row map is live."""
+        self._check_results()
         rm = self._rowmap
         if rm is None:
             return buf
@@ -1268,7 +1281,23 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
         return DeviceBuffer(fetch, (rm.n_out * width,), buf.dtype)
 
+    def _invalidate_results(self) -> None:
+        """The rows changed: the last run's results are dropped (every result query raises
+        until the next compute())."""
+        self._results_stale = True
+        self._rowmap = None
+        self._last_residuals = None
+        self._row_branch = {}
+        self._rl_result = None
+        self._flows_done = False
+
+    def _check_results(self) -> None:
+        if self._results_stale:
+            raise RuntimeError("the contingencies, actions or strategies changed since the last compute(): "
+                               "call compute() again before reading results")
+
     def _session_array(self, getter: Callable[[], np.ndarray], fill: Any) -> np.ndarray:
+        self._check_results()
         if self._rowmap is None:
             return getter()
         rm = self._rowmap
@@ -1276,6 +1305,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         return rm.expand(vals, fill)
 
     def _session_rows_or_empty(self, getter: Callable[[], list[Any]], fill: Callable[[], Any]) -> list[Any]:
+        self._check_results()
         if self._rowmap is None:
             return getter()
         rm = self._rowmap
@@ -1527,6 +1557,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     def last_residuals(self):
         """``‖F‖∞`` per contingency from the most recent :meth:`compute`."""
+        self._check_results()
         if self._last_residuals is None:
             raise RuntimeError("Call compute() before last_residuals().")
         if self._rowmap is not None:
@@ -1535,6 +1566,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     def compute_flows(self):
         """Compute branch currents (``or_amps`` / ``ex_amps``) after compute()."""
+        self._check_results()
         if self._rowmap is None or len(self._rowmap.session_rows):
             self._inner.compute_flows()
         self._flows_done = True
@@ -1606,6 +1638,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def _result_rows(self, rows: ResultRows) -> np.ndarray:
         """The caller rows ``rows`` covers (without strategies: every row is a contingency)."""
         rows = ResultRows(rows)
+        self._check_results()
         if self._last_residuals is None:
             raise RuntimeError("Call compute() first.")
         n_out: int = self._rowmap.n_out if self._rowmap is not None else int(self._last_residuals.shape[0])
@@ -1710,6 +1743,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def converged(self, tol=None):
         """(n_ctg,) bool ndarray: residual <= tol (defaults to violation_tol).
         Independent of compute_limit_violations -- requires compute()."""
+        self._check_results()
         if self._rowmap is not None:
             t = self._inner.violation_tol if tol is None else tol
             res = self.last_residuals()
