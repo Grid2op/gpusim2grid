@@ -1601,8 +1601,13 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         return np.arange(lo, hi)
 
     def _violation_records(self, picked: np.ndarray) -> dict[int, list[LimitViolation]]:
-        """The device's records of the caller rows ``picked`` (only those built; [] for a row
-        that did not run), the second pass' for a RECOMPUTED one."""
+        """The device's records of the caller rows ``picked`` (only those built), the second
+        pass' for a RECOMPUTED one. A row that did not run gets one GRID record, as a contingency
+        row the batch leaves out -- BATCH_UNSUPPORTED when it cannot run, NOT_SIMULATED otherwise
+        (islanded, or its contingency did not release it) --, never the empty entry of a
+        secure row."""
+        from ._limit_violations import LimitViolation, LimitViolationType, ViolationElementType
+
         rm = self._rowmap
         if rm is None:
             out = dict(zip(picked.tolist(), self._inner.get_violations(picked.tolist())))
@@ -1610,7 +1615,12 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             pos: np.ndarray = rm.session_pos(picked)
             run: np.ndarray = pos >= 0
             built = self._inner.get_violations(pos[run].tolist()) if run.any() else []
-            out = {int(r): [] for r in picked}
+            out = {}
+            if not run.all():
+                reasons: list[str] = self.get_batch_unsupported_reasons()
+                for r in picked[~run].tolist():
+                    kind = LimitViolationType.BATCH_UNSUPPORTED if reasons[r] else LimitViolationType.NOT_SIMULATED
+                    out[r] = [LimitViolation(ViolationElementType.GRID, -1, 0, kind, float("nan"), float("nan"))]
             out.update(zip(picked[run].tolist(), built))
         if self._rl_result is not None:
             for r, v in self._rl_result["viol"].items():

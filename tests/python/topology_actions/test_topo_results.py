@@ -339,3 +339,58 @@ def test_release_needs_the_continuous_schedule():
     ca = with_strategy(scheduling="chunked", strategy_warm_start=False)
     ca.compute(batch_size=BATCH)
     assert ca.get_strategy_ran().all()
+
+
+def _grid_record(rec: list[Any]) -> str | None:
+    """The type name of a row's single GRID record (NOT_SIMULATED / BATCH_UNSUPPORTED ...), None
+    when the row has anything else (no record: a secure row)."""
+    if len(rec) != 1 or rec[0].element_type.name != "GRID":
+        return None
+    return str(rec[0].violation_type.name)
+
+
+@pytest.mark.parametrize("warm", [False, True], ids=["base_start", "warm"])
+def test_violations_of_strategies_not_solved_are_not_empty(warm: bool):
+    """A strategy that did not run never reads as a secure one: its get_violations entry is a
+    GRID record, as a contingency row's -- BATCH_UNSUPPORTED when a row cannot run (here a move
+    of the slack generator), NOT_SIMULATED when it is skipped as islanded (its contingency and
+    its action cut bus 0 off, no handle_disconnected_grid) -- and its counts are -1."""
+    from gpusim2grid.actions import Action
+
+    grid = with_current_limits(case118(), 1.1)
+    slack = next(g for g in grid.get_generators() if g.is_slack)
+    actions = [
+        Action(gen_bus={slack.id: int(slack.bus_id) + grid.get_n_sub()}),  # refused: the slack
+        Action(line_bus1={1: -1}, line_bus2={1: -1}),  # with contingency [0]: bus 0 islanded
+    ]
+    ca = _ca(grid, [[0]], actions, [(0, [0]), (0, [1])], dict(scheduling="continuous"),
+             compute_limit_violations=True, strategy_warm_start=warm)
+    ca.set_limits_from_grid()
+    ca.compute(batch_size=BATCH)
+    assert ca.get_batch_unsupported_reasons()[1]
+    assert np.isnan(ca.last_residuals()[1:]).all()
+    viol = ca.get_violations()
+    assert _grid_record(viol[1]) == "BATCH_UNSUPPORTED", viol[1]
+    assert _grid_record(viol[2]) == "NOT_SIMULATED", viol[2]
+    assert [_grid_record(v) for v in ca.get_violations(ResultRows.STRATEGIES)] == [
+        "BATCH_UNSUPPORTED", "NOT_SIMULATED"]
+    for k, v in ca.get_violation_counts().items():
+        assert np.all(v[1:] == -1), (k, v)
+
+
+def test_violations_of_strategies_not_released_are_not_simulated():
+    """``StrategyCondition.ANY_VIOLATION``: a strategy its contingency did not release (no
+    violation) was never solved -- a NOT_SIMULATED record, not an empty (secure) entry."""
+    grid, ctgs, actions, strategies = _case()
+    grid = with_current_limits(case118(), 1.6)
+    ca = _ca(grid, ctgs, actions, strategies, dict(scheduling="continuous"),
+             compute_limit_violations=True, strategy_condition=StrategyCondition.ANY_VIOLATION)
+    ca.set_limits_from_grid()
+    ca.compute(batch_size=BATCH)
+    ran: np.ndarray = ca.get_strategy_ran()
+    assert 0 < ran.sum() < len(strategies)
+    viol = ca.get_violations(ResultRows.STRATEGIES)
+    for r in np.flatnonzero(~ran):
+        assert _grid_record(viol[r]) == "NOT_SIMULATED", (r, viol[r])
+    for r in np.flatnonzero(ran):
+        assert _grid_record(viol[r]) is None, (r, viol[r])
