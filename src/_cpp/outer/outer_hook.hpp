@@ -151,7 +151,7 @@ struct RowResult {
     bool unrealistic = false;
     std::string failed_loop;     // the loop's name when status == FAILED
     int  nb_outer_iterations = 0;
-    int  nb_nr_iterations = 0;   // summed over every inner solve, at least 1 per solve
+    int  nb_nr_iterations = 0;   // Newton steps summed over every inner solve (lightsim2grid's batch)
     // what the loops moved: the generators' targets by generator id, dense (MW, NaN: not
     // moved; empty: none moved). gens_target_p_mw is every generator, gen_target_p_mw(gen_id)
     // one of them, gen_targets() the moved ones as (id, MW) pairs.

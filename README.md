@@ -1,19 +1,16 @@
 # gpusim2grid
 
-GPU-accelerated power flow. <!-- for the [Grid2Op](https://github.com/Grid2Op) ecosystem. REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER 
+GPU-accelerated power flow for the [Grid2Op](https://github.com/Grid2Op) ecosystem.
 
 `gpusim2grid` runs AC power flow on the GPU and scales it to large batches, so that
 thousands of scenarios can be solved in parallel on a single device. It is built
-around batched sparse direct factorization (cuDSS). 
-<!-- REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
-, and is the GPU companion to
+around batched sparse direct factorization (cuDSS), and is the GPU companion to
 [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid), which it uses for CPU
 preprocessing and as a reference oracle.
--->
 
-> **Status:** research code, early release. No PyPI package yet — **install from
-> source only** (see [installation](#installation)). The public API is still moving
-> and may change between versions.
+> **Status:** research code, early release, distributed on PyPI as a source
+> distribution that `pip` compiles on your machine (see [installation](#installation)).
+> The public API is still moving and may change between versions.
 
 > **Hardware:** this package requires a CUDA-capable NVIDIA device (i.e. an NVIDIA
 > GPU). It cannot run on CPU-only machines or on non-NVIDIA accelerators.
@@ -33,7 +30,13 @@ In order of maturity:
    scenarios (varying loads/generation) in a single batched call.
 4. **Scenario sweep on the GPU** — row-aligned combination of the two: row `i`'s
    injection profile is solved together with row `i`'s own set of tripped
-   branches, independently of every other row. Mirrors <!-- REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER lightsim2grid's own `ScenarioSweep`. -->
+   branches, independently of every other row. Mirrors lightsim2grid's own
+   `ScenarioSweep`.
+
+The three batch workloads run in one of two schedules: **chunked** (every row of a
+chunk runs the same number of iterations) or **continuous** (`scheduling="continuous"`:
+a row leaves its slot as soon as it converges and the next row takes it, so the
+batch never waits for its slowest row).
 
 Both single (FP32) and double (FP64) precision are supported and work well; the
 precision is selectable at build time (see the documentation).
@@ -48,25 +51,36 @@ poses**, including the in-Jacobian power-system controls modelled there:
 - **SVC** (static var compensator, voltage mode with optional slope),
 - **remote generator voltage control** (a generator regulating a non-local bus).
 
-<!-- 
-REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER 
-These match the lightsim2grid CPU solution bit-for-bit, on both the single solve
-and the batched contingency / injection-sweep / scenario-sweep paths. The
-low-level array entry points (`acpf_nr_gpu`, the `*Session` classes constructed
-from raw NumPy/SciPy arrays) solve only the bare `[pvpq | pq]` system without
-these controls.
--->
+These match the lightsim2grid CPU solution to rounding (~1e-15), on both the single
+solve and the batched contingency / injection-sweep / scenario-sweep paths (a droop
+HVDC line with a resistance matches to the Newton tolerance: gpusim2grid takes its
+Jacobian slope exactly). The low-level array entry points (`acpf_nr_gpu`, the
+`*Session` classes constructed from raw NumPy/SciPy arrays) solve only the bare
+`[pvpq | pq]` system without these controls.
 
 ## Alpha features
 
 These work today but are early and **subject to change**:
 
-- **Derivatives through the power flow** — differentiate through the solver. Currently
-  limited to a **single** power flow (not yet the batched / contingency path).
+- **Derivatives through the power flow** — the adjoint method, on a single power flow
+  and on a whole batch (`BatchPowerFlow`, a PyTorch layer): gradients with respect to
+  loads, generator set-points and voltage set-points, with branch and generator
+  statuses as discrete inputs, and through the outer loops (the adjoint of each row's
+  last inner solve, the loops' decisions held).
 - **PyTorch integration via DLPack** — zero-copy export of GPU results as PyTorch
   tensors. JAX support is coming soon through the same path.
   See [DLPack](https://github.com/dmlc/dlpack) and its
   [license](https://github.com/dmlc/dlpack/blob/main/LICENSE).
+- **Outer loops per row** (`outer_loops=True` on the three batch facades) — the grid's
+  own lightsim2grid outer loops (OpenLoadFlow's reactive limits, distributed slack,
+  HVDC AC-emulation limits, voltage monitoring, phase / transformer / shunt voltage
+  control) run on the host for every row, its inner solves on the GPU.
+- **Limit checks** — bus voltage and branch current violations
+  (`compute_limit_violations`) and the conditions OpenLoadFlow's outer loops act on
+  (`compute_physical_violations`: reactive limits, PQ → PV releases, slack active-power
+  limits, HVDC saturation), checked on the GPU per row.
+- **Own batched LU** (`linear_solver="own_lu"`, experimental) — a batched sparse LU in
+  place of cuDSS in the batch solves.
 
 Coming soon:
 
@@ -98,7 +112,7 @@ to other open-source tools that cover them.
   - **[`lightsim2grid`](https://github.com/Grid2op/lightsim2grid) >= 1.3.1 (hard
     dependency)** — CPU preprocessing and reference oracle. Its wheel ships the C++
     core and headers (KLU's included) that gpusim2grid's bridge compiles against.
-    <!--REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER  Integration with `lightsim2grid` is expected to deepen in future releases. -->
+    Integration with `lightsim2grid` is expected to deepen in future releases.
   - **[cuDSS](https://developer.nvidia.com/cudss) 1.x** (`nvidia-cudss-cu12` /
     `nvidia-cudss-cu13`) — the sparse direct solve.
   - the **CUDA 13 toolkit** (`cuda-toolkit`), compiler included. PyPI has no
@@ -106,37 +120,34 @@ to other open-source tools that cover them.
     [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) installer,
     the libraries and cuDSS from PyPI.
 
+  `pip` installs them itself (see below).
+
 ## Installation
 
-Install from source (no PyPI release of gpusim2grid yet). With CUDA 13, everything
-it builds against comes from PyPI:
-
 ```bash
-git clone https://github.com/Grid2Op/gpusim2grid.git
-cd gpusim2grid
-pip install "lightsim2grid>=1.3.1" "nvidia-cudss-cu13>=1.0.0.35,<2" \
-    "cuda-toolkit[nvcc,crt,cudart,cccl,cublas,cusolver,cusparse,nvjitlink,nvvm]>=13,<14" \
-    scikit-build-core pybind11 cmake
-CUDA_ROOT=$(python -c "import nvidia.cu13 as m; print(list(m.__path__)[0])")
-CUDACXX=$CUDA_ROOT/bin/nvcc CUDAToolkit_ROOT=$CUDA_ROOT cudss_DIR=$PWD/ci/cmake/cudss \
-    pip install --no-build-isolation .
-export LD_LIBRARY_PATH=$CUDA_ROOT/lib:$LD_LIBRARY_PATH   # cuDSS / cuSPARSE at runtime
+pip install "gpusim2grid[cuda13]"
 ```
 
-With CUDA 12, install `"nvidia-cudss-cu12>=1.0.0.35,<2"` instead and keep the
-toolkit's own `nvcc` on your `PATH`; `cudss_DIR` is the same, `LD_LIBRARY_PATH`
-needs the wheel's `nvidia/cu12/lib`. `pip install ".[cuda12]"` / `".[cuda13]"`
-lists the runtime libraries.
+gpusim2grid is a source distribution: `pip` compiles it, in an isolated environment
+holding PyPI's CUDA 13 toolkit (`nvcc` included), cuDSS, lightsim2grid, pybind11 and
+cmake, and the `cuda13` extra installs the CUDA libraries and cuDSS it runs on, which
+it finds next to itself (no `LD_LIBRARY_PATH`). You need an NVIDIA driver recent
+enough for CUDA 13 (>= 580) and a C++17 compiler. `CUDA_REAL_FLOAT=1` builds the FP32
+version.
 
-This builds the zero-copy C++ bridge to `lightsim2grid` (`lightsim2grid_core`):
-CMake locates it, and the KLU headers it ships, via the Python interpreter it is
-building against. `--no-build-isolation` makes the build use the `lightsim2grid`
-installed in your environment instead of a fresh, isolated one pip would resolve.
-`ci/cmake/cudss/` is a small CMake package for the cuDSS wheel, which ships none.
+With CUDA 12, PyPI has no compiler: name the toolkit's (12.4 or later),
+`CUDACXX=/usr/local/cuda-12.4/bin/nvcc pip install "gpusim2grid[cuda12]"`.
 
-For detailed installation options — selecting float precision, a CUDA toolkit or
-cuDSS not from PyPI, and other build customization — see the dedicated installation
-page in the [documentation](#building-the-docs).
+From a clone, `pip install ".[cuda13]"` does the same. To compile against the
+`lightsim2grid` installed in your environment (built from source, or pinned) instead
+of the newest one on PyPI, build without isolation:
+`pip install --no-build-isolation ".[cuda13]"`, with scikit-build-core, pybind11 and
+cmake installed. `import gpusim2grid` checks that the CUDA libraries, the driver and
+lightsim2grid match the build.
+
+For the details — the CUDA major chosen from the environment, a toolkit or cuDSS not
+from PyPI, GPU architectures — see the installation page of the
+[documentation](#building-the-docs).
 
 ## Quickstart
 
@@ -152,7 +163,7 @@ grid = init_from_pandapower(pn.case14())
 grid.ac_pf(np.ones(grid.get_bus_vn_kv().shape[0], dtype=complex), 10, 1e-8)
 
 ca = g2g.ContingencyAnalysisGPU(grid, nb_iter=4)
-ca.add_contingencies_by_branch_id([[12], [40], [12, 40]])  # branch ids, lines-then-trafos
+ca.add_contingencies_by_branch_id([[12], [4], [12, 4]])    # branch ids, lines-then-trafos
 
 V = ca.compute(batch_size=512)   # DLPack capsule, shape (n_ctg, n_bus), complex
 residuals = ca.last_residuals()  # per-contingency ‖F‖∞ (NaN = skipped)
@@ -160,14 +171,21 @@ timings = ca.timings             # BatchTimings, per-phase breakdown
 ```
 
 When an N-k contingency splits the grid, opt into solving the largest connected
-component (islanded buses reported as ``NaN``) instead of skipping it:
+component (islanded buses reported as ``NaN``) instead of skipping it. The angle
+reference then moves, by default, to the slack participant stranded by the fewest
+contingencies (`reference_slack="auto"`):
 
 ```python
-# Pick the angle-reference slack stranded by the fewest contingencies and
-# re-solve the base case with it (minimises skips), then enable the masking.
-cont = [[c] for c in range(ca.n_branches)]
-g2g.optimize_reference_slack(grid, cont)
 ca = g2g.ContingencyAnalysisGPU(grid, handle_disconnected_grid=True, nb_iter=4)
+ca.add_contingencies_by_branch_id([[12], [4], [12, 4]])
+V = ca.compute(batch_size=512)
+```
+
+Rows of very different difficulty are better served by the continuous schedule,
+each row stopping at its own tolerance within a budget of `nb_iter` iterations:
+
+```python
+ca = g2g.ContingencyAnalysisGPU(grid, scheduling="continuous", nb_iter=30)
 ```
 
 Zero-copy export to PyTorch (the capsule aliases live GPU memory — clone it
@@ -184,7 +202,7 @@ other row — the GPU analogue of lightsim2grid's `ScenarioSweep`:
 ```python
 sweep = g2g.ScenarioSweepGPU(grid, nb_iter=4)
 sweep.set_injections_from_elements(load_p, load_q, gen_p)  # (n_scen, n_load/n_gen)
-sweep.set_topology([[], [3], [], [3, 40]])                 # one branch-id list per row
+sweep.set_topology([[], [3], [], [3, 12]])                 # one branch-id list per row
 V = sweep.compute(batch_size=512)
 disconnected = sweep.get_disconnected()  # which rows a topology trip islanded
 ```
@@ -200,7 +218,8 @@ the backward needs is built lazily on the first `backward()`:
 from gpusim2grid.differentiable import BatchPowerFlow
 pf = BatchPowerFlow.from_lsgrid(grid, nb_iter=8)
 V = pf(load_p=load_p, load_q=load_q, gen_p=gen_p, gen_v=gen_v,   # (n_scen, n_elem) tensors
-       line_status=line_status, trafo_status=trafo_status)        # bool, True = connected
+       line_status=line_status, trafo_status=trafo_status,        # bool, True = connected
+       gen_status=gen_status)
 loss = (V.abs() - 1.0).pow(2).sum()
 loss.backward()   # gradients w.r.t. load_p, load_q, gen_p and gen_v
 ```
@@ -210,24 +229,27 @@ See [`examples/`](examples/):
 - `ieee14_basic.py` — end-to-end AC power flow on the IEEE 14-bus case.
 - `case6515rte_screen.py` — batched contingency screen with residuals.
 - `injection_sweep_scan.py` — batched load-scaling injection sweep.
-- `scenario_sweep_scan.py` — row-aligned combined topology + injection sweep.
 - `handle_disconnected.py` — solve the largest component of a grid-splitting contingency.
 - `limit_violations.py` — fused per-contingency bus voltage / branch current limit checking.
 - `distributed_slack.py` — augmented solve (distributed slack in the Jacobian) via the lightsim2grid bridge.
 - `differentiable_pf.py` — derivatives through a single power flow via the adjoint method.
 - `batch_differentiable_pf.py` — `BatchPowerFlow`: a batch of scenarios (injections, set-points, branch statuses) as one differentiable PyTorch layer, trained over a few steps.
+- `pypowsybl_ca_and_differentiable_pf.ipynb` — a narrated walk-through on a real snapshot loaded with pypowsybl: N-1 analysis with limit violations and `BatchPowerFlow` gradients.
 
 ## How it works
 
 The base case is solved once (on the CPU via lightsim2grid, or on the GPU) to
 get the converged voltages and the Jacobian sparsity pattern. The batch is then
-processed in GPU chunks: each scenario starts from the base-case voltages, its
-Ybus is patched in place (contingencies subtract the tripped-branch admittances;
-injection sweeps vary Sbus; the scenario sweep does both, row-aligned), and a
-fixed number of Newton-Raphson iterations run in parallel over the
-block-diagonal system. The cuDSS symbolic factorization is computed **once**
-and reused across the whole batch — only numeric refactorization/solve happen
-per iteration. A post-loop residual pass reports the final ‖F‖∞ per scenario.
+solved in GPU slots: each scenario starts from the base-case voltages, its Ybus
+is patched in place (contingencies subtract the tripped-branch admittances;
+injection sweeps vary Sbus; the scenario sweep does both, row-aligned), and the
+Newton-Raphson iterations run in parallel over the block-diagonal system — a
+fixed number per chunk of rows, or, in the continuous schedule, until each row
+converges, a freed slot taking the next row at once. The cuDSS symbolic
+factorization is computed **once** and reused across the whole batch, and
+across `compute()` calls while nothing that shapes it changes — only numeric
+refactorization/solve happen per iteration. A residual pass reports the final
+‖F‖∞ per scenario.
 
 See the [API documentation](https://gpusim2grid.readthedocs.io) for the full design.
 
@@ -273,15 +295,13 @@ design. See the [roadmap](#roadmap) below for areas where help is especially wel
 
 Directions we plan to pursue — **any help or ideas are very welcome**:
 
-- **Extend derivatives** beyond `BatchPowerFlow`'s inputs (`load_p`, `load_q`,
-  `gen_p`, `gen_v`): generator contingencies (`gen_status`), a JAX front-end on the
-  same DLPack primitives, and the plain contingency-analysis path.
+- **Extend derivatives**: a JAX front-end on the same DLPack primitives, and the
+  plain contingency-analysis path.
 - **Best action selector** — given one or several grid snapshots and a list of
   candidate actions, find the best action(s) to apply, by evaluating the candidates in
   batch on the GPU.
-- **Performance** — for example, reusing the KLU ordering already computed by
-  `lightsim2grid` during the base-case solve, instead of recomputing an ordering on
-  the GPU.
+- **Performance** — a single kernel assembling the Jacobian and the mismatch straight
+  into the batched LU's own layout, and the LU itself (factor and solve fused).
 - Deeper `lightsim2grid` integration and a simpler, more ergonomic public API.
 
 ### Explored but not yet implemented
@@ -298,20 +318,18 @@ simply have not had the time to implement them yet:
 Licensed under the **Mozilla Public License 2.0 (MPL-2.0)** — see [`LICENSE`](LICENSE)
 and [`DISCLAIMER.md`](DISCLAIMER.md).
 
-Copyright © "DOUBLE BLINDE REMOVED" DO NOT DISTRIBUTE THIS ANONYMISED VERSION ! <!--RTE (<https://www.rte-france.com>) REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER --> . Released as part of the
-[Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem. 
+Copyright © RTE (<https://www.rte-france.com>). Released as part of the
+[Linux Foundation Energy (LF Energy)](https://www.lfenergy.org/) ecosystem.
 
 NVIDIA CUDA libraries (CUDA Toolkit, cuDSS, cuSPARSE) are dependencies, not
 redistributed components, and remain under their respective NVIDIA licenses. The vendored
 DLPack header (`src/_cpp/dlpack/dlpack.h`) is under the Apache License 2.0, its
 [license](src/_cpp/dlpack/LICENSE) next to it.
 
-<!-- ## Acknowledgements
-
-REMOVE FOR DOUBLE BLIND, WILL BE ADDED BACK LATER
+## Acknowledgements
 
 Developed at RTE. Part of the [Grid2Op](https://github.com/Grid2Op) ecosystem and built
 on [`lightsim2grid`](https://github.com/Grid2op/lightsim2grid). Uses
 [Eigen](https://eigen.tuxfamily.org), [KLU](https://github.com/DrTimothyAldenDavis/SuiteSparse),
 [cuDSS](https://developer.nvidia.com/cudss), and cuSPARSE. The batched LU behind
-`linear_solver='own_lu'` is Ralf Cortes Do Nascimento's contribution. -->
+`linear_solver='own_lu'` is Ralf Cortes Do Nascimento's contribution.

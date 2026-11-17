@@ -1,6 +1,22 @@
 Change Log
 ===========
 
+[0.3.1] (unreleased)
+--------------------
+- [IMPROVED] The Newton voltage update applies its step as a product (no ``atan2``/``sin``/``cos`` per bus):
+  4x faster in FP64 on an RTX A1000.
+- [IMPROVED] The Jacobian fill: fewer FP64 operations per entry, no warp divergence on the diagonal (4.6x faster).
+- [IMPROVED] Ybus·V and the P/Q mismatch in one kernel instead of cuSPARSE's SpMV and two fills: time series 2x faster.
+- [IMPROVED] ``scheduling="continuous"`` keeps its driver across ``compute()`` calls on the three batch facades
+  (not with ``outer_loops``): no allocation or cuDSS analysis.
+- [IMPROVED] ``scheduling="continuous"``: a round's first Newton step reuses the residual pass's mismatch.
+- [IMPROVED] Batch drivers no longer allocate the block-diagonal Ybus CSR (batch × nnz_Y ints) unless cuSPARSE's
+  SpMV is used.
+- [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's;
+  the extra step changed the loops' decisions.
+- [BREAKING] ``outer_loops=True``: ``nb_nr_iterations`` / ``get_row_iterations()`` count the steps taken, 0 for an
+  inner solve converged from its start.
+
 [0.3.0] 2026-11-16
 --------------------
 - [ADDED] An sdist installable with ``pip install gpusim2grid[cuda13]``: the isolated build takes nvcc and

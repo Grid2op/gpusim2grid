@@ -114,6 +114,34 @@ def test_ca_nb_iter_change_keeps_the_driver(ieee14_base_case, solver_atol):
     _assert_same(ca.V_results.to_numpy(), _ca_V(grid, range(10), nb_iter=5), 1e-3 * solver_atol)
 
 
+@pytest.mark.parametrize("linear_solver", ["cudss", "own_lu"])
+def test_ca_continuous_reuses_the_driver(ieee14_base_case, solver_atol, linear_solver):
+    """The continuous schedule keeps its driver and source too: every N-1
+    (islanding ones masked), 3 slots and a tail of 1-slot groups, run three
+    times -- each run what a fresh session gives, iteration counts included."""
+    grid = ieee14_base_case["grid"]
+    n_br = len(grid.get_lines()) + len(grid.get_trafos())
+    kw = dict(scheduling="continuous", handle_disconnected_grid=True, linear_solver=linear_solver)
+
+    def make():
+        ca = _ca(grid, range(n_br), **kw)
+        ca.tail_max_groups, ca.tail_group_size = 2, 1
+        return ca
+
+    ref = make()
+    ref.compute(batch_size=3)
+    V_ref, it_ref = ref.V_results.to_numpy(), np.asarray(ref.get_row_iterations())
+    ca = make()
+    for _ in range(3):
+        ca.compute(batch_size=3)
+        _assert_same(ca.V_results.to_numpy(), V_ref, 1e-3 * solver_atol)
+        np.testing.assert_array_equal(np.asarray(ca.get_row_iterations()), it_ref)
+    assert _session(ca).driver_build_counter == 1
+    assert ca.timings.t_analysis_ms == 0.0
+    assert ca.timings.n_tail_rounds > 0
+    assert ca.timings.n_disconnected == ref.timings.n_disconnected
+
+
 def test_ca_hot_run_keeps_disconnected_rows(ieee14_base_case):
     """The per-row islanding flags describe the live source: a hot run must
     report the same disconnected rows (it skips the connectivity pass)."""
@@ -202,6 +230,44 @@ def test_is_new_gen_v_keeps_the_driver(ieee14_base_case, solver_atol):
     sw.compute()
     assert _session(sw).driver_build_counter == 1
     _assert_same(sw.V_results.to_numpy(), _is_V(grid, F1, gen_v=gen_v), 1e-3 * solver_atol)
+
+
+@pytest.mark.parametrize("linear_solver", ["cudss", "own_lu"])
+def test_is_continuous_reuses_the_driver(ieee14_base_case, solver_atol, linear_solver):
+    """The continuous schedule keeps its driver too: 3 slots for 7 rows (refills)
+    and a tail of 1-slot groups (compaction, own LU's active prefix), run again
+    as is, with new injections and with new gen_v -- each run what a fresh
+    session gives, iteration counts included."""
+    grid = ieee14_base_case["grid"]
+    n_gen = len(grid.get_generators())
+    gen_v = np.full((len(F1), n_gen), np.nan)
+    gen_v[:, 0] = np.linspace(1.0, 1.06, len(F1))
+    kw = dict(scheduling="continuous", linear_solver=linear_solver)
+
+    def make(factors):
+        sw = _is(grid, factors, **kw)
+        sw.tail_max_groups, sw.tail_group_size = 2, 1
+        return sw
+
+    def fresh(factors, gv):
+        sw = make(factors)
+        if gv is not None:
+            sw.set_gen_v(gv)
+        sw.compute(batch_size=3)
+        return sw.V_results.to_numpy(), np.asarray(_session(sw).get_row_iterations())
+
+    sw = make(F1)
+    for factors, gv in ((F1, None), (F1, None), (F2, None), (F2, gen_v), (F1, gen_v)):
+        sw.set_injections_from_elements(*_injections(grid, factors))
+        if gv is not None:
+            sw.set_gen_v(gv)
+        sw.compute(batch_size=3)
+        V_ref, it_ref = fresh(factors, gv)
+        _assert_same(sw.V_results.to_numpy(), V_ref, 1e-3 * solver_atol)
+        np.testing.assert_array_equal(np.asarray(_session(sw).get_row_iterations()), it_ref)
+    assert _session(sw).driver_build_counter == 1
+    assert sw.timings.t_analysis_ms == 0.0
+    assert sw.timings.n_tail_rounds > 0   # the tail ran on the reused driver
 
 
 def test_is_hot_gen_v_moves_voltage_control_columns(solver_atol):

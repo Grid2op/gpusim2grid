@@ -214,6 +214,13 @@ struct NrIterBuffers {
     // slack participant re-weights the survivors (lightsim2grid PR #193).
     int                    slack_w_stride = 0;
 
+    // ---- slots that take no step this iteration ------------------------------
+    // [actual_batch], nullptr (default) = every slot steps. A slot at 1 has its
+    // dx zeroed right after the solve: the continuous schedule's check before an
+    // inner solve's first step found it converged already (lightsim2grid's
+    // NRAlgo::newton checks before it steps).
+    const int*             d_skip_step = nullptr;
+
     // ---- per-slot VoltageControl set-points ---------------------------------
     // 0 (default): d_vc_vset is the shared [n_vc_grp] base array. n_vc_grp:
     // d_vc_vset is per slot, [actual_batch * n_vc_grp] -- a batch row whose
@@ -270,6 +277,30 @@ struct NrIterBuffers {
     cuda_real_type         max_dVm = static_cast<cuda_real_type>(0.1);
     cuda_real_type*        d_scale_max_dtheta = nullptr;  // [actual_batch] scratch, zeroed each call
     cuda_real_type*        d_scale_max_dvm    = nullptr;  // [actual_batch] scratch, zeroed each call
+
+    // Per-bus P / Q row (-1: none), [n_bus] each (AcPfNrState::d_p/q_row_of_bus).
+    // Both set: the batch loop and the residual pass run spmv_fill_F_kernel
+    // instead of cuSPARSE's SpMV + fill_FP / fill_FQ (nr_spmv_fill_F).
+    const int*             d_p_row_of_bus = nullptr;
+    const int*             d_q_row_of_bus = nullptr;
+    // Buses by Ybus row length (AcPfNrState::d_bus_order), the thread order of
+    // spmv_fill_F_kernel; nullptr: natural order. Set with ybus_shared only.
+    const int*             d_bus_order    = nullptr;
+
+    // Every slot holds the same Ybus (an injection sweep without outer-loop
+    // patches, BatchPfDriver::_make_nr_buffers): spmv_fill_F_kernel reads slot
+    // 0's copy of d_Ybus_values for every slot (Ybus stride 0). fill_J keeps
+    // the per-slot read: its cost is the J writes (60.4 -> 58.9 ms shared).
+    bool                   ybus_shared    = false;
+
+    // The continuous schedule's F computed once per round (fused path only,
+    // BatchPfDriver::_solve_continuous): the residual pass stores the P/Q rows
+    // of F into d_F_raw [actual_batch × n_bus × 2] (spmv_fill_F_kernel's layout), and the next round's first
+    // Newton iteration copies them back for the slots d_F_clean flags (nothing
+    // changed their V, Ybus or Sbus since) instead of recomputing. The feature
+    // mismatch and the masks still run on every slot. nullptr: always compute.
+    cuda_real_type*        d_F_raw        = nullptr;
+    const int*             d_F_clean      = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -516,7 +547,9 @@ inline void nr_fill_J_at_current_V(
     cudaStream_t cs)
 {
     nr_feature_zero_J(buf, nnz_J, batch, cs);
-    fill_J_kernel<<<nr_grid_size((long long)batch * nnz_Y, BS), BS, 0, cs>>>(
+    // 2D grid: Ybus entries on x, batch slots on y (the kernel strides past 65535).
+    const dim3 fill_J_grid((nnz_Y + BS - 1) / BS, static_cast<unsigned>(batch < 65535 ? batch : 65535));
+    fill_J_kernel<<<fill_J_grid, BS, 0, cs>>>(
         buf.d_J_values, buf.d_V, buf.d_Ibus,
         buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values,
         buf.d_map_j11, buf.d_map_j12, buf.d_map_j21, buf.d_map_j22,
@@ -525,6 +558,42 @@ inline void nr_fill_J_at_current_V(
     // Per-slot overrides + identity-pinned / masked rows win over every stamp
     // above (no-op unless the buffers carry mask entries).
     nr_apply_J_masks(buf, nnz_J, dim_J, batch, cs);
+}
+
+// -----------------------------------------------------------------------------
+// nr_spmv_fill_F
+//
+// Steps ① and the P/Q part of ② for n_slots slots: d_Ibus = Ybus · d_V and
+// −[ΔP, ΔQ] into the ledger P/Q rows. One fused kernel when the buffers carry
+// the per-bus row maps, else cuSPARSE's SpMV then fill_FP / fill_FQ. The feature
+// mismatch and the F masks still follow (the caller's).
+// -----------------------------------------------------------------------------
+// store_raw: also store the P/Q rows into buf.d_F_raw (when set); use_clean:
+// copy them back from it for the slots buf.d_F_clean flags (when set).
+inline void nr_spmv_fill_F(
+    CuSpMV& spmv, const NrIterBuffers& buf,
+    int n_bus, int nnz_Y, int dim_J, int n_slots, cudaStream_t cs,
+    bool store_raw = false, bool use_clean = false)
+{
+    if (buf.d_p_row_of_bus != nullptr && buf.d_q_row_of_bus != nullptr) {
+        if (n_slots <= 0) return;
+        const dim3 grid((n_bus + BS - 1) / BS, static_cast<unsigned>(n_slots < 65535 ? n_slots : 65535));
+        spmv_fill_F_kernel<<<grid, BS, 0, cs>>>(
+            buf.d_F, buf.d_Ibus, buf.d_V, buf.d_Sbus, buf.sbus_stride,
+            buf.d_Ybus_outer, buf.d_Ybus_inner, buf.d_Ybus_values, buf.ybus_shared ? 0 : nnz_Y,
+            buf.d_p_row_of_bus, buf.d_q_row_of_bus, buf.d_bus_order,
+            buf.d_F_raw, use_clean && buf.d_F_raw != nullptr ? buf.d_F_clean : nullptr,
+            store_raw && buf.d_F_raw != nullptr ? 1 : 0, n_bus, dim_J, n_slots);
+        return;
+    }
+    spmv.spmv();
+    if (n_slots <= 0) return;
+    fill_FP_kernel<<<nr_grid_size((long long)n_slots * buf.n_p, BS), BS, 0, cs>>>(
+        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
+        buf.n_p, n_bus, dim_J, n_slots, buf.sbus_stride);
+    fill_FQ_kernel<<<nr_grid_size((long long)n_slots * buf.n_q, BS), BS, 0, cs>>>(
+        buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
+        buf.n_q, n_bus, dim_J, n_slots, buf.sbus_stride);
 }
 
 // -----------------------------------------------------------------------------

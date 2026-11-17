@@ -60,6 +60,9 @@ struct InjectionBatch {
     // sbus_stride = n_bus  → per-scenario row indexing in fill_FP/FQ kernels.
     // -------------------------------------------------------------------------
     static int sbus_stride(int n_bus) { return n_bus; }
+    // Every slot holds the base Ybus, tiled once (initialize()): the driver may
+    // read one copy for all (spmv_fill_F_kernel) unless the outer loops patch it.
+    static constexpr bool ybus_same_in_every_slot() { return true; }
 
     // -------------------------------------------------------------------------
     // Host-side per-scenario Sbus (n_scenario × n_bus complex per-unit)

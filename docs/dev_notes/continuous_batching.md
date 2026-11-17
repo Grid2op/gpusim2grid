@@ -798,8 +798,12 @@ grid with one slack bus. So:
 | 3. check records the scheduler can read | **Partial.** `_solve_continuous` runs every check at eviction (`batch_pf_driver.cu:1667`, `1704-1900`), but the records exist only in the user-facing top-K buffers. The scheduler reads only the residuals. A per-row summary of what was detected is still to add. |
 | 4. extensible status and counter | **Done.** `RowStatus` is append-only (`row_status.hpp`), with one counter per row, reset when a slot is loaded. |
 
-Also not done: A.6 item 2. Every continuous run is cold (the sessions rebuild the driver), and
-`nb_iter_per_round` / `tol` are not in the driver config snapshot.
+A.6 item 2 (done 2026-11-16, branch `perf_v_update`): the three sessions reuse their driver in
+continuous mode as in chunk mode (hot, and warm for a scenario sweep), except with the outer loops.
+`nb_iter_per_round` / `tol` stay out of the driver config snapshot: they are per-run knobs set on
+the live driver. A warm scenario sweep rebuilds the driver when its topology leaves more active
+rows than the live slots and `batch_size` allows more. `BatchPowerFlow`'s continuous backward
+refuses any forward in between (`run_counter`), since it rebuilds J from the live source.
 
 *First version, 2026-10-15 (`ScenarioSweepGPU(outer_loops=True)`, CLAUDE.md "Outer loops"):*
 

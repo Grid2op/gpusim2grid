@@ -103,6 +103,18 @@ struct TailSolve {
     }
 };
 
+// zero_skipped_steps_kernel -- dx = 0 on the slots NrIterBuffers::d_skip_step
+// flags (one block per slot): their V and every other unknown stay where they are.
+template <typename R>
+__global__ void zero_skipped_steps_kernel(R* __restrict__ d_dx, const int* __restrict__ d_skip,
+                                          int dim_J, int batch)
+{
+    const int b = blockIdx.x;
+    if (b >= batch || d_skip[b] == 0) return;
+    R* dx = d_dx + static_cast<size_t>(b) * dim_J;
+    for (int k = threadIdx.x; k < dim_J; k += blockDim.x) dx[k] = R(0);
+}
+
 // =============================================================================
 // run_nr_loop<Policy>
 //
@@ -158,19 +170,16 @@ inline void run_nr_loop(
     for (int iter = 0; iter < nb_iter; ++iter) {
         NrIterTimings step;
 
-        // ①  SpMV: d_Ibus_batch = Ybus_batch · d_V_batch
+        // ①+②  d_Ibus_batch = Ybus_batch · d_V_batch and −[ΔP, ΔQ] into the
+        //       ledger P/Q rows (one fused kernel when possible, nr_spmv_fill_F;
+        //       timed as t_spmv, t_fill_F then holds the feature mismatch + masks)
         timer.start();
-        spmv.spmv();
+        nr_spmv_fill_F(spmv, buf, n_bus, nnz_Y, dim_J, batch_size, cs,
+                       /*store_raw=*/false, /*use_clean=*/iter == 0);
         step.t_spmv = timer.stop_ms();
 
-        // ②  Fill F: −[ΔP, ΔQ] scattered into the ledger P/Q rows
+        // ②  F: feature contributions and masks
         timer.start();
-        fill_FP_kernel<<<nr_grid_size((long long)batch_size * buf.n_p, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_p_buses, buf.d_p_rows,
-            buf.n_p, n_bus, dim_J, batch_size, buf.sbus_stride);
-        fill_FQ_kernel<<<nr_grid_size((long long)batch_size * buf.n_q, BS), BS, 0, cs>>>(
-            buf.d_F, buf.d_V, buf.d_Ibus, buf.d_Sbus, buf.d_q_buses, buf.d_q_rows,
-            buf.n_q, n_bus, dim_J, batch_size, buf.sbus_stride);
         nr_feature_mismatch(buf, n_bus, dim_J, batch_size, cs);
         // handle_disconnected_grid / PV pins / stranded controllers: rewrite
         // the stranded voltage rows, then zero the masked rows of F (the J
@@ -214,6 +223,11 @@ inline void run_nr_loop(
             n_tail_refactor = tail->solve(buf.d_J_values, buf.d_F, buf.d_dx, timer, step);
         else
             did_refactor = policy.solve_iter(linear_solver, buf.d_J_values, cs, timer, step);
+
+        // ④a A slot found converged before its first step takes none
+        //     (NrIterBuffers::d_skip_step; nullptr = every slot steps).
+        if (buf.d_skip_step != nullptr)
+            zero_skipped_steps_kernel<<<batch_size, BS, 0, cs>>>(buf.d_dx, buf.d_skip_step, dim_J, batch_size);
 
         // ④b Step-scaling (MaxVoltageChange), if enabled -- rescale each
         //     batch slot's dx BEFORE applying it anywhere, so Va/Vm and any

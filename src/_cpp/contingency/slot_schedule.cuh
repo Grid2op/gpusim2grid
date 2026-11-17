@@ -168,6 +168,61 @@ __global__ void init_slack_absorbed_slots_kernel(R* __restrict__ d_slack_absorbe
 }
 
 // -----------------------------------------------------------------------------
+// The check before a solve's first step (continuous schedule, outer loops):
+// lightsim2grid's NRAlgo::newton checks its residual before stepping, after
+// recalibrating a distributed slack's slack_absorbed from it, so an inner solve
+// whose start is already converged (a re-solve after the loops moved the
+// units' targets, typically) takes no step.
+// -----------------------------------------------------------------------------
+
+// For each slot with d_check[slot] != 0: NRSystem::calibrate_slack_absorbed /
+// MultiSlack::absorb_balance -- the sum of the P rows of F (the negated
+// mismatch, masked rows already 0) over the total participation weight goes to
+// slack_absorbed, which closes the active power balance at the current V
+// (adjust_slack_mismatch_kernel takes sa·w out of F: the sum is affine in sa).
+// A degenerate participation (total weight <= 1e-7, lightsim2grid's
+// _tol_equal_float) leaves it as it is. One block per slot.
+template <typename R>
+__global__ void calibrate_slack_absorbed_slots_kernel(R* __restrict__ d_slack_absorbed,
+                                                      const R* __restrict__ d_F,
+                                                      const int* __restrict__ d_p_rows, int n_p,
+                                                      const R* __restrict__ d_slack_w, int w_stride,
+                                                      int n_slack, int dim_J,
+                                                      const int* __restrict__ d_check, int n_slots)
+{
+    const int b = blockIdx.x;
+    if (b >= n_slots || d_check[b] == 0) return;
+    __shared__ R s_sum[BS];
+    const R* F = d_F + static_cast<size_t>(b) * dim_J;
+    R acc = static_cast<R>(0.);
+    for (int k = threadIdx.x; k < n_p; k += blockDim.x) acc += F[d_p_rows[k]];
+    s_sum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int h = blockDim.x / 2; h > 0; h /= 2) {
+        if (threadIdx.x < h) s_sum[threadIdx.x] += s_sum[threadIdx.x + h];
+        __syncthreads();
+    }
+    if (threadIdx.x != 0) return;
+    const R* w = d_slack_w + static_cast<size_t>(b) * w_stride;
+    R total_w = static_cast<R>(0.);
+    for (int k = 0; k < n_slack; ++k) total_w += w[k];
+    if (!(fabs(static_cast<double>(total_w)) > 1e-7)) return;
+    d_slack_absorbed[b] += s_sum[0] / total_w;
+}
+
+// d_skip[slot] = the slot is checked and its residual is already below tol.
+template <typename R>
+__global__ void skip_converged_slots_kernel(int* __restrict__ d_skip,
+                                            const int* __restrict__ d_check,
+                                            const R* __restrict__ d_res,
+                                            double tol, int n_slots)
+{
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= n_slots) return;
+    d_skip[s] = (d_check[s] != 0 && static_cast<double>(d_res[s]) < tol) ? 1 : 0;
+}
+
+// -----------------------------------------------------------------------------
 // Launchers (no-ops on empty input)
 // -----------------------------------------------------------------------------
 template <typename T>

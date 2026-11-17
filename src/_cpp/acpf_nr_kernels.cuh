@@ -254,7 +254,8 @@ __global__ void fill_FQ_kernel(
 // fill_J_kernel
 //
 // Fills the Jacobian for a batch of systems (actual_batch=1 for single-system NR).
-// One thread per (contingency b, Ybus nnz k).
+// Ybus nnz k on blockIdx.x * blockDim.x + threadIdx.x, batch slot b on blockIdx.y
+// (grid-stride over b: launch with gridDim.y = min(actual_batch, 65535)).
 //
 // Row recovery: binary search on the SINGLE-SYSTEM d_Ybus_outer using k.
 //   Reusing the single-system outer avoids repeating the n_bus-wide search
@@ -317,7 +318,7 @@ __global__ void apply_step_scale_kernel(
 //
 // Applies angle corrections to each bus owning a theta unknown.
 //   Va_new = Va_old + dx[b * dim_J + theta_cols[k]],   bus = theta_buses[k]
-//   V_new  = |V| * exp(j * Va_new)
+//   V_new  = |V| * exp(j * Va_new), applied as V *= exp(j * dx) (no atan2)
 // Ledger-driven: the (bus, col) pairs come from the NRLedger's theta-unknown
 // list. Feature-free: theta_buses == sorted(pvpq), theta_cols == [0, n_pvpq).
 // Must complete before update_Vm_kernel (same stream → implicit order).
@@ -337,7 +338,7 @@ __global__ void update_Va_kernel(
 //
 // Applies magnitude corrections to each bus owning a vm unknown.
 //   Vm_new = Vm_old + dx[b * dim_J + vm_cols[k]],   bus = vm_buses[k]
-//   V_new  = Vm_new * exp(j * Va)
+//   V_new  = Vm_new * exp(j * Va), applied as V *= 1 + dx / |V| (no atan2)
 // Feature-free: vm_buses == pq, vm_cols == [n_pvpq, n_pvpq + n_pq).
 // Reads Va from d_V after update_Va_kernel has written it (same stream).
 // ---------------------------------------------------------------------------
@@ -513,6 +514,50 @@ __global__ void hvdc_fill_feature_kernel(
     int n_bus,
     int nnz_J,
     int actual_batch);
+
+// ---------------------------------------------------------------------------
+// spmv_fill_F_kernel
+//
+// The batched SpMV and fill_FP / fill_FQ in one pass: per (bus i, slot b),
+//   Ibus[b, i] = Σ_k Y[b, k] · V[b, inner[k]]   over row i of the slot's Ybus
+//   F[b, p_row_of_bus[i]] = −(Re(V_i·conj(Ibus_i)) − Re(Sbus_i))   if ≥ 0
+//   F[b, q_row_of_bus[i]] = −(Im(V_i·conj(Ibus_i)) − Im(Sbus_i))   if ≥ 0
+// i.e. what cuSPARSE's block-diagonal SpMV followed by the two fill kernels
+// write, without the block-diagonal column indices and without reading V and
+// Ibus back. Only valid when no bus owns two P rows or two Q rows
+// (AcPfNrState::fused_F_ok). Ybus values per slot, stride nnz_Y (the patched
+// copy fill_J reads) or, ybus_stride 0, one copy shared by every slot; Sbus
+// as fill_FP (stride 0 = shared).
+// Thread t handles bus d_bus_order[t] (nullptr: bus t). With a shared Ybus,
+// the buses by row length: a warp otherwise waits for its longest row (2.7x
+// the useful FP64 work on case2869: 1.97 -> 1.27 ms per 512-slot launch on an
+// RTX A1000). Not with a per-slot Ybus: the sorted rows of one warp are then
+// scattered over the slot's copy and the reads stop coalescing (3.1 ms).
+// d_F_raw [n_slots × n_bus × 2] (nullable), by thread (P, Q of the bus thread t
+// handles: coalesced in the sorted order too): write_raw = 1 also stores the
+// P/Q rows there; a slot with d_F_clean[b] != 0 copies them back into F instead of
+// computing (its V, Ybus and Sbus unchanged since they were stored: the
+// continuous schedule's residual pass stores, the next round's first Newton
+// iteration copies; Ibus is left as that pass wrote it).
+// Grid: buses on x, slots on y (grid-stride: gridDim.y = min(n_slots, 65535)).
+// ---------------------------------------------------------------------------
+__global__ void spmv_fill_F_kernel(
+          cuda_real_type*  __restrict__ d_F,
+          cudaComplexType* __restrict__ d_Ibus,
+    const cudaComplexType* __restrict__ d_V,
+    const cudaComplexType* __restrict__ d_Sbus,
+    int sbus_stride,
+    const int*             __restrict__ d_Ybus_outer,
+    const int*             __restrict__ d_Ybus_inner,
+    const cudaComplexType* __restrict__ d_Ybus_values_batch,
+    int ybus_stride,
+    const int*             __restrict__ d_p_row_of_bus,
+    const int*             __restrict__ d_q_row_of_bus,
+    const int*             __restrict__ d_bus_order,
+          cuda_real_type*  __restrict__ d_F_raw,
+    const int*             __restrict__ d_F_clean,
+    int write_raw,
+    int n_bus, int dim_J, int n_slots);
 
 // ===========================================================================
 // VoltageControl (remote gen + SVC) — Phase 4 (bordered formulation)

@@ -317,7 +317,7 @@ def test_ieee300_reactive_limits(load_scale):
     assert stats.nb_outer_iterations > 0
     assert res.nb_outer_iterations == stats.nb_outer_iterations, msg
     assert _decision_keys(res.decisions) == _decision_keys(stats.decisions, row), msg
-    assert res.nb_nr_iterations == sum(max(n, 1) for n in stats.nr_iterations), msg
+    assert res.nb_nr_iterations == sum(stats.nr_iterations), msg
     assert (V_ref.size == 0) == (load_scale == 1.03), msg
     if V_ref.size == 0:
         assert status == MAX_ITER, msg

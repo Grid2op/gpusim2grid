@@ -58,7 +58,7 @@ constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 
 enum class Kind { DistributedSlack, HvdcLimits, VoltageMonitoring, ReactiveLimits, PhaseControl,
                   TransformerVoltageControl, ShuntVoltageControl };
-enum Status { STABLE = 0, UNSTABLE = 1, FAILED = 2 };   // OuterLoopStatus
+enum Status { STABLE = 0, UNSTABLE = 1, FAILED = 2, CHECK_AGAIN = 3 };   // OuterLoopStatus
 
 // A std::map's interface over a sorted vector (the subset the model uses): the same keys, the
 // same order, the same values. A row's maps hold tens of buses, are searched once per bus of
@@ -335,6 +335,12 @@ struct SlotState {
     std::vector<signed char> bc_ctl, bc_rctl;   // requested controls, -1 untouched
     // ---- driver state (OuterLoopAlgo::compute_pf) -----------------------------
     std::vector<int> loop_iter; // per active loop: its UNSTABLE count (OuterContext::iteration)
+    // a change a re-solve met with no Newton step is done (OuterLoopAlgo::compute_pf, #264):
+    // v_version counts the solves that moved V, done_at[i] the version loop i's change was
+    // done on (-1: none); changed = the check in flight said UNSTABLE (not CHECK_AGAIN)
+    std::vector<int> done_at;
+    int  v_version = 0;
+    bool changed = false;
     bool first = true;          // the first solve has not ended yet
     int  i = 0;                 // the loop being checked
     int  last_unstable = -1;
@@ -344,7 +350,8 @@ struct SlotState {
     bool check_unrealistic = false;     // for the solve in flight
     bool pass_check_unrealistic = false;
     int  old_total = 0;
-    int  total_nr = 0;
+    int  total_nr = 0;          // at least 1 per solve: what tells a pass re-solved
+    int  nr_steps = 0;          // the Newton steps actually taken (RowResult::nb_nr_iterations)
     int  nb_outer = 0;
     int  nb_passes = 0;
     bool unrealistic = false;
@@ -1202,6 +1209,9 @@ void Ls2gOuterModel::load(int slot, int row)
     }
     { ProfScope p(prof_, P_LOAD_SET_ACTIVE); set_active(st); }
     st.loop_iter.assign(st.active.size(), 0);
+    st.done_at.assign(st.active.size(), -1);
+    st.v_version = 0;
+    st.changed = false;
     if (row >= 0) {
         if (resume_) {
             ProfScope p(prof_, P_LOAD_RESUME_TARGETS);
@@ -2758,7 +2768,7 @@ int Ls2gOuterModel::check_tvc(SlotState& st, const LoopDecl& L, const RowView& r
         tvc_freeze(st, rv, tvc_limit(st, L), closed);
         tvc_fix_controls(st, closed);
         st.tvc_step = 1;
-        return UNSTABLE;
+        return CHECK_AGAIN;   // the next check is the next step
     }
 
     // CONTROL: the ratios out of their range rounded to their extreme tap
@@ -2798,8 +2808,8 @@ int Ls2gOuterModel::check_tvc(SlotState& st, const LoopDecl& L, const RowView& r
         tvc_release(st);
         st.tvc_step = 2;
     }
-    // in any case, the loop must run again
-    return UNSTABLE;
+    // in any case, the loop must run again: its next check is its next step
+    return CHECK_AGAIN;
 }
 
 // =============================================================================
@@ -2900,8 +2910,9 @@ int Ls2gOuterModel::check_pc(SlotState& st, const LoopDecl& L, const RowView& rv
             st.bc_req_tap[ee] = best;
             record(st, L.name, "ROUND_TAP", true, sh.trafo, a, ptc.alpha_at(sh.trafo, best));
         }
-        // OpenLoadFlow re-solves whenever there is a phase shifter, limiters included
-        return UNSTABLE;
+        // OpenLoadFlow re-solves whenever there is a phase shifter, limiters included; the
+        // next check (the limiters') runs whatever this one moved
+        return CHECK_AGAIN;
     }
     // the current limiters above their limit move one tap, the way that lowers the current
     bool moved = false;
@@ -2970,6 +2981,7 @@ Next Ls2gOuterModel::on_solved_impl(int slot, bool converged, int nr_iter, int i
     SlotState& st = slots_[static_cast<size_t>(slot)];
     // OuterLoopAlgo::_solve's epilogue: a solve counts for at least one iteration
     st.total_nr += std::max(nr_iter, 1);
+    st.nr_steps += nr_iter;
     bool ok = converged;
     if (ok && st.check_unrealistic && data != nullptr && data->unrealistic) {
         st.unrealistic = true;
@@ -2991,7 +3003,20 @@ Next Ls2gOuterModel::on_solved_impl(int slot, bool converged, int nr_iter, int i
     }
     // a re-solve after loop i acted: runOuterLoop's do-while goes on
     ++st.nb_outer;
-    if (st.solver_ok && st.nb_outer < params_.max_outer_iterations)
+    bool again = true;
+    if (nr_iter > 0) {
+        ++st.v_version;
+    } else if (st.solver_ok && st.changed) {
+        // no Newton step: V did not move and the change sits in the residuals, within
+        // tolerance; checked again, the loop would act again for what it already did
+        // (DistributedSlack moving its units twice for one mismatch). Its change is done,
+        // until a solve moves V.
+        st.done_at[static_cast<size_t>(st.i)] = st.v_version;
+        st.last_status = STABLE;
+        record(st, loops_[static_cast<size_t>(st.active[static_cast<size_t>(st.i)])].name, "SETTLED", true, -1, 0., 0.);
+        again = false;
+    }
+    if (again && st.solver_ok && st.nb_outer < params_.max_outer_iterations)
         return drive(st, rv, row_status, inner_status, /*recheck=*/true);
     // the loop's do-while ends: its epilogue, then the next loop (which stops the pass)
     if (!st.pass_check_unrealistic && st.i == st.last_fixing && st.solver_ok && data != nullptr && data->unrealistic) {
@@ -3008,6 +3033,7 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
     const int n = static_cast<int>(st.active.size());
     for (;;) {
         // the for loop over the loops of a pass, from loop i
+        const bool rechecking = recheck;   // inside loop i's do-while: always checked
         const bool stop = !recheck &&
                           (st.i >= n || st.i == st.last_unstable || !st.solver_ok ||
                            st.last_status == FAILED || st.nb_outer >= params_.max_outer_iterations);
@@ -3025,10 +3051,15 @@ Next Ls2gOuterModel::drive(SlotState& st, const RowView& rv, int& row_status, in
             return finish(st, row_status, inner_status);
         }
         const LoopDecl& L = loops_[static_cast<size_t>(st.active[static_cast<size_t>(st.i)])];
-        const int status = check(st, L, rv, st.loop_iter[static_cast<size_t>(st.i)]);
-        st.last_status = status;
-        st.last_name = L.name;
-        if (status == UNSTABLE) {
+        // a loop whose change is done is not checked again until a solve moves V
+        const bool settled = !rechecking && st.done_at[static_cast<size_t>(st.i)] == st.v_version;
+        const int status = settled ? STABLE : check(st, L, rv, st.loop_iter[static_cast<size_t>(st.i)]);
+        if (!settled) {
+            st.last_status = status;
+            st.last_name = L.name;
+        }
+        if (status == UNSTABLE || status == CHECK_AGAIN) {
+            st.changed = status == UNSTABLE;
             if (prof_.on) {
                 const int kk = static_cast<int>(L.kind);
                 ++prof_.n[P_ACT_ALL + kk];
@@ -3068,7 +3099,7 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status)
         r.unrealistic = st.unrealistic;
         if (status == FAILED) r.failed_loop = st.last_name;
         r.nb_outer_iterations = st.nb_outer;
-        r.nb_nr_iterations = st.total_nr;
+        r.nb_nr_iterations = st.nr_steps;
         // the final positions; row_result() lists where they differ from the grid's
         const size_t row = static_cast<size_t>(st.row);
         if (!st.storage_target_p.empty())

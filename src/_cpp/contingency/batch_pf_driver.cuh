@@ -202,8 +202,6 @@ struct BatchAdjoint {
     // the first call that asks for it.
     bool                                   gen_v_ready = false;
     thrust::device_vector<int>             d_Ybus_T_pos;      // [nnz_Y] position of (j,i) for entry (i,j)
-    thrust::device_vector<int>             d_p_row_of_bus;    // [n_bus]
-    thrust::device_vector<int>             d_q_row_of_bus;    // [n_bus]
     thrust::device_vector<char>            d_is_vm_fixed_bus; // [n_bus]
     thrust::device_vector<cudaComplexType> d_V_ext_slots;     // [capacity × n_bus] snapshot-mode scratch
     thrust::device_vector<cuda_real_type>  d_gvm;             // [capacity × n_bus], slot order
@@ -1055,6 +1053,19 @@ private:
     PinnedBuffer<cuda_real_type>          h_slot_res_;
     thrust::device_vector<cuda_real_type> d_slot_res_;
     CudaEvent                             sched_done_;
+    // The check before an inner solve's first step (outer loops, see
+    // _check_before_first_step): the slots it runs on (h_/d_check0_), their
+    // residual at the start, and the ones that take no step (d_/h_skip0_,
+    // NrIterBuffers::d_skip_step), brought back with the round's residuals.
+    PinnedBuffer<int>                     h_check0_, h_skip0_;
+    // F computed once per round (continuous, fused path; NrIterBuffers::d_F_raw):
+    // the residual pass's P/Q rows of F, and the slots nothing changed since
+    // (1 = the next round's first Newton iteration copies them back).
+    thrust::device_vector<cuda_real_type> d_F_raw_;
+    PinnedBuffer<int>                     h_fclean_;
+    thrust::device_vector<int>            d_fclean_;
+    thrust::device_vector<int>            d_check0_, d_skip0_;
+    thrust::device_vector<cuda_real_type> d_res0_;
 
     int*       h_load_slot() { return h_sched_.ptr; }
     int*       h_load_row()  { return h_sched_.ptr + batch_size_; }
@@ -1167,9 +1178,17 @@ private:
     // chunk's own c_start + s.
     NrIterBuffers _make_nr_buffers();
     void _init_slot_state(const NrIterBuffers& buf, const SlotLoadView& L);
+    bool _check_before_first_step(NrIterBuffers& buf, int n_cur, const std::vector<int>& iters,
+                                  CudaTimer& timer, BatchTimings& t);
+    // n_spmv: the slots whose d_Ibus = Ybus·V (and P/Q rows of F) are computed,
+    // -1 = n_slots; more than n_slots when a J refill follows over the padded
+    // chunk (keep_final_jacobian). The residuals are always n_slots'.
+    // use_clean: the slots d_fclean_ flags copy their P/Q rows back from the F
+    // cache instead (continuous schedule, buf bound to it; see spmv_fill_F_kernel).
     void _residual_pass(const NrIterBuffers& buf, int n_slots, cuda_real_type* d_out,
                         int c_start, const int* d_result_map, const int* d_slot_active,
-                        CudaTimer& timer, BatchTimings& t);
+                        CudaTimer& timer, BatchTimings& t, int n_spmv = -1,
+                        bool use_clean = false);
     void _evict(const NrIterBuffers& buf, int n_slots, int c_start, const int* d_slot_active,
                 CudaTimer& timer, BatchTimings& t);
     // First-call setup of the adjoint: skeleton transpose + position map,
