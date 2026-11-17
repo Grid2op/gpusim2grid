@@ -20,9 +20,11 @@ import numpy as np
 import pytest
 
 from gpusim2grid import RowStatus
+from gpusim2grid._gpusim2grid import have_ls2g_bridge
 from gpusim2grid.actions import Action
 
 from _topo_helpers import batch_V_global, make_ca
+from conftest import requires_gpu
 
 if TYPE_CHECKING:
     from lightsim2grid.lightsim2grid_cpp import LSGrid
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
 
     from gpusim2grid import ContingencyAnalysisGPU
 
-pytestmark = pytest.mark.gpu
+pytestmark = [requires_gpu, pytest.mark.skipif(not have_ls2g_bridge, reason="needs the lightsim2grid bridge")]
 
 OUTER: str = "NROuter_KLU"
 MAX_IT: int = 30
