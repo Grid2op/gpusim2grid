@@ -28,7 +28,10 @@ Change Log
   (pypowsybl's ``"TRUE"`` / ``"ANY_VIOLATION"``, checked on the device) and ``strategy_warm_start``
   (default True: a strategy starts from its own contingency's converged voltages, as OpenLoadFlow's
   security analysis); ``get_max_loading`` reduced on
-  the device (one value and one branch per row come back).
+  the device (one value and one branch per row come back); ``get_violations`` /
+  ``get_violation_counts`` / ``get_violations_truncated`` take a ``ResultRows`` (``ALL``,
+  ``CONTINGENCIES``, ``STRATEGIES``) and build only those rows' records; the rows whose actions change
+  a branch bring only their own voltages to the host.
 - [ADDED] Strategy actions may change transformer values (``trafo_ratio`` / ``trafo_shift_deg``): per-row
   Ybus values on the base pattern; the changed transformer's flows and current violations use the row's.
 - [ADDED] Strategy actions may move elements between the buses of a substation (bus splits and merges):

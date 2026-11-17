@@ -46,11 +46,24 @@ class StrategyCondition(str, enum.Enum):
         """The session's code (``ContingencyAnalysisSession.set_streaming``)."""
         return 0 if self is StrategyCondition.TRUE else 1
 
+
+class ResultRows(str, enum.Enum):
+    """Which rows a result query covers (``ContingencyAnalysisGPU.get_violations`` ...); an
+    array of row indices picks single rows."""
+
+    #: every row: the contingencies, then the strategies
+    ALL = "ALL"
+    #: the contingency rows (the N-1 results)
+    CONTINGENCIES = "CONTINGENCIES"
+    #: the strategy rows
+    STRATEGIES = "STRATEGIES"
+
 __all__ = [
     "BranchY",
     "CompiledAction",
     "RowBranch",
     "RowMap",
+    "ResultRows",
     "Strategy",
     "StrategyCondition",
     "StrategyRow",
@@ -562,6 +575,13 @@ class RowMap:
     session_rows: np.ndarray
     reasons: list[str]
     released: np.ndarray | None = None
+
+    def session_pos(self, rows: np.ndarray) -> np.ndarray:
+        """Per caller row, its position among the session rows; -1 for a row that did not run."""
+        out: np.ndarray = np.full(self.n_out, -1, dtype=np.int64)
+        pos, run = self._run_rows()
+        out[run] = pos
+        return out[np.asarray(rows, dtype=np.int64)]
 
     def _run_rows(self) -> tuple[np.ndarray, np.ndarray]:
         """(the session positions that ran, their caller rows)."""

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pytest
 
-from gpusim2grid import StrategyCondition
+from gpusim2grid import ResultRows, StrategyCondition
 from gpusim2grid._gpusim2grid import have_ls2g_bridge
 
 from _topo_helpers import (
@@ -135,9 +135,9 @@ def test_warm_start_same_solution_fewer_iterations(settings: dict[str, Any], sol
     assert np.all(iters[True] <= MAX_IT)
 
 
-def _violations(ca: ContingencyAnalysisGPU, rows: slice) -> np.ndarray:
-    counts = ca.get_violation_counts()
-    return (counts["low_voltage"] + counts["high_voltage"] + counts["current"])[rows] > 0
+def _violating_contingencies(ca: ContingencyAnalysisGPU) -> np.ndarray:
+    counts = ca.get_violation_counts(ResultRows.CONTINGENCIES)
+    return counts["low_voltage"] + counts["high_voltage"] + counts["current"] > 0
 
 
 @pytest.mark.parametrize("settings", CONTINUOUS)
@@ -172,7 +172,7 @@ def test_condition_recipe(settings: dict[str, Any]):
     )
     ca.set_limits_from_grid()
     ca.compute(batch_size=BATCH)
-    violating: np.ndarray = _violations(ca, slice(0, n_ctg))
+    violating: np.ndarray = _violating_contingencies(ca)
     assert 0 < violating.sum() < n_ctg
     ran: np.ndarray = ca.get_strategy_ran()
     np.testing.assert_array_equal(ran, violating[ctg_of])
@@ -255,7 +255,7 @@ def test_row_status_and_iterations_on_the_strategy_rows(settings: dict[str, Any]
     ca.compute(batch_size=BATCH)
     n_ctg: int = len(ctgs)
     picked: np.ndarray = ca.get_strategy_ran()
-    np.testing.assert_array_equal(picked, _violations(ca, slice(0, n_ctg))[[c for c, _ in strategies]])
+    np.testing.assert_array_equal(picked, _violating_contingencies(ca)[[c for c, _ in strategies]])
     assert 0 < picked.sum() < len(strategies)
     status: np.ndarray = ca.get_row_status()
     iters: np.ndarray = ca.get_row_iterations()

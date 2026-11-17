@@ -42,7 +42,7 @@ from .. import _gpusim2grid as _cpp
 from .._outer_loops import _check_outer_loops_args
 from ._reactive_limits import ReactiveLimitsStatus
 from ..actions import current_buses
-from ._strategies import (RowBranch, RowMap, StrategyCondition, TopologyContext, UnionPlan, compile_action, plan_union,
+from ._strategies import (ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, UnionPlan, compile_action, plan_union,
                           strategy_row, topology_context)
 from ._violation_threshold import ViolationThresholdFacadeMixin
 
@@ -997,27 +997,19 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         # admittance and buses here (the session's flows use the base ones)
         lim1_a: np.ndarray = np.where(np.asarray(lim1, dtype=float) > 0, np.asarray(lim1, dtype=float), np.nan)
         lim2_a: np.ndarray = np.where(np.asarray(lim2, dtype=float) > 0, np.asarray(lim2, dtype=float), np.nan)
-        changed_rows: dict[int, dict[int, RowBranch]] = {}
-        skip: list[int] = []
-        if rm is not None and self._row_branch:
-            pos: dict[int, int] = {int(r): k for k, r in enumerate(rm.session_rows)}
-            for row, changed in self._row_branch.items():
-                k = pos[row]
-                changed_rows[k] = changed
-                skip += [k * nb + b for b in changed]
-        rho_d, branch_d = self._inner._s.compute_max_loading(lim1_a, lim2_a, sorted(skip))
+        pos: dict[int, int] = {int(r): k for k, r in enumerate(rm.session_rows)} if rm is not None else {}
+        skip: list[int] = sorted(pos[row] * nb + b for row, changed in self._row_branch.items() for b in changed)
+        rho_d, branch_d = self._inner._s.compute_max_loading(lim1_a, lim2_a, skip)
         rho: np.ndarray = np.asarray(rho_d, dtype=float)
         branch: np.ndarray = np.asarray(branch_d, dtype=np.int64)
-        if changed_rows:
-            keys: list[int] = sorted(changed_rows)
-            V: np.ndarray = np.asarray(self._inner._s.get_V_rows(keys)).reshape(len(keys), -1)
-            for i, k in enumerate(keys):
-                for b, rb in sorted(changed_rows[k].items()):
-                    loads = [self._branch_amps(V[i], rb, side) * 1e-3 / lim
-                             for side, lim in ((1, lim1_a[b]), (2, lim2_a[b])) if np.isfinite(lim)]
-                    if loads and (not np.isfinite(rho[k]) or max(loads) > rho[k]
-                                  or (max(loads) == rho[k] and b < branch[k])):
-                        rho[k], branch[k] = max(loads), b
+        for row, V_row in self._changed_rows_V().items():
+            k: int = pos[row]
+            for b, rb in sorted(self._row_branch[row].items()):
+                loads = [self._branch_amps(V_row, rb, side) * 1e-3 / lim
+                         for side, lim in ((1, lim1_a[b]), (2, lim2_a[b])) if np.isfinite(lim)]
+                if loads and (not np.isfinite(rho[k]) or max(loads) > rho[k]
+                              or (max(loads) == rho[k] and b < branch[k])):
+                    rho[k], branch[k] = max(loads), b
         # a row not solved (skipped, unsupported, NaN residual) has no loading
         bad: np.ndarray = ~np.isfinite(residuals.to_numpy())
         rho[bad] = np.nan
@@ -1148,29 +1140,44 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         finally:
             self._ctg_elements, self._ctg_branch_ids = saved
 
-    def _changed_branch_violations(
-        self, rows: list[list[LimitViolation]]
-    ) -> tuple[list[list[LimitViolation]], dict[int, int]]:
-        """``rows`` with the CURRENT records of the branches whose values or ends a row changes
-        replaced by the ones of its own admittance and buses (the device check uses the base ones), and the
-        change of each such row's current count. Records keep the effective limit here
+    def _changed_rows_V(self, rows: Sequence[int] | None = None) -> dict[int, np.ndarray]:
+        """Per caller row whose actions change a branch (of ``rows``, default all), its voltages:
+        only those rows come to the host (all of them would be n_rows x n_bus, 16 GB on France
+        200 x 800)."""
+        rm = self._rowmap
+        if rm is None or not self._row_branch:
+            return {}
+        pos: dict[int, int] = {int(r): k for k, r in enumerate(rm.session_rows)}
+        rows = sorted(self._row_branch if rows is None else (r for r in rows if r in self._row_branch))
+        if not rows:
+            return {}
+        V: np.ndarray = np.asarray(self._inner._s.get_V_rows([pos[r] for r in rows])).reshape(len(rows), -1)
+        return dict(zip(rows, V))
+
+    def _changed_branch_violations(self, rows: dict[int, list[LimitViolation]]) -> dict[int, int]:
+        """In ``rows`` (caller row -> its records), the CURRENT records of the branches whose values
+        or ends a row changes replaced by the ones of its own admittance and buses (the device
+        check uses the base ones), in place; returns the change of each such row's current count.
+        Only those rows' voltages come to the host. Records keep the effective limit here
         (``_restore_limits`` puts the configured one back); a row's current records stay most
         severe first."""
         from ._limit_violations import LimitViolation, LimitViolationType, ViolationElementType
 
-        if not self._row_branch:
-            return rows, {}
+        changed_rows: list[int] = [r for r in rows if r in self._row_branch]
+        if not changed_rows:
+            return {}
         _, _, lim1, lim2, n_lines = self._configured_limits()
         t: float = self._violation_threshold
         rel_tol: float = float(self._inner.violation_rel_tol)
-        V: np.ndarray = self.V_results.to_numpy().reshape(len(rows), -1)
+        V: dict[int, np.ndarray] = self._changed_rows_V(changed_rows)
+        current = LimitViolationType.CURRENT
+
+        def branch_of(v: LimitViolation) -> int:
+            return v.element_id + (int(n_lines) if v.element_type == ViolationElementType.TRAFO else 0)
+
         delta: dict[int, int] = {}
-        for r, changed in self._row_branch.items():
-
-            def branch_of(v: LimitViolation) -> int:
-                return v.element_id + (int(n_lines) if v.element_type == ViolationElementType.TRAFO else 0)
-
-            current = LimitViolationType.CURRENT
+        for r in changed_rows:
+            changed = self._row_branch[r]
             kept = [v for v in rows[r] if not (v.violation_type == current and branch_of(v) in changed)]
             added: list[LimitViolation] = []
             for b, rb in changed.items():
@@ -1187,10 +1194,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             removed: int = len(rows[r]) - len(kept)
             currents = sorted([v for v in kept if v.violation_type == current] + added,
                               key=lambda v: -abs(v.value / v.limit - 1.0))
-            others = [v for v in kept if v.violation_type != current]
-            rows[r] = currents + others
+            rows[r] = currents + [v for v in kept if v.violation_type != current]
             delta[r] = len(added) - removed
-        return rows, delta
+        return delta
 
     def _flow_buffer(self, buf: DeviceBuffer, side: int) -> DeviceBuffer:
         """The amps of one side on the caller's rows, the branches whose values or ends a row
@@ -1204,7 +1210,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
         def fetch() -> np.ndarray:
             amps: np.ndarray = expanded.to_numpy().reshape(-1, nb).copy()
-            V: np.ndarray = self.V_results.to_numpy().reshape(amps.shape[0], -1)
+            V: dict[int, np.ndarray] = self._changed_rows_V()
             for r, changed in self._row_branch.items():
                 for b, rb in changed.items():
                     amps[r, b] = self._branch_amps(V[r], rb, side)
@@ -1583,48 +1589,79 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def compute_limit_violations(self, value):
         self._inner.compute_limit_violations = value
 
-    def get_violations(self):
-        """list[list[LimitViolation]]: one entry per contingency (row order
-        matches add_contingencies_by_branch_id). Requires compute() with
-        compute_limit_violations=True. With reactive_limits_outer_loop, a
-        RECOMPUTED contingency's entry is its second pass'."""
-        out = self._session_rows_or_empty(self._inner.get_violations, list)
+    def _result_rows(self, rows: ResultRows) -> np.ndarray:
+        """The caller rows ``rows`` covers (without strategies: every row is a contingency)."""
+        rows = ResultRows(rows)
+        if self._last_residuals is None:
+            raise RuntimeError("Call compute() first.")
+        n_out: int = self._rowmap.n_out if self._rowmap is not None else int(self._last_residuals.shape[0])
+        n_ctg: int = n_out - (self.n_strategies if self._rowmap is not None else 0)
+        lo, hi = {ResultRows.ALL: (0, n_out), ResultRows.CONTINGENCIES: (0, n_ctg),
+                  ResultRows.STRATEGIES: (n_ctg, n_out)}[rows]
+        return np.arange(lo, hi)
+
+    def _violation_records(self, picked: np.ndarray) -> dict[int, list[LimitViolation]]:
+        """The device's records of the caller rows ``picked`` (only those built; [] for a row
+        that did not run), the second pass' for a RECOMPUTED one."""
+        rm = self._rowmap
+        if rm is None:
+            out = dict(zip(picked.tolist(), self._inner.get_violations(picked.tolist())))
+        else:
+            pos: np.ndarray = rm.session_pos(picked)
+            run: np.ndarray = pos >= 0
+            built = self._inner.get_violations(pos[run].tolist()) if run.any() else []
+            out = {int(r): [] for r in picked}
+            out.update(zip(picked[run].tolist(), built))
         if self._rl_result is not None:
             for r, v in self._rl_result["viol"].items():
-                out[r] = v
-        out, _ = self._changed_branch_violations(out)
-        return self._restore_limits(out)
+                if r in out:
+                    out[r] = v
+        return out
 
-    def get_violations_truncated(self):
-        """(n_ctg,) bool ndarray: True where more than violation_capacity
-        violations were found for that contingency (clamped)."""
+    def get_violations(self, rows: ResultRows = ResultRows.ALL) -> list[list[LimitViolation]]:
+        """list[list[LimitViolation]]: one entry per row ``rows`` covers (:class:`ResultRows`:
+        every row, the contingencies -- the N-1 results --, or the strategies), in row order;
+        only those rows' records are built. Requires compute() with
+        compute_limit_violations=True. With reactive_limits_outer_loop, a RECOMPUTED
+        contingency's entry is its second pass'."""
+        picked: np.ndarray = self._result_rows(rows)
+        records = self._violation_records(picked)
+        self._changed_branch_violations(records)
+        return self._restore_limits([records[int(r)] for r in picked])
+
+    def get_violations_truncated(self, rows: ResultRows = ResultRows.ALL) -> np.ndarray:
+        """bool ndarray, one per row ``rows`` covers: True where more than violation_capacity
+        violations were found for that row (clamped)."""
         out = self._session_array(self._inner.get_violations_truncated, False)
         if self._rl_result is not None:
             for r, v in self._rl_result["viol_trunc"].items():
                 out[r] = v
-        return out
+        return out[self._result_rows(rows)]
 
-    def get_violation_counts(self):
-        """dict of (n_ctg,) int ndarrays with keys 'low_voltage',
-        'high_voltage', 'current': the TRUE, uncapped count of violations of
-        each type per contingency (-1 = not simulated). Unlike
-        get_violations()'s records (capped at violation_capacity), these
-        totals stay exact even when get_violations_truncated() is True."""
+    def get_violation_counts(self, rows: ResultRows = ResultRows.ALL) -> dict[str, np.ndarray]:
+        """dict of int ndarrays, one entry per row ``rows`` covers, with keys 'low_voltage',
+        'high_voltage', 'current': the TRUE, uncapped count of violations of each type per row
+        (-1 = not simulated). Unlike get_violations()'s records (capped at
+        violation_capacity), these totals stay exact even when get_violations_truncated() is
+        True. The rows whose actions change a branch recount it from their own voltages."""
+        picked: np.ndarray = self._result_rows(rows)
         if self._rowmap is None:
             out = self._inner.get_violation_counts()
         else:
             raw = self._inner.get_violation_counts() if len(self._rowmap.session_rows) else None
             out = {k: self._rowmap.expand(raw[k] if raw else np.zeros(0, dtype=np.int64), -1)
                    for k in ("low_voltage", "high_voltage", "current")}
-            if self._row_branch:
-                rows = self._session_rows_or_empty(self._inner.get_violations, list)
-                _, delta = self._changed_branch_violations(rows)
-                for r, d in delta.items():
-                    out["current"][r] += d
         if self._rl_result is not None:
             for r, cnt in self._rl_result["viol_counts"].items():
                 for k, v in cnt.items():
                     out[k][r] = v
+        out = {k: v[picked] for k, v in out.items()}
+        if self._row_branch:
+            changed: np.ndarray = picked[np.isin(picked, list(self._row_branch))]
+            delta = self._changed_branch_violations(self._violation_records(changed))
+            where: dict[int, int] = {int(r): i for i, r in enumerate(picked)}
+            for r, d in delta.items():
+                out["current"][where[r]] += d
         return out
 
     def get_physical_violations(self):

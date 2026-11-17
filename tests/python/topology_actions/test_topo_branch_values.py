@@ -123,3 +123,53 @@ def test_current_violation_of_the_changed_transformer(factor: float, violates: b
     if violates:
         np.testing.assert_allclose(rec[0].value, ref_ka, atol=10 * solver_atol, rtol=0)
         assert rec[0].limit == pytest.approx(float(grid.get_trafos()[0].limit_a1_ka))  # configured limit
+
+
+def test_changed_branch_results_read_only_their_rows(monkeypatch: pytest.MonkeyPatch):
+    """The violations, counts and max loading of the rows that change a branch recompute it from
+    those rows' voltages only: never every row's (n_rows x n_bus on the host, 16 GB on France
+    200 x 800)."""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    grid = with_current_limits(case14(), 0.25)
+    ca = make_ca(grid, {}, batch_size=BATCH, compute_limit_violations=True)
+    ca.add_contingencies_by_branch_id([[], [3]])
+    ca.set_actions(_actions(grid))
+    ca.add_strategies([(c, [a]) for c in range(2) for a in range(4)])
+    ca.set_limits_from_grid()
+    ca.compute(batch_size=BATCH)
+    expected = (ca.get_violation_counts(), ca.get_violations(), ca.get_max_loading())
+
+    def every_row(self: ContingencyAnalysisGPU) -> Any:
+        raise AssertionError("every row's voltages copied to the host")
+
+    monkeypatch.setattr(ContingencyAnalysisGPU, "V_results", property(every_row))
+    counts, violations, (rho, branch) = ca.get_violation_counts(), ca.get_violations(), ca.get_max_loading()
+    for k in counts:
+        np.testing.assert_array_equal(counts[k], expected[0][k])
+    assert [len(r) for r in violations] == [len(r) for r in expected[1]]
+    np.testing.assert_array_equal(rho, expected[2][0])
+    np.testing.assert_array_equal(branch, expected[2][1])
+
+
+def test_result_rows_select_the_rows():
+    """``ResultRows.CONTINGENCIES`` / ``STRATEGIES``: the N-1 rows / the strategy rows of every
+    violation query, as the same rows of ``ALL`` (rows that change a branch included)."""
+    from gpusim2grid import ResultRows
+
+    grid = with_current_limits(case14(), 0.25)
+    ca = make_ca(grid, {}, batch_size=BATCH, compute_limit_violations=True)
+    ca.add_contingencies_by_branch_id([[], [3]])
+    ca.set_actions(_actions(grid))
+    ca.add_strategies([(c, [a]) for c in range(2) for a in range(4)])
+    ca.set_limits_from_grid()
+    ca.compute(batch_size=BATCH)
+    every = slice(None)
+    for rows, part in ((ResultRows.CONTINGENCIES, slice(0, 2)), (ResultRows.STRATEGIES, slice(2, None))):
+        counts, all_counts = ca.get_violation_counts(rows), ca.get_violation_counts()
+        for k in all_counts:
+            np.testing.assert_array_equal(counts[k], all_counts[k][part])
+        assert ca.get_violations(rows) == ca.get_violations(ResultRows.ALL)[part]
+        np.testing.assert_array_equal(ca.get_violations_truncated(rows), ca.get_violations_truncated()[part])
+    assert ca.get_violations(ResultRows.ALL) == ca.get_violations()[every]
+    assert sum(len(r) for r in ca.get_violations(ResultRows.STRATEGIES)) > 0

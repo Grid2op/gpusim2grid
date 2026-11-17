@@ -69,7 +69,9 @@ contingency's converged state; the schedule is then continuous (``scheduling=Non
 
 Every per-row result (voltages, residuals, ``get_max_loading``, violations, ``get_row_status``,
 ``get_row_iterations``, ``get_outer_results``, flows) has one entry per row: the contingencies,
-then the strategies (NaN / ``NOT_SIMULATED`` / ``None`` for a strategy that did not run).
+then the strategies (NaN / ``NOT_SIMULATED`` / ``None`` for a strategy that did not run). The
+violation queries take a :class:`gpusim2grid.ResultRows` to cover only some rows, e.g. the N-1
+results: ``ca.get_violation_counts(ResultRows.CONTINGENCIES)`` (only those records are built).
 
 What an action can do:
 
@@ -106,6 +108,10 @@ buses or values on one element. The full example is ``examples/contingency_x_act
 the design and its status are in ``docs/dev_notes/topology_actions_plan.md``.
 
 .. autoclass:: gpusim2grid.StrategyCondition
+   :members:
+   :undoc-members:
+
+.. autoclass:: gpusim2grid.ResultRows
    :members:
    :undoc-members:
 
