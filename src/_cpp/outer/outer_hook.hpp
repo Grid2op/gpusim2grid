@@ -21,6 +21,7 @@
 #define GPUSIM2GRID_OUTER_HOOK_HPP
 
 #include <cmath>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <utility>
@@ -233,6 +234,21 @@ public:
     virtual void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) = 0;
     // The rows' other changes (see RowOverrides); replaces the previous ones.
     virtual void set_row_overrides(RowOverrides overrides) = 0;
+    // Keep, for every row of the next runs whose loops end stable, where they left them (its
+    // resume point: moved targets, frozen buses, regimes, taps...), for the rows of a later run
+    // to resume from (set_row_resume). Set before begin(); a run that keeps them forgets the
+    // previous ones.
+    virtual void keep_row_points(bool keep) {
+        if (keep) throw std::runtime_error("this outer model cannot keep the rows' resume points");
+    }
+    // Per row of the next runs, the row of the run that kept the points (keep_row_points) whose
+    // point it resumes from, as a solve resuming from that row's: -1, or a row that did not end
+    // stable, resumes from the grid's own solve (resume_from_n) or from scratch. Empty: none.
+    virtual void set_row_resume(std::vector<int> point_of_row) {
+        if (!point_of_row.empty()) throw std::runtime_error("this outer model cannot resume rows from kept points");
+    }
+    // how many points the last run that kept them kept (its number of rows)
+    virtual int n_row_points() const { return 0; }
 };
 
 }  // namespace outer

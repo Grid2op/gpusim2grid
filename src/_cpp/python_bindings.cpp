@@ -1879,6 +1879,26 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "(n_rows,) int: Newton iterations each row ran in the last run().")
     .def_property_readonly("has_outer_model", &ContingencyAnalysisSession::has_outer_model,
                    "Whether the outer loops (lightsim2grid's NROuter_* ones) decide on every row.")
+    .def("keep_outer_row_points", [](ContingencyAnalysisSession& s, bool keep) {
+            outer::OuterHook* m = s.outer_model();
+            if (m == nullptr) throw std::runtime_error("no outer loops on this session");
+            m->keep_row_points(keep);
+        }, pybind11::arg("keep"),
+        "Keep, for every row of the next runs whose outer loops end stable, where they left "
+        "them (its resume point), for the rows of a later run to resume from "
+        "(set_outer_row_resume). A run that keeps them forgets the previous ones.")
+    .def("set_outer_row_resume", [](ContingencyAnalysisSession& s, std::vector<int> point_of_row) {
+            outer::OuterHook* m = s.outer_model();
+            if (m == nullptr) throw std::runtime_error("no outer loops on this session");
+            m->set_row_resume(std::move(point_of_row));
+        }, pybind11::arg("point_of_row"),
+        "Per row of the next runs, the row of the run that kept the points whose outer-loop "
+        "state it resumes from (-1, or a row that did not end stable: the grid's own solve with "
+        "resume_from_n, else from scratch); [] for none.")
+    .def_property_readonly("n_outer_row_points", [](const ContingencyAnalysisSession& s) {
+            const outer::OuterHook* m = s.outer_model();
+            return m == nullptr ? 0 : m->n_row_points();
+        }, "How many rows the last run that kept the outer resume points had.")
     .def("get_outer_results", [](const ContingencyAnalysisSession& s) {
             const outer::OuterHook* m = s.outer_model();
             if (m == nullptr)

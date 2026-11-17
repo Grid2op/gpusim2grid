@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
-from ._scheduling import check_linear_solver_args
+from ._scheduling import RowStatus, check_linear_solver_args
 from . import (
     DeviceBuffer,
     LimitViolationsFacadeMixin,
@@ -800,7 +800,18 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         :meth:`ScenarioSweepGPU.get_outer_results`). Needs ``outer_loops=True``."""
         if not self._outer_loops:
             raise RuntimeError("get_outer_results() needs outer_loops=True")
-        return self._inner._s.get_outer_results()
+        return self._session_rows_or_empty(self._inner._s.get_outer_results, lambda: None)
+
+    def get_row_status(self) -> np.ndarray:
+        """(n_rows,) int ndarray of :class:`RowStatus` codes of the last :meth:`compute`, on
+        its rows (after ``rows="strategies"``: one per strategy); NOT_SIMULATED for a strategy
+        not run (not selected, or unsupported: see :meth:`get_batch_unsupported_reasons`)."""
+        return self._session_array(self._inner.get_row_status, int(RowStatus.NOT_SIMULATED))
+
+    def get_row_iterations(self) -> np.ndarray:
+        """(n_rows,) int ndarray: the Newton iterations each row of the last :meth:`compute`
+        ran, on its rows; 0 for a strategy not run."""
+        return self._session_array(self._inner.get_row_iterations, 0)
 
     def compute(self, batch_size: int = 512, rows: Rows | None = None) -> Any:
         """Solve every contingency and return the batched voltages.
@@ -928,8 +939,13 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
 
     @property
     def strategy_warm_start(self) -> bool:
-        """bool: a strategy row starts from its contingency's converged voltages (the last
-        ``rows="contingencies"`` run) instead of the base case. Default False."""
+        """bool: a strategy row starts from its contingency's converged state (the last
+        ``rows="contingencies"`` run) instead of the base case: its voltages and, with
+        ``outer_loops=True``, where its outer loops ended (moved targets, frozen buses, switched
+        SVCs, hvdc regimes, taps and sections): as a second solve on the grid with the
+        contingency applied, whose loss its DistributedSlack does not share again. A contingency
+        that did not converge (or whose loops did not end stable) leaves its strategies the base
+        start. Default False."""
         return self._strategy_warm_start
 
     @strategy_warm_start.setter
@@ -1005,9 +1021,6 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._strategy_warm_start and rows is None:
             raise NotImplementedError("strategy_warm_start runs in two phases: compute(rows='contingencies'), "
                                       "then compute(rows='strategies')")
-        if warm and self._outer_loops:
-            raise NotImplementedError("strategy_warm_start with outer_loops=True: a row would need its "
-                                      "contingency's loop state too, not only its voltages (not yet)")
         if warm and self._ctg_start_ok is None:
             raise RuntimeError("strategy_warm_start: run compute(rows='contingencies') first")
         ctg: list[CtgElements] = list(self._ctg_elements or [])
@@ -1066,6 +1079,16 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             if any(session_sbus):
                 session.add_row_sbus_deltas(session_sbus)
             self._inner.batch_size = int(batch_size)
+            if self._outer_loops:
+                # the outer loops resume as the voltages do: phase 1 keeps where each contingency's
+                # loops ended, a warm-started strategy resumes from its contingency's (a second solve
+                # on the grid with the contingency applied: its loss shared once)
+                resume: list[int] = []
+                if warm and self._ctg_start_ok is not None:
+                    ok_c: np.ndarray = self._ctg_start_ok
+                    resume = [c if ok_c[c] else -1 for c in (self._strategies[r - off][0] for r in session_rows)]
+                session.set_outer_row_resume(resume)
+                session.keep_outer_row_points(rows == "contingencies" and bool(self._strategies))
             if rows == "strategies" and session.has_v_init_groups:
                 # the contingencies' voltages of phase 1 are groups 0..C-1 (-1: not converged)
                 ok: np.ndarray = (
@@ -1598,7 +1621,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """See :meth:`PhysicalChecksEngineMixin.get_physical_violations`. With
         reactive_limits_outer_loop, a RECOMPUTED contingency's entry is its
         second pass' (with the new labels, see ``_reactive_limits.py``)."""
-        out = self._inner.get_physical_violations()
+        out = self._session_rows_or_empty(self._inner.get_physical_violations, list)
         if self._rl_result is not None:
             for r, v in self._rl_result["phys"].items():
                 out[r] = v
@@ -1607,7 +1630,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     def get_physical_violations_truncated(self):
         """(n_ctg,) bool ndarray: True where one of the physical checks kept
         only its most severe records on that row."""
-        out = self._inner.get_physical_violations_truncated()
+        out = self._session_array(self._inner.get_physical_violations_truncated, False)
         if self._rl_result is not None:
             for r, v in self._rl_result["phys_trunc"].items():
                 out[r] = v

@@ -264,3 +264,49 @@ def test_phases_reuse_the_driver_chunked():
     n_build: int = ca.solver._s.driver_build_counter
     ca.compute(batch_size=BATCH, rows="strategies")
     assert ca.solver._s.driver_build_counter == n_build
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_row_status_and_iterations_on_the_strategy_rows(settings: dict[str, Any]):
+    """After rows="strategies", get_row_status / get_row_iterations have one entry per strategy:
+    the run ones the session's (in strategy order), NOT_SIMULATED / 0 for the others."""
+    from gpusim2grid import RowStatus
+
+    grid, ctgs, actions, strategies = _case()
+    ca = _ca(grid, ctgs, actions, strategies, settings)
+    ca.compute(batch_size=BATCH, rows="contingencies")
+    assert ca.get_row_status().shape == (len(ctgs),)
+    picked: np.ndarray = np.arange(len(strategies)) % 3 == 0
+    ca.select_strategies(picked)
+    ca.compute(batch_size=BATCH, rows="strategies")
+    status: np.ndarray = ca.get_row_status()
+    iters: np.ndarray = ca.get_row_iterations()
+    assert status.shape == iters.shape == (len(strategies),)
+    assert np.all(status[~picked] == RowStatus.NOT_SIMULATED)
+    assert np.all(iters[~picked] == 0)
+    assert np.all(status[picked] == RowStatus.CONVERGED)
+    assert np.all(iters[picked] > 0)
+    np.testing.assert_array_equal(status[picked], np.asarray(ca._inner.get_row_status()))
+
+
+def test_outer_results_on_the_strategy_rows():
+    """With the outer loops, get_outer_results has one entry per strategy after
+    rows="strategies": the session's for the run ones, None for the others."""
+    grid, ctgs, actions, strategies = _case()
+    grid.change_algorithm("NROuter_KLU")
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), MAX_IT, 1e-8).size > 0
+    ca = _ca(grid, ctgs, actions, strategies, dict(scheduling="continuous"), outer_loops=True,
+             init_from_n_powerflow=False)
+    ca.compute(batch_size=BATCH, rows="contingencies")
+    assert len(ca.get_outer_results()) == len(ctgs)
+    picked: np.ndarray = np.arange(len(strategies)) % 2 == 1
+    ca.select_strategies(picked)
+    ca.compute(batch_size=BATCH, rows="strategies")
+    res = ca.get_outer_results()
+    assert len(res) == len(strategies)
+    assert all(r is None for r, p in zip(res, picked) if not p)
+    run = [r for r, p in zip(res, picked) if p]
+    session = ca._inner._s.get_outer_results()
+    assert [r.status for r in run] == [r.status for r in session]
+    assert [r.nb_nr_iterations for r in run] == [r.nb_nr_iterations for r in session]

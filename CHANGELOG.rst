@@ -29,6 +29,10 @@ Change Log
   Ybus values on the base pattern; the changed transformer's flows and current violations use the row's.
 - [ADDED] Strategy actions may move elements between the buses of a substation (bus splits and merges):
   spare buses and one union sparsity pattern for the run, unused spares masked per row.
+- [ADDED] ``strategy_warm_start`` with ``outer_loops=True``: a strategy resumes from its contingency's
+  outer-loop state too (moved targets, frozen buses, regimes, taps), as lightsim2grid's batch row resuming
+  from a solve; ``get_row_status`` / ``get_row_iterations`` / ``get_outer_results`` / the physical checks
+  follow the rows of the last ``compute`` (one per strategy after ``rows="strategies"``).
 - [ADDED] C++/CUDA unit tests (``tests/cpp``, ctest), opt-in with ``-DGPUSIM2GRID_BUILD_TESTS=ON``; a
   test needing a GPU is skipped without one.
 

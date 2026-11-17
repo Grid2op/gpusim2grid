@@ -234,7 +234,14 @@ condition between the phases usable with a security margin (pypowsybl's limit re
   same V, so the contingency session keeps **one start per contingency** (C × n_bus, 22 MB
   there) and a row → contingency index, gathered at slot load. Opt-in
   (`strategy_warm_start`): it changes the iterates, not the solution. Expected: fewer Newton
-  iterations, since most actions are local.
+  iterations, since most actions are local. With the outer loops, the row also resumes from where
+  its contingency's loops ended (moved targets, frozen buses, switched SVCs, hvdc regimes, taps,
+  sections, parked units): phase 1 keeps one resume point per contingency row in the outer model
+  (`OuterHook::keep_row_points`), phase 2 points each strategy row at its contingency's
+  (`set_row_resume`) -- lightsim2grid's batch row resuming from a solve (`init_from_n_powerflow`)
+  on the grid with the contingency applied; its DistributedSlack shares only the loss its actions
+  add. Checked against lightsim2grid's `ContingencyAnalysisCPP` / `ScenarioSweepCPP` (topology
+  actions) resumed from the contingency's solve (`test_topo_outer_warm_start.py`).
 - **Driver reuse between the phases**: the contingency session rebuilds its driver (and its
   analysis) on any new row list today; it gets ScenarioSweep's warm path (new source on the
   live driver, chunked schedule). The continuous schedule rebuilds its driver every run in
@@ -387,7 +394,7 @@ plan), factor / solve time per batch, before and after.
 
 ## 9. Order of work and PRs
 
-| step | content | PR | status (2026-11-16) |
+| step | content | PR | status (2026-11-17) |
 |---|---|---|---|
 | 0 | this note; build + suite on this machine; § 8.2 measurement script | 1 | note, tests, tooling done; § 8.2 waits for a free GPU |
 | D | `Action` format (`set_bus`-style moves, branch values), results | 1 | done |
@@ -395,9 +402,9 @@ plan), factor / solve time per batch, before and after.
 | A2 | warm start: one start V per contingency on the device, gathered at slot load | 1 | done (C++ unit tests for the gather) |
 | A4 | the contingency session's warm path (new rows on the live driver, chunked) | 1 | deferred: the phases change the row count, the live driver's result buffers would have to be re-sized; chunked only (continuous rebuilds anyway, upstream A.6), ~0.1 s per phase; pinned by an xfail(strict) test |
 | B.1 | per-row branch admittance (taps) | 2 | done (row triplets in C++; the changed branch's flows / current violations recomputed on the host) |
-| B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | to do |
-| A3 | device-side max loading at eviction, `store_voltages` (user: at the end of the roadmap) | last | designed (`_evict` hook, shared current helper) |
-| — | switch actions → moves (lightsim2grid detailed topology), pattern banks; outer loops / groups / gradients with moves | later | |
+| A5 | warm start with the outer loops: each strategy resumes from its contingency's loop state; per-row accessors (`get_row_status`, `get_row_iterations`, `get_outer_results`, physical checks) on the caller's rows | 1 | done |
+| B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | S1-S3 done (also under the outer loops, warm or not); S4 moved-branch flows / violations, S5 generator moves to do |
+| — | switch actions → moves (lightsim2grid detailed topology), pattern banks; groups / gradients with moves | later | |
 
 The tests come first (`tests/python/topology_actions/`, red until their step lands), one file
 per step:
@@ -409,7 +416,8 @@ per step:
 | `test_topo_trips.py` | A | strategy rows = union of trips, lightsim2grid, a trip counted once, conflicts per row, array input |
 | `test_topo_branch_values.py` | B.1 | taps / ratios vs lightsim2grid, flows with the row's admittance |
 | `test_topo_bus_moves.py` | B.2 | splits, merges, a generator moved (PV), islands, 8 splits in one union pattern, flows, unsupported moves, analysis reuse |
-| `test_topo_results.py` | A | max loading on the device, two calls = one, selection, warm start (fewer iterations), the two-phase recipe (violations as the condition) |
+| `test_topo_results.py` | A | max loading on the device, two calls = one, selection, warm start (fewer iterations), the two-phase recipe (violations as the condition), per-row statuses / outer results on the strategy rows |
+| `test_topo_outer_warm_start.py` | A5 | strategies resumed from their contingency's outer-loop state vs lightsim2grid's resumed batch, a no-op strategy gives its contingency back (its loss not shared twice), splits under the outer loops |
 | `../violations/test_violation_threshold.py` | A | `violation_threshold` vs lightsim2grid's `ContingencyAnalysisCPP`, both facades, clamped voltage anchor, records not rescaled, invalidation |
 
 Code conventions for the new modules (those of the prototype): `from __future__ import

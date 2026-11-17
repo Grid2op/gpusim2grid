@@ -547,6 +547,7 @@ struct ContingencyAnalysisSession {
     void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
     bool has_outer_model() const { return static_cast<bool>(outer_); }
     const outer::OuterHook* outer_model() const { return outer_.get(); }
+    outer::OuterHook* outer_model() { return outer_.get(); }
 
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }
