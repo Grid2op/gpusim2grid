@@ -224,17 +224,23 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     {
         auto t_alloc_start = std::chrono::steady_clock::now();
 
-        const long long n_batch_outer = static_cast<long long>(batch_size_) * n_bus + 1;
-        const long long n_batch_inner = static_cast<long long>(batch_size_) * nnz_Y;
-        d_Ybus_batch_outer.resize(static_cast<size_t>(n_batch_outer));
-        d_Ybus_batch_inner.resize(static_cast<size_t>(n_batch_inner));
-        blockdiag_csr_kernel<<<nr_grid_size(std::max(n_batch_outer, n_batch_inner), BS), BS, 0, cs>>>(
-            n_bus, nnz_Y, batch_size_,
-            thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
-            thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
-            thrust::raw_pointer_cast(d_Ybus_batch_outer.data()),
-            thrust::raw_pointer_cast(d_Ybus_batch_inner.data()));
-        CHK_CUDA_BPF(cudaGetLastError());
+        // The block-diagonal CSR only serves cuSPARSE's SpMV, i.e. a ledger the fused
+        // SpMV + mismatch kernel cannot take (AcPfNrState::fused_F_ok false); the
+        // fused path never reads it (batch × nnz_Y ints: ~1 GB at a 10k batch on a
+        // 7k-bus grid). Built with spmv_batch below.
+        if (!base.fused_F_ok) {
+            const long long n_batch_outer = static_cast<long long>(batch_size_) * n_bus + 1;
+            const long long n_batch_inner = static_cast<long long>(batch_size_) * nnz_Y;
+            d_Ybus_batch_outer.resize(static_cast<size_t>(n_batch_outer));
+            d_Ybus_batch_inner.resize(static_cast<size_t>(n_batch_inner));
+            blockdiag_csr_kernel<<<nr_grid_size(std::max(n_batch_outer, n_batch_inner), BS), BS, 0, cs>>>(
+                n_bus, nnz_Y, batch_size_,
+                thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
+                thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
+                thrust::raw_pointer_cast(d_Ybus_batch_outer.data()),
+                thrust::raw_pointer_cast(d_Ybus_batch_inner.data()));
+            CHK_CUDA_BPF(cudaGetLastError());
+        }
 
         d_V_batch.resize(static_cast<size_t>(batch_size_) * n_bus);
         d_Ybus_values_batch.resize(static_cast<size_t>(batch_size_) * nnz_Y);
@@ -288,9 +294,11 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
     // -------------------------------------------------------------------------
     // cuSPARSE block-diagonal SpMV descriptor (for the maximum batch_size).
     // The last chunk may be smaller, but the descriptor stays valid since the
-    // block structure is identical within each block.
+    // block structure is identical within each block. Only without the fused
+    // kernel (see the block-diagonal CSR above): nr_spmv_fill_F, the one caller
+    // of an SpMV, takes the fused path whenever the buffers carry the row maps.
     // -------------------------------------------------------------------------
-    _build_spmv(spmv_batch, batch_size_);
+    if (!base.fused_F_ok) _build_spmv(spmv_batch, batch_size_);
 
     // -------------------------------------------------------------------------
     // cuDSS uniform-batch context + ANALYSIS + policy init
@@ -2047,7 +2055,7 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
                                                 const int* d_result_map,
                                                 const int* d_slot_active,
                                                 CudaTimer& timer, BatchTimings& t,
-                                                int n_spmv)
+                                                int n_spmv, bool use_clean)
 {
     const int n_bus = base.n_bus;
     const int dim_J = base.dim_J;
@@ -2058,7 +2066,7 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
         // d_V_batch / d_Ibus_batch). The fused kernel covers n_spmv slots only
         // (cuSPARSE's SpMV, the fallback, always the descriptor's whole batch).
         nr_spmv_fill_F(_spmv(), buf, n_bus, base.nnz_Y, dim_J,
-                       n_spmv < 0 ? n_slots : n_spmv, cs, /*store_raw=*/true);
+                       n_spmv < 0 ? n_slots : n_spmv, cs, /*store_raw=*/true, use_clean);
 
         if (n_slots > 0) {
             // Augmented-feature contributions to the final residual (slack /
@@ -2114,13 +2122,31 @@ bool BatchPfDriver<BatchSource>::_check_before_first_step(NrIterBuffers& buf, in
     cuda_real_type* d_res = thrust::raw_pointer_cast(d_res0_.data());
     CHK_CUDA_BPF(cudaMemcpyAsync(d_check, h_check0_.ptr, static_cast<size_t>(n_cur) * sizeof(int),
                                  cudaMemcpyHostToDevice, cs));
-    // F at the current V (the residual pass's own sequence; ‖F‖∞ unused when recalibrated)
-    _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t);
+    // F at the current V (the residual pass's own sequence; ‖F‖∞ unused when recalibrated).
+    // With the F cache (buf bound to it), the slots nothing changed since the last
+    // residual pass (h_fclean_: every staying slot) copy their P/Q rows back instead of
+    // recomputing them, the others are computed and stored -- so afterwards every slot's
+    // rows are the cache's (d_fclean_ all 1 on return; the caller must not upload
+    // h_fclean_ again before the round's sync: this upload may still read it). The
+    // previous upload of the flags retired at the last round's sync.
+    const bool f_cache = buf.d_F_raw != nullptr && buf.d_F_clean != nullptr;
+    if (f_cache)
+        CHK_CUDA_BPF(cudaMemcpyAsync(thrust::raw_pointer_cast(d_fclean_.data()), h_fclean_.ptr,
+                                     static_cast<size_t>(n_cur) * sizeof(int),
+                                     cudaMemcpyHostToDevice, cs));
+    _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t,
+                   /*n_spmv=*/-1, /*use_clean=*/f_cache);
+    if (f_cache)
+        thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)),
+                     d_fclean_.begin(), d_fclean_.begin() + n_cur, 1);
     if (buf.slack_col >= 0 && buf.n_slack > 0) {
         calibrate_slack_absorbed_slots_kernel<cuda_real_type><<<n_cur, BS, 0, cs>>>(
             buf.d_slack_absorbed, buf.d_F, buf.d_p_rows, buf.n_p, buf.d_slack_w, buf.slack_w_stride,
             buf.n_slack, base.dim_J, d_check, n_cur);
-        _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t);
+        // V did not move, so the P/Q rows are the cache's: only the feature mismatch
+        // (slack_absorbed's share), the masks and ‖F‖∞ are redone
+        _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t,
+                       /*n_spmv=*/-1, /*use_clean=*/f_cache);
     }
     skip_converged_slots_kernel<cuda_real_type><<<(n_cur + BS - 1) / BS, BS, 0, cs>>>(
         d_skip, d_check, d_res, static_cast<double>(tol_), n_cur);
@@ -2834,12 +2860,14 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         _compact_tail(groups * G, n_cur, iters, t);
         set_clean(0, S, 0);   // rows moved: every slot's F is recomputed
         n_cur = groups * G;
-        if (!spmv_tail_) spmv_tail_ = std::make_unique<CuSpMV>();
-        if (spmv_tail_n_ != n_cur) {
-            _build_spmv(*spmv_tail_, n_cur);
-            spmv_tail_n_ = n_cur;
+        if (!base.fused_F_ok) {   // the fused kernel takes its slot count as is
+            if (!spmv_tail_) spmv_tail_ = std::make_unique<CuSpMV>();
+            if (spmv_tail_n_ != n_cur) {
+                _build_spmv(*spmv_tail_, n_cur);
+                spmv_tail_n_ = n_cur;
+            }
+            spmv_live_ = spmv_tail_.get();
         }
-        spmv_live_ = spmv_tail_.get();
         tail       = _tail_solve(groups);
         in_tail    = true;
         t.t_tail_compact += TimingEntry{0., ms_since(t_c0)};
@@ -2942,9 +2970,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     while (n_live > 0) {
         rec_n_cur  = n_cur;
         rec_n_live = n_live;
+        // the check leaves every slot's flag at 1 on the device (its passes stored or
+        // copied every slot's F) and may still be reading h_fclean_: no upload then
         const bool checked0 = hook != nullptr && _check_before_first_step(buf, n_cur, iters, timer, t);
-        if (checked0) set_clean(0, n_cur, 1);   // its residual pass just stored every slot's F
-        if (f_cache)   // (the previous upload retired at the last round's sync)
+        if (f_cache && !checked0)   // (the previous upload retired at the last round's sync)
             CHK_CUDA_BPF(cudaMemcpyAsync(thrust::raw_pointer_cast(d_fclean_.data()), h_fclean_.ptr,
                                          static_cast<size_t>(n_cur) * sizeof(int),
                                          cudaMemcpyHostToDevice, cs));
@@ -3491,8 +3520,6 @@ void BatchPfDriver<BatchSource>::_prepare_gen_v_adjoint(const std::vector<char>&
             }
         }
     upload_h2d(A.d_Ybus_T_pos, h_pos.data(), h_pos.size(), cs);
-    upload_h2d(A.d_p_row_of_bus, base.h_p_row_of_bus.data(), base.h_p_row_of_bus.size(), cs);
-    upload_h2d(A.d_q_row_of_bus, base.h_q_row_of_bus.data(), base.h_q_row_of_bus.size(), cs);
     upload_h2d(A.d_is_vm_fixed_bus, is_vm_fixed_bus.data(), is_vm_fixed_bus.size(), cs);
     A.d_gvm.resize(static_cast<size_t>(batch_size_) * n_bus);
     A.d_gvm_full.resize(static_cast<size_t>(n_contingencies) * n_bus);
@@ -3639,7 +3666,9 @@ void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rh
 
         // ③
         if (!reuse) {
-            spmv_batch.spmv();
+            // Ibus = Ybus · V as the forward computes it (the fused kernel, which also
+            // rewrites the slots' F: unused here; cuSPARSE without it)
+            nr_spmv_fill_F(spmv_batch, buf, n_bus, nnz_Y, dim_J, S, cs);
             nr_fill_J_at_current_V(buf, n_bus, dim_J, nnz_Y, nnz_J, S, cs);
             CHK_CUDA_BPF(cudaGetLastError());
         }
@@ -3684,8 +3713,8 @@ void BatchPfDriver<BatchSource>::_solve_JT_rebuilt(const cuda_real_type*    d_rh
                 thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
                 thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
                 thrust::raw_pointer_cast(A.d_Ybus_T_pos.data()),
-                thrust::raw_pointer_cast(A.d_p_row_of_bus.data()),
-                thrust::raw_pointer_cast(A.d_q_row_of_bus.data()),
+                thrust::raw_pointer_cast(base.d_p_row_of_bus.data()),
+                thrust::raw_pointer_cast(base.d_q_row_of_bus.data()),
                 thrust::raw_pointer_cast(A.d_is_vm_fixed_bus.data()),
                 n_bus, nnz_Y, dim_J, n);
             CHK_CUDA_BPF(cudaGetLastError());
@@ -3817,8 +3846,8 @@ void BatchPfDriver<BatchSource>::solve_JT_batch(
             thrust::raw_pointer_cast(base.d_Ybus_outer.data()),
             thrust::raw_pointer_cast(base.d_Ybus_inner.data()),
             thrust::raw_pointer_cast(A.d_Ybus_T_pos.data()),
-            thrust::raw_pointer_cast(A.d_p_row_of_bus.data()),
-            thrust::raw_pointer_cast(A.d_q_row_of_bus.data()),
+            thrust::raw_pointer_cast(base.d_p_row_of_bus.data()),
+            thrust::raw_pointer_cast(base.d_q_row_of_bus.data()),
             thrust::raw_pointer_cast(A.d_is_vm_fixed_bus.data()),
             n_bus, nnz_Y, dim_J, n_active_);
         CHK_CUDA_BPF(cudaGetLastError());

@@ -10,6 +10,8 @@ Change Log
 - [IMPROVED] ``scheduling="continuous"`` keeps its driver across ``compute()`` calls on the three batch facades
   (not with ``outer_loops``): no allocation or cuDSS analysis.
 - [IMPROVED] ``scheduling="continuous"``: a round's first Newton step reuses the residual pass's mismatch.
+- [IMPROVED] Batch drivers no longer allocate the block-diagonal Ybus CSR (batch × nnz_Y ints) unless cuSPARSE's
+  SpMV is used.
 - [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's;
   the extra step changed the loops' decisions.
 - [BREAKING] ``outer_loops=True``: ``nb_nr_iterations`` / ``get_row_iterations()`` count the steps taken, 0 for an

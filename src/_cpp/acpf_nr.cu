@@ -725,8 +725,18 @@ AcPfNrState::AcPfNrState(
         h_q_diag_pos.assign(n_bus, -1);
         for (int i = 0; i < n_theta; ++i) h_theta_col_of_bus[theta_buses[i]] = theta_cols[i];
         for (int i = 0; i < n_vm;    ++i) h_vm_col_of_bus[vm_buses[i]]       = vm_cols[i];
-        for (int i = 0; i < n_p;     ++i) h_p_row_of_bus[p_buses[i]]         = p_rows[i];
-        for (int i = 0; i < n_q;     ++i) h_q_row_of_bus[q_buses[i]]         = q_rows[i];
+        // (fused_F_ok: no bus owns two P rows or two Q rows, see the upload below)
+        fused_F_ok = true;
+        for (int i = 0; i < n_p; ++i) {
+            int& r = h_p_row_of_bus[p_buses[i]];
+            if (r >= 0) fused_F_ok = false;
+            r = p_rows[i];
+        }
+        for (int i = 0; i < n_q; ++i) {
+            int& r = h_q_row_of_bus[q_buses[i]];
+            if (r >= 0) fused_F_ok = false;
+            r = q_rows[i];
+        }
         auto find_J_pos = [&](int row, int col) -> int {
             if (row < 0 || col < 0) return -1;
             const int s = J_outer_h[row], e = J_outer_h[row + 1];
@@ -799,18 +809,15 @@ AcPfNrState::AcPfNrState(
     upload_h2d(d_vm_buses,    vm_buses.data(),    n_vm,    cs);
     upload_h2d(d_vm_cols,     vm_cols.data(),     n_vm,    cs);
     {
-        // Per-bus P / Q rows for the fused SpMV + fill_F of the batch loop:
-        // only when each bus owns at most one P row and one Q row (the
-        // ledger's compact lists normally guarantee it; otherwise the batch
-        // keeps cuSPARSE + fill_FP / fill_FQ, which write every pair).
-        std::vector<int> pr(n_bus, -1), qr(n_bus, -1);
-        bool ok = true;
-        for (int i = 0; i < n_p && ok; ++i) { int& r = pr[p_buses[i]]; ok = (r < 0); r = p_rows[i]; }
-        for (int i = 0; i < n_q && ok; ++i) { int& r = qr[q_buses[i]]; ok = (r < 0); r = q_rows[i]; }
-        fused_F_ok = ok;
-        if (ok) {
-            upload_h2d(d_p_row_of_bus, pr.data(), n_bus, cs);
-            upload_h2d(d_q_row_of_bus, qr.data(), n_bus, cs);
+        // Per-bus P / Q rows (the host maps above, last pair wins): the batched
+        // adjoint's gen_v term reads them, and the fused SpMV + fill_F of the
+        // batch loop too, but only when each bus owns at most one P row and one
+        // Q row (fused_F_ok; the ledger's compact lists normally guarantee it;
+        // otherwise the batch keeps cuSPARSE + fill_FP / fill_FQ, which write
+        // every pair).
+        upload_h2d(d_p_row_of_bus, h_p_row_of_bus.data(), n_bus, cs);
+        upload_h2d(d_q_row_of_bus, h_q_row_of_bus.data(), n_bus, cs);
+        if (fused_F_ok) {
             // Buses by Ybus row length (stable): a warp of the fused kernel
             // then holds rows of (nearly) one length instead of waiting for
             // its longest row (2.7x the useful FP64 work on case2869).
