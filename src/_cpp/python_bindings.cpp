@@ -1984,6 +1984,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
         "ANALYSIS, factorization state) while the settings it was built with "
         "and the contingency list are unchanged, so this only grows when one of them changed.")
+    .def_readonly("base_state_generation", &ContingencyAnalysisSession::base_state_generation_,
+        "Base states built so far (base-case solve and its cuDSS ANALYSIS): grows when the "
+        "reference slack, the reserved buses or the union pattern of the bus moves change.")
     .def_readwrite("batch_size", &ContingencyAnalysisSession::batch_size_,
                    "Contingencies per GPU chunk (takes effect on the next run())")
     .def_readonly("used_batch_size", &ContingencyAnalysisSession::used_batch_size_,

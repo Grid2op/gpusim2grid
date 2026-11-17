@@ -282,8 +282,9 @@ def test_moved_regulator_of_a_voltage_control_group_is_unsupported():
 
 
 def test_pattern_reused_across_runs_when_the_union_is_unchanged():
-    """A second compute() with other strategies over the same moved elements keeps the analysis
-    (no new cuDSS ANALYSIS / own-LU plan); a new moved element rebuilds it."""
+    """A second compute() with other strategies over the same moved elements keeps the union
+    pattern and the base state built on it; a new moved element rebuilds them. The batch driver is
+    rebuilt by every compute() with other rows (topology_actions_plan.md, "One run")."""
     from gpusim2grid.actions import Action
 
     grid = case14()
@@ -293,17 +294,19 @@ def test_pattern_reused_across_runs_when_the_union_is_unchanged():
     ca.set_actions([a])
     ca.add_strategies([(0, [0])])
     ca.compute(batch_size=BATCH)
-    n0: int = ca.solver._s.driver_build_counter
+    n0: int = ca.solver._s.base_state_generation
+    d0: int = ca.solver._s.driver_build_counter
     ca.add_strategies([(1, [0])])
     ca.compute(batch_size=BATCH)
-    assert ca.solver._s.driver_build_counter == n0
+    assert ca.solver._s.base_state_generation == n0
+    assert ca.solver._s.driver_build_counter == d0 + 1
     load = next(el.id for el in grid.get_loads() if el.bus_id == 8)
     line8 = next(el.id for el in grid.get_lines() if el.bus2_id == 8)
     other = Action(load_bus={load: bus2(grid, 8)}, line_bus2={line8: bus2(grid, 8)})
     ca.set_actions([a, other])
     ca.add_strategies([(0, [1])])
     ca.compute(batch_size=BATCH)
-    assert ca.solver._s.driver_build_counter == n0 + 1
+    assert ca.solver._s.base_state_generation == n0 + 1
 
 
 def test_generator_moves_lightsim2grid_refuses_are_unsupported():
