@@ -348,6 +348,35 @@ class TestAdjointPrimitives:
             np.testing.assert_allclose(lam[r], expected, atol=1e-8, rtol=1e-8)
         assert np.all(lam[2] == 0.0)                     # dropped row
 
+    @needs_bridge
+    @fp64_only
+    def test_converged_jacobian_on_padded_slots(self):
+        # A fixed-capacity chunk with islanded rows runs phantom slots (the base
+        # case) past its active rows, and keep_final_jacobian refills J over the
+        # whole capacity: a phantom slot's J must be built at its final V too,
+        # i.e. equal row 0's (the base case as well). The base case is solved
+        # loosely and nb_iter=1, so the last step moves V (by that residual) and
+        # a Ybus·V left over from the iteration before shows up in J.
+        from gpusim2grid import ScenarioSweepGPU
+        grid, n_bus, spur_line, _ = _solved_spur_grid(distributed_slack=False)
+        v0 = grid.dc_pf(np.ones(n_bus, dtype=complex), 1, 1e-6)
+        grid.ac_pf(v0.copy(), 30, 1e-3)
+        sw = ScenarioSweepGPU(grid, nb_iter=1, tol_base=1e-1)
+        sw.solver.fixed_batch_capacity = True
+        sw.solver.keep_final_jacobian = True
+        load_p, load_q = (np.asarray(a) for a in grid.get_loads_res_full()[:2])
+        gen_p = np.asarray(grid.get_gen_target_p())
+        rep = lambda a: np.repeat(a[None, :], 3, axis=0)   # noqa: E731
+        sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+        sw.set_topology([[], [int(spur_line)], [int(spur_line)]])   # 2 rows dropped
+        sw.compute(batch_size=3)
+        sol = sw.solver
+        assert sol.capacity == 3 and sol.n_active == 1
+        J_all = torch.from_dlpack(sol.j_values_dlpack()).cpu().numpy()
+        assert J_all.shape == (3, sol.nnz_J)
+        for slot in (1, 2):
+            np.testing.assert_allclose(J_all[slot], J_all[0], rtol=1e-13, atol=1e-13)
+
     def test_solve_JT_batch_refuses_a_multi_chunk_forward(self, ieee14_base_case):
         # The adjoint buffers hold one chunk: a snapshot J passes the shape
         # check (it IS one chunk's worth), but gathering the n_active rows of

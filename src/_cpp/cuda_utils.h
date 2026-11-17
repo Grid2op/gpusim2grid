@@ -486,6 +486,8 @@ struct CuSpMV {
     CuSpMV& operator=(const CuSpMV&) = delete;
 
     void spmv() {
+        if (mat == nullptr)   // a driver builds its block-diagonal SpMV only without the fused kernel
+            throw std::runtime_error("CuSpMV::spmv: no matrix descriptor (never built)");
         cusparseStatus_t status = cusparseSpMV(
             handle,
             CUSPARSE_OPERATION_NON_TRANSPOSE,

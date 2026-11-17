@@ -206,7 +206,35 @@ outer loops. `BatchPowerFlow`'s continuous backward now refuses any forward in b
 (case2869, 3 779 rows): 819 -> 772 ms a call, same results (max |dV| 5.3e-13 against the
 original build, identical iteration counts and NaN rows).
 
-## 11. Next steps
+## 11. Review follow-ups (done)
+
+What the review of PR #41 found in sections 6 to 10:
+
+- **Ybus·V over the padded chunk for the kept J.** cuSPARSE's block-diagonal SpMV covered the
+  whole chunk, the fused kernel covers the slots it is given, and the residual pass gives it the
+  real ones; `keep_final_jacobian` then refilled the phantom slots' J from V_final and the Ybus·V
+  of the iteration before. `_residual_pass(n_spmv)` covers the chunk when J is refilled there.
+  Pinned by `test_converged_jacobian_on_padded_slots`.
+- **F cache only in continuous drivers**: a chunked driver never binds it. 66 MiB at 1 500 slots
+  on case2869.
+- **No block-diagonal CSR on the fused path.** It only fed cuSPARSE's SpMV: built (with
+  `spmv_batch`, and the tail's prefix descriptor) only when `fused_F_ok` is false;
+  `_solve_JT_rebuilt` goes through `nr_spmv_fill_F` like the forward. Another 80 MiB at
+  1 500 slots on case2869 (batch × (nnz_Y + n_bus) ints), ~1 GB at a 10k batch on a 7k-bus grid.
+- **The check before the first step uses the F cache.** Both its passes ran the SpMV over every
+  slot, in nearly every outer-loop round. The first now copies back the rows of the slots nothing
+  changed since the last residual pass. The second, after the `slack_absorbed` recalibration (V
+  unchanged), copies back every slot's. Own LU: bitwise the same outer-loop results on ieee300
+  (NROuter and NROuterDist). On a real snapshot with NROuterDist the residual time fell by about
+  a quarter, against lightsim2grid the same as before.
+- **One device copy of the per-bus row maps** (`AcPfNrState::d_p_row_of_bus`, built from
+  `h_p_row_of_bus`; `fused_F_ok` is decided while building them): the adjoint no longer uploads
+  its own.
+
+Left as it was: the `d_bus_order` sort is done for every session (one stable sort of n_bus ints),
+and the F-cache flags are still set by hand in `_solve_continuous` (issue #42).
+
+## 12. Next steps
 
 - **One assembly kernel in the style of `eval_FJ`**, replacing `fill_J`, `fill_FP`/`fill_FQ` and the
   SpMV: system index fastest, the patched or shared Ybus through a stride (stride 0 for an
