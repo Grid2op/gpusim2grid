@@ -1447,14 +1447,18 @@ CplxVect ContingencyAnalysisSession::get_V_rows(const std::vector<int>& rows) co
     solver_->cs.synchronize();
     const int n_bus = base_state_->n_bus;
     CplxVect out(static_cast<Eigen::Index>(rows.size()) * n_bus);
-    static_assert(sizeof(cudaComplexType) == sizeof(CplxVect::Scalar), "complex layouts differ");
+    // the device's precision (float2 in an FP32 build), widened row by row
+    std::vector<cudaComplexType> row_buf(static_cast<size_t>(n_bus));
     for (size_t k = 0; k < rows.size(); ++k) {
         const int r = rows[k];
         if (r < 0 || r >= solver_->n_contingencies)
             throw std::runtime_error("ContingencyAnalysisSession::get_V_rows: row " + std::to_string(r) + " out of range");
-        cudaMemcpy(out.data() + static_cast<Eigen::Index>(k) * n_bus,
+        cudaMemcpy(row_buf.data(),
                    thrust::raw_pointer_cast(solver_->d_V_results.data()) + static_cast<size_t>(r) * n_bus,
                    sizeof(cudaComplexType) * static_cast<size_t>(n_bus), cudaMemcpyDeviceToHost);
+        for (int b = 0; b < n_bus; ++b)
+            out[static_cast<Eigen::Index>(k) * n_bus + b] = CplxVect::Scalar(row_buf[static_cast<size_t>(b)].x,
+                                                                              row_buf[static_cast<size_t>(b)].y);
     }
     return out;
 }
