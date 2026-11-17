@@ -222,15 +222,12 @@ def _gen_move_unsupported(grid: LSGrid, el: int) -> str:
 
 
 def _shunt_admittance(grid: LSGrid, shunt: int) -> complex:
-    """The shunt's Ybus diagonal admittance (pu): lightsim2grid's own, the solver Ybus with the
-    shunt minus without it (no sign convention to guess)."""
-    bus: int = int(grid.id_me_to_ac_solver()[grid.get_shunts()[shunt].bus_id])
-    without = copy.deepcopy(grid)
-    without.deactivate_shunt(shunt)
-    without.tell_solver_need_reset()
-    with_v = np.asarray(grid.get_V(), dtype=complex)
-    without.ac_pf(with_v.copy(), 30, 1e-8)
-    return complex(grid.get_Ybus_solver()[bus, bus] - without.get_Ybus_solver()[bus, bus])
+    """The shunt's Ybus diagonal admittance (pu), what lightsim2grid stamps for it
+    (``ShuntContainer::_fillYbus``): ``(target_p_mw - j target_q_mvar) / sn_mva``, the targets
+    of its sections in service. Read off the shunt, no copy of the grid nor power flow (pinned
+    against lightsim2grid's Ybus with and without the shunt in test_topo_bus_moves.py)."""
+    sh = grid.get_shunts()[shunt]
+    return complex(float(sh.target_p_mw), -float(sh.target_q_mvar)) / float(grid.get_sn_mva())
 
 
 def _y(branch: Any) -> BranchY:

@@ -674,6 +674,24 @@ def test_shunt_admittance_is_lightsim2grids():
         np.testing.assert_allclose(_shunt_admittance(grid, s), y_ref, rtol=1e-12, atol=0)
 
 
+def test_compiling_a_shunt_move_copies_no_grid(monkeypatch: pytest.MonkeyPatch):
+    """Compiling an action that moves shunts reads their admittance off the shunts themselves: no
+    copy of the grid, no power flow per shunt (hundreds of actions on a large grid)."""
+    import types
+
+    from gpusim2grid.contingency_analysis import _strategies
+
+    grid = _case14_two_shunts()
+    move = _move(grid, 8, [("shunt_bus", 0)])
+
+    def no_copy(_: Any) -> Any:
+        raise AssertionError("compile_action copied the grid")
+
+    monkeypatch.setattr(_strategies, "copy", types.SimpleNamespace(deepcopy=no_copy))
+    compiled = _strategies.compile_action(grid, move, len(grid.get_lines()))
+    assert set(compiled.shunt_y) == {0}
+
+
 @pytest.mark.parametrize("settings", ca_settings())
 def test_shunt_moves_match_lightsim2grid(settings: dict[str, Any], solver_atol: float):
     """Each shunt moved to bus 2 of its substation with a branch end, with and without a
