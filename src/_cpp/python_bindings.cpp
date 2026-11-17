@@ -1870,6 +1870,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Compute per-branch ampere flows for every contingency from the stored "
          "voltages (tripped branches zeroed). Requires run() and set_branch_data().")
+    .def("get_V_rows", &ContingencyAnalysisSession::get_V_rows, pybind11::arg("rows"),
+         pybind11::call_guard<pybind11::gil_scoped_release>(),
+         "Copy the voltages of the listed rows only to host: (len(rows) * n_bus,) complex128.")
     .def("get_V_results",  &ContingencyAnalysisSession::get_V_results,
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Copy batch voltages to host: (n_contingencies * n_bus,) complex128.")
@@ -1932,6 +1935,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "loop's second pass. Requires run() on both.")
     .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
          "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
+    .def("compute_max_loading", &ContingencyAnalysisSession::compute_max_loading,
+         pybind11::arg("lim1_ka"), pybind11::arg("lim2_ka"), pybind11::arg("skip") = std::vector<long long>(),
+         "Per row of the last run(): (rho, branch), the highest |I| / limit over the branches and "
+         "their two sides and the branch reaching it (-1: none), reduced on the device; skip: flat "
+         "row * n_branches + branch entries left out.")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Copy origin-terminal ampere flows to host: (n_contingencies * n_branches,). "
@@ -1977,6 +1985,17 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
          "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
          "and no add_row_sbus_deltas bus on it), with no call.")
+    .def("set_streaming", &ContingencyAnalysisSession::set_streaming,
+         pybind11::arg("parent_of_row"), pybind11::arg("condition"), pybind11::arg("warm"),
+         "Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a "
+         "contingency row); each contingency releases its strategies when it finishes, if the "
+         "condition holds (0 TRUE, 1 ANY_VIOLATION), each starting from its contingency's converged "
+         "state when warm (voltages, outer-loop state).")
+    .def("clear_streaming", &ContingencyAnalysisSession::clear_streaming)
+    .def_property_readonly("streamed_rows", [](const ContingencyAnalysisSession& s) {
+            std::vector<bool> out(s.streamed_rows().begin(), s.streamed_rows().end());
+            return out;
+        }, "Last streamed run: per row, whether it was released (a contingency row: always).")
     .def("set_row_pv_moves", &ContingencyAnalysisSession::set_row_pv_moves,
          pybind11::arg("release"), pybind11::arg("pv"),
          pybind11::arg("gen_bus") = std::vector<std::vector<std::pair<int, int>>>(),

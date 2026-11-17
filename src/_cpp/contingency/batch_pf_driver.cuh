@@ -87,6 +87,22 @@
 struct TailSolve;   // driver.cuh: the linear solve of a continuous run's tail
 
 // -----------------------------------------------------------------------------
+// RowFeed -- a dynamic row queue for the continuous schedule (streamed strategies: a
+// contingency's strategies released when it finishes). Without one, the rows are the active
+// rows 0..n_active-1 in order.
+//   next():      an active row ready to load, -1 when none is ready now
+//   more():      whether it may still produce rows (ready or pending): the tail waits for false
+//   finished():  the active rows that left this round, their results stored on the device (V,
+//                residuals, violation counts) -- what it releases next; may synchronize `cs`
+// -----------------------------------------------------------------------------
+struct RowFeed {
+    virtual ~RowFeed() = default;
+    virtual int  next() = 0;
+    virtual bool more() const = 0;
+    virtual void finished(const std::vector<int>& active_rows, cudaStream_t cs) = 0;
+};
+
+// -----------------------------------------------------------------------------
 // BatchPfDriverContext — non-owning per-chunk view passed to the BatchSource
 // hooks.  Plain struct (no templates) to keep BatchSource types decoupled from
 // BatchPfDriver's template parameter.
@@ -689,6 +705,8 @@ struct BatchPfDriver {
     // row's LAST inner solve.
     // -------------------------------------------------------------------------
     outer::OuterHook* outer_hook_ = nullptr;
+    // A dynamic row queue (RowFeed): continuous scheduling only. Not owned.
+    RowFeed* row_feed_ = nullptr;
     // The batched adjoint through the outer loops (lightsim2grid's: the last inner solve of
     // each row, every decision of its loops held): when set, a continuous solve() with a model
     // keeps, per active row, the per-slot state that row's last Jacobian was built with -- the

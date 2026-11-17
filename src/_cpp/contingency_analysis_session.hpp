@@ -55,6 +55,8 @@
 #include <complex>
 #include <cstdint>
 #include <memory>
+
+struct RowFeed;   // contingency/batch_pf_driver.cuh: the continuous schedule's row queue
 #include <utility>
 #include <tuple>
 #include <vector>
@@ -206,6 +208,8 @@ struct ContingencyAnalysisSession {
 
     // Host-side flow result storage (filled by compute_flows()).
     RealVect h_or_amps_;
+    // the flows of every row on the device (d_or_amps_results / d_ex_amps_results)
+    void _compute_flows_device();
     RealVect h_ex_amps_;
 
     // =========================================================================
@@ -266,6 +270,13 @@ struct ContingencyAnalysisSession {
     std::vector<std::vector<int>> row_pv_release_;
     std::vector<std::vector<std::pair<int, double>>> row_pv_set_;
     std::vector<std::vector<std::pair<int, int>>> row_gen_bus_;
+    // set_streaming: per row its contingency's row (empty: no streaming), the condition, the
+    // warm start, each contingency row's V group; the last run's released rows
+    std::vector<int>  stream_parent_;
+    int               stream_condition_ = 0;
+    bool              stream_warm_ = false;
+    std::vector<int>  stream_group_of_ctg_;
+    std::vector<char> stream_released_;
     bool has_gen_trips_ = false;
     // the buses the base ledger was extended with (a generator trip releases them
     // on some row), and the ones each row releases
@@ -394,6 +405,13 @@ struct ContingencyAnalysisSession {
     // Requires run() and set_branch_data() to have been called.
     // =========================================================================
     void compute_flows();
+    // Per row of the last run(): the highest |I| / limit over the branches and their two sides
+    // (lim*_ka per branch, kA; NaN / <= 0 ignored) and the branch reaching it (-1: none), reduced
+    // on the device from the flows (computed there, never copied to the host). `skip`: flat
+    // row * n_branches + branch entries left out (the caller computes those itself).
+    std::pair<RealVect, std::vector<int>> compute_max_loading(Eigen::Ref<const RealVect> lim1_ka,
+                                                              Eigen::Ref<const RealVect> lim2_ka,
+                                                              const std::vector<long long>& skip);
 
     // =========================================================================
     // compute_limit_violations
@@ -442,6 +460,7 @@ struct ContingencyAnalysisSession {
     // Result accessors — synchronous D→H copy on demand.
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_contingencies * n_bus,)  complex
+    CplxVect get_V_rows(const std::vector<int>& rows) const;   // (len(rows) * n_bus,) those rows only
     RealVect get_residuals()  const;   // (n_contingencies,)           real
 
     // Overwrite the voltages and residuals of rows dst_rows[i] with row
@@ -519,6 +538,17 @@ struct ContingencyAnalysisSession {
                           const std::vector<std::vector<std::pair<int, double>>>& pv,
                           const std::vector<std::vector<std::pair<int, int>>>& gen_bus = {});
     void clear_v_init_groups();
+    // Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a
+    // contingency row); the contingency rows run first and each releases its strategies when it
+    // finishes, if `condition` holds (0 TRUE, 1 ANY_VIOLATION: at least one violation, the limit
+    // checks on), each strategy then starting from its contingency's converged state when `warm`
+    // (voltages, and the outer loops' state). One list per row of build_contingencies*();
+    // clear_streaming() goes back to the plain queue.
+    void set_streaming(const std::vector<int>& parent_of_row, int condition, bool warm);
+    void clear_streaming();
+    std::unique_ptr<RowFeed> _make_stream_feed();
+    // last streamed run: per row, whether it was released (a contingency row: always)
+    const std::vector<char>& streamed_rows() const { return stream_released_; }
     bool has_v_init_groups() const { return has_v_groups_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real

@@ -593,6 +593,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._rowmap: RowMap | None = None
         self._flows_done: bool = False
         self._strategy_warm_start: bool = False
+        self._strategy_condition: str = "TRUE"
+        self._stream_released: np.ndarray | None = None
         # the union pattern the session holds for the bus moves (None: the base pattern)
         self._union: UnionPlan | None = None
         # the rows of the last run whose actions change branch values: {row: {branch: new y}}
@@ -831,8 +833,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         contingencies and the selected strategies in one call, ``"contingencies"`` the
         contingencies (phase 1), ``"strategies"`` the strategies :meth:`select_strategies`
         kept (phase 2). The results then cover those rows (contingencies, then strategies;
-        NaN for a strategy that did not run) and the voltages come back as a host array
-        ``(n_rows, n_bus)``.
+        NaN for a strategy that did not run) and the voltages come back as :attr:`V_results`
+        (``(n_rows * n_bus,)``, copied to the host only by its ``to_numpy()``).
         """
         if rows not in (None, "contingencies", "strategies"):
             raise ValueError(f"rows must be None, 'contingencies' or 'strategies', not {rows!r}")
@@ -936,8 +938,26 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._rowmap is None:
             raise RuntimeError("no strategy run yet")
         ran = self._rowmap.ran
+        if self._stream_released is not None:   # streamed: a strategy whose condition failed did not run
+            released = self._rowmap.expand(self._stream_released, False)
+            ran = ran & released
         return ran[self._rowmap.n_out - len(self._strategies):] if self._last_rows != "contingencies" \
             else np.zeros(len(self._strategies), dtype=bool)
+
+    @property
+    def strategy_condition(self) -> str:
+        """str: when a contingency's strategies run in one :meth:`compute` (no ``rows``):
+        pypowsybl's ``"TRUE"`` (all of them, the default) or ``"ANY_VIOLATION"`` (only when the
+        contingency violates a limit, ``compute_limit_violations`` on and ``violation_threshold``
+        applied). On the continuous schedule the run streams: a contingency releases its
+        strategies when it finishes, the condition checked on the device."""
+        return self._strategy_condition
+
+    @strategy_condition.setter
+    def strategy_condition(self, value: str) -> None:
+        if value not in ("TRUE", "ANY_VIOLATION"):
+            raise ValueError(f"strategy_condition must be 'TRUE' or 'ANY_VIOLATION', not {value!r}")
+        self._strategy_condition = value
 
     @property
     def strategy_warm_start(self) -> bool:
@@ -968,8 +988,6 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         or has no limit."""
         if self._last_residuals is None:
             raise RuntimeError("Call compute() before get_max_loading().")
-        if not self._flows_done:
-            self.compute_flows()
         _, _, lim1, lim2, _ = self._configured_limits()
         if self.n_branches is None:
             raise RuntimeError("get_max_loading needs branch data (set_branch_data in array mode)")
@@ -982,30 +1000,36 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if n_session == 0:
             assert rm is not None
             return np.full(rm.n_out, np.nan), np.full(rm.n_out, -1, dtype=np.int64)
-        i1: np.ndarray = self._inner.or_amps.to_numpy().reshape(n_session, nb) * 1e-3  # A -> kA, as the limits
-        i2: np.ndarray = self._inner.ex_amps.to_numpy().reshape(n_session, nb) * 1e-3
+        # reduced on the device (one rho and one branch per row come back); the branches whose
+        # values or ends a row changes are left out there and taken from the row's own
+        # admittance and buses here (the session's flows use the base ones)
+        lim1_a: np.ndarray = np.where(np.asarray(lim1, dtype=float) > 0, np.asarray(lim1, dtype=float), np.nan)
+        lim2_a: np.ndarray = np.where(np.asarray(lim2, dtype=float) > 0, np.asarray(lim2, dtype=float), np.nan)
+        changed_rows: dict[int, dict[int, RowBranch]] = {}
+        skip: list[int] = []
         if rm is not None and self._row_branch:
-            # the branches whose values or ends a row changes: its own (the session's are the base ones)
-            V: np.ndarray = self._inner.V_results.to_numpy().reshape(n_session, -1)
             pos: dict[int, int] = {int(r): k for k, r in enumerate(rm.session_rows)}
             for row, changed in self._row_branch.items():
                 k = pos[row]
-                for b, rb in changed.items():
-                    i1[k, b] = self._branch_amps(V[k], rb, 1) * 1e-3
-                    i2[k, b] = self._branch_amps(V[k], rb, 2) * 1e-3
-        with np.errstate(divide="ignore", invalid="ignore"):
-            r: np.ndarray = np.fmax(
-                np.where(np.asarray(lim1) > 0, i1 / lim1, np.nan), np.where(np.asarray(lim2) > 0, i2 / lim2, np.nan)
-            )
-        del i1, i2
-        # a row not solved (skipped, unsupported, NaN residual) reads zero currents: no loading
-        r[~np.isfinite(residuals.to_numpy())] = np.nan
-        has: np.ndarray = ~np.all(np.isnan(r), axis=1)
-        branch: np.ndarray = np.full(n_session, -1, dtype=np.int64)
-        rho: np.ndarray = np.full(n_session, np.nan)
-        if has.any():
-            branch[has] = np.nanargmax(r[has], axis=1)
-            rho[has] = r[has, branch[has]]
+                changed_rows[k] = changed
+                skip += [k * nb + b for b in changed]
+        rho_d, branch_d = self._inner._s.compute_max_loading(lim1_a, lim2_a, sorted(skip))
+        rho: np.ndarray = np.asarray(rho_d, dtype=float)
+        branch: np.ndarray = np.asarray(branch_d, dtype=np.int64)
+        if changed_rows:
+            keys: list[int] = sorted(changed_rows)
+            V: np.ndarray = np.asarray(self._inner._s.get_V_rows(keys)).reshape(len(keys), -1)
+            for i, k in enumerate(keys):
+                for b, rb in sorted(changed_rows[k].items()):
+                    loads = [self._branch_amps(V[i], rb, side) * 1e-3 / lim
+                             for side, lim in ((1, lim1_a[b]), (2, lim2_a[b])) if np.isfinite(lim)]
+                    if loads and (not np.isfinite(rho[k]) or max(loads) > rho[k]
+                                  or (max(loads) == rho[k] and b < branch[k])):
+                        rho[k], branch[k] = max(loads), b
+        # a row not solved (skipped, unsupported, NaN residual) has no loading
+        bad: np.ndarray = ~np.isfinite(residuals.to_numpy())
+        rho[bad] = np.nan
+        branch[bad | ~np.isfinite(rho)] = -1
         if rm is None:
             return rho, branch
         return rm.expand(rho, np.nan), rm.expand(branch, -1)
@@ -1013,16 +1037,20 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
     # ------------------------------------------------- topology actions, inside
     _last_rows: Rows | None = None
 
-    def _compute_rows(self, batch_size: int, rows: Rows | None) -> np.ndarray:
+    def _compute_rows(self, batch_size: int, rows: Rows | None) -> DeviceBuffer:
         """Run the contingency rows (``rows`` None / "contingencies") and the selected,
         supported strategy rows (None / "strategies") through the session; map them back."""
         if self._reactive_limits_outer_loop:
             raise NotImplementedError("strategies with reactive_limits_outer_loop (deprecated): "
                                       "use outer_loops=True")
+        # one run, contingencies and strategies: streamed on the continuous schedule (a contingency
+        # releases its strategies when it finishes, the condition and the warm start on the device)
+        stream: bool = rows is None and bool(self._strategies) and self.scheduling == "continuous"
+        if rows is None and not stream and (self._strategy_warm_start or self._strategy_condition != "TRUE"):
+            raise NotImplementedError("strategy_warm_start / strategy_condition in one compute() need the "
+                                      "continuous schedule (or the two phases: rows='contingencies', then "
+                                      "rows='strategies')")
         warm: bool = self._strategy_warm_start and rows == "strategies"
-        if self._strategy_warm_start and rows is None:
-            raise NotImplementedError("strategy_warm_start runs in two phases: compute(rows='contingencies'), "
-                                      "then compute(rows='strategies')")
         if warm and self._ctg_start_ok is None:
             raise RuntimeError("strategy_warm_start: run compute(rows='contingencies') first")
         ctg: list[CtgElements] = list(self._ctg_elements or [])
@@ -1097,7 +1125,16 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             if any(session_release) or any(session_pv) or any(session_gen_bus):
                 session.set_row_pv_moves(session_release, session_pv, session_gen_bus)
             self._inner.batch_size = int(batch_size)
-            if self._outer_loops:
+            self._stream_released = None
+            if stream:
+                n_ctg: int = len(ctg)
+                parent: list[int] = [-1 if r < n_ctg else self._strategies[r - n_ctg][0] for r in session_rows]
+                cond: int = 0 if self._strategy_condition == "TRUE" else 1
+                session.set_streaming(parent, cond, self._strategy_warm_start)
+                self._ctg_start_ok = None
+            else:
+                session.clear_streaming()
+            if self._outer_loops and not stream:
                 # the outer loops resume as the voltages do: phase 1 keeps where each contingency's
                 # loops ended, a warm-started strategy resumes from its contingency's (a second solve
                 # on the grid with the contingency applied: its loss shared once)
@@ -1107,7 +1144,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                     resume = [c if ok_c[c] else -1 for c in (self._strategies[r - off][0] for r in session_rows)]
                 session.set_outer_row_resume(resume)
                 session.keep_outer_row_points(rows == "contingencies" and bool(self._strategies))
-            if rows == "strategies" and session.has_v_init_groups:
+            if stream:
+                pass   # set_streaming set the V groups
+            elif rows == "strategies" and session.has_v_init_groups:
                 # the contingencies' voltages of phase 1 are groups 0..C-1 (-1: not converged)
                 ok: np.ndarray = (
                     self._ctg_start_ok if warm and self._ctg_start_ok is not None else np.zeros(len(ctg), dtype=bool)
@@ -1119,6 +1158,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 self._ctg_start_ok = None
             self._inner.run()
             self._last_residuals = self._inner.residuals
+            if stream:
+                self._stream_released = np.asarray(session.streamed_rows, dtype=bool)
             if rows == "contingencies" and self._strategies:
                 # keep the contingencies' voltages on the device for phase 2's warm start
                 session.set_v_init_groups_from(session, list(range(len(ctg))))
@@ -1126,7 +1167,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 self._ctg_start_ok = np.isfinite(res) & (res <= self._inner.violation_tol)
         else:
             self._last_residuals = DeviceBuffer(lambda: np.zeros(0), (0,), "float64")
-        return self.V_results.to_numpy().reshape(n_out, -1)
+        return self.V_results
 
     def _prepare_union(self, n_lines: int) -> TopologyContext | None:
         """The union pattern of every registered strategy's bus moves, set on the session when it

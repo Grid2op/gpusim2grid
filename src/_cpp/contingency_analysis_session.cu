@@ -8,6 +8,7 @@
 
 #include "contingency_analysis_session.hpp"
 
+#include <deque>
 #include <map>
 #include <tuple>
 #include "gen_contingency_rows.hpp"   // gen_contingency::prepare_rows / check_rows / row_slack_weights
@@ -380,6 +381,7 @@ void ContingencyAnalysisSession::build_contingencies_full(
     row_pv_release_.clear();
     row_pv_set_.clear();
     row_gen_bus_.clear();
+    stream_parent_.clear();
     ctg_shunts_ = shunt_ids_per_ctg;
     ctg_loads_  = load_ids_per_ctg;
     ctg_gens_   = gen_ids_per_ctg;
@@ -965,7 +967,17 @@ void ContingencyAnalysisSession::run()
     } else {
         solver_->source_.clear_v_groups();
     }
+    // streamed strategies: the feed the continuous schedule takes its rows from
+    std::unique_ptr<RowFeed> feed;
+    solver_->row_feed_ = nullptr;
+    if (!stream_parent_.empty()) {
+        if (!continuous)
+            throw std::runtime_error("ContingencyAnalysisSession: streamed strategies need the continuous schedule");
+        feed = _make_stream_feed();
+        solver_->row_feed_ = feed.get();
+    }
     timings_ = solver_->solve();
+    solver_->row_feed_ = nullptr;
     const auto t_after0 = std::chrono::steady_clock::now();
 
     // Wire in base-case and one-time setup timings captured before/during
@@ -1028,6 +1040,110 @@ void ContingencyAnalysisSession::run()
 // compute_flows
 // =============================================================================
 void ContingencyAnalysisSession::compute_flows()
+{
+    _compute_flows_device();
+    // D→H download of flow results — timed separately.
+    const Eigen::Index n = static_cast<Eigen::Index>(solver_->n_contingencies) * solver_->n_branches_;
+    auto t_copy_start = std::chrono::steady_clock::now();
+    {
+        // Through the driver's pinned staging buffer (download_into).
+        h_or_amps_.resize(n);
+        h_ex_amps_.resize(n);
+        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
+        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
+    }
+    timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
+}
+
+namespace {
+// One block per row: the highest |I| / limit over the branches and their two sides (amps in A,
+// limits in kA; a NaN / non-positive limit ignored) and the first branch reaching it.
+__global__ void max_loading_kernel(const cuda_real_type* __restrict__ or_amps, const cuda_real_type* __restrict__ ex_amps,
+                                   const double* __restrict__ lim1_ka, const double* __restrict__ lim2_ka,
+                                   int n_rows, int n_bra, double* __restrict__ rho, int* __restrict__ branch)
+{
+    const int r = blockIdx.x;
+    if (r >= n_rows) return;
+    const size_t off = static_cast<size_t>(r) * static_cast<size_t>(n_bra);
+    double best = -1.;
+    int best_b = -1;
+    for (int b = threadIdx.x; b < n_bra; b += blockDim.x) {
+        const double l1 = lim1_ka[b], l2 = lim2_ka[b];
+        double v = -1.;
+        if (l1 > 0.) v = fmax(v, or_amps[off + b] * 1e-3 / l1);
+        if (l2 > 0.) v = fmax(v, ex_amps[off + b] * 1e-3 / l2);
+        if (v > best) { best = v; best_b = b; }      // b increases: the first one kept on ties
+    }
+    __shared__ double s_v[256];
+    __shared__ int s_b[256];
+    s_v[threadIdx.x] = best;
+    s_b[threadIdx.x] = best_b;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const double ov = s_v[threadIdx.x + stride];
+            const int ob = s_b[threadIdx.x + stride];
+            if (ov > s_v[threadIdx.x] || (ov == s_v[threadIdx.x] && ob >= 0 && (s_b[threadIdx.x] < 0 || ob < s_b[threadIdx.x]))) {
+                s_v[threadIdx.x] = ov;
+                s_b[threadIdx.x] = ob;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        rho[r] = s_b[0] >= 0 ? s_v[0] : nan("");
+        branch[r] = s_b[0];
+    }
+}
+}  // namespace
+
+std::pair<RealVect, std::vector<int>> ContingencyAnalysisSession::compute_max_loading(
+    Eigen::Ref<const RealVect> lim1_ka, Eigen::Ref<const RealVect> lim2_ka, const std::vector<long long>& skip)
+{
+    _compute_flows_device();
+    const int n_rows = solver_->n_contingencies;
+    const int n_bra = solver_->n_branches_;
+    if (lim1_ka.size() != n_bra || lim2_ka.size() != n_bra)
+        throw std::runtime_error("ContingencyAnalysisSession::compute_max_loading: one limit per branch and side");
+    const cudaStream_t cs = solver_->cs;
+    // the branches the caller computes itself (their values / ends change on that row): out of the max
+    thrust::device_vector<long long> d_skip;
+    if (!skip.empty()) {
+        const long long n_z = static_cast<long long>(skip.size());
+        for (long long k : skip)
+            if (k < 0 || k >= static_cast<long long>(n_rows) * n_bra)
+                throw std::runtime_error("ContingencyAnalysisSession::compute_max_loading: skip entry out of range");
+        upload_h2d(d_skip, skip.data(), skip.size(), cs);
+        zero_branch_flows_kernel<<<static_cast<unsigned>((n_z + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
+            thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
+            thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
+            thrust::raw_pointer_cast(d_skip.data()), n_z);
+    }
+    thrust::device_vector<double> d_l1, d_l2, d_rho(static_cast<size_t>(std::max(n_rows, 1)));
+    thrust::device_vector<int> d_br(static_cast<size_t>(std::max(n_rows, 1)));
+    upload_h2d(d_l1, lim1_ka.data(), static_cast<size_t>(n_bra), cs);
+    upload_h2d(d_l2, lim2_ka.data(), static_cast<size_t>(n_bra), cs);
+    if (n_rows > 0)
+        max_loading_kernel<<<static_cast<unsigned>(n_rows), 256, 0, cs>>>(
+            thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
+            thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
+            thrust::raw_pointer_cast(d_l1.data()), thrust::raw_pointer_cast(d_l2.data()),
+            n_rows, n_bra, thrust::raw_pointer_cast(d_rho.data()), thrust::raw_pointer_cast(d_br.data()));
+    RealVect rho(n_rows);
+    std::vector<int> branch(static_cast<size_t>(n_rows));
+    if (n_rows > 0) {
+        cudaMemcpyAsync(rho.data(), thrust::raw_pointer_cast(d_rho.data()), sizeof(double) * n_rows, cudaMemcpyDeviceToHost, cs);
+        cudaMemcpyAsync(branch.data(), thrust::raw_pointer_cast(d_br.data()), sizeof(int) * n_rows, cudaMemcpyDeviceToHost, cs);
+    }
+    cudaStreamSynchronize(cs);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ContingencyAnalysisSession::compute_max_loading: ") + cudaGetErrorString(e));
+    // (the host flows of a previous compute_flows() are untouched: the zeroing is on the device)
+    return {rho, branch};
+}
+
+void ContingencyAnalysisSession::_compute_flows_device()
 {
     if (!has_branch_data_)
         throw std::runtime_error(
@@ -1093,18 +1209,6 @@ void ContingencyAnalysisSession::compute_flows()
     // the sync point that lets d_zero be safely destroyed below.
     timings_.t_flow_computation += flow_timer.stop_ms();
     // d_zero destroyed here, after sync
-
-    // D→H download of flow results — timed separately.
-    const Eigen::Index n = static_cast<Eigen::Index>(n_ctg) * n_bra;
-    auto t_copy_start = std::chrono::steady_clock::now();
-    {
-        // Through the driver's pinned staging buffer (download_into).
-        h_or_amps_.resize(n);
-        h_ex_amps_.resize(n);
-        solver_->download_into(h_or_amps_.data(), static_cast<size_t>(n), solver_->d_or_amps_results);
-        solver_->download_into(h_ex_amps_.data(), static_cast<size_t>(n), solver_->d_ex_amps_results);
-    }
-    timings_.t_copy_flows_to_host_ms = ms_since(t_copy_start);
 }
 
 // =============================================================================
@@ -1336,6 +1440,25 @@ CplxVect ContingencyAnalysisSession::get_V_results() const
     return out;
 }
 
+CplxVect ContingencyAnalysisSession::get_V_rows(const std::vector<int>& rows) const
+{
+    if (!solver_)
+        throw std::runtime_error("ContingencyAnalysisSession: call run() first");
+    solver_->cs.synchronize();
+    const int n_bus = base_state_->n_bus;
+    CplxVect out(static_cast<Eigen::Index>(rows.size()) * n_bus);
+    static_assert(sizeof(cudaComplexType) == sizeof(CplxVect::Scalar), "complex layouts differ");
+    for (size_t k = 0; k < rows.size(); ++k) {
+        const int r = rows[k];
+        if (r < 0 || r >= solver_->n_contingencies)
+            throw std::runtime_error("ContingencyAnalysisSession::get_V_rows: row " + std::to_string(r) + " out of range");
+        cudaMemcpy(out.data() + static_cast<Eigen::Index>(k) * n_bus,
+                   thrust::raw_pointer_cast(solver_->d_V_results.data()) + static_cast<size_t>(r) * n_bus,
+                   sizeof(cudaComplexType) * static_cast<size_t>(n_bus), cudaMemcpyDeviceToHost);
+    }
+    return out;
+}
+
 RealVect ContingencyAnalysisSession::get_residuals() const
 {
     if (!solver_)
@@ -1462,6 +1585,175 @@ void ContingencyAnalysisSession::set_v_init_groups_from_ptr(std::uintptr_t d_V_s
     base_state_->cs.synchronize();
     n_v_groups_ = n;
     has_v_groups_ = true;
+}
+
+// =============================================================================
+// Streamed strategies (set_streaming): a RowFeed over the session's rows
+// =============================================================================
+namespace {
+struct StreamFeed final : RowFeed {
+    std::vector<int> a2o;                            // active -> original row
+    std::vector<int> parent;                         // per original row (-1: a contingency row)
+    std::vector<std::vector<int>> children;          // per original contingency row: its active strategy rows
+    std::vector<int> group;                          // per original contingency row: its V group (-1: none)
+    std::deque<int>  ready;
+    long long        pending = 0;
+    int              condition = 0;
+    bool             warm = false;
+    int              n_bus = 0;
+    const int*             d_count = nullptr;        // violation counts, per original row
+    const std::vector<int>* status = nullptr;        // the driver's row_status_
+    const cudaComplexType* d_V_results = nullptr;
+    const cudaComplexType* d_V_base = nullptr;
+    cudaComplexType*       d_V_groups = nullptr;
+    std::vector<char>*     released = nullptr;       // per original row
+
+    int next() override {
+        if (ready.empty()) return -1;
+        const int a = ready.front();
+        ready.pop_front();
+        return a;
+    }
+    bool more() const override { return !ready.empty() || pending > 0; }
+
+    // contingency `o` is over (count: its violations, -1 never simulated; converged): its
+    // strategies released or dropped, their V group written
+    void settle(int o, int count, bool converged, cudaStream_t cs) {
+        std::vector<int>& kids = children[static_cast<size_t>(o)];
+        if (kids.empty()) return;
+        pending -= static_cast<long long>(kids.size());
+        const bool go = condition == 0 || count > 0;
+        if (go) {
+            const int g = group[static_cast<size_t>(o)];
+            if (warm && g >= 0) {
+                const cudaComplexType* src = converged ? d_V_results + static_cast<size_t>(o) * n_bus : d_V_base;
+                cudaMemcpyAsync(d_V_groups + static_cast<size_t>(g) * n_bus, src,
+                                sizeof(cudaComplexType) * static_cast<size_t>(n_bus), cudaMemcpyDeviceToDevice, cs);
+            }
+            for (int a : kids) {
+                ready.push_back(a);
+                (*released)[static_cast<size_t>(a2o[static_cast<size_t>(a)])] = 1;
+            }
+        }
+        kids.clear();
+    }
+
+    void finished(const std::vector<int>& rows, cudaStream_t cs) override {
+        std::vector<int> ctg;
+        for (int a : rows) {
+            const int o = a2o[static_cast<size_t>(a)];
+            if (parent[static_cast<size_t>(o)] < 0 && !children[static_cast<size_t>(o)].empty()) ctg.push_back(o);
+        }
+        if (ctg.empty()) return;
+        std::vector<int> count(ctg.size(), -1);
+        if (d_count != nullptr)
+            for (size_t i = 0; i < ctg.size(); ++i)
+                cudaMemcpyAsync(&count[i], d_count + ctg[i], sizeof(int), cudaMemcpyDeviceToHost, cs);
+        cudaStreamSynchronize(cs);
+        for (size_t i = 0; i < ctg.size(); ++i)
+            settle(ctg[i], count[i], (*status)[static_cast<size_t>(ctg[i])] == static_cast<int>(RowStatus::Converged), cs);
+    }
+};
+}  // namespace
+
+std::unique_ptr<RowFeed> ContingencyAnalysisSession::_make_stream_feed()
+{
+    auto f = std::make_unique<StreamFeed>();
+    const size_t n_rows = contingencies_.size();
+    f->a2o = solver_->source_.active_to_orig();
+    if (f->a2o.empty() && solver_->n_active_ == static_cast<int>(n_rows)) {
+        f->a2o.resize(n_rows);
+        for (size_t i = 0; i < n_rows; ++i) f->a2o[i] = static_cast<int>(i);
+    }
+    f->parent = stream_parent_;
+    f->children.assign(n_rows, {});
+    f->group = stream_group_of_ctg_;
+    f->condition = stream_condition_;
+    f->warm = stream_warm_;
+    f->n_bus = base_state_->n_bus;
+    if (stream_condition_ != 0) {
+        if (solver_->d_violation_count.size() != n_rows)
+            throw std::runtime_error("ContingencyAnalysisSession: the ANY_VIOLATION condition needs the limit "
+                                     "checks (compute_limit_violations)");
+        f->d_count = thrust::raw_pointer_cast(solver_->d_violation_count.data());
+    }
+    f->status = &solver_->row_status_;
+    f->d_V_results = thrust::raw_pointer_cast(solver_->d_V_results.data());
+    f->d_V_base = thrust::raw_pointer_cast(base_state_->d_V_base.data());
+    f->d_V_groups = stream_warm_ ? thrust::raw_pointer_cast(dev_->d_V_groups.data()) : nullptr;
+    stream_released_.assign(n_rows, 0);
+    f->released = &stream_released_;
+    std::vector<char> active(n_rows, 0);
+    for (size_t a = 0; a < f->a2o.size(); ++a) {
+        const int o = f->a2o[a];
+        active[static_cast<size_t>(o)] = 1;
+        const int p = f->parent[static_cast<size_t>(o)];
+        if (p < 0) {
+            f->ready.push_back(static_cast<int>(a));
+            stream_released_[static_cast<size_t>(o)] = 1;
+        } else {
+            f->children[static_cast<size_t>(p)].push_back(static_cast<int>(a));
+            ++f->pending;
+        }
+    }
+    // a contingency that never runs (islanded, unsupported): settled now, never simulated
+    const cudaStream_t cs = static_cast<cudaStream_t>(solver_->cs);
+    for (size_t o = 0; o < n_rows; ++o)
+        if (f->parent[o] < 0 && !active[o]) f->settle(static_cast<int>(o), -1, false, cs);
+    return f;
+}
+
+void ContingencyAnalysisSession::set_streaming(const std::vector<int>& parent_of_row, int condition, bool warm)
+{
+    static const char* who = "ContingencyAnalysisSession::set_streaming";
+    if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
+    const size_t n = contingencies_.size();
+    if (parent_of_row.size() != n)
+        throw std::runtime_error(std::string(who) + ": one entry per row (" + std::to_string(n) + ")");
+    if (condition != 0 && condition != 1)
+        throw std::runtime_error(std::string(who) + ": condition 0 (TRUE) or 1 (ANY_VIOLATION)");
+    // each contingency row with strategies gets a V group (written when it finishes)
+    std::vector<int> group(n, -1), group_of_row(n, -1);
+    int n_groups = 0;
+    for (size_t r = 0; r < n; ++r) {
+        const int p = parent_of_row[r];
+        if (p < 0) continue;
+        if (p >= static_cast<int>(n) || parent_of_row[static_cast<size_t>(p)] >= 0)
+            throw std::runtime_error(std::string(who) + ": row " + std::to_string(r) + "'s contingency row "
+                                     + std::to_string(p) + " is not a contingency row");
+        if (group[static_cast<size_t>(p)] < 0) group[static_cast<size_t>(p)] = n_groups++;
+        group_of_row[r] = group[static_cast<size_t>(p)];
+    }
+    stream_parent_ = parent_of_row;
+    stream_condition_ = condition;
+    stream_warm_ = warm;
+    stream_group_of_ctg_ = group;
+    if (warm && n_groups > 0) {
+        dev_->d_V_groups.resize(static_cast<size_t>(n_groups) * base_state_->n_bus);
+        n_v_groups_ = n_groups;
+        has_v_groups_ = true;
+        v_group_of_row_ = group_of_row;
+    } else {
+        has_v_groups_ = false;
+    }
+    // the outer loops: each strategy resumes from its contingency's loops, kept as it finishes
+    if (outer_) {
+        outer_->keep_row_points(warm);
+        outer_->set_row_resume(warm ? parent_of_row : std::vector<int>(), /*same_run=*/true);
+    }
+    ++contingencies_generation_;
+}
+
+void ContingencyAnalysisSession::clear_streaming()
+{
+    if (stream_parent_.empty()) return;
+    stream_parent_.clear();
+    stream_group_of_ctg_.clear();
+    has_v_groups_ = false;
+    if (outer_) {
+        outer_->keep_row_points(false);
+        outer_->set_row_resume({});
+    }
 }
 
 void ContingencyAnalysisSession::set_v_group_of_row(const std::vector<int>& group_of_row)

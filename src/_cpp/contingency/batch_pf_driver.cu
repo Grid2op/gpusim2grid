@@ -1316,7 +1316,7 @@ BatchTimings BatchPfDriver<BatchSource>::solve()
     // (n_active_ < n_contingencies), the chunk loop only writes the connected
     // result slots.  Pre-fill the full result buffers with NaN so the dropped
     // (disconnected) slots are reported as NaN, matching the historic contract.
-    if (n_active_ < n_contingencies) {
+    if (n_active_ < n_contingencies || row_feed_ != nullptr) {   // a feed may never load some rows
         static const cuda_real_type nan_r =
             std::numeric_limits<cuda_real_type>::quiet_NaN();
         const cudaComplexType nan_c = { nan_r, nan_r };
@@ -2814,8 +2814,12 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     // Once the queue is empty: shrink the rounds to the groups the live rows
     // fit in, when there are few enough of them and that is fewer slots.
     // (the groups to shrink to, 0 = no shrink)
+    // the queue: the active rows in order, or the feed's (RowFeed)
+    RowFeed* feed = row_feed_;
+    auto next_row = [&]() { return feed != nullptr ? feed->next() : (q < n_active_ ? q++ : -1); };
+    auto more_rows = [&]() { return feed != nullptr ? feed->more() : q < n_active_; };
     auto tail_groups = [&](int n_live) {
-        if (!tail_ok || q < n_active_ || n_live <= 0) return 0;
+        if (!tail_ok || more_rows() || n_live <= 0) return 0;
         const int groups = (n_live + G - 1) / G;
         return (groups > tail_max_groups_ || groups * G >= n_cur) ? 0 : groups;
     };
@@ -2897,7 +2901,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     _wait_sched_upload();
     int n_live = 0;
     for (int s = 0; s < S; ++s) {
-        const int row = q < n_active_ ? q++ : -1;
+        const int row = next_row();
         h_load_slot()[s] = s;
         h_load_row()[s]  = row;
         h_evict()[s]     = -1;
@@ -3057,7 +3061,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         if (n_leave > 0) {
             for (int s = 0; s < S; ++s) {
                 if (h_evict()[s] < 0) continue;
-                const int row = q < n_active_ ? q++ : -1;
+                const int row = next_row();
                 h_slot_row()[s] = row;
                 iters[static_cast<size_t>(s)] = 0;
                 if (row < 0) continue;
@@ -3135,6 +3139,39 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             sc_restore_kernel<<<nr_grid_size(static_cast<long long>(n_cur) * base.n_sc, BS), BS, 0, cs>>>(
                 thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.sc_static(), _sc_slots(),
                 d_evict(), base.nnz_Y, n_cur);
+
+        // ---- a feed: what the leaving rows release, into the empty slots ----------
+        // (the running width's: a slot the queue left empty, a phantom; the tail waits for
+        // the feed, so the width is the full batch while it may produce rows)
+        if (feed != nullptr) {
+            std::vector<int> left;
+            for (int s = 0; s < S; ++s)
+                if (h_evict()[s] >= 0) left.push_back(h_evict()[s]);
+            feed->finished(left, cs);   // reads this round's stored results: synchronizes cs
+            bool topped = false;
+            for (int s = 0; s < n_cur; ++s) {
+                if (h_slot_row()[s] >= 0) continue;
+                const int row = feed->next();
+                if (row < 0) break;
+                h_slot_row()[s] = row;
+                iters[static_cast<size_t>(s)] = 0;
+                ++n_live;
+                topped = true;
+                int i = 0;
+                while (i < n_load && h_load_slot()[i] != s) ++i;
+                if (i < n_load) {          // a base load of this round: the row instead
+                    h_load_row()[i] = row;
+                    --t.n_base_loads;
+                } else {
+                    h_load_slot()[n_load] = s;
+                    h_load_row()[n_load]  = row;
+                    ++n_load;
+                    loaded.push_back(s);
+                }
+                ++n_load_real;
+            }
+            if (topped) _upload_sched();
+        }
 
         // ---- refill the freed slots ---------------------------------------
         if (n_live == 0) {        // everything left; no round follows

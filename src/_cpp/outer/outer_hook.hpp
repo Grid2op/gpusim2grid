@@ -249,7 +249,10 @@ public:
     // Per row of the next runs, the row of the run that kept the points (keep_row_points) whose
     // point it resumes from, as a solve resuming from that row's: -1, or a row that did not end
     // stable, resumes from the grid's own solve (resume_from_n) or from scratch. Empty: none.
-    virtual void set_row_resume(std::vector<int> point_of_row) {
+    // same_run: the indices are rows of the next run itself (their points kept as they end:
+    // a row resuming from one loads after it), not of an earlier run's.
+    virtual void set_row_resume(std::vector<int> point_of_row, bool same_run = false) {
+        (void)same_run;
         if (!point_of_row.empty()) throw std::runtime_error("this outer model cannot resume rows from kept points");
     }
     // how many points the last run that kept them kept (its number of rows)

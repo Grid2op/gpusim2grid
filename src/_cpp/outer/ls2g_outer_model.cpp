@@ -456,7 +456,7 @@ public:
     void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) override;
     void set_row_overrides(RowOverrides overrides) override { ov_ = std::move(overrides); }
     void keep_row_points(bool keep) override { keep_points_ = keep; }
-    void set_row_resume(std::vector<int> point_of_row) override;
+    void set_row_resume(std::vector<int> point_of_row, bool same_run = false) override;
     int n_row_points() const override { return static_cast<int>(row_points_.size()); }
     void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) override;
 
@@ -575,6 +575,7 @@ private:
     bool keep_points_ = false;
     std::vector<std::shared_ptr<const ResumePoint>> row_points_;
     std::vector<int> resume_of_row_;                    // [n_rows] index into row_points_, -1: point_n_ / none
+    bool resume_same_run_ = false;                      // row_points_ of the current run (kept as rows end)
     void keep_point(const SlotState& st, const RowView* rv);
     // take_resume_targets on a row that sets no target and disconnects no unit
     std::vector<double> resume0_gen_target_p_, resume0_sto_target_p_;
@@ -1057,7 +1058,7 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.load_off.empty() || ov_.load_off.size() == static_cast<size_t>(n_rows) * n_load_, "disconnected loads");
     check(ov_.lost_p_mw.empty() || ov_.lost_p_mw.size() == static_cast<size_t>(n_rows), "lost active power");
     check(resume_of_row_.empty() || resume_of_row_.size() == static_cast<size_t>(n_rows), "resume points");
-    if (keep_points_ && !resume_of_row_.empty())
+    if (keep_points_ && !resume_of_row_.empty() && !resume_same_run_)
         throw std::runtime_error("outer model: a run cannot both keep its rows' points and resume from the "
                                  "kept ones (keep_row_points(false) before set_row_resume)");
     n_rows_ = n_rows;
@@ -1145,7 +1146,9 @@ void Ls2gOuterModel::load(int slot, int row)
     { ProfScope p(prof_, P_LOAD_RESET); st = slot0_; }
     st.row = row;
     if (row >= 0) {
-        const int k = static_cast<size_t>(row) < resume_of_row_.size() ? resume_of_row_[static_cast<size_t>(row)] : -1;
+        int k = static_cast<size_t>(row) < resume_of_row_.size() ? resume_of_row_[static_cast<size_t>(row)] : -1;
+        // a point of this run: only once that row ended stable (else the fallback)
+        if (k >= 0 && (static_cast<size_t>(k) >= row_points_.size() || !row_points_[static_cast<size_t>(k)])) k = -1;
         st.rp = k >= 0 ? row_points_[static_cast<size_t>(k)].get() : (resume_ ? &point_n_ : nullptr);
     }
     // the row as its loops see it (BaseBatchSweep::_fill_outer_row_view)
@@ -3284,8 +3287,13 @@ void Ls2gOuterModel::set_spare_buses(const LedgerData& ledger, const std::vector
     vm_v_scratch_ = ls2g::CplxVect::Zero(n_bus_);
 }
 
-void Ls2gOuterModel::set_row_resume(std::vector<int> point_of_row)
+void Ls2gOuterModel::set_row_resume(std::vector<int> point_of_row, bool same_run)
 {
+    resume_same_run_ = same_run;
+    if (same_run) {   // checked at load: the points are this run's
+        resume_of_row_ = std::move(point_of_row);
+        return;
+    }
     for (int& k : point_of_row) {
         if (k >= static_cast<int>(row_points_.size()))
             throw std::runtime_error("outer model: resume point " + std::to_string(k) + " of " +
