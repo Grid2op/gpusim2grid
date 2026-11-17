@@ -1182,9 +1182,12 @@ private:
     void _init_slot_state(const NrIterBuffers& buf, const SlotLoadView& L);
     bool _check_before_first_step(NrIterBuffers& buf, int n_cur, const std::vector<int>& iters,
                                   CudaTimer& timer, BatchTimings& t);
+    // n_spmv: the slots whose d_Ibus = Ybus·V (and P/Q rows of F) are computed,
+    // -1 = n_slots; more than n_slots when a J refill follows over the padded
+    // chunk (keep_final_jacobian). The residuals are always n_slots'.
     void _residual_pass(const NrIterBuffers& buf, int n_slots, cuda_real_type* d_out,
                         int c_start, const int* d_result_map, const int* d_slot_active,
-                        CudaTimer& timer, BatchTimings& t);
+                        CudaTimer& timer, BatchTimings& t, int n_spmv = -1);
     void _evict(const NrIterBuffers& buf, int n_slots, int c_start, const int* d_slot_active,
                 CudaTimer& timer, BatchTimings& t);
     // First-call setup of the adjoint: skeleton transpose + position map,

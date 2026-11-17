@@ -270,7 +270,11 @@ BatchPfDriver<BatchSource>::BatchPfDriver(
         d_check0_.resize(static_cast<size_t>(batch_size_));
         d_skip0_.resize(static_cast<size_t>(batch_size_));
         d_res0_.resize(static_cast<size_t>(batch_size_));
-        if (base.fused_F_ok) {
+        // F once per round: only the continuous schedule binds it (_solve_continuous's
+        // bind_f_cache), and the schedule is fixed for this driver's life. A chunked
+        // driver would carry batch_size × n_bus × 2 reals for nothing (~1 GB at a
+        // 10k batch on a 7k-bus grid in FP64).
+        if (base.fused_F_ok && scheduling_ == BatchScheduling::Continuous) {
             d_F_raw_.resize(static_cast<size_t>(batch_size_) * base.n_bus * 2);
             h_fclean_.resize(static_cast<size_t>(batch_size_));
             d_fclean_.resize(static_cast<size_t>(batch_size_));
@@ -2042,7 +2046,8 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
                                                 cuda_real_type* d_out, int c_start,
                                                 const int* d_result_map,
                                                 const int* d_slot_active,
-                                                CudaTimer& timer, BatchTimings& t)
+                                                CudaTimer& timer, BatchTimings& t,
+                                                int n_spmv)
 {
     const int n_bus = base.n_bus;
     const int dim_J = base.dim_J;
@@ -2050,8 +2055,10 @@ void BatchPfDriver<BatchSource>::_residual_pass(const NrIterBuffers& buf, int n_
     timer.start();
     {
         // SpMV + the P/Q rows of F (buf's d_F / d_V / d_Ibus are d_F_batch /
-        // d_V_batch / d_Ibus_batch)
-        nr_spmv_fill_F(_spmv(), buf, n_bus, base.nnz_Y, dim_J, n_slots, cs, /*store_raw=*/true);
+        // d_V_batch / d_Ibus_batch). The fused kernel covers n_spmv slots only
+        // (cuSPARSE's SpMV, the fallback, always the descriptor's whole batch).
+        nr_spmv_fill_F(_spmv(), buf, n_bus, base.nnz_Y, dim_J,
+                       n_spmv < 0 ? n_slots : n_spmv, cs, /*store_raw=*/true);
 
         if (n_slots > 0) {
             // Augmented-feature contributions to the final residual (slack /
@@ -3240,16 +3247,18 @@ void BatchPfDriver<BatchSource>::_solve_chunk(
     }, policy_);
 
     // -------------------------------------------------------------------------
-    // ④  Post-loop: final SpMV + fill_F + per-element ‖F‖∞
+    // ④  Post-loop: final SpMV + fill_F + per-element ‖F‖∞ (the SpMV over the
+    //     whole padded batch when ④b refills J there)
     // -------------------------------------------------------------------------
     _residual_pass(buf, actual_batch, thrust::raw_pointer_cast(d_residuals.data()),
-                   c_start, source_.d_result_map(), /*d_slot_active=*/nullptr, timer, t);
+                   c_start, source_.d_result_map(), /*d_slot_active=*/nullptr, timer, t,
+                   /*n_spmv=*/keep_final_jacobian_ ? batch_size_ : actual_batch);
 
     // -------------------------------------------------------------------------
     // ④b Converged Jacobian (opt-in, differentiable wrapper): the loop left
     //     J(V_{nb_iter-1}) in d_J_values_batch; refill it at V_final using the
     //     SpMV output of step ④ (d_Ibus_batch = Ybus · V_final for the whole
-    //     padded batch). Same fill sequence as the loop -- one definition
+    //     padded batch, phantom slots included). Same fill sequence as the loop -- one definition
     //     (nr_fill_J_at_current_V). Must run BEFORE step ⑤'s NaN masking of
     //     d_V_batch. The forward factors are untouched (cuDSS keeps them in
     //     its own data object); the batched adjoint reads the values later.
