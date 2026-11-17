@@ -431,3 +431,89 @@ def test_move_needing_no_new_entry_runs(settings: dict[str, Any], solver_atol: f
     V_ref, _ = oracle(grid, action=back)
     assert_row_matches(V[1], V_ref, solver_atol)
     np.testing.assert_allclose(abs(V[1, sub]), gen.target_vm_pu, atol=solver_atol)
+
+
+#: case14: generator 2 regulates its own bus 5 at 1.07 pu
+GEN_B5, BUS_B5, VM_B5 = 2, 5, 1.07
+
+
+def _case14_second_regulator(kind: str) -> LSGrid:
+    """The two-busbar case14 with a second machine holding bus 5 with generator 2, at its
+    set-point: generator 3 (bus 7) regulating it remotely (``"remote"``), or a storage unit on
+    bus 5 regulating it (``"storage"``)."""
+    import warnings
+
+    import pandapower as pp
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+
+    net = pn.case14()
+    if kind == "storage":
+        pp.create_storage(net, bus=BUS_B5, p_mw=0.0, max_e_mwh=10.0, q_mvar=0.0)
+    n_sub: int = len(net.bus)
+    for b in range(n_sub):
+        pp.create_bus(net, vn_kv=net.bus.vn_kv.iloc[b], in_service=False)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        grid = init_from_pandapower(net, n_sub=n_sub, n_busbar_per_sub=2)
+    if kind == "remote":
+        grid.set_gen_regulated_bus(3, BUS_B5)
+        grid.change_v_gen(3, VM_B5)
+    else:
+        grid.init_storages_full(np.array([0.0]), np.array([0.0]), [True], np.array([VM_B5]),
+                                np.array([-50.0]), np.array([50.0]), np.array([BUS_B5], dtype=np.int32))
+    assert grid.get_generators()[GEN_B5].bus_id == BUS_B5
+    assert np.isclose(grid.get_generators()[GEN_B5].target_vm_pu, VM_B5)
+    grid.change_algorithm("NR_KLU")
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), 30, 1e-10).size > 0
+    return grid
+
+
+@pytest.mark.parametrize("kind", ["remote", "storage"])
+def test_bus_another_machine_holds_stays_pv_when_its_generator_moves(kind: str, solver_atol: float):
+    """Generator 2 leaves bus 5 for bus 2 of its substation (with a branch end), while another
+    machine -- a remote regulator, a regulating storage unit -- still holds bus 5: bus 5 stays
+    at its set-point (lightsim2grid's one-off solve), it is not released to PQ."""
+    grid = _case14_second_regulator(kind)
+    a = _move(grid, BUS_B5, [("gen_bus", GEN_B5), _branch_ends(grid, BUS_B5)[0]])
+    ca, V = _run(grid, {}, [[]], [a], [(0, [0])])
+    assert not ca.get_batch_unsupported_reasons()[1]
+    V_ref, _ = oracle(grid, action=a)
+    assert_row_matches(V[1], V_ref, solver_atol)
+    np.testing.assert_allclose(abs(V[1, BUS_B5]), VM_B5, atol=solver_atol)
+    np.testing.assert_allclose(abs(V[1, bus2(grid, BUS_B5)]), VM_B5, atol=solver_atol)
+
+
+@pytest.mark.parametrize("kind", ["remote", "storage"])
+def test_generator_moved_onto_a_bus_another_machine_holds_is_unsupported(kind: str):
+    """In a grid where generator 2 stands on bus 2 of substation 5, moving it back onto bus 5,
+    which a remote regulator / a storage unit holds, is refused per row, as onto a bus another
+    generator holds."""
+    from gpusim2grid.actions import Action
+
+    grid = _case14_second_regulator(kind)
+    split = _move(grid, BUS_B5, [("gen_bus", GEN_B5), _branch_ends(grid, BUS_B5)[0]])
+    split.apply_to(grid)
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), 30, 1e-10).size > 0
+    back = Action(gen_bus={GEN_B5: BUS_B5})
+    ca, _ = _run(grid, {}, [[]], [back], [(0, [0])])
+    assert "regulator holds" in ca.get_batch_unsupported_reasons()[1]
+
+
+def test_bus_released_when_its_contingency_trips_the_other_regulator(solver_atol: float):
+    """The contingency trips the storage unit holding bus 5 with generator 2, the strategy moves
+    generator 2 away: nothing holds bus 5 any more, it is PQ on that row (lightsim2grid's
+    one-off solve with the storage unit off)."""
+    grid = _case14_second_regulator("storage")
+    a = _move(grid, BUS_B5, [("gen_bus", GEN_B5), _branch_ends(grid, BUS_B5)[0]])
+    ca = make_ca(grid, {}, batch_size=BATCH)
+    ca.add_contingency(storage_ids=[0])
+    ca.set_actions([a])
+    ca.add_strategies([(0, [0])])
+    ca.compute(batch_size=BATCH)
+    assert not ca.get_batch_unsupported_reasons()[1]
+    V = batch_V_global(ca, 2, grid.total_bus())
+    V_ref, _ = oracle(grid, action=a, apply=lambda g: g.deactivate_storage(0))
+    assert_row_matches(V[1], V_ref, solver_atol)

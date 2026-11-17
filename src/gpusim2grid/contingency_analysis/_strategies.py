@@ -365,7 +365,7 @@ class TopologyContext:
     occupancy: np.ndarray
     me_to_solver: np.ndarray
     current: dict[ElementRef, int]
-    #: solver bus -> the voltage regulators on it in the base case (generators, SVCs)
+    #: solver bus -> the machines holding its voltage in the base case (see _regulators)
     regulators: dict[int, frozenset[ElementRef]] = dataclasses.field(default_factory=dict)
 
     def solver(self, g: int) -> int:
@@ -383,15 +383,39 @@ def topology_context(
             occupancy[me_to_solver[bus]] += 1
     branch_y: list[BranchY] = [_y(ln) for ln in grid.get_lines()] + [_y(t) for t in grid.get_trafos()]
     current = current_buses(grid)
-    regulators: dict[int, set[ElementRef]] = {}
-    for g in grid.get_generators():
-        if g.connected and g.voltage_regulator_on and g.bus_id >= 0 and me_to_solver[g.bus_id] >= 0:
-            regulators.setdefault(int(me_to_solver[g.bus_id]), set()).add(("gen_bus", int(g.id)))
-    for sv in grid.get_svcs():
-        if sv.connected and sv.bus_id >= 0 and me_to_solver[sv.bus_id] >= 0:
-            regulators.setdefault(int(me_to_solver[sv.bus_id]), set()).add(("svc", int(sv.id)))
     return TopologyContext(plan, n_lines, branch_from, branch_to, branch_y, occupancy, me_to_solver, current,
-                           {b: frozenset(r) for b, r in regulators.items()})
+                           _regulators(grid, me_to_solver))
+
+
+def _regulators(grid: LSGrid, me_to_solver: np.ndarray) -> dict[int, frozenset[ElementRef]]:
+    """Solver bus -> every machine holding its voltage in the base case, keyed on the bus it
+    REGULATES (a remote regulator holds its regulated bus, not its own): the voltage-regulating
+    generators (not treated as off), storage units and VSC converter stations, and the SVCs in
+    voltage mode -- the controllers the session counts. ``("hvdc_station1" / "2", line id)``
+    names a station."""
+    regulators: dict[int, set[ElementRef]] = {}
+
+    def add(bus: int, ref: ElementRef) -> None:
+        if 0 <= bus < len(me_to_solver) and me_to_solver[bus] >= 0:
+            regulators.setdefault(int(me_to_solver[bus]), set()).add(ref)
+
+    # lightsim2grid's GeneratorContainer::_treated_as_off: a pseudo-off generator holds nothing
+    turned_off_pv: bool = bool(grid.get_turnedoff_gen_pv())
+    for g in grid.get_generators():
+        pseudo_off = not g.is_slack and abs(g.slack_weight) < 1e-7 and abs(g.target_p_mw) < 1e-7
+        if g.connected and g.voltage_regulator_on and not (pseudo_off and not turned_off_pv):
+            add(int(g.regulated_bus_id), ("gen_bus", int(g.id)))
+    for s in grid.get_storages():
+        if s.connected and s.voltage_regulator_on:
+            add(int(s.bus_id), ("storage_bus", int(s.id)))  # a unit holds its own bus only
+    for sv in grid.get_svcs():
+        if sv.connected and int(sv.regulation_mode) == 1:  # VOLTAGE
+            add(int(sv.regulated_bus_id), ("svc", int(sv.id)))
+    for h in grid.get_dclines():
+        for side, st in (("1", h.station1), ("2", h.station2)):
+            if st.connected and st.voltage_regulator_on and int(st.converter_type) == 0:  # VSC
+                add(int(st.bus_id), (f"hvdc_station{side}", int(h.id)))
+    return {b: frozenset(r) for b, r in regulators.items()}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -547,8 +571,10 @@ def _voltage_control_of_moves(
     }
     if not moved:
         return [], [], ""
+    # what the row takes away from a bus: the generators it moves, and the controllers it trips
     gone: set[ElementRef] = {("gen_bus", el) for el in moved} | {("gen_bus", g) for g in lists[3]}
-    gone |= {("svc", s) for s in lists[8]}
+    gone |= {("storage_bus", s) for s in lists[7]} | {("svc", s) for s in lists[8]}
+    gone |= {(f"hvdc_station{side}", h) for h in lists[9] for side in ("1", "2")}
     release: list[int] = []
     for el in moved:
         old = int(topo.me_to_solver[topo.current[("gen_bus", el)]])
