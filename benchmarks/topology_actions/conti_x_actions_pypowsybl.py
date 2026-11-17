@@ -18,7 +18,8 @@ operator strategies in pypowsybl's JSON names (``{"actions": [...], "operator_st
   position becomes the transformer's ratio / shift, read off a copy of the grid after
   lightsim2grid's ``change_trafo_phase_tap``.
 - Phase 1 solves the contingencies, phase 2 every strategy (in chunks: per-row results stay on
-  the device until the processors step).
+  the device), each resuming from its contingency's converged state -- voltages and outer-loop
+  state -- unless ``--no-warm-start``.
 
 Output: one CSV row per situation (contingency_id, operator_strategy_id, kind, converged,
 reason, max_rho, branch_id); with ``--reference`` (a CSV with contingency_id,
@@ -308,6 +309,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     )
     if args.settings == "perf":
         ca.tail_max_groups, ca.tail_group_size = args.batch, 1
+    ca.strategy_warm_start = not args.no_warm_start
     ca.add_contingencies_by_branch_id([[index[c]] for c in ctg_ids])
     expressible = [i for i, a in enumerate(translated) if a is not None]
     combo_action = {combos[i]: k for k, i in enumerate(expressible)}
@@ -423,6 +425,12 @@ def main() -> None:
     )
     p.add_argument("--batch", type=int, default=2048)
     p.add_argument("--chunk", type=int, default=20000, help="strategies per phase-2 call")
+    p.add_argument(
+        "--no-warm-start",
+        action="store_true",
+        help="phase 2 from the base case (default: each strategy resumes from its contingency's "
+        "converged state, outer loops included, as OpenLoadFlow's security analysis)",
+    )
     args = p.parse_args()
     df = run(args)
     Path(args.out).mkdir(parents=True, exist_ok=True)
