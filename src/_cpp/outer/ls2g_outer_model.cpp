@@ -247,7 +247,7 @@ struct RlPlan {
 
 // everything one row carries through its solves
 // Where a solve left the loops, for a row to resume from (lightsim2grid's OuterResumePoint): the
-// grid's own last solve (Ls2gModelOptions::resume_from_n), or a row of an earlier run that ended
+// grid's own last solve (Ls2gModelOptions::resume_from_n), or a row of the same run that ended
 // with its loops stable (OuterHook::keep_row_points / set_row_resume) -- a strategy row resumes
 // from its contingency's N-1 state, as a second solve on the grid with the contingency applied.
 struct ResumePoint {
@@ -456,8 +456,7 @@ public:
     void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) override;
     void set_row_overrides(RowOverrides overrides) override { ov_ = std::move(overrides); }
     void keep_row_points(bool keep) override { keep_points_ = keep; }
-    void set_row_resume(std::vector<int> point_of_row, bool same_run = false) override;
-    int n_row_points() const override { return static_cast<int>(row_points_.size()); }
+    void set_row_resume(std::vector<int> point_of_row) override { resume_of_row_ = std::move(point_of_row); }
     void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) override;
 
 private:
@@ -570,12 +569,11 @@ private:
     // where the grid's own solve left the loops (Ls2gModelOptions::resume_from_n)
     bool resume_ = false;
     ResumePoint point_n_;
-    // the rows' own points (keep_row_points: by row of the run that kept them, nullptr where
-    // the row did not end stable) and, for this run, the point each row resumes from
+    // the rows' own points (keep_row_points: by row, nullptr while the row has not ended
+    // stable) and the point each row resumes from
     bool keep_points_ = false;
     std::vector<std::shared_ptr<const ResumePoint>> row_points_;
     std::vector<int> resume_of_row_;                    // [n_rows] index into row_points_, -1: point_n_ / none
-    bool resume_same_run_ = false;                      // row_points_ of the current run (kept as rows end)
     void keep_point(const SlotState& st, const RowView* rv);
     // take_resume_targets on a row that sets no target and disconnects no unit
     std::vector<double> resume0_gen_target_p_, resume0_sto_target_p_;
@@ -1058,9 +1056,6 @@ void Ls2gOuterModel::begin(int n_slots, int n_rows)
     check(ov_.load_off.empty() || ov_.load_off.size() == static_cast<size_t>(n_rows) * n_load_, "disconnected loads");
     check(ov_.lost_p_mw.empty() || ov_.lost_p_mw.size() == static_cast<size_t>(n_rows), "lost active power");
     check(resume_of_row_.empty() || resume_of_row_.size() == static_cast<size_t>(n_rows), "resume points");
-    if (keep_points_ && !resume_of_row_.empty() && !resume_same_run_)
-        throw std::runtime_error("outer model: a run cannot both keep its rows' points and resume from the "
-                                 "kept ones (keep_row_points(false) before set_row_resume)");
     n_rows_ = n_rows;
     slots_.assign(static_cast<size_t>(n_slots), SlotState());
     const size_t nr = static_cast<size_t>(n_rows);
@@ -3285,22 +3280,6 @@ void Ls2gOuterModel::set_spare_buses(const LedgerData& ledger, const std::vector
     }
     hvdc_va_scratch_ = ls2g::RealVect::Zero(n_bus_);
     vm_v_scratch_ = ls2g::CplxVect::Zero(n_bus_);
-}
-
-void Ls2gOuterModel::set_row_resume(std::vector<int> point_of_row, bool same_run)
-{
-    resume_same_run_ = same_run;
-    if (same_run) {   // checked at load: the points are this run's
-        resume_of_row_ = std::move(point_of_row);
-        return;
-    }
-    for (int& k : point_of_row) {
-        if (k >= static_cast<int>(row_points_.size()))
-            throw std::runtime_error("outer model: resume point " + std::to_string(k) + " of " +
-                                     std::to_string(row_points_.size()) + " kept");
-        if (k >= 0 && !row_points_[static_cast<size_t>(k)]) k = -1;   // that row did not end stable
-    }
-    resume_of_row_ = std::move(point_of_row);
 }
 
 // Where the row's loops ended (stable), as lightsim2grid's OuterResumePoint has a solve's: the

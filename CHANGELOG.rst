@@ -20,11 +20,15 @@ Change Log
   extra step changed the loops' decisions (a row cycling to ``max_outer_iterations``).
 - [ADDED] ``gpusim2grid.actions.Action``: a remedial action as element bus moves (lightsim2grid's
   ``change_bus_*`` convention), disconnections and transformer ratio / phase shift values.
-- [ADDED] ``violation_threshold`` on ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``: lightsim2grid's
-  knob, limits moved towards a healthy anchor; records keep the configured limit.
+- [ADDED] ``violation_threshold`` argument of ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU``:
+  lightsim2grid's knob, limits moved towards a healthy anchor; records keep the configured limit.
 - [ADDED] ``ContingencyAnalysisGPU`` strategies: ``set_actions`` / ``add_strategies`` (a contingency then
-  actions, solved as one more row), two phases with ``compute(rows=...)`` and ``select_strategies``,
-  ``strategy_warm_start`` (one start per contingency, kept on the device), ``get_max_loading``.
+  actions, solved as one more row) in the same ``compute()`` as the contingencies: a contingency
+  releases its strategies as it finishes (continuous schedule), arguments ``strategy_condition``
+  (pypowsybl's ``"TRUE"`` / ``"ANY_VIOLATION"``, checked on the device) and ``strategy_warm_start``
+  (default True: a strategy starts from its own contingency's converged voltages, as OpenLoadFlow's
+  security analysis); ``get_max_loading`` reduced on
+  the device (one value and one branch per row come back).
 - [ADDED] Strategy actions may change transformer values (``trafo_ratio`` / ``trafo_shift_deg``): per-row
   Ybus values on the base pattern; the changed transformer's flows and current violations use the row's.
 - [ADDED] Strategy actions may move elements between the buses of a substation (bus splits and merges):
@@ -37,9 +41,9 @@ Change Log
 - [CHANGED] ``Action.apply_to`` leaves a half-open branch half-open when it moves the closed end
   (lightsim2grid's ``change_bus*`` alone reconnects the open one).
 - [ADDED] ``strategy_warm_start`` with ``outer_loops=True``: a strategy resumes from its contingency's
-  outer-loop state too (moved targets, frozen buses, regimes, taps), as lightsim2grid's batch row resuming
-  from a solve; ``get_row_status`` / ``get_row_iterations`` / ``get_outer_results`` / the physical checks
-  follow the rows of the last ``compute`` (one per strategy after ``rows="strategies"``).
+  outer-loop state too (moved targets, frozen buses, regimes, taps), kept as the contingency finishes,
+  as lightsim2grid's batch row resuming from a solve; ``get_row_status`` / ``get_row_iterations`` /
+  ``get_outer_results`` / the physical checks have one entry per row (contingencies, then strategies).
 - [ADDED] C++/CUDA unit tests (``tests/cpp``, ctest), opt-in with ``-DGPUSIM2GRID_BUILD_TESTS=ON``; a
   test needing a GPU is skipped without one.
 

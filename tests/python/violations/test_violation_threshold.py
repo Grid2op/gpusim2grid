@@ -92,7 +92,9 @@ def _gpu(grid: LSGrid, threshold: float, cls_name: str = "ContingencyAnalysisGPU
     import gpusim2grid
 
     n_lines: int = len(grid.get_lines())
-    obj = getattr(gpusim2grid, cls_name)(grid, nb_iter=MAX_IT, compute_limit_violations=True)
+    obj = getattr(gpusim2grid, cls_name)(
+        grid, nb_iter=MAX_IT, compute_limit_violations=True, violation_threshold=threshold
+    )
     obj.solver.violation_capacity = 128  # every record (the default keeps the 16 most severe per type)
     if cls_name == "ContingencyAnalysisGPU":
         obj.add_contingencies_by_branch_id([[b] for b in range(n_lines)])
@@ -105,23 +107,22 @@ def _gpu(grid: LSGrid, threshold: float, cls_name: str = "ContingencyAnalysisGPU
         )
         obj.set_topology([[b] for b in range(n_lines)])
     obj.set_limits_from_grid()
-    obj.violation_threshold = threshold
     obj.compute(batch_size=n_lines)
     return obj
 
 
 @pytest.mark.parametrize("cls_name", ["ContingencyAnalysisGPU", "ScenarioSweepGPU"])
-def test_property(cls_name: str):
-    """Default 1.0, validated to ]0, 1]."""
+def test_argument(cls_name: str):
+    """A constructor argument, default 1.0, validated to ]0, 1]."""
     import gpusim2grid
 
-    obj = getattr(gpusim2grid, cls_name)(_grid(), compute_limit_violations=True)
-    assert obj.violation_threshold == 1.0
+    cls = getattr(gpusim2grid, cls_name)
+    grid = _grid()
+    assert cls(grid, compute_limit_violations=True).violation_threshold == 1.0
     for bad in (0.0, -0.5, 1.0 + 1e-9, 2.0, "x"):
         with pytest.raises(ValueError):
-            obj.violation_threshold = bad
-    obj.violation_threshold = 0.8
-    assert obj.violation_threshold == 0.8
+            cls(grid, compute_limit_violations=True, violation_threshold=bad)
+    assert cls(grid, compute_limit_violations=True, violation_threshold=0.8).violation_threshold == 0.8
 
 
 @pytest.mark.parametrize("threshold", [1.0, 0.9, 0.75])
@@ -176,19 +177,6 @@ def test_voltage_anchor_is_the_clamped_nominal_voltage():
         _, ref_n = _ls2g(grid, t)
         ca = _gpu(grid, t)
         assert _keys(ca.get_violations_n()) == _keys(ref_n)
-
-
-def test_lowering_invalidates_raising_does_not():
-    grid = _grid()
-    ca = _gpu(grid, 0.9)
-    ca.get_violations()
-    ca.violation_threshold = 0.95  # looser: results stay
-    ca.get_violations()
-    ca.violation_threshold = 0.8  # stricter: results cleared until the next compute()
-    with pytest.raises(RuntimeError):
-        ca.get_violations()
-    ca.compute(batch_size=len(grid.get_lines()))
-    ca.get_violations()
 
 
 def test_scenario_sweep_matches_contingency_analysis():

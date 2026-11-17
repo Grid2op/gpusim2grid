@@ -183,6 +183,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         With ``outer_loops``: keep each row's decision trace
         (``get_outer_results()[i].decisions``, lightsim2grid's
         ``OuterLoopStats.decisions``).
+    violation_threshold : float in ``]0, 1]``, default 1.0
+        lightsim2grid's knob of the same name and semantics: every checked limit moves towards a
+        healthy anchor, ``t * limit + (1 - t) * anchor`` (0 for currents, the bus nominal voltage
+        clamped into ``[vmin, vmax]`` for voltages); records keep the configured limit.
 
     Examples
     --------
@@ -226,8 +230,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
                  reference_slack="auto", scheduling=None, nb_iter_per_round=1,
-                 tol=None, outer_loops=False, keep_outer_trace=False):
+                 tol=None, outer_loops=False, keep_outer_trace=False, violation_threshold=1.0):
         _validate_precision(precision)
+        self._init_violation_threshold(violation_threshold)
         check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
         self._outer_loops = bool(outer_loops)
         if scheduling is None:
@@ -827,7 +832,6 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                 "given by set_injections_from_elements(); with per-bus set_injections(), take them out of "
                 "the arrays yourself (and do not call them).")
         self._push_effective_limits()
-        self._violations_valid = True
         self._inner.batch_size = int(batch_size)
         if self._skip_rows_stale:
             self._update_skipped_rows()
@@ -924,8 +928,6 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         """list[list[LimitViolation]]: one entry per scenario (row order
         matches set_injections()/set_topology()'s input rows). Requires
         compute() with compute_limit_violations=True."""
-        if not self._violations_valid:
-            raise RuntimeError("violation_threshold was lowered after compute(): compute() again")
         return self._restore_limits(self._inner.get_violations())
 
     def get_violations_truncated(self):

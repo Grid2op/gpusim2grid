@@ -37,39 +37,39 @@ A remedial action is a :class:`gpusim2grid.actions.Action`: per element, the glo
 to in lightsim2grid's own ``change_bus_*`` convention (local bus ``k`` of substation ``s`` is
 ``s + (k - 1) * n_sub``), ``-1`` for disconnected (on one end of a branch: that end only, the
 branch stays energized from the other), and transformer values. ``ContingencyAnalysisGPU``
-runs **strategies** -- a contingency followed by actions -- next to its contingencies, in two
-phases on one session: the contingencies first, then the strategies a condition of the
-caller's keeps (here pypowsybl's "at least one violation"), each strategy row being its
-contingency's disconnections plus its actions'.
+runs **strategies** -- a contingency followed by actions, its row the contingency's
+disconnections plus its actions' -- in the same ``compute()`` as its contingencies. The
+security-analysis parameters are constructor arguments: ``strategy_condition`` (pypowsybl's
+condition, a :class:`gpusim2grid.StrategyCondition`: ``TRUE`` or ``ANY_VIOLATION``), ``strategy_warm_start`` (default True) and
+``violation_threshold``. A contingency releases its strategies into the batch as soon as it
+finishes, the condition checked on the device, each strategy starting from its own
+contingency's converged state; the schedule is then continuous (``scheduling=None`` picks it).
 
 .. code-block:: python
 
-    import numpy as np
-    from gpusim2grid import ContingencyAnalysisGPU
+    from gpusim2grid import ContingencyAnalysisGPU, StrategyCondition
     from gpusim2grid.actions import Action
 
-    ca = ContingencyAnalysisGPU(grid, compute_limit_violations=True, linear_solver="own_lu")
-    ca.violation_threshold = 0.95                      # limits at 95 % (lightsim2grid's knob)
+    ca = ContingencyAnalysisGPU(
+        grid,
+        linear_solver="own_lu",
+        compute_limit_violations=True,
+        violation_threshold=0.95,             # limits at 95 % (lightsim2grid's knob)
+        strategy_condition=StrategyCondition.ANY_VIOLATION,   # its strategies run if it violates
+    )   # each strategy resumes from its own contingency (strategy_warm_start, the default)
     ca.add_contingencies_by_branch_id([[3], [7], [12]])
     ca.set_actions([
         Action(line_bus1={5: -1}, line_bus2={5: -1}),  # open line 5
         Action(load_bus={2: -1}),                      # shed load 2
     ])
     ca.add_strategies([(c, [a]) for c in range(3) for a in range(2)])   # or two index arrays
-    ctg_of = np.array([c for c in range(3) for _ in range(2)])
-    ca.strategy_warm_start = True                      # each strategy resumes from its contingency
+    ca.compute(batch_size=512)
+    rho, branch = ca.get_max_loading()   # per row (contingencies, then strategies): max |I| / limit
+    ran = ca.get_strategy_ran()          # which strategies were solved
 
-    ca.compute(batch_size=512, rows="contingencies")   # phase 1
-    violating = ca.get_violation_counts()["current"] > 0
-    ca.select_strategies(violating[ctg_of])            # the condition is the caller's
-    ca.compute(batch_size=512, rows="strategies")      # phase 2
-    rho, branch = ca.get_max_loading()                 # per strategy row: max |I| / limit
-    ran = ca.get_strategy_ran()                        # which strategies were solved
-
-``compute()`` without ``rows`` runs the contingencies and the strategies in one call. After
-``rows="strategies"`` every per-row result (voltages, residuals, ``get_max_loading``,
-violations, ``get_row_status``, ``get_row_iterations``, ``get_outer_results``, flows) has one
-entry per strategy.
+Every per-row result (voltages, residuals, ``get_max_loading``, violations, ``get_row_status``,
+``get_row_iterations``, ``get_outer_results``, flows) has one entry per row: the contingencies,
+then the strategies (NaN / ``NOT_SIMULATED`` / ``None`` for a strategy that did not run).
 
 What an action can do:
 
@@ -90,8 +90,8 @@ An element end the strategy's contingency trips stays out whatever its actions d
 (the contingency's breakers stay open, as in OpenLoadFlow's security analysis); the rest of
 the actions apply.
 
-``strategy_warm_start = True`` starts each strategy from its contingency's converged state
-(phase 1's): its voltages and, with the outer loops, where its loops ended -- the targets
+Each strategy starts from its own contingency's converged state (``strategy_warm_start``,
+default True; False: from the base case), in the same run: its voltages and, with the outer loops, where its loops ended -- the targets
 DistributedSlack moved, the buses ReactiveLimits froze, the SVCs switched on, hvdc regimes,
 taps, sections, parked units -- as a solve on the grid with the contingency applied resuming
 from it (lightsim2grid's batch row with ``init_from_n_powerflow``); DistributedSlack shares
@@ -104,6 +104,10 @@ a storage unit, the slack generator, a generator taking part in the slack or one
 remote bus (as lightsim2grid's ScenarioSweep), two actions of one strategy setting different
 buses or values on one element. The full example is ``examples/contingency_x_actions.py``;
 the design and its status are in ``docs/dev_notes/topology_actions_plan.md``.
+
+.. autoclass:: gpusim2grid.StrategyCondition
+   :members:
+   :undoc-members:
 
 .. automodule:: gpusim2grid.actions
    :members: Action, substation_elements

@@ -137,8 +137,8 @@ class ThresholdHost(Protocol):
 class ViolationThresholdFacadeMixin:
     """``violation_threshold`` on a batch facade (``ContingencyAnalysisGPU``,
     ``ScenarioSweepGPU``). The facade calls ``_push_effective_limits()`` at the start of
-    ``compute()`` and ``_restore_limits`` on the records it returns; ``get_violations`` raises
-    while ``_violations_valid`` is False.
+    ``compute()`` and ``_restore_limits`` on the records it returns; its constructor calls
+    ``_init_violation_threshold`` with its ``violation_threshold`` argument.
 
     What the host facade must provide is the :class:`ThresholdHost` protocol: the methods that
     need it are typed ``self: ThresholdHost``, so the type checker verifies each facade at the
@@ -147,23 +147,18 @@ class ViolationThresholdFacadeMixin:
 
     _violation_threshold: float = 1.0
     _threshold_pushed: tuple[float, int] = (1.0, -1)
-    _violations_valid: bool = True
+
+    def _init_violation_threshold(self, value: Any) -> None:
+        self._violation_threshold = check_threshold(value)
 
     @property
     def violation_threshold(self) -> float:
         """float in ``]0, 1]``, default 1.0: lightsim2grid's knob of the same name and
         semantics -- every checked limit moves towards a healthy anchor,
         ``t * limit + (1 - t) * anchor`` (0 for currents, the bus nominal voltage clamped into
-        ``[vmin, vmax]`` for voltages); records keep the configured limit. Lowering it
-        invalidates the computed violations, raising it does not. Next compute()."""
+        ``[vmin, vmax]`` for voltages); records keep the configured limit. A constructor
+        argument."""
         return self._violation_threshold
-
-    @violation_threshold.setter
-    def violation_threshold(self, value: Any) -> None:
-        t = check_threshold(value)
-        if t < self._violation_threshold:
-            self._violations_valid = False
-        self._violation_threshold = t
 
     def _configured_limits(self: ThresholdHost) -> Limits:
         """(vmin, vmax, limit_a1, limit_a2, n_lines): the limits given, else the grid's."""

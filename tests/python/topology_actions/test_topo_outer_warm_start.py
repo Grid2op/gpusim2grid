@@ -2,8 +2,9 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Strategies with the outer loops, warm-started from their contingency (``strategy_warm_start``):
-each strategy row resumes from its contingency's N-1 state -- its voltages and where its outer
+"""Strategies with the outer loops, warm-started from their contingency (``strategy_warm_start``,
+one ``compute()``: a contingency releases its strategies as it finishes): each strategy row
+resumes from its own contingency's N-1 state -- its voltages and where its outer
 loops ended (the targets they moved, the buses they froze, ...) -- as lightsim2grid's batch row
 resuming from a solve (``init_from_n_powerflow``): a batch on the grid with the contingency
 applied and solved, the strategy's actions as its row. Without the warm start, a strategy row
@@ -107,7 +108,15 @@ def _scratch_reference(grid: LSGrid, line: int, action: int) -> np.ndarray:
     return np.where(np.asarray(ref.get_bus_status(), dtype=bool), V, 0.0)
 
 
-def _two_phases(grid: LSGrid, settings: dict[str, Any], warm: bool, **kwargs: Any) -> ContingencyAnalysisGPU:
+def _run(
+    grid: LSGrid,
+    settings: dict[str, Any],
+    warm: bool,
+    strategies: list[tuple[int, list[int]]] | None = None,
+    **kwargs: Any,
+) -> ContingencyAnalysisGPU:
+    """One compute() of CONTINGENCIES and ``strategies`` (default every (contingency, action),
+    by contingency) over ACTIONS."""
     ca = make_ca(
         grid,
         settings,
@@ -115,32 +124,43 @@ def _two_phases(grid: LSGrid, settings: dict[str, Any], warm: bool, **kwargs: An
         outer_loops=True,
         init_from_n_powerflow=False,
         tol=TOL_MVA / grid.get_sn_mva(),
+        strategy_warm_start=warm,
         **kwargs,
     )
     ca.add_contingencies_by_branch_id(CONTINGENCIES)
     ca.set_actions(ACTIONS)
-    ca.add_strategies([(c, [a]) for c in range(len(CONTINGENCIES)) for a in range(len(ACTIONS))])
-    ca.strategy_warm_start = warm
-    ca.compute(batch_size=4, rows="contingencies")
-    ca.compute(batch_size=4, rows="strategies")
+    if strategies is None:
+        strategies = [(c, [a]) for c in range(len(CONTINGENCIES)) for a in range(len(ACTIONS))]
+    ca.add_strategies(strategies)
+    ca.compute(batch_size=4)
     return ca
+
+
+def _strategies_V(ca: ContingencyAnalysisGPU, n_ctg: int, total_bus: int) -> np.ndarray:
+    """The strategy rows' voltages on global bus ids (the contingency rows come first)."""
+    return batch_V_global(ca, n_ctg + ca.n_strategies, total_bus)[n_ctg:]
 
 
 @pytest.mark.parametrize("settings", SETTINGS)
 @pytest.mark.parametrize("redistribute_slack", [False, True], ids=["mismatch_shared", "loss_shared_first"])
+@pytest.mark.parametrize("shuffled", [False, True], ids=["by_contingency", "shuffled"])
 def test_strategy_rows_resume_their_contingency_outer_state(
-    case14: LSGrid, settings: dict[str, Any], redistribute_slack: bool
+    case14: LSGrid, settings: dict[str, Any], redistribute_slack: bool, shuffled: bool
 ):
-    """Every warm-started strategy row is lightsim2grid's batch row resumed from its
+    """Every warm-started strategy row is lightsim2grid's batch row resumed from its own
     contingency's solve -- with redistribute_slack, the loss its actions add (and only that:
     its contingency's is in the targets it resumes from) shared before its first solve. That
-    reference differs from the one-off solve: the loops' state matters on this grid."""
-    ca = _two_phases(case14, settings, True, redistribute_slack=redistribute_slack)
-    n: int = len(CONTINGENCIES) * len(ACTIONS)
-    V: np.ndarray = batch_V_global(ca, n, case14.total_bus())
+    reference differs from the one-off solve: the loops' state matters on this grid. Shuffled,
+    the strategies of the contingencies interleave in the queue: each still resumes from its
+    own contingency, never a neighbour's."""
+    pairs: list[tuple[int, int]] = [(c, a) for c in range(len(CONTINGENCIES)) for a in range(len(ACTIONS))]
+    if shuffled:
+        pairs = [pairs[k] for k in np.random.default_rng(3).permutation(len(pairs))]
+        assert [c for c, _ in pairs] != sorted(c for c, _ in pairs)
+    ca = _run(case14, settings, True, [(c, [a]) for c, a in pairs], redistribute_slack=redistribute_slack)
+    V: np.ndarray = _strategies_V(ca, len(CONTINGENCIES), case14.total_bus())
     gaps: list[float] = []
-    for r in range(n):
-        c, a = divmod(r, len(ACTIONS))
+    for r, (c, a) in enumerate(pairs):
         line: int = CONTINGENCIES[c][0]
         V_ref: np.ndarray = _resumed_reference(case14, line, a, redistribute_slack)
         on: np.ndarray = np.abs(V_ref) > 0
@@ -151,30 +171,14 @@ def test_strategy_rows_resume_their_contingency_outer_state(
 
 @pytest.mark.parametrize("settings", SETTINGS)
 def test_without_warm_start_strategy_rows_solve_from_scratch(case14: LSGrid, settings: dict[str, Any]):
-    ca = _two_phases(case14, settings, False)
+    ca = _run(case14, settings, False)
     n: int = len(CONTINGENCIES) * len(ACTIONS)
-    V: np.ndarray = batch_V_global(ca, n, case14.total_bus())
+    V: np.ndarray = _strategies_V(ca, len(CONTINGENCIES), case14.total_bus())
     for r in range(n):
         c, a = divmod(r, len(ACTIONS))
         V_ref: np.ndarray = _scratch_reference(case14, CONTINGENCIES[c][0], a)
         on: np.ndarray = np.abs(V_ref) > 0
         np.testing.assert_allclose(V[r][on], V_ref[on], atol=ATOL, rtol=0, err_msg=f"strategy {r}")
-
-
-def test_resume_needs_the_contingencies_first(case14: LSGrid):
-    ca = make_ca(
-        case14,
-        dict(scheduling="continuous"),
-        outer_loops=True,
-        init_from_n_powerflow=False,
-        tol=TOL_MVA / case14.get_sn_mva(),
-    )
-    ca.add_contingencies_by_branch_id(CONTINGENCIES)
-    ca.set_actions(ACTIONS)
-    ca.add_strategies([(0, [0])])
-    ca.strategy_warm_start = True
-    with pytest.raises(RuntimeError, match="contingencies"):
-        ca.compute(batch_size=4, rows="strategies")
 
 
 @pytest.fixture(scope="module")
@@ -204,6 +208,7 @@ def test_a_noop_strategy_gives_its_contingency_back(
         init_from_n_powerflow=False,
         tol=TOL_MVA / grid.get_sn_mva(),
         redistribute_slack=redistribute_slack,
+        strategy_warm_start=True,
     )
     for gen in (1, 2, 3):
         ca.add_contingency_gen([gen])
@@ -211,11 +216,9 @@ def test_a_noop_strategy_gives_its_contingency_back(
     n_ctg: int = 4
     ca.set_actions([Action()])
     ca.add_strategies([(c, [0]) for c in range(n_ctg)])
-    ca.strategy_warm_start = True
-    ca.compute(batch_size=4, rows="contingencies")
-    V_ctg: np.ndarray = batch_V_global(ca, n_ctg, grid.total_bus())
-    ca.compute(batch_size=4, rows="strategies")
-    V_str: np.ndarray = batch_V_global(ca, n_ctg, grid.total_bus())
+    ca.compute(batch_size=4)
+    V: np.ndarray = batch_V_global(ca, 2 * n_ctg, grid.total_bus())
+    V_ctg, V_str = V[:n_ctg], V[n_ctg:]
     on: np.ndarray = np.isfinite(V_ctg)
     np.testing.assert_allclose(V_str[on], V_ctg[on], atol=ATOL, rtol=0)
 
@@ -325,15 +328,15 @@ def test_bus_splits_under_the_outer_loops(case14_two_busbars: LSGrid, settings: 
         outer_loops=True,
         init_from_n_powerflow=False,
         tol=TOL_MVA / grid.get_sn_mva(),
+        strategy_warm_start=warm,
     )
     ca.add_contingencies_by_branch_id(SPLIT_CONTINGENCIES)
     ca.set_actions(actions)
     ca.add_strategies(strategies)
-    ca.strategy_warm_start = warm
-    ca.compute(batch_size=4, rows="contingencies")
-    ca.compute(batch_size=4, rows="strategies")
-    V: np.ndarray = batch_V_global(ca, len(strategies), grid.total_bus())
-    status: np.ndarray = ca.get_row_status()
+    ca.compute(batch_size=4)
+    n_ctg: int = len(SPLIT_CONTINGENCIES)
+    V: np.ndarray = _strategies_V(ca, n_ctg, grid.total_bus())
+    status: np.ndarray = ca.get_row_status()[n_ctg:]
     compared: int = 0
     for r, (c, (a,)) in enumerate(strategies):
         lines: list[int] = SPLIT_CONTINGENCIES[c]
@@ -417,15 +420,16 @@ def test_generator_moves_under_the_outer_loops(case14_gen_moves: LSGrid, setting
         outer_loops=True,
         init_from_n_powerflow=False,
         tol=TOL_MVA / grid.get_sn_mva(),
+        strategy_warm_start=False,
     )
     ca.add_contingencies_by_branch_id(SPLIT_CONTINGENCIES)
     ca.set_actions(actions)
     ca.add_strategies(strategies)
-    ca.compute(batch_size=4, rows="contingencies")
-    ca.compute(batch_size=4, rows="strategies")
-    V: np.ndarray = batch_V_global(ca, len(strategies), grid.total_bus())
-    status: np.ndarray = ca.get_row_status()
-    reasons: list[str] = ca.get_batch_unsupported_reasons()
+    ca.compute(batch_size=4)
+    n_ctg: int = len(SPLIT_CONTINGENCIES)
+    V: np.ndarray = _strategies_V(ca, n_ctg, grid.total_bus())
+    status: np.ndarray = ca.get_row_status()[n_ctg:]
+    reasons: list[str] = ca.get_batch_unsupported_reasons()[n_ctg:]
     compared: int = 0
     for r, (c, (a,)) in enumerate(strategies):
         lines: list[int] = SPLIT_CONTINGENCIES[c]
@@ -460,17 +464,18 @@ def test_generator_moves_resume_their_contingency(case14_gen_moves: LSGrid, sett
         init_from_n_powerflow=False,
         tol=TOL_MVA / grid.get_sn_mva(),
         keep_outer_trace=True,
+        strategy_warm_start=True,
     )
     ca.add_contingencies_by_branch_id(SPLIT_CONTINGENCIES)
     ca.set_actions(actions)
     ca.add_strategies(strategies)
-    ca.strategy_warm_start = True
-    ca.compute(batch_size=4, rows="contingencies")
-    ctg_frozen: list[set[int]] = [_frozen_at_end(r.decisions) for r in ca.get_outer_results()]
-    ca.compute(batch_size=4, rows="strategies")
-    V: np.ndarray = batch_V_global(ca, len(strategies), grid.total_bus())
-    status: np.ndarray = ca.get_row_status()
+    ca.compute(batch_size=4)
+    n_ctg: int = len(SPLIT_CONTINGENCIES)
     results = ca.get_outer_results()
+    ctg_frozen: list[set[int]] = [_frozen_at_end(r.decisions) for r in results[:n_ctg]]
+    results = results[n_ctg:]
+    V: np.ndarray = _strategies_V(ca, n_ctg, grid.total_bus())
+    status: np.ndarray = ca.get_row_status()[n_ctg:]
     gens = grid.get_generators()
     solver_of: dict[int, int] = {int(b): k for k, b in enumerate(ca.batch_bus_ids)}
     checked: int = 0

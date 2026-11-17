@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""Contingency x remedial action screen of a pypowsybl network, in two phases, optionally
+"""Contingency x remedial action screen of a pypowsybl network, in one compute(), optionally
 compared with reference results (docs/dev_notes/topology_actions_plan.md § 8).
 
 Inputs: a network file pypowsybl reads, a JSON list of contingency branch ids, and actions /
@@ -17,9 +17,9 @@ operator strategies in pypowsybl's JSON names (``{"actions": [...], "operator_st
   renames buses, ids are not comparable) becomes an ``Action.from_partition``. A phase tap
   position becomes the transformer's ratio / shift, read off a copy of the grid after
   lightsim2grid's ``change_trafo_phase_tap``.
-- Phase 1 solves the contingencies, phase 2 every strategy (in chunks: per-row results stay on
-  the device), each resuming from its contingency's converged state -- voltages and outer-loop
-  state -- unless ``--no-warm-start``.
+- One ``compute()`` solves the contingencies and every strategy, a contingency releasing its
+  strategies as it finishes (per-row results stay on the device), each resuming from its own
+  contingency's converged state -- voltages and outer-loop state -- unless ``--no-warm-start``.
 
 Output: one CSV row per situation (contingency_id, operator_strategy_id, kind, converged,
 reason, max_rho, branch_id); with ``--reference`` (a CSV with contingency_id,
@@ -305,11 +305,11 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
         handle_disconnected_grid=True,
         tol=1e-6 / grid.get_sn_mva(),
         ir_n_steps=1,
+        strategy_warm_start=not args.no_warm_start,
         **kw,
     )
     if args.settings == "perf":
         ca.tail_max_groups, ca.tail_group_size = args.batch, 1
-    ca.strategy_warm_start = not args.no_warm_start
     ca.add_contingencies_by_branch_id([[index[c]] for c in ctg_ids])
     expressible = [i for i, a in enumerate(translated) if a is not None]
     combo_action = {combos[i]: k for k, i in enumerate(expressible)}
@@ -324,8 +324,11 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
     out: list[dict[str, Any]] = []
     t0 = time.perf_counter()
-    ca.compute(batch_size=args.batch, rows="contingencies")
-    res, (rho, br) = ca.last_residuals(), ca.get_max_loading()
+    ca.compute(batch_size=args.batch)
+    t_compute = time.perf_counter() - t0
+    res, reasons = ca.last_residuals(), ca.get_batch_unsupported_reasons()
+    rho, br = ca.get_max_loading()  # per row: the contingencies, then the strategies
+    n_ctg: int = len(ctg_ids)
     for k, c in enumerate(ctg_ids):
         out.append(
             dict(
@@ -338,31 +341,19 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                 branch_id=names[br[k]] if br[k] >= 0 else "",
             )
         )
-    t_phase1 = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    n = len(rows)
-    for start in range(0, n, args.chunk):
-        mask = np.zeros(n, dtype=bool)
-        mask[start : start + args.chunk] = True
-        ca.select_strategies(mask)
-        ca.compute(batch_size=args.batch, rows="strategies")
-        res, reasons = ca.last_residuals(), ca.get_batch_unsupported_reasons()
-        rho, br = ca.get_max_loading()
-        for k in np.flatnonzero(mask):
-            s = rows[k]
-            out.append(
-                dict(
-                    contingency_id=s["contingency_id"],
-                    operator_strategy_id=s["id"],
-                    kind=kinds[combos.index(tuple(s["action_ids"]))],
-                    converged=bool(res[k] <= 1e-6),
-                    reason=reasons[k],
-                    max_rho=rho[k],
-                    branch_id=names[br[k]] if br[k] >= 0 else "",
-                )
+    for k, s in enumerate(rows, start=n_ctg):
+        out.append(
+            dict(
+                contingency_id=s["contingency_id"],
+                operator_strategy_id=s["id"],
+                kind=kinds[combos.index(tuple(s["action_ids"]))],
+                converged=bool(res[k] <= 1e-6),
+                reason=reasons[k],
+                max_rho=rho[k],
+                branch_id=names[br[k]] if br[k] >= 0 else "",
             )
-        print(f"  strategies {min(start + args.chunk, n)}/{n}", flush=True)
-    t_phase2 = time.perf_counter() - t0
+        )
+    t_results = time.perf_counter() - t0 - t_compute
     for s in strategies:
         k = combos.index(tuple(s["action_ids"]))
         if translated[k] is None:
@@ -377,7 +368,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     branch_id="",
                 )
             )
-    print(f"phase 1 {t_phase1:.1f} s, phase 2 {t_phase2:.1f} s ({n} strategies, chunks of {args.chunk})")
+    print(f"compute {t_compute:.1f} s ({n_ctg} contingencies, {len(rows)} strategies)")
+    print(f"results {t_results:.1f} s")
     return pd.DataFrame(out)
 
 
@@ -424,11 +416,10 @@ def main() -> None:
         help="perf: own LU, the tail from the start; defaults: cuDSS, the default tail",
     )
     p.add_argument("--batch", type=int, default=2048)
-    p.add_argument("--chunk", type=int, default=20000, help="strategies per phase-2 call")
     p.add_argument(
         "--no-warm-start",
         action="store_true",
-        help="phase 2 from the base case (default: each strategy resumes from its contingency's "
+        help="strategies from the base case (default: each strategy resumes from its contingency's "
         "converged state, outer loops included, as OpenLoadFlow's security analysis)",
     )
     args = p.parse_args()

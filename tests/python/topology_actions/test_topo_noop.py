@@ -33,7 +33,8 @@ def _run(
     settings: dict[str, Any], actions: list[Action] | None = None, strategies: list[Strategy] | None = None
 ) -> tuple[ContingencyAnalysisGPU, np.ndarray]:
     grid = case14()
-    ca = make_ca(grid, settings, batch_size=BATCH)
+    # every row from the base case: the rows themselves are what these tests compare
+    ca = make_ca(grid, settings, batch_size=BATCH, strategy_warm_start=False)
     ca.add_contingencies_by_branch_id(CTGS)
     if actions is not None:
         ca.set_actions(actions)

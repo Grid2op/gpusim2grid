@@ -79,7 +79,7 @@ def test_strategy_rows_equal_the_union_of_trips(settings: dict[str, Any]):
     actions = _actions()
     strategies = [(c, [a]) for c in range(len(ctgs)) for a in range(len(actions))]
 
-    ca = make_ca(grid, settings, batch_size=BATCH)
+    ca = make_ca(grid, settings, batch_size=BATCH, strategy_warm_start=False)  # vs from-scratch rows
     ca.add_contingencies_by_branch_id(ctgs)
     ca.set_actions(actions)
     ca.add_strategies(strategies)
@@ -120,7 +120,7 @@ def test_element_tripped_twice_counts_once(settings: dict[str, Any], solver_atol
     from gpusim2grid.actions import Action
 
     grid = case14()
-    ca = make_ca(grid, settings, batch_size=BATCH)
+    ca = make_ca(grid, settings, batch_size=BATCH, strategy_warm_start=False)  # vs from-scratch rows
     ca.add_contingencies_by_branch_id([[0]])
     ca.set_actions([Action(line_bus1={0: -1})])
     ca.add_strategies([(0, [0])])
@@ -140,14 +140,14 @@ def test_an_element_its_contingency_trips_stays_out(solver_atol: float):
     load = next(ld for ld in grid.get_loads() if ld.bus_id == line.bus1_id or ld.bus_id == line.bus2_id)
     put_back = Action(line_bus1={0: int(line.bus1_id)})
     moved = Action(line_bus1={0: int(line.bus1_id) + grid.get_n_sub()}, load_bus={int(load.id): -1})
-    ca = make_ca(grid, {}, batch_size=BATCH)
+    ca = make_ca(grid, {}, batch_size=BATCH, strategy_warm_start=False)  # vs from-scratch rows
     ca.add_contingencies_by_branch_id([[0]])
     ca.set_actions([put_back, moved])
     ca.add_strategies([(0, [0]), (0, [1])])
     ca.compute(batch_size=BATCH)
     assert not any(ca.get_batch_unsupported_reasons())
     V = batch_V_global(ca, 3, grid.total_bus())
-    np.testing.assert_allclose(V[1], V[0], atol=1e-12, rtol=0)   # nothing else in that action
+    np.testing.assert_allclose(V[1], V[0], atol=1e-12, rtol=0)  # nothing else in that action
     V_ref, _ = oracle(grid, branches=[0], apply=lambda g: g.deactivate_load(int(load.id)))
     assert_row_matches(V[2], V_ref, solver_atol)
 

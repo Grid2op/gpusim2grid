@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import enum
 from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -29,12 +30,29 @@ from ..actions import DISCONNECTED, Action, ElementRef, current_buses
 if TYPE_CHECKING:
     from lightsim2grid.lightsim2grid_cpp import LSGrid
 
+
+class StrategyCondition(str, enum.Enum):
+    """When a contingency's strategies run (pypowsybl's operator strategy conditions), checked
+    on the device as the contingency finishes."""
+
+    #: every strategy of the contingency (pypowsybl's TrueCondition)
+    TRUE = "TRUE"
+    #: only when the contingency violates a limit (pypowsybl's AnyViolationCondition), the limit
+    #: checks on (``compute_limit_violations``) at ``violation_threshold``
+    ANY_VIOLATION = "ANY_VIOLATION"
+
+    @property
+    def code(self) -> int:
+        """The session's code (``ContingencyAnalysisSession.set_streaming``)."""
+        return 0 if self is StrategyCondition.TRUE else 1
+
 __all__ = [
     "BranchY",
     "CompiledAction",
     "RowBranch",
     "RowMap",
     "Strategy",
+    "StrategyCondition",
     "StrategyRow",
     "compile_action",
     "strategy_row",
@@ -537,27 +555,37 @@ def _voltage_control_of_moves(
 class RowMap:
     """The rows the session solved (``session_rows``: their index in the caller's rows) among
     the ``n_out`` rows the caller sees; ``reasons``: why a row did not run (``""`` for the rows
-    that ran and the ones not asked for)."""
+    that ran and the ones not asked for); ``released``: per session row, whether it ran (a
+    strategy whose contingency failed the condition did not; None: every one)."""
 
     n_out: int
     session_rows: np.ndarray
     reasons: list[str]
+    released: np.ndarray | None = None
+
+    def _run_rows(self) -> tuple[np.ndarray, np.ndarray]:
+        """(the session positions that ran, their caller rows)."""
+        if self.released is None:
+            return np.arange(len(self.session_rows)), self.session_rows
+        pos: np.ndarray = np.flatnonzero(self.released)
+        return pos, self.session_rows[pos]
 
     @property
     def ran(self) -> np.ndarray:
         out = np.zeros(self.n_out, dtype=bool)
-        out[self.session_rows] = True
+        out[self._run_rows()[1]] = True
         return out
 
     def expand(self, values: np.ndarray, fill: Any) -> np.ndarray:
-        """``values`` (session rows first) on the caller's rows, ``fill`` elsewhere."""
+        """``values`` (one per session row) on the caller's rows that ran, ``fill`` elsewhere."""
         values = np.asarray(values)
         out = np.full((self.n_out,) + values.shape[1:], fill, dtype=values.dtype)
-        out[self.session_rows] = values
+        pos, rows = self._run_rows()
+        out[rows] = values[pos]
         return out
 
     def expand_list(self, values: Sequence[T], fill: Callable[[], T]) -> list[T]:
         out: list[T] = [fill() for _ in range(self.n_out)]
-        for i, r in enumerate(self.session_rows):
-            out[int(r)] = values[i]
+        for i, r in zip(*self._run_rows()):
+            out[int(r)] = values[int(i)]
         return out

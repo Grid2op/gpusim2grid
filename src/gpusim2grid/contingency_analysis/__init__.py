@@ -10,6 +10,7 @@ __all__ = [
     "LimitViolation",
     "ReactiveLimitsStatus",
     "RowStatus",
+    "StrategyCondition",
 ]
 
 import operator
@@ -777,3 +778,4 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 # gpusim2grid.optimize_reference_slack (see docs/api.rst) to avoid duplicate
 # autodoc entries for the same classes/functions.
 from .gpu_facade import ContingencyAnalysisGPU, optimize_reference_slack
+from ._strategies import StrategyCondition

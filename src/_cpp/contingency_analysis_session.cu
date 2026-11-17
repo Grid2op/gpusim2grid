@@ -381,7 +381,7 @@ void ContingencyAnalysisSession::build_contingencies_full(
     row_pv_release_.clear();
     row_pv_set_.clear();
     row_gen_bus_.clear();
-    stream_parent_.clear();
+    clear_streaming();   // its parents index the old rows
     ctg_shunts_ = shunt_ids_per_ctg;
     ctg_loads_  = load_ids_per_ctg;
     ctg_gens_   = gen_ids_per_ctg;
@@ -958,7 +958,7 @@ void ContingencyAnalysisSession::run()
     // starting voltages by group (strategy_warm_start), else the base case
     if (has_v_groups_) {
         if (v_group_of_row_.size() != contingencies_.size())
-            throw std::runtime_error("ContingencyAnalysisSession: set_v_group_of_row() gave "
+            throw std::runtime_error("ContingencyAnalysisSession: set_streaming() gave "
                                      + std::to_string(v_group_of_row_.size()) + " groups for "
                                      + std::to_string(contingencies_.size()) + " rows");
         solver_->source_.set_v_groups(thrust::raw_pointer_cast(dev_->d_V_groups.data()), n_v_groups_,
@@ -1553,40 +1553,6 @@ Eigen::VectorXi ContingencyAnalysisSession::get_row_status() const
     return Eigen::Map<const Eigen::VectorXi>(v.data(), static_cast<Eigen::Index>(v.size()));
 }
 
-void ContingencyAnalysisSession::set_v_init_groups_from_ptr(std::uintptr_t d_V_src,
-                                                            const std::vector<int>& src_rows,
-                                                            int n_src_rows, int n_bus_src)
-{
-    static const char* who = "ContingencyAnalysisSession::set_v_init_groups_from_ptr";
-    if (d_V_src == 0) throw std::runtime_error(std::string(who) + ": null source buffer (run() first)");
-    if (src_rows.empty()) throw std::runtime_error(std::string(who) + ": no group");
-    if (n_bus_src != base_state_->n_bus)
-        throw std::runtime_error(std::string(who) + ": the source has " + std::to_string(n_bus_src)
-                                 + " buses, this session " + std::to_string(base_state_->n_bus));
-    for (int r : src_rows)
-        if (r < 0 || r >= n_src_rows)
-            throw std::runtime_error(std::string(who) + ": source row " + std::to_string(r)
-                                     + " outside [0, " + std::to_string(n_src_rows) + ")");
-    const int n = static_cast<int>(src_rows.size());
-    const int n_bus = base_state_->n_bus;
-    const cudaStream_t cs = static_cast<cudaStream_t>(base_state_->cs);
-    dev_->d_V_groups.resize(static_cast<size_t>(n) * n_bus);
-    std::vector<int> dst_rows(static_cast<size_t>(n));
-    for (int i = 0; i < n; ++i) dst_rows[static_cast<size_t>(i)] = i;
-    thrust::device_vector<int> d_dst, d_src;
-    upload_h2d(d_dst, dst_rows.data(), dst_rows.size(), cs);
-    upload_h2d(d_src, src_rows.data(), src_rows.size(), cs);
-    launch_copy_rows(thrust::raw_pointer_cast(dev_->d_V_groups.data()),
-                     reinterpret_cast<const cudaComplexType*>(d_V_src),
-                     thrust::raw_pointer_cast(d_dst.data()), thrust::raw_pointer_cast(d_src.data()),
-                     n_bus, n, cs);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) throw std::runtime_error(std::string(who) + ": " + cudaGetErrorString(e));
-    base_state_->cs.synchronize();
-    n_v_groups_ = n;
-    has_v_groups_ = true;
-}
-
 // =============================================================================
 // Streamed strategies (set_streaming): a RowFeed over the session's rows
 // =============================================================================
@@ -1739,30 +1705,24 @@ void ContingencyAnalysisSession::set_streaming(const std::vector<int>& parent_of
     // the outer loops: each strategy resumes from its contingency's loops, kept as it finishes
     if (outer_) {
         outer_->keep_row_points(warm);
-        outer_->set_row_resume(warm ? parent_of_row : std::vector<int>(), /*same_run=*/true);
+        outer_->set_row_resume(warm ? parent_of_row : std::vector<int>());
     }
     ++contingencies_generation_;
 }
 
 void ContingencyAnalysisSession::clear_streaming()
 {
-    if (stream_parent_.empty()) return;
     stream_parent_.clear();
     stream_group_of_ctg_.clear();
     has_v_groups_ = false;
+    n_v_groups_ = 0;
+    v_group_of_row_.clear();
+    dev_->d_V_groups.clear();
+    dev_->d_V_groups.shrink_to_fit();
     if (outer_) {
         outer_->keep_row_points(false);
         outer_->set_row_resume({});
     }
-}
-
-void ContingencyAnalysisSession::set_v_group_of_row(const std::vector<int>& group_of_row)
-{
-    for (int g : group_of_row)
-        if (g < -1 || g >= n_v_groups_)
-            throw std::runtime_error("ContingencyAnalysisSession::set_v_group_of_row: group "
-                                     + std::to_string(g) + " outside [-1, " + std::to_string(n_v_groups_) + ")");
-    v_group_of_row_ = group_of_row;
 }
 
 void ContingencyAnalysisSession::add_row_triplets(
@@ -1969,15 +1929,6 @@ RealVect ContingencyAnalysisSession::_bus_array_with_spares(const RealVect& a, b
                      ? a(spare_parents_[static_cast<size_t>(k)]) : fill;
     }
     return out;
-}
-
-void ContingencyAnalysisSession::clear_v_init_groups()
-{
-    has_v_groups_ = false;
-    n_v_groups_ = 0;
-    v_group_of_row_.clear();
-    dev_->d_V_groups.clear();
-    dev_->d_V_groups.shrink_to_fit();
 }
 
 int ContingencyAnalysisSession::result_rows() const

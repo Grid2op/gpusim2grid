@@ -19,7 +19,7 @@ from ._build_checks import check_build as _check_build
 _check_build()
 
 from .contingency_analysis import (ContingencyAnalysisGPU, optimize_reference_slack,
-                                   ReactiveLimitsStatus, RowStatus)
+                                   ReactiveLimitsStatus, RowStatus, StrategyCondition)
 from .injection_sweep import InjectionSweepGPU
 from .scenario_sweep import ScenarioSweepGPU
 from .acpf_nr import AcPfGPU
@@ -30,6 +30,7 @@ __all__ = [
     "optimize_reference_slack",
     "ReactiveLimitsStatus",
     "RowStatus",
+    "StrategyCondition",
     "InjectionSweepGPU",
     "ScenarioSweepGPU",
     "AcPfGPU",

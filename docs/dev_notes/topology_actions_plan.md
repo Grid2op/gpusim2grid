@@ -90,8 +90,8 @@ batched Newton problem with different scopes. What differs, and what is worth br
 | sparsity | one pattern per block = **union** over its scenarios (`union_pattern`); scenarios differ by routing arrays (which bus row/column an element writes to, identity rows) | one base pattern per batch; supersets only for controller slots / switchable Vm | **yes**: § 5.2, union pattern with a bit-identical no-op; banks later |
 | actions | `SWITCH` (open/close), `PHASE_TAP_CHANGER_POSITION`, nodal actions | none (contingencies, injections, generator v-set) | **yes**: § 4 – § 7 |
 | switch model | pypowsybl node-breaker view through OLF; contingency propagation (a contingency opens the switches up to the nearest breakers) | none | **outside the solver and later** (§ 6): lightsim2grid's detailed topology; propagation belongs there too |
-| contingency × strategy | two phases as OLF's `AcSecurityAnalysis`: contingencies first, then each strategy starts from its contingency's final state | one phase, every row from the base case | **yes**: § 4 product + warm start |
-| strategy conditions | `TRUE_CONDITION`, `AT_LEAST_ONE_VIOLATION_CONDITION` (+ subject filter): a strategy runs only if its contingency violates a limit | n/a | **yes**, as the caller's mask between the two phases (`compute(rows=...)`, `select_strategies`): e.g. the contingencies whose violation counts (already computed on the GPU) are non-zero |
+| contingency × strategy | two phases as OLF's `AcSecurityAnalysis`: contingencies first, then each strategy starts from its contingency's final state | one phase, every row from the base case | **yes**: § 4 product + warm start, streamed (a contingency releases its strategies as it finishes) |
+| strategy conditions | `TRUE_CONDITION`, `AT_LEAST_ONE_VIOLATION_CONDITION` (+ subject filter): a strategy runs only if its contingency violates a limit | n/a | **yes**: `strategy_condition=StrategyCondition.ANY_VIOLATION` (constructor), checked on the device from the contingency's violation counts as it finishes |
 | results | result processors reduced on the GPU while the analysis runs (`MaxRho`: max loading + branch per situation), flows optional | V, flows on the host (n_rows × n_branch), most severe violation records | **yes**: max-loading reduction (§ 4, G7) |
 | batching | continuous, tail by smaller banks (2048 → 512 → ... → 64) | continuous, tail by compaction (own LU prefix) | no: G2G's tail is the better one |
 | linear solver | cuDSS uniform batch or own batched LU | cuDSS or `own_lu` (ported from GSA) | already there |
@@ -120,7 +120,7 @@ Target: the prototype's 13.4 s of GPU time / 19.3 s end to end per snapshot (185
 | 3 | Python per-row calls (`add_contingency` × 160 k) | ~3 s at ~20 µs per call | — | `set_actions` once (A objects) + `add_strategies` with arrays |
 | 4 | results to the host: `compute_flows` = 160 k × 11 k branches × 2 sides × 8 B | **28 GB** | — | per-row **max loading** reduced on the device at eviction (the prototype's `MaxRho` processor); flows only for selected rows |
 | 5 | dense per-row Sbus (ScenarioSweep path) | 19 GB | — | the ContingencyAnalysis path (sparse Sbus deltas per row) |
-| 6 | strategies that need not run | 100 % run today | prototype: `AT_LEAST_ONE_VIOLATION_CONDITION` skips every strategy of a contingency without violation (all of them on this snapshot: max rho 0.978) | `select_strategies(mask)` between `compute(rows="contingencies")` and `compute(rows="strategies")` (§ 4) |
+| 6 | strategies that need not run | 100 % run today | prototype: `AT_LEAST_ONE_VIOLATION_CONDITION` skips every strategy of a contingency without violation (all of them on this snapshot: max rho 0.978) | `StrategyCondition.ANY_VIOLATION` (§ 4) |
 | 7 | union pattern fill (§ 5.2) | unknown: 53 substations touched by splits / merges on this snapshot, a few entries each | prototype: one union pattern per bank; `pattern_growth_limit` fallback when a block's union grows | measure nnz(J) and the own-LU plan's nnz(L+U) of the union **on the host** (no GPU needed); banks only if it grows |
 | 8 | tail: the few rows with many outer restarts | prototype: 1–3 % of strategies with 4–6 restarts kept small banks busy (22 s before its fix) | `continuous_batching.md` (both repositories) | gpusim2grid's tail compaction (own LU prefix), from the first eviction: `tail_max_groups=batch_size, tail_group_size=1` |
 
@@ -154,7 +154,7 @@ CuPy array. What this work changes:
 | result | size per row | today | with topology actions |
 |---|---|---|---|
 | residuals, reasons, max loading, iterations | O(1) | `DeviceBuffer` / numpy | same; the row map expands them on the host (cheap) |
-| V | n_bus (7 400 on France) | stored for every row on the device (`d_V_results`, 19 GB at 160 k rows) | optional, only for chosen rows (phase 1: all, 22 MB, the warm start needs them; phase 2: none) |
+| V | n_bus (7 400 on France) | stored for every row on the device (`d_V_results`, 19 GB at 160 k rows) | one start per contingency with strategies (22 MB, the warm start), the rows' own lazily (`V_results`) |
 | branch currents | 2 × n_branch (22 000) | `compute_flows()`: every row on the device (28.7 GB), copied whole | reduced at eviction by a processor (max loading, ~60-100 ms for 160 k rows, estimated); per-row flows only on request |
 
 The first version of `get_max_loading()` reduces on the host from `compute_flows()`. The
@@ -188,26 +188,33 @@ Actions that only disconnect elements (~70 % of the case) are contingencies alre
 Two layers, as in the prototype (its analysis structure, gpusim2grid's engine):
 
 ```python
-# the engine: rows on one session, one pattern (the union, § 5) for both phases
-ca = g2g.ContingencyAnalysisGPU(grid, ...)
+# the engine: rows on one session, one pattern (the union, § 5), one compute()
+ca = g2g.ContingencyAnalysisGPU(
+    grid, ...,
+    compute_limit_violations=True,
+    violation_threshold=0.95,             # lightsim2grid's knob
+    strategy_condition=g2g.StrategyCondition.ANY_VIOLATION,   # pypowsybl's condition, on the device
+    strategy_warm_start=True,             # (default) each strategy from its own contingency's state
+)
 ca.add_contingencies_by_branch_id(...)            # C rows, as today
 ca.set_actions(actions)                           # A gpusim2grid.actions.Action (§ 7)
 ca.add_strategies(ctg_idx, action_idx)            # or [(c, [a, ...]), ...]; rows after the C
-ca.compute(batch_size=..., rows="contingencies")  # phase 1
-ca.select_strategies(mask)                        # e.g. from phase 1's violations
-ca.strategy_warm_start = True                     # start from the contingency's V
-ca.compute(batch_size=..., rows="strategies")     # phase 2, no new analysis
+ca.compute(batch_size=...)                        # contingencies, then their strategies, streamed
 rho, branch = ca.get_max_loading()                # on the device, per row
 ```
 
-`compute()` with no `rows` runs everything in one call (contingencies and strategies mixed in
-the queue, no warm start), so a caller that does not use strategies sees no change.
+**Streamed strategies.** On the continuous schedule, the contingency rows enter the slots first
+and each releases its strategies into the queue as soon as it finishes (the driver's `RowFeed`,
+slots topped up after each eviction): no wait for the whole N-1. The condition is read on the
+device from the contingency's violation counts; the warm start copies the contingency's converged
+voltages into its start group (and, with the outer loops, keeps its resume point) at that moment.
+With `StrategyCondition.TRUE` and no warm start nothing depends on a contingency, every row is
+queued at once (either schedule). The security-analysis parameters (`strategy_condition`,
+`strategy_warm_start`, `violation_threshold`) are constructor arguments, fixed for the instance.
 
-**No second class.** The two phases are this engine API, not a separate "security analysis"
+**No second class.** The strategies are this engine API, not a separate "security analysis"
 object: gpusim2grid has one public entry point per workload, lightsim2grid deprecated its
-`SecurityAnalysis` name for `ContingencyAnalysis`, and the condition between the phases is the
-caller's (pypowsybl's `AT_LEAST_ONE_VIOLATION_CONDITION` is one mask, a max loading above a
-threshold or the top-k contingencies are others). Named contingencies / actions / strategies in
+`SecurityAnalysis` name for `ContingencyAnalysis`. Named contingencies / actions / strategies in
 pypowsybl's shape belong in a thin layer outside gpusim2grid.
 
 **`violation_threshold`** (lightsim2grid parity, same name and semantics as its
@@ -215,8 +222,8 @@ pypowsybl's shape belong in a thin layer outside gpusim2grid.
 `ScenarioSweepGPU`: a float in `]0, 1]` (default 1.0 = today) moving every checked limit towards
 a healthy anchor, `effective = t · limit + (1 − t) · anchor` (anchor 0 for currents, the bus
 nominal voltage clamped into `[vmin, vmax]` for both voltage bounds); records keep the
-configured limit; lowering it invalidates computed results. It is what makes a violation-based
-condition between the phases usable with a security margin (pypowsybl's limit reductions).
+configured limit; a constructor argument. It is what makes the violation condition usable with
+a security margin (pypowsybl's limit reductions).
 
 - **Union, not sum.** A row applies the union of the element statuses of `c` and `a`: an
   element both trip is tripped once (two triplet lists summed would subtract its admittance
@@ -228,25 +235,24 @@ condition between the phases usable with a security margin (pypowsybl's limit re
   by row).
 - **Connectivity** of `(c, a)`: the base DFS tree answers "removed edges" sets of any size
   (`compute_component_masks`), so a pair is one more query, no new graph search.
-- **Warm start (G5)**: phase 1 solves the C contingencies; phase 2 starts `(c, a)` from `V_c`.
+- **Warm start (G5)**: `(c, a)` starts from `V_c`, written when `c` finishes in the same run.
   ScenarioSweep's per-row start (`set_v_init_from_orig`) holds a dense `n_rows × n_bus` buffer
-  on the device (17 GB for the French phase 2); every strategy of a contingency starts from the
-  same V, so the contingency session keeps **one start per contingency** (C × n_bus, 22 MB
-  there) and a row → contingency index, gathered at slot load. Opt-in
-  (`strategy_warm_start`): it changes the iterates, not the solution. Expected: fewer Newton
+  on the device (17 GB for the French strategies); every strategy of a contingency starts from
+  the same V, so the contingency session keeps **one start per contingency** (C × n_bus, 22 MB
+  there) and a row → contingency index, gathered at slot load. On by default
+  (`strategy_warm_start=True`, OpenLoadFlow's semantics): it changes the iterates, not the
+  solution. Expected: fewer Newton
   iterations, since most actions are local. With the outer loops, the row also resumes from where
   its contingency's loops ended (moved targets, frozen buses, switched SVCs, hvdc regimes, taps,
-  sections, parked units): phase 1 keeps one resume point per contingency row in the outer model
-  (`OuterHook::keep_row_points`), phase 2 points each strategy row at its contingency's
-  (`set_row_resume`) -- lightsim2grid's batch row resuming from a solve (`init_from_n_powerflow`)
+  sections, parked units): the outer model keeps one resume point per contingency row as it ends
+  (`OuterHook::keep_row_points`) and each strategy row, loaded after it, points at its own
+  contingency's (`set_row_resume`) -- lightsim2grid's batch row resuming from a solve (`init_from_n_powerflow`)
   on the grid with the contingency applied; its DistributedSlack shares only the loss its actions
   add. Checked against lightsim2grid's `ContingencyAnalysisCPP` / `ScenarioSweepCPP` (topology
   actions) resumed from the contingency's solve (`test_topo_outer_warm_start.py`).
-- **Driver reuse between the phases**: the contingency session rebuilds its driver (and its
-  analysis) on any new row list today; it gets ScenarioSweep's warm path (new source on the
-  live driver, chunked schedule). The continuous schedule rebuilds its driver every run in
-  both sessions (`continuous_batching.md` A.6, not done upstream): one analysis per phase,
-  ~0.1 s on France, accepted for now.
+- **One run**: contingencies and strategies share one driver and one analysis per
+  `compute()`. A later `compute()` with other rows rebuilds them (the continuous schedule
+  rebuilds every run in both sessions, `continuous_batching.md` A.6, not done upstream).
 - **Reduction (G7)**: `get_max_loading()` → per row `(max |I|/I_max, branch id)` computed on the
   device from the slot's V, before eviction; flows only on request for selected rows.
 - **Perf settings** for every measurement here: `linear_solver='own_lu'`,
@@ -291,7 +297,7 @@ it the **union** of what the batch's rows need:
    ledger is not extended, the analysis is the one of today: bit-identical (test). Above that,
    the extra cost is the fill of the union pattern, paid by every row of the batch.
 7. **Built once, upfront.** The union covers every strategy registered on the analysis and is
-   built before the first run; phase 1, phase 2 and every chunk solve on it. (The prototype
+   built before the first run; the contingencies, the strategies and every chunk solve on it. (The prototype
    builds a smaller union per block of strategies.) If building it upfront ever shows, it can be
    streamed while the GPU works on the first rows, which needs a join of patterns: one that only
    grows, with a new analysis when it does.
@@ -346,8 +352,8 @@ PRs**: its stable interface is the per-element bus move (`Action`, § 7).
   [action indices]), ...])`; rows = the contingencies, then the strategies; `batch_bus_ids`
   (global bus of every voltage column: the base solver buses, then the spare ones),
   `n_spare_buses` (0 on the no-op path), `get_max_loading()` → `(rho, branch)` per row,
-  `compute(rows=None | "contingencies" | "strategies")`, `select_strategies(mask)`,
-  `get_strategy_ran()`, `strategy_warm_start` (bool), `get_iterations()`.
+  `compute()` (contingencies, then their strategies), `get_strategy_ran()`, `get_iterations()`;
+  constructor arguments `strategy_condition`, `strategy_warm_start`, `violation_threshold`.
 - Results per row: status (converged / diverged / not simulated / unsupported), residual,
   max loading + its branch, the violations; full V / flows on request.
 
@@ -418,9 +424,9 @@ plan), factor / solve time per batch, before and after.
 |---|---|---|---|
 | 0 | this note; build + suite on this machine; § 8.2 measurement script | 1 | note, tests, tooling done; § 8.2 waits for a free GPU |
 | D | `Action` format (`set_bus`-style moves, branch values), results | 1 | done |
-| A | strategy rows (union of trips), two phases (`rows=`, `select_strategies`), max loading, `violation_threshold` | 1 | done (Python row map over today's session; max loading reduced on the host for now) |
+| A | strategy rows (union of trips), max loading, `violation_threshold` | 1 | done (Python row map over today's session; max loading reduced on the device) |
 | A2 | warm start: one start V per contingency on the device, gathered at slot load | 1 | done (C++ unit tests for the gather) |
-| A4 | the contingency session's warm path (new rows on the live driver, chunked) | 1 | deferred: the phases change the row count, the live driver's result buffers would have to be re-sized; chunked only (continuous rebuilds anyway, upstream A.6), ~0.1 s per phase; pinned by an xfail(strict) test |
+| A6 | streamed strategies: one `compute()`, a contingency releases its strategies as it finishes (`strategy_condition` on the device, warm start and outer resume point kept in the same run); the two-phase `rows=` / `select_strategies` API removed | 1 | done |
 | B.1 | per-row branch admittance (taps) | 2 | done (row triplets in C++; the changed branch's flows / current violations recomputed on the host) |
 | A5 | warm start with the outer loops: each strategy resumes from its contingency's loop state; per-row accessors (`get_row_status`, `get_row_iterations`, `get_outer_results`, physical checks) on the caller's rows | 1 | done |
 | B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | done: S1-S3 (also under the outer loops, warm or not), S4 moved-branch flows / violations, S5 generator moves (PV on the new bus, group members, under the outer loops: spares switchable in the outer model), half-open branches' closed ends; the contingency wins over an action's move of its elements |
@@ -436,9 +442,9 @@ per step:
 | `test_topo_trips.py` | A | strategy rows = union of trips, lightsim2grid, a trip counted once, the contingency wins over an action, conflicts per row, array input |
 | `test_topo_branch_values.py` | B.1 | taps / ratios vs lightsim2grid, flows with the row's admittance |
 | `test_topo_bus_moves.py` | B.2 | splits, merges, a generator moved (PV), a group member moved, the closed end of a half-open branch, islands, 8 splits in one union pattern, flows / loading / violations of moved branches, refused moves, analysis reuse |
-| `test_topo_results.py` | A | max loading on the device, two calls = one, selection, warm start (fewer iterations), the two-phase recipe (violations as the condition), per-row statuses / outer results on the strategy rows |
-| `test_topo_outer_warm_start.py` | A5 | strategies resumed from their contingency's outer-loop state vs lightsim2grid's resumed batch, a no-op strategy gives its contingency back (its loss not shared twice), splits and generator moves under the outer loops (warm and from scratch) |
-| `../violations/test_violation_threshold.py` | A | `violation_threshold` vs lightsim2grid's `ContingencyAnalysisCPP`, both facades, clamped voltage anchor, records not rescaled, invalidation |
+| `test_topo_results.py` | A, A6 | max loading on the device, warm start (lightsim2grid's solution, each strategy from its own contingency whatever the order), the violation condition (`violation_threshold`), per-row statuses / outer results with strategies not released, the continuous schedule required |
+| `test_topo_outer_warm_start.py` | A5 | strategies resumed from their own contingency's outer-loop state vs lightsim2grid's resumed batch (also with the strategies shuffled), a no-op strategy gives its contingency back (its loss not shared twice), splits and generator moves under the outer loops (warm and from scratch) |
+| `../violations/test_violation_threshold.py` | A | `violation_threshold` vs lightsim2grid's `ContingencyAnalysisCPP`, both facades, clamped voltage anchor, records not rescaled, the constructor argument |
 
 Code conventions for the new modules (those of the prototype): `from __future__ import
 annotations`, typed signatures and module-level variables, frozen dataclasses for values,
