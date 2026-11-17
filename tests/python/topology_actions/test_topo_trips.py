@@ -129,22 +129,27 @@ def test_element_tripped_twice_counts_once(settings: dict[str, Any], solver_atol
     np.testing.assert_allclose(V[1], V[0], atol=1e-12, rtol=0)
 
 
-def test_reconnecting_a_tripped_element_is_unsupported():
-    """An action putting back an element its contingency trips (here: line 0 on its bus) is
-    reported for that row, not solved and not raised."""
+def test_an_element_its_contingency_trips_stays_out(solver_atol: float):
+    """An action placing an end of the line its contingency trips (back on its bus, or on bus 2
+    of its substation) leaves it out: the contingency wins, as its breakers stay open in
+    OpenLoadFlow's security analysis; the rest of the action applies."""
     from gpusim2grid.actions import Action
 
     grid = case14()
     line = grid.get_lines()[0]
+    load = next(ld for ld in grid.get_loads() if ld.bus_id == line.bus1_id or ld.bus_id == line.bus2_id)
+    put_back = Action(line_bus1={0: int(line.bus1_id)})
+    moved = Action(line_bus1={0: int(line.bus1_id) + grid.get_n_sub()}, load_bus={int(load.id): -1})
     ca = make_ca(grid, {}, batch_size=BATCH)
-    ca.add_contingencies_by_branch_id([[0], [3]])
-    ca.set_actions([Action(line_bus1={0: int(line.bus1_id)})])
-    ca.add_strategies([(0, [0]), (1, [0])])
+    ca.add_contingencies_by_branch_id([[0]])
+    ca.set_actions([put_back, moved])
+    ca.add_strategies([(0, [0]), (0, [1])])
     ca.compute(batch_size=BATCH)
-    res = ca.last_residuals()
-    assert np.isnan(res[2]) and np.isfinite(res[3])
-    reasons = ca.get_batch_unsupported_reasons()
-    assert reasons[2] and not reasons[3]
+    assert not any(ca.get_batch_unsupported_reasons())
+    V = batch_V_global(ca, 3, grid.total_bus())
+    np.testing.assert_allclose(V[1], V[0], atol=1e-12, rtol=0)   # nothing else in that action
+    V_ref, _ = oracle(grid, branches=[0], apply=lambda g: g.deactivate_load(int(load.id)))
+    assert_row_matches(V[2], V_ref, solver_atol)
 
 
 def test_two_actions_in_one_strategy(solver_atol: float):

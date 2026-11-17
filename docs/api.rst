@@ -57,6 +57,7 @@ contingency's disconnections plus its actions'.
     ])
     ca.add_strategies([(c, [a]) for c in range(3) for a in range(2)])   # or two index arrays
     ctg_of = np.array([c for c in range(3) for _ in range(2)])
+    ca.strategy_warm_start = True                      # each strategy resumes from its contingency
 
     ca.compute(batch_size=512, rows="contingencies")   # phase 1
     violating = ca.get_violation_counts()["current"] > 0
@@ -65,12 +66,44 @@ contingency's disconnections plus its actions'.
     rho, branch = ca.get_max_loading()                 # per strategy row: max |I| / limit
     ran = ca.get_strategy_ran()                        # which strategies were solved
 
-``compute()`` without ``rows`` runs the contingencies and the strategies in one call. A
-strategy the batch cannot run yet (an action putting back an element its contingency trips;
-bus moves and transformer values until they land, see
-``docs/dev_notes/topology_actions_plan.md``) is reported in
-``get_batch_unsupported_reasons()`` with NaN results, never raised for the batch. The full
-example is ``examples/contingency_x_actions.py``.
+``compute()`` without ``rows`` runs the contingencies and the strategies in one call. After
+``rows="strategies"`` every per-row result (voltages, residuals, ``get_max_loading``,
+violations, ``get_row_status``, ``get_row_iterations``, ``get_outer_results``, flows) has one
+entry per strategy.
+
+What an action can do:
+
+- **disconnect** elements, one end of a branch or both;
+- **change a transformer's values** (``trafo_ratio`` / ``trafo_shift_deg``): per-row Ybus values,
+  the transformer's flows and current violations with the row's admittance;
+- **move elements between the buses of a substation** (bus splits and merges): the batch keeps
+  spare buses (the empty busbars the moves use) and one union sparsity pattern for the whole
+  run, built once from every registered strategy; a moved branch's flows and current checks
+  use its new buses. A voltage-regulating generator moved to another bus holds that bus PV at
+  its set-point (its former bus turns PQ when nothing else regulates it); one of a
+  voltage-control group leaves its group on that row. Moving the closed end of a half-open
+  branch moves its admittance, Kron-reduced onto that end, and the open end stays open;
+- with ``outer_loops=True``, all of the above: the loops see each row's buses and machines
+  (a moved generator's reactive limits on its new bus).
+
+An element end the strategy's contingency trips stays out whatever its actions do with it
+(the contingency's breakers stay open, as in OpenLoadFlow's security analysis); the rest of
+the actions apply.
+
+``strategy_warm_start = True`` starts each strategy from its contingency's converged state
+(phase 1's): its voltages and, with the outer loops, where its loops ended -- the targets
+DistributedSlack moved, the buses ReactiveLimits froze, the SVCs switched on, hvdc regimes,
+taps, sections, parked units -- as a solve on the grid with the contingency applied resuming
+from it (lightsim2grid's batch row with ``init_from_n_powerflow``); DistributedSlack shares
+only what the actions lose beyond the contingency. A contingency that did not converge leaves
+its strategies the base start.
+
+Not supported (the row is reported in ``get_batch_unsupported_reasons()`` with NaN results,
+never raised for the batch): putting back an element disconnected in the base case, moving
+a storage unit, the slack generator, a generator taking part in the slack or one regulating a
+remote bus (as lightsim2grid's ScenarioSweep), two actions of one strategy setting different
+buses or values on one element. The full example is ``examples/contingency_x_actions.py``;
+the design and its status are in ``docs/dev_notes/topology_actions_plan.md``.
 
 .. automodule:: gpusim2grid.actions
    :members: Action, substation_elements

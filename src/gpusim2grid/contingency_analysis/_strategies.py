@@ -402,12 +402,15 @@ def strategy_row(
     for a in actions:
         if a.unsupported:
             return StrategyRow(None, reason=a.unsupported)
+    # an element end its contingency trips stays out whatever the actions do with it (the
+    # contingency's breakers stay open, as in OpenLoadFlow's security analysis): their moves of
+    # it are dropped, the rest of each action applies
     out_ends = _ctg_ends(ctg, n_lines)
-    for a in actions:
-        back = sorted(a.placed & out_ends)
-        if back:
-            name, el = back[0]
-            return StrategyRow(None, reason=f"puts back {name}[{el}], which its contingency trips")
+    actions = [
+        dataclasses.replace(a, moves={ref: g for ref, g in a.moves.items() if ref not in out_ends})
+        if a.placed & out_ends else a
+        for a in actions
+    ]
     lists = [set(x) for x in ctg]
     for a in actions:
         for k in range(10):

@@ -387,6 +387,26 @@ every row, the permanent current limits of the network:
 29 action sets name elements this snapshot lacks. Times (a GPU shared with another job:
 indicative only): phase 1 0.4 s, phase 2 115 s for 146 490 strategies in chunks of 10 000.
 
+**Result (2026-11-17, B.2 done, phase 2 warm-started from the contingencies, outer state
+included)**, same inputs, GPU 1 (free):
+
+| kind | situations | not run | status agrees | \|Δ max rho\| p50 | p99 | max | same worst branch |
+|---|---|---|---|---|---|---|---|
+| contingency | 185 | 0 | 100 % | 1.6e-8 | 1.3e-6 | 1.0e-5 | 100 % |
+| disconnection | 71 780 | 0 | 100 % | 1.7e-8 | 6.0e-6 | 2.0e-4 | 100 % |
+| no change | 58 275 | 0 | 100 % | 1.5e-8 | 1.6e-6 | 1.0e-5 | 100 % |
+| phase shifter tap | 740 | 0 | 100 % | 1.5e-8 | 3.5e-7 | 1.0e-5 | 100 % |
+| bus split / merge | 11 840 | 0 | 100 % | 2.3e-8 | 6.5e-6 | 2.6e-5 | 100 % |
+
+Phase 1 0.5 s, phase 2 82 s. The moves include 570 strategies moving the closed end of a
+half-open branch and 380 moving a generator (one of them a member of a voltage-control group).
+
+lightsim2grid note (no reference for warm generator moves under the outer loops): its
+ScenarioSweep with ``NROuter_*`` leaves a generator a topological action moves unregulated on
+its new bus (Q = 0, PQ), from scratch or resumed; its one-off solve and its ScenarioSweep
+without outer loops regulate it. The from-scratch rows are checked against the one-off solve,
+the warm ones against the resume rules (test_topo_outer_warm_start.py).
+
 ### 8.3 Union pattern cost
 
 On the French case: base nnz(J) vs union nnz(J) with all the case's splits, LU fill (own LU
@@ -403,7 +423,7 @@ plan), factor / solve time per batch, before and after.
 | A4 | the contingency session's warm path (new rows on the live driver, chunked) | 1 | deferred: the phases change the row count, the live driver's result buffers would have to be re-sized; chunked only (continuous rebuilds anyway, upstream A.6), ~0.1 s per phase; pinned by an xfail(strict) test |
 | B.1 | per-row branch admittance (taps) | 2 | done (row triplets in C++; the changed branch's flows / current violations recomputed on the host) |
 | A5 | warm start with the outer loops: each strategy resumes from its contingency's loop state; per-row accessors (`get_row_status`, `get_row_iterations`, `get_outer_results`, physical checks) on the caller's rows | 1 | done |
-| B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | S1-S3 done (also under the outer loops, warm or not); S4 moved-branch flows / violations, S5 generator moves to do |
+| B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | done: S1-S3 (also under the outer loops, warm or not), S4 moved-branch flows / violations, S5 generator moves (PV on the new bus, group members, under the outer loops: spares switchable in the outer model), half-open branches' closed ends; the contingency wins over an action's move of its elements |
 | — | switch actions → moves (lightsim2grid detailed topology), pattern banks; groups / gradients with moves | later | |
 
 The tests come first (`tests/python/topology_actions/`, red until their step lands), one file
@@ -413,11 +433,11 @@ per step:
 |---|---|---|
 | `test_topo_action_api.py` | D | `Action`: frozen, `apply_to` = lightsim2grid's calls, `validate`, `from_partition`, `combine` |
 | `test_topo_noop.py` | principle 1 | no actions / no-op actions: today's path, no spare bus |
-| `test_topo_trips.py` | A | strategy rows = union of trips, lightsim2grid, a trip counted once, conflicts per row, array input |
+| `test_topo_trips.py` | A | strategy rows = union of trips, lightsim2grid, a trip counted once, the contingency wins over an action, conflicts per row, array input |
 | `test_topo_branch_values.py` | B.1 | taps / ratios vs lightsim2grid, flows with the row's admittance |
-| `test_topo_bus_moves.py` | B.2 | splits, merges, a generator moved (PV), islands, 8 splits in one union pattern, flows, unsupported moves, analysis reuse |
+| `test_topo_bus_moves.py` | B.2 | splits, merges, a generator moved (PV), a group member moved, the closed end of a half-open branch, islands, 8 splits in one union pattern, flows / loading / violations of moved branches, refused moves, analysis reuse |
 | `test_topo_results.py` | A | max loading on the device, two calls = one, selection, warm start (fewer iterations), the two-phase recipe (violations as the condition), per-row statuses / outer results on the strategy rows |
-| `test_topo_outer_warm_start.py` | A5 | strategies resumed from their contingency's outer-loop state vs lightsim2grid's resumed batch, a no-op strategy gives its contingency back (its loss not shared twice), splits under the outer loops |
+| `test_topo_outer_warm_start.py` | A5 | strategies resumed from their contingency's outer-loop state vs lightsim2grid's resumed batch, a no-op strategy gives its contingency back (its loss not shared twice), splits and generator moves under the outer loops (warm and from scratch) |
 | `../violations/test_violation_threshold.py` | A | `violation_threshold` vs lightsim2grid's `ContingencyAnalysisCPP`, both facades, clamped voltage anchor, records not rescaled, invalidation |
 
 Code conventions for the new modules (those of the prototype): `from __future__ import

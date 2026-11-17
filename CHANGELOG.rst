@@ -28,7 +28,14 @@ Change Log
 - [ADDED] Strategy actions may change transformer values (``trafo_ratio`` / ``trafo_shift_deg``): per-row
   Ybus values on the base pattern; the changed transformer's flows and current violations use the row's.
 - [ADDED] Strategy actions may move elements between the buses of a substation (bus splits and merges):
-  spare buses and one union sparsity pattern for the run, unused spares masked per row.
+  spare buses and one union sparsity pattern for the run, unused spares masked per row; a moved branch's
+  flows and current violations on its new buses; a moved voltage-regulating generator holds its new bus
+  PV (its former bus PQ when nothing else regulates it), a group member leaves its group; the closed end
+  of a half-open branch moves with its Kron-reduced admittance. All of it with ``outer_loops=True`` too.
+- [CHANGED] An element end a strategy's contingency trips stays out whatever its actions do with it (the
+  action's move of it is dropped, the rest applies), instead of the row being reported unsupported.
+- [CHANGED] ``Action.apply_to`` leaves a half-open branch half-open when it moves the closed end
+  (lightsim2grid's ``change_bus*`` alone reconnects the open one).
 - [ADDED] ``strategy_warm_start`` with ``outer_loops=True``: a strategy resumes from its contingency's
   outer-loop state too (moved targets, frozen buses, regimes, taps), as lightsim2grid's batch row resuming
   from a solve; ``get_row_status`` / ``get_row_iterations`` / ``get_outer_results`` / the physical checks
