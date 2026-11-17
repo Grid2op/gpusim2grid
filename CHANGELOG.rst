@@ -4,20 +4,16 @@ Change Log
 [0.3.1] (unreleased)
 --------------------
 - [IMPROVED] The Newton voltage update applies its step as a product (no ``atan2``/``sin``/``cos`` per bus):
-  4x faster in FP64 on GPUs with a reduced FP64 rate, same results to rounding.
-- [IMPROVED] The Jacobian fill: fewer FP64 operations per entry and no warp divergence on the diagonal,
-  4.6x faster in FP64 on an RTX A1000, same results to rounding.
-- [IMPROVED] The batched Newton loop computes Ybus·V and the P/Q mismatch in one kernel instead of cuSPARSE's SpMV
-  and two fill kernels (an injection sweep reads one shared Ybus): 2x (time series) / 1.1x (N-1) faster.
-- [IMPROVED] ``InjectionSweepGPU(scheduling="continuous")`` keeps its driver across ``compute()`` calls, as the chunked
-  schedule: no Sbus rebuild, allocation or cuDSS analysis when only the injections change (-15 % per call).
-- [IMPROVED] ``ContingencyAnalysisGPU`` / ``ScenarioSweepGPU(scheduling="continuous")`` keep their driver across
-  ``compute()`` calls too (hot and warm runs; not with ``outer_loops``): N-1 -6 % per call.
-- [IMPROVED] ``scheduling="continuous"``: a Newton step reuses the residual pass's power mismatch for the slots
-  nothing changed since (N-1: the mismatch kernel 1.4x faster, same results).
-- [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's
-  (``slack_absorbed`` recalibrated first); a change re-solved that way is settled. At loose tolerances the
-  extra step changed the loops' decisions (a row cycling to ``max_outer_iterations``).
+  4x faster in FP64 on an RTX A1000.
+- [IMPROVED] The Jacobian fill: fewer FP64 operations per entry, no warp divergence on the diagonal (4.6x faster).
+- [IMPROVED] Ybus·V and the P/Q mismatch in one kernel instead of cuSPARSE's SpMV and two fills: time series 2x faster.
+- [IMPROVED] ``scheduling="continuous"`` keeps its driver across ``compute()`` calls on the three batch facades
+  (not with ``outer_loops``): no allocation or cuDSS analysis.
+- [IMPROVED] ``scheduling="continuous"``: a round's first Newton step reuses the residual pass's mismatch.
+- [FIXED] ``outer_loops=True``: an inner solve already within tolerance takes no Newton step, as lightsim2grid's;
+  the extra step changed the loops' decisions.
+- [BREAKING] ``outer_loops=True``: ``nb_nr_iterations`` / ``get_row_iterations()`` count the steps taken, 0 for an
+  inner solve converged from its start.
 
 [0.3.0] 2026-11-16
 --------------------
