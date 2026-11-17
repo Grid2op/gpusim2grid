@@ -271,11 +271,14 @@ class Action:
         open_before: set[ElementRef] = {
             ref for ref, _, bus in _element_ends(grid) if ref in moved_branches and bus == DISCONNECTED
         }
+        # every placement first, then every opening: a change_bus after the opening of the
+        # other end of its branch would close that end again
+        for name, el, bus in self.bus_items():
+            if bus != DISCONNECTED:
+                getattr(grid, _CHANGE_BUS[name])(int(el), int(bus))
         for name, el, bus in self.bus_items():
             if bus == DISCONNECTED:
                 getattr(grid, _DEACTIVATE[name])(int(el))
-            else:
-                getattr(grid, _CHANGE_BUS[name])(int(el), int(bus))
         for name, el in sorted(open_before):
             getattr(grid, _DEACTIVATE[name])(int(el))
         for el, ratio in self.trafo_ratio.items():

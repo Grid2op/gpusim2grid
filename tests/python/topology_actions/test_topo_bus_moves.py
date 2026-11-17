@@ -517,3 +517,56 @@ def test_bus_released_when_its_contingency_trips_the_other_regulator(solver_atol
     V = batch_V_global(ca, 2, grid.total_bus())
     V_ref, _ = oracle(grid, action=a, apply=lambda g: g.deactivate_storage(0))
     assert_row_matches(V[1], V_ref, solver_atol)
+
+
+#: case14 line 5 (buses 2 - 3): its side 2 stands on substation SUB
+LINE_2_3: int = 5
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+@pytest.mark.parametrize("opened_by", ["action", "contingency"])
+def test_branch_opened_at_one_end_and_moved_at_the_other(
+    settings: dict[str, Any], opened_by: str, solver_atol: float
+):
+    """Line 5 is opened at its side 1 (by the strategy's action, or by its contingency) and its
+    side 2 moved to the new bus of substation SUB (with the split of ``_split_sub3``): its
+    Kron-reduced charging lands on the new bus, as in lightsim2grid's one-off solve, and its
+    side-2 current is read there -- the move is not dropped."""
+    from gpusim2grid.actions import Action
+
+    grid = case14()
+    assert grid.get_lines()[LINE_2_3].bus2_id == SUB
+    split = _split_sub3(grid)
+    moved = Action(line_bus2={LINE_2_3: bus2(grid, SUB)})
+    opened = Action(line_bus1={LINE_2_3: -1})
+    ca = make_ca(grid, settings, batch_size=BATCH)
+    if opened_by == "action":
+        ca.add_contingencies_by_branch_id([[]])
+        ca.set_actions([Action.combine([split, moved, opened])])
+    else:
+        ca.add_contingency(branch_ids_side1=[LINE_2_3])
+        ca.set_actions([Action.combine([split, moved])])
+    ca.add_strategies([(0, [0])])
+    ca.compute(batch_size=BATCH)
+    assert not ca.get_batch_unsupported_reasons()[1]
+    V = batch_V_global(ca, 2, grid.total_bus())
+    V_ref, ref = oracle(grid, action=Action.combine([split, moved, opened]))
+    assert not ref.get_lines()[LINE_2_3].connected1 and ref.get_lines()[LINE_2_3].bus2_id == bus2(grid, SUB)
+    assert_row_matches(V[1], V_ref, solver_atol)
+    ca.compute_flows()
+    or_ka = ca.or_amps.to_numpy().reshape(2, ca.n_branches)[1] * 1e-3
+    ex_ka = ca.ex_amps.to_numpy().reshape(2, ca.n_branches)[1] * 1e-3
+    assert or_ka[LINE_2_3] == 0.0
+    np.testing.assert_allclose(ex_ka[LINE_2_3], ref.get_line_res2()[3][LINE_2_3], atol=10 * solver_atol, rtol=0)
+
+
+def test_branch_end_opened_and_moved_by_two_actions_is_unsupported():
+    """One action opens line 5 at side 2, another moves that same end: the row cannot decide,
+    it is refused, not run with either."""
+    from gpusim2grid.actions import Action
+
+    grid = case14()
+    split = _split_sub3(grid)
+    moved = Action(line_bus2={LINE_2_3: bus2(grid, SUB)})
+    ca, _ = _run(grid, {}, [[]], [Action.combine([split, moved]), Action(line_bus2={LINE_2_3: -1})], [(0, [0, 1])])
+    assert "line_bus2[5]" in ca.get_batch_unsupported_reasons()[1]

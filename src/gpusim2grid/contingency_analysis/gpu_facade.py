@@ -1077,7 +1077,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             changed: dict[int, RowBranch] = {b: (y, int(bf[b]), int(bt[b])) for b, y in row.branch_y.items()}
             if row.branch_ends:
                 assert topo is not None  # moves run on the union pattern
-                changed.update({b: (topo.branch_y[b], f2, t2) for b, (f2, t2) in row.branch_ends.items()})
+                changed.update({b: (row.branch_ends_y.get(b, topo.branch_y[b]), f2, t2)
+                                for b, (f2, t2) in row.branch_ends.items()})
             if changed:
                 self._row_branch[off + k] = changed
         self._rowmap = RowMap(n_out, np.asarray(session_rows, dtype=np.int64), reasons)

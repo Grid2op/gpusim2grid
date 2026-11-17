@@ -170,3 +170,19 @@ def test_apply_to_leaves_a_half_open_branch_half_open():
     moved = grid.get_lines()[2]
     assert moved.connected1 and not moved.connected2
     assert moved.bus1_id == bus2(grid, line.sub1_id)
+
+
+@pytest.mark.parametrize("kind", ["line", "trafo"])
+def test_apply_to_opens_one_end_and_moves_the_other(kind: str):
+    """One action opening a branch at one end and moving its other end: the branch ends up open
+    at the first end, on the new bus at the second -- whatever order lightsim2grid's calls come
+    in (a change_bus after the opening would close the opened end again)."""
+    from gpusim2grid.actions import Action
+
+    grid = case14()
+    el = grid.get_lines()[5] if kind == "line" else grid.get_trafos()[0]
+    new_bus: int = bus2(grid, el.sub2_id)
+    Action(**{f"{kind}_bus1": {el.id: -1}, f"{kind}_bus2": {el.id: new_bus}}).apply_to(grid)
+    after = grid.get_lines()[el.id] if kind == "line" else grid.get_trafos()[el.id]
+    assert not after.connected1 and after.connected2
+    assert after.bus2_id == new_bus

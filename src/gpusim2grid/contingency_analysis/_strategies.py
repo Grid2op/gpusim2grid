@@ -435,6 +435,9 @@ class StrategyRow:
     sbus: list[tuple[int, complex]] = dataclasses.field(default_factory=list)
     #: the new (from, to) solver buses of the branches its moves move (for their flows)
     branch_ends: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    #: the admittance of the moved branches whose block is not the base one (opened at one end
+    #: by the row, their other end moved: Kron-reduced onto it), for their flows
+    branch_ends_y: dict[int, BranchY] = dataclasses.field(default_factory=dict)
     #: base PV buses its moved generators leave without a regulator (PQ on this row)
     pv_release: list[int] = dataclasses.field(default_factory=list)
     #: (bus, |V| pu) its moved generators hold PV
@@ -516,13 +519,36 @@ def strategy_row(
     sbus: list[tuple[int, complex]] = []
     moved = _moved_branch_ends(moves, topo.n_lines, topo.branch_from, topo.branch_to, topo.solver)
     branch_ends: dict[int, tuple[int, int]] = {}
+    branch_ends_y: dict[int, BranchY] = {}
     for b, (f2, t2) in moved.items():
-        if b in opened:
-            continue  # the row opens it: nothing left to move
-        branch_ends[b] = (f2, t2)
+        if b in lists[0]:
+            continue  # the row trips it: nothing left to move
         if b in branch_y:
             return StrategyRow(None, reason=f"branch {b} is moved and its value changed by one strategy")
         f, t = int(topo.branch_from[b]), int(topo.branch_to[b])
+        open_side: int = 1 if b in lists[4] else 2 if b in lists[5] else 0
+        if open_side:
+            # opened at one end by the row (its actions or its contingency), moved at the other:
+            # the session's one-end trip leaves the kept end's Kron-reduced diagonal at its base
+            # bus (append_one_side_trips); it moves to the kept end's new bus. The branch stays
+            # one of the row's opened ones (flows, the outer loops' view).
+            kind, el = ("line", b) if b < topo.n_lines else ("trafo", b - topo.n_lines)
+            if (f"{kind}_bus{open_side}", el) in moves:
+                return StrategyRow(None, reason=f"{kind}_bus{open_side}[{el}] is both opened and moved by its actions")
+            y = topo.branch_y[b]
+            y_oo, y_ok, y_ko, y_kk = (y[0], y[1], y[2], y[3]) if open_side == 1 else (y[3], y[2], y[1], y[0])
+            if f < 0 or t < 0 or y_oo == 0:
+                continue  # nothing stamped at the opened end: the session's one-end trip does it all
+            y_red: complex = y_kk - y_ko * y_ok / y_oo
+            kept_old, kept_new = (t, t2) if open_side == 1 else (f, f2)
+            triplets.append((kept_old, kept_old, y_red.real, y_red.imag))  # subtracted: out of the old bus
+            triplets.append((kept_new, kept_new, -y_red.real, -y_red.imag))  # added at the new one
+            branch_ends[b] = (-1, kept_new) if open_side == 1 else (kept_new, -1)
+            branch_ends_y[b] = (0j, 0j, 0j, y_red) if open_side == 1 else (y_red, 0j, 0j, 0j)
+            occupancy[kept_old] -= 1
+            occupancy[kept_new] += 1
+            continue
+        branch_ends[b] = (f2, t2)
         # a half-open branch (an end open in the base case, -1): its block is lightsim2grid's
         # effective one, Kron-reduced onto the closed end, (y, 0, 0, 0) -- only that end moves
         # (placing the open one is a reconnection, refused by compile_action)
@@ -557,7 +583,8 @@ def strategy_row(
         return StrategyRow(None, reason=why)
     gen_bus = sorted((el, topo.solver(g)) for (name, el), g in moves.items() if name == "gen_bus")
     return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y, empty_buses=empty, sbus=sbus,
-                       branch_ends=branch_ends, pv_release=pv_release, pv_set=pv_set, gen_bus=gen_bus)
+                       branch_ends=branch_ends, branch_ends_y=branch_ends_y, pv_release=pv_release,
+                       pv_set=pv_set, gen_bus=gen_bus)
 
 
 def _voltage_control_of_moves(
