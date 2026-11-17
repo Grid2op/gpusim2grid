@@ -520,6 +520,7 @@ def strategy_row(
     moved = _moved_branch_ends(moves, topo.n_lines, topo.branch_from, topo.branch_to, topo.solver)
     branch_ends: dict[int, tuple[int, int]] = {}
     branch_ends_y: dict[int, BranchY] = {}
+    left: set[int] = set()  # the base buses its moves take an element end off
     for b, (f2, t2) in moved.items():
         if b in lists[0]:
             continue  # the row trips it: nothing left to move
@@ -547,6 +548,7 @@ def strategy_row(
             branch_ends_y[b] = (0j, 0j, 0j, y_red) if open_side == 1 else (y_red, 0j, 0j, 0j)
             occupancy[kept_old] -= 1
             occupancy[kept_new] += 1
+            left.add(kept_old)
             continue
         branch_ends[b] = (f2, t2)
         # a half-open branch (an end open in the base case, -1): its block is lightsim2grid's
@@ -563,6 +565,7 @@ def strategy_row(
             if old != new and old >= 0 and new >= 0:
                 occupancy[old] -= 1
                 occupancy[new] += 1
+                left.add(old)
     for (name, el), g in moves.items():
         if name.startswith(("line", "trafo")):
             continue
@@ -576,8 +579,16 @@ def strategy_row(
             sbus += [(old, -s_inj), (new, s_inj)]
         occupancy[old] -= 1
         occupancy[new] += 1
-    # the base buses its moves empty (the spares are masked by the session unless used)
-    empty = [int(b) for b in np.flatnonzero(occupancy[: topo.plan.n_solver] == 0)]
+        left.add(old)
+    # the element ends the row takes out (its contingency's and its actions' trips) hold no bus
+    # any more: a bus its moves leave with only those is empty too
+    for ref in _ctg_ends(tuple(lists), topo.n_lines):
+        bus = topo.current.get(ref, DISCONNECTED)
+        if ref not in moves and bus >= 0 and topo.me_to_solver[bus] >= 0:
+            occupancy[topo.me_to_solver[bus]] -= 1
+    # the base buses its moves empty (the spares are masked by the session unless used); a bus
+    # its trips alone empty is left to the session, as on its contingency's row
+    empty = [b for b in sorted(left) if b < topo.plan.n_solver and occupancy[b] <= 0]
     pv_release, pv_set, why = _voltage_control_of_moves(moves, gen_vm, lists, topo)
     if why:
         return StrategyRow(None, reason=why)

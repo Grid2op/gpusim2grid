@@ -570,3 +570,36 @@ def test_branch_end_opened_and_moved_by_two_actions_is_unsupported():
     moved = Action(line_bus2={LINE_2_3: bus2(grid, SUB)})
     ca, _ = _run(grid, {}, [[]], [Action.combine([split, moved]), Action(line_bus2={LINE_2_3: -1})], [(0, [0, 1])])
     assert "line_bus2[5]" in ca.get_batch_unsupported_reasons()[1]
+
+
+@pytest.mark.parametrize("opened_by", ["contingency", "action"])
+def test_bus_left_with_tripped_ends_only_is_empty(opened_by: str, solver_atol: float):
+    """Line 3 (buses 1 - 3) is tripped (by the contingency, or opened at its bus-3 end by the
+    action), and the action moves every other element of bus 3 to its bus 2: bus 3 holds nothing
+    connected any more, it is out of the row (lightsim2grid deactivates it), not an island that
+    would skip the row without handle_disconnected_grid."""
+    from gpusim2grid.actions import Action
+
+    grid = case14()
+    line: int = 3
+    assert grid.get_lines()[line].bus2_id == SUB
+    others = [e for e in _branch_ends(grid, SUB) if e != ("line_bus2", line)]
+    loads = [("load_bus", ld.id) for ld in grid.get_loads() if ld.bus_id == SUB]
+    move = _move(grid, SUB, others + loads)
+    ca = make_ca(grid, {}, batch_size=BATCH)
+    if opened_by == "contingency":
+        ca.add_contingencies_by_branch_id([[line]])
+        ca.set_actions([move])
+        ref_action = Action.combine([move, Action(line_bus1={line: -1}, line_bus2={line: -1})])
+    else:
+        ca.add_contingencies_by_branch_id([[]])
+        ref_action = Action.combine([move, Action(line_bus2={line: -1})])
+        ca.set_actions([ref_action])
+    ca.add_strategies([(0, [0])])
+    ca.compute(batch_size=BATCH)
+    assert not ca.get_batch_unsupported_reasons()[1]
+    assert np.isfinite(ca.last_residuals()[1])
+    V = batch_V_global(ca, 2, grid.total_bus())
+    V_ref, ref = oracle(grid, action=ref_action)
+    assert not ref.get_bus_status()[SUB]
+    assert_row_matches(V[1], V_ref, solver_atol)
