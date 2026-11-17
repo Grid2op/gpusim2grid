@@ -27,6 +27,7 @@ from _topo_helpers import (
     case118,
     make_ca,
     oracle,
+    with_current_limits,
 )
 from conftest import requires_gpu
 
@@ -234,12 +235,39 @@ def test_flows_of_moved_branches(settings: dict[str, Any], solver_atol: float):
     ca.compute_flows()
     nb = ca.n_branches
     n_lines = len(grid.get_lines())
-    or_ka = ca.or_amps.to_numpy().reshape(2, nb)[1]
-    ex_ka = ca.ex_amps.to_numpy().reshape(2, nb)[1]
+    or_ka = ca.or_amps.to_numpy().reshape(2, nb)[1] * 1e-3  # A -> kA, as lightsim2grid's results
+    ex_ka = ca.ex_amps.to_numpy().reshape(2, nb)[1] * 1e-3
     _, ref = oracle(grid, action=a)
     np.testing.assert_allclose(or_ka[:n_lines], ref.get_line_res1()[3], atol=10 * solver_atol, rtol=0)
     np.testing.assert_allclose(ex_ka[:n_lines], ref.get_line_res2()[3], atol=10 * solver_atol, rtol=0)
 
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_loading_and_current_violations_of_moved_branches(settings: dict[str, Any]):
+    """get_max_loading and the current violations read a moved branch's current at its new bus:
+    the row's loading and its violation count are lightsim2grid's."""
+    grid = with_current_limits(case14(), 1.05)
+    a = _split_sub3(grid)
+    ca = make_ca(grid, settings, batch_size=BATCH, compute_limit_violations=True)
+    ca.add_contingencies_by_branch_id([[]])
+    ca.set_actions([a])
+    ca.add_strategies([(0, [0])])
+    ca.compute(batch_size=BATCH)
+    _, ref = oracle(grid, action=a)
+    i1: np.ndarray = np.concatenate([ref.get_line_res1()[3], ref.get_trafo_res1()[3]])
+    i2: np.ndarray = np.concatenate([ref.get_line_res2()[3], ref.get_trafo_res2()[3]])
+    base1: np.ndarray = np.concatenate([grid.get_line_res1()[3], grid.get_trafo_res1()[3]])
+    lim1: np.ndarray = 1.05 * np.maximum(base1, 1e-3)
+    base2: np.ndarray = np.concatenate([grid.get_line_res2()[3], grid.get_trafo_res2()[3]])
+    lim2: np.ndarray = 1.05 * np.maximum(base2, 1e-3)
+    rho_ref: np.ndarray = np.fmax(i1 / lim1, i2 / lim2)
+    rho, branch = ca.get_max_loading()
+    np.testing.assert_allclose(rho[1], np.nanmax(rho_ref), rtol=1e-9)
+    assert branch[1] == int(np.nanargmax(rho_ref))
+    n_ref: int = int(np.sum(i1 > lim1 * (1 + 1e-9)) + np.sum(i2 > lim2 * (1 + 1e-9)))
+    assert ca.get_violation_counts()["current"][1] == n_ref
+    assert sum(v.violation_type.name == "CURRENT" for v in ca.get_violations()[1]) == n_ref
 
 def test_moved_regulator_of_a_voltage_control_group_is_unsupported():
     """§ 5.3: moving a controller of a remote / shared voltage control group, an HVDC end, or

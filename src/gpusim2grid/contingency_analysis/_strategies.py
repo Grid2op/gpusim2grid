@@ -29,7 +29,16 @@ from ..actions import DISCONNECTED, Action, ElementRef, current_buses
 if TYPE_CHECKING:
     from lightsim2grid.lightsim2grid_cpp import LSGrid
 
-__all__ = ["BranchY", "CompiledAction", "RowMap", "Strategy", "StrategyRow", "compile_action", "strategy_row"]
+__all__ = [
+    "BranchY",
+    "CompiledAction",
+    "RowBranch",
+    "RowMap",
+    "Strategy",
+    "StrategyRow",
+    "compile_action",
+    "strategy_row",
+]
 
 #: one contingency row of the session: the ten lists of ``ContingencyAnalysisGPU.add_contingencies``
 #: (branch, shunt, load, gen, branch side 1, branch side 2, sgen, storage, svc, hvdc ids)
@@ -39,6 +48,8 @@ Strategy = tuple[int, tuple[int, ...]]
 
 #: a branch's pi-model admittance, lightsim2grid's ``yac_eff_11, _12, _21, _22``
 BranchY = tuple[complex, complex, complex, complex]
+#: a branch as one row has it: its admittance and its (from, to) solver buses there
+RowBranch = tuple[BranchY, int, int]
 #: one Ybus value change: (row, col, re, im) in solver numbering, subtracted (as a trip's)
 Triplet = tuple[int, int, float, float]
 
@@ -326,6 +337,8 @@ class StrategyRow:
     empty_buses: list[int] = dataclasses.field(default_factory=list)
     #: (bus, dS pu) added to the row's Sbus (moved injections)
     sbus: list[tuple[int, complex]] = dataclasses.field(default_factory=list)
+    #: the new (from, to) solver buses of the branches its moves move (for their flows)
+    branch_ends: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
 
 
 def strategy_row(
@@ -395,9 +408,11 @@ def strategy_row(
     occupancy: np.ndarray = topo.occupancy.copy()
     sbus: list[tuple[int, complex]] = []
     moved = _moved_branch_ends(moves, topo.n_lines, topo.branch_from, topo.branch_to, topo.solver)
+    branch_ends: dict[int, tuple[int, int]] = {}
     for b, (f2, t2) in moved.items():
         if b in opened:
             continue  # the row opens it: nothing left to move
+        branch_ends[b] = (f2, t2)
         if b in branch_y:
             return StrategyRow(None, reason=f"branch {b} is moved and its value changed by one strategy")
         f, t = int(topo.branch_from[b]), int(topo.branch_to[b])
@@ -427,7 +442,8 @@ def strategy_row(
         occupancy[new] += 1
     # the base buses its moves empty (the spares are masked by the session unless used)
     empty = [int(b) for b in np.flatnonzero(occupancy[: topo.plan.n_solver] == 0)]
-    return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y, empty_buses=empty, sbus=sbus)
+    return StrategyRow(tuple(sorted(x) for x in lists), triplets, branch_y, empty_buses=empty, sbus=sbus,
+                       branch_ends=branch_ends)
 
 
 @dataclasses.dataclass
