@@ -1857,6 +1857,26 @@ void ContingencyAnalysisSession::set_row_empty_buses(const std::vector<std::vect
     ++contingencies_generation_;
 }
 
+void ContingencyAnalysisSession::set_row_unchecked_branches(const std::vector<std::vector<int>>& rows)
+{
+    static const char* who = "ContingencyAnalysisSession::set_row_unchecked_branches";
+    if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
+    if (rows.size() != contingencies_.size())
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(rows.size()) + " lists for "
+                                 + std::to_string(contingencies_.size()) + " rows");
+    const int n_bra = static_cast<int>(h_branch_from_.size());
+    for (size_t c = 0; c < rows.size(); ++c) {
+        std::vector<int> branches = rows[c];
+        for (int l : branches)
+            if (l < 0 || (has_branch_data_ && l >= n_bra))
+                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(l) + " out of range");
+        std::sort(branches.begin(), branches.end());
+        branches.erase(std::unique(branches.begin(), branches.end()), branches.end());
+        contingencies_[c].unchecked_branches = std::move(branches);
+    }
+    ++contingencies_generation_;
+}
+
 void ContingencyAnalysisSession::set_row_pv_moves(const std::vector<std::vector<int>>& release,
                                                   const std::vector<std::vector<std::pair<int, double>>>& pv,
                                                   const std::vector<std::vector<std::pair<int, int>>>& gen_bus)

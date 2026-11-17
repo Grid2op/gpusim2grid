@@ -517,6 +517,10 @@ struct ContingencyAnalysisSession {
     // its moves leave without any element (rare: [] for most rows; the call may be omitted
     // when no row empties a base bus), masked too (Contingency::empty_buses).
     void set_row_empty_buses(const std::vector<std::vector<int>>& rows);
+    // set_row_unchecked_branches: after build_contingencies*(), per row the branches the fused
+    // current check skips (Contingency::unchecked_branches): their block or ends differ from
+    // the shared ones on that row, the caller checks them itself. Counts exclude them.
+    void set_row_unchecked_branches(const std::vector<std::vector<int>>& rows);
     // add_row_sbus_deltas: after build_contingencies*(), per row (bus, dS pu) ADDED to the
     // row's Sbus (an injection moved between buses), merged per bus with the row's trips.
     void add_row_sbus_deltas(const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows);

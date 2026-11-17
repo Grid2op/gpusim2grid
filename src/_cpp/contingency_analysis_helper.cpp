@@ -1142,10 +1142,13 @@ void build_tripped_branch_table(
     h_trip_branch_flat.clear();
 
     for (int slot = 0; slot < n_active; ++slot) {
-        const auto& tb = contingencies[static_cast<size_t>(active_to_orig[slot])].tripped_branches;
+        const Contingency& ctg = contingencies[static_cast<size_t>(active_to_orig[slot])];
+        const auto& tb = ctg.tripped_branches;
+        const auto& ub = ctg.unchecked_branches;   // skipped by the check as a trip is
         h_trip_start[static_cast<size_t>(slot)] = static_cast<int>(h_trip_branch_flat.size());
-        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size());
+        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size() + ub.size());
         h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
+        h_trip_branch_flat.insert(h_trip_branch_flat.end(), ub.begin(), ub.end());
     }
 }
 

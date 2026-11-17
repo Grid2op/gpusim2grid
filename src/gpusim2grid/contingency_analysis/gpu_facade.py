@@ -1068,6 +1068,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         session_release: list[list[int]] = [[] for _ in ctg]
         session_pv: list[list[tuple[int, float]]] = [[] for _ in ctg]
         session_gen_bus: list[list[tuple[int, int]]] = [[] for _ in ctg]
+        # per session row, the branches whose block or ends it changes: the device check skips
+        # them, the host checks them from the row's own block (_changed_branch_violations)
+        session_unchecked: list[list[int]] = [[] for _ in ctg]
         # per session row, the session row of its contingency (-1: a contingency row)
         session_parent: list[int] = [-1] * n_ctg
         self._row_branch = {}
@@ -1093,6 +1096,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                 assert topo is not None  # moves run on the union pattern
                 changed.update({b: (row.branch_ends_y.get(b, topo.branch_y[b]), f2, t2)
                                 for b, (f2, t2) in row.branch_ends.items()})
+            session_unchecked.append(sorted(changed))
             if changed:
                 self._row_branch[off + k] = changed
         self._rowmap = RowMap(n_out, np.asarray(session_rows, dtype=np.int64), reasons)
@@ -1101,6 +1105,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         self._push_rows(session_list)
         if any(session_triplets):
             session.add_row_triplets(session_triplets)
+        if any(session_unchecked):
+            session.set_row_unchecked_branches(session_unchecked)
         if any(session_empty):
             session.set_row_empty_buses(session_empty)
         if any(session_sbus):
@@ -1172,13 +1178,15 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         V: np.ndarray = np.asarray(self._inner._s.get_V_rows([pos[r] for r in rows])).reshape(len(rows), -1)
         return dict(zip(rows, V))
 
-    def _changed_branch_violations(self, rows: dict[int, list[LimitViolation]]) -> dict[int, int]:
+    def _changed_branch_violations(self, rows: dict[int, list[LimitViolation]]) -> dict[int, tuple[int, bool]]:
         """In ``rows`` (caller row -> its records), the CURRENT records of the branches whose values
-        or ends a row changes replaced by the ones of its own admittance and buses (the device
-        check uses the base ones), in place; returns the change of each such row's current count.
-        Only those rows' voltages come to the host. Records keep the effective limit here
-        (``_restore_limits`` puts the configured one back); a row's current records stay most
-        severe first."""
+        or ends a row changes added from its own admittance and buses (the device check skips
+        them: set_row_unchecked_branches), in place; returns, per such row, what that adds to its
+        exact current count and whether its CURRENT records now went past violation_capacity
+        (the most severe kept, as the device keeps them). Only those rows' voltages come to the
+        host. Records keep the effective limit here (``_restore_limits`` puts the configured one
+        back); a row's current records stay most severe first. A row not solved (its single GRID
+        record) is left as it is."""
         from ._limit_violations import LimitViolation, LimitViolationType, ViolationElementType
 
         changed_rows: list[int] = [r for r in rows if r in self._row_branch]
@@ -1193,8 +1201,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         def branch_of(v: LimitViolation) -> int:
             return v.element_id + (int(n_lines) if v.element_type == ViolationElementType.TRAFO else 0)
 
-        delta: dict[int, int] = {}
+        capacity: int = int(self._inner.violation_capacity)
+        delta: dict[int, tuple[int, bool]] = {}
         for r in changed_rows:
+            if any(v.element_type == ViolationElementType.GRID for v in rows[r]):
+                continue  # not simulated / diverged: no limit check on that row
             changed = self._row_branch[r]
             kept = [v for v in rows[r] if not (v.violation_type == current and branch_of(v) in changed)]
             added: list[LimitViolation] = []
@@ -1209,11 +1220,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                         added.append(LimitViolation(
                             ViolationElementType.TRAFO if is_trafo else ViolationElementType.LINE,
                             b - int(n_lines) if is_trafo else b, side, current, ka, limit_ka))
-            removed: int = len(rows[r]) - len(kept)
             currents = sorted([v for v in kept if v.violation_type == current] + added,
                               key=lambda v: -abs(v.value / v.limit - 1.0))
-            rows[r] = currents + [v for v in kept if v.violation_type != current]
-            delta[r] = len(added) - removed
+            rows[r] = currents[:capacity] + [v for v in kept if v.violation_type != current]
+            delta[r] = (len(added), len(currents) > capacity)
         return delta
 
     def _flow_buffer(self, buf: DeviceBuffer, side: int) -> DeviceBuffer:
@@ -1695,7 +1705,13 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._rl_result is not None:
             for r, v in self._rl_result["viol_trunc"].items():
                 out[r] = v
-        return out[self._result_rows(rows)]
+        picked: np.ndarray = self._result_rows(rows)
+        if self._row_branch:
+            # the rows whose changed branches add CURRENT records past the capacity
+            changed: np.ndarray = picked[np.isin(picked, list(self._row_branch))]
+            for r, (_, past) in self._changed_branch_violations(self._violation_records(changed)).items():
+                out[r] |= past
+        return out[picked]
 
     def get_violation_counts(self, rows: ResultRows = ResultRows.ALL) -> dict[str, np.ndarray]:
         """dict of int ndarrays, one entry per row ``rows`` covers, with keys 'low_voltage',
@@ -1719,7 +1735,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             changed: np.ndarray = picked[np.isin(picked, list(self._row_branch))]
             delta = self._changed_branch_violations(self._violation_records(changed))
             where: dict[int, int] = {int(r): i for i, r in enumerate(picked)}
-            for r, d in delta.items():
+            for r, (d, _) in delta.items():
                 out["current"][where[r]] += d
         return out
 

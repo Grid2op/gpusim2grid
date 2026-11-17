@@ -603,3 +603,34 @@ def test_bus_left_with_tripped_ends_only_is_empty(opened_by: str, solver_atol: f
     V_ref, ref = oracle(grid, action=ref_action)
     assert not ref.get_bus_status()[SUB]
     assert_row_matches(V[1], V_ref, solver_atol)
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_current_counts_of_moved_branches_past_the_capacity(settings: dict[str, Any]):
+    """Current limits at half the base case currents: every branch side violates, far more than
+    violation_capacity (2). The row's exact CURRENT count is lightsim2grid's -- the moved
+    branch counted once, at its new bus --, its records keep the capacity's most severe and the
+    row is reported truncated."""
+    grid = with_current_limits(case14(), 0.5)
+    a = _split_sub3(grid)
+    ca = make_ca(grid, settings, batch_size=BATCH, compute_limit_violations=True)
+    ca.solver.violation_capacity = 2
+    ca.add_contingencies_by_branch_id([[]])
+    ca.set_actions([a])
+    ca.add_strategies([(0, [0])])
+    ca.compute(batch_size=BATCH)
+    _, ref = oracle(grid, action=a)
+    i1: np.ndarray = np.concatenate([ref.get_line_res1()[3], ref.get_trafo_res1()[3]])
+    i2: np.ndarray = np.concatenate([ref.get_line_res2()[3], ref.get_trafo_res2()[3]])
+    base1: np.ndarray = np.concatenate([grid.get_line_res1()[3], grid.get_trafo_res1()[3]])
+    base2: np.ndarray = np.concatenate([grid.get_line_res2()[3], grid.get_trafo_res2()[3]])
+    lim1, lim2 = 0.5 * np.maximum(base1, 1e-3), 0.5 * np.maximum(base2, 1e-3)
+    n_ref: int = int(np.sum(i1 > lim1 * (1 + 1e-9)) + np.sum(i2 > lim2 * (1 + 1e-9)))
+    assert n_ref > 2
+    assert ca.get_violation_counts()["current"][1] == n_ref
+    currents = [v for v in ca.get_violations()[1] if v.violation_type.name == "CURRENT"]
+    assert len(currents) == 2
+    assert ca.get_violations_truncated()[1]
+    # the most severe two of lightsim2grid's
+    sev = np.sort(np.concatenate([i1 / lim1, i2 / lim2]) - 1.0)[::-1]
+    np.testing.assert_allclose(sorted((v.value / v.limit - 1.0 for v in currents), reverse=True), sev[:2], rtol=1e-6)

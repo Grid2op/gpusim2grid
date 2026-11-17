@@ -1954,6 +1954,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
          "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
          "and no add_row_sbus_deltas bus on it), with no call.")
+    .def("set_row_unchecked_branches", &ContingencyAnalysisSession::set_row_unchecked_branches,
+         pybind11::arg("rows"),
+         "After build_contingencies*(): per row, the branches compute_limit_violations' current check "
+         "skips as it skips a tripped one (records and counts), because their admittance or ends on "
+         "that row are not the shared ones: the caller checks them from the row's own block.")
     .def("set_streaming", &ContingencyAnalysisSession::set_streaming,
          pybind11::arg("parent_of_row"), pybind11::arg("condition"), pybind11::arg("warm"),
          "Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a "

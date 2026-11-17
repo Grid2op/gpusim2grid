@@ -157,6 +157,11 @@ struct Contingency {
     // is a second, independent index space from Triplet::k (CSR flat index
     // into Ybus) — no interaction with resolve_indices()/build_flat_patches().
     std::vector<int> tripped_branches;
+    // Branches the same check skips although the row does not trip them: their
+    // admittance or their ends differ from the shared *_eff blocks on this row (a
+    // strategy's transformer values, its bus moves), so the caller checks them
+    // from the row's own block (set_row_unchecked_branches). Never read elsewhere.
+    std::vector<int> unchecked_branches;
 
     // Topology actions, bus moves on the union pattern (ContingencyAnalysisSession::
     // set_spare_buses): buses with no element in this row -- an unused spare bus, a bus a
