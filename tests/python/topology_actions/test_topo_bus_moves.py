@@ -407,3 +407,27 @@ def test_spare_bus_has_its_substation_voltage_limits(threshold: float, reread: b
     assert ca.get_violation_counts()["low_voltage"][1] == 2
     # the contingency row has no spare bus: only bus SUB
     assert {v.element_id for v in ca.get_violations()[0] if v.violation_type.name == "LOW_VOLTAGE"} == {SUB}
+
+
+@pytest.mark.parametrize("settings", ca_settings())
+def test_move_needing_no_new_entry_runs(settings: dict[str, Any], solver_atol: float):
+    """A grid where generator 2 stands on bus 2 of substation 5 with a branch end; the action
+    moves the generator alone back onto bus 5: no spare bus and no Ybus entry the base pattern
+    lacks (the union plan is empty), the row still runs on the base pattern and is lightsim2grid's
+    one-off solve (bus 5 PV at the generator's set-point, bus 2 PQ)."""
+    from gpusim2grid.actions import Action
+
+    grid = case14()
+    gen = grid.get_generators()[2]
+    sub: int = int(gen.bus_id)
+    split = _move(grid, sub, [("gen_bus", gen.id), _branch_ends(grid, sub)[0]])
+    split.apply_to(grid)
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.ones(grid.total_bus(), dtype=complex), 30, 1e-10).size > 0
+    back = Action(gen_bus={gen.id: sub})
+    ca, V = _run(grid, settings, [[]], [back], [(0, [0])])
+    assert not ca.get_batch_unsupported_reasons()[1]
+    assert ca.n_spare_buses == 0
+    V_ref, _ = oracle(grid, action=back)
+    assert_row_matches(V[1], V_ref, solver_atol)
+    np.testing.assert_allclose(abs(V[1, sub]), gen.target_vm_pu, atol=solver_atol)

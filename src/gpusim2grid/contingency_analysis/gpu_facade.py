@@ -1118,7 +1118,10 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         combos = {acts for _, acts in self._strategies}
         plan = plan_union(self._grid, self._compiled, combos, n_lines, bf, bt)
         if plan.is_empty():
-            return self._prepare_union_none()
+            # moves the base pattern already holds (no spare bus, no new entry): the base
+            # pattern, but the rows still need the context to place them
+            self._prepare_union_none()
+            return topology_context(self._grid, plan, n_lines, bf, bt)
         if self._union is None or (plan.parents, plan.entries) != (self._union.parents, self._union.entries):
             self._inner._s.set_spare_buses(plan.parents, plan.entries, plan.spare_global)
         self._union = plan
