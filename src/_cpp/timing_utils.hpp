@@ -464,6 +464,9 @@ struct BatchTimings {
     // unnecessary (the slot overwritten by a moved row, or out of the rounds)
     long long n_base_loads = 0;
     long long n_base_loads_skipped = 0;
+    // outer loops: the rows whose loops' state was set up by the host model (every load with
+    // outer_loops_backend HOST; with DEVICE, the rows not copied from a template on the device)
+    long long n_oc_host_loads = 0;
     // continuous: one record per round (the first one includes the initial load)
     std::vector<RoundRecord> round_records;
     // what ContingencyAnalysisSession::run does around the driver's solve (wall, ms): the

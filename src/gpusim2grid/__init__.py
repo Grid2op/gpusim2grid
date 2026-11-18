@@ -25,7 +25,7 @@ from .injection_sweep import InjectionSweepGPU
 from .scenario_sweep import ScenarioSweepGPU
 from .acpf_nr import AcPfGPU
 from ._gpusim2grid import warmup
-from ._outer_loops import outer_device_census
+from ._outer_loops import OuterLoopsBackend, outer_device_census
 
 __all__ = [
     "ContingencyAnalysisGPU",
@@ -38,6 +38,7 @@ __all__ = [
     "ScenarioSweepGPU",
     "AcPfGPU",
     "warmup",
+    "OuterLoopsBackend",
     "outer_device_census",
     "get_cmake_dir",
 ]

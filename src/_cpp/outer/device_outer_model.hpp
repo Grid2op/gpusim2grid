@@ -44,6 +44,8 @@ public:
     virtual void set_stream(void* stream) = 0;
     // the rows enter the slots (OuterHook::load of each, the slot states uploaded together)
     virtual void load_rows(const std::vector<int>& slots, const std::vector<int>& rows) = 0;
+    // the rows load_rows set up through the host model since begin() (the others: copies on the device)
+    virtual long long n_host_loads() const = 0;
     // every listed slot's inner solve ended (OuterHook::on_solved of each): converged or not, its
     // Newton steps and inner status; a converged one's gathered row (the driver's oc_gather layout,
     // `stride` doubles) is row d_grow[i] of d_gather. Writes the next step (0 Resolve, 1 Done) and the

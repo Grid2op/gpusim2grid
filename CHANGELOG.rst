@@ -11,8 +11,10 @@ Change Log
   same bits; a third fewer kernel launches on a 7k-bus N-1).
 - [IMPROVED] ``outer_loops=True``: a row disconnecting units or tripping lines takes its ReactiveLimits plan and
   DistributedSlack units by filtering the grid's (the same lists, a third of a row's load).
-- [ADDED] ``outer_loops_backend`` (``"host"`` default, today's path) on the three batch facades and
-  ``BatchPowerFlow``: ``"device"`` runs all seven outer loops in CUDA kernels (``outer_device_census``).
+- [ADDED] ``outer_loops_backend`` (``OuterLoopsBackend``, a str enum: ``HOST`` default, today's path) on the three
+  batch facades and ``BatchPowerFlow``: ``DEVICE`` runs all seven outer loops in CUDA kernels (``outer_device_census``).
+- [ADDED] ``timings.n_oc_host_loads``: the rows whose outer-loop state the host model set up (``DEVICE``: the rows
+  not copied from a template on the GPU), a load-independent measure of the CPU's share.
 - [IMPROVED] ``outer_loops=True``: the unrealistic-voltage check runs one block per converged row instead of
   one thread (12 ms per call on a 7k-bus grid, a fifth of an N-1 run's GPU time).
 

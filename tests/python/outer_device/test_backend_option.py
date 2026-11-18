@@ -16,9 +16,14 @@ import numpy as np
 import pytest
 from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_outer_loops
 
+import gpusim2grid._gpusim2grid as _cpp
+
 from conftest import requires_gpu
 
 pytestmark = [needs_outer_loops]
+
+#: the build's precision: the refusals must be the ones under test, not the precision check's (FP32 legs)
+PREC: str = "fp32" if _cpp.is_fp32 else "fp64"
 
 
 @pytest.fixture(scope="module")
@@ -68,16 +73,39 @@ def test_census_sees_the_resume_point(grid: Any):
 # ---- the option -----------------------------------------------------------------------------
 
 
+def test_backend_is_a_string_enum():
+    """``OuterLoopsBackend``: a str enum (``enum.StrEnum`` needs Python 3.11), its members equal to
+    their strings, which stay accepted"""
+    from gpusim2grid import OuterLoopsBackend
+
+    assert [b.value for b in OuterLoopsBackend] == ["host", "device"]
+    assert OuterLoopsBackend.HOST == "host" and OuterLoopsBackend.DEVICE == "device"
+    assert str(OuterLoopsBackend.DEVICE) == "device"
+    assert OuterLoopsBackend("device") is OuterLoopsBackend.DEVICE
+
+
+@requires_gpu
+@pytest.mark.parametrize("facade", range(3))
+@pytest.mark.parametrize("backend", ["device", "DEVICE_MEMBER"])
+def test_backend_takes_the_enum_or_its_string(grid_all_loops: Any, facade: int, backend: str):
+    """the facades take a member or its string, and give back the member"""
+    from gpusim2grid import OuterLoopsBackend
+
+    value = OuterLoopsBackend.DEVICE if backend == "DEVICE_MEMBER" else backend
+    obj = _facades()[facade](grid_all_loops, outer_loops=True, outer_loops_backend=value, precision=PREC)
+    assert obj.outer_loops_backend is OuterLoopsBackend.DEVICE
+
+
 @pytest.mark.parametrize("facade", range(3))
 def test_unknown_backend_is_refused(grid: Any, facade: int):
     with pytest.raises(ValueError, match="outer_loops_backend"):
-        _facades()[facade](grid, outer_loops=True, outer_loops_backend="gpu")
+        _facades()[facade](grid, outer_loops=True, outer_loops_backend="gpu", precision=PREC)
 
 
 @pytest.mark.parametrize("facade", range(3))
 def test_device_needs_the_outer_loops(grid: Any, facade: int):
     with pytest.raises(ValueError, match="needs outer_loops=True"):
-        _facades()[facade](grid, outer_loops_backend="device")
+        _facades()[facade](grid, outer_loops_backend="device", precision=PREC)
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +149,7 @@ def test_device_refuses_the_whole_batch_naming_what_is_missing(
 
     monkeypatch.setattr(ol._cpp, "_outer_device_census", census)
     with pytest.raises(NotImplementedError) as err:
-        _facades()[facade](grid, outer_loops=True, outer_loops_backend="device")
+        _facades()[facade](grid, outer_loops=True, outer_loops_backend="device", precision=PREC)
     msg = str(err.value)
     assert "a feature to come (2)" in msg
     assert "outer_loops_backend='host'" in msg
@@ -129,16 +157,19 @@ def test_device_refuses_the_whole_batch_naming_what_is_missing(
     assert "loop ReactiveLimits" not in msg
 
 
+@requires_gpu
 @pytest.mark.parametrize("facade", range(3))
 def test_device_runs_every_loop(grid_all_loops: Any, facade: int):
-    _facades()[facade](grid_all_loops, outer_loops=True, outer_loops_backend="device")
+    _facades()[facade](grid_all_loops, outer_loops=True, outer_loops_backend="device", precision=PREC)
 
 
 @requires_gpu
 @pytest.mark.parametrize("facade", range(3))
 def test_host_is_the_default(grid: Any, facade: int):
-    obj = _facades()[facade](grid, outer_loops=True)
-    assert obj.outer_loops_backend == "host"
+    from gpusim2grid import OuterLoopsBackend
+
+    obj = _facades()[facade](grid, outer_loops=True, precision=PREC)
+    assert obj.outer_loops_backend is OuterLoopsBackend.HOST
 
 
 @requires_gpu

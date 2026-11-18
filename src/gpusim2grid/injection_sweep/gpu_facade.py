@@ -32,7 +32,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
+from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
 
 __all__ = ["InjectionSweepGPU"]
 
@@ -193,7 +193,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         ``ir_n_steps=1`` with it (see there). Each row's generator targets are the ones :meth:`set_injections_from_elements` gives. With
         ``init_from_n_powerflow`` (default) the rows resume from where the
         grid's own solve left its loops. :meth:`get_outer_results`.
-    outer_loops_backend : {"host", "device"}, default "host"
+    outer_loops_backend : OuterLoopsBackend or {"host", "device"}, default OuterLoopsBackend.HOST
         Where the outer loops run with ``outer_loops=True`` (docs/outer_loops_on_device.md):
         ``"host"`` is lightsim2grid's loops ported on the host, ``"device"`` CUDA kernels. A grid
         whose loops use a feature ``"device"`` does not implement yet (see
@@ -232,7 +232,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                  use_distributed_slack=True,
                  compute_physical_violations=False, scheduling=None,
                  nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False,
-                 outer_loops_backend="host"):
+                 outer_loops_backend=OuterLoopsBackend.HOST):
         _validate_precision(precision)
         check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
         self._outer_loops = bool(outer_loops)
@@ -242,7 +242,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
-        if self._outer_loops_backend == "device":
+        if self._outer_loops_backend is OuterLoopsBackend.DEVICE:
             _check_outer_loops_device(grid, init_from_n_powerflow)
 
         # Single source of truth, resolved once here and applied at
@@ -296,7 +296,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                         else int(bool(scaling_max_voltage_change))),
                     max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
                     max_dVm_override=-1.0 if max_dVm is None else float(max_dVm),
-                    outer_backend=self._outer_loops_backend)
+                    outer_backend=self._outer_loops_backend.value)
                 self._inner = _InjectionSweepSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,

@@ -39,7 +39,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
+from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
 from ._reactive_limits import ReactiveLimitsStatus
 from ..actions import current_buses
 from ._strategies import (ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, UnionPlan, compile_action, plan_union,
@@ -343,7 +343,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         ``ir_n_steps=1`` with it (see there). Each contingency keeps the grid's targets. With
         ``init_from_n_powerflow`` (default) the rows resume from where the
         grid's own solve left its loops. :meth:`get_outer_results`.
-    outer_loops_backend : {"host", "device"}, default "host"
+    outer_loops_backend : OuterLoopsBackend or {"host", "device"}, default OuterLoopsBackend.HOST
         Where the outer loops run with ``outer_loops=True`` (docs/outer_loops_on_device.md):
         ``"host"`` is lightsim2grid's loops ported on the host, ``"device"`` CUDA kernels. A grid
         whose loops use a feature ``"device"`` does not implement yet (see
@@ -400,7 +400,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                  outer_loop_min_last_chunk=250, outer_loop_warm_start=True,
                  outer_loop_nb_iter=None, scheduling=None, nb_iter_per_round=1,
                  tol=None, outer_loops=False, keep_outer_trace=False, violation_threshold=1.0,
-                 outer_loops_backend="host",
+                 outer_loops_backend=OuterLoopsBackend.HOST,
                  strategy_condition=StrategyCondition.TRUE, strategy_warm_start=True):
         _validate_precision(precision)
         check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
@@ -422,7 +422,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                                     compute_physical_violations=compute_physical_violations,
                                     reactive_limits_outer_loop=reactive_limits_outer_loop)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
-        if self._outer_loops_backend == "device":
+        if self._outer_loops_backend is OuterLoopsBackend.DEVICE:
             _check_outer_loops_device(grid, init_from_n_powerflow)
         # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
         # built (lazily) from the same grid with the same construction options
@@ -517,7 +517,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                         else int(bool(scaling_max_voltage_change))),
                     max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
                     max_dVm_override=-1.0 if max_dVm is None else float(max_dVm),
-                    outer_backend=self._outer_loops_backend)
+                    outer_backend=self._outer_loops_backend.value)
                 self._inner = _ContingencyAnalysisSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,

@@ -6,6 +6,8 @@
 ``NROuterDist_*`` outer loops run per row (docs/dev_notes/continuous_batching.md, Part B; the
 C++ side is ``outer/``). What the three facades check alike."""
 
+from enum import Enum
+
 from . import _gpusim2grid as _cpp
 
 
@@ -43,17 +45,27 @@ def _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round, **u
         raise ValueError(f"outer_loops=True does not support {', '.join(bad)} yet")
 
 
-#: ``outer_loops_backend``: where the outer loops run (docs/outer_loops_on_device.md).
-OUTER_LOOPS_BACKENDS = ("host", "device")
+class OuterLoopsBackend(str, Enum):
+    """``outer_loops_backend``: where the outer loops run (docs/outer_loops_on_device.md). A str
+    enum (``enum.StrEnum`` needs Python 3.11): a member equals its string, which the facades
+    accept too."""
+
+    HOST = "host"      #: lightsim2grid's loops ported on the host (the default, today's behaviour)
+    DEVICE = "device"  #: the loops' decisions in CUDA kernels (``outer_loops=True`` only)
+
+    def __str__(self):
+        return self.value
 
 
 def _resolve_outer_loops_backend(backend, outer_loops):
-    """``outer_loops_backend`` checked against ``outer_loops``: ``"host"`` (the default,
-    lightsim2grid's loops ported on the host, today's behaviour) or ``"device"`` (CUDA kernels,
-    only with ``outer_loops=True``)."""
-    if backend not in OUTER_LOOPS_BACKENDS:
-        raise ValueError(f"outer_loops_backend must be one of {OUTER_LOOPS_BACKENDS}, got {backend!r}")
-    if backend == "device" and not outer_loops:
+    """``outer_loops_backend`` (a member or its string) checked against ``outer_loops``, as the
+    member."""
+    try:
+        backend = OuterLoopsBackend(backend)
+    except ValueError:
+        raise ValueError(f"outer_loops_backend must be one of {[b.value for b in OuterLoopsBackend]}, "
+                         f"got {backend!r}") from None
+    if backend is OuterLoopsBackend.DEVICE and not outer_loops:
         raise ValueError("outer_loops_backend='device' needs outer_loops=True")
     return backend
 

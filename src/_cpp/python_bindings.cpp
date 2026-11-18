@@ -1035,6 +1035,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "continuous: base-case loads of freed slots once the queue is empty")
         .def_readonly("n_base_loads_skipped", &BatchTimings::n_base_loads_skipped,
                       "continuous: base-case loads the tail made unnecessary (slot overwritten or out of the rounds)")
+        .def_readonly("n_oc_host_loads", &BatchTimings::n_oc_host_loads,
+                      "outer loops: rows whose loops' state the host model set up (backend HOST: every load; "
+                      "DEVICE: those not copied from a template on the device)")
         .def_readonly("n_tail_row_rounds", &BatchTimings::n_tail_row_rounds,
                       "Continuous scheduling: live rows summed over the rounds of the tail")
         .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,

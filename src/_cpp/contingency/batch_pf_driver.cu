@@ -3094,7 +3094,13 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             all_rows[static_cast<size_t>(s)] = a >= 0 ? _orig_row(a) : -1;
             if (dev_hook == nullptr) hook->load(s, all_rows[static_cast<size_t>(s)]);
         }
-        if (dev_hook != nullptr) dev_hook->load_rows(all, all_rows);
+        if (dev_hook != nullptr) {
+            const long long before = dev_hook->n_host_loads();
+            dev_hook->load_rows(all, all_rows);
+            t.n_oc_host_loads += dev_hook->n_host_loads() - before;
+        } else {
+            t.n_oc_host_loads += S;
+        }
         g2g_nvtx::pop();
         const auto t_c0 = std::chrono::steady_clock::now();
         t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
@@ -3415,7 +3421,13 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 loaded_rows.push_back(a >= 0 ? _orig_row(a) : -1);
                 if (dev_hook == nullptr) hook->load(s, loaded_rows.back());
             }
-            if (dev_hook != nullptr) dev_hook->load_rows(loaded, loaded_rows);
+            if (dev_hook != nullptr) {
+                const long long before = dev_hook->n_host_loads();
+                dev_hook->load_rows(loaded, loaded_rows);
+                t.n_oc_host_loads += dev_hook->n_host_loads() - before;
+            } else {
+                t.n_oc_host_loads += static_cast<long long>(loaded.size());
+            }
             g2g_nvtx::pop();
             const auto t_c0 = std::chrono::steady_clock::now();
             t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
