@@ -10,6 +10,7 @@
 // the driver first: the header's inline members need BatchPfDriverContext complete
 #include "../batch_pf_driver.cuh"   // BatchPfDriverContext (complete type)
 #include "contingency_batch.cuh"
+#include "../v_groups.cuh"         // v_groups_by_active, launch_gather_groups_to_slots
 
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,10 @@
 void ContingencyBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
 {
     initialize_patches(cs);
+    if (!h_vr_bus_.empty()) {
+        upload_h2d(d_vr_bus, h_vr_bus_.data(), h_vr_bus_.size(), cs);
+        upload_h2d(d_vr_vm,  h_vr_vm_.data(),  h_vr_vm_.size(),  cs);
+    }
     if (slack_.has_weights() && slack_.n_slack != ctx.base.n_slack)
         throw std::runtime_error(
             "[contingency_batch] per-row slack weight count does not match the base "
@@ -42,16 +47,51 @@ inline void cb_chk_cuda(cudaError_t e, const char* what)
 }
 
 // =============================================================================
+// set_v_groups — per-row starting voltages by group (see the header's doc).
+// =============================================================================
+void ContingencyBatch::set_v_groups(const cudaComplexType* d_groups, int n_groups,
+                                    const std::vector<int>& group_of_orig,
+                                    const cudaComplexType* d_fallback, cudaStream_t cs)
+{
+    has_v_groups_ = false;
+    if (d_groups == nullptr || d_fallback == nullptr || n_groups <= 0) return;
+    const std::vector<int> by_active = v_groups_by_active(group_of_orig, active_to_orig_, n_total_, n_groups);
+    upload_h2d(d_group_of_active, by_active.data(), by_active.size(), cs);
+    d_V_groups_   = d_groups;
+    d_V_fallback_ = d_fallback;
+    has_v_groups_ = true;
+}
+
+// =============================================================================
 // load_slots — fill the listed slots with their rows (see the header's doc).
 // =============================================================================
 void ContingencyBatch::load_slots(BatchPfDriverContext& ctx, const SlotLoadView& L,
                                   cudaStream_t cs, CudaTimer& timer, BatchTimings& t)
 {
-    // ①  base V
+    // ①  base V, or the row's group's (strategy_warm_start)
     timer.start();
-    launch_gather_rows_to_slots(ctx.d_V_batch, static_cast<const cudaComplexType*>(nullptr),
-                                thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
-                                L, ctx.n_bus, cs);
+    if (has_v_groups_ && L.n > 0 && ctx.n_bus > 0) {
+        cb_chk_cuda(launch_gather_groups_to_slots(ctx.d_V_batch, d_V_groups_,
+                                                  thrust::raw_pointer_cast(d_group_of_active.data()),
+                                                  d_V_fallback_, L.d_slot, L.d_row, L.n, ctx.n_bus, cs),
+                    "group V gather");
+    } else {
+        launch_gather_rows_to_slots(ctx.d_V_batch, static_cast<const cudaComplexType*>(nullptr),
+                                    thrust::raw_pointer_cast(ctx.base.d_V_base.data()),
+                                    L, ctx.n_bus, cs);
+    }
+    // ... the |V| of the buses a row holds PV (a generator moved there), its Q row pinned
+    vr_gather_.plan(vr_seg_, L.h_slot, L.h_row, L.n, cs);
+    if (vr_gather_.total > 0) {
+        vr_gather_.gather(b_vr_bus, d_vr_bus, cs);
+        vr_gather_.gather(b_vr_vm, d_vr_vm, cs);
+        apply_vm_reseed_kernel<<<(vr_gather_.total + BS - 1) / BS, BS, 0, cs>>>(
+            ctx.d_V_batch, vr_gather_.out_slot(),
+            thrust::raw_pointer_cast(b_vr_bus.data()),
+            thrust::raw_pointer_cast(b_vr_vm.data()),
+            vr_gather_.total, ctx.n_bus);
+        cb_chk_cuda(cudaGetLastError(), "vm reseed");
+    }
     t.t_tile_V += timer.stop_ms();
 
     // ②  base Ybus values

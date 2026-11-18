@@ -10,6 +10,8 @@ __all__ = [
     "LimitViolation",
     "ReactiveLimitsStatus",
     "RowStatus",
+    "StrategyCondition",
+    "ResultRows",
 ]
 
 import operator
@@ -613,9 +615,10 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         self._s.set_limits(bus_vmin_kv, bus_vmax_kv, branch_limit_a1_ka,
                            branch_limit_a2_ka, int(n_lines))
 
-    def get_violations(self):
+    def get_violations(self, rows=None):
         """list[list[LimitViolation]]: one entry per contingency (row order
-        matches build_contingencies()'s input list). A not-simulated
+        matches build_contingencies()'s input list); with ``rows`` (row
+        indices), one entry per listed row, in that order (only those built). A not-simulated
         (disconnected / masked-skip) contingency gets a single GRID/
         NOT_SIMULATED entry (value=limit=nan -- the solver was never
         invoked, there is no residual to report); a non-converged one gets a
@@ -646,7 +649,9 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
         status = self._s.get_row_status()
         unsupported = self._s.get_batch_unsupported_reasons()
         out = []
-        for c, cnt in enumerate(counts):
+        for c in (range(len(counts)) if rows is None else rows):
+            c = int(c)
+            cnt = int(counts[c])
             if c < len(status) and int(status[c]) in OUTER_FAILURE_STATUSES:
                 out.append([LimitViolation(ViolationElementType.GRID, -1, 0,
                                             LimitViolationType.DIVERGENCE,
@@ -777,3 +782,4 @@ class _ContingencyAnalysisSolver(PhysicalChecksEngineMixin, SlackRedistributionE
 # gpusim2grid.optimize_reference_slack (see docs/api.rst) to avoid duplicate
 # autodoc entries for the same classes/functions.
 from .gpu_facade import ContingencyAnalysisGPU, optimize_reference_slack
+from ._strategies import ResultRows, StrategyCondition

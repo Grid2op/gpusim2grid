@@ -235,3 +235,6 @@ docs/lightsim2grid_requirements.md
 20260831_neurips_paper/matpowerdata/*.json
 20260831_neurips_paper/matpowerdata/*.mat
 20260831_neurips_paper/raw_results/*.json
+
+# type stubs of the compiled modules (tools/generate_stubs.sh)
+typings/

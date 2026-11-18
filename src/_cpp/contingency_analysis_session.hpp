@@ -55,7 +55,10 @@
 #include <complex>
 #include <cstdint>
 #include <memory>
+
+struct RowFeed;   // contingency/batch_pf_driver.cuh: the continuous schedule's row queue
 #include <utility>
+#include <tuple>
 #include <vector>
 
 // Forward-declare CUDA-dependent types to avoid pulling CUDA headers
@@ -83,7 +86,12 @@ struct ContingencyAnalysisSession {
     // =========================================================================
     std::shared_ptr<AcPfNrState>               base_state_;   // shared: a v_base_dlpack() capsule co-owns it
     std::unique_ptr<ContingencyAnalysisSolver>  solver_;   // null until run(); then kept
-    std::unique_ptr<ContingencyAnalysisDeviceData> dev_;   // the generator mask of the physical checks
+    std::unique_ptr<ContingencyAnalysisDeviceData> dev_;
+    // starting voltages by group: a streamed strategy's from its contingency's (set_streaming;
+    // the buffer itself is in dev_)
+    bool             has_v_groups_ = false;
+    int              n_v_groups_   = 0;
+    std::vector<int> v_group_of_row_;
 
     // =========================================================================
     // Driver persistence (see BatchDriverConfig): run() keeps solver_ -- its
@@ -168,6 +176,20 @@ struct ContingencyAnalysisSession {
     bool   presolved_v_     = false;
     bool   debug_base_case_ = false;
     std::unique_ptr<LedgerData> base_ledger_;   // null in array/tuple mode
+    // set_spare_buses: the spare buses' parents and the union entries; the base inputs
+    // before any spare (restored by an empty call); n_orig_bus_ = their bus count.
+    std::vector<int>                 spare_parents_;
+    std::vector<int>                 spare_grid_bus_;
+    std::vector<std::pair<int, int>> spare_entries_;
+    bool                             union_active_ = false;   // spare buses or union entries (a merge)
+    int                              n_orig_bus_ = 0;
+    Eigen::SparseMatrix<eigen_cplx_type>                  Ybus_cm_orig_;
+    Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor> Ybus_rm_orig_;
+    CplxVect        Vinit_orig_, Sbus_base_orig_;
+    Eigen::VectorXi pq_orig_;
+    // a per-bus array of the n original buses, for the n+m of the batch: a spare bus takes
+    // its parent's value (nominal voltage) or `fill` (limits: NaN, not checked)
+    RealVect _bus_array_with_spares(const RealVect& a, bool from_parent, double fill) const;
     bool auto_reference_slack_ = false;
     int  forced_ref_bus_       = -1;
     int  grid_ref_bus_         = -1;
@@ -187,6 +209,8 @@ struct ContingencyAnalysisSession {
 
     // Host-side flow result storage (filled by compute_flows()).
     RealVect h_or_amps_;
+    // the flows of every row on the device (d_or_amps_results / d_ex_amps_results)
+    void _compute_flows_device();
     RealVect h_ex_amps_;
 
     // =========================================================================
@@ -243,6 +267,17 @@ struct ContingencyAnalysisSession {
     bool               has_gen_data_ = false;
     std::vector<std::vector<int>> ctg_shunts_, ctg_loads_, ctg_gens_;
     std::vector<std::vector<std::pair<int, std::complex<double>>>> ctg_sbus_ds_;
+    // set_row_pv_moves, per row (empty: no row has one)
+    std::vector<std::vector<int>> row_pv_release_;
+    std::vector<std::vector<std::pair<int, double>>> row_pv_set_;
+    std::vector<std::vector<std::pair<int, int>>> row_gen_bus_;
+    // set_streaming: per row its contingency's row (empty: no streaming), the condition, the
+    // warm start, each contingency row's V group; the last run's released rows
+    std::vector<int>  stream_parent_;
+    int               stream_condition_ = 0;
+    bool              stream_warm_ = false;
+    std::vector<int>  stream_group_of_ctg_;
+    std::vector<char> stream_released_;
     bool has_gen_trips_ = false;
     // the buses the base ledger was extended with (a generator trip releases them
     // on some row), and the ones each row releases
@@ -371,6 +406,13 @@ struct ContingencyAnalysisSession {
     // Requires run() and set_branch_data() to have been called.
     // =========================================================================
     void compute_flows();
+    // Per row of the last run(): the highest |I| / limit over the branches and their two sides
+    // (lim*_ka per branch, kA; NaN / <= 0 ignored) and the branch reaching it (-1: none), reduced
+    // on the device from the flows (computed there, never copied to the host). `skip`: flat
+    // row * n_branches + branch entries left out (the caller computes those itself).
+    std::pair<RealVect, std::vector<int>> compute_max_loading(Eigen::Ref<const RealVect> lim1_ka,
+                                                              Eigen::Ref<const RealVect> lim2_ka,
+                                                              const std::vector<long long>& skip);
 
     // =========================================================================
     // compute_limit_violations
@@ -419,6 +461,7 @@ struct ContingencyAnalysisSession {
     // Result accessors — synchronous D→H copy on demand.
     // =========================================================================
     CplxVect get_V_results()  const;   // (n_contingencies * n_bus,)  complex
+    CplxVect get_V_rows(const std::vector<int>& rows) const;   // (len(rows) * n_bus,) those rows only
     RealVect get_residuals()  const;   // (n_contingencies,)           real
 
     // Overwrite the voltages and residuals of rows dst_rows[i] with row
@@ -444,6 +487,63 @@ struct ContingencyAnalysisSession {
     std::uintptr_t v_results_ptr() const;
     // Rows of the result buffers v_results_ptr() points to (0 before run()).
     int result_rows() const;
+
+    // Per-row Ybus value changes on top of the rows build_contingencies*() made (a
+    // transformer's ratio / phase shift: its four entries, step B.1 of the topology actions):
+    // one list of (row, col, re, im) per row, in solver bus numbering, SUBTRACTED from the
+    // row's Ybus like the trips' own triplets (so a change to y_new is y_base - y_new). Every
+    // (row, col) must be in the base pattern. Call after build_contingencies*(); the next
+    // run() builds a new source.
+    void add_row_triplets(const std::vector<std::vector<std::tuple<int, int, double, double>>>& rows);
+
+    // ---- topology actions, bus moves on a union pattern (step B.2) ----------
+    // set_spare_buses: m = parents.size() spare buses appended after the n solver buses
+    // (ids n .. n+m-1), spare k starting from the voltage of solver bus parents[k]; entries:
+    // the Ybus entries (i, j) over the n+m buses the batch's rows need (explicit zeros in the
+    // base case; base entries are fine). The base state is rebuilt at once on that union
+    // (Ybus, V, Sbus, PQ spares, the ledger through extend_ledger_union, the spare buses'
+    // P / Q rows pinned in the base solve): n_bus() is n+m afterwards, and the contingency
+    // rows' triplets resolve on the union at the next run(). Empty lists restore the
+    // original base (today's path). Grid (ledger) mode only.
+    // spare_grid_bus: each spare's grid bus (an empty busbar of the grid), needed with the
+    // outer loops (their labelling has the spares under it); may be empty otherwise.
+    void set_spare_buses(const std::vector<int>& parents, const std::vector<std::pair<int, int>>& entries,
+                         const std::vector<int>& spare_grid_bus = {});
+    int  n_spare_buses() const { return static_cast<int>(spare_parents_.size()); }
+    // Masking per row: a spare bus is masked in a row by DEFAULT, unless the row uses it --
+    // one of its add_row_triplets entries (row or col) or one of its add_row_sbus_deltas
+    // buses is that spare (derived on the host when the source is built, nothing to send).
+    // set_row_empty_buses: after build_contingencies*(), one list per row of the BASE buses
+    // its moves leave without any element (rare: [] for most rows; the call may be omitted
+    // when no row empties a base bus), masked too (Contingency::empty_buses).
+    void set_row_empty_buses(const std::vector<std::vector<int>>& rows);
+    // set_row_unchecked_branches: after build_contingencies*(), per row the branches the fused
+    // current check skips (Contingency::unchecked_branches): their block or ends differ from
+    // the shared ones on that row, the caller checks them itself. Counts exclude them.
+    void set_row_unchecked_branches(const std::vector<std::vector<int>>& rows);
+    // add_row_sbus_deltas: after build_contingencies*(), per row (bus, dS pu) ADDED to the
+    // row's Sbus (an injection moved between buses), merged per bus with the row's trips.
+    void add_row_sbus_deltas(const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows);
+    // set_row_pv_moves: after build_contingencies*(), per row, the generator moves' voltage
+    // control: `release` the PV buses it leaves without a regulator (PQ for that row: reserved
+    // like a generator trip's), `pv` the (bus, |V| pu) it holds PV (Q row pinned, |V| seeded at
+    // the set-point). Not with the outer loops (such a row is reported unsupported).
+    // gen_bus: per row, the (generator, solver bus) placements of its moved generators, for
+    // the outer loops (they see each generator on its row's bus); may be empty without them.
+    void set_row_pv_moves(const std::vector<std::vector<int>>& release,
+                          const std::vector<std::vector<std::pair<int, double>>>& pv,
+                          const std::vector<std::vector<std::pair<int, int>>>& gen_bus = {});
+    // Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a
+    // contingency row); the contingency rows run first and each releases its strategies when it
+    // finishes, if `condition` holds (0 TRUE, 1 ANY_VIOLATION: at least one violation, the limit
+    // checks on), each strategy then starting from its contingency's converged state when `warm`
+    // (voltages, and the outer loops' state). One list per row of build_contingencies*();
+    // clear_streaming() goes back to the plain queue.
+    void set_streaming(const std::vector<int>& parent_of_row, int condition, bool warm);
+    void clear_streaming();
+    std::unique_ptr<RowFeed> _make_stream_feed();
+    // last streamed run: per row, whether it was released (a contingency row: always)
+    const std::vector<char>& streamed_rows() const { return stream_released_; }
     RealVect get_or_amps()    const;   // (n_contingencies * n_branches,) real
     RealVect get_ex_amps()    const;   // (n_contingencies * n_branches,) real
     BatchTimings get_timings() const { return timings_; }
@@ -488,6 +588,7 @@ struct ContingencyAnalysisSession {
     void set_outer_model(std::shared_ptr<outer::OuterHook> model) { outer_ = std::move(model); }
     bool has_outer_model() const { return static_cast<bool>(outer_); }
     const outer::OuterHook* outer_model() const { return outer_.get(); }
+    outer::OuterHook* outer_model() { return outer_.get(); }
 
     PhysicalChecksConfig&       physical_checks()       { return phys_; }
     const PhysicalChecksConfig& physical_checks() const { return phys_; }

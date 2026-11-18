@@ -122,3 +122,28 @@ input = "./src/gpusim2grid/__init__.py"
 regex = '''^__version__\s*=\s*"(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?"$'''
 result = "{major}.{minor}.{patch}.{prerelease}"
 remove = '''\.None$'''
+
+[tool.ruff]
+# Applied to new and changed files only; the existing code is not reformatted wholesale.
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, bugbear, pyupgrade, simplify, annotations (typed signatures)
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ANN"]
+# Any is allowed (e.g. **kwargs forwarded to a facade)
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+# test functions return None by definition
+"tests/**" = ["ANN201"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["gpusim2grid"]
+known-local-folder = ["conftest", "_topo_helpers"]
+
+[tool.pyright]
+# Pylance / pyright: stubs of the compiled modules (tools/generate_stubs.sh, git-ignored), and
+# the test helpers imported by name (conftest, _topo_helpers).
+stubPath = "typings"
+extraPaths = ["tests/python", "tests/python/topology_actions", "examples", "benchmarks/topology_actions"]

@@ -1870,6 +1870,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Compute per-branch ampere flows for every contingency from the stored "
          "voltages (tripped branches zeroed). Requires run() and set_branch_data().")
+    .def("get_V_rows", &ContingencyAnalysisSession::get_V_rows, pybind11::arg("rows"),
+         pybind11::call_guard<pybind11::gil_scoped_release>(),
+         "Copy the voltages of the listed rows only to host: (len(rows) * n_bus,) complex128.")
     .def("get_V_results",  &ContingencyAnalysisSession::get_V_results,
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Copy batch voltages to host: (n_contingencies * n_bus,) complex128.")
@@ -1912,6 +1915,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "loop's second pass. Requires run() on both.")
     .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
          "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
+    .def("compute_max_loading", &ContingencyAnalysisSession::compute_max_loading,
+         pybind11::arg("lim1_ka"), pybind11::arg("lim2_ka"), pybind11::arg("skip") = std::vector<long long>(),
+         "Per row of the last run(): (rho, branch), the highest |I| / limit over the branches and "
+         "their two sides and the branch reaching it (-1: none), reduced on the device; skip: flat "
+         "row * n_branches + branch entries left out.")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Copy origin-terminal ampere flows to host: (n_contingencies * n_branches,). "
@@ -1928,10 +1936,57 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "Number of buses in the grid.")
     .def_property_readonly("n_branches",      &ContingencyAnalysisSession::n_branches,
          "Number of branches (lines + trafos); available after set_branch_data().")
+    .def("add_row_triplets", &ContingencyAnalysisSession::add_row_triplets, pybind11::arg("rows"),
+         "Per-row Ybus value changes after build_contingencies*(): one list of (row, col, re, im) per "
+         "row, solver numbering, subtracted from the row's Ybus as the trips' own (a change to y_new is "
+         "y_base - y_new). Every entry must be in the base pattern.")
+    .def("set_spare_buses", &ContingencyAnalysisSession::set_spare_buses,
+         pybind11::arg("parents"), pybind11::arg("entries"), pybind11::arg("spare_grid_bus") = std::vector<int>(),
+         "Bus moves (topology actions): m = len(parents) spare buses appended after the n solver "
+         "buses (ids n..n+m-1), spare k starting from solver bus parents[k]'s voltage; entries: the "
+         "Ybus entries (i, j) over the n+m buses the rows need (explicit zeros in the base case). "
+         "Rebuilds the base state on that union at once (n_bus is n+m afterwards); empty lists "
+         "restore the original base. Grid mode only. spare_grid_bus: each spare's grid bus (an empty "
+         "busbar), needed with the outer loops.")
+    .def_property_readonly("n_spare_buses", &ContingencyAnalysisSession::n_spare_buses)
+    .def("set_row_empty_buses", &ContingencyAnalysisSession::set_row_empty_buses, pybind11::arg("rows"),
+         "After build_contingencies*(): per row, the BASE buses its moves leave without any element, "
+         "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
+         "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
+         "and no add_row_sbus_deltas bus on it), with no call.")
+    .def("set_row_unchecked_branches", &ContingencyAnalysisSession::set_row_unchecked_branches,
+         pybind11::arg("rows"),
+         "After build_contingencies*(): per row, the branches compute_limit_violations' current check "
+         "skips as it skips a tripped one (records and counts), because their admittance or ends on "
+         "that row are not the shared ones: the caller checks them from the row's own block.")
+    .def("set_streaming", &ContingencyAnalysisSession::set_streaming,
+         pybind11::arg("parent_of_row"), pybind11::arg("condition"), pybind11::arg("warm"),
+         "Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a "
+         "contingency row); each contingency releases its strategies when it finishes, if the "
+         "condition holds (0 TRUE, 1 ANY_VIOLATION), each starting from its contingency's converged "
+         "state when warm (voltages, outer-loop state).")
+    .def("clear_streaming", &ContingencyAnalysisSession::clear_streaming)
+    .def_property_readonly("streamed_rows", [](const ContingencyAnalysisSession& s) {
+            std::vector<bool> out(s.streamed_rows().begin(), s.streamed_rows().end());
+            return out;
+        }, "Last streamed run: per row, whether it was released (a contingency row: always).")
+    .def("set_row_pv_moves", &ContingencyAnalysisSession::set_row_pv_moves,
+         pybind11::arg("release"), pybind11::arg("pv"),
+         pybind11::arg("gen_bus") = std::vector<std::vector<std::pair<int, int>>>(),
+         "After build_contingencies*(): per row, the voltage control of its moved generators: "
+         "`release` the base PV buses it leaves without a regulator (PQ on that row), `pv` the "
+         "(bus, |V| pu) it holds PV (Q row pinned, |V| seeded at the set-point); gen_bus the "
+         "(generator, solver bus) placements, for the outer loops.")
+    .def("add_row_sbus_deltas", &ContingencyAnalysisSession::add_row_sbus_deltas, pybind11::arg("rows"),
+         "After build_contingencies*(): per row, (bus, dS pu) added to the row's Sbus (an injection "
+         "moved between buses), merged per bus with the row's trips.")
     .def_readonly("driver_build_counter", &ContingencyAnalysisSession::driver_build_counter_,
         "Batch drivers built so far. run() keeps the driver (allocations, cuDSS "
         "ANALYSIS, factorization state) while the settings it was built with "
         "and the contingency list are unchanged, so this only grows when one of them changed.")
+    .def_readonly("base_state_generation", &ContingencyAnalysisSession::base_state_generation_,
+        "Base states built so far (base-case solve and its cuDSS ANALYSIS): grows when the "
+        "reference slack, the reserved buses or the union pattern of the bus moves change.")
     .def_readwrite("batch_size", &ContingencyAnalysisSession::batch_size_,
                    "Contingencies per GPU chunk (takes effect on the next run())")
     .def_readonly("used_batch_size", &ContingencyAnalysisSession::used_batch_size_,

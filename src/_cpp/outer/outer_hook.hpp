@@ -21,10 +21,13 @@
 #define GPUSIM2GRID_OUTER_HOOK_HPP
 
 #include <cmath>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
+
+struct LedgerData;
 
 namespace outer {
 
@@ -139,6 +142,9 @@ struct RowOverrides {
     std::vector<std::vector<int>> hvdc_off;
     // n_rows x n_storage, row-major: 1 = the row disconnects the storage unit
     std::vector<char> storage_off;
+    // per row, the (generator id, solver bus) it places on another bus of its substation (a
+    // topological action, OuterRowView::Units::bus_solver)
+    std::vector<std::vector<std::pair<int, int>>> gen_bus;
     // per row, the active power its contingency loses (MW, generator convention, at the
     // grid's targets) that DistributedSlack shares before its first solve (redistribute_slack,
     // lightsim2grid's OuterRowView::lost_p_mw); NaN: nothing to share
@@ -233,6 +239,26 @@ public:
     virtual void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) = 0;
     // The rows' other changes (see RowOverrides); replaces the previous ones.
     virtual void set_row_overrides(RowOverrides overrides) = 0;
+    // Keep, for every row of the next run whose loops end stable, where they left them (its
+    // resume point: moved targets, frozen buses, regimes, taps...), for the rows of the same run
+    // that resume from it (set_row_resume). Set before begin().
+    virtual void keep_row_points(bool keep) {
+        if (keep) throw std::runtime_error("this outer model cannot keep the rows' resume points");
+    }
+    // Per row of the next run, the row of that run whose point it resumes from (kept as that row
+    // ends: a row resuming from one loads after it), as a solve resuming from that row's: -1, or
+    // a row that did not end stable, resumes from the grid's own solve (resume_from_n) or from
+    // scratch. Empty: none.
+    virtual void set_row_resume(std::vector<int> point_of_row) {
+        if (!point_of_row.empty()) throw std::runtime_error("this outer model cannot resume rows from kept points");
+    }
+    // The session's buses grew by spare buses (topology actions, the last ones), or went back
+    // to the base (none): `ledger` the session's (spares included, switchable: PQ unless a row
+    // holds one PV), `spare_grid_bus` each spare's grid bus (an empty busbar of the grid).
+    virtual void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) {
+        (void)ledger;
+        if (!spare_grid_bus.empty()) throw std::runtime_error("this outer model cannot take spare buses");
+    }
 };
 
 }  // namespace outer

@@ -27,7 +27,10 @@
 //   segment per ACTIVE row (patch_seg_)
 // =============================================================================
 
+#include <algorithm>
 #include <chrono>
+#include <iterator>
+#include <stdexcept>
 #include <complex>
 #include <thrust/device_vector.h>
 #include <vector>
@@ -107,6 +110,16 @@ struct ContingencyBatch {
     thrust::device_vector<cuda_real_type> d_flat_delta_re;
     thrust::device_vector<cuda_real_type> d_flat_delta_im;
     SegmentGather                         patch_gather_;
+    // Per-row |V| reseeds (Contingency::vm_reseed: a bus a strategy row holds PV -- a generator
+    // moved onto it -- at its set-point, its Q row pinned), one segment per ACTIVE row
+    std::vector<int>                      h_vr_bus_;
+    std::vector<cuda_real_type>           h_vr_vm_;
+    RowSegments                           vr_seg_;
+    thrust::device_vector<int>            d_vr_bus;
+    thrust::device_vector<cuda_real_type> d_vr_vm;
+    SegmentGather                         vr_gather_;
+    thrust::device_vector<int>            b_vr_bus;
+    thrust::device_vector<cuda_real_type> b_vr_vm;
     thrust::device_vector<int>            b_flat_k;
     thrust::device_vector<cuda_real_type> b_flat_delta_re;
     thrust::device_vector<cuda_real_type> b_flat_delta_im;
@@ -125,6 +138,24 @@ struct ContingencyBatch {
     // unconditionally (cheap: O(n_active + total_trips) ints) so it costs
     // nothing when nobody enables compute_limit_violations.
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Starting voltages by group (ContingencyAnalysisGPU.strategy_warm_start): a
+    // row of group g >= 0 starts from row g of d_V_groups_ (a contingency's
+    // converged V, owned by the session), its non-finite entries (masked buses)
+    // from the base case; group -1 starts from the base case. d_group_of_active
+    // is per ACTIVE row. Off (has_v_groups_ false) = today's base-case start.
+    // -------------------------------------------------------------------------
+    const cudaComplexType*     d_V_groups_   = nullptr;
+    const cudaComplexType*     d_V_fallback_ = nullptr;
+    thrust::device_vector<int> d_group_of_active;
+    bool                       has_v_groups_ = false;
+
+    // group_of_orig: one group per ORIGINAL row (-1 = base case), < n_groups
+    void set_v_groups(const cudaComplexType* d_groups, int n_groups,
+                      const std::vector<int>& group_of_orig,
+                      const cudaComplexType* d_fallback, cudaStream_t cs);
+    void clear_v_groups() { has_v_groups_ = false; }
+
     std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
     thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
 
@@ -153,6 +184,11 @@ struct ContingencyBatch {
     //   max_batch_size: upper bound on systems per chunk (the user batch_size).
     //                   The effective per-chunk size is rebalanced over the
     //                   ACTIVE (connected) count and exposed via used_batch_size().
+    //   n_spare       : spare buses of the union pattern (the last n_spare of Ybus_rm's,
+    //                   topology actions' bus moves): left out of the connectivity graph;
+    //                   every row's empty buses (Contingency::empty_effective) are masked.
+    //   union_pattern : Ybus_rm is a union pattern (spare buses or merge entries): its
+    //                   explicit zeros are no edges of the connectivity graph.
     // -------------------------------------------------------------------------
     ContingencyBatch(std::vector<Contingency>& contingencies,
                      const int*                Ybus_rm_outer,
@@ -160,7 +196,9 @@ struct ContingencyBatch {
                      const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                      int                       max_batch_size,
                      const MaskConfig*         mask_cfg = nullptr,
-                     bool                      mask_mode = true)
+                     bool                      mask_mode = true,
+                     int                       n_spare = 0,
+                     bool                      union_pattern = false)
     {
         auto t_start = std::chrono::steady_clock::now();
         n_total_ = static_cast<int>(contingencies.size());
@@ -172,10 +210,23 @@ struct ContingencyBatch {
         // mask_cfg without mask_mode: no largest-component masking, only the
         // per-row pins (lightsim2grid's held controllers) need its positions
         mask_mode_ = (mask_cfg != nullptr) && mask_mode;
+        const int n_graph = static_cast<int>(Ybus_rm.rows()) - n_spare;
         if (mask_mode_)
-            compute_component_masks(contingencies, Ybus_rm, *mask_cfg);
+            compute_component_masks(contingencies, Ybus_rm, *mask_cfg, n_graph, union_pattern);
         else
-            check_connectivity(contingencies, Ybus_rm);
+            check_connectivity(contingencies, Ybus_rm, n_graph, union_pattern);
+        // empty buses (no element in the row): masked whatever the mode, with the islands
+        bool any_empty = false;
+        for (auto& ctg : contingencies) {
+            if (ctg.disconnected || ctg.empty_effective.empty()) continue;
+            any_empty = true;
+            std::vector<int> merged;
+            std::set_union(ctg.masked_buses.begin(), ctg.masked_buses.end(),
+                           ctg.empty_effective.begin(), ctg.empty_effective.end(), std::back_inserter(merged));
+            ctg.masked_buses.swap(merged);
+        }
+        if (any_empty && mask_cfg == nullptr)
+            throw std::runtime_error("ContingencyBatch: rows with empty buses need the mask configuration");
 
         // Rebalance the chunk size over the ACTIVE (simulated) contingencies —
         // the ones actually solved — rather than the full input count.  This
@@ -199,14 +250,37 @@ struct ContingencyBatch {
         bool any_pins = false;
         for (const auto& ctg : contingencies)
             if (!ctg.pinned_buses.empty() || !ctg.vc_pinned_ctrl.empty()) { any_pins = true; break; }
-        if (mask_mode_ || (mask_cfg != nullptr && any_pins))
+        if (mask_mode_ || (mask_cfg != nullptr && (any_pins || any_empty)))
             build_mask_entries(contingencies, active_to_orig_, /*batch_size=*/1,
                                *mask_cfg, mask_.h);
 
         build_tripped_branch_table(contingencies, active_to_orig_,
                                    h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+        _build_vm_reseed(contingencies);
 
         t_preprocess_ms = cb_ms_since(t_start);
+    }
+
+    // Flatten the rows' Contingency::vm_reseed into the per-row h_vr_* stream (one segment
+    // per ACTIVE row), as ScenarioSweepBatch.
+    void _build_vm_reseed(const std::vector<Contingency>& contingencies)
+    {
+        h_vr_bus_.clear(); h_vr_vm_.clear(); vr_seg_.clear();
+        bool any = false;
+        for (int o : active_to_orig_)
+            if (!contingencies[static_cast<size_t>(o)].vm_reseed.empty()) { any = true; break; }
+        if (!any) return;
+        std::vector<ChunkPatchRange> ranges(active_to_orig_.size(), ChunkPatchRange{0, 0});
+        for (size_t a = 0; a < active_to_orig_.size(); ++a) {
+            const int start = static_cast<int>(h_vr_bus_.size());
+            for (const auto& bv : contingencies[static_cast<size_t>(active_to_orig_[a])].vm_reseed) {
+                if (bv.first < 0) throw std::runtime_error("[contingency_batch] vm_reseed: negative bus");
+                h_vr_bus_.push_back(bv.first);
+                h_vr_vm_.push_back(static_cast<cuda_real_type>(bv.second));
+            }
+            ranges[a] = ChunkPatchRange{start, static_cast<int>(h_vr_bus_.size()) - start};
+        }
+        vr_seg_.from_ranges(ranges);
     }
 
     // Effective per-chunk size (rebalanced over the active/simulated count).

@@ -105,3 +105,13 @@ later calls, and the transposed system being built on the first backward only.
 
 .. literalinclude:: ../examples/batch_differentiable_pf.py
    :language: python
+
+Contingency x action screening, in two phases
+---------------------------------------------
+
+Solves N-1 contingencies, then -- for the ones violating a current limit only -- every
+candidate action (lines opened, loads shed) on the same session, and ranks the actions of each
+contingency by the highest loading they leave.
+
+.. literalinclude:: ../examples/contingency_x_actions.py
+   :language: python
