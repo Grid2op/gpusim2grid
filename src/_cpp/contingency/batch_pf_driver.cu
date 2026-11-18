@@ -20,6 +20,7 @@
 #include "violation_kernels.cuh"            // check_limit_violations_kernel
 #include "../outer/outer_kernels.cuh"       // the outer loops' per-slot controls
 #include "slot_ranges.hpp"                  // slot_upload_ranges
+#include "../nvtx_range.hpp"                // nsys ranges of the continuous round
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -1922,7 +1923,7 @@ void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const
             thrust::raw_pointer_cast(d_oc_list_.data()),
             thrust::raw_pointer_cast(d_oc_watch_.data()),
             n, n_watch, Lo.n_ctrl, base.n_bus, oc_stride_);
-    oc_unrealistic_kernel<<<(n + BS - 1) / BS, BS, 0, cs>>>(
+    oc_unrealistic_kernel<<<n, BS, 0, cs>>>(
         thrust::raw_pointer_cast(d_oc_gather_.data()), buf.d_V,
         base.slack_col >= 0 ? thrust::raw_pointer_cast(d_slack_absorbed_batch.data()) : nullptr,
         Lo.pin_bus.empty() ? nullptr : thrust::raw_pointer_cast(d_oc_pin_.data()),
@@ -2879,6 +2880,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
 
     oa_.ready = false;
     if (hook != nullptr) {
+        g2g_nvtx::Range nv("oc_begin");
         const auto t_l0 = std::chrono::steady_clock::now();
         _oc_setup();
         if (keep_outer_adjoint_) _oa_alloc();
@@ -2953,15 +2955,19 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     _load(_load_view(S, -1, n_live), timer, t);
     if (hook != nullptr) {
         const auto t_l0 = std::chrono::steady_clock::now();
+        g2g_nvtx::push("oc_load");
         std::vector<int> all(static_cast<size_t>(S));
         for (int s = 0; s < S; ++s) {
             all[static_cast<size_t>(s)] = s;
             const int a = h_slot_row()[s];
             hook->load(s, a >= 0 ? _orig_row(a) : -1);
         }
+        g2g_nvtx::pop();
         const auto t_c0 = std::chrono::steady_clock::now();
         t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
+        g2g_nvtx::push("oc_controls");
         _oc_write_controls(all, /*reload_sbus=*/false);
+        g2g_nvtx::pop();
         t.t_oc_controls += TimingEntry{0., ms_since(t_c0)};
     }
     enter_tail(n_live);   // fewer rows than slots: the queue is empty already
@@ -2972,6 +2978,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     std::vector<RowStatus> leave_st(static_cast<size_t>(S));
     std::vector<double> gbuf;
     while (n_live > 0) {
+        g2g_nvtx::Range nv_round(in_tail ? "round (tail)" : "round");
         rec_n_cur  = n_cur;
         rec_n_live = n_live;
         // the check leaves every slot's flag at 1 on the device (its passes stored or
@@ -3042,8 +3049,11 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             const outer::Layout& Lo = hook->layout();
             const int n_watch = static_cast<int>(Lo.watch_bus.size());
             const auto t_g0 = std::chrono::steady_clock::now();
+            g2g_nvtx::push("oc_gather");
             _oc_gather(conv, buf);
+            g2g_nvtx::pop();
             const auto t_g1 = std::chrono::steady_clock::now();
+            g2g_nvtx::push("oc_decide");
             t.t_oc_gather += TimingEntry{0., std::chrono::duration<double, std::milli>(t_g1 - t_g0).count()};
             gbuf.resize(static_cast<size_t>(oc_stride_));
             size_t ci = 0;
@@ -3081,6 +3091,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                     leave_st[static_cast<size_t>(s)] = static_cast<RowStatus>(final_status);
                 }
             }
+            g2g_nvtx::pop();
             t.t_oc_decide += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_g1).count()};
         }
@@ -3142,6 +3153,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         for (int s : loaded)  set_clean(s, s + 1, 0);
         if (!reenter.empty()) {
             const auto t_c0 = std::chrono::steady_clock::now();
+            g2g_nvtx::Range nv("oc_controls (re-solve)");
             _oc_write_controls(reenter, /*reload_sbus=*/true);
             t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_c0).count()};
@@ -3218,12 +3230,15 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         if (n_load > 0) _load(_load_view(n_load, -1, n_load_real), timer, t);
         if (hook != nullptr && n_load > 0) {
             const auto t_l0 = std::chrono::steady_clock::now();
+            g2g_nvtx::push("oc_load");
             for (int s : loaded) {
                 const int a = h_slot_row()[s];
                 hook->load(s, a >= 0 ? _orig_row(a) : -1);
             }
+            g2g_nvtx::pop();
             const auto t_c0 = std::chrono::steady_clock::now();
             t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
+            g2g_nvtx::Range nv("oc_controls");
             _oc_write_controls(loaded, /*reload_sbus=*/false);
             t.t_oc_controls += TimingEntry{0., std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_c0).count()};

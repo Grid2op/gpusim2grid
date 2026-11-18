@@ -1,6 +1,11 @@
 Change Log
 ===========
 
+[0.3.2] (unreleased)
+--------------------
+- [IMPROVED] ``outer_loops=True``: the unrealistic-voltage check runs one block per converged row instead of
+  one thread (12 ms per call on a 7k-bus grid, a fifth of an N-1 run's GPU time).
+
 [0.3.1] (unreleased)
 --------------------
 - [IMPROVED] The Newton voltage update applies its step as a product (no ``atan2``/``sin``/``cos`` per bus):

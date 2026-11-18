@@ -85,7 +85,7 @@ __global__ void oc_gather_kernel(
     const int*             __restrict__ d_watch,      // [n_watch]
     int n_list, int n_watch, int n_ctrl, int n_bus, int stride);
 
-// One thread per (listed slot): 1 when some candidate bus whose magnitude is a
+// One block per listed slot (launch with n_list blocks): 1 when some candidate bus whose magnitude is a
 // Newton unknown in that slot (not a pinned switchable bus) is outside
 // [vmin, vmax], written to out[i * stride + stride - 1]; the slot's
 // slack_absorbed (0 without one) to out[i * stride + stride - 2].
