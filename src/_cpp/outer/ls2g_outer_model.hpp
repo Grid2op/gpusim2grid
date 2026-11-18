@@ -19,8 +19,11 @@
 #define GPUSIM2GRID_LS2G_OUTER_MODEL_HPP
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "outer_hook.hpp"
+#include "device_tables.hpp"
 
 namespace ls2g { class LSGrid; }
 struct LedgerData;
@@ -40,6 +43,28 @@ struct Ls2gModelOptions {
 
 // whether the lightsim2grid built against exposes the loops' state (resume_from_n)
 bool ls2g_outer_resume_available();
+
+// One feature of a grid's outer loops, as the model sees it (docs/outer_loops_on_device.md,
+// §4.2): how many of it the grid has (0: none) and whether outer_loops_backend='device'
+// implements it. A feature the grid has and the device does not implement refuses 'device'.
+struct DeviceFeature {
+    std::string name;
+    int count = 0;
+    bool supported = false;
+};
+
+// The features of `grid`'s outer loops (the model built on `ledger` with `options`), every
+// one listed, those the grid lacks with count 0. Read off the model's own plans, so the
+// census sees exactly what the host model runs.
+// The device model of `grid` (outer_loops_backend='device', outer/device_outer_model.hpp): a
+// host model kept for the loads and the tables, the decisions in kernels.
+std::shared_ptr<OuterHook> make_device_outer_model(const ls2g::LSGrid& grid,
+                                                   const LedgerData& ledger,
+                                                   const Ls2gModelOptions& options);
+
+std::vector<DeviceFeature> outer_device_census(const ls2g::LSGrid& grid,
+                                               const LedgerData& ledger,
+                                               const Ls2gModelOptions& options);
 
 // The model of `grid` (solved, its algorithm an NROuter_* one), on the ledger the
 // session solves (`ledger`, extracted from that same grid). Throws when the grid

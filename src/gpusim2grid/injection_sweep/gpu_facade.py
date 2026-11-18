@@ -32,7 +32,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import _check_outer_loops_args
+from .._outer_loops import _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
 
 __all__ = ["InjectionSweepGPU"]
 
@@ -193,6 +193,12 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         ``ir_n_steps=1`` with it (see there). Each row's generator targets are the ones :meth:`set_injections_from_elements` gives. With
         ``init_from_n_powerflow`` (default) the rows resume from where the
         grid's own solve left its loops. :meth:`get_outer_results`.
+    outer_loops_backend : {"host", "device"}, default "host"
+        Where the outer loops run with ``outer_loops=True`` (docs/outer_loops_on_device.md):
+        ``"host"`` is lightsim2grid's loops ported on the host, ``"device"`` CUDA kernels. A grid
+        whose loops use a feature ``"device"`` does not implement yet (see
+        :func:`gpusim2grid.outer_device_census`) raises ``NotImplementedError`` at construction,
+        for the whole batch. Construction-time only.
 
     Examples
     --------
@@ -225,7 +231,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                  scaling_max_voltage_change=None, max_dVa=None, max_dVm=None,
                  use_distributed_slack=True,
                  compute_physical_violations=False, scheduling=None,
-                 nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False):
+                 nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False,
+                 outer_loops_backend="host"):
         _validate_precision(precision)
         check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
         self._outer_loops = bool(outer_loops)
@@ -234,6 +241,9 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         if self._outer_loops:
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations)
+        self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
+        if self._outer_loops_backend == "device":
+            _check_outer_loops_device(grid, init_from_n_powerflow, keep_outer_trace=keep_outer_trace)
 
         # Single source of truth, resolved once here and applied at
         # construction time to BOTH the base-case solve and the batch solver
@@ -285,7 +295,8 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                         -1 if scaling_max_voltage_change is None
                         else int(bool(scaling_max_voltage_change))),
                     max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
-                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm),
+                    outer_backend=self._outer_loops_backend)
                 self._inner = _InjectionSweepSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
@@ -440,6 +451,11 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         # ReactiveLimits' capability curves)
         if self._outer_loops:
             self._inner._s.set_outer_gen_p_rows(np.ascontiguousarray(self._gen_p_rows))
+
+    @property
+    def outer_loops_backend(self):
+        """str: where the outer loops run, ``"host"`` or ``"device"`` (construction-time only)."""
+        return self._outer_loops_backend
 
     @property
     def outer_loops(self):

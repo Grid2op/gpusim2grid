@@ -41,3 +41,40 @@ def _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round, **u
     bad = [name for name, value in unsupported.items() if value]
     if bad:
         raise ValueError(f"outer_loops=True does not support {', '.join(bad)} yet")
+
+
+#: ``outer_loops_backend``: where the outer loops run (docs/outer_loops_on_device.md).
+OUTER_LOOPS_BACKENDS = ("host", "device")
+
+
+def _resolve_outer_loops_backend(backend, outer_loops):
+    """``outer_loops_backend`` checked against ``outer_loops``: ``"host"`` (the default,
+    lightsim2grid's loops ported on the host, today's behaviour) or ``"device"`` (CUDA kernels,
+    only with ``outer_loops=True``)."""
+    if backend not in OUTER_LOOPS_BACKENDS:
+        raise ValueError(f"outer_loops_backend must be one of {OUTER_LOOPS_BACKENDS}, got {backend!r}")
+    if backend == "device" and not outer_loops:
+        raise ValueError("outer_loops_backend='device' needs outer_loops=True")
+    return backend
+
+
+def _check_outer_loops_device(grid, resume_from_n, **host_only):
+    """Raise ``NotImplementedError`` when ``outer_loops_backend='device'`` cannot run this grid:
+    every feature of its outer loops the device backend does not implement yet
+    (``_outer_device_census``) and every option only the host backend has (``host_only``:
+    name -> value, a truthy value counts). Nothing is run partly on the host: the whole batch is
+    refused, before any GPU work."""
+    census = _cpp._outer_device_census(grid, bool(resume_from_n))
+    missing = [f"{name} ({count})" for name, count, supported in census if count > 0 and not supported]
+    missing += [name for name, value in host_only.items() if value]
+    if missing:
+        raise NotImplementedError(
+            "outer_loops_backend='device' does not implement yet: " + "; ".join(missing)
+            + ". Use outer_loops_backend='host'.")
+
+
+def outer_device_census(grid, init_from_n_powerflow=False):
+    """The features of a solved ``NROuter_*`` grid's outer loops, as ``(name, count,
+    supported)``: how many of each the grid has (0: none) and whether
+    ``outer_loops_backend='device'`` implements it."""
+    return [tuple(f) for f in _cpp._outer_device_census(grid, bool(init_from_n_powerflow))]

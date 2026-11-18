@@ -100,7 +100,7 @@ __global__ void oc_unrealistic_kernel(
     int n_list, int n_cand, int n_pin, int n_bus, int stride,
     cuda_real_type vmin, cuda_real_type vmax);
 
-// One thread per entry: d_Sbus[slot * n_bus + bus] += (dp, dq).
+// One thread per entry: d_Sbus[slot * n_bus + bus] += (dp, dq); an entry with bus -1 is skipped.
 __global__ void oc_sbus_delta_kernel(
           cudaComplexType* __restrict__ d_Sbus,
     const int*             __restrict__ d_slot,

@@ -234,7 +234,7 @@ __global__ void oc_sbus_delta_kernel(
     int n, int n_bus)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
+    if (t >= n || d_bus[t] < 0) return;   // bus -1: an unused entry of a fixed block
     cudaComplexType& s = d_Sbus[static_cast<ptrdiff_t>(d_slot[t]) * n_bus + d_bus[t]];
     s = CudaFunHelper::my_make_cuComplex(CudaFunHelper::my_cuCreal(s) + d_dp[t],
                                          CudaFunHelper::my_cuCimag(s) + d_dq[t]);

@@ -11,6 +11,7 @@
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <stdio.h>            // printf
 #include <stdlib.h>           // EXIT_FAILURE
+#include <cstdlib>            // std::getenv
 #include <stdexcept>          // std::runtime_error
 #include <string>             // std::string
 
@@ -548,6 +549,19 @@ struct CudaDeviceScalar {
 //
 // All three throw std::runtime_error on CUDA failure.
 // ---------------------------------------------------------------------------
+// upload_h2d into a buffer that only grows (amortised): no resize (a thrust value-initialising
+// fill, which synchronises) once it holds the largest list; dst.size() is a capacity then
+template<typename T>
+void upload_h2d_grow(thrust::device_vector<T>& dst, const T* src, std::size_t n, cudaStream_t stream)
+{
+    if (dst.size() < n) dst.resize(n + n / 2 + 64);
+    if (n == 0) return;
+    cudaError_t err = cudaMemcpyAsync(thrust::raw_pointer_cast(dst.data()), src, n * sizeof(T),
+                                      cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("upload_h2d_grow: ") + cudaGetErrorString(err));
+}
+
 template<typename T>
 void upload_h2d(thrust::device_vector<T>& dst,
                 const T*                  src,
@@ -725,11 +739,26 @@ struct CudaTimer {
 
     // Records the stop event, synchronises (so wall time is accurate),
     // then returns {gpu_ms, wall_ms}.
+    //
+    // GPUSIM2GRID_ASYNC_TIMERS=1 (opt-in, read once per process): no synchronisation, {0, the
+    // host's enqueue time}. Each timed phase otherwise makes the host wait for the GPU, which then
+    // idles for the next launch: on a launch-bound loop (many short kernels, the continuous
+    // schedule's tail) that is most of its idle time. No result depends on these waits: every
+    // read of device data on the host has its own synchronisation.
     TimingEntry stop_ms() {
+        if (async_timers()) return {0., ms_since(_wall_start)};
         _stop.record(_stream);
         _stop.synchronize();   // CPU waits for GPU — wall_ms is now valid
         double wall_ms = ms_since(_wall_start);
         return {static_cast<double>(_stop.elapsed_since(_start)), wall_ms};
+    }
+
+    static bool async_timers() {
+        static const bool on = [] {
+            const char* e = std::getenv("GPUSIM2GRID_ASYNC_TIMERS");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
     }
 };
 

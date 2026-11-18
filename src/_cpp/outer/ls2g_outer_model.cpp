@@ -17,6 +17,7 @@
 // =============================================================================
 
 #include "ls2g_outer_model.hpp"
+#include "device_outer_model.hpp"
 
 #include "../ledger_data.hpp"
 
@@ -36,6 +37,8 @@
 #include <powerflow_algorithm/outer_loop/ShuntVoltageControlLoop.hpp>
 
 #include <algorithm>
+#include <array>
+#include <tuple>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -435,7 +438,7 @@ void hvdc_flows(int st, double raw, double lf1, double lf2, double r, double pma
     else               { p1 = -hvdc_recv(pmax21, false, lf1, lf2, r); p2 = pmax21; }
 }
 
-class Ls2gOuterModel final : public OuterHook {
+class Ls2gOuterModel final : public OuterHook, public DeviceHostSide {
 public:
     Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledger, const Ls2gModelOptions& opt);
 
@@ -458,6 +461,11 @@ public:
     void keep_row_points(bool keep) override { keep_points_ = keep; }
     void set_row_resume(std::vector<int> point_of_row) override { resume_of_row_ = std::move(point_of_row); }
     void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) override;
+    // see outer_device_census
+    std::vector<DeviceFeature> census() const;
+    // the device model's inputs (outer/device_tables.hpp)
+    DeviceTables device_tables() const override;
+    void device_slot_image(int slot, DeviceSlotImage& img) const override;
 
 private:
     // ---- static data -------------------------------------------------------------
@@ -3494,6 +3502,361 @@ std::shared_ptr<OuterHook> make_ls2g_outer_model(const ls2g::LSGrid& grid, const
                                                  const Ls2gModelOptions& options)
 {
     return std::make_shared<Ls2gOuterModel>(grid, ledger, options);
+}
+
+// =============================================================================
+// The device backend's feature census (docs/outer_loops_on_device.md, §4.2)
+// =============================================================================
+std::vector<DeviceFeature> Ls2gOuterModel::census() const
+{
+    std::vector<DeviceFeature> out;
+    // what outer_loops_backend='device' runs (device_outer_model.cu); every other feature refuses it
+    static const std::set<std::string> device_runs = {
+        "loop DistributedSlack", "loop AcHvdcAcEmulationLimits", "loop VoltageMonitoring", "loop ReactiveLimits",
+        "ReactiveLimits local controller buses", "ReactiveLimits voltage-control group buses (remote regulators)",
+        "ReactiveLimits robust mode on group buses", "ReactiveLimits buses with SVCs",
+        "ReactiveLimits buses with storage units", "ReactiveLimits buses with HVDC stations",
+        "ReactiveLimits voltage-monitor buses (standby SVCs once switched on)",
+        "generators with a reactive capability curve", "generators with forceTargetQInReactiveLimits",
+        "held controllers (frozen regulators kept in their group)", "DistributedSlack units",
+        "HVDC lines in AC emulation (AcHvdcAcEmulationLimits)", "standby SVCs (VoltageMonitoring)",
+        "resumed rows (init_from_n_powerflow)", "resumed frozen local buses", "resumed frozen group buses",
+        "resumed switched-on SVCs", "resumed saturated HVDC lines"};
+    auto add = [&](const char* name, size_t count) {
+        out.push_back(DeviceFeature{name, static_cast<int>(count), device_runs.count(name) > 0});
+    };
+    size_t n_kind[7] = {0, 0, 0, 0, 0, 0, 0};
+    for (const LoopDecl& d : loops_) ++n_kind[static_cast<int>(d.kind)];
+    add("loop DistributedSlack", n_kind[static_cast<int>(Kind::DistributedSlack)]);
+    add("loop AcHvdcAcEmulationLimits", n_kind[static_cast<int>(Kind::HvdcLimits)]);
+    add("loop VoltageMonitoring", n_kind[static_cast<int>(Kind::VoltageMonitoring)]);
+    add("loop ReactiveLimits", n_kind[static_cast<int>(Kind::ReactiveLimits)]);
+    add("loop PhaseControl", n_kind[static_cast<int>(Kind::PhaseControl)]);
+    add("loop TransformerVoltageControl", n_kind[static_cast<int>(Kind::TransformerVoltageControl)]);
+    add("loop ShuntVoltageControl", n_kind[static_cast<int>(Kind::ShuntVoltageControl)]);
+    add("distributed-slack Newton (NROuterDist_*)", dist_ ? 1 : 0);
+    bool robust = false;
+    for (const LoopDecl& d : loops_) robust = robust || (d.kind == Kind::ReactiveLimits && d.rl_robust);
+
+    // ReactiveLimits' controller buses (the grid's plan)
+    size_t rl_local = 0, rl_remote = 0, rl_svc = 0, rl_storage = 0, rl_station = 0, rl_monitor = 0;
+    for (const RlBus& b : rl0_->buses) {
+        if (b.monitor_svc >= 0) { ++rl_monitor; continue; }
+        const auto& e = rl0_->plan->buses[static_cast<size_t>(b.entry)];
+        if (b.local) ++rl_local; else ++rl_remote;
+        if (!e.svc_ids.empty()) ++rl_svc;
+        if (!e.storage_ids.empty()) ++rl_storage;
+        if (!e.station_ids.empty()) ++rl_station;
+    }
+    add("ReactiveLimits local controller buses", rl_local);
+    add("ReactiveLimits voltage-control group buses (remote regulators)", rl_remote);
+    add("ReactiveLimits robust mode on group buses", robust && rl_remote > 0 ? 1 : 0);
+    add("ReactiveLimits buses with SVCs", rl_svc);
+    add("ReactiveLimits buses with storage units", rl_storage);
+    add("ReactiveLimits buses with HVDC stations", rl_station);
+    add("ReactiveLimits voltage-monitor buses (standby SVCs once switched on)", rl_monitor);
+    // limits that move with a generator's target P, a target Q that follows it
+    size_t curves = 0, force_q = 0;
+    {
+        const auto raw_q = grid_->get_gen_raw_target_q();
+        for (int g = 0; g < n_gen_; ++g) {
+            ls2g::real_type lo, hi;
+            if (grid_->gen_limits_at(g, 0., lo, hi)) ++curves;
+            if (raw_q.size() == n_gen_ && !std::isnan(static_cast<double>(raw_q(g)))) ++force_q;
+        }
+    }
+    add("generators with a reactive capability curve", curves);
+    add("generators with forceTargetQInReactiveLimits", force_q);
+    size_t held = 0;
+    for (int c = 0; c < layout_.n_ctrl; ++c)
+        if (vc_plan_held_[static_cast<size_t>(c)] && vc_kind_[static_cast<size_t>(c)] != ls2g::VoltageControlSolverData::SVC) ++held;
+    add("held controllers (frozen regulators kept in their group)", held);
+
+    // the other loops' plans
+    add("DistributedSlack units", units0_.size());
+    add("HVDC lines in AC emulation (AcHvdcAcEmulationLimits)", hvdc_plan0_.lines.size());
+    add("standby SVCs (VoltageMonitoring)", monitors_.svcs.size());
+    add("BranchControl transformers", static_cast<size_t>(n_bc_));
+    add("ShuntControl controllers", static_cast<size_t>(n_sc_));
+
+    // where the rows resume from (init_from_n_powerflow=True)
+    size_t fr_local = 0, fr_remote = 0, hv_sat = 0;
+    if (resume_) {
+        for (const auto& kv : point_n_.frozen) {
+            bool local = true;
+            for (const RlBus& b : rl0_->buses)
+                if (b.bus_solver == kv.first) { local = b.local; break; }
+            if (local) ++fr_local; else ++fr_remote;
+        }
+        for (const auto& kv : point_n_.hvdc) hv_sat += kv.second != 0;
+    }
+    add("resumed rows (init_from_n_powerflow)", resume_ ? 1 : 0);
+    add("resumed frozen local buses", fr_local);
+    add("resumed frozen group buses", fr_remote);
+    add("resumed switched-on SVCs", resume_ ? point_n_.svc_on.size() : 0);
+    add("resumed saturated HVDC lines", hv_sat);
+    add("resumed parked DistributedSlack units", resume_ ? point_n_.parked.size() : 0);
+    add("resumed tap / section positions",
+        resume_ ? point_n_.phase_tap.size() + point_n_.ratio_tap.size() + point_n_.sections.size() : 0);
+    return out;
+}
+
+std::shared_ptr<OuterHook> make_device_outer_model(const ls2g::LSGrid& grid, const LedgerData& ledger,
+                                                   const Ls2gModelOptions& options)
+{
+    if (options.keep_trace) throw DeviceNotImplemented("the decision trace (keep_outer_trace)");
+    auto host = std::make_shared<Ls2gOuterModel>(grid, ledger, options);
+    const DeviceHostSide* side = host.get();
+    return make_device_outer_model_from(std::move(host), side);
+}
+
+std::vector<DeviceFeature> outer_device_census(const ls2g::LSGrid& grid, const LedgerData& ledger,
+                                               const Ls2gModelOptions& options)
+{
+    return Ls2gOuterModel(grid, ledger, options).census();
+}
+
+// =============================================================================
+// The device model's inputs (docs/outer_loops_on_device.md, §4.6)
+// =============================================================================
+DeviceTables Ls2gOuterModel::device_tables() const
+{
+    if (dist_) throw std::domain_error("a distributed-slack Newton (NROuterDist_*)");
+    DeviceTables t;
+    t.n_bus = n_bus_; t.n_gen = n_gen_; t.n_sto = n_sto_;
+    const auto& svcs = grid_->get_svcs();
+    const auto& gens = grid_->get_generators();
+    t.n_svc = svcs.nb();
+    t.sn = sn_;
+    t.slack_bus = slack_bus_;
+    t.max_outer_iterations = params_.max_outer_iterations;
+    t.robust_mode = params_.voltage_remote_control_robust_mode ? 1 : 0;
+    t.widx = widx_;
+    t.n_watch = static_cast<int>(layout_.watch_bus.size());
+    for (const LoopDecl& d : loops_) {
+        switch (d.kind) {
+            case Kind::DistributedSlack:
+                t.loop_kind.push_back(DL_DISTRIBUTED_SLACK);
+                t.ds_mismatch_mw = d.ds_mismatch_mw; t.ds_eps_mw = d.ds_eps_mw;
+                t.ds_moved_fraction = d.ds_moved_fraction; t.ds_fail = d.ds_fail;
+                t.ds_run_without_participant = d.ds_run_without_participant;
+                break;
+            case Kind::HvdcLimits:        t.loop_kind.push_back(DL_HVDC_LIMITS); break;
+            case Kind::VoltageMonitoring: t.loop_kind.push_back(DL_VOLTAGE_MONITORING); break;
+            case Kind::ReactiveLimits:
+                t.loop_kind.push_back(DL_REACTIVE_LIMITS);
+                t.rl_max_switch = d.rl_max_switch; t.rl_robust = d.rl_robust;
+                t.rl_max_mismatch = d.rl_max_mismatch; t.rl_base_mva = d.rl_base_mva;
+                t.rl_vmin = d.rl_vmin; t.rl_vmax = d.rl_vmax; t.rl_margin = d.rl_margin; t.rl_restart = d.rl_restart;
+                break;
+            default:
+                throw std::domain_error("the loop " + d.name);
+        }
+    }
+    // generators and storage units: the base targets in force (a row that sets none)
+    SlotState plain;
+    plain.rowv.layout = &sbl_;
+    const ls2g::OuterGridView v = view(plain);
+    const auto raw_q = grid_->get_gen_raw_target_q();
+    for (int g = 0; g < n_gen_; ++g) {
+        t.gen_target_p.push_back(static_cast<double>(v.gen_target_p(g)));
+        t.gen_min_q.push_back(static_cast<double>(gens.get_min_q(g)));
+        t.gen_max_q.push_back(static_cast<double>(gens.get_max_q(g)));
+        t.gen_target_q.push_back(static_cast<double>(gens.get_target_q()(g)));
+        t.gen_raw_target_q.push_back(raw_q.size() == n_gen_ ? static_cast<double>(raw_q(g)) : NaN);
+        t.gen_vreg_on.push_back(gens.get_voltage_regulator_on(g) ? 1 : 0);
+    }
+    {
+        // LSGrid::set_gen_capability_curves's storage, read back through its state
+        const ls2g::LSGrid::StateRes state = grid_->get_state();
+        const auto& cid = std::get<ls2g::LSGrid::GEN_CURVE_GEN_ID_ID>(state);
+        const auto& cp = std::get<ls2g::LSGrid::GEN_CURVE_P_ID>(state);
+        const auto& cmin = std::get<ls2g::LSGrid::GEN_CURVE_MIN_Q_ID>(state);
+        const auto& cmax = std::get<ls2g::LSGrid::GEN_CURVE_MAX_Q_ID>(state);
+        std::vector<std::vector<std::array<double, 3>>> curves(static_cast<size_t>(n_gen_));
+        for (size_t k = 0; k < cid.size(); ++k)
+            if (cid[k] >= 0 && cid[k] < n_gen_)
+                curves[static_cast<size_t>(cid[k])].push_back({static_cast<double>(cp[k]), static_cast<double>(cmin[k]),
+                                                              static_cast<double>(cmax[k])});
+        t.curve_ptr.push_back(0);
+        for (auto& c : curves) {
+            std::stable_sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a[0] < b[0]; });
+            for (const auto& pt : c) { t.curve_p.push_back(pt[0]); t.curve_min_q.push_back(pt[1]); t.curve_max_q.push_back(pt[2]); }
+            t.curve_ptr.push_back(static_cast<int>(t.curve_p.size()));
+        }
+    }
+    t.gen_rl_bus_ptr.push_back(0);
+    for (const auto& buses : gen_rl_bus_) {
+        t.gen_rl_bus.insert(t.gen_rl_bus.end(), buses.begin(), buses.end());
+        t.gen_rl_bus_ptr.push_back(static_cast<int>(t.gen_rl_bus.size()));
+    }
+    for (int s = 0; s < n_sto_; ++s) t.sto_target_p.push_back(static_cast<double>(v.storage_target_p(s)));
+    for (int sid = 0; sid < t.n_svc; ++sid) {
+        t.svc_b_min.push_back(static_cast<double>(svcs.get_b_min(sid)));
+        t.svc_b_max.push_back(static_cast<double>(svcs.get_b_max(sid)));
+        t.svc_standby_low_target.push_back(static_cast<double>(svcs.get_standby_low_target_vm_pu(sid)));
+        t.svc_standby_high_target.push_back(static_cast<double>(svcs.get_standby_high_target_vm_pu(sid)));
+        t.svc_reg_is_own_bus.push_back(svcs.get_regulated_bus_id(sid) == svcs.get_bus_id()(sid).cast_int() ? 1 : 0);
+    }
+    t.held_svcs = held_svcs_;
+    const auto& dcl = grid_->get_dclines();
+    for (int h = 0; h < dcl.nb(); ++h) {
+        t.station_min_q1.push_back(static_cast<double>(dcl.get_station_min_q_mvar(h, 1)));
+        t.station_max_q1.push_back(static_cast<double>(dcl.get_station_max_q_mvar(h, 1)));
+        t.station_min_q2.push_back(static_cast<double>(dcl.get_station_min_q_mvar(h, 2)));
+        t.station_max_q2.push_back(static_cast<double>(dcl.get_station_max_q_mvar(h, 2)));
+    }
+    // ReactiveLimits: the grid's plan
+    t.rl_n = static_cast<int>(rl0_->buses.size());
+    t.rl_n_bus_q = static_cast<int>(rl0_->n_bus_q);
+    t.rl_has_monitor = rl0_->has_monitor ? 1 : 0;
+    for (auto* p : {&t.rl_gen_ptr, &t.rl_svc_ptr, &t.rl_sto_ptr, &t.rl_ctrl_ptr}) p->push_back(0);
+    for (size_t k = 0; k < rl0_->buses.size(); ++k) {
+        const RlBus& b = rl0_->buses[k];
+        t.rl_bus.push_back(b.bus_solver); t.rl_local.push_back(b.local ? 1 : 0);
+        t.rl_reg_bus.push_back(b.reg_bus_solver); t.rl_group.push_back(b.group);
+        t.rl_monitor_svc.push_back(b.monitor_svc); t.rl_pin.push_back(b.pin);
+        t.rl_has_base.push_back(b.has_base ? 1 : 0); t.rl_has_storage.push_back(b.has_storage ? 1 : 0);
+        t.rl_min_q.push_back(b.min_q); t.rl_max_q.push_back(b.max_q); t.rl_target_vm.push_back(b.target_vm);
+        t.rl_nominal_v.push_back(b.nominal_v); t.rl_target_q.push_back(b.target_q);
+        t.rl_base_min_q.push_back(b.base_min_q); t.rl_base_max_q.push_back(b.base_max_q);
+        const auto& e = rl0_->plan->buses[static_cast<size_t>(b.entry)];
+        t.rl_gen.insert(t.rl_gen.end(), e.gen_ids.begin(), e.gen_ids.end());
+        t.rl_svc.insert(t.rl_svc.end(), e.svc_ids.begin(), e.svc_ids.end());
+        t.rl_sto.insert(t.rl_sto.end(), e.storage_ids.begin(), e.storage_ids.end());
+        t.rl_ctrl.insert(t.rl_ctrl.end(), e.ctrl_pos.begin(), e.ctrl_pos.end());
+        t.rl_gen_ptr.push_back(static_cast<int>(t.rl_gen.size()));
+        t.rl_svc_ptr.push_back(static_cast<int>(t.rl_svc.size()));
+        t.rl_sto_ptr.push_back(static_cast<int>(t.rl_sto.size()));
+        t.rl_ctrl_ptr.push_back(static_cast<int>(t.rl_ctrl.size()));
+        const RlBusState& s0 = rl0_->state0[k];
+        t.rl0_target_p.push_back(s0.target_p); t.rl0_frozen_q.push_back(s0.frozen_q);
+        t.rl0_state.push_back(s0.state); t.rl0_nb_pv_pq.push_back(s0.nb_pv_pq); t.rl0_realistic.push_back(s0.realistic ? 1 : 0);
+    }
+    // VoltageControl
+    t.n_ctrl = layout_.n_ctrl; t.n_grp = layout_.n_grp;
+    t.vc_bus = vc_bus_; t.vc_kind = vc_kind_; t.vc_elem = vc_elem_; t.vc_group = vc_group_;
+    t.vc_plan_held = vc_plan_held_; t.vc_slope = vc_slope_; t.vc_q_plan = vc_q_plan_; t.vc_v_set = vc_v_set_;
+    t.vc_at_bus_ptr.push_back(0);
+    for (const auto& cs : vc_at_bus_) {
+        t.vc_at_bus.insert(t.vc_at_bus.end(), cs.begin(), cs.end());
+        t.vc_at_bus_ptr.push_back(static_cast<int>(t.vc_at_bus.size()));
+    }
+    t.svc_ctrl = svc_ctrl_;
+    // droop hvdc and the HvdcLimits plan
+    t.n_hvdc = layout_.n_hvdc;
+    t.hvdc_bus1 = hvdc_bus1_; t.hvdc_bus2 = hvdc_bus2_; t.hvdc_status0 = hvdc_status0_; t.hvdc_id = hvdc_id_;
+    t.hvdc_p0 = hvdc_p0_; t.hvdc_k = hvdc_k_; t.hvdc_lf1 = hvdc_lf1_; t.hvdc_lf2 = hvdc_lf2_; t.hvdc_r = hvdc_r_;
+    t.hvdc_pmax12 = hvdc_pmax12_; t.hvdc_pmax21 = hvdc_pmax21_;
+    for (const auto& line : hvdc_plan0_.lines) {
+        t.hl_hvdc_id.push_back(line.hvdc_id); t.hl_bus1.push_back(line.bus1_solver); t.hl_bus2.push_back(line.bus2_solver);
+        t.hl_p0_mw.push_back(static_cast<double>(line.p0_mw)); t.hl_k_mw_per_rad.push_back(static_cast<double>(line.k_mw_per_rad));
+        t.hl_pmax12_mw.push_back(static_cast<double>(line.pmax_1to2_mw)); t.hl_pmax21_mw.push_back(static_cast<double>(line.pmax_2to1_mw));
+    }
+    for (const auto& m : monitors_.svcs) {
+        t.mon_svc.push_back(m.svc_id); t.mon_reg_bus.push_back(m.reg_bus_solver); t.mon_svc_bus.push_back(m.svc_bus_solver);
+        t.mon_low_vm.push_back(static_cast<double>(m.low_vm_pu)); t.mon_high_vm.push_back(static_cast<double>(m.high_vm_pu));
+        t.mon_vn_kv.push_back(static_cast<double>(m.vn_kv));
+    }
+    // DistributedSlack's participants
+    for (size_t k = 0; k < units0_.size(); ++k) {
+        const auto& u = units0_[k];
+        t.ds_el_id.push_back(u.el_id);
+        t.ds_kind.push_back(u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR ? 0 : 1);
+        t.ds_bus.push_back(units0_bus_[k]);
+        t.ds_in_slack.push_back(u.in_slack ? 1 : 0);
+        t.ds_weight.push_back(static_cast<double>(u.weight));
+        t.ds_min_mw.push_back(static_cast<double>(u.min_p_mw));
+        t.ds_max_mw.push_back(static_cast<double>(u.max_p_mw));
+        if (u.overshoot_mw != 0.) throw std::domain_error("a DistributedSlack unit with an overshoot");
+    }
+    t.n_pin = static_cast<int>(layout_.pin_bus.size());
+    t.pin_bus = layout_.pin_bus;
+    // the buses a Sbus correction may touch
+    std::vector<int> corr(units0_bus_.begin(), units0_bus_.end());
+    for (const RlBus& b : rl0_->buses) if (b.local && b.bus_solver >= 0) corr.push_back(b.bus_solver);
+    for (const auto& kv : resume0_target_delta_) corr.push_back(kv.first);
+    if (resume_) for (const auto& kv : point_n_.frozen) corr.push_back(kv.first);
+    std::sort(corr.begin(), corr.end());
+    corr.erase(std::unique(corr.begin(), corr.end()), corr.end());
+    t.corr_bus = corr;
+    return t;
+}
+
+void Ls2gOuterModel::device_slot_image(int slot, DeviceSlotImage& img) const
+{
+    const SlotState& st = slots_[static_cast<size_t>(slot)];
+    if (dist_) throw std::domain_error("a distributed-slack Newton (NROuterDist_*)");
+    if (st.rl && st.rl->plan != rl0_->plan) throw std::domain_error("a row with its own ReactiveLimits plan");
+    img = DeviceSlotImage();
+    img.row = st.row;
+    img.active = st.active;
+    img.last_fixing = st.last_fixing;
+    img.check_unrealistic = st.check_unrealistic ? 1 : 0;
+    img.masked_bus.assign(static_cast<size_t>(n_bus_), 0);
+    for (int b : st.masked) if (b >= 0 && b < n_bus_) img.masked_bus[static_cast<size_t>(b)] = 1;
+    img.pq = st.pq;
+    img.held_q = st.held_q;
+    img.svc_on = st.svc_on;
+    img.hvdc_regime = st.hvdc_regime;
+    img.gen_target_p = st.gen_target_p.empty() ? std::vector<double>(static_cast<size_t>(n_gen_), NaN) : st.gen_target_p;
+    img.sto_target_p = st.storage_target_p.empty() ? std::vector<double>(static_cast<size_t>(n_sto_), NaN) : st.storage_target_p;
+    for (const auto& kv : st.target_delta) {
+        img.delta_bus.push_back(kv.first); img.delta_p.push_back(kv.second.real()); img.delta_q.push_back(kv.second.imag());
+    }
+    for (const auto& kv : st.freeze_q) { img.freeze_bus.push_back(kv.first); img.freeze_q.push_back(kv.second); }
+    img.vm_reset_bus = st.vm_reset_bus;
+    img.vm_reset_vm = st.vm_reset_vm;
+    img.lim_base = st.lim_base ? 1 : 0;
+    for (size_t b = 0; b < st.lim_dirty.size(); ++b) if (st.lim_dirty[b]) img.lim_dirty_bus.push_back(static_cast<int>(b));
+    // ReactiveLimits: the grid's plan, the row's buses present (a masked row's plan is a filter of it)
+    const size_t rn = rl0_->buses.size();
+    img.rl_present.assign(rn, 0);
+    img.rl_target_p.assign(rn, 0.); img.rl_frozen_q.assign(rn, 0.);
+    img.rl_state.assign(rn, 0); img.rl_nb_pv_pq.assign(rn, 0); img.rl_realistic.assign(rn, 0);
+    if (st.rl) {
+        size_t k0 = 0;
+        for (size_t j = 0; j < st.rl->buses.size(); ++j) {
+            while (k0 < rn && rl0_->buses[k0].entry != st.rl->buses[j].entry) ++k0;
+            if (k0 == rn) throw std::domain_error("a row whose ReactiveLimits plan is not a filter of the grid's");
+            img.rl_present[k0] = 1;
+            const RlBusState& rs = j < st.rl_state.size() ? st.rl_state[j] : st.rl->state0[j];
+            img.rl_target_p[k0] = rs.target_p; img.rl_frozen_q[k0] = rs.frozen_q; img.rl_state[k0] = rs.state;
+            img.rl_nb_pv_pq[k0] = rs.nb_pv_pq; img.rl_realistic[k0] = rs.realistic ? 1 : 0;
+            ++k0;
+        }
+    }
+    // DistributedSlack: the grid's units, the row's present (a masked row filters them)
+    const size_t un = units0_.size();
+    img.ds_present.assign(un, 0);
+    img.ds_injection.assign(un, 0.); img.ds_current.assign(un, 0.); img.ds_initial.assign(un, 0.);
+    {
+        size_t k0 = 0;
+        for (size_t j = 0; j < st.ds_units.size(); ++j) {
+            const auto& u = st.ds_units[j];
+            while (k0 < un && !(units0_[k0].el_id == u.el_id && units0_[k0].kind == u.kind)) ++k0;
+            if (k0 == un) throw std::domain_error("a row with its own DistributedSlack units");
+            img.ds_present[k0] = 1;
+            img.ds_injection[k0] = static_cast<double>(u.injection_mw);
+            if (j < st.ds_current_mw.size()) img.ds_current[k0] = st.ds_current_mw[j];
+            if (j < st.ds_initial_mw.size()) img.ds_initial[k0] = st.ds_initial_mw[j];
+            ++k0;
+        }
+    }
+    // HvdcLimits: the grid's lines in AC emulation, the row's present
+    const size_t hn = hvdc_plan0_.lines.size();
+    img.hl_present.assign(hn, 0);
+    img.hl_frozen_dir.assign(hn, 0);
+    {
+        size_t k0 = 0;
+        for (const auto& line : st.hvdc_plan.lines) {
+            while (k0 < hn && hvdc_plan0_.lines[k0].hvdc_id != line.hvdc_id) ++k0;
+            if (k0 == hn) throw std::domain_error("a row whose hvdc plan is not a filter of the grid's");
+            img.hl_present[k0] = 1;
+            img.hl_frozen_dir[k0] = line.frozen_dir;
+            ++k0;
+        }
+    }
 }
 
 }  // namespace outer

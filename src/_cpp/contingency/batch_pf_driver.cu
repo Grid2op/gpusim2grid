@@ -21,6 +21,7 @@
 #include "../outer/outer_kernels.cuh"       // the outer loops' per-slot controls
 #include "slot_ranges.hpp"                  // slot_upload_ranges
 #include "../nvtx_range.hpp"                // nsys ranges of the continuous round
+#include "../outer/device_outer_model.hpp"  // outer_loops_backend='device'
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -1717,6 +1718,10 @@ template <typename BatchSource>
 void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slots, bool reload_sbus)
 {
     if (slots.empty()) return;
+    if (auto* dev = dynamic_cast<outer::DeviceOuterHook*>(outer_hook_)) {
+        _oc_write_controls_device(dev, slots, reload_sbus);
+        return;
+    }
     const outer::Layout& Lo = outer_hook_->layout();
     const int n_pin = static_cast<int>(Lo.pin_bus.size());
     const int n_bus = base.n_bus;
@@ -1907,14 +1912,87 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
     for (int s : slots) outer_hook_->clear_vm_reset(s);
 }
 
+// outer_loops_backend='device': the controls come from the device model's own arrays, never through
+// the host (DeviceOuterHook::write_controls); the Sbus correction and the |V| resets are applied by
+// the same kernels as on the host path, over its fixed per-slot blocks (unused entries: bus -1).
 template <typename BatchSource>
-void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const NrIterBuffers& buf)
+void BatchPfDriver<BatchSource>::_oc_write_controls_device(outer::DeviceOuterHook* dev, const std::vector<int>& slots,
+                                                           bool reload_sbus)
+{
+    const int n_bus = base.n_bus;
+    NrIterBuffers buf = _make_nr_buffers();
+    if (buf.sbus_stride != n_bus)
+        throw std::runtime_error("[batch_pf] outer loops need a per-slot Sbus (a scenario sweep)");
+    cudaComplexType* d_Sbus = const_cast<cudaComplexType*>(buf.d_Sbus);
+    const int n = static_cast<int>(slots.size());
+    upload_h2d_grow(d_oc_wsl_, slots.data(), slots.size(), cs);   // persistent: no allocation per call
+    auto& d_sl = d_oc_wsl_;
+    std::vector<int> rows;
+    if (reload_sbus) {
+        g2g_nvtx::Range nv("device controls: Sbus re-read");
+        rows.resize(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) rows[i] = h_slot_row()[slots[i]];
+        upload_h2d_grow(d_oc_wlr_, rows.data(), rows.size(), cs);
+        SlotLoadView L;
+        L.n = n;
+        L.d_slot = thrust::raw_pointer_cast(d_sl.data());
+        L.d_row  = thrust::raw_pointer_cast(d_oc_wlr_.data());
+        L.h_slot = slots.data();
+        L.h_row  = rows.data();
+        L.chunk  = -1;
+        L.n_real = L.n;
+        BatchPfDriverContext ctx = make_context();
+        source_.reload_sbus(ctx, L, cs);
+    }
+    g2g_nvtx::Range nv_write("device controls: write + apply");
+    const size_t nb = static_cast<size_t>(n) * static_cast<size_t>(dev->sbus_block());
+    const size_t nv = static_cast<size_t>(n) * static_cast<size_t>(dev->vm_reset_block());
+    // amortised growth: a thrust resize value-initialises (a fill that synchronises)
+    if (d_oc_ds_slot_.size() < nb) {
+        const size_t c = nb + nb / 2 + 64;
+        d_oc_ds_slot_.resize(c); d_oc_ds_bus_.resize(c); d_oc_ds_p_.resize(c); d_oc_ds_q_.resize(c);
+    }
+    if (d_oc_vr_slot_.size() < nv) {
+        const size_t c = nv + nv / 2 + 64;
+        d_oc_vr_slot_.resize(c); d_oc_vr_bus_.resize(c); d_oc_vr_vm_.resize(c);
+    }
+    outer::DeviceOuterHook::ControlTargets t;
+    t.pin = thrust::raw_pointer_cast(d_oc_pin_.data());
+    t.held_q = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_held_q_.data()));
+    t.plan_held = thrust::raw_pointer_cast(d_oc_plan_held_.data());
+    t.v_set = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_vset_.data()));
+    t.hvdc = thrust::raw_pointer_cast(d_oc_hvdc_.data());
+    t.ds_slot = thrust::raw_pointer_cast(d_oc_ds_slot_.data());
+    t.ds_bus = thrust::raw_pointer_cast(d_oc_ds_bus_.data());
+    t.ds_p = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_ds_p_.data()));
+    t.ds_q = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_ds_q_.data()));
+    t.vr_slot = thrust::raw_pointer_cast(d_oc_vr_slot_.data());
+    t.vr_bus = thrust::raw_pointer_cast(d_oc_vr_bus_.data());
+    t.vr_vm = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_vr_vm_.data()));
+    dev->write_controls(n, thrust::raw_pointer_cast(d_sl.data()), t, static_cast<cudaStream_t>(cs));
+    if (nb > 0)
+        oc_sbus_delta_kernel<<<nr_grid_size(static_cast<long long>(nb), BS), BS, 0, cs>>>(
+            d_Sbus, t.ds_slot, t.ds_bus, thrust::raw_pointer_cast(d_oc_ds_p_.data()),
+            thrust::raw_pointer_cast(d_oc_ds_q_.data()), static_cast<int>(nb), n_bus);
+    if (nv > 0)
+        apply_vm_reseed_kernel<<<nr_grid_size(static_cast<long long>(nv), BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_V_batch.data()), t.vr_slot, t.vr_bus,
+            thrust::raw_pointer_cast(d_oc_vr_vm_.data()), static_cast<int>(nv), n_bus);
+    CHK_CUDA_BPF(cudaGetLastError());
+    // no synchronisation: everything above is stream-ordered and the host lists were staged by
+    // their (pageable) uploads before those returned
+    // the host mirrors no longer hold what the device holds (see _oc_write_controls)
+    oc_mirrors_on_device_ = false;
+}
+
+template <typename BatchSource>
+void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const NrIterBuffers& buf, bool download)
 {
     const outer::Layout& Lo = outer_hook_->layout();
     const int n = static_cast<int>(slots.size());
     if (n == 0) return;
     const int n_watch = static_cast<int>(Lo.watch_bus.size());
-    upload_h2d(d_oc_list_, slots.data(), slots.size(), cs);
+    upload_h2d_grow(d_oc_list_, slots.data(), slots.size(), cs);   // grow-only: no fill per round
     const int per = n_watch + Lo.n_ctrl;
     if (per > 0)
         oc_gather_kernel<<<nr_grid_size((long long)n * per, BS), BS, 0, cs>>>(
@@ -1942,6 +2020,7 @@ void BatchPfDriver<BatchSource>::_oc_gather(const std::vector<int>& slots, const
             thrust::raw_pointer_cast(d_oc_gather_.data()), base.sc_static(), _sc_slots(),
             thrust::raw_pointer_cast(d_oc_list_.data()), n, 6 * n_watch + Lo.n_ctrl + 2 * base.n_bc, oc_stride_);
     CHK_CUDA_BPF(cudaGetLastError());
+    if (!download) return;   // the device outer model reads d_oc_gather_ in place
     CHK_CUDA_BPF(cudaMemcpyAsync(h_oc_gather_.ptr, thrust::raw_pointer_cast(d_oc_gather_.data()),
                                  static_cast<size_t>(n) * oc_stride_ * sizeof(cuda_real_type),
                                  cudaMemcpyDeviceToHost, cs));
@@ -2137,8 +2216,8 @@ bool BatchPfDriver<BatchSource>::_check_before_first_step(NrIterBuffers& buf, in
                                      cudaMemcpyHostToDevice, cs));
     _residual_pass(buf, n_cur, d_res, /*c_start=*/0, nullptr, nullptr, timer, t,
                    /*n_spmv=*/-1, /*use_clean=*/f_cache);
-    if (f_cache)
-        thrust::fill(thrust::cuda::par.on(static_cast<cudaStream_t>(cs)),
+    if (f_cache)   // par_nosync: stream-ordered, no host wait (thrust's par synchronises the stream)
+        thrust::fill(thrust::cuda::par_nosync.on(static_cast<cudaStream_t>(cs)),
                      d_fclean_.begin(), d_fclean_.begin() + n_cur, 1);
     if (buf.slack_col >= 0 && buf.n_slack > 0) {
         calibrate_slack_absorbed_slots_kernel<cuda_real_type><<<n_cur, BS, 0, cs>>>(
@@ -2670,7 +2749,10 @@ void BatchPfDriver<BatchSource>::_compact_tail(int n_keep, int n_cur, std::vecto
             launch_move_slot_rows(raw(d_sc_b_target_), w, M, cs);
             launch_move_slot_rows(raw(d_sc_on_), w, M, cs);
         }
-        for (int i = 0; i < n; ++i) outer_hook_->move(from[i], to[i]);
+        if (auto* dev = dynamic_cast<outer::DeviceOuterHook*>(outer_hook_))   // one launch per pool
+            dev->move_slots(M.n, M.d_from, M.d_to, M.h_from, M.h_to);
+        else
+            for (int i = 0; i < n; ++i) outer_hook_->move(from[i], to[i]);
     }
     CHK_CUDA_BPF(cudaGetLastError());
     _upload_sched();   // the new slot table
@@ -2815,6 +2897,11 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     const int nnz_J  = base.nnz_J;
     const int* d_result_map = source_.d_result_map();
     outer::OuterHook* hook = outer_hook_;
+    // outer_loops_backend='device': the batched entry points (docs/outer_loops_on_device.md, M3)
+    outer::DeviceOuterHook* dev_hook = dynamic_cast<outer::DeviceOuterHook*>(hook);
+    if (dev_hook != nullptr && !std::is_same<cuda_real_type, double>::value)
+        throw std::runtime_error("outer_loops_backend='device' needs an FP64 build");
+    if (dev_hook != nullptr) dev_hook->set_stream(static_cast<cudaStream_t>(cs));
 
     CudaTimer timer(cs);
     std::vector<int> iters(static_cast<size_t>(S), 0);
@@ -2956,12 +3043,14 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
     if (hook != nullptr) {
         const auto t_l0 = std::chrono::steady_clock::now();
         g2g_nvtx::push("oc_load");
-        std::vector<int> all(static_cast<size_t>(S));
+        std::vector<int> all(static_cast<size_t>(S)), all_rows(static_cast<size_t>(S));
         for (int s = 0; s < S; ++s) {
             all[static_cast<size_t>(s)] = s;
             const int a = h_slot_row()[s];
-            hook->load(s, a >= 0 ? _orig_row(a) : -1);
+            all_rows[static_cast<size_t>(s)] = a >= 0 ? _orig_row(a) : -1;
+            if (dev_hook == nullptr) hook->load(s, all_rows[static_cast<size_t>(s)]);
         }
+        if (dev_hook != nullptr) dev_hook->load_rows(all, all_rows);
         g2g_nvtx::pop();
         const auto t_c0 = std::chrono::steady_clock::now();
         t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};
@@ -3050,14 +3139,54 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             const int n_watch = static_cast<int>(Lo.watch_bus.size());
             const auto t_g0 = std::chrono::steady_clock::now();
             g2g_nvtx::push("oc_gather");
-            _oc_gather(conv, buf);
+            _oc_gather(conv, buf, /*download=*/dev_hook == nullptr);
             g2g_nvtx::pop();
             const auto t_g1 = std::chrono::steady_clock::now();
             g2g_nvtx::push("oc_decide");
             t.t_oc_gather += TimingEntry{0., std::chrono::duration<double, std::milli>(t_g1 - t_g0).count()};
             gbuf.resize(static_cast<size_t>(oc_stride_));
             size_t ci = 0;
-            for (int s = 0; s < S; ++s) {
+            if (dev_hook != nullptr) {
+                // every leaving slot decided in one launch, on the gathered rows the device holds
+                std::vector<int> ls, lc, ln, li, lg;
+                int gi = 0;
+                for (int s = 0; s < S; ++s) {
+                    if (h_evict()[s] < 0) continue;
+                    const RowStatus st = leave_st[static_cast<size_t>(s)];
+                    const bool converged = st == RowStatus::Converged;
+                    ls.push_back(s); lc.push_back(converged ? 1 : 0); ln.push_back(iters[static_cast<size_t>(s)]);
+                    li.push_back(static_cast<int>(st)); lg.push_back(converged ? gi++ : -1);
+                }
+                const int nd = static_cast<int>(ls.size());
+                std::vector<int> pack;
+                for (auto* v : {&ls, &lc, &ln, &li, &lg}) pack.insert(pack.end(), v->begin(), v->end());
+                // (persistent buffers: an allocation per round would sync the device)
+                upload_h2d_grow(d_oc_dec_in_, pack.data(), pack.size(), cs);
+                if (d_oc_dec_out_.size() < 2 * static_cast<size_t>(std::max(nd, 1)))
+                    d_oc_dec_out_.resize(2 * static_cast<size_t>(std::max(nd, 1)));
+                int* p = thrust::raw_pointer_cast(d_oc_dec_in_.data());
+                int* q = thrust::raw_pointer_cast(d_oc_dec_out_.data());
+                dev_hook->decide(nd, p, p + nd, p + 2 * nd, p + 3 * nd, p + 4 * nd,
+                                 reinterpret_cast<const double*>(thrust::raw_pointer_cast(d_oc_gather_.data())),
+                                 oc_stride_, q, q + nd, static_cast<cudaStream_t>(cs));
+                std::vector<int> out(2 * static_cast<size_t>(nd));
+                if (nd > 0)
+                    CHK_CUDA_BPF(cudaMemcpyAsync(out.data(), q, out.size() * sizeof(int), cudaMemcpyDeviceToHost, cs));
+                cs.synchronize();
+                for (int i = 0; i < nd; ++i) {
+                    const int s = ls[static_cast<size_t>(i)];
+                    const int next = out[static_cast<size_t>(i)], status = out[static_cast<size_t>(nd + i)];
+                    if (next == 2) throw std::runtime_error(outer::device_outer_error(s, status));
+                    if (next == 0) {
+                        h_evict()[s] = -1;          // the row stays in its slot
+                        iters[static_cast<size_t>(s)] = 0;
+                        reenter.push_back(s);
+                    } else {
+                        leave_st[static_cast<size_t>(s)] = static_cast<RowStatus>(status);
+                    }
+                }
+            }
+            for (int s = 0; dev_hook == nullptr && s < S; ++s) {
                 if (h_evict()[s] < 0) continue;
                 const RowStatus st = leave_st[static_cast<size_t>(s)];
                 const bool converged = st == RowStatus::Converged;
@@ -3231,10 +3360,13 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
         if (hook != nullptr && n_load > 0) {
             const auto t_l0 = std::chrono::steady_clock::now();
             g2g_nvtx::push("oc_load");
+            std::vector<int> loaded_rows;
             for (int s : loaded) {
                 const int a = h_slot_row()[s];
-                hook->load(s, a >= 0 ? _orig_row(a) : -1);
+                loaded_rows.push_back(a >= 0 ? _orig_row(a) : -1);
+                if (dev_hook == nullptr) hook->load(s, loaded_rows.back());
             }
+            if (dev_hook != nullptr) dev_hook->load_rows(loaded, loaded_rows);
             g2g_nvtx::pop();
             const auto t_c0 = std::chrono::steady_clock::now();
             t.t_oc_load += TimingEntry{0., std::chrono::duration<double, std::milli>(t_c0 - t_l0).count()};

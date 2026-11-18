@@ -415,7 +415,7 @@ __global__ void apply_vm_reseed_kernel(
     int n_bus)
 {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= n_entries) return;
+    if (k >= n_entries || d_bus[k] < 0) return;   // bus -1: an unused entry of a fixed block
     const ptrdiff_t at = static_cast<ptrdiff_t>(d_slot[k]) * n_bus + d_bus[k];
     cudaComplexType v = d_V_batch[at];
     cuda_real_type mag = CudaFunHelper::my_cuCabs(v);

@@ -291,9 +291,11 @@ struct PinnedBuffer {
         return *this;
     }
 
+    // Grows only: a smaller request keeps the buffer (cudaFreeHost / cudaMallocHost are expensive
+    // and cudaFreeHost synchronises the device); `size` is the capacity, never an element count.
     void resize(std::size_t n)
     {
-        if (n == size) return;
+        if (n <= size) return;
         release();
         if (n == 0) return;
         void* p = nullptr;

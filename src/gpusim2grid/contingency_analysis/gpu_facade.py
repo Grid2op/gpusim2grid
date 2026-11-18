@@ -39,7 +39,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import _check_outer_loops_args
+from .._outer_loops import _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
 from ._reactive_limits import ReactiveLimitsStatus
 from ..actions import current_buses
 from ._strategies import (ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, UnionPlan, compile_action, plan_union,
@@ -343,6 +343,12 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         ``ir_n_steps=1`` with it (see there). Each contingency keeps the grid's targets. With
         ``init_from_n_powerflow`` (default) the rows resume from where the
         grid's own solve left its loops. :meth:`get_outer_results`.
+    outer_loops_backend : {"host", "device"}, default "host"
+        Where the outer loops run with ``outer_loops=True`` (docs/outer_loops_on_device.md):
+        ``"host"`` is lightsim2grid's loops ported on the host, ``"device"`` CUDA kernels. A grid
+        whose loops use a feature ``"device"`` does not implement yet (see
+        :func:`gpusim2grid.outer_device_census`) raises ``NotImplementedError`` at construction,
+        for the whole batch. Construction-time only.
     violation_threshold : float in ``]0, 1]``, default 1.0
         lightsim2grid's knob of the same name and semantics: every checked limit moves towards a
         healthy anchor, ``t * limit + (1 - t) * anchor`` (0 for currents, the bus nominal voltage
@@ -394,6 +400,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                  outer_loop_min_last_chunk=250, outer_loop_warm_start=True,
                  outer_loop_nb_iter=None, scheduling=None, nb_iter_per_round=1,
                  tol=None, outer_loops=False, keep_outer_trace=False, violation_threshold=1.0,
+                 outer_loops_backend="host",
                  strategy_condition=StrategyCondition.TRUE, strategy_warm_start=True):
         _validate_precision(precision)
         check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
@@ -414,6 +421,9 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations,
                                     reactive_limits_outer_loop=reactive_limits_outer_loop)
+        self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
+        if self._outer_loops_backend == "device":
+            _check_outer_loops_device(grid, init_from_n_powerflow, keep_outer_trace=keep_outer_trace)
         # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
         # built (lazily) from the same grid with the same construction options
         self._rl_ctor_kwargs = dict(
@@ -506,7 +516,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                         -1 if scaling_max_voltage_change is None
                         else int(bool(scaling_max_voltage_change))),
                     max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
-                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm),
+                    outer_backend=self._outer_loops_backend)
                 self._inner = _ContingencyAnalysisSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
@@ -827,6 +838,11 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         load_ids, gen_ids, branch_ids_side1, branch_ids_side2, sgen_ids, storage_ids,
         svc_ids, hvdc_ids)``."""
         return [tuple(list(el) for el in c) for c in (getattr(self, "_ctg_elements", None) or [])]
+
+    @property
+    def outer_loops_backend(self):
+        """str: where the outer loops run, ``"host"`` or ``"device"`` (construction-time only)."""
+        return self._outer_loops_backend
 
     @property
     def outer_loops(self):

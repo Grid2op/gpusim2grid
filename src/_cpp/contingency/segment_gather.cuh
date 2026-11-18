@@ -103,12 +103,15 @@ struct SegmentGather {
     int total   = 0;
     int n_pairs = 0;
 
-    PinnedBuffer<int>          h_pairs;     // [3 * n_pairs]: slot | src | dst
+    // [3 * n_pairs]: slot | src | dst, two staging buffers used in turn: a plan waits only for the
+    // upload of the one before last (long done), not for the GPU to reach the last one
+    PinnedBuffer<int>          h_pairs_[2];
     thrust::device_vector<int> d_pairs;
     thrust::device_vector<int> d_out_slot;  // [>= total]
     thrust::device_vector<int> d_out_src;   // [>= total]
-    CudaEvent                  uploaded;    // the last H->D of h_pairs
-    bool                       recorded = false;
+    CudaEvent                  uploaded_[2];   // the last H->D of each staging buffer
+    bool                       recorded_[2] = {false, false};
+    int                        cur_ = 0;
 
     // Pairs (h_slot[i], h_row[i]), i < n (row -1 = none). Computes the plan,
     // ships it and expands it on cs. total == 0 → nothing launched.
@@ -118,14 +121,18 @@ struct SegmentGather {
         total = 0;
         n_pairs = 0;
         if (!seg.any() || n <= 0) return;
-        if (recorded) uploaded.synchronize();   // h_pairs may still be in flight
+        cur_ ^= 1;
+        PinnedBuffer<int>& h_pairs = h_pairs_[cur_];
+        if (recorded_[cur_]) uploaded_[cur_].synchronize();   // this buffer's last upload may still be in flight
         // count first (pinned buffers only grow)
         int np = 0;
         for (int i = 0; i < n; ++i)
             if (seg.count(h_row[i]) > 0) ++np;
         if (np == 0) return;
+        // sized for every offered pair at once (np <= n): growing with np, which creeps up as rows
+        // with segments enter the batch, reallocated pinned memory round after round
         if (h_pairs.size < static_cast<size_t>(3 * np))
-            h_pairs.resize(static_cast<size_t>(3 * std::max(np, 64)));
+            h_pairs.resize(static_cast<size_t>(3 * std::max(n, 64)));
         int* slot = h_pairs.ptr;
         int* src  = h_pairs.ptr + np;
         int* dst  = h_pairs.ptr + 2 * np;
@@ -142,17 +149,20 @@ struct SegmentGather {
         n_pairs = np;
         total   = acc;
         if (d_pairs.size() < static_cast<size_t>(3 * np))
-            d_pairs.resize(static_cast<size_t>(3 * std::max(np, 64)));
+            d_pairs.resize(static_cast<size_t>(3 * std::max(n, 64)));
         if (d_out_slot.size() < static_cast<size_t>(total)) {
-            const size_t cap = static_cast<size_t>(total) + static_cast<size_t>(total) / 2 + 64;
+            // every row's entries at most once (a row sits in one slot): sized for all of them at
+            // once, so the stream never grows round after round (a resize fills and syncs)
+            const size_t all = static_cast<size_t>(seg.row_ptr.back() - seg.row_ptr.front());
+            const size_t cap = std::max(all, static_cast<size_t>(total) + static_cast<size_t>(total) / 2 + 64);
             d_out_slot.resize(cap);
             d_out_src.resize(cap);
         }
         CHK_CUDA_SEG(cudaMemcpyAsync(thrust::raw_pointer_cast(d_pairs.data()), h_pairs.ptr,
                                      static_cast<size_t>(3 * np) * sizeof(int),
                                      cudaMemcpyHostToDevice, cs));
-        uploaded.record(cs);
-        recorded = true;
+        uploaded_[cur_].record(cs);
+        recorded_[cur_] = true;
         expand_segments_kernel<int><<<(total + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(d_pairs.data()), np, total,
             thrust::raw_pointer_cast(d_out_slot.data()),
@@ -167,8 +177,8 @@ struct SegmentGather {
                 cudaStream_t cs) const
     {
         if (total <= 0) return;
-        if (dst.size() < static_cast<size_t>(total))
-            dst.resize(static_cast<size_t>(total) + static_cast<size_t>(total) / 2 + 64);
+        if (dst.size() < static_cast<size_t>(total))   // at most src's entries: sized for them once
+            dst.resize(std::max(src.size(), static_cast<size_t>(total) + static_cast<size_t>(total) / 2 + 64));
         index_gather_kernel<T><<<(total + BS - 1) / BS, BS, 0, cs>>>(
             thrust::raw_pointer_cast(dst.data()), thrust::raw_pointer_cast(src.data()),
             thrust::raw_pointer_cast(d_out_src.data()), total);
