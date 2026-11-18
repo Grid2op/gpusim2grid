@@ -301,8 +301,8 @@ def test_pattern_reused_across_runs_when_the_union_is_unchanged():
     assert ca.solver._s.base_state_generation == n0
     assert ca.solver._s.driver_build_counter == d0 + 1
     load = next(el.id for el in grid.get_loads() if el.bus_id == 8)
-    line8 = next(el.id for el in grid.get_lines() if el.bus2_id == 8)
-    other = Action(load_bus={load: bus2(grid, 8)}, line_bus2={line8: bus2(grid, 8)})
+    line8 = next(el.id for el in grid.get_lines() if el.bus1_id == 8)  # IEEE 14: bus 8 is only a side 1
+    other = Action(load_bus={load: bus2(grid, 8)}, line_bus1={line8: bus2(grid, 8)})
     ca.set_actions([a, other])
     ca.add_strategies([(0, [1])])
     ca.compute(batch_size=BATCH)
