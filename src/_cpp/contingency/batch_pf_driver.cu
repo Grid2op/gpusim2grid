@@ -1969,7 +1969,51 @@ void BatchPfDriver<BatchSource>::_oc_write_controls_device(outer::DeviceOuterHoo
     t.vr_slot = thrust::raw_pointer_cast(d_oc_vr_slot_.data());
     t.vr_bus = thrust::raw_pointer_cast(d_oc_vr_bus_.data());
     t.vr_vm = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_vr_vm_.data()));
+    if (!outer_hook_->layout().slack_bus.empty())
+        t.slack_w = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_slack_w_.data()));
+    const size_t nbcs = static_cast<size_t>(n) * static_cast<size_t>(base.n_bc);
+    if (nbcs > 0) {
+        if (d_bc_in_out_.size() < nbcs) {   // amortised growth
+            const size_t c = nbcs + nbcs / 2 + 64;
+            d_bc_in_out_.resize(c); d_bc_in_retap_.resize(c); d_bc_in_tap_.resize(4 * c); d_bc_in_a_tap_.resize(c);
+            d_bc_in_rho_tap_.resize(c); d_bc_in_ctl_.resize(c); d_bc_in_rctl_.resize(c);
+        }
+        t.bc_out = thrust::raw_pointer_cast(d_bc_in_out_.data());
+        t.bc_retap = thrust::raw_pointer_cast(d_bc_in_retap_.data());
+        t.bc_tap = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_bc_in_tap_.data()));
+        t.bc_a_tap = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_bc_in_a_tap_.data()));
+        t.bc_rho_tap = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_bc_in_rho_tap_.data()));
+        t.bc_ctl = thrust::raw_pointer_cast(d_bc_in_ctl_.data());
+        t.bc_rctl = thrust::raw_pointer_cast(d_bc_in_rctl_.data());
+    }
+    const size_t nsc = static_cast<size_t>(n) * static_cast<size_t>(base.n_sc);
+    if (nsc > 0) {
+        if (d_sc_in_set_.size() < nsc) {   // amortised growth (a resize fills, which synchronises)
+            const size_t c = nsc + nsc / 2 + 64;
+            d_sc_in_set_.resize(c); d_sc_in_b_.resize(c); d_sc_in_ctl_.resize(c);
+        }
+        t.sc_set = thrust::raw_pointer_cast(d_sc_in_set_.data());
+        t.sc_b_new = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_sc_in_b_.data()));
+        t.sc_ctl = thrust::raw_pointer_cast(d_sc_in_ctl_.data());
+    }
     dev->write_controls(n, thrust::raw_pointer_cast(d_sl.data()), t, static_cast<cudaStream_t>(cs));
+    // BranchControl: the transformers' taps and controls into each slot's Ybus (a fresh load first
+    // resets them to the grid's taps), then ShuntControl's
+    if (nbcs > 0)
+        bc_controls_kernel<<<nr_grid_size(static_cast<long long>(n), BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.bc_static(), _bc_slots(),
+            thrust::raw_pointer_cast(d_sl.data()), n, /*fresh=*/!reload_sbus,
+            thrust::raw_pointer_cast(d_bc_in_out_.data()), thrust::raw_pointer_cast(d_bc_in_retap_.data()),
+            thrust::raw_pointer_cast(d_bc_in_tap_.data()), thrust::raw_pointer_cast(d_bc_in_a_tap_.data()),
+            thrust::raw_pointer_cast(d_bc_in_rho_tap_.data()), thrust::raw_pointer_cast(d_bc_in_ctl_.data()),
+            thrust::raw_pointer_cast(d_bc_in_rctl_.data()), base.nnz_Y);
+    // ShuntControl: the sections and controls into each slot's Ybus (a fresh load first resets it)
+    if (nsc > 0)
+        sc_controls_kernel<<<nr_grid_size(static_cast<long long>(nsc), BS), BS, 0, cs>>>(
+            thrust::raw_pointer_cast(d_Ybus_values_batch.data()), base.sc_static(), _sc_slots(),
+            thrust::raw_pointer_cast(d_sl.data()), n, /*fresh=*/!reload_sbus,
+            thrust::raw_pointer_cast(d_sc_in_set_.data()), thrust::raw_pointer_cast(d_sc_in_b_.data()),
+            thrust::raw_pointer_cast(d_sc_in_ctl_.data()), base.nnz_Y);
     if (nb > 0)
         oc_sbus_delta_kernel<<<nr_grid_size(static_cast<long long>(nb), BS), BS, 0, cs>>>(
             d_Sbus, t.ds_slot, t.ds_bus, thrust::raw_pointer_cast(d_oc_ds_p_.data()),
@@ -3148,10 +3192,11 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
             size_t ci = 0;
             if (dev_hook != nullptr) {
                 // every leaving slot decided in one launch, on the gathered rows the device holds
-                std::vector<int> ls, lc, ln, li, lg;
+                std::vector<int> ls, lc, ln, li, lg, lr;
                 int gi = 0;
                 for (int s = 0; s < S; ++s) {
                     if (h_evict()[s] < 0) continue;
+                    lr.push_back(_orig_row(h_evict()[s]));
                     const RowStatus st = leave_st[static_cast<size_t>(s)];
                     const bool converged = st == RowStatus::Converged;
                     ls.push_back(s); lc.push_back(converged ? 1 : 0); ln.push_back(iters[static_cast<size_t>(s)]);
@@ -3173,6 +3218,10 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 if (nd > 0)
                     CHK_CUDA_BPF(cudaMemcpyAsync(out.data(), q, out.size() * sizeof(int), cudaMemcpyDeviceToHost, cs));
                 cs.synchronize();
+                // the points other rows resume from, read off the finished slots before they are reused
+                dev_hook->export_points(nd, ls.data(), lr.data(), out.data(), out.data() + nd, lg.data(),
+                                        reinterpret_cast<const double*>(thrust::raw_pointer_cast(d_oc_gather_.data())),
+                                        oc_stride_);
                 for (int i = 0; i < nd; ++i) {
                     const int s = ls[static_cast<size_t>(i)];
                     const int next = out[static_cast<size_t>(i)], status = out[static_cast<size_t>(nd + i)];

@@ -249,7 +249,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                                     compute_physical_violations=compute_physical_violations)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
         if self._outer_loops_backend == "device":
-            _check_outer_loops_device(grid, init_from_n_powerflow, keep_outer_trace=keep_outer_trace)
+            _check_outer_loops_device(grid, init_from_n_powerflow)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg

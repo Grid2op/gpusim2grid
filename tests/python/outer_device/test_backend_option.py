@@ -81,50 +81,57 @@ def test_device_needs_the_outer_loops(grid: Any, facade: int):
 
 
 @pytest.fixture(scope="module")
-def grid_phase_control() -> Any:
-    """case14 with a PhaseControl loop besides the default ones (no shifter: stable at once), a
-    loop the device backend does not run yet"""
-    from lightsim2grid.algorithm import PhaseControl
+def grid_all_loops() -> Any:
+    """case14 with every loop lightsim2grid runs: the four default ones, PhaseControl,
+    TransformerVoltageControl and ShuntVoltageControl (none with an element to act on: stable at once)"""
+    from lightsim2grid.algorithm import PhaseControl, ShuntVoltageControl, TransformerVoltageControl
 
     g = case14_outer()
-    g.add_outer_loop(PhaseControl())
+    for lp in (PhaseControl(), TransformerVoltageControl(), ShuntVoltageControl()):
+        g.add_outer_loop(lp)
     g.change_algorithm("NROuter_KLU")
     assert g.ac_pf(np.full(g.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
     return g
 
 
-def test_census_marks_what_the_device_runs(grid: Any, grid_phase_control: Any):
+def test_census_marks_what_the_device_runs(grid: Any, grid_all_loops: Any):
+    """every feature the census lists is one the device runs"""
     from gpusim2grid import outer_device_census
 
-    supported: dict[str, bool] = {name: ok for name, _, ok in outer_device_census(grid)}
-    for name in (
-        "loop DistributedSlack",
-        "loop ReactiveLimits",
-        "ReactiveLimits local controller buses",
-        "generators with a reactive capability curve",
-        "DistributedSlack units",
-    ):
-        assert supported[name], name
-    counts = {name: (count, ok) for name, count, ok in outer_device_census(grid_phase_control)}
-    assert counts["loop PhaseControl"] == (1, False)
+    for g in (grid, grid_all_loops):
+        census = outer_device_census(g)
+        assert all(ok for _, _, ok in census), [name for name, _, ok in census if not ok]
+    counts = {name: count for name, count, _ in outer_device_census(grid_all_loops)}
+    for loop in ("PhaseControl", "TransformerVoltageControl", "ShuntVoltageControl"):
+        assert counts[f"loop {loop}"] == 1
 
 
 @pytest.mark.parametrize("facade", range(3))
-def test_device_refuses_the_whole_batch_naming_what_is_missing(grid_phase_control: Any, facade: int):
+def test_device_refuses_the_whole_batch_naming_what_is_missing(
+    grid: Any, facade: int, monkeypatch: pytest.MonkeyPatch
+):
+    """a feature the census marks unsupported refuses the whole batch at construction, naming it
+    (none is left today: the census is patched to report one)"""
+    import gpusim2grid._outer_loops as ol
+
+    real = ol._cpp._outer_device_census
+
+    def census(g: Any, resume: bool) -> list[Any]:
+        return [*real(g, resume), ("a feature to come", 2, False)]
+
+    monkeypatch.setattr(ol._cpp, "_outer_device_census", census)
     with pytest.raises(NotImplementedError) as err:
-        _facades()[facade](grid_phase_control, outer_loops=True, outer_loops_backend="device")
+        _facades()[facade](grid, outer_loops=True, outer_loops_backend="device")
     msg = str(err.value)
-    assert "loop PhaseControl (1)" in msg
+    assert "a feature to come (2)" in msg
     assert "outer_loops_backend='host'" in msg
     # what the device runs is not listed
     assert "loop ReactiveLimits" not in msg
 
 
-def test_device_refusal_names_the_host_only_options(grid: Any):
-    from gpusim2grid import ContingencyAnalysisGPU
-
-    with pytest.raises(NotImplementedError, match="keep_outer_trace"):
-        ContingencyAnalysisGPU(grid, outer_loops=True, outer_loops_backend="device", keep_outer_trace=True)
+@pytest.mark.parametrize("facade", range(3))
+def test_device_runs_every_loop(grid_all_loops: Any, facade: int):
+    _facades()[facade](grid_all_loops, outer_loops=True, outer_loops_backend="device")
 
 
 @requires_gpu

@@ -243,7 +243,7 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
                                     compute_physical_violations=compute_physical_violations)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
         if self._outer_loops_backend == "device":
-            _check_outer_loops_device(grid, init_from_n_powerflow, keep_outer_trace=keep_outer_trace)
+            _check_outer_loops_device(grid, init_from_n_powerflow)
 
         # Single source of truth, resolved once here and applied at
         # construction time to BOTH the base-case solve and the batch solver

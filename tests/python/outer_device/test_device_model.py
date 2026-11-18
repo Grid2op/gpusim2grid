@@ -75,6 +75,11 @@ def _assert_same_result(host: Any, dev: Any, where: str) -> None:
         "hvdc_regime",
     ):
         assert getattr(dev, key) == getattr(host, key), f"{where}: row_result.{key}"
+    # the decision trace (keep_outer_trace), line by line
+    assert list(dev.decisions) == list(host.decisions), f"{where}\ndevice:\n" + "\n".join(dev.decisions)
+    assert sorted(dev.shunt_sections) == sorted(host.shunt_sections), f"{where}: row_result.shunt_sections"
+    assert sorted(dev.phase_tap) == sorted(host.phase_tap), f"{where}: row_result.phase_tap"
+    assert sorted(dev.ratio_tap) == sorted(host.ratio_tap), f"{where}: row_result.ratio_tap"
     h, d = dict(host.gen_target_p), dict(dev.gen_target_p)
     assert sorted(d) == sorted(h), f"{where}: row_result.gen_target_p ids"
     for g, mw in h.items():
@@ -89,7 +94,7 @@ def _lockstep(
     base = make_grid()
     assert base.ac_pf(np.full(base.total_bus(), 1.0 + 0j), cpu.MAX_IT, tol_mva).size > 0
     host = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=resume)
-    dev = _cpp._OuterModelHarness(base, keep_trace=False, resume_from_n=resume, backend="device")
+    dev = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=resume, backend="device")
     for h in (host, dev):
         h.begin(1, 1)
     row = make_grid(**row_kwargs)
@@ -228,7 +233,7 @@ def test_row_masking_a_voltage_controlled_bus(load_scale: float):
     to_base = np.asarray(base.id_me_to_ac_solver(), dtype=int)
     masked = int(to_base[bus])
     host = _cpp._OuterModelHarness(base, keep_trace=True)
-    dev = _cpp._OuterModelHarness(base, keep_trace=False, backend="device")
+    dev = _cpp._OuterModelHarness(base, keep_trace=True, backend="device")
     for h in (host, dev):
         h.set_branch_off([[len(base.get_lines()) + trafo]], masked=[[masked]])
         h.begin(1, 1)
@@ -294,3 +299,142 @@ def test_row_masking_a_voltage_controlled_bus(load_scale: float):
             _assert_same_result(res, dev.row_result(0), "\n".join(res.decisions))
             return
     raise AssertionError("the row never ended")
+
+
+# ---- a distributed-slack Newton (NROuterDist_*) --------------------------------------------------
+
+
+@pytest.mark.parametrize("load_scale, line_off", [(1.0, None), (1.1, None), (1.1, 3), (1.3, None)])
+def test_dist_newton(load_scale: float, line_off: int | None):
+    """the Newton shares the slack on the units by the weights each solve sets (controls' slack_w);
+    DistributedSlack parks the unit its share pushes past its limit"""
+    _lockstep(lambda **kw: cpu._case14_dist(**kw), load_scale=load_scale, line_off=line_off)
+
+
+@pytest.mark.parametrize("fail_on_residue", [True, False])
+def test_dist_every_unit_at_its_limit(fail_on_residue: bool):
+    def make(**kw: Any) -> Any:
+        n_gen = len(cpu._case14_dist(capped=False, only_ds=True).get_generators())
+        return cpu._case14_dist(
+            capped=False, only_ds=True, max_p=np.full(n_gen, 45.0), fail_on_residue=fail_on_residue, **kw
+        )
+
+    _lockstep(make, load_scale=1.2)
+
+
+def test_dist_only_the_loop():
+    _lockstep(lambda **kw: cpu._case14_dist(only_ds=True, **kw), load_scale=1.1)
+
+
+@pytest.mark.skipif(
+    not getattr(_cpp, "have_ls2g_outer_resume", False), reason="lightsim2grid without its loops' state"
+)
+@pytest.mark.parametrize("load_scale", [1.03, 1.09])
+def test_dist_rows_resume_with_the_parked_units(load_scale: float):
+    _lockstep(lambda **kw: cpu._case14_dist(**kw), resume=True, load_scale=load_scale)
+
+
+# ---- ShuntVoltageControl (ShuntControl) -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bus, target_kv, sections",
+    [("B9", 12.8, (3, 1)), ("B9", 13.2, (3, 1)), ("B9", 12.4, (3, 1)), ("B10", 12.8, (5, 0))],
+)
+def test_shunt_voltage_control(bus: str, target_kv: float, sections: tuple[int, int]):
+    """the regulating shunts of a bus one susceptance unknown in the first solve, then dispatched to
+    sections (ShuntControl's controls compared every iteration)"""
+    res = _lockstep(lambda **kw: cpu._shunt_grid(bus, target_kv, sections, **kw), tol_mva=1e-10)
+    assert any("ROUND_SECTIONS" in d for d in res.decisions), res.decisions
+
+
+def test_shunt_voltage_control_hidden_by_a_generator():
+    res = _lockstep(lambda **kw: cpu._shunt_grid("B6", 12.8, (0, 2), **kw), tol_mva=1e-10)
+    assert not res.decisions
+
+
+@pytest.mark.parametrize("load_scale", [1.05, 1.1])
+def test_shunt_voltage_control_rows(load_scale: float):
+    _lockstep(lambda **kw: cpu._shunt_grid("B9", 13.2, (3, 1), **kw), tol_mva=1e-10, load_scale=load_scale)
+
+
+# ---- PhaseControl (BranchControl) ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("delta_mw", [7.0, -12.3, 30.0])
+def test_phase_control_active_power(delta_mw: float):
+    """a phase shifter regulating its active power: its shift a Newton unknown, then rounded to the
+    closest tap (BranchControl's controls compared every iteration)"""
+    p1, _ = cpu._pst_flow()
+    res = _lockstep(lambda **kw: cpu._pst_grid("ACTIVE_POWER_CONTROL", p1 + delta_mw, **kw), tol_mva=1e-10)
+    assert res.phase_tap
+
+
+@pytest.mark.parametrize("factor", [0.8, 0.95, 1.1])
+def test_phase_control_current_limiter(factor: float):
+    """a current limiter one tap at a time, the way that lowers its current"""
+    _, i1 = cpu._pst_flow()
+    _lockstep(lambda **kw: cpu._pst_grid("CURRENT_LIMITER", factor * i1, **kw), tol_mva=1e-10)
+
+
+@pytest.mark.parametrize("load_scale", [1.05, 1.1])
+def test_phase_control_rows(load_scale: float):
+    p1, _ = cpu._pst_flow()
+    _lockstep(
+        lambda **kw: cpu._pst_grid("ACTIVE_POWER_CONTROL", p1 + 7.0, **kw),
+        tol_mva=1e-10,
+        load_scale=load_scale,
+    )
+
+
+# ---- TransformerVoltageControl (BranchControl's ratio columns) -------------------------------------
+
+
+@pytest.mark.parametrize("target_kv, deadband_kv", [(12.6, 0.1), (12.4, 0.05), (12.5, 0.02), (12.0, 0.1)])
+def test_transformer_voltage_control(target_kv: float, deadband_kv: float):
+    """a ratio tap changer regulating a bus: switched on, its ratio solved, rounded to a tap"""
+    res = _lockstep(lambda **kw: cpu._tvc_grid("T4-9-1", target_kv, deadband_kv, **kw), tol_mva=1e-10)
+    assert any("ROUND_TAP" in d for d in res.decisions), res.decisions
+
+
+def test_transformer_voltage_control_with_reactive_limits():
+    _lockstep(lambda **kw: cpu._tvc_grid("T4-9-1", 12.3, 0.05, reactive_limits=True, **kw), tol_mva=1e-10)
+
+
+def test_transformer_voltage_control_hidden_by_a_generator():
+    _lockstep(lambda **kw: cpu._tvc_grid("T5-6-1", 12.6, 0.1, **kw), tol_mva=1e-10)
+
+
+@pytest.mark.parametrize(
+    "loop_kw",
+    [
+        dict(use_initial_tap_position=True, max_controlled_nominal_voltage=120.0),
+        dict(max_controlled_nominal_voltage=120.0),
+    ],
+)
+def test_transformer_voltage_control_frozen_generators(loop_kw: dict[str, Any]):
+    """the generators of up to 120 kV frozen while the transformer acts (suspended for ReactiveLimits)"""
+    _lockstep(
+        lambda **kw: cpu._tvc_grid("T4-9-1", 12.6, 0.1, reactive_limits=True, **loop_kw, **kw), tol_mva=1e-10
+    )
+
+
+@pytest.mark.parametrize("load_scale", [1.05, 1.1])
+def test_transformer_voltage_control_rows(load_scale: float):
+    _lockstep(
+        lambda **kw: cpu._tvc_grid(
+            "T4-9-1",
+            12.6,
+            0.1,
+            reactive_limits=True,
+            use_initial_tap_position=True,
+            max_controlled_nominal_voltage=120.0,
+            **kw,
+        ),
+        tol_mva=1e-10,
+        load_scale=load_scale,
+    )
+
+
+def test_shunt_voltage_control_hidden_by_a_transformer():
+    _lockstep(lambda **kw: cpu._shunt_grid("B9", 13.2, (0, 2), with_trafo_control=True, **kw), tol_mva=1e-10)

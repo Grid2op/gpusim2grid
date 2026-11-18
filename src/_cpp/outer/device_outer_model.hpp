@@ -63,10 +63,23 @@ public:
         int* hvdc = nullptr;
         int* ds_slot = nullptr;  int* ds_bus = nullptr;  double* ds_p = nullptr;  double* ds_q = nullptr;
         int* vr_slot = nullptr;  int* vr_bus = nullptr;  double* vr_vm = nullptr;
+        double* slack_w = nullptr;   // [S x n_slack] a distributed-slack Newton's weights (nullptr: none)
+        // ShuntControl, one block of n_sc per listed slot (nullptr: none): sections set (once), their
+        // susceptance (pu), the controls (1 on, 0 off, -1 untouched)
+        unsigned char* sc_set = nullptr;  double* sc_b_new = nullptr;  signed char* sc_ctl = nullptr;
+        // BranchControl, one block of n_bc per listed slot (nullptr: none): out of the row, retapped,
+        // the block at the taps (4 complex as re/im pairs), its shift and ratio, the controls
+        unsigned char* bc_out = nullptr;  unsigned char* bc_retap = nullptr;  double* bc_tap = nullptr;
+        double* bc_a_tap = nullptr;  double* bc_rho_tap = nullptr;  signed char* bc_ctl = nullptr;  signed char* bc_rctl = nullptr;
     };
     // the tail compaction's moves together (OuterHook::move of each pair; the two slot sets are
     // disjoint): device lists d_from / d_to and the same on the host
     virtual void move_slots(int n, const int* d_from, const int* d_to, const int* h_from, const int* h_to) = 0;
+    // the slots decide() just finished (next 1): a row other rows resume from (set_row_resume) that
+    // ended stable and converged has its point read off its slot and its gathered row (row
+    // h_grow[i] of d_gather) and handed to the host model (keep_point), before the slot is reused
+    virtual void export_points(int n, const int* h_slots, const int* h_rows, const int* h_next, const int* h_status,
+                               const int* h_grow, const double* d_gather, int stride) = 0;
     virtual int sbus_block() const = 0;
     virtual int vm_reset_block() const = 0;
     virtual void write_controls(int n, const int* d_slots, const ControlTargets& t, void* stream) = 0;
@@ -77,7 +90,7 @@ std::string device_outer_error(int slot, int code);
 
 // The device model over `host` (a model implementing both interfaces, Ls2gOuterModel; `side` is
 // the same object). Throws DeviceNotImplemented for a grid the device does not run yet.
-std::shared_ptr<OuterHook> make_device_outer_model_from(std::shared_ptr<OuterHook> host, const DeviceHostSide* side);
+std::shared_ptr<OuterHook> make_device_outer_model_from(std::shared_ptr<OuterHook> host, DeviceHostSide* side);
 
 }  // namespace outer
 

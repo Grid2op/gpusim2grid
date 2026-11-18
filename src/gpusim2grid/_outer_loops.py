@@ -58,15 +58,13 @@ def _resolve_outer_loops_backend(backend, outer_loops):
     return backend
 
 
-def _check_outer_loops_device(grid, resume_from_n, **host_only):
+def _check_outer_loops_device(grid, resume_from_n):
     """Raise ``NotImplementedError`` when ``outer_loops_backend='device'`` cannot run this grid:
     every feature of its outer loops the device backend does not implement yet
-    (``_outer_device_census``) and every option only the host backend has (``host_only``:
-    name -> value, a truthy value counts). Nothing is run partly on the host: the whole batch is
-    refused, before any GPU work."""
+    (``_outer_device_census``). Nothing is run partly on the host: the whole batch is refused,
+    before any GPU work."""
     census = _cpp._outer_device_census(grid, bool(resume_from_n))
     missing = [f"{name} ({count})" for name, count, supported in census if count > 0 and not supported]
-    missing += [name for name, value in host_only.items() if value]
     if missing:
         raise NotImplementedError(
             "outer_loops_backend='device' does not implement yet: " + "; ".join(missing)

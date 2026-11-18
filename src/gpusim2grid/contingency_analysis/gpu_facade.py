@@ -423,7 +423,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                                     reactive_limits_outer_loop=reactive_limits_outer_loop)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
         if self._outer_loops_backend == "device":
-            _check_outer_loops_device(grid, init_from_n_powerflow, keep_outer_trace=keep_outer_trace)
+            _check_outer_loops_device(grid, init_from_n_powerflow)
         # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
         # built (lazily) from the same grid with the same construction options
         self._rl_ctor_kwargs = dict(
