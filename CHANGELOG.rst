@@ -7,6 +7,8 @@ Change Log
   the host keeps the GPU fed; opt-in.
 - [IMPROVED] Fewer device synchronisations per round: grow-only pinned buffers, double-buffered segment uploads,
   no stream sync after a fill.
+- [IMPROVED] ``outer_loops=True``: a row disconnecting units or tripping lines takes its ReactiveLimits plan and
+  DistributedSlack units by filtering the grid's (the same lists, a third of a row's load).
 - [ADDED] ``outer_loops_backend`` (``"host"`` default, today's path) on the three batch facades and
   ``BatchPowerFlow``: ``"device"`` runs all seven outer loops in CUDA kernels (``outer_device_census``).
 - [IMPROVED] ``outer_loops=True``: the unrealistic-voltage check runs one block per converged row instead of

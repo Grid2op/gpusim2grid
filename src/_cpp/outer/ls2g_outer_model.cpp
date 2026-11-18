@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <type_traits>
 #include <complex>
 #include <limits>
@@ -116,7 +117,7 @@ enum ProfSec : int {
     P_LOAD_RESUME_TARGETS, P_LOAD_INIT_LOOPS, P_LOAD_RESUME_LOOPS, P_LOAD_RESET, P_LOAD_INIT_DS, P_LOAD_INIT_RL, P_LOAD_MASKED_ROWS, P_LOAD_DS_NUNITS,
     P_DONE_NO_RESOLVE, P_DNR_FAILED, P_DNR_OK_MASKED, P_DNR_OK_MOVED, P_DNR_OK_BASE,
     P_ACT_FIRST, P_ACT_FIRST_LAST = P_ACT_FIRST + 6, P_ACT_ALL, P_ACT_ALL_LAST = P_ACT_ALL + 6,
-    P_DS_STABLE_MOVED, P_RL_RESUME_FROZEN, P_RL_BASE, P_RL_RECOMPUTE, P_RL_NO_BASE, P_N_SEC
+    P_DS_STABLE_MOVED, P_RL_RESUME_FROZEN, P_RL_BASE, P_RL_RECOMPUTE, P_RL_NO_BASE, P_RL_PLAN_FILTER, P_RL_PLAN_BUSES, P_N_SEC
 };
 const char* const kProfName[P_N_SEC] = {
     "on_solved (Resolve)", "on_solved (Done)", "  ds_fold", "  check DistributedSlack", "  check HvdcLimits",
@@ -130,7 +131,7 @@ const char* const kProfName[P_N_SEC] = {
     "first act: PhaseControl", "first act: TVC", "first act: ShuntVoltageControl",
     "acts: DistributedSlack", "acts: HvdcLimits", "acts: VoltageMonitoring", "acts: ReactiveLimits",
     "acts: PhaseControl", "acts: TVC", "acts: ShuntVoltageControl",
-    "DS STABLE but moved", "rl buses resumed frozen", "rl bus: base sums", "rl bus: moved, recomputed", "rl bus: no base"};
+    "DS STABLE but moved", "rl buses resumed frozen", "rl bus: base sums", "rl bus: moved, recomputed", "rl bus: no base", "    plan: bus_q entries", "    plan: controller buses"};
 
 struct OcProfile {
     bool on = false;
@@ -485,6 +486,9 @@ private:
     // the rows' adjoint terms are wanted (set_keep_adjoint): only then are the slopes of the frozen
     // generators and the last solve's parked units recorded, and adjoint_info run
     bool keep_adjoint_ = false;
+    // GPUSIM2GRID_OUTER_CHECK_RL_PLAN=1 (diagnostic): every filtered ReactiveLimits plan compared
+    // with build_bus_q_plan's, every filtered unit list with collect_units' (throws on a difference)
+    bool check_rl_filter_ = [] { const char* e = std::getenv("GPUSIM2GRID_OUTER_CHECK_RL_PLAN"); return e && *e && *e != '0'; }();
     mutable OcProfile prof_;              // GPUSIM2GRID_OC_PROFILE
     Layout layout_;
     double sn_ = 1.;
@@ -579,6 +583,7 @@ private:
     // the device tables' plan: the grid's, or with the buses the rows' moved generators bring
     // (device_prepare_rows: bus_q entries, then theirs, then the monitors)
     std::shared_ptr<const RlPlan> rl_dev_;
+    std::vector<std::vector<int>> gens_of_bus0_;   // per solver bus, the grid's generators there
     const RlPlan& rl_dev() const { return rl_dev_ ? *rl_dev_ : *rl0_; }
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
     ls2g::svc_standby_check::SvcStandbyPlan monitors_;
@@ -645,7 +650,10 @@ private:
     }
     // the plan, units and active loops of the row a slot holds (its view set already)
     std::shared_ptr<const RlPlan> build_rl_plan(const ls2g::OuterGridView& v, const std::vector<int>* gone = nullptr,
-                                                const std::vector<int>* hvdc_gone = nullptr) const;
+                                                const std::vector<int>* hvdc_gone = nullptr, bool filtered = false) const;
+    // bus_q_check::build_bus_q_plan of a row that moves no generator: the grid's plan filtered
+    // (the machines the row disconnects or strands out, the buses left without one dropped)
+    void filtered_bus_q_plan(const ls2g::OuterGridView& v, ls2g::bus_q_check::BusQPlan& out) const;
     std::shared_ptr<const RlPlan> rl_plan_masked(const std::vector<int>& masked) const;
     void take_resume_targets(SlotState& st) const;
     // DistributedSlack, at initialize: the row's lost active power shared on its units
@@ -948,6 +956,19 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
     // DistributedSlack's participants: collected once here, they depend on a row only
     // through the units it disconnects (collecting them was most of a slot's load)
     collect_units(v, units0_, units0_bus_);
+
+    // per solver bus, the generators the grid places there (id order): build_rl_plan's target Q sums
+    // of a row moving no generator
+    {
+        SlotState plain_g;
+        plain_g.rowv.layout = &sbl_;
+        const ls2g::OuterGridView vg = view(plain_g);
+        gens_of_bus0_.assign(static_cast<size_t>(n_bus_), {});
+        for (int g = 0; g < n_gen_; ++g) {
+            const int b = vg.gen_bus_solver(g);
+            if (b >= 0 && b < n_bus_) gens_of_bus0_[static_cast<size_t>(b)].push_back(g);
+        }
+    }
 
     // ---- a distributed-slack Newton (NROuterDist_*) ----------------------------------------
     // its slack_absorbed column has an entry on the reference and on every bus its
@@ -1263,7 +1284,9 @@ void Ls2gOuterModel::load(int slot, int row)
     {
         ProfScope p(prof_, P_LOAD_RL_PLAN);
         st.lim_base = st.rowv.gens.target_p.empty();
-    if (changes_units || !st.rowv.gens.target_vm.empty()) st.rl = build_rl_plan(view(st), vc_gone, hvdc_gone);
+    // (a row moving no generator: the grid's plan filtered, build_bus_q_plan's result at a fraction)
+    if (changes_units || !st.rowv.gens.target_vm.empty())
+        st.rl = build_rl_plan(view(st), vc_gone, hvdc_gone, /*filtered=*/st.rowv.gens.bus_solver.empty());
         else if (!st.masked.empty())                          st.rl = rl_plan_masked(st.masked);
         else                                                  st.rl = rl0_;
     }
@@ -1284,7 +1307,33 @@ void Ls2gOuterModel::load(int slot, int row)
     {
         ProfScope p(prof_, P_LOAD_UNITS);
         if (prof_.on && !st.masked.empty()) ++prof_.n[P_LOAD_MASKED_ROWS];
-        if (changes_units) {
+        if (changes_units && st.rowv.gens.bus_solver.empty()) {
+            // a row moving no unit: the grid's participants still on and on a live bus, in order
+            // (collect_units' rules; the injections are rewritten by init_loops)
+            const ls2g::OuterGridView v = view(st);
+            st.ds_units.reserve(units0_.size());
+            st.ds_unit_bus.reserve(units0_.size());
+            for (size_t k = 0; k < units0_.size(); ++k) {
+                const auto& u = units0_[k];
+                const bool gen = u.kind == ls2g::slack_redistribution::UnitKind::GENERATOR;
+                const int bus = gen ? v.gen_bus_solver(u.el_id) : v.storage_bus_solver(u.el_id);
+                if (bus < 0 || v.is_masked(bus)) continue;
+                st.ds_units.push_back(u);
+                st.ds_unit_bus.push_back(units0_bus_[k]);
+            }
+            if (check_rl_filter_) {
+                std::vector<ls2g::slack_redistribution::Participant> ref;
+                std::vector<int> ref_bus;
+                collect_units(v, ref, ref_bus);
+                bool same = ref.size() == st.ds_units.size() && ref_bus == st.ds_unit_bus;
+                for (size_t k = 0; same && k < ref.size(); ++k)
+                    same = ref[k].kind == st.ds_units[k].kind && ref[k].el_id == st.ds_units[k].el_id &&
+                           ref[k].bus == st.ds_units[k].bus && ref[k].weight == st.ds_units[k].weight &&
+                           ref[k].min_p_mw == st.ds_units[k].min_p_mw && ref[k].max_p_mw == st.ds_units[k].max_p_mw;
+                if (!same) throw std::runtime_error("outer model: the filtered DistributedSlack units are not collect_units'");
+                st.ds_units = ref;   // the injections as collect_units has them (init_loops rewrites them)
+            }
+        } else if (changes_units) {
             collect_units(view(st), st.ds_units, st.ds_unit_bus);
         } else if (!st.masked.empty()) {
             st.ds_units.reserve(units0_.size());
@@ -1420,15 +1469,66 @@ void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
             stos.get_can_participate_slack_weight(el), -v.storage_target_p(el), stos.get_min_p(el), stos.get_max_p(el));
 }
 
+void Ls2gOuterModel::filtered_bus_q_plan(const ls2g::OuterGridView& v, ls2g::bus_q_check::BusQPlan& out) const
+{
+    // build_bus_q_plan's rules on the grid's entries (in the grid's bus order): a generator that is
+    // a controller of the plan counts while on, any other while a local voltage controller; a
+    // storage unit while a local voltage controller; a station while its line is on; an SVC and
+    // the controller positions as the grid's; a masked bus, or one left without a machine, out
+    const ls2g::VoltageControlSolverData& ctrl = v.layout().voltage_control.controllers();
+    std::vector<char> gen_is_ctrl(static_cast<size_t>(n_gen_), 0);
+    for (int c = 0; c < ctrl.n_controllers(); ++c)
+        if (!ctrl.is_held(c) && ctrl.kind(c) == ls2g::VoltageControlSolverData::GEN && ctrl.elem_id(c) >= 0 &&
+            ctrl.elem_id(c) < n_gen_)
+            gen_is_ctrl[static_cast<size_t>(ctrl.elem_id(c))] = 1;
+    out.clear();
+    for (size_t k = 0; k < rl0_->n_bus_q; ++k) {
+        const auto& g = rl0_->plan->buses[static_cast<size_t>(rl0_->buses[k].entry)];
+        if (v.is_masked(g.bus_solver)) continue;
+        ls2g::bus_q_check::BusQEntry e = g;
+        e.gen_ids.clear();
+        for (int gid : g.gen_ids)
+            if (gen_is_ctrl[static_cast<size_t>(gid)] ? v.gen_on(gid) : v.gen_is_local_voltage_controller(gid)) e.gen_ids.push_back(gid);
+        e.storage_ids.clear();
+        for (int sid : g.storage_ids) if (v.storage_is_local_voltage_controller(sid)) e.storage_ids.push_back(sid);
+        e.station_ids.clear();
+        for (const auto& st : g.station_ids) if (v.hvdc_on(st.first)) e.station_ids.push_back(st);
+        if (e.gen_ids.empty() && e.storage_ids.empty() && e.station_ids.empty() && e.svc_ids.empty()) continue;
+        if (!e.ctrl_pos.empty()) out.needs_controller_q = true;
+        out.buses.push_back(std::move(e));
+    }
+}
+
 std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGridView& v, const std::vector<int>* gone,
-                                                            const std::vector<int>* hvdc_gone) const
+                                                            const std::vector<int>* hvdc_gone, bool filtered) const
 {
     auto rl = std::make_shared<RlPlan>();
     // ReactiveLimitsLoop::_initialize: bus_q_check's plan on this view, plus one entry per
     // voltage monitor (a held SVC controller of the plan)
     auto plan = std::make_shared<ls2g::bus_q_check::BusQPlan>();
     rl->plan = plan;
-    ls2g::bus_q_check::build_bus_q_plan(v, *plan);
+    {
+    ProfScope p_filter(prof_, P_RL_PLAN_FILTER);
+    if (filtered) {
+        filtered_bus_q_plan(v, *plan);
+        if (check_rl_filter_) {   // GPUSIM2GRID_OUTER_CHECK_RL_PLAN: the filter is build_bus_q_plan's plan
+            ls2g::bus_q_check::BusQPlan ref;
+            ls2g::bus_q_check::build_bus_q_plan(v, ref);
+            bool same = ref.buses.size() == plan->buses.size() && ref.needs_controller_q == plan->needs_controller_q;
+            for (size_t k = 0; same && k < ref.buses.size(); ++k) {
+                const auto& a = ref.buses[k];
+                const auto& b = plan->buses[k];
+                same = a.bus_solver == b.bus_solver && a.bus_grid == b.bus_grid && a.gen_ids == b.gen_ids &&
+                       a.storage_ids == b.storage_ids && a.station_ids == b.station_ids && a.svc_ids == b.svc_ids &&
+                       a.ctrl_pos == b.ctrl_pos && a.sub_name == b.sub_name;
+            }
+            if (!same) throw std::runtime_error("outer model: the filtered ReactiveLimits plan is not build_bus_q_plan's");
+        }
+    } else {
+        ls2g::bus_q_check::build_bus_q_plan(v, *plan);
+    }
+    }
+    ProfScope p_buses(prof_, P_RL_PLAN_BUSES);
     // The controllers the row trips (`gone`, sorted) hold nothing: the plan keeps every
     // controller standing on a bus (a generator it only drops from the machines), and a
     // freeze of that bus would write a limit over their Q = 0.
@@ -1472,13 +1572,27 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
     const auto& stos = grid_->get_storages();
     const auto& hvdcs = grid_->get_dclines();
     const auto vn_kv = grid_->get_bus_vn_kv();
-    // the robust mode's: the target Q of every generator ON in this row, summed per bus
-    std::vector<double> target_q_of_bus(v.id_solver_to_me().size(), 0.);
-    for (int gid = 0; gid < gens.nb(); ++gid) {
-        const int b = v.gen_bus_solver(gid);
-        if (b >= 0 && static_cast<size_t>(b) < target_q_of_bus.size())
-            target_q_of_bus[static_cast<size_t>(b)] += gens.get_target_q()(gid);
+    // the robust mode's: the target Q of every generator ON in this row, summed per bus (a row
+    // moving no generator: over the grid's generators of each bus, in id order -- the same sums)
+    std::vector<double> target_q_of_bus;
+    if (!filtered || check_rl_filter_) {
+        target_q_of_bus.assign(v.id_solver_to_me().size(), 0.);
+        for (int gid = 0; gid < gens.nb(); ++gid) {
+            const int b = v.gen_bus_solver(gid);
+            if (b >= 0 && static_cast<size_t>(b) < target_q_of_bus.size())
+                target_q_of_bus[static_cast<size_t>(b)] += gens.get_target_q()(gid);
+        }
     }
+    auto target_q_at = [&](int b) {
+        if (!filtered) return target_q_of_bus[static_cast<size_t>(b)];
+        double q = 0.;
+        if (b >= 0 && static_cast<size_t>(b) < gens_of_bus0_.size())
+            for (int gid : gens_of_bus0_[static_cast<size_t>(b)])
+                if (v.gen_bus_solver(gid) == b) q += gens.get_target_q()(gid);
+        if (check_rl_filter_ && std::memcmp(&q, &target_q_of_bus[static_cast<size_t>(b)], sizeof(double)) != 0)
+            throw std::runtime_error("outer model: a filtered row's target Q sum is not build_rl_plan's");
+        return q;
+    };
     for (size_t k = 0; k < rl->plan->buses.size(); ++k) {
         const auto& entry = rl->plan->buses[k];
         RlBus bus;
@@ -1500,7 +1614,7 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::build_rl_plan(const ls2g::OuterGri
             const int reg_grid = v.id_solver_to_me()[bus.reg_bus_solver].cast_int();
             if (reg_grid >= 0) bus.nominal_v = vn_kv(reg_grid);
         }
-        bus.target_q = target_q_of_bus[static_cast<size_t>(entry.bus_solver)];
+        bus.target_q = target_q_at(entry.bus_solver);
         for (int gid : entry.gen_ids)
             if (!has_target) { bus.target_vm = v.gen_target_vm(gid); has_target = true; }
         for (int sid : entry.storage_ids) {

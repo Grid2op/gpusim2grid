@@ -31,6 +31,9 @@
 #include <cmath>
 #include <limits>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <sstream>
 #include <memory>
@@ -1786,6 +1789,16 @@ struct HostRow {
 class DeviceOuterModel final : public OuterHook, public DeviceOuterHook {
 public:
     DeviceOuterModel(std::shared_ptr<OuterHook> host, DeviceHostSide* side);
+    ~DeviceOuterModel() override {
+        if (prof_on_ && prof_rows_ > 0)
+            std::fprintf(stderr, "[GPUSIM2GRID_OC_PROFILE] device host-loaded rows %ld: host load %.1f ms, image %.1f ms, "
+                         "fill %.1f ms, upload %.1f ms; pool widths int %zu u8 %zu f64 %zu\n", prof_rows_, prof_ms_[0],
+                         prof_ms_[1], prof_ms_[2], prof_ms_[3], w_int_, w_u8_, w_f64_);
+        if (prof_on_ && prof_rows_ > 0)
+            std::fprintf(stderr, "[GPUSIM2GRID_OC_PROFILE] device host-loaded rows by kind: resuming plain %ld, resuming masked %ld, "
+                         "resuming other %ld, masked %ld, other %ld, phantom %ld\n", prof_why_[0], prof_why_[1], prof_why_[2],
+                         prof_why_[3], prof_why_[4], prof_why_[5]);
+    }
     const Layout& layout() const override { return host_->layout(); }
     void set_keep_adjoint(bool keep) override {
         keep_adj_ = keep;
@@ -1891,7 +1904,10 @@ private:
     void compare_rows_with(const HostRow& hr, const HostRow& tmpl, int row) const;
     void compare_with_template(const HostRow& hr, int row) const;
     void compare_rows(const HostRow& host, const HostRow& dev, int row) const;
-    bool mask_from_template(int row) const;
+    bool mask_from_template(int row) const { return mask_source(row) != -2; }
+    // the template a masked row is loaded from: -1 the plain rows', k >= 0 point template k's (a row
+    // resuming from that point), -2 none (loaded through the host model)
+    int mask_source(int row) const;
     void read_row(int slot, HostRow& hr) const;
     void set_int(int slot, const char* name, int v);
     int get_int(int slot, const char* name) const;
@@ -1967,6 +1983,11 @@ private:
     // every such row also loaded through the host and compared)
     bool keep_points_ = false;                // OuterHook::keep_row_points
     bool keep_adj_ = false;                   // OuterHook::set_keep_adjoint
+    // GPUSIM2GRID_OC_PROFILE: the host-loaded rows' parts (host load, image, fill, upload), ms
+    bool prof_on_ = [] { const char* e = std::getenv("GPUSIM2GRID_OC_PROFILE"); return e && *e && *e != '0'; }();
+    double prof_ms_[4] = {0., 0., 0., 0.};
+    long prof_rows_ = 0;
+    long prof_why_[6] = {0, 0, 0, 0, 0, 0};
     std::vector<RowResult> adj_;              // per row: its adjoint view (pq_buses ... gen_p_slope_*)
     std::vector<int> resume_of_row_;          // OuterHook::set_row_resume
     std::vector<char> referenced_;            // per row: another row resumes from its point
@@ -1986,9 +2007,26 @@ private:
     // staging
     thrust::device_vector<int> st_slots_, st_conv_, st_nr_, st_inner_, st_grow_, st_next_, st_status_;
     // load_rows' lists and staging, kept across calls (an allocation would sync the device)
-    thrust::device_vector<int> ld_slots_, ld_tmpl_, ld_mask_, ld_si_, ld_point_;
-    thrust::device_vector<unsigned char> ld_su_;
-    thrust::device_vector<double> ld_sf_;
+    thrust::device_vector<int> ld_slots_, ld_tmpl_, ld_mask_, ld_point_;
+    // the phantom rows' template (a base-case load: row -1)
+    bool phantom_ready_ = false;
+    std::unique_ptr<HostRow> ph_host_;
+    thrust::device_vector<int> ph_i_, ld_phantom_;
+    thrust::device_vector<unsigned char> ph_u_;
+    thrust::device_vector<double> ph_f_;
+    // host-loaded rows: the baseline row (host / device) and each call's differences from it
+    std::unique_ptr<HostRow> base_row_;
+    thrust::device_vector<int> base_i_;
+    thrust::device_vector<unsigned char> base_u_;
+    thrust::device_vector<double> base_f_;
+    std::vector<long long> dif_i_pos_, dif_u_pos_, dif_f_pos_;
+    std::vector<int> dif_i_val_;
+    std::vector<unsigned char> dif_u_val_;
+    std::vector<double> dif_f_val_;
+    thrust::device_vector<long long> ld_dpos_i_, ld_dpos_u_, ld_dpos_f_;
+    thrust::device_vector<int> ld_dval_i_;
+    thrust::device_vector<unsigned char> ld_dval_u_;
+    thrust::device_vector<double> ld_dval_f_;
     thrust::device_vector<double> st_gather_;
 };
 
@@ -2258,6 +2296,8 @@ void DeviceOuterModel::begin(int n_slots, int n_rows)
     alloc_rows(n_rows);
     build_dev();
     have_tmpl_ = false;
+    phantom_ready_ = false;
+    base_row_.reset();
     point_base_.clear();
     row_base_.clear();
     point_tmpl_.clear();
@@ -2321,15 +2361,27 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
 // a masked row loads from the template unless the mask touches what the template's load decided
 // from the whole grid: DistributedSlack left without a unit off the slack bus (the loop goes out),
 // a bus it froze or reset (a resumed frozen bus the row's plan no longer has)
-bool DeviceOuterModel::mask_from_template(int row) const
+int DeviceOuterModel::mask_source(int row) const
 {
-    if (!tmpl_row_ || row < 0 || resumes(row) || own_targets(row) || static_cast<size_t>(row) >= mask_only_.size() ||
-        !mask_only_[static_cast<size_t>(row)])
-        return false;
+    if (row < 0 || own_targets(row) || static_cast<size_t>(row) >= mask_only_.size() || !mask_only_[static_cast<size_t>(row)])
+        return -2;
+    // the plain template, or the template of the point the row resumes from
+    const HostRow* tmpl = nullptr;
+    int source = -2;
+    if (resumes(row)) {
+        auto it = point_tmpl_.find(resume_of_row_[static_cast<size_t>(row)]);
+        if (it == point_tmpl_.end()) return -2;
+        tmpl = it->second.host.get();
+        source = it->second.idx;
+    } else {
+        if (!tmpl_row_) return -2;
+        tmpl = tmpl_row_.get();
+        source = -1;
+    }
     const std::vector<int>& m = masked_rows_[static_cast<size_t>(row)];
     auto is_masked = [&](int b) { return std::binary_search(m.begin(), m.end(), b); };
-    const auto& ti = tmpl_row_->i;
-    const auto& tu = tmpl_row_->u;
+    const auto& ti = tmpl->i;
+    const auto& tu = tmpl->u;
     const size_t act = field_of_.at("active").off, n_act = static_cast<size_t>(ti[field_of_.at("n_active").off]);
     for (size_t k = 0; k < n_act; ++k) {
         if (t_.loop_kind[static_cast<size_t>(ti[act + k])] != DL_DISTRIBUTED_SLACK) continue;
@@ -2338,14 +2390,14 @@ bool DeviceOuterModel::mask_from_template(int row) const
             const int b = t_.ds_bus[static_cast<size_t>(u)];
             off_slack = !is_masked(b) && b != t_.slack_bus;
         }
-        if (!off_slack) return false;
+        if (!off_slack) return -2;
     }
     const size_t fset = field_of_.at("fset").off;
     for (int ci = 0; ci < nc_; ++ci)
-        if (tu[fset + static_cast<size_t>(ci)] && is_masked(t_.corr_bus[static_cast<size_t>(ci)])) return false;
+        if (tu[fset + static_cast<size_t>(ci)] && is_masked(t_.corr_bus[static_cast<size_t>(ci)])) return -2;
     const size_t vb = field_of_.at("vmr_bus").off, nv = static_cast<size_t>(ti[field_of_.at("vmr_n").off]);
-    for (size_t k = 0; k < nv; ++k) if (is_masked(ti[vb + k])) return false;
-    return true;
+    for (size_t k = 0; k < nv; ++k) if (is_masked(ti[vb + k])) return -2;
+    return source;
 }
 
 void DeviceOuterModel::compare_rows(const HostRow& host, const HostRow& dev, int row) const
@@ -2539,16 +2591,6 @@ void DeviceOuterModel::fill_row(const DeviceSlotImage& img, HostRow& hr)
     set_field(hr.i, I("hl_dir"), img.hl_frozen_dir);
 }
 
-// row i of the staging pools -> slot slots[i] of the device pools
-template <typename T>
-__global__ void scatter_rows_kernel(T* pool, const T* staged, const int* slots, int n, size_t w)
-{
-    const size_t t = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= static_cast<size_t>(n) * w) return;
-    const size_t i = t / w, k = t % w;
-    pool[static_cast<size_t>(slots[i]) * w + k] = staged[t];
-}
-
 // a persistent device buffer holding `v` (grown, never shrunk: an allocation would sync the device)
 // (pageable host memory: staged before the call returns, `v` may die after)
 template <typename T>
@@ -2559,17 +2601,6 @@ void put_buf(thrust::device_vector<T>& d, const std::vector<T>& v, cudaStream_t 
     check_cuda(cudaMemcpyAsync(raw(d), v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice, st), "upload");
 }
 
-template <typename T>
-void scatter(thrust::device_vector<T>& pool, thrust::device_vector<T>& stage, const std::vector<T>& staged,
-             const int* d_slots, int n, size_t w, cudaStream_t st)
-{
-    if (n == 0 || w == 0) return;
-    put_buf(stage, staged, st);
-    const size_t total = static_cast<size_t>(n) * w;
-    scatter_rows_kernel<T><<<static_cast<unsigned>((total + 255) / 256), 256, 0, st>>>(raw(pool), raw(stage), d_slots, n, w);
-    check_cuda(cudaGetLastError(), "scatter");
-}
-
 // the template slot row into each listed slot, then each slot's own row index
 template <typename T>
 __global__ void template_rows_kernel(T* pool, const T* tmpl, const int* slots, int n, size_t w)
@@ -2578,6 +2609,16 @@ __global__ void template_rows_kernel(T* pool, const T* tmpl, const int* slots, i
     if (t >= static_cast<size_t>(n) * w) return;
     pool[static_cast<size_t>(slots[t / w]) * w + t % w] = tmpl[t % w];
 }
+// the differences of n rows from their baseline: entry j at (row k, offset q) = pos[j] / w, pos[j] % w
+template <typename T>
+__global__ void scatter_diffs_kernel(T* pool, const long long* pos, const T* val, const int* slots, size_t m, size_t w)
+{
+    const size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    const size_t k = static_cast<size_t>(pos[j]) / w, q = static_cast<size_t>(pos[j]) % w;
+    pool[static_cast<size_t>(slots[k]) * w + q] = val[j];
+}
+
 // row idx[i] of the templates into slot slots[i]
 template <typename T>
 __global__ void indexed_rows_kernel(T* pool, const T* tmpl, const int* slots, const int* idx, int n, size_t w)
@@ -2629,6 +2670,21 @@ __global__ void mask_rows_kernel(Dev d, const int* slots, int n, const int* mask
 void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::vector<int>& rows_in)
 {
     if (slots_in.empty()) return;
+    // no phantom template yet: the call's first phantom row (row -1) alone first, the others copies
+    if (!phantom_ready_ && !check_tmpl_ && slots_in.size() > 1) {
+        for (size_t k = 0; k < slots_in.size(); ++k) {
+            if (rows_in[k] >= 0) continue;
+            int n_ph = 0;
+            for (int r : rows_in) n_ph += r < 0;
+            if (n_ph < 2) break;
+            load_rows({slots_in[k]}, {rows_in[k]});
+            std::vector<int> s2, r2;
+            for (size_t j = 0; j < slots_in.size(); ++j)
+                if (j != k) { s2.push_back(slots_in[j]); r2.push_back(rows_in[j]); }
+            load_rows(s2, r2);
+            return;
+        }
+    }
     // no template yet: the first plain row alone through the host (it becomes the template), so
     // that the other plain rows of this call are copied already
     if (!tmpl_row_ && !check_tmpl_ && slots_in.size() > 1) {
@@ -2669,7 +2725,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         }
     }
     // the plain rows once the template exists: copied on the device, no host load
-    std::vector<int> slots, rows, t_slots, t_rows, m_slots, m_rows, p_slots, p_rows;
+    std::vector<int> slots, rows, t_slots, t_rows, m_slots, m_rows, m_src, p_slots, p_rows, f_slots;
     // a row copied on the device starts with no decision (its template's load recorded none it shares)
     auto clear_trace = [&](const std::vector<int>& rs) {
         if (!t_.keep_trace) return;
@@ -2679,14 +2735,35 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         const int row = rows_in[k];
         const bool from_point = !check_tmpl_ && resumes(row) && plain_overrides(row) &&
                                 point_tmpl_.count(resume_of_row_[static_cast<size_t>(row)]) > 0;
-        if (tmpl_row_ && !check_tmpl_ && plain(row)) { t_slots.push_back(slots_in[k]); t_rows.push_back(row); }
+        if (row < 0 && phantom_ready_ && !check_tmpl_) { f_slots.push_back(slots_in[k]); }
+        else if (tmpl_row_ && !check_tmpl_ && plain(row)) { t_slots.push_back(slots_in[k]); t_rows.push_back(row); }
         else if (from_point)                        { p_slots.push_back(slots_in[k]); p_rows.push_back(row); }
-        else if (mask_from_template(row))           { m_slots.push_back(slots_in[k]); m_rows.push_back(row); }
+        else if (const int src = mask_source(row); src != -2) {
+            m_slots.push_back(slots_in[k]); m_rows.push_back(row); m_src.push_back(src);
+        }
         else                                        { slots.push_back(slots_in[k]); rows.push_back(row); }
     }
     clear_trace(t_rows);
     clear_trace(m_rows);
     clear_trace(p_rows);
+    // the base-case loads of slots the queue left empty (row -1, always the same): copies of the first
+    if (!f_slots.empty()) {
+        g2g_nvtx::Range nv("device load: phantom rows");
+        const int nf = static_cast<int>(f_slots.size());
+        put_buf(ld_phantom_, f_slots, stream_);
+        auto copy = [&](auto& pool, auto& tmpl, size_t w) {
+            using T = typename std::remove_reference<decltype(pool)>::type::value_type;
+            const size_t total = static_cast<size_t>(nf) * w;
+            if (total == 0) return;
+            template_rows_kernel<T><<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream_>>>(
+                raw(pool), raw(tmpl), raw(ld_phantom_), nf, w);
+        };
+        copy(p_int_, ph_i_, w_int_);
+        copy(p_u8_, ph_u_, w_u8_);
+        copy(p_f64_, ph_f_, w_f64_);
+        materialize_kernel<<<(nf + 63) / 64, 64, 0, stream_>>>(dev_, raw(ld_phantom_), nf);
+        check_cuda(cudaGetLastError(), "phantom load");
+    }
     // the rows resuming from a point that has a template: copies of it, grouped by point
     if (!p_slots.empty()) {
         g2g_nvtx::Range nv("device load: rows from their point's template");
@@ -2722,24 +2799,45 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
             mbus.insert(mbus.end(), m.begin(), m.end());
             mptr.push_back(static_cast<int>(mbus.size()));
         }
+        // the plain template's rows first, then those resuming from a point (their point's template)
+        std::vector<int> order(static_cast<size_t>(nm));
+        for (int k = 0; k < nm; ++k) order[static_cast<size_t>(k)] = k;
+        std::stable_partition(order.begin(), order.end(), [&](int k) { return m_src[static_cast<size_t>(k)] < 0; });
+        std::vector<int> ms, mr, msrc;
+        for (int k : order) { ms.push_back(m_slots[static_cast<size_t>(k)]); mr.push_back(m_rows[static_cast<size_t>(k)]); msrc.push_back(m_src[static_cast<size_t>(k)]); }
+        m_slots = ms; m_rows = mr; m_src = msrc;
+        mptr.assign(1, 0); mbus.clear();
+        for (int r : m_rows) {
+            const auto& m = masked_rows_[static_cast<size_t>(r)];
+            mbus.insert(mbus.end(), m.begin(), m.end());
+            mptr.push_back(static_cast<int>(mbus.size()));
+        }
+        const int n_plain = static_cast<int>(std::count_if(m_src.begin(), m_src.end(), [](int x) { return x < 0; }));
         std::vector<int> pack(m_slots);
         pack.insert(pack.end(), m_rows.begin(), m_rows.end());
         pack.insert(pack.end(), mptr.begin(), mptr.end());
         pack.insert(pack.end(), mbus.begin(), mbus.end());
+        pack.insert(pack.end(), m_src.begin() + n_plain, m_src.end());
         put_buf(ld_mask_, pack, stream_);
         const int* d_ms = raw(ld_mask_);
         const int* d_mr = d_ms + nm;
         const int* d_mptr = d_mr + nm;
         const int* d_mbus = d_mptr + nm + 1;
-        auto copy = [&](auto& pool, auto& tmpl, size_t w) {
+        const int* d_msrc = d_mbus + mbus.size();
+        auto copy = [&](auto& pool, auto& tmpl, auto& pts, size_t w) {
             using T = typename std::remove_reference<decltype(pool)>::type::value_type;
-            const size_t total = static_cast<size_t>(nm) * w;
-            if (total == 0) return;
-            template_rows_kernel<T><<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream_>>>(raw(pool), raw(tmpl), d_ms, nm, w);
+            if (w == 0) return;
+            if (n_plain > 0)
+                template_rows_kernel<T><<<static_cast<unsigned>((static_cast<size_t>(n_plain) * w + 255) / 256), 256, 0, stream_>>>(
+                    raw(pool), raw(tmpl), d_ms, n_plain, w);
+            const int np = nm - n_plain;
+            if (np > 0)
+                indexed_rows_kernel<T><<<static_cast<unsigned>((static_cast<size_t>(np) * w + 255) / 256), 256, 0, stream_>>>(
+                    raw(pool), raw(pts), d_ms + n_plain, d_msrc, np, w);
         };
-        copy(p_int_, tmpl_i_, w_int_);
-        copy(p_u8_, tmpl_u_, w_u8_);
-        copy(p_f64_, tmpl_f_, w_f64_);
+        copy(p_int_, tmpl_i_, pt_i_, w_int_);
+        copy(p_u8_, tmpl_u_, pt_u_, w_u8_);
+        copy(p_f64_, tmpl_f_, pt_f_, w_f64_);
         set_rows_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(raw(p_int_), d_ms, d_mr, nm, w_int_, field_of_.at("row").off);
         mask_rows_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(dev_, d_ms, nm, d_mptr, d_mbus);
         check_cuda(cudaGetLastError(), "masked load");
@@ -2782,21 +2880,43 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
     const int n = static_cast<int>(slots.size());
     if (n == 0) return;
     g2g_nvtx::Range nv("device load: rows through the host model");
-    std::vector<int> si(static_cast<size_t>(n) * w_int_);
-    std::vector<unsigned char> su(static_cast<size_t>(n) * w_u8_);
-    std::vector<double> sf(static_cast<size_t>(n) * w_f64_);
+    // each row uploaded as its differences from a baseline row (the run's first host-loaded one, kept
+    // on the device): a row is mostly the grid's, a full upload was hundreds of KB a row
+    dif_i_pos_.clear(); dif_i_val_.clear(); dif_u_pos_.clear(); dif_u_val_.clear(); dif_f_pos_.clear(); dif_f_val_.clear();
     HostRow hr;
     DeviceSlotImage img;
+    using clk = std::chrono::steady_clock;
+    auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
     for (int k = 0; k < n; ++k) {
+        auto t0 = clk::now();
         host_->load(slots[static_cast<size_t>(k)], rows[static_cast<size_t>(k)]);
+        if (prof_on_) prof_ms_[0] += ms_since(t0);
+        t0 = clk::now();
         try {
             side_->device_slot_image(slots[static_cast<size_t>(k)], img);
         } catch (const std::domain_error& e) {
             throw DeviceNotImplemented(e.what());
         }
+        if (prof_on_) prof_ms_[1] += ms_since(t0);
+        t0 = clk::now();
         fill_row(img, hr);
+        if (prof_on_) prof_ms_[2] += ms_since(t0);
         const int row = rows[static_cast<size_t>(k)];
+        if (prof_on_) {   // why through the host: point template capture / masked, its point without a template / other
+            const bool res = resumes(row);
+            const bool masked = row >= 0 && static_cast<size_t>(row) < mask_only_.size() && mask_only_[static_cast<size_t>(row)];
+            const int why = row < 0 ? 5 : res && plain_overrides(row) ? 0 : res && masked ? 1 : res ? 2 : masked ? 3 : 4;
+            ++prof_why_[why];
+        }
         if (t_.keep_trace && row >= 0 && static_cast<size_t>(row) < trace_.size()) trace_[static_cast<size_t>(row)] = img.trace;
+        if (row < 0 && phantom_ready_ && check_tmpl_) compare_rows_with(hr, *ph_host_, row);
+        if (row < 0 && !phantom_ready_) {   // the first phantom load: the template of the next ones
+            ph_host_ = std::make_unique<HostRow>(hr);
+            ph_i_.assign(hr.i.begin(), hr.i.end());
+            ph_u_.assign(hr.u.begin(), hr.u.end());
+            ph_f_.assign(hr.f.begin(), hr.f.end());
+            phantom_ready_ = true;
+        }
         if (resumes(row) && plain_overrides(row)) {   // the first row of a point: that point's template
             const int pk = resume_of_row_[static_cast<size_t>(row)];
             auto it = point_tmpl_.find(pk);
@@ -2816,16 +2936,47 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
                 compare_with_template(hr, row);
             }
         }
-        std::copy(hr.i.begin(), hr.i.end(), si.begin() + static_cast<ptrdiff_t>(static_cast<size_t>(k) * w_int_));
-        std::copy(hr.u.begin(), hr.u.end(), su.begin() + static_cast<ptrdiff_t>(static_cast<size_t>(k) * w_u8_));
-        std::copy(hr.f.begin(), hr.f.end(), sf.begin() + static_cast<ptrdiff_t>(static_cast<size_t>(k) * w_f64_));
+        if (!base_row_) {
+            base_row_ = std::make_unique<HostRow>(hr);
+            base_i_.assign(hr.i.begin(), hr.i.end());
+            base_u_.assign(hr.u.begin(), hr.u.end());
+            base_f_.assign(hr.f.begin(), hr.f.end());
+        }
+        // its differences (doubles bitwise: a NaN is the same NaN), as (k * width + offset, value)
+        const HostRow& b = *base_row_;
+        for (size_t q = 0; q < w_int_; ++q)
+            if (hr.i[q] != b.i[q]) { dif_i_pos_.push_back(static_cast<long long>(k) * static_cast<long long>(w_int_) + static_cast<long long>(q)); dif_i_val_.push_back(hr.i[q]); }
+        for (size_t q = 0; q < w_u8_; ++q)
+            if (hr.u[q] != b.u[q]) { dif_u_pos_.push_back(static_cast<long long>(k) * static_cast<long long>(w_u8_) + static_cast<long long>(q)); dif_u_val_.push_back(hr.u[q]); }
+        for (size_t q = 0; q < w_f64_; ++q)
+            if (std::memcmp(&hr.f[q], &b.f[q], sizeof(double)) != 0) {
+                dif_f_pos_.push_back(static_cast<long long>(k) * static_cast<long long>(w_f64_) + static_cast<long long>(q));
+                dif_f_val_.push_back(hr.f[q]);
+            }
     }
+    auto t_up = clk::now();
     put_buf(ld_slots_, slots, stream_);
-    scatter(p_int_, ld_si_, si, raw(ld_slots_), n, w_int_, stream_);
-    scatter(p_u8_, ld_su_, su, raw(ld_slots_), n, w_u8_, stream_);
-    scatter(p_f64_, ld_sf_, sf, raw(ld_slots_), n, w_f64_, stream_);
+    const int* d_sl = raw(ld_slots_);
+    auto apply = [&](auto& pool, auto& base, size_t w, const std::vector<long long>& pos, const auto& val,
+                     thrust::device_vector<long long>& d_pos, auto& d_val) {
+        using T = typename std::remove_reference<decltype(pool)>::type::value_type;
+        const size_t total = static_cast<size_t>(n) * w;
+        if (total > 0)
+            template_rows_kernel<T><<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream_>>>(
+                raw(pool), raw(base), d_sl, n, w);
+        if (pos.empty()) return;
+        put_buf(d_pos, pos, stream_);
+        put_buf(d_val, val, stream_);
+        const size_t m = pos.size();
+        scatter_diffs_kernel<T><<<static_cast<unsigned>((m + 255) / 256), 256, 0, stream_>>>(
+            raw(pool), raw(d_pos), raw(d_val), d_sl, m, w);
+    };
+    apply(p_int_, base_i_, w_int_, dif_i_pos_, dif_i_val_, ld_dpos_i_, ld_dval_i_);
+    apply(p_u8_, base_u_, w_u8_, dif_u_pos_, dif_u_val_, ld_dpos_u_, ld_dval_u_);
+    apply(p_f64_, base_f_, w_f64_, dif_f_pos_, dif_f_val_, ld_dpos_f_, ld_dval_f_);
     materialize_kernel<<<(n + 63) / 64, 64, 0, stream_>>>(dev_, raw(ld_slots_), n);
     check_cuda(cudaGetLastError(), "materialize");
+    if (prof_on_) { prof_ms_[3] += ms_since(t_up); prof_rows_ += n; }
     // stream-ordered: the driver's next work on the same stream sees the loaded slots; the host
     // staging vectors were copied out by the (pageable) uploads before they returned
 }
