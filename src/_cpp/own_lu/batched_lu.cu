@@ -10,6 +10,8 @@
 // Original batched LU (algorithm, symbolic plan and kernels): Ralf Cortes Do
 // Nascimento (RTE), contributed from gpu-security-analysis.
 
+#include <cstdio>
+#include <cstdlib>
 #include "batched_lu.cuh"
 
 #include <algorithm>
@@ -236,6 +238,58 @@ __global__ void lu_bwd_split(const int* __restrict__ rows, const int* __restrict
     x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[(size_t)dp[i] * B + b];
 }
 
+// A run of narrow levels of a triangular solve in one kernel: block = 32 consecutive matrices (lane) x
+// 32 warps, the levels in order with a block barrier between them (a matrix depends on its own rows
+// only). In a level of k parts, warps item * k ... item * k + k - 1 take item `item`; every value is
+// computed as lu_fwd / lu_bwd (k = 1) or lu_fwd_split / lu_bwd_split (k > 1) do: the same bits.
+template <class T, bool kForward>
+__global__ void lu_solve_run(const int* __restrict__ rows, const int* __restrict__ run, const int first,
+                             const int last, const int n_lv, const int* __restrict__ rp, const int* __restrict__ dp,
+                             const int* __restrict__ ci, const int B, const int nb, const T* __restrict__ v,
+                             T* __restrict__ x)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int b = blockIdx.x * 32 + lane;
+    __shared__ T red[32][33];
+    for (int l = first; l < last; ++l) {
+        const int offset = run[l], count = run[n_lv + l], K = run[2 * n_lv + l];
+        const int item = warp / K, part = warp - item * K;
+        const bool active = item < count && b < nb;
+        const int i = item < count ? rows[offset + item] : 0;
+        if (K == 1) {
+            if (active) {
+                T s = x[(size_t)i * B + b];
+                if (kForward) {
+                    for (int e = rp[i]; e < dp[i]; ++e) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
+                    x[(size_t)i * B + b] = s;
+                } else {
+                    for (int e = dp[i] + 1; e < rp[i + 1]; ++e) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
+                    x[(size_t)i * B + b] = s / v[(size_t)dp[i] * B + b];
+                }
+            }
+        } else {
+            T acc = T(0);
+            if (active) {
+                if (kForward) {
+                    for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
+                } else {
+                    for (int e = dp[i] + 1 + part; e < rp[i + 1]; e += K)
+                        acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
+                }
+            }
+            red[warp][lane] = acc;
+            __syncthreads();
+            if (part == 0 && active) {
+                T sum = T(0);
+                for (int w = 0; w < K; ++w) sum += red[item * K + w][lane];
+                if (kForward) x[(size_t)i * B + b] -= sum;
+                else x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[(size_t)dp[i] * B + b];
+            }
+        }
+        __syncthreads();   // the level's rows before the next level reads them
+    }
+}
+
 // r[b, i] = rhs[b, i] - (A_b x_b)[i], slot-major (thread = (matrix, row), row fastest)
 template <class T>
 __global__ void lu_residual(const T* __restrict__ values, const int* __restrict__ indptr,
@@ -308,6 +362,51 @@ void BatchedLu::init(const LuPlan& plan, int batch, cudaStream_t stream, double 
     for (const auto& s : plan.factor_steps) f_launch_.push_back({s.offset, s.count, k_of(s), s.is_u});
     for (const auto& s : plan.fw_levels) fw_launch_.push_back({s.offset, s.count, k_of(s), false});
     for (const auto& s : plan.bw_levels) bw_launch_.push_back({s.offset, s.count, k_of(s), false});
+    // the triangular solves' steps: runs of at least two consecutive narrow levels fused
+    // (GPUSIM2GRID_OWN_LU_FUSE=0: none, every level its own launch)
+    const char* fuse_env = std::getenv("GPUSIM2GRID_OWN_LU_FUSE");
+    const bool fuse = !(fuse_env != nullptr && fuse_env[0] == '0');
+    auto plan_steps = [&](const std::vector<Launch>& ls, std::vector<SolveStep>& steps, thrust::device_vector<int>& d_run) {
+        steps.clear();
+        const int n_lv = static_cast<int>(ls.size());
+        std::vector<int> run(3 * static_cast<size_t>(std::max(n_lv, 1)), 0);
+        for (int l = 0; l < n_lv; ++l) {
+            run[static_cast<size_t>(l)] = ls[static_cast<size_t>(l)].offset;
+            run[static_cast<size_t>(n_lv + l)] = ls[static_cast<size_t>(l)].count;
+            run[static_cast<size_t>(2 * n_lv + l)] = ls[static_cast<size_t>(l)].k;
+        }
+        auto narrow = [&](int l) {
+            return fuse && static_cast<long long>(ls[static_cast<size_t>(l)].count) * ls[static_cast<size_t>(l)].k <= 32;
+        };
+        for (int l = 0; l < n_lv;) {
+            int e = l;
+            while (e < n_lv && narrow(e)) ++e;
+            if (e - l >= 2) { steps.push_back(SolveStep{-1, l, e}); l = e; }
+            else { steps.push_back(SolveStep{l, 0, 0}); ++l; }
+        }
+        d_run.assign(run.begin(), run.end());
+    };
+    plan_steps(fw_launch_, fw_steps_, d_fw_run_);
+    plan_steps(bw_launch_, bw_steps_, d_bw_run_);
+    // GPUSIM2GRID_OWN_LU_STATS=1 (diagnostic): the launches' widths, how many are narrow
+    if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_STATS"); e != nullptr && *e && *e != '0') {
+        auto stats = [&](const char* what, const std::vector<Launch>& ls) {
+            long long items = 0; int n8 = 0, n32 = 0, n128 = 0, split = 0;
+            for (const Launch& L : ls) {
+                items += L.count;
+                n8 += L.count <= 8; n32 += L.count <= 32; n128 += L.count <= 128; split += L.k > 1;
+            }
+            // fusable: one pass of a 32-warp block (count * k <= 32); runs of consecutive fusable ones
+            int fus = 0, runs = 0; bool in = false;
+            for (const Launch& L : ls) {
+                const bool f = static_cast<long long>(L.count) * L.k <= 32;
+                fus += f; if (f && !in) ++runs; in = f;
+            }
+            std::fprintf(stderr, "[own_lu] n %d batch %d %s: %zu launches, %lld items, <=8: %d, <=32: %d, <=128: %d, split: %d, "
+                         "fusable %d in %d runs\n", n_, B_, what, ls.size(), items, n8, n32, n128, split, fus, runs);
+        };
+        stats("factor", f_launch_); stats("forward", fw_launch_); stats("backward", bw_launch_);
+    }
 
     // entries never computed (symmetrized fill without contributions) stay 0
     d_v_.assign(static_cast<size_t>(n_ent_) * B_, cuda_real_type(0));
@@ -368,7 +467,14 @@ void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x)
     dim3 tgrid((n_ + 31) / 32, (nb + 31) / 32), tblock(32, 8);
     lu_tr_in<T><<<tgrid, tblock, 0, stream_>>>(b, raw(d_inv_), n_, B, nb, xi);
     const int* rp = raw(d_rp_); const int* dp = raw(d_dp_); const int* ci = raw(d_ci_);
-    for (const Launch& L : fw_launch_) {
+    const int n_fw = static_cast<int>(fw_launch_.size()), n_bw = static_cast<int>(bw_launch_.size());
+    for (const SolveStep& st : fw_steps_) {
+        if (st.launch < 0) {
+            lu_solve_run<T, true><<<(nb + 31) / 32, 1024, 0, stream_>>>(raw(d_fw_rows_), raw(d_fw_run_), st.first, st.last,
+                                                                         n_fw, rp, dp, ci, B, nb, v, xi);
+            continue;
+        }
+        const Launch& L = fw_launch_[static_cast<size_t>(st.launch)];
         const int* rows = raw(d_fw_rows_) + L.offset;
         if (L.k > 1)
             lu_fwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
@@ -376,7 +482,13 @@ void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x)
             lu_fwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb,
                                                                                       v, xi);
     }
-    for (const Launch& L : bw_launch_) {
+    for (const SolveStep& st : bw_steps_) {
+        if (st.launch < 0) {
+            lu_solve_run<T, false><<<(nb + 31) / 32, 1024, 0, stream_>>>(raw(d_bw_rows_), raw(d_bw_run_), st.first, st.last,
+                                                                          n_bw, rp, dp, ci, B, nb, v, xi);
+            continue;
+        }
+        const Launch& L = bw_launch_[static_cast<size_t>(st.launch)];
         const int* rows = raw(d_bw_rows_) + L.offset;
         if (L.k > 1)
             lu_bwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);

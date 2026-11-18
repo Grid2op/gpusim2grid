@@ -7,6 +7,8 @@ Change Log
   the host keeps the GPU fed; opt-in.
 - [IMPROVED] Fewer device synchronisations per round: grow-only pinned buffers, double-buffered segment uploads,
   no stream sync after a fill.
+- [IMPROVED] ``linear_solver='own_lu'``: the triangular solves' runs of narrow levels run as one kernel each (the
+  same bits; a third fewer kernel launches on a 7k-bus N-1).
 - [IMPROVED] ``outer_loops=True``: a row disconnecting units or tripping lines takes its ReactiveLimits plan and
   DistributedSlack units by filtering the grid's (the same lists, a third of a row's load).
 - [ADDED] ``outer_loops_backend`` (``"host"`` default, today's path) on the three batch facades and

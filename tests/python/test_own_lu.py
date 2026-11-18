@@ -549,3 +549,22 @@ def test_dump_j_names_values_by_their_precision(case118, linear_solver, monkeypa
         for v in vals:
             assert v.suffix == f".f{8 * rb}", v.name
             assert v.stat().st_size == ub * nnz * rb, v.name
+
+
+@requires_gpu
+def test_fused_solve_levels_give_the_same_bits(case118, monkeypatch):
+    """the triangular solves' narrow levels run fused (one kernel per run of levels, a block barrier
+    between them; GPUSIM2GRID_OWN_LU_FUSE=0: one launch per level): every value computed as the
+    level kernels do, the same solution bits -- seen through the raw benchmark's residual"""
+    from gpusim2grid import AcPfGPU
+    pf = AcPfGPU(case118, precision=PREC)
+    indptr, indices, data = (np.asarray(a) for a in pf._s.get_J())
+    n = len(indptr) - 1
+    res = {}
+    for fuse in ("0", "1"):
+        monkeypatch.setenv("GPUSIM2GRID_OWN_LU_FUSE", fuse)
+        r = _cpp.benchmark_cudss_batch_raw(n, indptr.tolist(), indices.tolist(), data.astype(float).tolist(), 40,
+                                           n_refactorize=1, ir_n_steps=1, linear_solver=_cpp.LinearSolver.OwnLu)
+        res[fuse] = r.max_rel_residual
+    assert 0. < res["0"] < 1e-6
+    assert res["1"] == res["0"]
