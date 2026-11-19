@@ -155,6 +155,9 @@ struct Dev {
     int *rl_state, *rl_nb, *rl_real;
     unsigned char *ds_present;
     double *ds_inj, *ds_cur, *ds_ini;
+    // each unit's bus in the slot's row: the grid's (ds_bus), a generator the row moves on its new one
+    // (the host's ds_unit_bus)
+    int *ds_ubus;
     unsigned char *hl_present;
     int *hl_dir;
     // per slot: the controls (materialize)
@@ -436,7 +439,7 @@ __device__ bool ds_shares(const Dev& d, int s, int k, double& w)
     w = 0.;
     if (!S1(ds_inn) || !SLOT(ds_present, d.n_units)[k]) return false;
     w = SLOT(ds_park, d.n_units)[k] ? 0. : d.ds_w[k];
-    const int b = d.ds_bus[k];
+    const int b = SLOT(ds_ubus, d.n_units)[k];
     return w > 0. && b >= 0 && b < d.n_bus && d.slack_idx[b] >= 0;
 }
 __device__ double ds_share(const Dev& d, int s)
@@ -459,7 +462,7 @@ __device__ void ds_fold(const Dev& d, int s, double sa)
     double w;
     for (int k = 0; k < d.n_units; ++k) {
         if (!ds_shares(d, s, k, w)) continue;
-        const int el = d.ds_el[k], bus = d.ds_bus[k];
+        const int el = d.ds_el[k], bus = SLOT(ds_ubus, d.n_units)[k];
         const int ci = (bus >= 0 && bus < d.n_bus) ? d.corr_of_bus[bus] : -1;
         const double q_before = (ci >= 0 && dset[ci]) ? dim[ci] : 0.;
         const double mw = -sa * d.sn * w / total;   // generation convention
@@ -582,8 +585,9 @@ __device__ int check_ds_in_newton(const Dev& d, int s, const Row& rv)
         if (!present[k]) continue;
         // a unit at a bound leaves the Newton's share; one back inside its bounds rejoins it
         if ((sat[k] ? 1 : 0) != parked[k]) rec(d, s, sat[k] ? TA_PARK : TA_UNPARK, true, d.ds_el[k], cur[k], nmw[k]);
-        moved += fabs(d.ds_kind[k] == 0 ? move_gen(d, s, d.ds_el[k], d.ds_bus[k], nmw[k])
-                                        : move_storage(d, s, d.ds_el[k], d.ds_bus[k], -nmw[k]));
+        const int ub = SLOT(ds_ubus, d.n_units)[k];
+        moved += fabs(d.ds_kind[k] == 0 ? move_gen(d, s, d.ds_el[k], ub, nmw[k])
+                                        : move_storage(d, s, d.ds_el[k], ub, -nmw[k]));
         cur[k] = nmw[k];
         parked[k] = sat[k] ? 1 : 0;
         parked_high[k] = remaining > 0. ? 1 : 0;
@@ -637,8 +641,9 @@ __device__ int check_ds(const Dev& d, int s, const Row& rv)
     const double* nmw = SLOT(s_new, d.n_units);
     for (int k = 0; k < d.n_units; ++k) {
         if (!present[k]) continue;
-        moved += fabs(d.ds_kind[k] == 0 ? move_gen(d, s, d.ds_el[k], d.ds_bus[k], nmw[k])
-                                        : move_storage(d, s, d.ds_el[k], d.ds_bus[k], -nmw[k]));
+        const int ub = SLOT(ds_ubus, d.n_units)[k];
+        moved += fabs(d.ds_kind[k] == 0 ? move_gen(d, s, d.ds_el[k], ub, nmw[k])
+                                        : move_storage(d, s, d.ds_el[k], ub, -nmw[k]));
         cur[k] = nmw[k];
     }
     const bool unstable = moved > d.ds_moved_fraction * d.ds_eps_mw;
@@ -1529,7 +1534,7 @@ __device__ void materialize(const Dev& d, int s)
         if (total > 0.) {
             double w;
             for (int k = 0; k < d.n_units; ++k)
-                if (ds_shares(d, s, k, w)) w_out[d.slack_idx[d.ds_bus[k]]] += w / total;
+                if (ds_shares(d, s, k, w)) w_out[d.slack_idx[SLOT(ds_ubus, d.n_units)[k]]] += w / total;
         } else if (d.ref_slack >= 0) {
             w_out[d.ref_slack] = 1.;
         }
@@ -2202,6 +2207,7 @@ void DeviceOuterModel::init_tables()
     X(rl_nb, 0, t_.rl_n) X(rl_real, 0, t_.rl_n) X(rl_tq_s, 2, t_.rl_n) X(rl_tvm_s, 2, t_.rl_n)             \
     X(rl_hb_s, 1, t_.rl_n) X(rl_goff, 1, t_.rl_gen.size()) X(ctrl_off, 1, t_.n_ctrl)                     \
     X(ds_present, 1, n_units_) X(ds_inj, 2, n_units_) X(ds_cur, 2, n_units_) X(ds_ini, 2, n_units_)      \
+    X(ds_ubus, 0, n_units_)                                                                              \
     X(hl_present, 1, n_hl_) X(hl_dir, 0, n_hl_)                                                          \
     X(c_pin, 1, t_.n_pin) X(c_plan_held, 1, t_.n_ctrl) X(c_held_q, 2, t_.n_ctrl) X(c_v_set, 2, t_.n_grp)  \
     X(c_hvdc_status, 0, t_.n_hvdc) X(c_sb_n, 0, 1) X(c_sb_bus, 0, nc_) X(c_sb_dp, 2, nc_) X(c_sb_dq, 2, nc_) \
@@ -2653,6 +2659,7 @@ void DeviceOuterModel::fill_row(const DeviceSlotImage& img, HostRow& hr)
     set_field(hr.u, I("rl_goff"), img.rl_goff);
     set_field(hr.u, I("ctrl_off"), img.ctrl_off);
     set_field(hr.u, I("ds_present"), img.ds_present);
+    set_field(hr.i, I("ds_ubus"), img.ds_bus);
     set_field(hr.f, I("ds_inj"), img.ds_injection);
     set_field(hr.f, I("ds_cur"), img.ds_current);
     set_field(hr.f, I("ds_ini"), img.ds_initial);
@@ -2719,8 +2726,9 @@ __global__ void mask_rows_kernel(Dev d, const int* slots, int n, const int* mask
         SLOT(rl_state, d.rl_n)[k] = 0; SLOT(rl_nb, d.rl_n)[k] = 0; SLOT(rl_real, d.rl_n)[k] = 0;
     }
     unsigned char* ds_present = SLOT(ds_present, d.n_units);
+    const int* ubus = SLOT(ds_ubus, d.n_units);
     for (int k = 0; k < d.n_units; ++k) {
-        if (!masked[d.ds_bus[k]]) continue;
+        if (ubus[k] < 0 || !masked[ubus[k]]) continue;
         ds_present[k] = 0;
         SLOT(ds_inj, d.n_units)[k] = 0.; SLOT(ds_cur, d.n_units)[k] = 0.; SLOT(ds_ini, d.n_units)[k] = 0.;
     }

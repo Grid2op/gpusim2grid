@@ -586,6 +586,9 @@ private:
     // the moves rl_dev_ was built for (device_prepare_rows: the same ones keep it)
     std::vector<std::vector<std::pair<int, int>>> rl_dev_moves_;
     bool rl_dev_built_ = false;
+    // the buses the rows move DistributedSlack participants to, sorted (device_prepare_rows): the
+    // device tables' Sbus correction must reach them, the units' shares go there (ds_unit_bus)
+    std::vector<int> ds_dev_move_bus_;
     std::vector<std::vector<int>> gens_of_bus0_;   // per solver bus, the grid's generators there
     const RlPlan& rl_dev() const { return rl_dev_ ? *rl_dev_ : *rl0_; }
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
@@ -4031,11 +4034,28 @@ bool Ls2gOuterModel::device_prepare_rows(const RowOverrides& ov)
         rl_dev_moves_.clear();
         rl_dev_built_ = false;
         rl_dev_.reset();
-        return had;
+        const bool had_ds = !ds_dev_move_bus_.empty();
+        ds_dev_move_bus_.clear();
+        return had || had_ds;
     }
     if (rl_dev_built_ && ov.gen_bus == rl_dev_moves_) return false;
     rl_dev_moves_ = ov.gen_bus;
     rl_dev_built_ = true;
+    // the buses DistributedSlack participants are moved to (load's filtered units: a moved one on
+    // its row bus), whether or not ReactiveLimits brings them too
+    std::vector<int> ds_move_bus;
+    for (const auto& moves : ov.gen_bus)
+        for (const auto& gb : moves) {
+            if (gb.second < 0) continue;
+            for (size_t k = 0; k < units0_.size(); ++k)
+                if (units0_[k].kind == ls2g::slack_redistribution::UnitKind::GENERATOR && units0_[k].el_id == gb.first &&
+                    units0_bus_[k] != gb.second)
+                    ds_move_bus.push_back(gb.second);
+        }
+    std::sort(ds_move_bus.begin(), ds_move_bus.end());
+    ds_move_bus.erase(std::unique(ds_move_bus.begin(), ds_move_bus.end()), ds_move_bus.end());
+    const bool ds_changed = ds_move_bus != ds_dev_move_bus_;
+    ds_dev_move_bus_ = std::move(ds_move_bus);
     std::map<int, std::pair<RlBus, ls2g::bus_q_check::BusQEntry>> extra;
     std::map<size_t, std::vector<int>> joining;   // grid bus_q entry k -> generators rows move there
     for (size_t r = 0; r < ov.gen_bus.size(); ++r) {
@@ -4069,7 +4089,7 @@ bool Ls2gOuterModel::device_prepare_rows(const RowOverrides& ov)
     }
     if (extra.empty() && joining.empty()) {
         rl_dev_.reset();
-        return had;
+        return had || ds_changed;
     }
     auto plan = std::make_shared<ls2g::bus_q_check::BusQPlan>(*rl0_->plan);
     auto rl = std::make_shared<RlPlan>();
@@ -4496,6 +4516,7 @@ DeviceTables Ls2gOuterModel::device_tables() const
     t.pin_bus = layout_.pin_bus;
     // the buses a Sbus correction may touch
     std::vector<int> corr(units0_bus_.begin(), units0_bus_.end());
+    corr.insert(corr.end(), ds_dev_move_bus_.begin(), ds_dev_move_bus_.end());
     for (const RlBus& b : rl_dev().buses) if (b.local && b.bus_solver >= 0) corr.push_back(b.bus_solver);
     for (const auto& kv : resume0_target_delta_) corr.push_back(kv.first);
     if (resume_) for (const auto& kv : point_n_.frozen) corr.push_back(kv.first);
@@ -4681,6 +4702,7 @@ void Ls2gOuterModel::device_slot_image(int slot, DeviceSlotImage& img) const
     img.ds_injection.assign(un, 0.); img.ds_current.assign(un, 0.); img.ds_initial.assign(un, 0.);
     img.ds_parked.assign(un, 0); img.ds_parked_high.assign(un, 0);
     img.ds_solved_parked.assign(un, 0); img.ds_solved_mw.assign(un, 0.);
+    img.ds_bus = units0_bus_;   // an absent unit's is never read
     img.slope_set.assign(static_cast<size_t>(n_gen_), 0); img.slope.assign(static_cast<size_t>(n_gen_), 0.);
     for (const auto& frozen : st.rl_slopes)
         for (const auto& sl : frozen.second) {
@@ -4700,6 +4722,8 @@ void Ls2gOuterModel::device_slot_image(int slot, DeviceSlotImage& img) const
             while (k0 < un && !(units0_[k0].el_id == u.el_id && units0_[k0].kind == u.kind)) ++k0;
             if (k0 == un) throw std::domain_error("a row with its own DistributedSlack units");
             img.ds_present[k0] = 1;
+            // a generator the row moves takes its share on its new bus (collect_units' solver bus)
+            if (j < st.ds_unit_bus.size()) img.ds_bus[k0] = st.ds_unit_bus[j];
             img.ds_injection[k0] = static_cast<double>(u.injection_mw);
             if (j < st.ds_current_mw.size()) img.ds_current[k0] = st.ds_current_mw[j];
             if (j < st.ds_initial_mw.size()) img.ds_initial[k0] = st.ds_initial_mw[j];

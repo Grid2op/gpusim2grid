@@ -175,6 +175,7 @@ struct DeviceSlotImage {
     std::vector<int>    rl_state, rl_nb_pv_pq, rl_realistic;
     std::vector<unsigned char> ds_present;      // [n units0]
     std::vector<double> ds_injection, ds_current, ds_initial;
+    std::vector<int> ds_bus;                    // [n units0] its bus in the row (a moved generator's new one)
     // a distributed-slack Newton's: the units out of its share (and at which bound), its last
     // slack_absorbed and whether the units took it, the target Q that share moved unseen
     unsigned char ds_in_newton = 0, sa_shared = 0;

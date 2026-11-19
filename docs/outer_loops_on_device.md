@@ -200,6 +200,7 @@ uploaded once):
 |---|---|
 | RL per bus: `state` (-1, 0, +1), `frozen_q`, `nb_pv_pq`, `realistic`, `target_p` | `rl_state[]` |
 | DS per unit: `current_mw`, `parked` (M4) | `ds_current_mw`, `ds_parked` |
+| DS per unit: its bus in the row (the static table's, a generator the row moves on its new bus, which the Sbus correction reaches: `device_prepare_rows`) | `ds_unit_bus` |
 | hvdc regime per line | `hvdc_regime`, `hvdc_plan.lines[].frozen_dir` |
 | standby target per SVC (NaN idle) | `svc_on` |
 | sequencing: `i`, `last_unstable`, `last_status`, `first`, `changed`, `nb_outer`, `nb_passes`, `total_nr`, `old_total`, `nr_steps`, `v_version`, `done_at[loop]`, `loop_iter[loop]`, `pass_check_unrealistic`, `check_unrealistic`, `solver_ok`, `unrealistic` | the "driver state" block |
