@@ -1,7 +1,7 @@
 Change Log
 ===========
 
-[0.3.2] (unreleased)
+[0.3.1] (unreleased)
 --------------------
 - [ADDED] ``GPUSIM2GRID_ASYNC_TIMERS=1``: per-phase timers no longer wait for the GPU (their GPU times read 0), so
   the host keeps the GPU fed; opt-in.
@@ -22,9 +22,6 @@ Change Log
   not copied from a template on the GPU), a load-independent measure of the CPU's share.
 - [IMPROVED] ``outer_loops=True``: the unrealistic-voltage check runs one block per converged row instead of
   one thread (12 ms per call on a 7k-bus grid, a fifth of an N-1 run's GPU time).
-
-[0.3.1] (unreleased)
---------------------
 - [IMPROVED] The Newton voltage update applies its step as a product (no ``atan2``/``sin``/``cos`` per bus):
   4x faster in FP64 on an RTX A1000.
 - [IMPROVED] The Jacobian fill: fewer FP64 operations per entry, no warp divergence on the diagonal (4.6x faster).
