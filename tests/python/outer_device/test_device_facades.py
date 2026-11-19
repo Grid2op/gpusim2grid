@@ -196,6 +196,53 @@ def test_template_load_equals_the_host_load(grid: Any, init_from_n: bool, monkey
     _same_rows(run("host"), run("device"), n_br)
 
 
+@pytest.mark.parametrize("handle_disconnected_grid", [False, True], ids=["opens", "opens_and_masks"])
+def test_rows_opening_branches_on_a_transformer_voltage_control_grid(
+    handle_disconnected_grid: bool, monkeypatch: pytest.MonkeyPatch
+):
+    """TransformerVoltageControl's image reads the row's closed branches (tv_closed, and from them
+    the generator-freeze candidates' step-up test), even with no transformer BranchControl reserves:
+    a row opening a branch (or masking a bus) is not plain there. It was, so it was copied from the
+    template, every branch closed; in check mode its host load differs from the template in its
+    field tv_closed"""
+    from lightsim2grid.algorithm import TransformerVoltageControl
+
+    from gpusim2grid import ContingencyAnalysisGPU, outer_device_census
+
+    grid = case14_outer()
+    grid.add_outer_loop(TransformerVoltageControl())
+    grid.change_algorithm("NROuter_KLU")
+    assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    counts = {name: count for name, count, _ in outer_device_census(grid)}
+    assert counts["loop TransformerVoltageControl"] == 1
+    # the case the other topology-dependent features (always on the host) do not cover
+    for name in (
+        "BranchControl transformers",
+        "ShuntControl controllers",
+        "loop PhaseControl",
+        "loop ShuntVoltageControl",
+    ):
+        assert counts[name] == 0, name
+    n_br = len(grid.get_lines()) + len(grid.get_trafos())
+    monkeypatch.setenv("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE", "1")
+
+    def run(backend: str) -> Any:
+        ca = ContingencyAnalysisGPU(
+            grid,
+            outer_loops=True,
+            nb_iter=MAX_IT,
+            tol=TOL_MVA / grid.get_sn_mva(),
+            handle_disconnected_grid=handle_disconnected_grid,
+            outer_loops_backend=backend,
+        )
+        # an empty contingency first: the plain row the template is captured from
+        ca.add_contingencies_by_branch_id([[]] + [[i] for i in range(n_br)])
+        ca.compute(batch_size=4)
+        return ca
+
+    _same_rows(run("host"), run("device"), n_br + 1)
+
+
 #: a 5-bus grid whose slack does not regulate (its |V| is free) and whose only regulator stands on
 #: a leaf bus behind line 5: the only ReactiveLimits bus, which that line's contingency islands
 LEAF_LINES: list[tuple[int, int]] = [(0, 1), (1, 2), (2, 3), (3, 0), (1, 3), (2, 4)]

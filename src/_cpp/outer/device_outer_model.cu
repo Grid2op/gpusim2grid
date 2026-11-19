@@ -2361,9 +2361,13 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
 {
     // a row is plain when nothing the loops start from depends on it. The branches it opens (and
     // the buses it masks) reach BranchControl (its transformers out of the row), PhaseControl's
-    // shifters and ShuntVoltageControl's groups: with any of them, such a row loads through the host
+    // shifters, ShuntVoltageControl's groups and TransformerVoltageControl's image (its closed
+    // branches, the freeze candidates' step-up test, its groups; with or without a transformer
+    // BranchControl reserves): with any of them, such a row loads through the host
     bool topo_dependent = t_.n_bc > 0 || t_.n_sc > 0;
-    for (int k : t_.loop_kind) topo_dependent = topo_dependent || k == DL_PHASE_CONTROL || k == DL_SHUNT_VOLTAGE_CONTROL;
+    for (int k : t_.loop_kind)
+        topo_dependent = topo_dependent || k == DL_PHASE_CONTROL || k == DL_SHUNT_VOLTAGE_CONTROL ||
+                         k == DL_TRANSFORMER_VOLTAGE_CONTROL;
     size_t n = 0;
     for (size_t m : {ov.masked.size(), ov.pq_buses.size(), ov.vc_tripped.size(), ov.hvdc_off.size(),
                      ov.gen_bus.size(), ov.lost_p_mw.size(), ov.branch_off.size()}) n = std::max(n, m);
