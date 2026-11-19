@@ -1870,7 +1870,9 @@ public:
                 const double* d_gather, int stride, int* d_next, int* d_status, void* stream) override;
     void set_stream(void* stream) override { stream_ = static_cast<cudaStream_t>(stream); }
     void move_slots(int n, const int* d_from, const int* d_to, const int* h_from, const int* h_to) override;
-    int sbus_block() const override { return std::max(nc_, 1); }
+    // every entry of the block is written by write_controls_kernel (k < nc): none without a
+    // correction bus, and the driver then launches no Sbus correction
+    int sbus_block() const override { return nc_; }
     int vm_reset_block() const override { return vcap_; }
     void write_controls(int n, const int* d_slots, const ControlTargets& t, void* stream) override {
         if (n == 0) return;

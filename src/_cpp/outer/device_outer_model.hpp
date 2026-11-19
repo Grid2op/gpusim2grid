@@ -68,8 +68,9 @@ public:
                         void* stream) = 0;
     // The controls of the listed slots into the driver's per-slot arrays (rows of Layout widths):
     // the dense ones written in place; the Sbus correction and the |V| resets as fixed blocks per
-    // listed slot (sbus_block() / vm_reset_block() entries, unused ones with bus -1) the driver
-    // applies with its own kernels. The resets are one-shot: cleared. Asynchronous on `stream`.
+    // listed slot (sbus_block() / vm_reset_block() entries, every one written, unused ones with bus -1;
+    // a block may be empty) the driver applies with its own kernels. The resets are one-shot: cleared.
+    // Asynchronous on `stream`.
     struct ControlTargets {
         unsigned char* pin = nullptr;
         double* held_q = nullptr;
