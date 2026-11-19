@@ -1912,6 +1912,38 @@ void BatchPfDriver<BatchSource>::_oc_write_controls(const std::vector<int>& slot
     for (int s : slots) outer_hook_->clear_vm_reset(s);
 }
 
+namespace {
+
+// The device outer model works in double (DeviceOuterHook's ControlTargets, the gathered rows decide()
+// and export_points() read): it takes the driver's own real_t buffers, which only an FP64 build can
+// hand it -- decided here at compile time, never by reinterpreting a float array as double. An FP32
+// build refuses a device hook before any of this runs (_solve_continuous; the facades at
+// construction), so its instantiation only throws.
+template <typename T>
+std::conditional_t<std::is_const_v<T>, const double, double>* device_model_f64(T* p)
+{
+    if constexpr (std::is_same_v<std::remove_cv_t<T>, double>) {
+        return p;
+    } else {
+        (void)p;
+        throw std::logic_error("[batch_pf] the device outer model in an FP32 build (refused before it runs)");
+    }
+}
+// ... and a complex array as its (re, im) doubles (cuDoubleComplex is a double2: re then im)
+template <typename T>
+double* device_model_f64_pairs(T* p)
+{
+    if constexpr (std::is_same_v<T, cuDoubleComplex>) {
+        static_assert(sizeof(cuDoubleComplex) == 2 * sizeof(double), "cuDoubleComplex as (re, im) doubles");
+        return reinterpret_cast<double*>(p);
+    } else {
+        (void)p;
+        throw std::logic_error("[batch_pf] the device outer model in an FP32 build (refused before it runs)");
+    }
+}
+
+}  // namespace
+
 // outer_loops_backend='device': the controls come from the device model's own arrays, never through
 // the host (DeviceOuterHook::write_controls); the Sbus correction and the |V| resets are applied by
 // the same kernels as on the host path, over its fixed per-slot blocks (unused entries: bus -1).
@@ -1958,19 +1990,19 @@ void BatchPfDriver<BatchSource>::_oc_write_controls_device(outer::DeviceOuterHoo
     }
     outer::DeviceOuterHook::ControlTargets t;
     t.pin = thrust::raw_pointer_cast(d_oc_pin_.data());
-    t.held_q = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_held_q_.data()));
+    t.held_q = device_model_f64(thrust::raw_pointer_cast(d_oc_held_q_.data()));
     t.plan_held = thrust::raw_pointer_cast(d_oc_plan_held_.data());
-    t.v_set = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_vset_.data()));
+    t.v_set = device_model_f64(thrust::raw_pointer_cast(d_oc_vset_.data()));
     t.hvdc = thrust::raw_pointer_cast(d_oc_hvdc_.data());
     t.ds_slot = thrust::raw_pointer_cast(d_oc_ds_slot_.data());
     t.ds_bus = thrust::raw_pointer_cast(d_oc_ds_bus_.data());
-    t.ds_p = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_ds_p_.data()));
-    t.ds_q = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_ds_q_.data()));
+    t.ds_p = device_model_f64(thrust::raw_pointer_cast(d_oc_ds_p_.data()));
+    t.ds_q = device_model_f64(thrust::raw_pointer_cast(d_oc_ds_q_.data()));
     t.vr_slot = thrust::raw_pointer_cast(d_oc_vr_slot_.data());
     t.vr_bus = thrust::raw_pointer_cast(d_oc_vr_bus_.data());
-    t.vr_vm = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_vr_vm_.data()));
+    t.vr_vm = device_model_f64(thrust::raw_pointer_cast(d_oc_vr_vm_.data()));
     if (!outer_hook_->layout().slack_bus.empty())
-        t.slack_w = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_oc_slack_w_.data()));
+        t.slack_w = device_model_f64(thrust::raw_pointer_cast(d_oc_slack_w_.data()));
     const size_t nbcs = static_cast<size_t>(n) * static_cast<size_t>(base.n_bc);
     if (nbcs > 0) {
         if (d_bc_in_out_.size() < nbcs) {   // amortised growth
@@ -1980,9 +2012,9 @@ void BatchPfDriver<BatchSource>::_oc_write_controls_device(outer::DeviceOuterHoo
         }
         t.bc_out = thrust::raw_pointer_cast(d_bc_in_out_.data());
         t.bc_retap = thrust::raw_pointer_cast(d_bc_in_retap_.data());
-        t.bc_tap = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_bc_in_tap_.data()));
-        t.bc_a_tap = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_bc_in_a_tap_.data()));
-        t.bc_rho_tap = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_bc_in_rho_tap_.data()));
+        t.bc_tap = device_model_f64_pairs(thrust::raw_pointer_cast(d_bc_in_tap_.data()));
+        t.bc_a_tap = device_model_f64(thrust::raw_pointer_cast(d_bc_in_a_tap_.data()));
+        t.bc_rho_tap = device_model_f64(thrust::raw_pointer_cast(d_bc_in_rho_tap_.data()));
         t.bc_ctl = thrust::raw_pointer_cast(d_bc_in_ctl_.data());
         t.bc_rctl = thrust::raw_pointer_cast(d_bc_in_rctl_.data());
     }
@@ -1993,7 +2025,7 @@ void BatchPfDriver<BatchSource>::_oc_write_controls_device(outer::DeviceOuterHoo
             d_sc_in_set_.resize(c); d_sc_in_b_.resize(c); d_sc_in_ctl_.resize(c);
         }
         t.sc_set = thrust::raw_pointer_cast(d_sc_in_set_.data());
-        t.sc_b_new = reinterpret_cast<double*>(thrust::raw_pointer_cast(d_sc_in_b_.data()));
+        t.sc_b_new = device_model_f64(thrust::raw_pointer_cast(d_sc_in_b_.data()));
         t.sc_ctl = thrust::raw_pointer_cast(d_sc_in_ctl_.data());
     }
     dev->write_controls(n, thrust::raw_pointer_cast(d_sl.data()), t, static_cast<cudaStream_t>(cs));
@@ -3218,7 +3250,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 int* p = thrust::raw_pointer_cast(d_oc_dec_in_.data());
                 int* q = thrust::raw_pointer_cast(d_oc_dec_out_.data());
                 dev_hook->decide(nd, p, p + nd, p + 2 * nd, p + 3 * nd, p + 4 * nd,
-                                 reinterpret_cast<const double*>(thrust::raw_pointer_cast(d_oc_gather_.data())),
+                                 device_model_f64(thrust::raw_pointer_cast(d_oc_gather_.data())),
                                  oc_stride_, q, q + nd, static_cast<cudaStream_t>(cs));
                 std::vector<int> out(2 * static_cast<size_t>(nd));
                 if (nd > 0)
@@ -3226,7 +3258,7 @@ void BatchPfDriver<BatchSource>::_solve_continuous(BatchTimings& t)
                 cs.synchronize();
                 // the points other rows resume from, read off the finished slots before they are reused
                 dev_hook->export_points(nd, ls.data(), lr.data(), out.data(), out.data() + nd, lg.data(),
-                                        reinterpret_cast<const double*>(thrust::raw_pointer_cast(d_oc_gather_.data())),
+                                        device_model_f64(thrust::raw_pointer_cast(d_oc_gather_.data())),
                                         oc_stride_);
                 for (int i = 0; i < nd; ++i) {
                     const int s = ls[static_cast<size_t>(i)];

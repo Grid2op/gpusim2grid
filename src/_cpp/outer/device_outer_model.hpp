@@ -50,6 +50,9 @@ void check_device_features(const std::vector<DeviceFeature>& features);
 
 // The batched entry points (docs/outer_loops_on_device.md, M3): what the driver calls instead of the
 // per-slot OuterHook ones when its hook is a device model. Device pointers; `stream` a cudaStream_t.
+// Its floating-point arrays are double whatever real_t: the device model runs in FP64 builds only
+// (an FP32 build refuses it), and the driver hands it its real_t buffers through a compile-time
+// typed view (batch_pf_driver.cu, device_model_f64), never a cast.
 class DeviceOuterHook {
 public:
     virtual ~DeviceOuterHook() = default;
