@@ -5,6 +5,8 @@ Change Log
 --------------------
 - [ADDED] ``GPUSIM2GRID_ASYNC_TIMERS=1``: per-phase timers no longer wait for the GPU (their GPU times read 0), so
   the host keeps the GPU fed; opt-in.
+- [IMPROVED] Strategies changing a branch (transformer values, bus moves): its current check, flows and max
+  loading are computed on the GPU from the row's own block; no voltages come back to the host.
 - [IMPROVED] ``ContingencyAnalysisGPU.set_actions``: the grid is walked once and copied once for all actions, not
   per action (771 actions on a French grid: 25 s -> 1.2 s).
 - [IMPROVED] Fewer device synchronisations per round: grow-only pinned buffers, double-buffered segment uploads,

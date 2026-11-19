@@ -211,6 +211,8 @@ struct ContingencyAnalysisSession {
     RealVect h_or_amps_;
     // the flows of every row on the device (d_or_amps_results / d_ex_amps_results)
     void _compute_flows_device();
+    // the flows of the branches rows hold their own block of (Contingency::own_branches)
+    void _override_own_branch_flows();
     RealVect h_ex_amps_;
 
     // =========================================================================
@@ -408,11 +410,10 @@ struct ContingencyAnalysisSession {
     void compute_flows();
     // Per row of the last run(): the highest |I| / limit over the branches and their two sides
     // (lim*_ka per branch, kA; NaN / <= 0 ignored) and the branch reaching it (-1: none), reduced
-    // on the device from the flows (computed there, never copied to the host). `skip`: flat
-    // row * n_branches + branch entries left out (the caller computes those itself).
+    // on the device from the flows (computed there, never copied to the host; a row's own
+    // branch blocks included, set_row_branch_blocks).
     std::pair<RealVect, std::vector<int>> compute_max_loading(Eigen::Ref<const RealVect> lim1_ka,
-                                                              Eigen::Ref<const RealVect> lim2_ka,
-                                                              const std::vector<long long>& skip);
+                                                              Eigen::Ref<const RealVect> lim2_ka);
 
     // =========================================================================
     // compute_limit_violations
@@ -517,10 +518,15 @@ struct ContingencyAnalysisSession {
     // its moves leave without any element (rare: [] for most rows; the call may be omitted
     // when no row empties a base bus), masked too (Contingency::empty_buses).
     void set_row_empty_buses(const std::vector<std::vector<int>>& rows);
-    // set_row_unchecked_branches: after build_contingencies*(), per row the branches the fused
-    // current check skips (Contingency::unchecked_branches): their block or ends differ from
-    // the shared ones on that row, the caller checks them itself. Counts exclude them.
-    void set_row_unchecked_branches(const std::vector<std::vector<int>>& rows);
+    // set_row_branch_blocks: after build_contingencies*(), the branches whose block or ends
+    // differ from the shared ones on a row (a strategy's transformer values, its bus moves),
+    // one entry each: row rows[i], branch branches[i], (from, to) solver buses ends[2i, 2i+1]
+    // (-1: Kron-reduced end), pi block y[4i .. 4i+3] (y11 y12 y21 y22), current bases of its
+    // sides base_A[2i, 2i+1] (A). The fused current check and the flows (compute_flows,
+    // compute_max_loading) use them (Contingency::own_branches). Replaces the previous set.
+    void set_row_branch_blocks(Eigen::Ref<const IntVect> rows, Eigen::Ref<const IntVect> branches,
+                               Eigen::Ref<const IntVect> ends, Eigen::Ref<const CplxVect> y,
+                               Eigen::Ref<const RealVect> base_A);
     // add_row_sbus_deltas: after build_contingencies*(), per row (bus, dS pu) ADDED to the
     // row's Sbus (an injection moved between buses), merged per bus with the row's trips.
     void add_row_sbus_deltas(const std::vector<std::vector<std::pair<int, std::complex<double>>>>& rows);

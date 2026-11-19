@@ -158,6 +158,12 @@ struct ContingencyBatch {
 
     std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
     thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
+    // the rows' own branch blocks (Contingency::own_branches), see TrippedBranchTable
+    std::vector<int> h_trip_own_;
+    std::vector<RowBranchBlock> h_own_;
+    thrust::device_vector<int> d_trip_own, d_own_ft;
+    thrust::device_vector<cudaComplexType> d_own_y;
+    thrust::device_vector<cuda_real_type> d_own_base;
 
     // -------------------------------------------------------------------------
     // Per-row distributed slack (redistribute_slack, see
@@ -255,7 +261,8 @@ struct ContingencyBatch {
                                *mask_cfg, mask_.h);
 
         build_tripped_branch_table(contingencies, active_to_orig_,
-                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_,
+                                   &h_trip_own_, &h_own_);
         _build_vm_reseed(contingencies);
 
         t_preprocess_ms = cb_ms_since(t_start);
@@ -353,6 +360,27 @@ struct ContingencyBatch {
                 upload_h2d(d_trip_branch_flat, h_trip_branch_flat_.data(),
                            h_trip_branch_flat_.size(), cs);
         }
+        if (!h_own_.empty()) {
+            const size_t n_own = h_own_.size();
+            std::vector<cudaComplexType> y(4 * n_own);
+            std::vector<int> ft(2 * n_own);
+            std::vector<cuda_real_type> base(2 * n_own);
+            for (size_t k = 0; k < n_own; ++k) {
+                const RowBranchBlock& ob = h_own_[k];
+                for (int q = 0; q < 4; ++q)
+                    y[4 * k + q] = CudaFunHelper::my_make_cuComplex(static_cast<cuda_real_type>(ob.y[q].real()),
+                                                                    static_cast<cuda_real_type>(ob.y[q].imag()));
+                ft[2 * k] = ob.from;
+                ft[2 * k + 1] = ob.to;
+                base[2 * k] = static_cast<cuda_real_type>(ob.base_or_A);
+                base[2 * k + 1] = static_cast<cuda_real_type>(ob.base_ex_A);
+            }
+            upload_h2d(d_trip_own, h_trip_own_.data(), h_trip_own_.size(), cs);
+            upload_h2d(d_own_y, y.data(), y.size(), cs);
+            upload_h2d(d_own_ft, ft.data(), ft.size(), cs);
+            upload_h2d(d_own_base, base.data(), base.size(), cs);
+            cudaStreamSynchronize(cs);   // the staging vectors die here
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -378,10 +406,17 @@ struct ContingencyBatch {
     // to skip branches tripped by the contingency it is currently checking.
     // -------------------------------------------------------------------------
     TrippedBranchTable tripped_branch_table() const {
-        return TrippedBranchTable{
+        TrippedBranchTable t{
             thrust::raw_pointer_cast(d_trip_start.data()),
             thrust::raw_pointer_cast(d_trip_count.data()),
             thrust::raw_pointer_cast(d_trip_branch_flat.data())};
+        if (!h_own_.empty()) {
+            t.d_own = thrust::raw_pointer_cast(d_trip_own.data());
+            t.d_own_y = thrust::raw_pointer_cast(d_own_y.data());
+            t.d_own_ft = thrust::raw_pointer_cast(d_own_ft.data());
+            t.d_own_base = thrust::raw_pointer_cast(d_own_base.data());
+        }
+        return t;
     }
 
     // -------------------------------------------------------------------------

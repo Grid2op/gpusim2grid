@@ -427,7 +427,7 @@ plan), factor / solve time per batch, before and after.
 | A | strategy rows (union of trips), max loading, `violation_threshold` | 1 | done (Python row map over today's session; max loading reduced on the device) |
 | A2 | warm start: one start V per contingency on the device, gathered at slot load | 1 | done (C++ unit tests for the gather) |
 | A6 | streamed strategies: one `compute()`, a contingency releases its strategies as it finishes (`strategy_condition` on the device, warm start and outer resume point kept in the same run); the two-phase `rows=` / `select_strategies` API removed | 1 | done |
-| B.1 | per-row branch admittance (taps) | 2 | done (row triplets in C++; the changed branch's flows / current violations recomputed on the host) |
+| B.1 | per-row branch admittance (taps) | 2 | done (row triplets in C++; the changed branch's flows / current violations / max loading from the row's own block on the device, `set_row_branch_blocks`) |
 | A5 | warm start with the outer loops: each strategy resumes from its contingency's loop state; per-row accessors (`get_row_status`, `get_row_iterations`, `get_outer_results`, physical checks) on the caller's rows | 1 | done |
 | B.2 | union pattern + spare buses + moves (splits / merges), no-op = today's path | 3 | done: S1-S3 (also under the outer loops, warm or not), S4 moved-branch flows / violations, S5 generator moves (PV on the new bus, group members, under the outer loops: spares switchable in the outer model), half-open branches' closed ends; the contingency wins over an action's move of its elements |
 | — | switch actions → moves (lightsim2grid detailed topology), pattern banks; groups / gradients with moves | later | |

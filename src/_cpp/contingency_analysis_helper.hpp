@@ -36,6 +36,7 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <complex>
 #include <utility>
 #include <vector>
 #include <tuple>
@@ -74,6 +75,18 @@ struct Triplet {
     double delta_re;   // real-part delta  (always double on the host side)
     double delta_im;   // imag-part delta
     int    k = -1;     // CSR flat index; -1 until resolve_indices() fills it
+};
+
+// A branch of a row with its own pi block and ends (Contingency::own_branches): its
+// admittances y11 y12 y21 y22 there, its (from, to) solver buses (-1: Kron-reduced end)
+// and the current base of each side in A (the nominal voltage of the bus the side sits on).
+struct RowBranchBlock {
+    int branch = -1;
+    int from = -1;
+    int to = -1;
+    std::complex<double> y[4];
+    double base_or_A = 0.;
+    double base_ex_A = 0.;
 };
 
 // ---------------------------------------------------------------------------
@@ -157,11 +170,11 @@ struct Contingency {
     // is a second, independent index space from Triplet::k (CSR flat index
     // into Ybus) — no interaction with resolve_indices()/build_flat_patches().
     std::vector<int> tripped_branches;
-    // Branches the same check skips although the row does not trip them: their
-    // admittance or their ends differ from the shared *_eff blocks on this row (a
-    // strategy's transformer values, its bus moves), so the caller checks them
-    // from the row's own block (set_row_unchecked_branches). Never read elsewhere.
-    std::vector<int> unchecked_branches;
+    // Branches whose admittance or ends differ from the shared *_eff blocks on this row (a
+    // strategy's transformer values, its bus moves): the current check and the flows use
+    // the row's own block (ContingencyAnalysisSession::set_row_branch_blocks). Sorted by
+    // branch, one entry per branch.
+    std::vector<RowBranchBlock> own_branches;
 
     // Topology actions, bus moves on the union pattern (ContingencyAnalysisSession::
     // set_spare_buses): buses with no element in this row -- an unused spare bus, a bus a
@@ -555,13 +568,20 @@ void build_mask_entries(
 //                       index (same array build_flat_patches() produces)
 // h_trip_branch_flat : output, concatenated tripped branch ids
 // h_trip_start       : output, [n_active] start offset into h_trip_branch_flat
-// h_trip_count       : output, [n_active] number of tripped branches
+// h_trip_count       : output, [n_active] number of entries
+// h_trip_own         : output (optional), per entry -1 (tripped) or the index in h_own of
+//                       the row's own block of that branch (Contingency::own_branches,
+//                       listed before the trips: a branch in both takes its block); without
+//                       it, those branches are not listed
+// h_own              : output (optional, with h_trip_own), the rows' own blocks
 // ---------------------------------------------------------------------------
 void build_tripped_branch_table(
     const std::vector<Contingency>& contingencies,
     const std::vector<int>&         active_to_orig,
     std::vector<int>&               h_trip_branch_flat,
     std::vector<int>&               h_trip_start,
-    std::vector<int>&               h_trip_count);
+    std::vector<int>&               h_trip_count,
+    std::vector<int>*               h_trip_own = nullptr,
+    std::vector<RowBranchBlock>*    h_own = nullptr);
 
 #endif // CONTINGENCY_ANALYSIS_HELPER_HPP

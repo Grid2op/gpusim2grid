@@ -1930,10 +1930,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
          "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
     .def("compute_max_loading", &ContingencyAnalysisSession::compute_max_loading,
-         pybind11::arg("lim1_ka"), pybind11::arg("lim2_ka"), pybind11::arg("skip") = std::vector<long long>(),
+         pybind11::arg("lim1_ka"), pybind11::arg("lim2_ka"),
          "Per row of the last run(): (rho, branch), the highest |I| / limit over the branches and "
-         "their two sides and the branch reaching it (-1: none), reduced on the device; skip: flat "
-         "row * n_branches + branch entries left out.")
+         "their two sides and the branch reaching it (-1: none), reduced on the device (the rows' "
+         "own branch blocks included, set_row_branch_blocks).")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Copy origin-terminal ampere flows to host: (n_contingencies * n_branches,). "
@@ -1968,11 +1968,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
          "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
          "and no add_row_sbus_deltas bus on it), with no call.")
-    .def("set_row_unchecked_branches", &ContingencyAnalysisSession::set_row_unchecked_branches,
-         pybind11::arg("rows"),
-         "After build_contingencies*(): per row, the branches compute_limit_violations' current check "
-         "skips as it skips a tripped one (records and counts), because their admittance or ends on "
-         "that row are not the shared ones: the caller checks them from the row's own block.")
+    .def("set_row_branch_blocks", &ContingencyAnalysisSession::set_row_branch_blocks,
+         pybind11::arg("rows"), pybind11::arg("branches"), pybind11::arg("ends"), pybind11::arg("y"),
+         pybind11::arg("base_A"),
+         "After build_contingencies*(): the branches whose admittance or ends on a row are not the "
+         "shared ones (a strategy's transformer values, its bus moves), one entry each: rows[i], "
+         "branches[i], ends[2i:2i+2] (from, to solver buses, -1: Kron-reduced), y[4i:4i+4] "
+         "(y11 y12 y21 y22), base_A[2i:2i+2] (current bases of the two sides, A). The current check "
+         "(records and counts), compute_flows and compute_max_loading use them. Replaces the "
+         "previous set.")
     .def("set_streaming", &ContingencyAnalysisSession::set_streaming,
          pybind11::arg("parent_of_row"), pybind11::arg("condition"), pybind11::arg("warm"),
          "Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a "

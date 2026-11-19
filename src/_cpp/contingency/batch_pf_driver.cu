@@ -1607,7 +1607,7 @@ void BatchPfDriver<BatchSource>::override_outer_trafo_flows()
         thrust::raw_pointer_cast(d_branch_from.data()), thrust::raw_pointer_cast(d_branch_to.data()),
         thrust::raw_pointer_cast(d_base_current_A.data()), thrust::raw_pointer_cast(d_base_current_ex_A.data()),
         thrust::raw_pointer_cast(d_or_amps_results.data()), thrust::raw_pointer_cast(d_ex_amps_results.data()),
-        base.n_bus, n_branches_, n);
+        base.n_bus, n_branches_, n, /*d_ft=*/nullptr, /*d_base=*/nullptr);
     CHK_CUDA_BPF(cudaGetLastError());
     cs.synchronize();   // the staging vectors die here
 }
@@ -2348,7 +2348,7 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
             thrust::raw_pointer_cast(d_base_current_ex_A.data()),
             thrust::raw_pointer_cast(d_branch_limit_a1_ka.data()),
             thrust::raw_pointer_cast(d_branch_limit_a2_ka.data()),
-            trip.d_start, trip.d_count, trip.d_branch_flat,
+            trip,
             n_bus, n_branches_, n_lines_,
             c_start, n_slots, violation_capacity_,
             d_result_map, d_slot_active,

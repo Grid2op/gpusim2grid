@@ -1134,21 +1134,33 @@ void build_tripped_branch_table(
     const std::vector<int>&         active_to_orig,
     std::vector<int>&               h_trip_branch_flat,
     std::vector<int>&               h_trip_start,
-    std::vector<int>&               h_trip_count)
+    std::vector<int>&               h_trip_count,
+    std::vector<int>*               h_trip_own,
+    std::vector<RowBranchBlock>*    h_own)
 {
     const int n_active = static_cast<int>(active_to_orig.size());
     h_trip_start.resize(static_cast<size_t>(n_active));
     h_trip_count.resize(static_cast<size_t>(n_active));
     h_trip_branch_flat.clear();
+    const bool own = h_trip_own != nullptr && h_own != nullptr;
+    if (own) { h_trip_own->clear(); h_own->clear(); }
 
     for (int slot = 0; slot < n_active; ++slot) {
         const Contingency& ctg = contingencies[static_cast<size_t>(active_to_orig[slot])];
         const auto& tb = ctg.tripped_branches;
-        const auto& ub = ctg.unchecked_branches;   // skipped by the check as a trip is
+        const size_t n_own = own ? ctg.own_branches.size() : 0;
         h_trip_start[static_cast<size_t>(slot)] = static_cast<int>(h_trip_branch_flat.size());
-        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size() + ub.size());
+        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size() + n_own);
+        // the own blocks first: a branch both tripped and listed with its own block (opened at
+        // one end, its other end moved) takes its block (the first match wins)
+        if (own)
+            for (const RowBranchBlock& ob : ctg.own_branches) {
+                h_trip_branch_flat.push_back(ob.branch);
+                h_trip_own->push_back(static_cast<int>(h_own->size()));
+                h_own->push_back(ob);
+            }
         h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
-        h_trip_branch_flat.insert(h_trip_branch_flat.end(), ub.begin(), ub.end());
+        if (own) h_trip_own->insert(h_trip_own->end(), tb.size(), -1);
     }
 }
 
