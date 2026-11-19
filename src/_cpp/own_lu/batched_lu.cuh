@@ -79,6 +79,10 @@ public:
     void set_active(int nb);
     int active() const { return nb_; }
 
+    // Whether the fused triangular-solve kernel (a run of narrow levels in one 1024-thread block)
+    // launches at that block size on the current device; init() fuses nothing otherwise.
+    static bool fused_solve_supported();
+
     // Pivots clamped per active matrix by the last factorize() (host sync).
     std::vector<int> clamped_counts() const;
 
