@@ -122,32 +122,6 @@ def test_generator_moves_device_equals_host():
     _same_strategies(g, _gen_moves(g), False)
 
 
-def test_moved_slack_participants_device_equals_host(grid: Any):
-    """generators 1-3 moved to a spare bus each, on the module's grid where every generator takes
-    part in the slack: DistributedSlack moves a moved generator's target on its new bus (the host's
-    ds_unit_bus, as lightsim2grid's solve-view units), on the device too. The device read the
-    grid's bus of every unit, so it put a moved one's share back on its former bus (and the
-    NROuterDist weights with it)"""
-    from test_topo_outer_warm_start import _gen_moves
-
-    actions = _gen_moves(grid)
-    moved = [int(grid.get_generators()[g].id) for g in (1, 2, 3)]
-    host, dev = _same_strategies(grid, actions, False, trace=True)
-    n_ctg = len(SPLIT_CONTINGENCIES)
-    rows_h, rows_d = host.get_outer_results(), dev.get_outer_results()
-    shared = 0
-    for c in range(n_ctg):
-        for a, gen in enumerate(moved):
-            k = n_ctg + c * len(actions) + a
-            th, td = dict(rows_h[k].gen_target_p), dict(rows_d[k].gen_target_p)
-            assert td.keys() == th.keys(), f"row {k}"
-            for g, mw in th.items():
-                assert td[g] == pytest.approx(mw, rel=0, abs=parity_tol("mw")), f"row {k}, generator {g}"
-            shared += gen in th
-    # the loop did move the moved generators (else this compares nothing the bug touches)
-    assert shared > 0
-
-
 def _case14_gen_on_busbar2() -> Any:
     """test_topo_outer_warm_start.py's generator-move grid with generator 2 standing on the second
     busbar of its substation (bus 19, with one line end), so a regulated bus of the grid comes after

@@ -14,6 +14,7 @@ decisions as the host model, which test_outer_model_cpu.py pins against lightsim
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -161,11 +162,14 @@ def _lockstep(
     raise AssertionError("the row never ended")
 
 
-def _case14_two_regulated_busbars(move: bool = False, load_scale: float = 1.0) -> Any:
+def _case14_two_regulated_busbars(
+    move: bool = False, load_scale: float = 1.0, merged_participates: bool = False
+) -> Any:
     """case14 with a second generator in generator 1's substation, on its second busbar (with one
     line end), regulating the same voltage: both busbars are controller buses of the grid's
     ReactiveLimits plan. ``move``: that generator moved onto busbar 1 (a re-merge: the bus generator
-    1 holds gains a generator). Only generator 0 and the slack share the slack."""
+    1 holds gains a generator). Only generator 0 and the slack share the slack, and that generator
+    too with ``merged_participates``."""
     import warnings
 
     import pandapower as pp
@@ -191,10 +195,14 @@ def _case14_two_regulated_busbars(move: bool = False, load_scale: float = 1.0) -
         g = init_from_pandapower(net, n_sub=n_sub, n_busbar_per_sub=2)
     n_gen = len(g.get_generators())
     g.set_gen_p_limits(np.zeros(n_gen), np.full(n_gen, 300.0))
-    participates = [gen.id == 0 or gen.is_slack for gen in g.get_generators()]
+    merged = _merged_gen(g)
+    participates = [
+        gen.id == 0 or gen.is_slack or (merged_participates and gen.id == merged)
+        for gen in g.get_generators()
+    ]
     g.set_gen_can_participate_slack(participates, np.full(n_gen, 300.0))
     if move:
-        g.change_bus_gen(_merged_gen(g), sub)
+        g.change_bus_gen(merged, sub)
     g.change_algorithm(cpu.OUTER)
     g.tell_solver_need_reset()
     return g
@@ -222,6 +230,27 @@ def test_generator_moved_onto_a_regulated_bus(load_scale: float):
         move=True,
         load_scale=load_scale,
     )
+
+
+@pytest.mark.parametrize("load_scale", [1.0, 1.15])
+def test_moved_slack_participant(load_scale: float):
+    """the same re-merge, the moved generator taking part in the slack (the facades refuse moving
+    one, as lightsim2grid's ScenarioSweep; the model takes it as RowOverrides::gen_bus): the host
+    puts it on its row bus among the DistributedSlack units (ds_unit_bus, lightsim2grid's
+    solve-view units), so the share the loop moves its target by goes there. The device read the
+    grid's bus of every unit and put that share on the generator's former busbar: the Sbus
+    corrections differ from the first DistributedSlack step"""
+    make = functools.partial(_case14_two_regulated_busbars, merged_participates=True)
+    base = make()
+    assert base.ac_pf(np.full(base.total_bus(), 1.0 + 0j), cpu.MAX_IT, cpu.TOL_MVA).size > 0
+    gen = _merged_gen(base)
+    sub = int(base.get_generators()[gen].bus_id) - base.get_n_sub()
+    to_solver = np.asarray(base.id_me_to_ac_solver(), dtype=int)
+    res = _lockstep(
+        make, overrides=dict(gen_bus=[[(gen, int(to_solver[sub]))]]), move=True, load_scale=load_scale
+    )
+    # the loop did move the moved generator's target (else this compares nothing the bug touches)
+    assert gen in dict(res.gen_target_p), res.decisions
 
 
 # ---- DistributedSlack and ReactiveLimits on local buses ----------------------------------------
