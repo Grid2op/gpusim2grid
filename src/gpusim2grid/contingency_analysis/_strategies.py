@@ -67,6 +67,7 @@ __all__ = [
     "Strategy",
     "StrategyCondition",
     "StrategyRow",
+    "TrafoScratch",
     "compile_action",
     "strategy_row",
 ]
@@ -118,11 +119,45 @@ def _empty() -> list[list[int]]:
     return [[] for _ in range(10)]
 
 
+class TrafoScratch:
+    """One copy of a grid on which the transformer admittances of many actions are computed
+    (``compile_action``): the copy is made on first use, and before each action the
+    transformers an earlier one changed are put back at the grid's ratio and shift, so the values
+    are those of a fresh copy per action (a copy of a large grid takes ~1 s)."""
+
+    def __init__(self, grid: LSGrid) -> None:
+        self._grid: LSGrid = grid
+        self._copy: LSGrid | None = None
+        self._changed: set[int] = set()
+
+    def trafos_after(self, action: Action) -> Any:
+        """The copy's transformers once ``action``'s ratios and shifts are applied (the others
+        at the grid's values)."""
+        if self._copy is None:
+            self._copy = copy.deepcopy(self._grid)
+        base = self._grid.get_trafos()
+        for el in sorted(self._changed):
+            self._copy.change_ratio_trafo(el, float(base[el].ratio))
+            self._copy.change_shift_trafo(el, float(base[el].shift_rad))
+        for el, ratio in action.trafo_ratio.items():
+            self._copy.change_ratio_trafo(int(el), float(ratio))
+        for el, deg in action.trafo_shift_deg.items():
+            self._copy.change_shift_trafo_deg(int(el), float(deg))
+        self._changed = {int(el) for el in action.trafo_ratio} | {int(el) for el in action.trafo_shift_deg}
+        return self._copy.get_trafos()
+
+
 def compile_action(
-    grid: LSGrid, action: Action, n_lines: int, current: dict[ElementRef, int] | None = None
+    grid: LSGrid,
+    action: Action,
+    n_lines: int,
+    current: dict[ElementRef, int] | None = None,
+    scratch: TrafoScratch | None = None,
 ) -> CompiledAction:
     """``action`` against ``grid`` (its current buses and transformer values). ``current``: the
-    grid's ``current_buses``, read once for many actions (it walks every element end)."""
+    grid's ``current_buses``, read once for many actions (it walks every element end);
+    ``scratch``: a ``TrafoScratch`` of ``grid`` shared by many actions (else a copy per action
+    that changes a transformer value)."""
     if current is None:
         current = current_buses(grid)
     trips = _empty()
@@ -181,13 +216,8 @@ def compile_action(
         if not np.isclose(np.deg2rad(deg), trafos[el].shift_rad, rtol=0.0, atol=1e-15)
     }
     if changed:
-        # lightsim2grid's own admittance after the change (a copy: the grid is left as it is)
-        changed_grid = copy.deepcopy(grid)
-        for el, ratio in action.trafo_ratio.items():
-            changed_grid.change_ratio_trafo(int(el), float(ratio))
-        for el, deg in action.trafo_shift_deg.items():
-            changed_grid.change_shift_trafo_deg(int(el), float(deg))
-        new_trafos = changed_grid.get_trafos()
+        # lightsim2grid's own admittance after the change (on a copy: the grid is left as it is)
+        new_trafos = (scratch if scratch is not None else TrafoScratch(grid)).trafos_after(action)
         for el in sorted(changed):
             branch_y[n_lines + el] = _y(new_trafos[el])
             base_y[n_lines + el] = _y(trafos[el])

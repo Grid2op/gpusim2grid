@@ -41,8 +41,9 @@ from .._ls2g_utils import (
 from .. import _gpusim2grid as _cpp
 from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
 from ._reactive_limits import ReactiveLimitsStatus
-from ..actions import current_buses
-from ._strategies import (ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, UnionPlan, compile_action, plan_union,
+from ..actions import current_buses, element_substations
+from ._strategies import (ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, TrafoScratch, UnionPlan,
+                          compile_action, plan_union,
                           strategy_row, topology_context)
 from ._violation_threshold import ViolationThresholdFacadeMixin
 
@@ -917,16 +918,18 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         if self._grid is None:
             raise RuntimeError("set_actions needs a grid-mode instance (a lightsim2grid grid)")
         actions = list(actions)
+        subs = element_substations(self._grid)  # once: it walks every element end of the grid
         for i, a in enumerate(actions):
             if not isinstance(a, Action):
                 raise TypeError(f"actions[{i}] is a {type(a).__name__}, not a gpusim2grid.actions.Action")
-            a.validate(self._grid)
+            a.validate(self._grid, subs)
         n_lines: int = len(self._grid.get_lines())
         if any(max(acts, default=-1) >= len(actions) for _, acts in self._strategies):
             raise ValueError("a strategy refers to an action index the new list does not have")
         self._actions = actions
-        current = current_buses(self._grid)  # once: it walks every element end of the grid
-        self._compiled = [compile_action(self._grid, a, n_lines, current) for a in actions]
+        current = current_buses(self._grid)
+        scratch = TrafoScratch(self._grid)  # one copy of the grid for every transformer value
+        self._compiled = [compile_action(self._grid, a, n_lines, current, scratch) for a in actions]
         # branch ends (solver numbering), nominal voltages, sn_mva: row triplets and flow fix-ups
         self._branch_args = extract_branch_data(self._grid)[0]
         self._invalidate_results()

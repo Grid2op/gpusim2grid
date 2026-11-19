@@ -186,3 +186,37 @@ def test_apply_to_opens_one_end_and_moves_the_other(kind: str):
     after = grid.get_lines()[el.id] if kind == "line" else grid.get_trafos()[el.id]
     assert not after.connected1 and after.connected2
     assert after.bus2_id == new_bus
+
+
+def test_set_actions_reads_and_copies_the_grid_a_fixed_number_of_times(monkeypatch: pytest.MonkeyPatch):
+    """set_actions validates and compiles every action against the grid: its element ends are
+    walked, and the grid copied for transformer values, a number of times that does not grow
+    with the actions (on a 7k-bus grid a walk is ~30 ms and a copy ~1 s: 771 actions took 25 s)."""
+    import copy
+
+    import gpusim2grid.actions as actions_mod
+    from gpusim2grid.actions import Action
+
+    from _topo_helpers import make_ca
+
+    grid = case14()
+    ca = make_ca(grid, {})
+    ca.add_contingencies_by_branch_id([[]])
+    calls: dict[str, int] = {"walks": 0, "copies": 0}
+    ends, deepcopy = actions_mod._element_ends, copy.deepcopy
+
+    def counted_ends(g: LSGrid):
+        calls["walks"] += 1
+        return ends(g)
+
+    def counted_deepcopy(x: Any, memo: Any = None) -> Any:
+        calls["copies"] += 1
+        return deepcopy(x, memo)
+
+    monkeypatch.setattr(actions_mod, "_element_ends", counted_ends)
+    monkeypatch.setattr(copy, "deepcopy", counted_deepcopy)
+    actions = [Action(trafo_shift_deg={0: float(d)}) for d in range(1, 11)]
+    actions += [Action(line_bus1={0: 0}), Action(load_bus={0: bus2(grid, grid.get_loads()[0].sub_id)})] * 5
+    ca.set_actions(actions)
+    assert calls["walks"] <= 2
+    assert calls["copies"] <= 1

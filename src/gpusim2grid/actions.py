@@ -50,6 +50,7 @@ __all__ = [
     "ElementRef",
     "FrozenMap",
     "current_buses",
+    "element_substations",
     "substation_elements",
 ]
 
@@ -230,12 +231,14 @@ class Action:
         return cls(**moves)
 
     # ------------------------------------------------------------ on a grid
-    def validate(self, grid: LSGrid) -> None:
+    def validate(self, grid: LSGrid, substations: dict[ElementRef, int] | None = None) -> None:
         """Raise ``ValueError`` if an element id is unknown, a bus is out of range or in another
-        substation than the element's, or a transformer value is not physical."""
+        substation than the element's, or a transformer value is not physical. ``substations``:
+        the grid's ``element_substations``, read once for many actions (it walks every element
+        end)."""
         n_sub: int = grid.get_n_sub()
         total: int = grid.total_bus()
-        subs = _element_substations(grid)
+        subs = element_substations(grid) if substations is None else substations
         for name, el, bus in self.bus_items():
             key = (name, el)
             if key not in subs:
@@ -337,7 +340,8 @@ def _element_ends(grid: LSGrid) -> Iterator[tuple[ElementRef, int, int]]:
             yield (name, el.id), el.sub_id, el.bus_id if el.connected else DISCONNECTED
 
 
-def _element_substations(grid: LSGrid) -> dict[ElementRef, int]:
+def element_substations(grid: LSGrid) -> dict[ElementRef, int]:
+    """The substation of every element end of ``grid``."""
     return {ref: int(sub) for ref, sub, _ in _element_ends(grid)}
 
 
