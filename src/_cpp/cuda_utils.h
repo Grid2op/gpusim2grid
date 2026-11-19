@@ -744,7 +744,8 @@ struct CudaTimer {
     // host's enqueue time}. Each timed phase otherwise makes the host wait for the GPU, which then
     // idles for the next launch: on a launch-bound loop (many short kernels, the continuous
     // schedule's tail) that is most of its idle time. No result depends on these waits: every
-    // read of device data on the host has its own synchronisation.
+    // read of device data on the host, and every free of a buffer a kernel may still read, has
+    // its own synchronisation -- never rely on stop_ms() for one.
     TimingEntry stop_ms() {
         if (async_timers()) return {0., ms_since(_wall_start)};
         _stop.record(_stream);

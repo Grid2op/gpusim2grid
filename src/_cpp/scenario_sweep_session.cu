@@ -2173,7 +2173,9 @@ void ScenarioSweepSession::compute_flows()
     }
 
     timings_.t_flow_computation += flow_timer.stop_ms();
-    // d_zero destroyed here, after sync (stop_ms() synchronizes)
+    // d_zero dies at the end of the scope: wait for the kernel reading it (stop_ms() does not under
+    // GPUSIM2GRID_ASYNC_TIMERS)
+    if (!h_zero.empty()) cudaStreamSynchronize(cs);
 
     const Eigen::Index n = static_cast<Eigen::Index>(n_scen) * n_bra;
     auto t_copy_start = std::chrono::steady_clock::now();

@@ -1197,19 +1197,30 @@ void ContingencyAnalysisSession::_compute_flows_device()
     // after the zeroing: a branch the row opens at one end keeps its other end's current
     _override_own_branch_flows();
 
-    // stop_ms() records + synchronizes the stop event, so this also serves as
-    // the sync point that lets d_zero be safely destroyed below.
     timings_.t_flow_computation += flow_timer.stop_ms();
-    // d_zero destroyed here, after sync
+    // d_zero dies here: wait for the kernel reading it (stop_ms() does not under GPUSIM2GRID_ASYNC_TIMERS)
+    if (!h_zero.empty()) cudaStreamSynchronize(cs);
 }
 
 void ContingencyAnalysisSession::_override_own_branch_flows()
 {
+    // the flows are those of the rows the last run solved, over the branches the driver holds: a
+    // block outside them (contingencies rebuilt since, branch data set after the blocks) would be
+    // written past the flow buffers
+    static const char* who = "ContingencyAnalysisSession::compute_flows";
+    const int n_run = solver_->n_contingencies, n_bra = solver_->n_branches_;
     std::vector<int> rows, branches, ft;
     std::vector<cudaComplexType> blk;
     std::vector<cuda_real_type> base;
     for (size_t c = 0; c < contingencies_.size(); ++c)
         for (const RowBranchBlock& ob : contingencies_[c].own_branches) {
+            if (static_cast<long long>(c) >= n_run)
+                throw std::runtime_error(std::string(who) + ": row " + std::to_string(c) + " has its own branch blocks "
+                                         "but the last run solved " + std::to_string(n_run) + " rows: run() first");
+            if (ob.branch >= n_bra)
+                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(ob.branch) + " of row "
+                                         + std::to_string(c) + "'s own blocks is not one of the "
+                                         + std::to_string(n_bra) + " branches");
             rows.push_back(static_cast<int>(c));
             branches.push_back(ob.branch);
             for (int q = 0; q < 4; ++q)
