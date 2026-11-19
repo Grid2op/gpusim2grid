@@ -583,6 +583,9 @@ private:
     // the device tables' plan: the grid's, or with the buses the rows' moved generators bring
     // (device_prepare_rows: bus_q entries, then theirs, then the monitors)
     std::shared_ptr<const RlPlan> rl_dev_;
+    // the moves rl_dev_ was built for (device_prepare_rows: the same ones keep it)
+    std::vector<std::vector<std::pair<int, int>>> rl_dev_moves_;
+    bool rl_dev_built_ = false;
     std::vector<std::vector<int>> gens_of_bus0_;   // per solver bus, the grid's generators there
     const RlPlan& rl_dev() const { return rl_dev_ ? *rl_dev_ : *rl0_; }
     ls2g::hvdc_p_check::HvdcPPlan hvdc_plan0_;     // the lines in AC emulation
@@ -1343,12 +1346,37 @@ void Ls2gOuterModel::load(int slot, int row)
                 std::vector<ls2g::slack_redistribution::Participant> ref;
                 std::vector<int> ref_bus;
                 collect_units(v, ref, ref_bus);
-                bool same = ref.size() == st.ds_units.size() && ref_bus == st.ds_unit_bus;
-                for (size_t k = 0; same && k < ref.size(); ++k)
-                    same = ref[k].kind == st.ds_units[k].kind && ref[k].el_id == st.ds_units[k].el_id &&
-                           ref[k].bus == st.ds_units[k].bus && ref[k].weight == st.ds_units[k].weight &&
-                           ref[k].min_p_mw == st.ds_units[k].min_p_mw && ref[k].max_p_mw == st.ds_units[k].max_p_mw;
-                if (!same) throw std::runtime_error("outer model: the filtered DistributedSlack units are not collect_units'");
+                // a limit may be NaN (none): the same NaN on both sides is the same limit
+                auto num = [](double a, double b) { return a == b || (std::isnan(a) && std::isnan(b)); };
+                auto unit_same = [&](size_t k) {
+                    return ref[k].kind == st.ds_units[k].kind && ref[k].el_id == st.ds_units[k].el_id &&
+                           ref[k].bus == st.ds_units[k].bus && ref_bus[k] == st.ds_unit_bus[k] &&
+                           num(ref[k].weight, st.ds_units[k].weight) && num(ref[k].min_p_mw, st.ds_units[k].min_p_mw) &&
+                           num(ref[k].max_p_mw, st.ds_units[k].max_p_mw);
+                };
+                bool same = ref.size() == st.ds_units.size();
+                for (size_t k = 0; same && k < ref.size(); ++k) same = unit_same(k);
+                if (!same) {
+                    std::ostringstream os;
+                    os << "outer model: the filtered DistributedSlack units are not collect_units' (row " << row << "): "
+                       << st.ds_units.size() << " filtered vs " << ref.size() << ";";
+                    for (size_t k = 0; k < std::max(ref.size(), st.ds_units.size()); ++k) {
+                        auto put = [&](const char* who, const std::vector<ls2g::slack_redistribution::Participant>& u,
+                                       const std::vector<int>& b) {
+                            if (k < u.size())
+                                os << " " << who << "(kind " << static_cast<int>(u[k].kind) << " el " << u[k].el_id
+                                   << " bus " << u[k].bus << "/" << b[k] << " w " << u[k].weight << " p ["
+                                   << u[k].min_p_mw << ", " << u[k].max_p_mw << "])";
+                            else os << " " << who << "(none)";
+                        };
+                        if (k < ref.size() && k < st.ds_units.size() && unit_same(k)) continue;
+                        os << " at " << k << ":";
+                        put("filtered", st.ds_units, st.ds_unit_bus);
+                        put("ref", ref, ref_bus);
+                        break;
+                    }
+                    throw std::runtime_error(os.str());
+                }
                 st.ds_units = ref;   // the injections as collect_units has them (init_loops rewrites them)
             }
         } else if (changes_units) {
@@ -3416,6 +3444,10 @@ Next Ls2gOuterModel::finish(SlotState& st, int& row_status, int inner_status, co
 
 void Ls2gOuterModel::set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus)
 {
+    // the buses change (and the grid's plans with them): the device tables' plan is rebuilt by the
+    // next device_prepare_rows
+    rl_dev_.reset();
+    rl_dev_built_ = false;
     BaseBuses& b = base_buses_;
     if (!b.saved) {
         b.n_bus = n_bus_;
@@ -3808,12 +3840,14 @@ std::shared_ptr<OuterHook> make_device_outer_model(const ls2g::LSGrid& grid, con
                                                    const Ls2gModelOptions& options)
 {
     auto host = std::make_shared<Ls2gOuterModel>(grid, ledger, options);
+    check_device_features(host->census());
     DeviceHostSide* side = host.get();
     return make_device_outer_model_from(std::move(host), side);
 }
 
-// keep_point, from what the device read off the row's slot (no tap / section / parked unit: the
-// device runs none of the loops that carry them)
+// keep_point, from what the device read off the row's slot (DevicePoint: its targets, frozen buses,
+// switched-on SVCs, hvdc regimes, parked units, taps and sections), merged with the point it resumed
+// from where the slot holds nothing of its own
 void Ls2gOuterModel::device_import_point(int row, const DevicePoint& p)
 {
     if (!keep_points_ || row < 0 || static_cast<size_t>(row) >= row_points_.size()) return;
@@ -3983,11 +4017,27 @@ void Ls2gOuterModel::device_tvc_image(const SlotState& st, DeviceSlotImage& img)
 
 // the buses the rows' moved generators bring to ReactiveLimits (a generator placed on another bus:
 // that bus a controller bus of its plan), appended to the grid's bus_q entries for the device
-// tables; each such bus with every generator a row moves there (sorted by id, the plans' order)
+// tables; each such bus with every generator a row moves there (sorted by id, the plans' order).
+// A generator a row moves onto a bus the grid's plan already has (a re-merge) joins that bus'
+// entry: the rows not moving it there have it off (device_slot_image's rl_goff). Each row's plan
+// is the grid's filtered (filtered_bus_q_plan, as its load builds it); the same moves as last
+// time keep the tables.
 bool Ls2gOuterModel::device_prepare_rows(const RowOverrides& ov)
 {
     const bool had = rl_dev_ != nullptr;
+    bool any_move = false;
+    for (const auto& m : ov.gen_bus) any_move = any_move || !m.empty();
+    if (!any_move) {
+        rl_dev_moves_.clear();
+        rl_dev_built_ = false;
+        rl_dev_.reset();
+        return had;
+    }
+    if (rl_dev_built_ && ov.gen_bus == rl_dev_moves_) return false;
+    rl_dev_moves_ = ov.gen_bus;
+    rl_dev_built_ = true;
     std::map<int, std::pair<RlBus, ls2g::bus_q_check::BusQEntry>> extra;
+    std::map<size_t, std::vector<int>> joining;   // grid bus_q entry k -> generators rows move there
     for (size_t r = 0; r < ov.gen_bus.size(); ++r) {
         if (ov.gen_bus[r].empty()) continue;
         SlotState st;
@@ -3995,13 +4045,18 @@ bool Ls2gOuterModel::device_prepare_rows(const RowOverrides& ov)
         st.rowv.gens.bus_solver.assign(static_cast<size_t>(n_gen_), ls2g::OuterRowView::Units::GRID_BUS);
         for (const auto& gb : ov.gen_bus[r])
             if (gb.first >= 0 && gb.first < n_gen_) st.rowv.gens.bus_solver[static_cast<size_t>(gb.first)] = gb.second;
-        const auto plan = build_rl_plan(view(st));
+        const auto plan = build_rl_plan(view(st), nullptr, nullptr, /*filtered=*/true, &ov.gen_bus[r]);
         for (size_t k = 0; k < plan->n_bus_q; ++k) {
             const RlBus& rb = plan->buses[k];
-            bool in_grid = false;
-            for (size_t q = 0; q < rl0_->n_bus_q && !in_grid; ++q) in_grid = rl0_->buses[q].bus_solver == rb.bus_solver;
-            if (in_grid) continue;
             const auto& entry = plan->plan->buses[static_cast<size_t>(rb.entry)];
+            size_t q = 0;
+            while (q < rl0_->n_bus_q && rl0_->buses[q].bus_solver != rb.bus_solver) ++q;
+            if (q < rl0_->n_bus_q) {
+                const auto& grid_ids = rl0_->plan->buses[static_cast<size_t>(rl0_->buses[q].entry)].gen_ids;
+                for (int g : entry.gen_ids)
+                    if (std::find(grid_ids.begin(), grid_ids.end(), g) == grid_ids.end()) joining[q].push_back(g);
+                continue;
+            }
             auto it = extra.find(rb.bus_solver);
             if (it == extra.end()) {
                 extra.emplace(rb.bus_solver, std::make_pair(rb, entry));
@@ -4012,7 +4067,7 @@ bool Ls2gOuterModel::device_prepare_rows(const RowOverrides& ov)
             }
         }
     }
-    if (extra.empty()) {
+    if (extra.empty() && joining.empty()) {
         rl_dev_.reset();
         return had;
     }
@@ -4026,6 +4081,11 @@ bool Ls2gOuterModel::device_prepare_rows(const RowOverrides& ov)
     // the decisions trace's order); a real grid's spare buses sit between its in-service ones --,
     // then the monitors
     std::vector<ls2g::bus_q_check::BusQEntry> entries(plan->buses.begin(), plan->buses.begin() + static_cast<ptrdiff_t>(rl0_->n_bus_q));
+    for (auto& [k, gens] : joining) {
+        auto& ids = entries[static_cast<size_t>(rl0_->buses[k].entry)].gen_ids;
+        for (int g : gens) if (std::find(ids.begin(), ids.end(), g) == ids.end()) ids.push_back(g);
+        std::sort(ids.begin(), ids.end());
+    }
     struct Placed { int bus_grid; RlBus bus; RlBusState state; };
     std::vector<Placed> placed;
     for (size_t k = 0; k < rl0_->n_bus_q; ++k)
@@ -4134,7 +4194,7 @@ std::vector<DeviceFeature> outer_device_census(const ls2g::LSGrid& grid, const L
 DeviceTables Ls2gOuterModel::device_tables() const
 {
     DeviceTables t;
-    t.n_bus = n_bus_; t.n_gen = n_gen_; t.n_sto = n_sto_;
+    t.n_bus = n_bus_; t.n_gen = n_gen_; t.n_sto = n_sto_; t.n_load = n_load_;
     const auto& svcs = grid_->get_svcs();
     const auto& gens = grid_->get_generators();
     t.n_svc = svcs.nb();

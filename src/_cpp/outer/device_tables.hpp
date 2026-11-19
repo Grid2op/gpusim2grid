@@ -30,7 +30,7 @@ enum DeviceLoopKind : int {
 
 struct DeviceTables {
     // ---- sizes, driver parameters ----------------------------------------------------------
-    int n_bus = 0, n_gen = 0, n_sto = 0, n_svc = 0;
+    int n_bus = 0, n_gen = 0, n_sto = 0, n_svc = 0, n_load = 0;
     double sn = 1.;
     int slack_bus = -1;
     int max_outer_iterations = 0;

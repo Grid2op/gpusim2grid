@@ -20,6 +20,7 @@
 #include "device_outer_model.hpp"
 #include "../ledger_data.hpp"   // HVDC_STATUS_TRIPPED
 #include "../nvtx_range.hpp"
+#include "../cuda_utils.h"      // upload_h2d_grow
 #include "../contingency/slot_schedule.cuh"   // move_slot_rows_kernel
 
 #include <cuda_runtime.h>
@@ -34,6 +35,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <memory>
@@ -2032,6 +2034,14 @@ private:
     mutable std::vector<SlotControls> ctl_;
     mutable std::vector<RowResult> results_;
     mutable std::vector<char> fin_built_;
+    // the row pools (r_int_ ... r_rpos_) on the host, downloaded once after a decide() changed them:
+    // row_result / row_trafo_blocks of every row read them there (one copy per pool, not per row)
+    mutable std::vector<int> h_r_int_, h_r_sc_, h_r_pos_, h_r_rpos_;
+    mutable std::vector<double> h_r_f64_;
+    mutable bool rows_on_host_ = false;
+    void sync_rows_host() const;
+    const int* host_of(const int* dev) const;
+    const double* host_of(const double* dev) const;
     // staging
     thrust::device_vector<int> st_slots_, st_conv_, st_nr_, st_inner_, st_grow_, st_next_, st_status_;
     // load_rows' lists and staging, kept across calls (an allocation would sync the device)
@@ -2260,6 +2270,7 @@ void DeviceOuterModel::alloc_rows(int R)
     adj_.assign(keep_adj_ ? r : 0, RowResult());
     trace_.assign(t_.keep_trace ? r : 0, {});
     fin_built_.assign(r, 0);
+    rows_on_host_ = false;
 }
 
 void DeviceOuterModel::build_dev()
@@ -2362,7 +2373,11 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
         for (size_t k = r * w; k < (r + 1) * w; ++k) if (pred(m[k])) return true;
         return false;
     };
-    const size_t nl = ov.load_off.empty() || n == 0 ? 0 : ov.load_off.size() / std::max<size_t>(n, 1);
+    // the loads a row trips: TransformerVoltageControl freezes a bus at mis_bus - the row's own load Q
+    // (device_tvc_image's tv_load); nothing else reads them (DistributedSlack takes a row's loss
+    // through its lost_p_mw, counted below)
+    const size_t nl = static_cast<size_t>(t_.n_load);
+    const bool loads_matter = t_.has_tvc != 0;
     for (size_t r = 0; r < n; ++r) {
         bool changes = false;
         const bool has_mask = r < ov.masked.size() && !ov.masked[r].empty();
@@ -2375,9 +2390,7 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
         changes = changes || any_row(ov.gen_vm, r, ng, [](double v) { return !std::isnan(v); });
         changes = changes || any_row(ov.storage_off, r, ns, [](char c) { return c != 0; });
         changes = changes || any_row(ov.vc_v_set, r, ngr, [](double v) { return !std::isnan(v); });
-        // (load_off: only TransformerVoltageControl reads it, which the device refuses; DistributedSlack
-        // shares a row's loss only with its own lost_p_mw, counted above)
-        (void)nl;
+        changes = changes || (loads_matter && any_row(ov.load_off, r, nl, [](char c) { return c != 0; }));
         if (topo_dependent) {
             const bool opens = r < ov.branch_off.size() && !ov.branch_off[r].empty();
             changes = changes || opens || has_mask;
@@ -2533,18 +2546,26 @@ void DeviceOuterModel::fill_row(const DeviceSlotImage& img, HostRow& hr)
             if (!(a[k] == b[k] || (std::isnan(a[k]) && std::isnan(b[k])))) return false;
         return true;
     };
+    // The references are taken from the rows the templates are captured from (a plain row; a point's
+    // point_row), whose targets every copy shares; any other row keeps its own unless it equals its
+    // reference (a row loaded before its reference exists keeps its own)
+    const auto own_start = [&](const std::vector<double>* gen, const std::vector<double>* sto) {
+        if (gen == nullptr || !same(*gen, img.gen_target_p) || !same(*sto, img.sto_target_p))
+            row_base_[img.row] = std::make_pair(img.gen_target_p, img.sto_target_p);
+    };
     if (img.row < 0) {
     } else if (resumes(img.row)) {
         const int k = resume_of_row_[static_cast<size_t>(img.row)];
         auto it = point_base_.find(k);
-        if (it == point_base_.end()) point_base_.emplace(k, std::make_pair(img.gen_target_p, img.sto_target_p));
-        else if (!same(it->second.first, img.gen_target_p) || !same(it->second.second, img.sto_target_p))
-            row_base_[img.row] = std::make_pair(img.gen_target_p, img.sto_target_p);
-    } else if (!have_tmpl_) {
+        if (it == point_base_.end() && point_row(img.row))
+            point_base_.emplace(k, std::make_pair(img.gen_target_p, img.sto_target_p));
+        else if (it == point_base_.end()) own_start(nullptr, nullptr);
+        else own_start(&it->second.first, &it->second.second);
+    } else if (plain(img.row) && !have_tmpl_) {
         gen_tp_tmpl_ = img.gen_target_p; sto_tp_tmpl_ = img.sto_target_p; have_tmpl_ = true;
-    } else if (!same(gen_tp_tmpl_, img.gen_target_p) || !same(sto_tp_tmpl_, img.sto_target_p)) {
+    } else {
         // a row starting from its own targets (a generator it disconnects, ...): kept for its result
-        row_base_[img.row] = std::make_pair(img.gen_target_p, img.sto_target_p);
+        own_start(have_tmpl_ ? &gen_tp_tmpl_ : nullptr, have_tmpl_ ? &sto_tp_tmpl_ : nullptr);
     }
     hr.i.assign(w_int_, 0);
     hr.u.assign(w_u8_, 0);
@@ -2637,16 +2658,6 @@ void DeviceOuterModel::fill_row(const DeviceSlotImage& img, HostRow& hr)
     set_field(hr.f, I("ds_ini"), img.ds_initial);
     set_field(hr.u, I("hl_present"), img.hl_present);
     set_field(hr.i, I("hl_dir"), img.hl_frozen_dir);
-}
-
-// a persistent device buffer holding `v` (grown, never shrunk: an allocation would sync the device)
-// (pageable host memory: staged before the call returns, `v` may die after)
-template <typename T>
-void put_buf(thrust::device_vector<T>& d, const std::vector<T>& v, cudaStream_t st)
-{
-    if (v.empty()) return;
-    if (d.size() < v.size()) d.resize(v.size() + v.size() / 2 + 64);   // amortised (a resize fills and syncs)
-    check_cuda(cudaMemcpyAsync(raw(d), v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice, st), "upload");
 }
 
 // the template slot row into each listed slot, then each slot's own row index
@@ -2801,7 +2812,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
     if (!f_slots.empty()) {
         g2g_nvtx::Range nv("device load: phantom rows");
         const int nf = static_cast<int>(f_slots.size());
-        put_buf(ld_phantom_, f_slots, stream_);
+        upload_h2d_grow(ld_phantom_, f_slots.data(), f_slots.size(), stream_);   // pageable: staged, f_slots may die
         auto copy = [&](auto& pool, auto& tmpl, size_t w) {
             using T = typename std::remove_reference<decltype(pool)>::type::value_type;
             const size_t total = static_cast<size_t>(nf) * w;
@@ -2822,7 +2833,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         std::vector<int> pack(p_slots);
         pack.insert(pack.end(), p_rows.begin(), p_rows.end());
         for (int r : p_rows) pack.push_back(point_tmpl_.at(resume_of_row_[static_cast<size_t>(r)]).idx);
-        put_buf(ld_point_, pack, stream_);
+        upload_h2d_grow(ld_point_, pack.data(), pack.size(), stream_);
         const int* d_ps = raw(ld_point_);
         const int* d_pr = d_ps + np;
         const int* d_pi = d_pr + np;
@@ -2844,12 +2855,6 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
     if (!m_slots.empty()) {
         g2g_nvtx::Range nv("device load: masked rows from the template");
         const int nm = static_cast<int>(m_slots.size());
-        std::vector<int> mptr(1, 0), mbus;
-        for (int r : m_rows) {
-            const auto& m = masked_rows_[static_cast<size_t>(r)];
-            mbus.insert(mbus.end(), m.begin(), m.end());
-            mptr.push_back(static_cast<int>(mbus.size()));
-        }
         // the plain template's rows first, then those resuming from a point (their point's template)
         std::vector<int> order(static_cast<size_t>(nm));
         for (int k = 0; k < nm; ++k) order[static_cast<size_t>(k)] = k;
@@ -2857,7 +2862,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         std::vector<int> ms, mr, msrc;
         for (int k : order) { ms.push_back(m_slots[static_cast<size_t>(k)]); mr.push_back(m_rows[static_cast<size_t>(k)]); msrc.push_back(m_src[static_cast<size_t>(k)]); }
         m_slots = ms; m_rows = mr; m_src = msrc;
-        mptr.assign(1, 0); mbus.clear();
+        std::vector<int> mptr(1, 0), mbus;   // each row's masks, in that order
         for (int r : m_rows) {
             const auto& m = masked_rows_[static_cast<size_t>(r)];
             mbus.insert(mbus.end(), m.begin(), m.end());
@@ -2869,7 +2874,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         pack.insert(pack.end(), mptr.begin(), mptr.end());
         pack.insert(pack.end(), mbus.begin(), mbus.end());
         pack.insert(pack.end(), m_src.begin() + n_plain, m_src.end());
-        put_buf(ld_mask_, pack, stream_);
+        upload_h2d_grow(ld_mask_, pack.data(), pack.size(), stream_);
         const int* d_ms = raw(ld_mask_);
         const int* d_mr = d_ms + nm;
         const int* d_mptr = d_mr + nm;
@@ -2912,7 +2917,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         const int nt = static_cast<int>(t_slots.size());
         std::vector<int> tpack(t_slots);
         tpack.insert(tpack.end(), t_rows.begin(), t_rows.end());
-        put_buf(ld_tmpl_, tpack, stream_);
+        upload_h2d_grow(ld_tmpl_, tpack.data(), tpack.size(), stream_);
         const int* d_ts = raw(ld_tmpl_);
         const int* d_tr = d_ts + nt;
         auto copy = [&](auto& pool, auto& tmpl, size_t w) {
@@ -3018,10 +3023,10 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
             }
     }
     auto t_up = clk::now();
-    put_buf(ld_slots_, slots, stream_);
+    upload_h2d_grow(ld_slots_, slots.data(), slots.size(), stream_);
     const int* d_sl = raw(ld_slots_);
     const int np_up = static_cast<int>(up_pslot_.size());
-    if (np_up > 0) { put_buf(ld_up_ps_, up_pslot_, stream_); put_buf(ld_up_pi_, up_pidx_, stream_); }
+    if (np_up > 0) { upload_h2d_grow(ld_up_ps_, up_pslot_.data(), up_pslot_.size(), stream_); upload_h2d_grow(ld_up_pi_, up_pidx_.data(), up_pidx_.size(), stream_); }
     auto apply = [&](auto& pool, auto& base, auto& pt, size_t w, const std::vector<long long>& pos, const auto& val,
                      thrust::device_vector<long long>& d_pos, auto& d_val) {
         using T = typename std::remove_reference<decltype(pool)>::type::value_type;
@@ -3034,8 +3039,8 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
             indexed_rows_kernel<T><<<static_cast<unsigned>((static_cast<size_t>(np_up) * w + 255) / 256), 256, 0, stream_>>>(
                 raw(pool), raw(pt), raw(ld_up_ps_), raw(ld_up_pi_), np_up, w);
         if (pos.empty()) return;
-        put_buf(d_pos, pos, stream_);
-        put_buf(d_val, val, stream_);
+        upload_h2d_grow(d_pos, pos.data(), pos.size(), stream_);
+        upload_h2d_grow(d_val, val.data(), val.size(), stream_);
         const size_t m = pos.size();
         scatter_diffs_kernel<T><<<static_cast<unsigned>((m + 255) / 256), 256, 0, stream_>>>(
             raw(pool), raw(d_pos), raw(d_val), d_sl, m, w);
@@ -3200,6 +3205,7 @@ void DeviceOuterModel::check_errors(const std::vector<int>& slots) const
 Next DeviceOuterModel::on_solved(int slot, bool converged, int nr_iter, int inner_status, const SlotData* data,
                                  int& row_status)
 {
+    rows_on_host_ = false;
     // the gathered row, in the driver's oc_gather layout
     std::vector<double> g(static_cast<size_t>(stride_), 0.);
     if (converged && data != nullptr) {
@@ -3221,7 +3227,7 @@ Next DeviceOuterModel::on_solved(int slot, bool converged, int nr_iter, int inne
     st_nr_.assign(1, nr_iter);
     st_inner_.assign(1, inner_status);
     st_grow_.assign(1, 0);
-    put_buf(st_gather_, g, stream_);
+    upload_h2d_grow(st_gather_, g.data(), g.size(), stream_);
     st_next_.assign(1, 0);
     st_status_.assign(1, 0);
     decide(1, raw(st_slots_), raw(st_conv_), raw(st_nr_), raw(st_inner_), raw(st_grow_), raw(st_gather_), stride_,
@@ -3242,6 +3248,7 @@ void DeviceOuterModel::decide(int n, const int* d_slots, const int* d_conv, cons
                               void* stream)
 {
     if (n == 0) return;
+    rows_on_host_ = false;   // finished rows write their results
     on_solved_kernel<<<n, 128, 0, static_cast<cudaStream_t>(stream)>>>(
         dev_, d_slots, n, d_conv, d_nr, d_inner, d_grow, d_gather, stride, d_next, d_status);
     check_cuda(cudaGetLastError(), "decide");
@@ -3460,32 +3467,63 @@ void DeviceOuterModel::adjoint_of(const HostRow& hr, RowResult& out) const
     side_->device_adjoint_info(a, out);
 }
 
-// one element / n elements of a per-row device array
-template <typename T>
-T get1(const T* p, int i)
+void DeviceOuterModel::sync_rows_host() const
 {
-    T v;
-    check_cuda(cudaMemcpy(&v, p + i, sizeof(T), cudaMemcpyDeviceToHost), "download");
-    return v;
+    if (rows_on_host_) return;
+    auto down = [](const auto& d, auto& h) {
+        h.resize(d.size());
+        if (!h.empty())
+            check_cuda(cudaMemcpy(h.data(), thrust::raw_pointer_cast(d.data()), h.size() * sizeof(h[0]),
+                                  cudaMemcpyDeviceToHost), "download");
+    };
+    down(r_int_, h_r_int_);
+    down(r_f64_, h_r_f64_);
+    down(r_sc_, h_r_sc_);
+    down(r_pos_, h_r_pos_);
+    down(r_rpos_, h_r_rpos_);
+    rows_on_host_ = true;
 }
-template <typename T>
-std::vector<T> get(const T* p, int row, size_t width, size_t n)
+
+// the host mirror of a pointer into one of the row pools (Dev's r_* fields)
+const int* DeviceOuterModel::host_of(const int* dev) const
 {
-    std::vector<T> v(n);
-    if (n > 0)
-        check_cuda(cudaMemcpy(v.data(), p + static_cast<size_t>(row) * width, n * sizeof(T), cudaMemcpyDeviceToHost),
-                   "download");
-    return v;
+    sync_rows_host();
+    const std::pair<const thrust::device_vector<int>*, const std::vector<int>*> pools[] = {
+        {&r_int_, &h_r_int_}, {&r_sc_, &h_r_sc_}, {&r_pos_, &h_r_pos_}, {&r_rpos_, &h_r_rpos_}};
+    for (const auto& [d, h] : pools) {
+        const int* b = thrust::raw_pointer_cast(d->data());
+        if (std::less_equal<const int*>()(b, dev) && std::less<const int*>()(dev, b + d->size()))
+            return h->data() + (dev - b);
+    }
+    throw std::logic_error("device outer model: not a row pool");
 }
+
+const double* DeviceOuterModel::host_of(const double* dev) const
+{
+    sync_rows_host();
+    const double* b = thrust::raw_pointer_cast(r_f64_.data());
+    if (!(std::less_equal<const double*>()(b, dev) && std::less<const double*>()(dev, b + r_f64_.size())))
+        throw std::logic_error("device outer model: not a row pool");
+    return h_r_f64_.data() + (dev - b);
+}
+
+namespace {
+// n elements of row `row` of a per-row (host) array
+template <typename T>
+std::vector<T> row_of(const T* p, int row, size_t width, size_t n)
+{
+    return std::vector<T>(p + static_cast<size_t>(row) * width, p + static_cast<size_t>(row) * width + n);
+}
+}  // namespace
 
 void DeviceOuterModel::row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const
 {
     trafo.clear();
     block.clear();
     if (row < 0 || row >= n_rows_ || t_.n_bc == 0) return;
-    if (get1(dev_.r_status, row) < 0) return;   // never ran
-    const std::vector<int> pos = get(dev_.r_pos, row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
-    const std::vector<int> rpos = get(dev_.r_rpos, row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
+    if (host_of(dev_.r_status)[row] < 0) return;   // never ran
+    const std::vector<int> pos = row_of(host_of(dev_.r_pos), row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
+    const std::vector<int> rpos = row_of(host_of(dev_.r_rpos), row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
     side_->device_row_blocks(pos.data(), rpos.data(), trafo, block);
 }
 
@@ -3497,16 +3535,14 @@ const RowResult& DeviceOuterModel::row_result(int row) const
     fin_built_[r] = 1;
     res = RowResult();
     const Dev& d = dev_;
-    res.status = get1(d.r_status, row);
+    res.status = host_of(d.r_status)[row];
     if (res.status < 0) return res;   // never ran (not simulated): the default result
-    res.unrealistic = get1(d.r_unreal, row) != 0;
-    const int failed = get1(d.r_failed, row);
-    if (failed >= 0) {
-        static const char* names[] = {"DistributedSlack", "AcHvdcAcEmulationLimits", "VoltageMonitoring", "ReactiveLimits"};
-        res.failed_loop = names[t_.loop_kind[static_cast<size_t>(failed)]];
-    }
-    res.nb_outer_iterations = get1(d.r_outer, row);
-    res.nb_nr_iterations = get1(d.r_nr, row);
+    res.unrealistic = host_of(d.r_unreal)[row] != 0;
+    const int failed = host_of(d.r_failed)[row];
+    if (failed >= 0 && static_cast<size_t>(failed) < t_.loop_name.size())
+        res.failed_loop = t_.loop_name[static_cast<size_t>(failed)];   // the loop's own name, as the host's
+    res.nb_outer_iterations = host_of(d.r_outer)[row];
+    res.nb_nr_iterations = host_of(d.r_nr)[row];
     if (r < trace_.size()) res.decisions = trace_[r];
     if (r < adj_.size()) {
         const RowResult& a = adj_[r];
@@ -3527,7 +3563,7 @@ const RowResult& DeviceOuterModel::row_result(int row) const
         auto it = row_base_.find(row);
         if (it != row_base_.end()) { gen_tp = it->second.first; sto_tp = it->second.second; }
     }
-    const std::vector<double> units = get(d.r_unit_mw, row, static_cast<size_t>(std::max(n_units_, 1)), static_cast<size_t>(n_units_));
+    const std::vector<double> units = row_of(host_of(d.r_unit_mw), row, static_cast<size_t>(std::max(n_units_, 1)), static_cast<size_t>(n_units_));
     for (int k = 0; k < n_units_; ++k) {
         const size_t el = static_cast<size_t>(t_.ds_el_id[static_cast<size_t>(k)]);
         if (t_.ds_kind[static_cast<size_t>(k)] == 0) { if (el < gen_tp.size()) gen_tp[el] = units[static_cast<size_t>(k)]; }
@@ -3540,7 +3576,7 @@ const RowResult& DeviceOuterModel::row_result(int row) const
         if (!std::isnan(sto_tp[s])) { res.storage_ids.push_back(static_cast<int>(s)); res.storage_target_p_mw.push_back(sto_tp[s]); }
     // the section counts the loops left, where they differ from the grid's
     if (t_.n_sc_sh > 0) {
-        const std::vector<int> sc = get(d.r_sc, row, static_cast<size_t>(t_.n_sc_sh), static_cast<size_t>(t_.n_sc_sh));
+        const std::vector<int> sc = row_of(host_of(d.r_sc), row, static_cast<size_t>(t_.n_sc_sh), static_cast<size_t>(t_.n_sc_sh));
         for (int j = 0; j < t_.n_sc_sh; ++j) {
             const size_t jj = static_cast<size_t>(j);
             if (t_.sh_has[jj] && t_.sh_count0[jj] == sc[jj]) continue;
@@ -3550,8 +3586,8 @@ const RowResult& DeviceOuterModel::row_result(int row) const
     }
     // the taps the loops handled, where they differ from the grid's
     if (t_.n_bc > 0) {
-        const std::vector<int> pos = get(d.r_pos, row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
-        const std::vector<int> rpos = get(d.r_rpos, row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
+        const std::vector<int> pos = row_of(host_of(d.r_pos), row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
+        const std::vector<int> rpos = row_of(host_of(d.r_rpos), row, static_cast<size_t>(t_.n_bc), static_cast<size_t>(t_.n_bc));
         for (int e = 0; e < t_.n_bc; ++e) {
             const size_t ee = static_cast<size_t>(e);
             const int tr = t_.bc_trafo[ee];
@@ -3559,7 +3595,7 @@ const RowResult& DeviceOuterModel::row_result(int row) const
             if (t_.bc_ratio[ee] && !(t_.bc_has_rtc[ee] && t_.bc_rpos0[ee] == rpos[ee])) { res.ratio_tap_ids.push_back(tr); res.ratio_tap.push_back(rpos[ee]); }
         }
     }
-    const std::vector<int> hv = get(d.r_hvdc, row, static_cast<size_t>(std::max(t_.n_hvdc, 1)), static_cast<size_t>(t_.n_hvdc));
+    const std::vector<int> hv = row_of(host_of(d.r_hvdc), row, static_cast<size_t>(std::max(t_.n_hvdc, 1)), static_cast<size_t>(t_.n_hvdc));
     for (int e = 0; e < t_.n_hvdc; ++e)
         if (hv[static_cast<size_t>(e)] != 2) { res.hvdc_ids.push_back(t_.hvdc_id[static_cast<size_t>(e)]); res.hvdc_regime.push_back(hv[static_cast<size_t>(e)]); }
     return res;
@@ -3575,6 +3611,17 @@ std::string device_outer_error(int slot, int code)
                      : code == ERR_NO_PIN ? "a local controller bus without a reserved Vm column"
                      : code == ERR_TRACE_CAP ? "more decisions in one solve than the trace holds" : "an unknown error";
     return "device outer model, slot " + std::to_string(slot) + ": " + what;
+}
+
+void check_device_features(const std::vector<DeviceFeature>& features)
+{
+    std::string missing;
+    for (const DeviceFeature& f : features) {
+        if (f.count <= 0 || f.supported) continue;
+        if (!missing.empty()) missing += "; ";
+        missing += f.name + " (" + std::to_string(f.count) + ")";
+    }
+    if (!missing.empty()) throw DeviceNotImplemented(missing);
 }
 
 std::shared_ptr<OuterHook> make_device_outer_model_from(std::shared_ptr<OuterHook> host, DeviceHostSide* side)

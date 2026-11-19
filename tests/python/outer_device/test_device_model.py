@@ -87,15 +87,22 @@ def _assert_same_result(host: Any, dev: Any, where: str) -> None:
 
 
 def _lockstep(
-    make_grid: Callable[..., Any], tol_mva: float = cpu.TOL_MVA, resume: bool = False, **row_kwargs: Any
+    make_grid: Callable[..., Any],
+    tol_mva: float = cpu.TOL_MVA,
+    resume: bool = False,
+    overrides: dict[str, Any] | None = None,
+    **row_kwargs: Any,
 ) -> Any:
     """Every outer iteration of one row, host and device side by side (see the module docstring);
-    returns the host's row result."""
+    returns the host's row result. ``overrides``: the row's RowOverrides (``set_row_overrides``
+    keywords), what the row's grid (``make_grid(**row_kwargs)``) changes for the loops."""
     base = make_grid()
     assert base.ac_pf(np.full(base.total_bus(), 1.0 + 0j), cpu.MAX_IT, tol_mva).size > 0
     host = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=resume)
     dev = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=resume, backend="device")
     for h in (host, dev):
+        if overrides:
+            h.set_row_overrides(**overrides)
         h.begin(1, 1)
     row = make_grid(**row_kwargs)
     # lightsim2grid's own solve of the row builds its solver data (Ybus, Sbus) as the host test does
@@ -152,6 +159,70 @@ def _lockstep(
             _assert_same_result(res, dev.row_result(0), "\n".join(res.decisions))
             return res
     raise AssertionError("the row never ended")
+
+
+
+def _case14_two_regulated_busbars(move: bool = False, load_scale: float = 1.0) -> Any:
+    """case14 with a second generator in generator 1's substation, on its second busbar (with one
+    line end), regulating the same voltage: both busbars are controller buses of the grid's
+    ReactiveLimits plan. ``move``: that generator moved onto busbar 1 (a re-merge: the bus generator
+    1 holds gains a generator). Only generator 0 and the slack share the slack."""
+    import warnings
+
+    import pandapower as pp
+    import pandapower.networks as pn
+    from lightsim2grid.network import init_from_pandapower
+
+    net = pn.case14()
+    net.gen["min_q_mvar"] = -15.0
+    net.gen["max_q_mvar"] = 15.0
+    net.load["p_mw"] *= load_scale
+    n_sub = len(net.bus)
+    for b in range(n_sub):
+        pp.create_bus(net, vn_kv=net.bus.vn_kv.iloc[b], in_service=False)
+    sub = int(net.gen.bus.iloc[1])
+    net.bus.loc[n_sub + sub, "in_service"] = True
+    vm_pu = float(net.gen.vm_pu.iloc[1])
+    pp.create_gen(net, n_sub + sub, p_mw=10.0, vm_pu=vm_pu, min_q_mvar=-5.0, max_q_mvar=5.0)
+    line = int(net.line.index[(net.line.from_bus == sub) | (net.line.to_bus == sub)][0])
+    end = "from_bus" if int(net.line.from_bus.loc[line]) == sub else "to_bus"
+    net.line.loc[line, end] = n_sub + sub
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        g = init_from_pandapower(net, n_sub=n_sub, n_busbar_per_sub=2)
+    n_gen = len(g.get_generators())
+    g.set_gen_p_limits(np.zeros(n_gen), np.full(n_gen, 300.0))
+    participates = [gen.id == 0 or gen.is_slack for gen in g.get_generators()]
+    g.set_gen_can_participate_slack(participates, np.full(n_gen, 300.0))
+    if move:
+        g.change_bus_gen(_merged_gen(g), sub)
+    g.change_algorithm(cpu.OUTER)
+    g.tell_solver_need_reset()
+    return g
+
+
+def _merged_gen(g: Any) -> int:
+    """the generator standing on a second busbar"""
+    return next(int(x.id) for x in g.get_generators() if int(x.bus_id) >= g.get_n_sub())
+
+
+@pytest.mark.parametrize("load_scale", [1.0, 1.15])
+def test_generator_moved_onto_a_regulated_bus(load_scale: float):
+    """a row moving a generator onto a bus the grid's ReactiveLimits plan already has (generator 1's,
+    a re-merge; the facades refuse it, the model takes it as RowOverrides::gen_bus): its plan bus has
+    one more generator than the grid's. The device tables carry it, off on the rows not moving it
+    there, instead of refusing the row at its load"""
+    base = _case14_two_regulated_busbars()
+    assert base.ac_pf(np.full(base.total_bus(), 1.0 + 0j), cpu.MAX_IT, cpu.TOL_MVA).size > 0
+    gen = _merged_gen(base)
+    sub = int(base.get_generators()[gen].bus_id) - base.get_n_sub()
+    to_solver = np.asarray(base.id_me_to_ac_solver(), dtype=int)
+    _lockstep(
+        _case14_two_regulated_busbars,
+        overrides=dict(gen_bus=[[(gen, int(to_solver[sub]))]]),
+        move=True,
+        load_scale=load_scale,
+    )
 
 
 # ---- DistributedSlack and ReactiveLimits on local buses ----------------------------------------
@@ -235,7 +306,7 @@ def test_row_masking_a_voltage_controlled_bus(load_scale: float):
     host = _cpp._OuterModelHarness(base, keep_trace=True)
     dev = _cpp._OuterModelHarness(base, keep_trace=True, backend="device")
     for h in (host, dev):
-        h.set_branch_off([[len(base.get_lines()) + trafo]], masked=[[masked]])
+        h.set_row_overrides([[len(base.get_lines()) + trafo]], masked=[[masked]])
         h.begin(1, 1)
     row = cpu._case14(distributed=False, load_scale=load_scale, extra_load=extra_load)
     row.deactivate_trafo(trafo)

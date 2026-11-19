@@ -35,6 +35,19 @@ struct DeviceNotImplemented : std::logic_error {
                            ". Use outer_loops_backend='host'.") {}
 };
 
+// One feature of a grid's outer loops, as the model sees it (docs/outer_loops_on_device.md,
+// §4.2): how many of it the grid has (0: none) and whether outer_loops_backend='device'
+// implements it. A feature the grid has and the device does not implement refuses 'device'.
+struct DeviceFeature {
+    std::string name;
+    int count = 0;
+    bool supported = false;
+};
+
+// Throws DeviceNotImplemented naming every feature the grid has (count > 0) and the device does not
+// implement, with its count; nothing when there is none.
+void check_device_features(const std::vector<DeviceFeature>& features);
+
 // The batched entry points (docs/outer_loops_on_device.md, M3): what the driver calls instead of the
 // per-slot OuterHook ones when its hook is a device model. Device pointers; `stream` a cudaStream_t.
 class DeviceOuterHook {

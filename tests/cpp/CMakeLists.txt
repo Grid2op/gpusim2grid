@@ -7,6 +7,7 @@
 # One executable per source, named after the file; sources may sit in a topic folder.
 set(_g2g_cpp_tests
     test_v_groups_host test_v_groups_gather test_union_pattern test_connectivity_moves
+    outer_device/test_device_features
     own_lu/test_fused_solve)
 foreach(_src ${_g2g_cpp_tests})
     get_filename_component(_t ${_src} NAME)

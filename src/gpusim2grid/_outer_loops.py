@@ -58,8 +58,9 @@ class OuterLoopsBackend(str, Enum):
 
 
 def _resolve_outer_loops_backend(backend, outer_loops):
-    """``outer_loops_backend`` (a member or its string) checked against ``outer_loops``, as the
-    member."""
+    """``outer_loops_backend`` (a member or its string) checked against ``outer_loops`` and the
+    build, as the member. A grid the device does not run yet is refused by the session itself
+    (``NotImplementedError``, the census of the model it builds, whole batch)."""
     try:
         backend = OuterLoopsBackend(backend)
     except ValueError:
@@ -67,20 +68,10 @@ def _resolve_outer_loops_backend(backend, outer_loops):
                          f"got {backend!r}") from None
     if backend is OuterLoopsBackend.DEVICE and not outer_loops:
         raise ValueError("outer_loops_backend='device' needs outer_loops=True")
+    if backend is OuterLoopsBackend.DEVICE and _cpp.is_fp32:
+        raise ValueError("outer_loops_backend='device' needs an FP64 build (the device model works in "
+                         "double); this one is FP32. Use outer_loops_backend='host'.")
     return backend
-
-
-def _check_outer_loops_device(grid, resume_from_n):
-    """Raise ``NotImplementedError`` when ``outer_loops_backend='device'`` cannot run this grid:
-    every feature of its outer loops the device backend does not implement yet
-    (``_outer_device_census``). Nothing is run partly on the host: the whole batch is refused,
-    before any GPU work."""
-    census = _cpp._outer_device_census(grid, bool(resume_from_n))
-    missing = [f"{name} ({count})" for name, count, supported in census if count > 0 and not supported]
-    if missing:
-        raise NotImplementedError(
-            "outer_loops_backend='device' does not implement yet: " + "; ".join(missing)
-            + ". Use outer_loops_backend='host'.")
 
 
 def outer_device_census(grid, init_from_n_powerflow=False):

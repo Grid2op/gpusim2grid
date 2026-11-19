@@ -39,7 +39,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
+from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _resolve_outer_loops_backend
 from ._reactive_limits import ReactiveLimitsStatus
 from ..actions import current_buses, element_substations
 from ._strategies import (BranchY, ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, TrafoScratch, UnionPlan,
@@ -423,8 +423,6 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
                                     compute_physical_violations=compute_physical_violations,
                                     reactive_limits_outer_loop=reactive_limits_outer_loop)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
-        if self._outer_loops_backend is OuterLoopsBackend.DEVICE:
-            _check_outer_loops_device(grid, init_from_n_powerflow)
         # the second pass of reactive_limits_outer_loop is a ScenarioSweepGPU
         # built (lazily) from the same grid with the same construction options
         self._rl_ctor_kwargs = dict(

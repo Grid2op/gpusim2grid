@@ -164,13 +164,13 @@ unchanged, for the tests and as a reference.
 The goal is full coverage, so there is no fallback path: anything the device path does not
 implement yet stops the run.
 
-- **At construction**, a feature scan (`outer::device_support(grid, ledger, options)`, host, reading
-  what `Ls2gOuterModel`'s constructor already reads) lists every feature the run may need: the loops,
+- **At construction**, a feature scan (`Ls2gOuterModel::census()`, on the host model the device model
+  wraps, built once; `outer_device_census` for the caller) lists every feature the run may need: the loops,
   voltage-control groups and remote regulators, held controllers, SVC entries in the ReactiveLimits
   plan, standby monitors, capability curves, `NROuterDist_*`, resumed frozen buses, masked rows,
   units disconnected or `gen_v` set by rows, the host-only options (`keep_outer_trace`,
   `keep_final_jacobian`, `keep_row_points` / `set_row_resume`, spare buses). With `'device'`, the
-  session raises `NotImplementedError` naming every missing feature, before any GPU work.
+  session's factory raises `NotImplementedError` naming every missing feature (`check_device_features`).
 - **Row inputs set after construction** (`set_row_overrides`, the rows' targets) are scanned again at
   `run()`, before the first round.
 - **On the device**, each kernel keeps an error flag for any case the scan should have refused. It is

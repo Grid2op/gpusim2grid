@@ -6,7 +6,8 @@
 the feature census that refuses ``'device'`` with ``NotImplementedError`` for the whole batch
 while a feature is not ported (docs/outer_loops_on_device.md, §4.1-4.2).
 
-The census and the refusals run before any GPU work: only the GPU-run tests need a device."""
+The census and the argument refusals need no GPU; a grid the device does not run is refused by the
+session (check_device_features, tests/cpp/outer_device/test_device_features.cu)."""
 
 from __future__ import annotations
 
@@ -134,27 +135,29 @@ def test_census_marks_what_the_device_runs(grid: Any, grid_all_loops: Any):
         assert counts[f"loop {loop}"] == 1
 
 
+@requires_gpu
 @pytest.mark.parametrize("facade", range(3))
-def test_device_refuses_the_whole_batch_naming_what_is_missing(
+def test_device_builds_the_outer_model_once(grid: Any, facade: int, monkeypatch: pytest.MonkeyPatch):
+    """the refusal reads the census off the model the session builds (make_device_outer_model):
+    no separate census, which would build the whole host model (grid copy, plans) a second time.
+    The refusal itself: tests/cpp/outer_device/test_device_features.cu"""
+
+    def census(*args: Any) -> list[Any]:
+        raise AssertionError("a separate census builds the host model a second time")
+
+    monkeypatch.setattr(_cpp, "_outer_device_census", census)
+    _facades()[facade](grid, outer_loops=True, outer_loops_backend="device", precision=PREC)
+
+
+@pytest.mark.parametrize("facade", range(3))
+def test_device_refuses_an_fp32_build_at_construction(
     grid: Any, facade: int, monkeypatch: pytest.MonkeyPatch
 ):
-    """a feature the census marks unsupported refuses the whole batch at construction, naming it
-    (none is left today: the census is patched to report one)"""
-    import gpusim2grid._outer_loops as ol
-
-    real = ol._cpp._outer_device_census
-
-    def census(g: Any, resume: bool) -> list[Any]:
-        return [*real(g, resume), ("a feature to come", 2, False)]
-
-    monkeypatch.setattr(ol._cpp, "_outer_device_census", census)
-    with pytest.raises(NotImplementedError) as err:
-        _facades()[facade](grid, outer_loops=True, outer_loops_backend="device", precision=PREC)
-    msg = str(err.value)
-    assert "a feature to come (2)" in msg
-    assert "outer_loops_backend='host'" in msg
-    # what the device runs is not listed
-    assert "loop ReactiveLimits" not in msg
+    """the device model works in double: an FP32 build refuses 'device' at construction (a
+    ValueError), not with a RuntimeError at the first compute()"""
+    monkeypatch.setattr(_cpp, "is_fp32", True)
+    with pytest.raises(ValueError, match="outer_loops_backend='device'.*FP64"):
+        _facades()[facade](grid, outer_loops=True, outer_loops_backend="device", precision=None)
 
 
 @requires_gpu

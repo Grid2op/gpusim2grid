@@ -32,7 +32,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
+from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _resolve_outer_loops_backend
 
 __all__ = ["InjectionSweepGPU"]
 
@@ -242,8 +242,6 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
-        if self._outer_loops_backend is OuterLoopsBackend.DEVICE:
-            _check_outer_loops_device(grid, init_from_n_powerflow)
 
         # Single source of truth, resolved once here and applied at
         # construction time to BOTH the base-case solve and the batch solver

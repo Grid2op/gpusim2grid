@@ -53,7 +53,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _check_outer_loops_device, _resolve_outer_loops_backend
+from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _resolve_outer_loops_backend
 from ..contingency_analysis._violation_threshold import ViolationThresholdFacadeMixin
 
 __all__ = ["ScenarioSweepGPU"]
@@ -248,8 +248,6 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations)
         self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
-        if self._outer_loops_backend is OuterLoopsBackend.DEVICE:
-            _check_outer_loops_device(grid, init_from_n_powerflow)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
