@@ -15,11 +15,11 @@ from typing import Any
 
 import numpy as np
 import pytest
-from _outer_device_helpers import MAX_IT, OUTER, TOL_MVA, needs_outer_loops
+from _outer_device_helpers import MAX_IT, OUTER, TOL_MVA, needs_fp64, needs_outer_loops
 
 from conftest import requires_gpu
 
-pytestmark = [needs_outer_loops, requires_gpu]
+pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "topology_actions"))
 

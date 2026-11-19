@@ -20,13 +20,13 @@ from typing import Any
 import numpy as np
 import pytest
 import test_outer_model_cpu as cpu
-from _outer_device_helpers import needs_outer_loops
+from _outer_device_helpers import needs_fp64, needs_outer_loops
 
 import gpusim2grid._gpusim2grid as _cpp
 
 from conftest import requires_gpu
 
-pytestmark = [needs_outer_loops, requires_gpu]
+pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
 #: controls compared to rounding: sums of the same terms, maybe in another order
 ATOL: float = 1e-12

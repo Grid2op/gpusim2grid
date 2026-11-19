@@ -18,11 +18,11 @@ from typing import Any
 
 import numpy as np
 import pytest
-from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_outer_loops
+from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_fp64, needs_outer_loops
 
 from conftest import requires_gpu
 
-pytestmark = [needs_outer_loops, requires_gpu]
+pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
 VTOL: float = 1e-9
 

@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_outer_loops
+from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_fp64, needs_outer_loops
 
 import gpusim2grid._gpusim2grid as _cpp
 
@@ -86,6 +86,7 @@ def test_backend_is_a_string_enum():
 
 
 @requires_gpu
+@needs_fp64
 @pytest.mark.parametrize("facade", range(3))
 @pytest.mark.parametrize("backend", ["device", "DEVICE_MEMBER"])
 def test_backend_takes_the_enum_or_its_string(grid_all_loops: Any, facade: int, backend: str):
@@ -136,6 +137,7 @@ def test_census_marks_what_the_device_runs(grid: Any, grid_all_loops: Any):
 
 
 @requires_gpu
+@needs_fp64
 @pytest.mark.parametrize("facade", range(3))
 def test_device_builds_the_outer_model_once(grid: Any, facade: int, monkeypatch: pytest.MonkeyPatch):
     """the refusal reads the census off the model the session builds (make_device_outer_model):
@@ -161,6 +163,7 @@ def test_device_refuses_an_fp32_build_at_construction(
 
 
 @requires_gpu
+@needs_fp64
 @pytest.mark.parametrize("facade", range(3))
 def test_device_runs_every_loop(grid_all_loops: Any, facade: int):
     _facades()[facade](grid_all_loops, outer_loops=True, outer_loops_backend="device", precision=PREC)
@@ -176,6 +179,7 @@ def test_host_is_the_default(grid: Any, facade: int):
 
 
 @requires_gpu
+@needs_fp64
 def test_host_backend_is_todays_path(grid: Any):
     from gpusim2grid import ContingencyAnalysisGPU
 

@@ -14,7 +14,7 @@ import pytest
 
 import gpusim2grid._gpusim2grid as _cpp
 
-__all__ = ["MAX_IT", "OUTER", "TOL_MVA", "case14_outer", "needs_outer_loops"]
+__all__ = ["MAX_IT", "OUTER", "TOL_MVA", "case14_outer", "needs_fp64", "needs_outer_loops"]
 
 OUTER: str = "NROuter_KLU"
 MAX_IT: int = 30
@@ -25,6 +25,12 @@ needs_outer_loops = pytest.mark.skipif(
     not getattr(_cpp, "have_ls2g_outer_loops", False),
     reason="gpusim2grid built without the bridge or against a lightsim2grid without NROuter_*",
 )
+
+#: ``outer_loops_backend='device'`` works in double: an FP32 build refuses it at construction
+#: (``_resolve_outer_loops_backend``), and the host-vs-device parity bounds (``TOL_MVA``, V to
+#: rounding) are FP64 ones. Every test that runs the device backend, or compares to that rounding,
+#: carries it; ``test_backend_option.py`` keeps its refusal tests running on FP32 builds.
+needs_fp64 = pytest.mark.skipif(bool(_cpp.is_fp32), reason="outer_loops_backend='device' needs an FP64 build")
 
 
 def case14_outer(q_limit: float = 15.0, distributed: bool = True) -> Any:
