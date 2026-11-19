@@ -24,12 +24,11 @@ from _outer_device_helpers import needs_fp64, needs_outer_loops
 
 import gpusim2grid._gpusim2grid as _cpp
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
 #: controls compared to rounding: sums of the same terms, maybe in another order
-ATOL: float = 1e-12
 
 
 def _sparse(bus: list[int], *vals: list[float]) -> dict[int, tuple[float, ...]]:
@@ -53,7 +52,7 @@ def _assert_same_controls(host: dict[str, Any], dev: dict[str, Any], where: str)
         h, d = np.asarray(host[key], dtype=float), np.asarray(dev[key], dtype=float)
         assert h.shape == d.shape, f"{where}: controls[{key!r}] shape"
         np.testing.assert_allclose(
-            d, h, rtol=0, atol=ATOL, equal_nan=True, err_msg=f"{where}: controls[{key!r}]"
+            d, h, rtol=0, atol=parity_tol("lockstep"), equal_nan=True, err_msg=f"{where}: controls[{key!r}]"
         )
     for bus, vals in (("sbus_bus", ("sbus_dp", "sbus_dq")), ("vm_reset_bus", ("vm_reset_vm",))):
         h = _sparse(host[bus], *(host[v] for v in vals))
@@ -61,7 +60,7 @@ def _assert_same_controls(host: dict[str, Any], dev: dict[str, Any], where: str)
         assert sorted(d) == sorted(h), f"{where}: controls[{bus!r}]"
         for b, hv in h.items():
             np.testing.assert_allclose(
-                d[b], hv, rtol=0, atol=ATOL, err_msg=f"{where}: controls[{bus!r}] at {b}"
+                d[b], hv, rtol=0, atol=parity_tol("lockstep"), err_msg=f"{where}: controls[{bus!r}] at {b}"
             )
 
 
@@ -82,8 +81,9 @@ def _assert_same_result(host: Any, dev: Any, where: str) -> None:
     assert sorted(dev.ratio_tap) == sorted(host.ratio_tap), f"{where}: row_result.ratio_tap"
     h, d = dict(host.gen_target_p), dict(dev.gen_target_p)
     assert sorted(d) == sorted(h), f"{where}: row_result.gen_target_p ids"
+    mw_tol = parity_tol("lockstep_mw")
     for g, mw in h.items():
-        assert d[g] == pytest.approx(mw, rel=0, abs=1e-9), f"{where}: row_result.gen_target_p[{g}]"
+        assert d[g] == pytest.approx(mw, rel=0, abs=mw_tol), f"{where}: row_result.gen_target_p[{g}]"
 
 
 def _lockstep(
@@ -159,7 +159,6 @@ def _lockstep(
             _assert_same_result(res, dev.row_result(0), "\n".join(res.decisions))
             return res
     raise AssertionError("the row never ended")
-
 
 
 def _case14_two_regulated_busbars(move: bool = False, load_scale: float = 1.0) -> Any:

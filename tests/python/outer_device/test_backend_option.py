@@ -19,7 +19,7 @@ from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_fp64, nee
 
 import gpusim2grid._gpusim2grid as _cpp
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops]
 
@@ -199,4 +199,6 @@ def test_host_backend_is_todays_path(grid: Any):
     assert converged.sum() >= n_rows - 1
     # two sessions reproduce to rounding (batched GPU reductions), never bit for bit; a row
     # out of its iteration budget keeps whatever its last iterate was
-    np.testing.assert_allclose(v_host[converged], v_default[converged], rtol=0, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(
+        v_host[converged], v_default[converged], rtol=0, atol=parity_tol("lockstep"), equal_nan=True
+    )

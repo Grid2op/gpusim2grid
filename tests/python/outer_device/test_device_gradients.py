@@ -16,11 +16,9 @@ import numpy as np
 import pytest
 from _outer_device_helpers import needs_fp64, needs_outer_loops
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
-
-GTOL: float = 1e-8
 
 
 TOL_MVA: float = 1e-8
@@ -112,7 +110,7 @@ def _same_adjoint_rows(
         dev.V_results.to_numpy().reshape(n, -1)[conv],
         host.V_results.to_numpy().reshape(n, -1)[conv],
         rtol=0,
-        atol=1e-9,
+        atol=parity_tol("state"),
     )
     return res_h
 
@@ -129,7 +127,10 @@ def _compare_results(res_h: list[Any], res_d: list[Any]) -> None:
         assert list(rd.gen_p_fixed) == list(rh.gen_p_fixed), f"row {k}: gen_p_fixed"
         assert [(g, r) for g, r, _ in rd.gen_p_slope] == [(g, r) for g, r, _ in rh.gen_p_slope], f"row {k}"
         np.testing.assert_allclose(
-            [c for _, _, c in rd.gen_p_slope], [c for _, _, c in rh.gen_p_slope], rtol=0, atol=1e-12
+            [c for _, _, c in rd.gen_p_slope],
+            [c for _, _, c in rh.gen_p_slope],
+            rtol=0,
+            atol=parity_tol("lockstep"),
         )
 
 
@@ -206,9 +207,9 @@ def _same_gradients(grid: Any, inputs: dict[str, np.ndarray], **call: Any) -> li
     V_d, g_d = og._grads(dev, inputs, **call)
     res_h, res_d = host.sweep.get_outer_results(), dev.sweep.get_outer_results()
     _compare_results(res_h, res_d)
-    torch.testing.assert_close(V_d, V_h, rtol=0, atol=1e-10, equal_nan=True)
+    torch.testing.assert_close(V_d, V_h, rtol=0, atol=parity_tol("state"), equal_nan=True)
     for name in g_h:
-        np.testing.assert_allclose(g_d[name], g_h[name], rtol=0, atol=GTOL, err_msg=name)
+        np.testing.assert_allclose(g_d[name], g_h[name], rtol=0, atol=parity_tol("gradient"), err_msg=name)
     return res_h
 
 

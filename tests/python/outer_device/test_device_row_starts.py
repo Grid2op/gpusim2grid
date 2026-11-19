@@ -20,21 +20,19 @@ import numpy as np
 import pytest
 from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_fp64, needs_outer_loops
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
-VTOL: float = 1e-9
 
-
-def _same_rows(host: Any, dev: Any, n_rows: int, gen_tol: float = 1e-6) -> None:
+def _same_rows(host: Any, dev: Any, n_rows: int) -> None:
     """status, iterations, decisions, every generator's target and the converged voltages"""
     st_h, st_d = np.asarray(host.get_row_status()), np.asarray(dev.get_row_status())
     np.testing.assert_array_equal(st_d, st_h)
     conv = st_h == 0
     v_h = host.V_results.to_numpy().reshape(n_rows, -1)
     v_d = dev.V_results.to_numpy().reshape(n_rows, -1)
-    np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=VTOL, equal_nan=True)
+    np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=parity_tol("state"), equal_nan=True)
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
         where = f"row {k}"
         assert (rd.status, rd.nb_outer_iterations, rd.nb_nr_iterations) == (
@@ -47,7 +45,7 @@ def _same_rows(host: Any, dev: Any, n_rows: int, gen_tol: float = 1e-6) -> None:
         h, d = dict(rh.gen_target_p), dict(rd.gen_target_p)
         assert sorted(d) == sorted(h), f"{where}: generators with a target"
         for g, mw in h.items():
-            assert d[g] == pytest.approx(mw, rel=0, abs=gen_tol), f"{where}, generator {g}"
+            assert d[g] == pytest.approx(mw, rel=0, abs=parity_tol("mw")), f"{where}, generator {g}"
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])

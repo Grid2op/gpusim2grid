@@ -17,14 +17,13 @@ import numpy as np
 import pytest
 from _outer_device_helpers import MAX_IT, OUTER, TOL_MVA, needs_fp64, needs_outer_loops
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "topology_actions"))
 
 SPLIT_CONTINGENCIES: list[list[int]] = [[], [3], [6]]
-VTOL: float = 1e-9
 
 
 @pytest.fixture(scope="module")
@@ -90,7 +89,7 @@ def _same_strategies(
         dev.V_results.to_numpy().reshape(n, -1)[conv],
         host.V_results.to_numpy().reshape(n, -1)[conv],
         rtol=0,
-        atol=VTOL,
+        atol=parity_tol("state"),
         equal_nan=True,
     )
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
@@ -143,7 +142,7 @@ def test_moved_slack_participants_device_equals_host(grid: Any):
             th, td = dict(rows_h[k].gen_target_p), dict(rows_d[k].gen_target_p)
             assert td.keys() == th.keys(), f"row {k}"
             for g, mw in th.items():
-                assert td[g] == pytest.approx(mw, rel=0, abs=1e-6), f"row {k}, generator {g}"
+                assert td[g] == pytest.approx(mw, rel=0, abs=parity_tol("mw")), f"row {k}, generator {g}"
             shared += gen in th
     # the loop did move the moved generators (else this compares nothing the bug touches)
     assert shared > 0

@@ -79,7 +79,16 @@ pytest tests/python/test_contingency_batch.py     # one file
 pytest tests/python/ -m "not slow"                 # skip >10s tests
 ```
 
-Tests **require a CUDA GPU and the installed extension** — `conftest.py` defines a `requires_gpu` skip marker. Reference values come from lightsim2grid (KLU CPU solver, `ContingencyAnalysisCPP`). Tolerances are precision-aware via the `solver_atol` / `residual_atol` fixtures (`1e-4` FP32, `1e-6` FP64) — never hardcode tolerances in new tests. The shared IEEE 14-bus grid and its solved base case are session-scoped fixtures.
+Tests **require a CUDA GPU and the installed extension** — `conftest.py` defines a `requires_gpu` skip marker. Reference values come from lightsim2grid (KLU CPU solver, `ContingencyAnalysisCPP`). The shared IEEE 14-bus grid and its solved base case are session-scoped fixtures.
+
+**Tolerances: never a bare number in a new test** (no `atol=1e-9`, no module-level `VTOL`). Pick the family by what is compared, all from `conftest.py`:
+
+- **Against a reference solved by another solver** (lightsim2grid's KLU, a numpy Newton): what the NR tolerance leaves. Use the `solver_atol` / `residual_atol` fixtures (`1e-4` FP32, `1e-6` FP64).
+- **Two paths of the same algorithm** (`outer_loops_backend='host'` vs `'device'`, a fused vs unfused kernel, two sessions): they differ by rounding only (reduction order, FMA, the GPU's libm), which Newton amplifies by J's conditioning, so they are compared far tighter. Use `parity_tol(kind)`, one value per kind of quantity, in `PARITY_TOL_FP64` with why: `lockstep` 1e-12 (the same arithmetic in the same order), `lockstep_mw` 1e-9 MW, `state` 1e-9 (converged V in pu / rad, and relatively what is computed from it), `mw` 1e-6 MW (targets the loops moved), `gradient` 1e-8. They are FP64 bounds: `parity_tol` raises in an FP32 build, so such a test skips FP32 (`needs_fp64`, `tests/python/outer_device/_outer_device_helpers.py`) and calls it inside the test, never at import. A new kind goes into that table with its reason.
+- **What must be identical** (statuses, iteration counts, a decision's text, kernels pinned bit for bit): `assert_array_equal` / `==`, no tolerance.
+- **A number parsed back from text** keeps the digits it was printed with (`std::ostream`'s default 6 significant digits: `rtol=1e-5`). Use a named constant next to the parser that says so (`TRACE_PRINT_RTOL`).
+
+A solve's own tolerance (`tol`, `TOL_MVA`, `tol_mva=`) is an input, not a comparison bound.
 
 ## CI
 

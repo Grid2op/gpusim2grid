@@ -17,12 +17,14 @@ import numpy as np
 import pytest
 from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_fp64, needs_outer_loops
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
 N_ROWS: int = 8
-VTOL: float = 1e-9
+#: a decision's value and limit are read back from its text, printed with std::ostream's default
+#: 6 significant digits: they agree to that, not to rounding
+TRACE_PRINT_RTOL: float = 1e-5
 
 
 @pytest.fixture(scope="module")
@@ -36,14 +38,15 @@ def _same_rows(host: Any, dev: Any, n_rows: int) -> None:
     conv = st_h == 0
     v_h = host.V_results.to_numpy().reshape(n_rows, -1)
     v_d = dev.V_results.to_numpy().reshape(n_rows, -1)
-    np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=VTOL, equal_nan=True)
+    np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=parity_tol("state"), equal_nan=True)
+    mw_tol = parity_tol("mw")
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
         assert rd.status == rh.status, f"row {k}"
         assert rd.nb_outer_iterations == rh.nb_outer_iterations, f"row {k}"
         assert rd.nb_nr_iterations == rh.nb_nr_iterations, f"row {k}"
         assert dict(rd.gen_target_p).keys() == dict(rh.gen_target_p).keys(), f"row {k}"
         for g, mw in dict(rh.gen_target_p).items():
-            assert dict(rd.gen_target_p)[g] == pytest.approx(mw, rel=0, abs=1e-6), f"row {k}, generator {g}"
+            assert dict(rd.gen_target_p)[g] == pytest.approx(mw, rel=0, abs=mw_tol), f"row {k}, generator {g}"
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
@@ -503,7 +506,11 @@ def _same_decisions(host: list[str], dev: list[str], where: str) -> None:
         assert md.group(1) == mh.group(1), f"{where}: {d} != {h}"
         for j in (2, 3):
             np.testing.assert_allclose(
-                float(md.group(j)), float(mh.group(j)), rtol=1e-5, atol=1e-9, err_msg=f"{where}: {d} != {h}"
+                float(md.group(j)),
+                float(mh.group(j)),
+                rtol=TRACE_PRINT_RTOL,
+                atol=parity_tol("state"),
+                err_msg=f"{where}: {d} != {h}",
             )
 
 
@@ -582,7 +589,8 @@ def test_phase_control(mode: str, init_from_n: bool):
     for name in ("or_amps", "ex_amps"):
         f_h = getattr(host, name).to_numpy().reshape(n_br, -1)[conv]
         f_d = getattr(dev, name).to_numpy().reshape(n_br, -1)[conv]
-        np.testing.assert_allclose(f_d, f_h, rtol=1e-9, atol=1e-9, equal_nan=True, err_msg=name)
+        tol = parity_tol("state")
+        np.testing.assert_allclose(f_d, f_h, rtol=tol, atol=tol, equal_nan=True, err_msg=name)
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
@@ -632,4 +640,5 @@ def test_transformer_voltage_control(grid_kw: dict[str, Any], init_from_n: bool)
     for name in ("or_amps", "ex_amps"):
         f_h = getattr(host, name).to_numpy().reshape(n_br, -1)[conv]
         f_d = getattr(dev, name).to_numpy().reshape(n_br, -1)[conv]
-        np.testing.assert_allclose(f_d, f_h, rtol=1e-9, atol=1e-9, equal_nan=True, err_msg=name)
+        tol = parity_tol("state")
+        np.testing.assert_allclose(f_d, f_h, rtol=tol, atol=tol, equal_nan=True, err_msg=name)

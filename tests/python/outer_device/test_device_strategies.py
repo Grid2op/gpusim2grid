@@ -17,7 +17,7 @@ from _outer_device_helpers import MAX_IT, TOL_MVA, case14_outer, needs_fp64, nee
 
 from gpusim2grid.actions import Action
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
@@ -26,7 +26,6 @@ ACTIONS: list[Action] = [
     Action(load_bus={2: -1}),  # a load shed
     Action(line_bus1={13: -1}, line_bus2={13: -1}),  # a line opened
 ]
-VTOL: float = 1e-9
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +64,7 @@ def test_strategies_device_equals_host(grid: Any, warm: bool):
     conv = st_h == 0
     v_h = host.V_results.to_numpy().reshape(n_rows, -1)
     v_d = dev.V_results.to_numpy().reshape(n_rows, -1)
-    np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=VTOL, equal_nan=True)
+    np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=parity_tol("state"), equal_nan=True)
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
         assert (rd.status, rd.nb_outer_iterations, rd.nb_nr_iterations) == (
             rh.status,
@@ -87,7 +86,7 @@ def test_a_strategy_tripping_a_generator(grid: Any):
         dev.V_results.to_numpy().reshape(n_rows, -1)[conv],
         host.V_results.to_numpy().reshape(n_rows, -1)[conv],
         rtol=0,
-        atol=VTOL,
+        atol=parity_tol("state"),
         equal_nan=True,
     )
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
@@ -122,7 +121,7 @@ def test_strategies_on_a_dist_newton():
         dev.V_results.to_numpy().reshape(n_rows, -1)[conv],
         host.V_results.to_numpy().reshape(n_rows, -1)[conv],
         rtol=0,
-        atol=VTOL,
+        atol=parity_tol("state"),
     )
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
         assert (rd.status, rd.nb_outer_iterations, rd.nb_nr_iterations) == (
