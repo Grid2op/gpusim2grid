@@ -2414,8 +2414,9 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
 }
 
 // a masked row loads from the template unless the mask touches what the template's load decided
-// from the whole grid: DistributedSlack left without a unit off the slack bus (the loop goes out),
-// a bus it froze or reset (a resumed frozen bus the row's plan no longer has)
+// from the whole grid: DistributedSlack left without a unit off the slack bus or ReactiveLimits
+// without a bus (the loop goes out), a bus it froze or reset (a resumed frozen bus the row's plan
+// no longer has)
 int DeviceOuterModel::mask_source(int row) const
 {
     if (row < 0 || own_targets(row) || static_cast<size_t>(row) >= mask_only_.size() || !mask_only_[static_cast<size_t>(row)])
@@ -2448,6 +2449,20 @@ int DeviceOuterModel::mask_source(int row) const
             off_slack = !is_masked(b) && b != t_.slack_bus;
         }
         if (!off_slack) return -2;
+    }
+    // ReactiveLimits needed by the template but not by the row: the row's plan is the grid's without
+    // its masked buses (rl_plan_masked), the monitors kept, and set_active drops the loop when that
+    // leaves nothing -- and with it moves the robust mode's last_fixing. A row whose masks cover every
+    // bus_q entry the template has, on a grid without monitors, loads through the host
+    const size_t rl_pres = field_of_.at("rl_present").off;
+    for (size_t k = 0; k < n_act; ++k) {
+        if (t_.loop_kind[static_cast<size_t>(ti[act + k])] != DL_REACTIVE_LIMITS) continue;
+        bool needed = t_.rl_has_monitor != 0 || t_.rl_n > t_.rl_n_bus_q;
+        for (int e = 0; e < t_.rl_n_bus_q && !needed; ++e) {
+            const int b = t_.rl_bus[static_cast<size_t>(e)];
+            needed = tu[rl_pres + static_cast<size_t>(e)] && (b < 0 || !is_masked(b));
+        }
+        if (!needed) return -2;
     }
     const size_t fset = field_of_.at("fset").off;
     for (int ci = 0; ci < nc_; ++ci)

@@ -196,6 +196,92 @@ def test_template_load_equals_the_host_load(grid: Any, init_from_n: bool, monkey
     _same_rows(run("host"), run("device"), n_br)
 
 
+#: a 5-bus grid whose slack does not regulate (its |V| is free) and whose only regulator stands on
+#: a leaf bus behind line 5: the only ReactiveLimits bus, which that line's contingency islands
+LEAF_LINES: list[tuple[int, int]] = [(0, 1), (1, 2), (2, 3), (3, 0), (1, 3), (2, 4)]
+LEAF_LOADS: list[tuple[int, float, float]] = [(1, 20.0, 2.0), (2, 25.0, 3.0), (3, 15.0, 1.0)]
+# (bus, p_mw, vm_pu, q_mvar, voltage_regulator_on, min_q, max_q)
+LEAF_GENS: list[tuple[int, float, float, float, bool, float, float]] = [
+    (0, 0.0, 1.0, 0.0, False, -500.0, 500.0),
+    (4, 30.0, 1.02, 0.0, True, -10.0, 10.0),
+]
+
+
+def _regulator_on_a_leaf() -> Any:
+    from lightsim2grid.lightsim2grid_cpp import LSGrid
+
+    grid = LSGrid()
+    grid.set_sn_mva(100.0)
+    grid.set_init_vm_pu(1.0)
+    n_bus = 5
+    grid.init_bus(n_bus, 1, np.full(n_bus, 138.0), 0, 0)
+    grid.init_powerlines(
+        np.full(len(LEAF_LINES), 0.01),
+        np.full(len(LEAF_LINES), 0.08),
+        np.full(len(LEAF_LINES), 0.02j),
+        np.array([a for a, _ in LEAF_LINES]),
+        np.array([b for _, b in LEAF_LINES]),
+    )
+    grid.init_loads(
+        np.array([ld[1] for ld in LEAF_LOADS]),
+        np.array([ld[2] for ld in LEAF_LOADS]),
+        np.array([ld[0] for ld in LEAF_LOADS]),
+    )
+    gens = LEAF_GENS
+    grid.init_generators_full(
+        np.array([g[1] for g in gens]),
+        np.array([g[2] for g in gens]),
+        np.array([g[3] for g in gens]),
+        [g[4] for g in gens],
+        np.array([g[5] for g in gens]),
+        np.array([g[6] for g in gens]),
+        np.array([g[0] for g in gens]),
+    )
+    grid.add_gen_slackbus(0, 1.0)
+    grid.change_algorithm("NROuter_KLU")
+    grid.tell_solver_need_reset()
+    assert grid.ac_pf(np.full(n_bus, 1.0 + 0j), MAX_IT, TOL_MVA).size > 0
+    return grid
+
+
+def test_masks_leaving_reactive_limits_without_a_bus(monkeypatch: pytest.MonkeyPatch):
+    """the contingency of line 5 islands the leaf bus, the grid's only ReactiveLimits bus: the host
+    load drops the loop from the row's active ones (set_active, its masked plan empty). The device
+    copied the row from the plain template, ReactiveLimits still active (and the robust mode's
+    last_fixing with it); in check mode that copy differs from the host load in its field active"""
+    from gpusim2grid import ContingencyAnalysisGPU, outer_device_census
+
+    grid = _regulator_on_a_leaf()
+    counts = {name: count for name, count, _ in outer_device_census(grid)}
+    assert counts["ReactiveLimits local controller buses"] == 1
+    assert counts["loop ReactiveLimits"] == 1
+    n_br = len(LEAF_LINES)
+    leaf_line, leaf_bus = n_br - 1, 4
+    monkeypatch.setenv("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE", "1")
+
+    def run(backend: str) -> Any:
+        ca = ContingencyAnalysisGPU(
+            grid,
+            outer_loops=True,
+            nb_iter=MAX_IT,
+            tol=TOL_MVA / grid.get_sn_mva(),
+            handle_disconnected_grid=True,
+            outer_loops_backend=backend,
+        )
+        ca.add_contingencies_by_branch_id([[i] for i in range(n_br)])
+        ca.compute(batch_size=4)
+        return ca
+
+    host, dev = run("host"), run("device")
+    _same_rows(host, dev, n_br)
+    # the leaf row ran, its leaf bus masked (else the template copy was never tried)
+    status = np.asarray(host.get_row_status())
+    assert status[leaf_line] == 0, status
+    v = host.V_results.to_numpy().reshape(n_br, -1)
+    solver_bus = int(np.asarray(grid.id_me_to_ac_solver())[leaf_bus])
+    assert np.isnan(v[leaf_line, solver_bus]) and np.isfinite(np.delete(v[leaf_line], solver_bus)).all()
+
+
 @pytest.mark.parametrize("qmax", [(100.0, 3.0, 3.0), (40.0, 100.0, 100.0)])
 def test_generator_contingencies_on_a_voltage_control_group(qmax: tuple[float, ...]):
     """every generator tripped in turn, on a grid where three of them hold a remote bus together:
