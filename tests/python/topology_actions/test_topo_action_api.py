@@ -200,10 +200,8 @@ def test_set_actions_reads_and_copies_the_grid_a_fixed_number_of_times(monkeypat
     from _topo_helpers import make_ca
 
     grid = case14()
-    ca = make_ca(grid, {})
-    ca.add_contingencies_by_branch_id([[]])
-    calls: dict[str, int] = {"walks": 0, "copies": 0}
     ends, deepcopy = actions_mod._element_ends, copy.deepcopy
+    calls: dict[str, int] = {}
 
     def counted_ends(g: LSGrid):
         calls["walks"] += 1
@@ -215,8 +213,20 @@ def test_set_actions_reads_and_copies_the_grid_a_fixed_number_of_times(monkeypat
 
     monkeypatch.setattr(actions_mod, "_element_ends", counted_ends)
     monkeypatch.setattr(copy, "deepcopy", counted_deepcopy)
-    actions = [Action(trafo_shift_deg={0: float(d)}) for d in range(1, 11)]
-    actions += [Action(line_bus1={0: 0}), Action(load_bus={0: bus2(grid, grid.get_loads()[0].sub_id)})] * 5
-    ca.set_actions(actions)
-    assert calls["walks"] <= 2
-    assert calls["copies"] <= 1
+
+    def counts(repeat: int) -> dict[str, int]:
+        ca = make_ca(grid, {})
+        ca.add_contingencies_by_branch_id([[]])
+        calls.update(walks=0, copies=0)
+        actions = [Action(trafo_shift_deg={0: float(d)}) for d in range(1, 1 + 2 * repeat)]
+        load_move = Action(load_bus={0: bus2(grid, grid.get_loads()[0].sub_id)})
+        actions += [Action(line_bus1={0: 0}), load_move] * repeat
+        ca.set_actions(actions)
+        return dict(calls)
+
+    few, many = counts(1), counts(5)
+    # both are counted (a walk, and the one copy the transformer actions need): else the patches
+    # missed the calls and the bounds below hold for nothing
+    assert few["walks"] >= 1 and few["copies"] == 1, few
+    assert many == few, (few, many)
+    assert many["walks"] <= 2

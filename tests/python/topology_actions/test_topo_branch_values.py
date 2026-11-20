@@ -79,7 +79,8 @@ def test_compiled_values_match_a_fresh_copy_per_action():
     ca.add_contingencies_by_branch_id([[]])
     ca.set_actions(actions)
     n_lines = len(grid.get_lines())
-    for a, got in zip(actions, ca._compiled):
+    assert len(ca._compiled) == len(actions)
+    for a, got in zip(actions, ca._compiled, strict=True):
         want = compile_action(grid, a, n_lines)
         assert got.branch_y == want.branch_y
         assert got.base_y == want.base_y
