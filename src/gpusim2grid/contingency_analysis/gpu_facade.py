@@ -1040,6 +1040,8 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         condition) is released by it as it finishes (the session's feed, continuous schedule)."""
         # the rows are millions of small Python objects, all alive until handed to the session:
         # the cyclic collector would walk them again and again for nothing
+        # NOTE (RalfC) : we could modify how the actions are handled to avoid pausing the GC ...
+        # Would add a lot of lines though so maybe later
         with gc_paused():
             stream: bool = self._push_strategy_rows(batch_size)
         self._inner.run()
