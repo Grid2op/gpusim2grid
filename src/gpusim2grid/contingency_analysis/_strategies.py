@@ -17,10 +17,12 @@ then strategies), the others NaN."""
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import enum
-from collections.abc import Callable, Iterable, Sequence
+import gc
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -69,6 +71,7 @@ __all__ = [
     "StrategyRow",
     "TrafoScratch",
     "compile_action",
+    "gc_paused",
     "strategy_row",
 ]
 
@@ -258,6 +261,20 @@ def _shunt_admittance(grid: LSGrid, shunt: int) -> complex:
     against lightsim2grid's Ybus with and without the shunt in test_topo_bus_moves.py)."""
     sh = grid.get_shunts()[shunt]
     return complex(float(sh.target_p_mw), -float(sh.target_q_mvar)) / float(grid.get_sn_mva())
+
+
+@contextlib.contextmanager
+def gc_paused() -> Iterator[None]:
+    """Python's cyclic garbage collector off for the block (back as it was after it). Building a
+    batch's rows allocates millions of small objects that all stay alive until the session takes
+    them: every collection pass would walk them again (a fifth of the setup of 36k strategy rows)."""
+    was_on: bool = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_on:
+            gc.enable()
 
 
 def _y(branch: Any) -> BranchY:

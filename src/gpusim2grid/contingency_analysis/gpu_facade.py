@@ -43,7 +43,7 @@ from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _resolve_
 from ._reactive_limits import ReactiveLimitsStatus
 from ..actions import current_buses, element_substations
 from ._strategies import (BranchY, ResultRows, RowBranch, RowMap, StrategyCondition, TopologyContext, TrafoScratch, UnionPlan,
-                          compile_action, plan_union,
+                          compile_action, gc_paused, plan_union,
                           strategy_row, topology_context)
 from ._violation_threshold import ViolationThresholdFacadeMixin
 
@@ -1038,6 +1038,19 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
         """Run the contingency rows and the supported strategy rows through the session in one
         run; map them back. A strategy that depends on its contingency (the warm start, a
         condition) is released by it as it finishes (the session's feed, continuous schedule)."""
+        # the rows are millions of small Python objects, all alive until handed to the session:
+        # the cyclic collector would walk them again and again for nothing
+        with gc_paused():
+            stream: bool = self._push_strategy_rows(batch_size)
+        self._inner.run()
+        self._last_residuals = self._inner.residuals
+        if stream:   # a strategy whose contingency failed the condition did not run
+            self._rowmap.released = np.asarray(self._inner._s.streamed_rows, dtype=bool)
+        return self.V_results
+
+    def _push_strategy_rows(self, batch_size: int) -> bool:
+        """Hand the session the contingency rows and the supported strategy rows (``_compute_rows``);
+        True when the strategies are streamed (released by their contingency)."""
         if self._reactive_limits_outer_loop:
             raise NotImplementedError("strategies with reactive_limits_outer_loop (deprecated): "
                                       "use outer_loops=True")
@@ -1126,11 +1139,7 @@ class ContingencyAnalysisGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacad
             session.set_streaming(session_parent, self._strategy_condition.code, self._strategy_warm_start)
         else:
             session.clear_streaming()
-        self._inner.run()
-        self._last_residuals = self._inner.residuals
-        if stream:   # a strategy whose contingency failed the condition did not run
-            self._rowmap.released = np.asarray(session.streamed_rows, dtype=bool)
-        return self.V_results
+        return stream
 
     def _prepare_union(self, n_lines: int) -> TopologyContext | None:
         """The union pattern of every registered strategy's bus moves, set on the session when it
