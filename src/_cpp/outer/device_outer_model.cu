@@ -2385,6 +2385,14 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
         for (size_t k = r * w; k < (r + 1) * w; ++k) if (pred(m[k])) return true;
         return false;
     };
+    // a row of a 0 / 1 mask with something set: an OR over the row, no branch per entry (the
+    // masks are dense, one row per generator / load of the grid: thousands of bytes per row)
+    auto any_set = [](const std::vector<char>& m, size_t r, size_t w) {
+        if (w == 0 || (r + 1) * w > m.size()) return false;
+        unsigned char acc = 0;
+        for (size_t k = r * w; k < (r + 1) * w; ++k) acc |= static_cast<unsigned char>(m[k]);
+        return acc != 0;
+    };
     // the loads a row trips: TransformerVoltageControl freezes a bus at mis_bus - the row's own load Q
     // (device_tvc_image's tv_load); nothing else reads them (DistributedSlack takes a row's loss
     // through its lost_p_mw, counted below)
@@ -2398,11 +2406,11 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
         changes = changes || (r < ov.hvdc_off.size() && !ov.hvdc_off[r].empty());
         changes = changes || (r < ov.gen_bus.size() && !ov.gen_bus[r].empty());
         changes = changes || (r < ov.lost_p_mw.size() && !std::isnan(ov.lost_p_mw[r]));
-        changes = changes || any_row(ov.gen_off, r, ng, [](char c) { return c != 0; });
+        changes = changes || any_set(ov.gen_off, r, ng);
         changes = changes || any_row(ov.gen_vm, r, ng, [](double v) { return !std::isnan(v); });
-        changes = changes || any_row(ov.storage_off, r, ns, [](char c) { return c != 0; });
+        changes = changes || any_set(ov.storage_off, r, ns);
         changes = changes || any_row(ov.vc_v_set, r, ngr, [](double v) { return !std::isnan(v); });
-        changes = changes || (loads_matter && any_row(ov.load_off, r, nl, [](char c) { return c != 0; }));
+        changes = changes || (loads_matter && any_set(ov.load_off, r, nl));
         if (topo_dependent) {
             const bool opens = r < ov.branch_off.size() && !ov.branch_off[r].empty();
             changes = changes || opens || has_mask;
