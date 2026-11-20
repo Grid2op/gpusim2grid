@@ -140,9 +140,10 @@ def test_census_marks_what_the_device_runs(grid: Any, grid_all_loops: Any):
 @needs_fp64
 @pytest.mark.parametrize("facade", range(3))
 def test_device_builds_the_outer_model_once(grid: Any, facade: int, monkeypatch: pytest.MonkeyPatch):
-    """the refusal reads the census off the model the session builds (make_device_outer_model):
-    no separate census, which would build the whole host model (grid copy, plans) a second time.
-    The refusal itself: tests/cpp/outer_device/test_device_features.cu"""
+    """the facades call no census of their own (_outer_device_census, which builds a whole host
+    model -- grid copy, plans -- a second time): the session's refusal reads it off the model it
+    builds (make_device_outer_model). Checked here on the Python side only; the refusal itself:
+    tests/cpp/outer_device/test_device_features.cu"""
 
     def census(*args: Any) -> list[Any]:
         raise AssertionError("a separate census builds the host model a second time")
@@ -166,7 +167,33 @@ def test_device_refuses_an_fp32_build_at_construction(
 @needs_fp64
 @pytest.mark.parametrize("facade", range(3))
 def test_device_runs_every_loop(grid_all_loops: Any, facade: int):
-    _facades()[facade](grid_all_loops, outer_loops=True, outer_loops_backend="device", precision=PREC)
+    """a row of each facade solved on the device with all seven loops declared (none has an element
+    to act on): accepted at construction, and the row converges with its loops stable"""
+    from gpusim2grid import RowStatus
+
+    g = grid_all_loops
+    obj = _facades()[facade](
+        g,
+        outer_loops=True,
+        nb_iter=MAX_IT,
+        tol=TOL_MVA / g.get_sn_mva(),
+        scheduling="continuous",
+        outer_loops_backend="device",
+        precision=PREC,
+    )
+    if facade == 0:
+        obj.add_contingencies_by_branch_id([[]])
+    else:
+        load_q = np.array([ld.target_q_mvar for ld in g.get_loads()], dtype=float)
+        obj.set_injections_from_elements(
+            np.asarray(g.get_load_target_p())[None, :],
+            load_q[None, :],
+            np.asarray(g.get_gen_target_p())[None, :],
+        )
+    obj.compute(batch_size=1)
+    assert int(obj.get_row_status()[0]) == RowStatus.CONVERGED
+    (res,) = obj.get_outer_results()
+    assert res.status == 0, res.decisions  # OuterLoopStatus STABLE
 
 
 @requires_gpu

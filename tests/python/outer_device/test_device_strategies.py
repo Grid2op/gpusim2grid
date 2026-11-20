@@ -33,7 +33,10 @@ def grid() -> Any:
     return case14_outer()
 
 
-def _run(grid: Any, backend: str, actions: list[Action], warm: bool = True) -> Any:
+N_CTG: int = len(CONTINGENCIES)
+
+
+def _run(grid: Any, backend: str, actions: list[Action], warm: bool = True, trace: bool = False) -> Any:
     from gpusim2grid import ContingencyAnalysisGPU
 
     ca = ContingencyAnalysisGPU(
@@ -44,6 +47,7 @@ def _run(grid: Any, backend: str, actions: list[Action], warm: bool = True) -> A
         init_from_n_powerflow=False,
         scheduling="continuous",
         strategy_warm_start=warm,
+        keep_outer_trace=trace,
         outer_loops_backend=backend,
     )
     ca.tail_max_groups, ca.tail_group_size = 4, 1
@@ -62,6 +66,7 @@ def test_strategies_device_equals_host(grid: Any, warm: bool):
     n_rows = st_h.size
     assert n_rows == len(CONTINGENCIES) * (1 + len(ACTIONS))
     conv = st_h == 0
+    assert conv[N_CTG:].any(), f"no strategy row converged: nothing compared ({st_h})"
     v_h = host.V_results.to_numpy().reshape(n_rows, -1)
     v_d = dev.V_results.to_numpy().reshape(n_rows, -1)
     np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=parity_tol("state"), equal_nan=True)
@@ -82,6 +87,7 @@ def test_a_strategy_tripping_a_generator(grid: Any):
     np.testing.assert_array_equal(np.asarray(dev.get_row_status()), st_h)
     n_rows = st_h.size
     conv = st_h == 0
+    assert conv[N_CTG:].any(), f"no strategy row converged: nothing compared ({st_h})"
     np.testing.assert_allclose(
         dev.V_results.to_numpy().reshape(n_rows, -1)[conv],
         host.V_results.to_numpy().reshape(n_rows, -1)[conv],
@@ -99,11 +105,16 @@ def test_a_strategy_tripping_a_generator(grid: Any):
 
 def test_strategy_rows_from_their_point_template(grid: Any, monkeypatch: pytest.MonkeyPatch):
     """a strategy row is a device copy of its point's template (the first strategy row of that
-    contingency, loaded through the host model); in check mode every one is also loaded through
+    contingency, loaded through the host model): only those, the phantom row and the first plain
+    contingency row are set up by the host model. In check mode every one is also loaded through
     the host and compared field by field (the device model throws on a difference)"""
+    monkeypatch.delenv("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE", raising=False)
+    copied = _run(grid, "device", ACTIONS)
+    assert copied.timings.n_oc_host_loads <= 2 + N_CTG, copied.timings.n_oc_host_loads
     monkeypatch.setenv("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE", "1")
     host, dev = _run(grid, "host", ACTIONS), _run(grid, "device", ACTIONS)
     np.testing.assert_array_equal(np.asarray(dev.get_row_status()), np.asarray(host.get_row_status()))
+    np.testing.assert_array_equal(np.asarray(copied.get_row_status()), np.asarray(host.get_row_status()))
 
 
 def test_strategies_on_a_dist_newton():
@@ -112,7 +123,10 @@ def test_strategies_on_a_dist_newton():
 
     grid = cpu._case14_dist()
     assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
-    host, dev = _run(grid, "host", ACTIONS), _run(grid, "device", ACTIONS)
+    host, dev = _run(grid, "host", ACTIONS, trace=True), _run(grid, "device", ACTIONS, trace=True)
+    # a contingency did leave a unit parked for its strategies to resume with
+    res_ctg = host.get_outer_results()[:N_CTG]
+    assert any(" PARK," in d for r in res_ctg for d in r.decisions), [r.decisions for r in res_ctg]
     st_h = np.asarray(host.get_row_status())
     np.testing.assert_array_equal(np.asarray(dev.get_row_status()), st_h)
     conv = st_h == 0
@@ -139,6 +153,8 @@ def test_strategies_on_shunt_voltage_control():
     assert grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, 1e-10).size > 0
     host, dev = _run(grid, "host", ACTIONS), _run(grid, "device", ACTIONS)
     np.testing.assert_array_equal(np.asarray(dev.get_row_status()), np.asarray(host.get_row_status()))
+    # a contingency did leave sections of its own for its strategies to resume with
+    assert any(r.shunt_sections for r in host.get_outer_results()[:N_CTG])
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
         assert (rd.status, rd.nb_outer_iterations, rd.nb_nr_iterations) == (
             rh.status,
@@ -161,6 +177,9 @@ def test_strategies_on_tap_changers(which: str):
     assert grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, 1e-10).size > 0
     host, dev = _run(grid, "host", ACTIONS), _run(grid, "device", ACTIONS)
     np.testing.assert_array_equal(np.asarray(dev.get_row_status()), np.asarray(host.get_row_status()))
+    # a contingency did leave taps of its own for its strategies to resume with
+    taps = "phase_tap" if which == "phase" else "ratio_tap"
+    assert any(getattr(r, taps) for r in host.get_outer_results()[:N_CTG])
     for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
         assert (rd.status, rd.nb_outer_iterations, rd.nb_nr_iterations) == (
             rh.status,

@@ -85,6 +85,8 @@ def _same_strategies(
     np.testing.assert_array_equal(np.asarray(dev.get_row_status()), st_h)
     n = st_h.size
     conv = st_h == 0
+    # strategy rows ran (a strategy the batch leaves out, NOT_SIMULATED on both backends, compares nothing)
+    assert conv[len(contingencies) :].any(), st_h
     np.testing.assert_allclose(
         dev.V_results.to_numpy().reshape(n, -1)[conv],
         host.V_results.to_numpy().reshape(n, -1)[conv],
@@ -110,7 +112,8 @@ def test_bus_splits_device_equals_host(grid: Any, warm: bool):
     """branches moved to a spare bus (the session's buses grow: set_spare_buses)"""
     from test_topo_outer_warm_start import _splits
 
-    _same_strategies(grid, _splits(grid), warm)
+    host, dev = _same_strategies(grid, _splits(grid), warm)
+    assert host.n_spare_buses > 0 and dev.n_spare_buses == host.n_spare_buses
 
 
 def test_generator_moves_device_equals_host():
@@ -197,7 +200,13 @@ def test_strategies_of_an_islanding_contingency_are_copied_on_the_device(grid: A
     leaf = [n_lines + t.id for t in grid.get_trafos() if 7 in (t.bus1_id, t.bus2_id)]
     assert len(leaf) == 1
     ctgs = [[], [3], leaf]
-    _, dev = _same_strategies(grid, _splits(grid), True, handle_disconnected_grid=True, contingencies=ctgs)
+    actions = _splits(grid)
+    host, dev = _same_strategies(grid, actions, True, handle_disconnected_grid=True, contingencies=ctgs)
+    # the islanding contingency's row and each of its strategies' mask bus 7 (NaN there)
+    v = host.V_results.to_numpy().reshape(len(ctgs) * (1 + len(actions)), -1)
+    leaf_bus = int(np.asarray(grid.id_me_to_ac_solver())[7])
+    rows = [2] + [len(ctgs) + 2 * len(actions) + a for a in range(len(actions))]
+    assert np.isnan(v[rows, leaf_bus]).all(), v[rows, leaf_bus]
     if os.environ.get("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE"):
         pytest.skip("the check mode loads the rows through the host on purpose (to compare)")
     assert dev.timings.n_oc_host_loads <= 2 + len(ctgs), dev.timings.n_oc_host_loads

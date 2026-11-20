@@ -29,7 +29,10 @@ from conftest import parity_tol, requires_gpu
 
 pytestmark = [needs_outer_loops, needs_fp64, requires_gpu]
 
-#: controls compared to rounding: sums of the same terms, maybe in another order
+
+def _actions(res: Any, loop: str, action: str) -> list[str]:
+    """the row's decisions taken by `loop` with `action` (a decision not taken ends "(not taken)")"""
+    return [d for d in res.decisions if d.startswith(f"{loop} #") and f" {action}," in d]
 
 
 def _sparse(bus: list[int], *vals: list[float]) -> dict[int, tuple[float, ...]]:
@@ -92,11 +95,13 @@ def _lockstep(
     tol_mva: float = cpu.TOL_MVA,
     resume: bool = False,
     overrides: dict[str, Any] | None = None,
+    controls_log: list[dict[str, Any]] | None = None,
     **row_kwargs: Any,
 ) -> Any:
     """Every outer iteration of one row, host and device side by side (see the module docstring);
     returns the host's row result. ``overrides``: the row's RowOverrides (``set_row_overrides``
-    keywords), what the row's grid (``make_grid(**row_kwargs)``) changes for the loops."""
+    keywords), what the row's grid (``make_grid(**row_kwargs)``) changes for the loops.
+    ``controls_log``: the host's controls of every outer iteration appended to it."""
     base = make_grid()
     assert base.ac_pf(np.full(base.total_bus(), 1.0 + 0j), cpu.MAX_IT, tol_mva).size > 0
     host = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=resume)
@@ -124,6 +129,8 @@ def _lockstep(
         c = host.controls(0)
         where = f"outer iteration {it}\n" + "\n".join(host.row_result(0).decisions)
         _assert_same_controls(c, dev.controls(0), where)
+        if controls_log is not None:
+            controls_log.append(c)
         sbus = sbus_row.copy()
         for b, dp, dq in zip(c["sbus_bus"], c["sbus_dp"], c["sbus_dq"], strict=True):
             sbus[b] += dp + 1j * dq
@@ -264,12 +271,15 @@ def test_ample_limits_nothing_acts():
 @pytest.mark.parametrize("load_scale", [1.0, 1.1, 1.3])
 def test_case14_short_of_reactive_power(load_scale: float):
     """DistributedSlack shares what the row changes, ReactiveLimits switches local buses PQ"""
-    _lockstep(lambda **kw: cpu._case14(**kw), load_scale=load_scale)
+    res = _lockstep(lambda **kw: cpu._case14(**kw), load_scale=load_scale)
+    assert _actions(res, "DistributedSlack", "UNITS_MOVED"), res.decisions
+    assert _actions(res, "ReactiveLimits", "PV_TO_PQ"), res.decisions
 
 
 @pytest.mark.parametrize("load_scale", [1.0, 1.05])
 def test_ieee300_reactive_limits(load_scale: float):
-    _lockstep(lambda **kw: cpu._ieee300(**kw), load_scale=load_scale)
+    res = _lockstep(lambda **kw: cpu._ieee300(**kw), load_scale=load_scale)
+    assert _actions(res, "ReactiveLimits", "PV_TO_PQ"), res.decisions
 
 
 # ---- the other loops and the group buses -------------------------------------------------------
@@ -277,19 +287,29 @@ def test_ieee300_reactive_limits(load_scale: float):
 
 @pytest.mark.parametrize("kwargs", [{}, {"p0": -60.0, "pmax12": 300.0, "pmax21": 20.0}])
 def test_hvdc_ac_emulation_limits(kwargs: dict[str, float]):
-    _lockstep(lambda **kw: cpu._case14_hvdc(**{**kwargs, **kw}))
+    res = _lockstep(lambda **kw: cpu._case14_hvdc(**{**kwargs, **kw}))
+    assert _actions(res, "AcHvdcAcEmulationLimits", "SATURATE"), res.decisions
 
 
 @pytest.mark.parametrize("low_pu, high_pu", [(0.90, 1.00), (1.10, 1.20)])
 def test_voltage_monitoring(low_pu: float, high_pu: float):
-    _lockstep(lambda: cpu._ieee14_standby_svc(low_pu, high_pu), tol_mva=1e-10)
+    res = _lockstep(lambda: cpu._ieee14_standby_svc(low_pu, high_pu), tol_mva=1e-10)
+    assert _actions(res, "VoltageMonitoring", "SWITCH_ON"), res.decisions
 
 
 @pytest.mark.parametrize(
-    "regulators, qmax", [(("B6-G", "B8-G"), (100.0, 3.0)), (("B3-G", "B6-G", "B8-G"), (100.0, 3.0, 3.0))]
+    "regulators, qmax",
+    [
+        (("B6-G", "B8-G"), (10.0, 10.0)),  # the whole group frozen
+        (("B3-G", "B6-G", "B8-G"), (10.0, 3.0, 100.0)),
+        (("B3-G", "B6-G", "B8-G"), (100.0, 3.0, 3.0)),
+    ],
 )
 def test_reactive_limits_on_a_voltage_control_group(regulators: tuple[str, ...], qmax: tuple[float, ...]):
-    _lockstep(lambda **kw: cpu._ieee14_remote_group(qmax, regulators, **kw), tol_mva=1e-10, scale=1.05)
+    """ReactiveLimits freezing controllers of a voltage-control group (B6-G, B8-G at (100, 3) froze
+    nothing: the group stays within its range there)"""
+    res = _lockstep(lambda **kw: cpu._ieee14_remote_group(qmax, regulators, **kw), tol_mva=1e-10, scale=1.05)
+    assert _actions(res, "ReactiveLimits", "PV_TO_PQ"), res.decisions
 
 
 @pytest.mark.skipif(
@@ -315,7 +335,9 @@ def test_reactive_limits_holds_part_of_a_group(
     res = _lockstep(
         lambda **kw: cpu._ieee14_remote_group(qmax, regulators, qmin=qmin, **kw), tol_mva=1e-10, scale=1.05
     )
-    assert any("PV_TO_PQ" in d for d in res.decisions), res.decisions
+    frozen = {d.split("element ")[1].split(",")[0] for d in _actions(res, "ReactiveLimits", "PV_TO_PQ")}
+    # some of the group's controllers, not all: the others regulate on
+    assert 0 < len(frozen) < len(regulators), res.decisions
 
 
 # ---- a row whose contingency masks a voltage-controlled bus (handle_disconnected_grid) ----------
@@ -407,18 +429,30 @@ def test_row_masking_a_voltage_controlled_bus(load_scale: float):
 def test_dist_newton(load_scale: float, line_off: int | None):
     """the Newton shares the slack on the units by the weights each solve sets (controls' slack_w);
     DistributedSlack parks the unit its share pushes past its limit"""
-    _lockstep(lambda **kw: cpu._case14_dist(**kw), load_scale=load_scale, line_off=line_off)
+    res = _lockstep(lambda **kw: cpu._case14_dist(**kw), load_scale=load_scale, line_off=line_off)
+    assert _actions(res, "DistributedSlack", "PARK"), res.decisions
 
 
 @pytest.mark.parametrize("fail_on_residue", [True, False])
 def test_dist_every_unit_at_its_limit(fail_on_residue: bool):
+    """test_outer_model_cpu.py's case: every unit at its max_p (285 MW, the base's load and losses
+    fit, not the row's): FAILED on the residue, or every unit parked at its max_p"""
+    max_p = [45.0, 5.0, 5.0, 5.0, 225.0]
+
     def make(**kw: Any) -> Any:
-        n_gen = len(cpu._case14_dist(capped=False, only_ds=True).get_generators())
         return cpu._case14_dist(
-            capped=False, only_ds=True, max_p=np.full(n_gen, 45.0), fail_on_residue=fail_on_residue, **kw
+            capped=False, only_ds=True, max_p=max_p, fail_on_residue=fail_on_residue, **kw
         )
 
-    _lockstep(make, load_scale=1.2)
+    res = _lockstep(make, load_scale=1.2)
+    if fail_on_residue:
+        assert res.failed_loop == "DistributedSlack", res.decisions
+        assert _actions(res, "DistributedSlack", "FAIL_RESIDUE"), res.decisions
+    else:
+        moved = dict(res.gen_target_p)
+        for g, p in enumerate(max_p):
+            assert any(f" PARK, element {g}," in d for d in res.decisions), (g, res.decisions)
+            assert moved[g] == pytest.approx(p), (g, moved)
 
 
 def test_dist_only_the_loop():
@@ -430,7 +464,12 @@ def test_dist_only_the_loop():
 )
 @pytest.mark.parametrize("load_scale", [1.03, 1.09])
 def test_dist_rows_resume_with_the_parked_units(load_scale: float):
-    _lockstep(lambda **kw: cpu._case14_dist(**kw), resume=True, load_scale=load_scale)
+    """the unit the N solve parked starts each row parked: a row with a little more load needs no
+    outer iteration"""
+    n = cpu._solved(cpu._case14_dist())
+    assert any(d.action == "PARK" for d in n.get_algo().get_outer_loop_stats().decisions)
+    res = _lockstep(lambda **kw: cpu._case14_dist(**kw), resume=True, load_scale=load_scale)
+    assert res.nb_outer_iterations == 0, res.decisions
 
 
 # ---- ShuntVoltageControl (ShuntControl) -----------------------------------------------------------
@@ -469,11 +508,14 @@ def test_phase_control_active_power(delta_mw: float):
     assert res.phase_tap
 
 
-@pytest.mark.parametrize("factor", [0.8, 0.95, 1.1])
-def test_phase_control_current_limiter(factor: float):
-    """a current limiter one tap at a time, the way that lowers its current"""
+@pytest.mark.parametrize("factor, moves", [(0.8, True), (0.95, True), (1.1, False)])
+def test_phase_control_current_limiter(factor: float, moves: bool):
+    """a current limiter one tap at a time (MOVE_TAP), and none when the current is already under
+    its limit (1.1)"""
     _, i1 = cpu._pst_flow()
-    _lockstep(lambda **kw: cpu._pst_grid("CURRENT_LIMITER", factor * i1, **kw), tol_mva=1e-10)
+    res = _lockstep(lambda **kw: cpu._pst_grid("CURRENT_LIMITER", factor * i1, **kw), tol_mva=1e-10)
+    assert bool(res.phase_tap) == moves, res.decisions
+    assert bool(_actions(res, "PhaseControl", "MOVE_TAP")) == moves, res.decisions
 
 
 @pytest.mark.parametrize("load_scale", [1.05, 1.1])
@@ -493,6 +535,7 @@ def test_phase_control_rows(load_scale: float):
 def test_transformer_voltage_control(target_kv: float, deadband_kv: float):
     """a ratio tap changer regulating a bus: switched on, its ratio solved, rounded to a tap"""
     res = _lockstep(lambda **kw: cpu._tvc_grid("T4-9-1", target_kv, deadband_kv, **kw), tol_mva=1e-10)
+    assert _actions(res, "TransformerVoltageControl", "SWITCH_ON"), res.decisions
     assert any("ROUND_TAP" in d for d in res.decisions), res.decisions
 
 
@@ -501,7 +544,8 @@ def test_transformer_voltage_control_with_reactive_limits():
 
 
 def test_transformer_voltage_control_hidden_by_a_generator():
-    _lockstep(lambda **kw: cpu._tvc_grid("T5-6-1", 12.6, 0.1, **kw), tol_mva=1e-10)
+    res = _lockstep(lambda **kw: cpu._tvc_grid("T5-6-1", 12.6, 0.1, **kw), tol_mva=1e-10)
+    assert not res.decisions and not res.ratio_tap, res.decisions
 
 
 @pytest.mark.parametrize(
@@ -512,10 +556,19 @@ def test_transformer_voltage_control_hidden_by_a_generator():
     ],
 )
 def test_transformer_voltage_control_frozen_generators(loop_kw: dict[str, Any]):
-    """the generators of up to 120 kV frozen while the transformer acts (suspended for ReactiveLimits)"""
-    _lockstep(
-        lambda **kw: cpu._tvc_grid("T4-9-1", 12.6, 0.1, reactive_limits=True, **loop_kw, **kw), tol_mva=1e-10
+    """the generators of up to 120 kV frozen while the transformer acts (suspended for ReactiveLimits):
+    no decision of their own, seen in the controls -- two buses released at once (without the
+    120 kV limit, one), every one held again at the end"""
+    log: list[dict[str, Any]] = []
+    res = _lockstep(
+        lambda **kw: cpu._tvc_grid("T4-9-1", 12.6, 0.1, reactive_limits=True, **loop_kw, **kw),
+        tol_mva=1e-10,
+        controls_log=log,
     )
+    assert _actions(res, "TransformerVoltageControl", "SWITCH_ON"), res.decisions
+    released = [len(c["pin"]) - sum(int(x) for x in c["pin"]) for c in log]
+    assert max(released) >= 2, released
+    assert released[-1] == 0, released
 
 
 @pytest.mark.parametrize("load_scale", [1.05, 1.1])
@@ -536,4 +589,8 @@ def test_transformer_voltage_control_rows(load_scale: float):
 
 
 def test_shunt_voltage_control_hidden_by_a_transformer():
-    _lockstep(lambda **kw: cpu._shunt_grid("B9", 13.2, (0, 2), with_trafo_control=True, **kw), tol_mva=1e-10)
+    res = _lockstep(
+        lambda **kw: cpu._shunt_grid("B9", 13.2, (0, 2), with_trafo_control=True, **kw), tol_mva=1e-10
+    )
+    assert not [d for d in res.decisions if d.startswith("ShuntVoltageControl")], res.decisions
+    assert not res.shunt_sections, res.decisions

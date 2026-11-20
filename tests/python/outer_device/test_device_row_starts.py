@@ -88,6 +88,8 @@ def test_rows_tripping_a_load_on_transformer_voltage_control(init_from_n: bool):
 
     host, dev = run("host"), run("device")
     assert any(r.ratio_tap for r in host.get_outer_results()), "TransformerVoltageControl moved no tap"
+    # each load-tripping row was set up by the host model, none copied from a template
+    assert dev.timings.n_oc_host_loads >= len(ctgs), dev.timings.n_oc_host_loads
     _same_rows(host, dev, len(ctgs))
 
 
@@ -123,4 +125,9 @@ def test_copied_rows_report_the_template_targets(distributed: bool, init_from_n:
         return ca
 
     host, dev = run("host"), run("device")
+    # the plain rows were copied on the device: fewer rows set up by the host model than on 'host'
+    assert dev.timings.n_oc_host_loads < host.timings.n_oc_host_loads, (
+        dev.timings.n_oc_host_loads,
+        host.timings.n_oc_host_loads,
+    )
     _same_rows(host, dev, len(ctgs))

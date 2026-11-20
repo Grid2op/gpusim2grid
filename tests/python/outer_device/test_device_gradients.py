@@ -77,10 +77,11 @@ def _element_rows(grid: Any, zero_gen_p_to: float | None = None) -> dict[str, np
 
 
 def _same_adjoint_rows(
-    grid: Any, rows: dict[str, np.ndarray], gen_off: np.ndarray | None = None
+    grid: Any, rows: dict[str, np.ndarray], gen_off: np.ndarray | None = None, init_from_n: bool = True
 ) -> list[Any]:
     """a scenario sweep keeping what the adjoint needs (BatchPowerFlow's session setting): the
-    rows' adjoint view of their last solve, host vs device"""
+    rows' adjoint view of their last solve, host vs device (the host's results returned, with
+    their decisions trace)"""
     from gpusim2grid import ScenarioSweepGPU
 
     def run(backend: str) -> Any:
@@ -91,6 +92,8 @@ def _same_adjoint_rows(
             tol=TOL_MVA / grid.get_sn_mva(),
             ir_n_steps=1,
             reference_slack="grid",
+            init_from_n_powerflow=init_from_n,
+            keep_outer_trace=True,
             outer_loops_backend=backend,
         )
         ss._inner.keep_final_jacobian = True
@@ -158,8 +161,15 @@ def test_adjoint_rows_distributed_slack():
 
 
 def test_adjoint_rows_parked_at_the_last_check():
+    """unit 0 parked at a check whose move is too small to re-solve (moved_fraction): rows not
+    resumed from the N solve, which parks it already (resumed rows start parked: no such check)"""
     grid = _grad_grid(distributed=True, reactive_limits=False, moved_fraction=1e9)
-    _same_adjoint_rows(grid, _element_rows(grid, zero_gen_p_to=5.0))
+    res = _same_adjoint_rows(grid, _element_rows(grid, zero_gen_p_to=5.0), init_from_n=False)
+    parked = [r for r in res if any(" PARK, element 0," in d for d in r.decisions)]
+    assert parked, [r.decisions for r in res]
+    for r in parked:
+        assert r.nb_outer_iterations == 0, r.decisions  # no solve followed the check
+        assert 0 not in r.gen_p_fixed, r.decisions  # so not held at its bound in the adjoint
 
 
 def test_adjoint_rows_capability_curve_slope():
@@ -180,22 +190,13 @@ def test_adjoint_rows_generator_contingency():
 
 
 def _pair(grid: Any, **kwargs: Any) -> tuple[Any, Any]:
+    """test_outer_gradients.py's own BatchPowerFlow (its _pf: rows not resumed, the trace kept), the
+    configuration whose host gradients it checks against central differences, on both backends"""
     import test_outer_gradients as og
 
-    from gpusim2grid.differentiable import BatchPowerFlow
-
-    def make(backend: str) -> Any:
-        return BatchPowerFlow.from_lsgrid(
-            grid,
-            outer_loops=True,
-            nb_iter=30,
-            tol=og.TOL_MVA / grid.get_sn_mva(),
-            ir_n_steps=1,
-            outer_loops_backend=backend,
-            **kwargs,
-        )
-
-    return make("host"), make("device")
+    return og._pf(grid, outer_loops_backend="host", **kwargs), og._pf(
+        grid, outer_loops_backend="device", **kwargs
+    )
 
 
 def _same_gradients(grid: Any, inputs: dict[str, np.ndarray], **call: Any) -> list[Any]:
@@ -233,7 +234,16 @@ def test_gradients_parked_at_the_last_check():
     import test_outer_gradients as og
 
     grid = og._grid(distributed=True, reactive_limits=False, moved_fraction=1e9)
-    _same_gradients(grid, og._inputs(grid, zero_gen_p_to=5.0))
+    inputs = og._inputs(grid, zero_gen_p_to=5.0)
+    res = _same_gradients(grid, inputs)
+    # test_outer_gradients.test_distributed_slack_parked_at_the_last_check's rows, as it checks them
+    cap = float(grid.get_gen_target_p()[0]) + 1.0
+    rows = [r for r in range(len(res)) if inputs["gen_p"][r, 0] < cap]
+    assert rows
+    for r in rows:
+        assert any("PARK" in d and "element 0," in d for d in res[r].decisions), res[r].decisions
+        assert res[r].nb_outer_iterations == 0, res[r].decisions
+        assert 0 not in res[r].gen_p_fixed, res[r].decisions
 
 
 def test_gradients_capability_curve_slope():

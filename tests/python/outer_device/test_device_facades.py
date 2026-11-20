@@ -36,6 +36,7 @@ def _same_rows(host: Any, dev: Any, n_rows: int) -> None:
     st_h, st_d = np.asarray(host.get_row_status()), np.asarray(dev.get_row_status())
     np.testing.assert_array_equal(st_d, st_h)
     conv = st_h == 0
+    assert conv.any(), f"no row converged: nothing compared ({st_h})"
     v_h = host.V_results.to_numpy().reshape(n_rows, -1)
     v_d = dev.V_results.to_numpy().reshape(n_rows, -1)
     np.testing.assert_allclose(v_d[conv], v_h[conv], rtol=0, atol=parity_tol("state"), equal_nan=True)
@@ -168,8 +169,14 @@ def test_rows_never_simulated(grid: Any):
         return ca
 
     host, dev = run("host"), run("device")
-    assert (np.asarray(host.get_row_status()) == 3).any(), "no contingency islands a bus"
+    not_run = np.asarray(host.get_row_status()) == 3
+    assert not_run.any(), "no contingency islands a bus"
     _same_rows(host, dev, n_br)
+    for k in np.flatnonzero(not_run):
+        for res in (host.get_outer_results()[k], dev.get_outer_results()[k]):
+            # RowResult's defaults: never ran (status -1), no iteration, no target
+            assert (res.status, res.nb_outer_iterations, res.nb_nr_iterations) == (-1, 0, 0), f"row {k}"
+            assert not list(res.gen_target_p), f"row {k}"
 
 
 @pytest.mark.parametrize("init_from_n", [False, True])
@@ -343,9 +350,12 @@ def test_generator_contingencies_on_a_voltage_control_group(qmax: tuple[float, .
 
     from gpusim2grid import ContingencyAnalysisGPU
 
-    grid = cpu._ieee14_remote_group(qmax, ("B3-G", "B6-G", "B8-G"), scale=1.05)
+    regulators = ("B3-G", "B6-G", "B8-G")
+    grid = cpu._ieee14_remote_group(qmax, regulators, scale=1.05)
     assert grid.ac_pf(np.full(grid.total_bus(), 1.0 + 0j), MAX_IT, TOL_MVA).size > 0
     n_gen = len(grid.get_generators())
+    controllers = [int(g.id) for g in grid.get_generators() if g.name in regulators]
+    assert len(controllers) == len(regulators)
 
     def run(backend: str) -> Any:
         ca = ContingencyAnalysisGPU(
@@ -363,7 +373,11 @@ def test_generator_contingencies_on_a_voltage_control_group(qmax: tuple[float, .
         ca.compute(batch_size=3)
         return ca
 
-    _same_rows(run("host"), run("device"), n_gen)
+    host, dev = run("host"), run("device")
+    _same_rows(host, dev, n_gen)
+    # every row tripping one of the group's controllers was solved (none left out)
+    status = np.asarray(host.get_row_status())
+    assert (status[controllers] != 3).all(), status
 
 
 def _element_rows(grid: Any, n_rows: int) -> dict[str, np.ndarray]:
@@ -434,13 +448,15 @@ def test_injection_sweep_rows_with_their_own_targets(grid: Any):
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_contingency_analysis_dist_newton(init_from_n: bool):
     """NROuterDist_*: the Newton shares the slack by the weights the device writes per slot, a
-    unit pushed past its limit parked (resumed rows: parked from the start)"""
+    unit pushed past its limit parked (resumed rows: parked from the start, by the grid's own N
+    solve)"""
     import test_outer_model_cpu as cpu
 
     from gpusim2grid import ContingencyAnalysisGPU
 
     grid = cpu._case14_dist()
     assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    n_parked = any(d.action == "PARK" for d in grid.get_algo().get_outer_loop_stats().decisions)
     n_br = len(grid.get_lines()) + len(grid.get_trafos())
 
     def run(backend: str) -> Any:
@@ -451,6 +467,7 @@ def test_contingency_analysis_dist_newton(init_from_n: bool):
             tol=TOL_MVA / grid.get_sn_mva(),
             init_from_n_powerflow=init_from_n,
             handle_disconnected_grid=True,
+            keep_outer_trace=True,
             outer_loops_backend=backend,
         )
         ca.tail_max_groups, ca.tail_group_size = 4, 1
@@ -458,7 +475,12 @@ def test_contingency_analysis_dist_newton(init_from_n: bool):
         ca.compute(batch_size=6)
         return ca
 
-    _same_rows(run("host"), run("device"), n_br)
+    host, dev = run("host"), run("device")
+    _same_rows(host, dev, n_br)
+    if init_from_n:
+        assert n_parked, "the N solve parked no unit: the resumed rows start with none"
+    else:
+        assert any(" PARK," in d for r in host.get_outer_results() for d in r.decisions)
 
 
 @pytest.mark.parametrize("dist", [False, True])
@@ -490,6 +512,7 @@ def test_decision_trace(grid: Any, dist: bool):
         return ca
 
     host, dev = run("host"), run("device")
+    assert dev.timings.n_slot_moves > 0, "the tail compaction moved no row"
     _same_rows(host, dev, n_br)
     res_h, res_d = host.get_outer_results(), dev.get_outer_results()
     assert any(r.decisions for r in res_h)
@@ -606,8 +629,10 @@ def test_phase_control(mode: str, init_from_n: bool):
     ],
 )
 def test_transformer_voltage_control(grid_kw: dict[str, Any], init_from_n: bool):
-    """TransformerVoltageControl: the ratio tap changer's ratio column switched on by the device,
-    the low voltage generators frozen meanwhile, rounded; the taps and flows each row ends with"""
+    """TransformerVoltageControl: the ratio tap changer's ratio column switched on by the device
+    (with ``max_controlled_nominal_voltage``, the low voltage generators frozen meanwhile: seen in the
+    controls, so checked in lockstep by test_device_model.py), rounded; the taps, decisions and flows
+    each row ends with"""
     import test_outer_model_cpu as cpu
 
     from gpusim2grid import ContingencyAnalysisGPU
