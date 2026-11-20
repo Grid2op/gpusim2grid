@@ -3,6 +3,7 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [ADDED] ``docs/environment_variables.md``: every environment variable gpusim2grid reads, in one page.
 - [ADDED] ``GPUSIM2GRID_ASYNC_TIMERS=1``: per-phase timers no longer wait for the GPU (their GPU times read 0), so
   the host keeps the GPU fed; opt-in.
 - [IMPROVED] Strategies changing a branch (transformer values, bus moves): its current check, flows and max

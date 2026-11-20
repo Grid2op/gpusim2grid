@@ -148,6 +148,8 @@ lightsim2grid match the build.
 For the details — the CUDA major chosen from the environment, a toolkit or cuDSS not
 from PyPI, GPU architectures — see the installation page of the
 [documentation](#building-the-docs).
+The environment variables (build choices, diagnostics, check modes) are listed in
+[docs/environment_variables.md](docs/environment_variables.md).
 
 ## Quickstart
 
