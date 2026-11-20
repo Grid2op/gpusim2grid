@@ -335,7 +335,10 @@ def test_masks_leaving_reactive_limits_without_a_bus(monkeypatch: pytest.MonkeyP
 @pytest.mark.parametrize("qmax", [(100.0, 3.0, 3.0), (40.0, 100.0, 100.0)])
 def test_generator_contingencies_on_a_voltage_control_group(qmax: tuple[float, ...]):
     """every generator tripped in turn, on a grid where three of them hold a remote bus together:
-    a tripped controller leaves its group bus' controllers (the row's own ReactiveLimits plan)"""
+    a tripped controller leaves its group bus' controllers (the row's own ReactiveLimits plan).
+    ``ir_n_steps=1`` (CLAUDE.md, with outer loops): without it the Newton steps row 2 takes to
+    1e-10 pu differed by one between host and device, either way and on either case from run to
+    run of the same build -- most likely cuDSS's perturbed pivots, which the refinement corrects"""
     import test_outer_model_cpu as cpu
 
     from gpusim2grid import ContingencyAnalysisGPU
@@ -353,6 +356,7 @@ def test_generator_contingencies_on_a_voltage_control_group(qmax: tuple[float, .
             init_from_n_powerflow=False,
             handle_disconnected_grid=True,
             outer_loops_backend=backend,
+            ir_n_steps=1,
         )
         for g in range(n_gen):
             ca.add_contingency(gen_ids=[g])
