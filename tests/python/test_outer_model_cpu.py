@@ -208,7 +208,7 @@ def test_row_masking_a_voltage_controlled_bus(load_scale):
     to_base = np.asarray(base.id_me_to_ac_solver(), dtype=int)
     masked = int(to_base[BUS])
     h = _cpp._OuterModelHarness(base, keep_trace=True)
-    h.set_branch_off([[len(base.get_lines()) + TRAFO]], masked=[[masked]])
+    h.set_row_overrides([[len(base.get_lines()) + TRAFO]], masked=[[masked]])
     h.begin(1, 1)
 
     row = _case14(distributed=False, load_scale=load_scale, extra_load=extra_load)
@@ -645,7 +645,7 @@ def _compare_single_solve(make_grid, tol_mva=TOL_MVA, start=None, branch_off=Non
     assert base.ac_pf(v0, MAX_IT, tol_mva).size > 0
     h = _cpp._OuterModelHarness(base, keep_trace=True)
     if branch_off is not None:
-        h.set_branch_off([list(branch_off)])
+        h.set_row_overrides([list(branch_off)])
     h.begin(1, 1)
     row = make_grid(**row_kwargs)
     V_ref = row.ac_pf(np.asarray(base.get_V(), dtype=complex), MAX_IT, tol_mva)
@@ -978,7 +978,7 @@ def test_phase_control_rows_resume_from_the_n_solve(mode):
     res_ls = batch.get_outer_results()
 
     h = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=True)
-    h.set_branch_off([[b] for b in branches])
+    h.set_row_overrides([[b] for b in branches])
     h.begin(1, len(branches))
     buses = np.asarray(base.id_ac_solver_to_me(), dtype=int)
     for i, b in enumerate(branches):

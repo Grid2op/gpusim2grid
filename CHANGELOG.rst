@@ -3,6 +3,28 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] N-1 x actions setup (host work before the first GPU round): 2.8 -> 0.9 s on PtFige, 36k strategies;
+  connectivity certified without a search per row, generator trips walked per row, rows built without GC passes.
+- [ADDED] ``docs/environment_variables.md``: every environment variable gpusim2grid reads, in one page.
+- [ADDED] ``GPUSIM2GRID_ASYNC_TIMERS=1``: per-phase timers no longer wait for the GPU (their GPU times read 0), so
+  the host keeps the GPU fed; opt-in.
+- [IMPROVED] Strategies changing a branch (transformer values, bus moves): its current check, flows and max
+  loading are computed on the GPU from the row's own block; no voltages come back to the host.
+- [IMPROVED] ``ContingencyAnalysisGPU.set_actions``: the grid is walked once and copied once for all actions, not
+  per action (771 actions on a French grid: 25 s -> 1.2 s).
+- [IMPROVED] Fewer device synchronisations per round: grow-only pinned buffers, double-buffered segment uploads,
+  no stream sync after a fill.
+- [IMPROVED] ``linear_solver='own_lu'``: the triangular solves' runs of narrow levels run as one kernel each (the
+  same bits; a third fewer kernel launches on a 7k-bus N-1).
+- [IMPROVED] ``outer_loops=True``: a row disconnecting units or tripping lines takes its ReactiveLimits plan and
+  DistributedSlack units by filtering the grid's (the same lists, a third of a row's load).
+- [ADDED] ``outer_loops_backend`` (``OuterLoopsBackend``, a str enum: ``HOST`` default, today's path) on the three
+  batch facades and ``BatchPowerFlow``: ``DEVICE`` runs all seven outer loops in CUDA kernels (FP64 builds;
+  ``outer_device_census``).
+- [ADDED] ``timings.n_oc_host_loads``: the rows whose outer-loop state the host model set up (``DEVICE``: the rows
+  not copied from a template on the GPU), a load-independent measure of the CPU's share.
+- [IMPROVED] ``outer_loops=True``: the unrealistic-voltage check runs one block per converged row instead of
+  one thread (12 ms per call on a 7k-bus grid, a fifth of an N-1 run's GPU time).
 - [IMPROVED] The Newton voltage update applies its step as a product (no ``atan2``/``sin``/``cos`` per bus):
   4x faster in FP64 on an RTX A1000.
 - [IMPROVED] The Jacobian fill: fewer FP64 operations per entry, no warp divergence on the diagonal (4.6x faster).

@@ -66,6 +66,26 @@ def test_branch_values_match_lightsim2grid(settings: dict[str, Any], solver_atol
         assert_row_matches(V[len(ctgs) + r], V_ref, solver_atol)
 
 
+def test_compiled_values_match_a_fresh_copy_per_action():
+    """set_actions computes every action's transformer admittances on one copy of the grid,
+    putting its transformers back before each action: the values are, bit for bit, those of a
+    fresh copy per action -- also for an action touching a transformer an earlier one moved (a
+    ratio alone after a shift: the shift must be the grid's again)."""
+    from gpusim2grid.contingency_analysis._strategies import compile_action
+
+    grid = case14()
+    actions = _actions(grid) + _actions(grid)[::-1]
+    ca = make_ca(grid, {}, batch_size=BATCH)
+    ca.add_contingencies_by_branch_id([[]])
+    ca.set_actions(actions)
+    n_lines = len(grid.get_lines())
+    assert len(ca._compiled) == len(actions)
+    for a, got in zip(actions, ca._compiled, strict=True):
+        want = compile_action(grid, a, n_lines)
+        assert got.branch_y == want.branch_y
+        assert got.base_y == want.base_y
+
+
 def test_flows_use_the_rows_branch_values(solver_atol: float):
     """compute_flows of a strategy row uses the row's admittance of the changed transformer,
     not the base one: its currents match lightsim2grid's."""

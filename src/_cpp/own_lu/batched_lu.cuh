@@ -79,8 +79,18 @@ public:
     void set_active(int nb);
     int active() const { return nb_; }
 
+    // Whether the fused triangular-solve kernel (a run of narrow levels in one 1024-thread block)
+    // launches at that block size on the current device; init() fuses nothing otherwise.
+    static bool fused_solve_supported();
+
     // Pivots clamped per active matrix by the last factorize() (host sync).
     std::vector<int> clamped_counts() const;
+
+    // The triangular solves' plan (diagnostic, for the tests): the launches one solve() makes
+    // (forward then backward; a fused run of levels is one), and whether a fused run holds a
+    // level split over several warps (k > 1)
+    int solve_launches() const { return static_cast<int>(fw_steps_.size() + bw_steps_.size()); }
+    bool fused_run_has_split_level() const;
 
     int n() const { return n_; }
     int batch() const { return B_; }
@@ -91,6 +101,12 @@ public:
 
 private:
     struct Launch { int offset, count, k; bool is_u; };
+    // a triangular solve's steps: one launch, or a run of consecutive narrow levels (each fitting one
+    // pass of a 32-warp block: count * k <= 32) in one fused kernel, levels [first, last) of the run
+    // tables (offset, count, k each)
+    struct SolveStep { int launch = -1, first = 0, last = 0; };
+    std::vector<SolveStep> fw_steps_, bw_steps_;
+    thrust::device_vector<int> d_fw_run_, d_bw_run_;   // [3 x levels]: offset, count, k
 
     int n_ = 0, nnz_ = 0, n_ent_ = 0, B_ = 0, nb_ = 0, levels_ = 0;
     long long contributions_ = 0;

@@ -53,7 +53,7 @@ from .._ls2g_utils import (
     _validate_precision,
 )
 from .. import _gpusim2grid as _cpp
-from .._outer_loops import _check_outer_loops_args
+from .._outer_loops import OuterLoopsBackend, _check_outer_loops_args, _resolve_outer_loops_backend
 from ..contingency_analysis._violation_threshold import ViolationThresholdFacadeMixin
 
 __all__ = ["ScenarioSweepGPU"]
@@ -183,6 +183,12 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         With ``outer_loops``: keep each row's decision trace
         (``get_outer_results()[i].decisions``, lightsim2grid's
         ``OuterLoopStats.decisions``).
+    outer_loops_backend : OuterLoopsBackend or {"host", "device"}, default OuterLoopsBackend.HOST
+        Where the outer loops run with ``outer_loops=True`` (docs/outer_loops_on_device.md):
+        ``"host"`` is lightsim2grid's loops ported on the host, ``"device"`` CUDA kernels. A grid
+        whose loops use a feature ``"device"`` does not implement yet (see
+        :func:`gpusim2grid.outer_device_census`) raises ``NotImplementedError`` at construction,
+        for the whole batch. Construction-time only.
     violation_threshold : float in ``]0, 1]``, default 1.0
         lightsim2grid's knob of the same name and semantics: every checked limit moves towards a
         healthy anchor, ``t * limit + (1 - t) * anchor`` (0 for currents, the bus nominal voltage
@@ -230,7 +236,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                  use_distributed_slack=True,
                  compute_physical_violations=False, redistribute_slack=False,
                  reference_slack="auto", scheduling=None, nb_iter_per_round=1,
-                 tol=None, outer_loops=False, keep_outer_trace=False, violation_threshold=1.0):
+                 tol=None, outer_loops=False, keep_outer_trace=False, violation_threshold=1.0,
+                 outer_loops_backend=OuterLoopsBackend.HOST):
         _validate_precision(precision)
         self._init_violation_threshold(violation_threshold)
         check_linear_solver_args(linear_solver, reordering_alg, matching_alg)
@@ -240,6 +247,7 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         if self._outer_loops:
             _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round,
                                     compute_physical_violations=compute_physical_violations)
+        self._outer_loops_backend = _resolve_outer_loops_backend(outer_loops_backend, self._outer_loops)
 
         _reordering_alg = 'default' if reordering_alg is None else reordering_alg
         _matching_alg = 'none' if matching_alg is None else matching_alg
@@ -299,7 +307,8 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
                         -1 if scaling_max_voltage_change is None
                         else int(bool(scaling_max_voltage_change))),
                     max_dVa_override=-1.0 if max_dVa is None else float(max_dVa),
-                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm))
+                    max_dVm_override=-1.0 if max_dVm is None else float(max_dVm),
+                    outer_backend=self._outer_loops_backend.value)
                 self._inner = _ScenarioSweepSolver._wrap_session(
                     session, max_iter_base=max_iter_base, tol_base=tol_base,
                     reordering_alg=_reordering_alg, matching_alg=_matching_alg,
@@ -416,6 +425,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         self.reference_slack = reference_slack
 
     # ------------------------------------------------------------ outer loops
+    @property
+    def outer_loops_backend(self):
+        """str: where the outer loops run, ``"host"`` or ``"device"`` (construction-time only)."""
+        return self._outer_loops_backend
+
     @property
     def outer_loops(self):
         """bool: whether the grid's own outer loops (lightsim2grid's NROuter_* / NROuterDist_*:

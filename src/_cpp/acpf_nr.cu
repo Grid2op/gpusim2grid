@@ -35,8 +35,10 @@
 //   replaced by a narrow event sync (e_va_done) that only blocks until that
 //   one point on cs is reached, leaving other streams free.
 //
-//   timer.stop_ms() calls cudaEventSynchronize internally, so the redundant
-//   cudaDeviceSynchronize() after cuDSS factorize/solve is dropped.
+//   No cudaDeviceSynchronize() after cuDSS factorize/solve: everything after is
+//   ordered on cs, and every host read of device data synchronises by itself
+//   (thrust reductions and copies). Do not rely on timer.stop_ms() for that: it
+//   does not wait under GPUSIM2GRID_ASYNC_TIMERS=1.
 //
 // See acpf_nr_state.cuh for the full class declaration and design notes.
 // =============================================================================

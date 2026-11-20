@@ -95,14 +95,16 @@ __global__ void override_branch_flows_kernel(
     const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
-    int n_bus, int n_branches, int n)
+    int n_bus, int n_branches, int n,
+    const int*             __restrict__ d_ft,
+    const cuda_real_type*  __restrict__ d_base)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const ptrdiff_t r = d_row[i];
     const int l = d_branch[i];
-    const int bf = d_branch_from[l];
-    const int bt = d_branch_to[l];
+    const int bf = d_ft ? d_ft[2 * i] : d_branch_from[l];
+    const int bt = d_ft ? d_ft[2 * i + 1] : d_branch_to[l];
     const cudaComplexType zero = CudaFunHelper::my_make_cuComplex(0., 0.);
     const cudaComplexType Vi = (bf >= 0) ? d_V[r * n_bus + bf] : zero;
     const cudaComplexType Vj = (bt >= 0) ? d_V[r * n_bus + bt] : zero;
@@ -112,8 +114,8 @@ __global__ void override_branch_flows_kernel(
     const cudaComplexType I_ex = (bt >= 0) ? CudaFunHelper::my_cuCadd(
         CudaFunHelper::my_cuCmul(y[2], Vi), CudaFunHelper::my_cuCmul(y[3], Vj)) : zero;
     const ptrdiff_t out_idx = r * n_branches + l;
-    d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * d_base_current_A[l];
-    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * d_base_current_ex_A[l];
+    d_or_amps[out_idx] = CudaFunHelper::my_cuCabs(I_or) * (d_base ? d_base[2 * i] : d_base_current_A[l]);
+    d_ex_amps[out_idx] = CudaFunHelper::my_cuCabs(I_ex) * (d_base ? d_base[2 * i + 1] : d_base_current_ex_A[l]);
 }
 
 // =============================================================================
@@ -415,7 +417,7 @@ __global__ void apply_vm_reseed_kernel(
     int n_bus)
 {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= n_entries) return;
+    if (k >= n_entries || d_bus[k] < 0) return;   // bus -1: an unused entry of a fixed block
     const ptrdiff_t at = static_cast<ptrdiff_t>(d_slot[k]) * n_bus + d_bus[k];
     cudaComplexType v = d_V_batch[at];
     cuda_real_type mag = CudaFunHelper::my_cuCabs(v);

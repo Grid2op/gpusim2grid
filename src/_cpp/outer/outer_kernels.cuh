@@ -85,7 +85,7 @@ __global__ void oc_gather_kernel(
     const int*             __restrict__ d_watch,      // [n_watch]
     int n_list, int n_watch, int n_ctrl, int n_bus, int stride);
 
-// One thread per (listed slot): 1 when some candidate bus whose magnitude is a
+// One block per listed slot (launch with n_list blocks): 1 when some candidate bus whose magnitude is a
 // Newton unknown in that slot (not a pinned switchable bus) is outside
 // [vmin, vmax], written to out[i * stride + stride - 1]; the slot's
 // slack_absorbed (0 without one) to out[i * stride + stride - 2].
@@ -100,7 +100,7 @@ __global__ void oc_unrealistic_kernel(
     int n_list, int n_cand, int n_pin, int n_bus, int stride,
     cuda_real_type vmin, cuda_real_type vmax);
 
-// One thread per entry: d_Sbus[slot * n_bus + bus] += (dp, dq).
+// One thread per entry: d_Sbus[slot * n_bus + bus] += (dp, dq); an entry with bus -1 is skipped.
 __global__ void oc_sbus_delta_kernel(
           cudaComplexType* __restrict__ d_Sbus,
     const int*             __restrict__ d_slot,

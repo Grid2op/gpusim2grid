@@ -81,9 +81,10 @@ constexpr int VIOL_BLOCK = 256;
 //
 //   2. Branch current, for each branch l in [0, n_branches):
 //        skip if l appears in this active slot's tripped-branch list
-//        (d_trip_start/d_trip_count/d_trip_branch_flat, indexed by the
-//        GLOBAL active-slot id c_start+local_c -- typically 0-4 entries,
-//        linear scan).
+//        (trip_table, indexed by the GLOBAL active-slot id c_start+local_c --
+//        typically 0-4 entries, linear scan); a branch the row lists with its
+//        own block (a strategy's transformer values / bus moves) takes that
+//        block, its ends and its current bases instead of the shared ones.
 //        I_or = yff_eff[l]*V[from] + yft_eff[l]*V[to];  ka_or = |I_or|*base_current_A[l]*0.001
 //        I_ex = ytf_eff[l]*V[from] + ytt_eff[l]*V[to];  ka_ex = |I_ex|*base_current_ex_A[l]*0.001
 //        (the /1000 converts gpusim2grid's existing Amps-basis
@@ -134,7 +135,7 @@ constexpr int VIOL_BLOCK = 256;
 // d_base_current_A : [n_branches] real, Amps-basis, origin side (kernel /1000 for kA)
 // d_base_current_ex_A : [n_branches] real, same, extremity side
 // d_branch_limit_a1_ka/a2_ka : [n_branches] real, kA, NaN = unconfigured
-// d_trip_start/d_trip_count/d_trip_branch_flat : tripped-branch lookup table,
+// trip_table       : tripped-branch lookup table (and the rows' own blocks),
 //                    indexed by GLOBAL active-slot id (c_start + local_c), or
 //                    all-nullptr when the batch source never trips branches
 //                    (e.g. injection sweep -- this kernel is never launched
@@ -178,9 +179,7 @@ __global__ void check_limit_violations_kernel(
     const cuda_real_type*  __restrict__ d_base_current_ex_A,
     const cuda_real_type*  __restrict__ d_branch_limit_a1_ka,
     const cuda_real_type*  __restrict__ d_branch_limit_a2_ka,
-    const int*             __restrict__ d_trip_start,
-    const int*             __restrict__ d_trip_count,
-    const int*             __restrict__ d_trip_branch_flat,
+    TrippedBranchTable     trip_table,
     int n_bus, int n_branches, int n_lines,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,

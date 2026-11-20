@@ -11,6 +11,7 @@
 
 #include <algorithm>        // std::lower_bound, std::min, std::sort, std::max_element
 #include <cmath>            // std::abs
+#include <cstdint>
 #include <cassert>
 #include <stdexcept>
 #include <string>
@@ -308,6 +309,13 @@ namespace {
 // Threshold below which a Ybus entry is considered zero after the patch.
 constexpr double kRemovedEdgeEps = 1e-10;
 
+// |z| < kRemovedEdgeEps, on the squared modulus: std::abs of a complex is a hypot call, and
+// the per-row searches below test every entry of the matrix
+inline bool removed_edge(const eigen_cplx_type& z)
+{
+    return std::norm(z) < kRemovedEdgeEps * kRemovedEdgeEps;
+}
+
 struct ConnectivityIndex {
     int        n_bus = 0;
     int        nnz   = 0;
@@ -323,6 +331,13 @@ struct ConnectivityIndex {
     std::vector<int>  tin, tout;   // [n_bus] preorder index / end of subtree (exclusive)
     std::vector<int>  preorder;    // [n_bus] bus at each preorder position
     bool              base_connected = false;
+    bool              skip_zero      = false;   // zero entries are no edges (the ctor's flag)
+    // Cycle-space labels (certify_removal): per edge (both directions), a random 64-bit word for
+    // a non-tree edge, and for a tree edge the XOR of the non-tree edges leaving the subtree below
+    // it. An edge cut XORs to 0, so removed edges with independent labels hold no cut.
+    // labels_ok: the graph is connected and every edge has both directions.
+    std::vector<uint64_t> label;   // [nnz]
+    bool              labels_ok = false;
 
     // The graph: the first n_graph buses (the others are spare buses of the union pattern,
     // see check_connectivity), an edge per off-diagonal entry between two of them -- with
@@ -344,6 +359,7 @@ struct ConnectivityIndex {
         , tin(static_cast<size_t>(n_bus), -1)
         , tout(static_cast<size_t>(n_bus), -1)
         , preorder(static_cast<size_t>(n_bus), -1)
+        , skip_zero(skip_zero)
     {
         const eigen_cplx_type* values = Ybus_rm.valuePtr();
         for (int i = 0; i < n_bus; ++i)
@@ -351,7 +367,7 @@ struct ConnectivityIndex {
                 row_of[static_cast<size_t>(p)] = i;
                 const int j = inner[p];
                 if (j == i || j >= n_bus) continue;
-                if (skip_zero && std::abs(values[p]) < kRemovedEdgeEps) continue;
+                if (skip_zero && removed_edge(values[p])) continue;
                 live[static_cast<size_t>(p)] = 1;
                 const int* b = inner + outer[j];
                 const int* e = inner + outer[j + 1];
@@ -409,6 +425,39 @@ struct ConnectivityIndex {
             }
         }
         base_connected = (counter == n_bus);
+        if (base_connected) set_labels(parent_k);
+    }
+
+    void set_labels(const std::vector<int>& parent_k)
+    {
+        // splitmix64's finalizer: a fixed word per entry, nonzero but for one input in 2^64
+        const auto mix = [](uint64_t z) {
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            return z ^ (z >> 31);
+        };
+        label.assign(static_cast<size_t>(nnz), 0);
+        std::vector<uint64_t> sub(static_cast<size_t>(n_bus), 0);   // XOR of the non-tree edges at a bus
+        for (int i = 0; i < n_bus; ++i)
+            for (int p = outer[i]; p < outer[i + 1]; ++p) {
+                if (!live[static_cast<size_t>(p)]) continue;
+                const int kr = k_rev[static_cast<size_t>(p)];
+                if (kr < 0 || !live[static_cast<size_t>(kr)]) return;   // a one-way edge: no labels
+                const int j = inner[p];
+                if (j < i || is_tree[static_cast<size_t>(p)]) continue;
+                const uint64_t w = mix(0x9e3779b97f4a7c15ull * (static_cast<uint64_t>(p) + 1));
+                label[static_cast<size_t>(p)] = label[static_cast<size_t>(kr)] = w;
+                sub[static_cast<size_t>(i)] ^= w;
+                sub[static_cast<size_t>(j)] ^= w;
+            }
+        // children before parents: the XOR over a subtree is what leaves it (inner edges cancel)
+        for (int pos = n_bus - 1; pos >= 1; --pos) {
+            const int v = preorder[static_cast<size_t>(pos)];
+            const int pk = parent_k[static_cast<size_t>(v)];
+            label[static_cast<size_t>(pk)] = label[static_cast<size_t>(k_rev[static_cast<size_t>(pk)])] = sub[static_cast<size_t>(v)];
+            sub[static_cast<size_t>(row_of[static_cast<size_t>(pk)])] ^= sub[static_cast<size_t>(v)];
+        }
+        labels_ok = true;
     }
 
     bool in_subtree(int bus, int child) const {
@@ -452,7 +501,7 @@ struct ConnectivityScratch {
         }
         for (size_t idx = 0; idx < acc_k.size(); ++idx) {
             const eigen_cplx_type new_val = values[acc_k[idx]] - eigen_cplx_type(acc_re[idx], acc_im[idx]);
-            if (std::abs(new_val) < kRemovedEdgeEps) removed.push_back(acc_k[idx]);
+            if (removed_edge(new_val)) removed.push_back(acc_k[idx]);
         }
     }
 
@@ -667,8 +716,7 @@ bool row_has_moves(const Contingency& ctg, const eigen_cplx_type* values, int n_
     for (int b : ctg.empty_buses) if (b < n_graph) return true;
     for (const auto& m : acc) {
         if (m.row >= n_graph || m.col >= n_graph) return true;
-        if (m.row != m.col && std::abs(values[m.k]) < kRemovedEdgeEps
-                && std::abs(values[m.k] - m.delta) >= kRemovedEdgeEps)
+        if (m.row != m.col && removed_edge(values[m.k]) && !removed_edge(values[m.k] - m.delta))
             return true;
     }
     return false;
@@ -695,25 +743,22 @@ std::vector<int> effective_empty(const Contingency& ctg, int n_graph, int n_tota
 // Components of a row on its own edge set: the nonzero off-diagonal entries of its Ybus
 // (the base values, minus its merged deltas where it has some), its empty buses left out
 // (label -1). BFS from every unlabelled bus in increasing order; returns the number of
-// components.
+// components. `delta_at`: scratch, one entry per Ybus entry, all -1 (left so on return).
 int label_row_components(const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
                          const std::vector<MergedDelta>& acc, const std::vector<int>& empty,
-                         std::vector<int>& comp, std::vector<int>& queue)
+                         std::vector<int>& comp, std::vector<int>& queue, std::vector<int>& delta_at)
 {
     const int n_total = static_cast<int>(Ybus_rm.rows());
     const int* outer = Ybus_rm.outerIndexPtr();
     const int* inner = Ybus_rm.innerIndexPtr();
     const eigen_cplx_type* values = Ybus_rm.valuePtr();
-    // the row's changes by flat index, looked up by binary search: a linear scan per visited
-    // entry costs nnz x changes per row (~1.5M per moved row on a 7k-bus grid)
-    std::vector<std::pair<int, eigen_cplx_type>> by_k;
-    by_k.reserve(acc.size());
-    for (const auto& m : acc) by_k.emplace_back(m.k, m.delta);
-    std::sort(by_k.begin(), by_k.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    // the row's changes by flat index (merged_deltas: one per entry), looked up in O(1): every
+    // entry of the matrix is visited, once per moved row
+    delta_at.resize(static_cast<size_t>(Ybus_rm.nonZeros()), -1);
+    for (size_t i = 0; i < acc.size(); ++i) delta_at[static_cast<size_t>(acc[i].k)] = static_cast<int>(i);
     const auto value_of = [&](int k) {
-        const auto it = std::lower_bound(by_k.begin(), by_k.end(), k,
-                                         [](const auto& e, int key) { return e.first < key; });
-        return (it != by_k.end() && it->first == k) ? values[k] - it->second : values[k];
+        const int i = delta_at[static_cast<size_t>(k)];
+        return i >= 0 ? values[k] - acc[static_cast<size_t>(i)].delta : values[k];
     };
     constexpr int kEmpty = -2;
     comp.assign(static_cast<size_t>(n_total), -1);
@@ -730,7 +775,7 @@ int label_row_components(const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMa
             for (int p = outer[u]; p < outer[u + 1]; ++p) {
                 const int v = inner[p];
                 if (v == u || comp[static_cast<size_t>(v)] != -1) continue;
-                if (std::abs(value_of(p)) < kRemovedEdgeEps) continue;
+                if (removed_edge(value_of(p))) continue;
                 comp[static_cast<size_t>(v)] = nb_comp;
                 queue[static_cast<size_t>(tail++)] = v;
             }
@@ -738,7 +783,125 @@ int label_row_components(const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMa
         ++nb_comp;
     }
     for (int& c : comp) if (c == kEmpty) c = -1;
+    for (const auto& m : acc) delta_at[static_cast<size_t>(m.k)] = -1;
     return nb_comp;
+}
+
+// ---- cycle-space certificate: "still connected" without a search -------------
+// A row's removed edges (and the buses it empties, all of whose edges go with them) split the
+// graph into c components, which gives c - 1 independent cuts inside the removed set, each with
+// labels XOR-ing to 0: the removed labels have at least c - 1 dependencies, whatever the random
+// words. So `n_isolated` emptied buses and exactly `n_isolated` dependencies mean c = n_isolated
+// + 1: the rest is one piece. Exact when it answers; more dependencies (an island, or a chance
+// collision of the words) leave the answer to the search. O(removed edges) per row, where the
+// search visits the whole grid: most rows of a batch island nothing.
+struct CertScratch {
+    std::vector<int> edges;      // flat indices of the removed edges, either direction
+    std::vector<int> uf;         // union-find over {the base graph, the spare buses}
+    std::vector<int> delta_at;   // [nnz] the row's delta at each entry (index in acc), else -1
+};
+
+bool removed_labels_have(const ConnectivityIndex& ix, std::vector<int>& edges, int n_dependencies)
+{
+    for (int& k : edges) k = std::min(k, ix.k_rev[static_cast<size_t>(k)]);   // one per edge
+    std::sort(edges.begin(), edges.end());
+    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    uint64_t basis[64] = {};
+    int dependencies = 0;
+    for (int k : edges) {
+        uint64_t x = ix.label[static_cast<size_t>(k)];
+        while (x != 0) {
+            int h = 63;
+            while (!((x >> h) & 1ull)) --h;
+            if (basis[h] == 0) { basis[h] = x; break; }
+            x ^= basis[h];
+        }
+        if (x == 0 && ++dependencies > n_dependencies) return false;
+    }
+    return dependencies == n_dependencies;
+}
+
+// A row without moves (its removed entries `sc.removed`): certainly still connected.
+bool certify_removal(const ConnectivityIndex& ix, ConnectivityScratch& sc, CertScratch& cs)
+{
+    if (!ix.labels_ok) return false;
+    cs.edges.clear();
+    for (int k : sc.removed) {
+        if (!ix.live[static_cast<size_t>(k)]) continue;   // no edge to remove
+        if (!sc.is_removed(ix.k_rev[static_cast<size_t>(k)])) return false;   // one way only
+        cs.edges.push_back(k);
+    }
+    return removed_labels_have(ix, cs.edges, 0);
+}
+
+// A row with moves (bus_moves: its merged deltas `acc`, its empty buses `empty`, sorted):
+// certainly one piece once its empty buses are left out. Its base graph minus the edges it
+// removes and the buses it empties must be one piece (the labels), and every spare bus it uses
+// must reach the base graph through edges it stamps (both ways nonzero). An edge it adds between
+// base buses only joins more: not needed. `cs.delta_at` is filled with the row's deltas by the
+// caller (certify_moves).
+bool certify_moves_filled(const ConnectivityIndex& ix, const eigen_cplx_type* values, int n_graph, int n_total,
+                          const std::vector<MergedDelta>& acc, const std::vector<int>& empty, CertScratch& cs)
+{
+    const auto is_empty = [&](int b) { return std::binary_search(empty.begin(), empty.end(), b); };
+    // the row's value of the entry (row, col): its base value minus its delta there, 0 off the pattern
+    const auto value_at = [&](int row, int col) {
+        const int* b = ix.inner + ix.outer[row];
+        const int* e = ix.inner + ix.outer[row + 1];
+        const int* it = std::lower_bound(b, e, col);
+        if (it == e || *it != col) return eigen_cplx_type(0);
+        const int k = static_cast<int>(it - ix.inner);
+        const int i = cs.delta_at[static_cast<size_t>(k)];
+        return i >= 0 ? values[k] - acc[static_cast<size_t>(i)].delta : values[k];
+    };
+    const auto new_value = [&](const MergedDelta& m) { return values[m.k] - m.delta; };
+    cs.edges.clear();
+    for (const auto& m : acc) {
+        if (m.row == m.col || m.row >= n_graph || m.col >= n_graph || !ix.live[static_cast<size_t>(m.k)]) continue;
+        if (!removed_edge(new_value(m))) continue;
+        if (!removed_edge(value_at(m.col, m.row))) return false;   // one way only
+        cs.edges.push_back(m.k);
+    }
+    int n_isolated = 0;
+    for (int b : empty) {
+        if (b >= n_graph) continue;
+        ++n_isolated;
+        for (int p = ix.outer[b]; p < ix.outer[b + 1]; ++p)
+            if (ix.live[static_cast<size_t>(p)]) cs.edges.push_back(p);
+    }
+    if (!removed_labels_have(ix, cs.edges, n_isolated)) return false;
+    if (n_total == n_graph) return true;
+    // the spare buses it uses: joined to the base graph (node 0) by its stamps
+    cs.uf.resize(static_cast<size_t>(n_total - n_graph + 1));
+    for (size_t i = 0; i < cs.uf.size(); ++i) cs.uf[i] = static_cast<int>(i);
+    const auto node = [n_graph](int b) { return b < n_graph ? 0 : b - n_graph + 1; };
+    const auto root = [&](int a) {
+        while (cs.uf[static_cast<size_t>(a)] != a) a = cs.uf[static_cast<size_t>(a)] = cs.uf[static_cast<size_t>(cs.uf[static_cast<size_t>(a)])];
+        return a;
+    };
+    for (const auto& m : acc) {
+        if (m.row == m.col || (m.row < n_graph && m.col < n_graph)) continue;
+        if (is_empty(m.row) || is_empty(m.col) || removed_edge(new_value(m))) continue;
+        if (removed_edge(value_at(m.col, m.row))) continue;   // not an edge both ways
+        const int a = root(node(m.row)), c = root(node(m.col));
+        if (a != c) cs.uf[static_cast<size_t>(std::max(a, c))] = std::min(a, c);
+    }
+    for (int sp = n_graph; sp < n_total; ++sp)
+        if (!is_empty(sp) && root(node(sp)) != 0) return false;
+    return true;
+}
+
+// certify_moves_filled with the row's deltas indexed by entry (merged_deltas: one per entry), so
+// the reverse of an entry is found in O(log degree), not by a scan of the row's deltas
+bool certify_moves(const ConnectivityIndex& ix, const eigen_cplx_type* values, int n_graph, int n_total,
+                   const std::vector<MergedDelta>& acc, const std::vector<int>& empty, CertScratch& cs)
+{
+    if (!ix.labels_ok || !ix.skip_zero) return false;   // (the search reads values: zeros no edges)
+    cs.delta_at.resize(static_cast<size_t>(ix.nnz), -1);
+    for (size_t i = 0; i < acc.size(); ++i) cs.delta_at[static_cast<size_t>(acc[i].k)] = static_cast<int>(i);
+    const bool ok = certify_moves_filled(ix, values, n_graph, n_total, acc, empty, cs);
+    for (const auto& m : acc) cs.delta_at[static_cast<size_t>(m.k)] = -1;
+    return ok;
 }
 
 }  // namespace
@@ -750,7 +913,8 @@ void check_connectivity(
     std::vector<Contingency>&                                     contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
     int                                                           n_graph,
-    bool                                                          union_pattern)
+    bool                                                          union_pattern,
+    ConnectivityStats*                                            stats)
 {
     const int n_total = static_cast<int>(Ybus_rm.rows());
     if (n_graph < 0 || n_graph > n_total) n_graph = n_total;
@@ -759,7 +923,8 @@ void check_connectivity(
     const eigen_cplx_type*  values = Ybus_rm.valuePtr();
     std::vector<int>        masked;
     std::vector<MergedDelta> acc;
-    std::vector<int>        comp, queue;
+    std::vector<int>        comp, queue, delta_at;
+    CertScratch             cs;
 
     for (auto& ctg : contingencies) {
         ctg.empty_effective = effective_empty(ctg, n_graph, n_total);
@@ -767,11 +932,19 @@ void check_connectivity(
         merged_deltas(ctg, acc);
         if (row_has_moves(ctg, values, n_graph, acc)) {
             // bus moves: the row's own graph; its empty buses are no island
-            if (label_row_components(Ybus_rm, acc, ctg.empty_effective, comp, queue) > 1)
+            if (certify_moves(ix, values, n_graph, n_total, acc, ctg.empty_effective, cs)) {
+                if (stats) ++stats->certified_moves;
+                continue;
+            }
+            if (label_row_components(Ybus_rm, acc, ctg.empty_effective, comp, queue, delta_at) > 1)
                 ctg.disconnected = true;
             continue;
         }
         sc.collect_removed(ctg, values);
+        if (certify_removal(ix, sc, cs)) {
+            if (stats) ++stats->certified_removal;
+            continue;
+        }
         if (fast_masked_set(ix, sc, masked)) {
             if (!masked.empty()) ctg.disconnected = true;
         } else if (count_reachable_from_0(ix, sc) < ix.n_bus) {
@@ -788,7 +961,8 @@ void compute_component_masks(
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
     const MaskConfig&                                             cfg,
     int                                                           n_graph,
-    bool                                                          union_pattern)
+    bool                                                          union_pattern,
+    ConnectivityStats*                                            stats)
 {
     const int n_total = static_cast<int>(Ybus_rm.rows());
     if (n_graph < 0 || n_graph > n_total) n_graph = n_total;
@@ -797,7 +971,8 @@ void compute_component_masks(
     const eigen_cplx_type*  values = Ybus_rm.valuePtr();
     const int               n_bus  = n_total;   // masked buses may be spare ones (a moved island)
     std::vector<MergedDelta> acc;
-    std::vector<int>        comp, queue;
+    std::vector<int>        comp, queue, delta_at;
+    CertScratch             cs;
 
     const int n_grp  = static_cast<int>(cfg.vc_grp_count.size());
     const int n_ctrl = static_cast<int>(cfg.vc_bus.size());
@@ -815,7 +990,11 @@ void compute_component_masks(
 
         if (row_has_moves(ctg, values, n_graph, acc)) {
             // bus moves: the row's own graph, its empty buses left out (masked anyway)
-            const int nb_comp = label_row_components(Ybus_rm, acc, ctg.empty_effective, comp, queue);
+            if (certify_moves(ix, values, n_graph, n_total, acc, ctg.empty_effective, cs)) {
+                if (stats) ++stats->certified_moves;
+                continue;
+            }
+            const int nb_comp = label_row_components(Ybus_rm, acc, ctg.empty_effective, comp, queue, delta_at);
             if (nb_comp <= 1) continue;
             std::vector<int> count(static_cast<size_t>(nb_comp), 0);
             for (int c : comp) if (c >= 0) ++count[static_cast<size_t>(c)];
@@ -826,6 +1005,10 @@ void compute_component_masks(
                     ctg.masked_buses.push_back(b);
         } else {
             sc.collect_removed(ctg, values);
+            if (certify_removal(ix, sc, cs)) {   // connected: nothing masked
+                if (stats) ++stats->certified_removal;
+                continue;
+            }
             if (!fast_masked_set(ix, sc, ctg.masked_buses)) {
                 const int nb_comp = label_components(ix, sc);
                 if (nb_comp <= 1) continue;   // still connected → nothing masked
@@ -1134,21 +1317,33 @@ void build_tripped_branch_table(
     const std::vector<int>&         active_to_orig,
     std::vector<int>&               h_trip_branch_flat,
     std::vector<int>&               h_trip_start,
-    std::vector<int>&               h_trip_count)
+    std::vector<int>&               h_trip_count,
+    std::vector<int>*               h_trip_own,
+    std::vector<RowBranchBlock>*    h_own)
 {
     const int n_active = static_cast<int>(active_to_orig.size());
     h_trip_start.resize(static_cast<size_t>(n_active));
     h_trip_count.resize(static_cast<size_t>(n_active));
     h_trip_branch_flat.clear();
+    const bool own = h_trip_own != nullptr && h_own != nullptr;
+    if (own) { h_trip_own->clear(); h_own->clear(); }
 
     for (int slot = 0; slot < n_active; ++slot) {
         const Contingency& ctg = contingencies[static_cast<size_t>(active_to_orig[slot])];
         const auto& tb = ctg.tripped_branches;
-        const auto& ub = ctg.unchecked_branches;   // skipped by the check as a trip is
+        const size_t n_own = own ? ctg.own_branches.size() : 0;
         h_trip_start[static_cast<size_t>(slot)] = static_cast<int>(h_trip_branch_flat.size());
-        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size() + ub.size());
+        h_trip_count[static_cast<size_t>(slot)] = static_cast<int>(tb.size() + n_own);
+        // the own blocks first: a branch both tripped and listed with its own block (opened at
+        // one end, its other end moved) takes its block (the first match wins)
+        if (own)
+            for (const RowBranchBlock& ob : ctg.own_branches) {
+                h_trip_branch_flat.push_back(ob.branch);
+                h_trip_own->push_back(static_cast<int>(h_own->size()));
+                h_own->push_back(ob);
+            }
         h_trip_branch_flat.insert(h_trip_branch_flat.end(), tb.begin(), tb.end());
-        h_trip_branch_flat.insert(h_trip_branch_flat.end(), ub.begin(), ub.end());
+        if (own) h_trip_own->insert(h_trip_own->end(), tb.size(), -1);
     }
 }
 

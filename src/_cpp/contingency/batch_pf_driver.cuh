@@ -67,6 +67,7 @@
 #include "row_status.hpp"                         // BatchScheduling, RowStatus
 #include "slot_schedule.cuh"                      // SlotLoadView, SlotTableView, PinnedBuffer
 #include "../outer/outer_hook.hpp"                // outer::OuterHook
+#include "../outer/device_outer_model.hpp"        // outer::DeviceOuterHook
 #include "strategies/cudss_batch_solver.cuh"
 #include "strategies/policy_refactor_every.cuh"
 #include "strategies/policy_base_case_factors.cuh"
@@ -1140,6 +1141,9 @@ private:
     bool                                  oc_mirrors_on_device_ = false;
     thrust::device_vector<int>            d_oc_watch_, d_oc_cand_bus_, d_oc_cand_pin_, d_oc_list_;
     thrust::device_vector<cuda_real_type> d_oc_gather_;
+    // outer_loops_backend='device': the decide lists / outcomes and the control slot lists, kept
+    // across rounds (an allocation per round would synchronise the device)
+    thrust::device_vector<int>            d_oc_dec_in_, d_oc_dec_out_, d_oc_wsl_, d_oc_wlr_;
     PinnedBuffer<cuda_real_type>          h_oc_gather_;
     thrust::device_vector<int>            d_oc_ds_slot_, d_oc_ds_bus_, d_oc_vr_slot_, d_oc_vr_bus_;
     thrust::device_vector<cuda_real_type> d_oc_ds_p_, d_oc_ds_q_, d_oc_vr_vm_;
@@ -1188,7 +1192,8 @@ private:
     // pending |V| resets.
     void _oc_write_controls(const std::vector<int>& slots, bool reload_sbus);
     // the converged slots `slots` gathered to the host; returns the row stride
-    void _oc_gather(const std::vector<int>& slots, const NrIterBuffers& buf);
+    void _oc_gather(const std::vector<int>& slots, const NrIterBuffers& buf, bool download = true);
+    void _oc_write_controls_device(outer::DeviceOuterHook* dev, const std::vector<int>& slots, bool reload_sbus);
 
     // Building blocks shared by the chunked and the continuous schedules (see
     // their definitions in batch_pf_driver.cu). d_slot_active: [n_slots] the

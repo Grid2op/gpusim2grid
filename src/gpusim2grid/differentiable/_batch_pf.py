@@ -210,6 +210,7 @@ from torch import Tensor
 
 from .. import _gpusim2grid as _cpp
 from .._ls2g_utils import extract_branch_data, gen_v_driven_columns, GEN_V_CONFLICT_TOL
+from .._outer_loops import OuterLoopsBackend
 from ..scenario_sweep.gpu_facade import ScenarioSweepGPU
 from ._flows import compute_flows as _compute_flows_torch
 
@@ -386,7 +387,8 @@ class BatchPowerFlow:
                     init_from_n_powerflow=True, max_iter_base=10, tol_base=1e-8,
                     precision=None, gen_v_conflict_tol=GEN_V_CONFLICT_TOL,
                     redistribute_slack=False, scheduling=None, batch_size=None,
-                    nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False):
+                    nb_iter_per_round=1, tol=None, outer_loops=False, keep_outer_trace=False,
+                    outer_loops_backend=OuterLoopsBackend.HOST):
         """Build from a *solved* lightsim2grid grid (``grid.ac_pf`` done).
 
         The keyword arguments are :class:`gpusim2grid.ScenarioSweepGPU`'s
@@ -404,6 +406,8 @@ class BatchPowerFlow:
         :class:`ScenarioSweepGPU`), and the gradient is lightsim2grid's through
         them: the one of each row's last inner solve, every decision of its loops
         held (see the module docstring), ``redistribute_slack`` included.
+        ``outer_loops_backend`` (:class:`~gpusim2grid.OuterLoopsBackend` or its string) is
+        :class:`ScenarioSweepGPU`'s.
         """
         sweep = ScenarioSweepGPU(
             grid, init_from_n_powerflow=init_from_n_powerflow, precision=precision,
@@ -418,7 +422,8 @@ class BatchPowerFlow:
             # a row's angles must not depend on the other rows' topologies
             reference_slack="grid",
             scheduling=scheduling, nb_iter_per_round=nb_iter_per_round, tol=tol,
-            outer_loops=outer_loops, keep_outer_trace=keep_outer_trace)
+            outer_loops=outer_loops, keep_outer_trace=keep_outer_trace,
+            outer_loops_backend=outer_loops_backend)
         sweep.strategy = strategy
         pf = cls(sweep, snapshot_jacobian=snapshot_jacobian,
                  gen_v_conflict_tol=gen_v_conflict_tol, batch_size=batch_size)

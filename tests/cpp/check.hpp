@@ -87,6 +87,12 @@ inline int run_tests(bool needs_gpu)
         if (!(cond)) g2g_test::fail(__FILE__, __LINE__, #cond);                                    \
     } while (0)
 
+// CHECK with a note of where (a row, a seed) in the failure message
+#define CHECK_MSG(cond, msg)                                                                       \
+    do {                                                                                           \
+        if (!(cond)) g2g_test::fail(__FILE__, __LINE__, std::string(#cond) + " -- " + (msg));     \
+    } while (0)
+
 #define CHECK_CLOSE(a, b, tol)                                                                     \
     do {                                                                                           \
         const double g2g_a_ = static_cast<double>(a), g2g_b_ = static_cast<double>(b);             \

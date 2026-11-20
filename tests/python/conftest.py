@@ -80,6 +80,40 @@ def residual_atol() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Parity tolerances: two paths of the SAME algorithm (see CLAUDE.md, Tests)
+# ---------------------------------------------------------------------------
+# solver_atol / residual_atol compare against a reference solved by another
+# solver: what the NR tolerance leaves. Two paths of one algorithm
+# (outer_loops_backend='host' vs 'device', a fused vs unfused kernel, two
+# sessions) differ by rounding only -- reduction order, FMA, the device's libm --
+# which Newton amplifies by the Jacobian's conditioning: far below that. One
+# value per kind of quantity, stated for FP64: a test using them skips FP32
+# builds, which have no rounding-level bound worth stating.
+PARITY_TOL_FP64: dict[str, float] = {
+    # the same arithmetic in the same order on both sides (the lockstep harness:
+    # both outer models fed the same inner solves; one path run twice): last bits
+    "lockstep": 1e-12,
+    # ... and the MW targets that arithmetic moves (sums of shares over units)
+    "lockstep_mw": 1e-9,
+    # a converged state from two paths whose reductions differ: V (pu, rad), and
+    # relatively what is computed from it (flows, the values a decision compares)
+    "state": 1e-9,
+    # MW targets the loops moved from such a state (shares of a slack mismatch)
+    "mw": 1e-6,
+    # adjoint gradients through such a state (a cuDSS solve of J^T on each side)
+    "gradient": 1e-8,
+}
+
+
+def parity_tol(kind: str) -> float:
+    """The parity tolerance of `kind` (PARITY_TOL_FP64); raises in an FP32 build,
+    where the test using it must be skipped."""
+    if _is_fp32():
+        raise RuntimeError("parity tolerances are FP64 ones: skip this test on an FP32 build")
+    return PARITY_TOL_FP64[kind]
+
+
+# ---------------------------------------------------------------------------
 # Core lightsim2grid / pandapower grid
 # ---------------------------------------------------------------------------
 

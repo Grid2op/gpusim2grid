@@ -184,8 +184,12 @@ struct ViolRowArgs {
     const cuda_real_type*  base_ex_A;
     const cuda_real_type*  lim1;
     const cuda_real_type*  lim2;
-    const int*             trip;         // the row's tripped branches
+    const int*             trip;         // the row's tripped branches, then its own-block ones
     int                    t_count;
+    const int*             trip_own;     // per trip entry: -1 tripped, else its own block (null: all tripped)
+    const cudaComplexType* own_y;        // TrippedBranchTable::d_own_y / d_own_ft / d_own_base
+    const int*             own_ft;
+    const cuda_real_type*  own_base;
     const int*             branch_bc;    // null: every branch has its shared *_eff block
     const cudaComplexType* bc_applied;   // the slot's own blocks, [n_bc * 4]
     cuda_real_type         up;           // 1 + rel_tol (HIGH_VOLTAGE / CURRENT)
@@ -201,8 +205,10 @@ struct ViolRowArgs {
 __device__ __noinline__ int eval_branch(const ViolRowArgs& a, int l, cuda_real_type* value,
                                         cuda_real_type* limit, cuda_real_type* sev)
 {
+    int own = -2;   // -2: the shared block, -1: tripped, k >= 0: the row's own block k
     for (int ti = 0; ti < a.t_count; ++ti)
-        if (a.trip[ti] == l) return 0;   // Ybus was patched but yff_eff/yft_eff/ytf_eff/ytt_eff weren't -- would report a phantom current
+        if (a.trip[ti] == l) { own = a.trip_own != nullptr ? a.trip_own[ti] : -1; break; }
+    if (own == -1) return 0;   // Ybus was patched but yff_eff/yft_eff/ytf_eff/ytt_eff weren't -- would report a phantom current
 
     const cuda_real_type lim1 = a.lim1[l];
     const cuda_real_type lim2 = a.lim2[l];
@@ -217,16 +223,23 @@ __device__ __noinline__ int eval_branch(const ViolRowArgs& a, int l, cuda_real_t
     // itself doesn't exist. Reading V[-1] without this guard is an
     // out-of-bounds read (confirmed via compute-sanitizer on a real
     // half-open-line grid).
-    const int bf = a.from[l];
-    const int bt = a.to[l];
-    const cudaComplexType Vi = (bf >= 0) ? a.V[bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
-    const cudaComplexType Vj = (bt >= 0) ? a.V[bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
-    // a transformer whose taps the outer loops move: the block the slot holds now
+    int bf = a.from[l];
+    int bt = a.to[l];
+    cuda_real_type base_or = a.base_A[l], base_ex = a.base_ex_A[l];
     cudaComplexType yff = a.yff[l], yft = a.yft[l], ytf = a.ytf[l], ytt = a.ytt[l];
-    if (a.branch_bc != nullptr && a.branch_bc[l] >= 0) {
+    if (own >= 0) {
+        // a strategy's transformer values / bus moves: the row's own block and ends
+        const cudaComplexType* y = a.own_y + 4 * own;
+        yff = y[0]; yft = y[1]; ytf = y[2]; ytt = y[3];
+        bf = a.own_ft[2 * own]; bt = a.own_ft[2 * own + 1];
+        base_or = a.own_base[2 * own]; base_ex = a.own_base[2 * own + 1];
+    } else if (a.branch_bc != nullptr && a.branch_bc[l] >= 0) {
+        // a transformer whose taps the outer loops move: the block the slot holds now
         const cudaComplexType* y = a.bc_applied + 4 * a.branch_bc[l];
         yff = y[0]; yft = y[1]; ytf = y[2]; ytt = y[3];
     }
+    const cudaComplexType Vi = (bf >= 0) ? a.V[bf] : CudaFunHelper::my_make_cuComplex(0., 0.);
+    const cudaComplexType Vj = (bt >= 0) ? a.V[bt] : CudaFunHelper::my_make_cuComplex(0., 0.);
     const cudaComplexType I_or = (bf >= 0) ? CudaFunHelper::my_cuCadd(
         CudaFunHelper::my_cuCmul(yff, Vi), CudaFunHelper::my_cuCmul(yft, Vj))
         : CudaFunHelper::my_make_cuComplex(0., 0.);
@@ -234,8 +247,8 @@ __device__ __noinline__ int eval_branch(const ViolRowArgs& a, int l, cuda_real_t
         CudaFunHelper::my_cuCmul(ytf, Vi), CudaFunHelper::my_cuCmul(ytt, Vj))
         : CudaFunHelper::my_make_cuComplex(0., 0.);
     // *0.001: gpusim2grid's d_base_current_A is Amps-based; limits are kA.
-    const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * a.base_A[l] * cuda_real_type(0.001);
-    const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * a.base_ex_A[l] * cuda_real_type(0.001);
+    const cuda_real_type ka_or = CudaFunHelper::my_cuCabs(I_or) * base_or * cuda_real_type(0.001);
+    const cuda_real_type ka_ex = CudaFunHelper::my_cuCabs(I_ex) * base_ex * cuda_real_type(0.001);
 
     // beyond the limit by more than rel_tol (violation_rel_tol, lightsim2grid's
     // OperationalCheck.hpp): a value ON its limit up to rounding is not reported
@@ -312,9 +325,7 @@ __global__ void __launch_bounds__(VIOL_BLOCK) check_limit_violations_kernel(
     const cuda_real_type*  __restrict__ d_base_current_ex_A,
     const cuda_real_type*  __restrict__ d_branch_limit_a1_ka,
     const cuda_real_type*  __restrict__ d_branch_limit_a2_ka,
-    const int*             __restrict__ d_trip_start,
-    const int*             __restrict__ d_trip_count,
-    const int*             __restrict__ d_trip_branch_flat,
+    TrippedBranchTable     trip_table,
     int n_bus, int n_branches, int n_lines,
     int c_start, int actual_batch, int K,
     const int* __restrict__ d_result_map,
@@ -386,7 +397,7 @@ __global__ void __launch_bounds__(VIOL_BLOCK) check_limit_violations_kernel(
         return;
     }
 
-    const int t_start = d_trip_start ? d_trip_start[slot_global] : 0;
+    const int t_start = trip_table.d_start ? trip_table.d_start[slot_global] : 0;
     ViolRowArgs a;
     a.V = d_V + local_c * n_bus;
     a.vn_kv = d_bus_vn_kv; a.vmin_kv = d_bus_vmin_kv; a.vmax_kv = d_bus_vmax_kv;
@@ -394,8 +405,12 @@ __global__ void __launch_bounds__(VIOL_BLOCK) check_limit_violations_kernel(
     a.yff = d_yff_eff; a.yft = d_yft_eff; a.ytf = d_ytf_eff; a.ytt = d_ytt_eff;
     a.base_A = d_base_current_A; a.base_ex_A = d_base_current_ex_A;
     a.lim1 = d_branch_limit_a1_ka; a.lim2 = d_branch_limit_a2_ka;
-    a.trip = d_trip_branch_flat ? d_trip_branch_flat + t_start : nullptr;
-    a.t_count = d_trip_count ? d_trip_count[slot_global] : 0;
+    a.trip = trip_table.d_branch_flat ? trip_table.d_branch_flat + t_start : nullptr;
+    a.t_count = trip_table.d_count ? trip_table.d_count[slot_global] : 0;
+    a.trip_own = trip_table.d_own ? trip_table.d_own + t_start : nullptr;
+    a.own_y = trip_table.d_own_y;
+    a.own_ft = trip_table.d_own_ft;
+    a.own_base = trip_table.d_own_base;
     a.branch_bc = d_branch_bc;
     a.bc_applied = d_bc_applied ? d_bc_applied + 4 * local_c * n_bc : nullptr;
     a.up = cuda_real_type(1) + rel_tol;

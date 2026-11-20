@@ -508,8 +508,14 @@ void ContingencyAnalysisSession::run()
     row_pv_to_pq_.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
     row_slack_off.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
     if (any_controller_trip) {
-        gen_contingency::prepare_rows(gen_data_, n_ctg_all, ctg_gen_off, ctg_sto_off, ctg_hvdc_off, base_ledger_.get(),
-                                      required, row_pv_to_pq_, row_slack_off);
+        gen_contingency::prepare_rows(gen_data_, n_ctg_all,
+                                      [this, &unsupported](int r, gen_contingency::RowOff& off) {
+                                          if (!unsupported[static_cast<size_t>(r)].empty()) return;
+                                          off.gens  = ctg_gens_[static_cast<size_t>(r)];
+                                          off.stos  = ctg_more_[static_cast<size_t>(r)].storages;
+                                          off.hvdcs = ctg_more_[static_cast<size_t>(r)].hvdcs;
+                                      },
+                                      base_ledger_.get(), required, row_pv_to_pq_, row_slack_off);
         if (outer_ && !required.empty()) {
             // a row releasing a bus the outer loops' ledger did not reserve (ReactiveLimits
             // reserves every bus its own machines hold)
@@ -1100,7 +1106,7 @@ __global__ void max_loading_kernel(const cuda_real_type* __restrict__ or_amps, c
 }  // namespace
 
 std::pair<RealVect, std::vector<int>> ContingencyAnalysisSession::compute_max_loading(
-    Eigen::Ref<const RealVect> lim1_ka, Eigen::Ref<const RealVect> lim2_ka, const std::vector<long long>& skip)
+    Eigen::Ref<const RealVect> lim1_ka, Eigen::Ref<const RealVect> lim2_ka)
 {
     _compute_flows_device();
     const int n_rows = solver_->n_contingencies;
@@ -1108,19 +1114,6 @@ std::pair<RealVect, std::vector<int>> ContingencyAnalysisSession::compute_max_lo
     if (lim1_ka.size() != n_bra || lim2_ka.size() != n_bra)
         throw std::runtime_error("ContingencyAnalysisSession::compute_max_loading: one limit per branch and side");
     const cudaStream_t cs = solver_->cs;
-    // the branches the caller computes itself (their values / ends change on that row): out of the max
-    thrust::device_vector<long long> d_skip;
-    if (!skip.empty()) {
-        const long long n_z = static_cast<long long>(skip.size());
-        for (long long k : skip)
-            if (k < 0 || k >= static_cast<long long>(n_rows) * n_bra)
-                throw std::runtime_error("ContingencyAnalysisSession::compute_max_loading: skip entry out of range");
-        upload_h2d(d_skip, skip.data(), skip.size(), cs);
-        zero_branch_flows_kernel<<<static_cast<unsigned>((n_z + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
-            thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
-            thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
-            thrust::raw_pointer_cast(d_skip.data()), n_z);
-    }
     thrust::device_vector<double> d_l1, d_l2, d_rho(static_cast<size_t>(std::max(n_rows, 1)));
     thrust::device_vector<int> d_br(static_cast<size_t>(std::max(n_rows, 1)));
     upload_h2d(d_l1, lim1_ka.data(), static_cast<size_t>(n_bra), cs);
@@ -1141,7 +1134,6 @@ std::pair<RealVect, std::vector<int>> ContingencyAnalysisSession::compute_max_lo
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess)
         throw std::runtime_error(std::string("ContingencyAnalysisSession::compute_max_loading: ") + cudaGetErrorString(e));
-    // (the host flows of a previous compute_flows() are untouched: the zeroing is on the device)
     return {rho, branch};
 }
 
@@ -1207,10 +1199,71 @@ void ContingencyAnalysisSession::_compute_flows_device()
             n_z);
     }
 
-    // stop_ms() records + synchronizes the stop event, so this also serves as
-    // the sync point that lets d_zero be safely destroyed below.
+    // the branches a row holds its own block of (a strategy's transformer values, bus moves),
+    // after the zeroing: a branch the row opens at one end keeps its other end's current
+    _override_own_branch_flows();
+
     timings_.t_flow_computation += flow_timer.stop_ms();
-    // d_zero destroyed here, after sync
+    // d_zero dies here: wait for the kernel reading it (stop_ms() does not under GPUSIM2GRID_ASYNC_TIMERS)
+    if (!h_zero.empty()) cudaStreamSynchronize(cs);
+}
+
+void ContingencyAnalysisSession::_override_own_branch_flows()
+{
+    // the flows are those of the rows the last run solved, over the branches the driver holds: a
+    // block outside them (contingencies rebuilt since, branch data set after the blocks) would be
+    // written past the flow buffers
+    static const char* who = "ContingencyAnalysisSession::compute_flows";
+    const int n_run = solver_->n_contingencies, n_bra = solver_->n_branches_;
+    std::vector<int> rows, branches, ft;
+    std::vector<cudaComplexType> blk;
+    std::vector<cuda_real_type> base;
+    for (size_t c = 0; c < contingencies_.size(); ++c)
+        for (const RowBranchBlock& ob : contingencies_[c].own_branches) {
+            if (static_cast<long long>(c) >= n_run)
+                throw std::runtime_error(std::string(who) + ": row " + std::to_string(c) + " has its own branch blocks "
+                                         "but the last run solved " + std::to_string(n_run) + " rows: run() first");
+            if (ob.branch >= n_bra)
+                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(ob.branch) + " of row "
+                                         + std::to_string(c) + "'s own blocks is not one of the "
+                                         + std::to_string(n_bra) + " branches");
+            rows.push_back(static_cast<int>(c));
+            branches.push_back(ob.branch);
+            for (int q = 0; q < 4; ++q)
+                blk.push_back(CudaFunHelper::my_make_cuComplex(static_cast<cuda_real_type>(ob.y[q].real()),
+                                                               static_cast<cuda_real_type>(ob.y[q].imag())));
+            ft.push_back(ob.from);
+            ft.push_back(ob.to);
+            base.push_back(static_cast<cuda_real_type>(ob.base_or_A));
+            base.push_back(static_cast<cuda_real_type>(ob.base_ex_A));
+        }
+    if (rows.empty()) return;
+    const cudaStream_t cs = solver_->cs;
+    thrust::device_vector<int> d_rows, d_br, d_ft;
+    thrust::device_vector<cudaComplexType> d_blk;
+    thrust::device_vector<cuda_real_type> d_base;
+    upload_h2d(d_rows, rows.data(), rows.size(), cs);
+    upload_h2d(d_br, branches.data(), branches.size(), cs);
+    upload_h2d(d_blk, blk.data(), blk.size(), cs);
+    upload_h2d(d_ft, ft.data(), ft.size(), cs);
+    upload_h2d(d_base, base.data(), base.size(), cs);
+    const int n = static_cast<int>(rows.size());
+    override_branch_flows_kernel<<<static_cast<unsigned>((n + SESSION_BS - 1) / SESSION_BS), SESSION_BS, 0, cs>>>(
+        thrust::raw_pointer_cast(solver_->d_V_results.data()),
+        thrust::raw_pointer_cast(d_rows.data()), thrust::raw_pointer_cast(d_br.data()),
+        thrust::raw_pointer_cast(d_blk.data()),
+        thrust::raw_pointer_cast(solver_->d_branch_from.data()),
+        thrust::raw_pointer_cast(solver_->d_branch_to.data()),
+        thrust::raw_pointer_cast(solver_->d_base_current_A.data()),
+        thrust::raw_pointer_cast(solver_->d_base_current_ex_A.data()),
+        thrust::raw_pointer_cast(solver_->d_or_amps_results.data()),
+        thrust::raw_pointer_cast(solver_->d_ex_amps_results.data()),
+        base_state_->n_bus, solver_->n_branches_, n,
+        thrust::raw_pointer_cast(d_ft.data()), thrust::raw_pointer_cast(d_base.data()));
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ContingencyAnalysisSession::_override_own_branch_flows: ") + cudaGetErrorString(e));
+    cudaStreamSynchronize(cs);   // the staging vectors die here
 }
 
 // =============================================================================
@@ -1857,22 +1910,44 @@ void ContingencyAnalysisSession::set_row_empty_buses(const std::vector<std::vect
     ++contingencies_generation_;
 }
 
-void ContingencyAnalysisSession::set_row_unchecked_branches(const std::vector<std::vector<int>>& rows)
+void ContingencyAnalysisSession::set_row_branch_blocks(Eigen::Ref<const IntVect> rows,
+                                                       Eigen::Ref<const IntVect> branches,
+                                                       Eigen::Ref<const IntVect> ends,
+                                                       Eigen::Ref<const CplxVect> y,
+                                                       Eigen::Ref<const RealVect> base_A)
 {
-    static const char* who = "ContingencyAnalysisSession::set_row_unchecked_branches";
+    static const char* who = "ContingencyAnalysisSession::set_row_branch_blocks";
     if (!has_contingencies_) throw std::runtime_error(std::string(who) + ": call build_contingencies() first");
-    if (rows.size() != contingencies_.size())
-        throw std::runtime_error(std::string(who) + ": " + std::to_string(rows.size()) + " lists for "
-                                 + std::to_string(contingencies_.size()) + " rows");
+    const Eigen::Index n = rows.size();
+    if (branches.size() != n || ends.size() != 2 * n || y.size() != 4 * n || base_A.size() != 2 * n)
+        throw std::runtime_error(std::string(who) + ": per entry one branch, 2 ends, 4 admittances and 2 bases");
+    const int n_rows = static_cast<int>(contingencies_.size());
     const int n_bra = static_cast<int>(h_branch_from_.size());
-    for (size_t c = 0; c < rows.size(); ++c) {
-        std::vector<int> branches = rows[c];
-        for (int l : branches)
-            if (l < 0 || (has_branch_data_ && l >= n_bra))
-                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(l) + " out of range");
-        std::sort(branches.begin(), branches.end());
-        branches.erase(std::unique(branches.begin(), branches.end()), branches.end());
-        contingencies_[c].unchecked_branches = std::move(branches);
+    const int n_bus_now = n_bus();
+    for (auto& ctg : contingencies_) ctg.own_branches.clear();
+    for (Eigen::Index i = 0; i < n; ++i) {
+        const int r = rows(i), l = branches(i);
+        if (r < 0 || r >= n_rows) throw std::runtime_error(std::string(who) + ": row " + std::to_string(r) + " out of range");
+        if (l < 0 || (has_branch_data_ && l >= n_bra))
+            throw std::runtime_error(std::string(who) + ": branch " + std::to_string(l) + " out of range");
+        RowBranchBlock ob;
+        ob.branch = l;
+        ob.from = ends(2 * i);
+        ob.to = ends(2 * i + 1);
+        for (int e : {ob.from, ob.to})
+            if (e < -1 || e >= n_bus_now)
+                throw std::runtime_error(std::string(who) + ": bus " + std::to_string(e) + " out of range");
+        for (int q = 0; q < 4; ++q) ob.y[q] = y(4 * i + q);
+        ob.base_or_A = base_A(2 * i);
+        ob.base_ex_A = base_A(2 * i + 1);
+        contingencies_[static_cast<size_t>(r)].own_branches.push_back(ob);
+    }
+    for (auto& ctg : contingencies_) {
+        auto& ob = ctg.own_branches;
+        std::sort(ob.begin(), ob.end(), [](const RowBranchBlock& a, const RowBranchBlock& b) { return a.branch < b.branch; });
+        for (size_t k = 1; k < ob.size(); ++k)
+            if (ob[k].branch == ob[k - 1].branch)
+                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(ob[k].branch) + " twice in a row");
     }
     ++contingencies_generation_;
 }

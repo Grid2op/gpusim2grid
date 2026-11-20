@@ -93,7 +93,7 @@ outer loops they are refused anyway).
 
 ### 2. `t_oc_load`
 
-*Done. Profiled on the CPU alone, through `_OuterModelHarness` (its `set_branch_off` now also
+*Done. Profiled on the CPU alone, through `_OuterModelHarness` (its `set_row_overrides` now also
 takes the rows' masked buses) on a snapshot saved with `LSGrid.save_binary`, under callgrind (a
 release build unstripped: `-C cmake.build-type=RelWithDebInfo` with `-O3`; `pybind11_add_module`
 strips every other build type). None of the suspects below: `collect_units`, which scans every

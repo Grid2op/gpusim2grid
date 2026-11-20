@@ -204,17 +204,23 @@ __global__ void oc_unrealistic_kernel(
     int n_list, int n_cand, int n_pin, int n_bus, int stride,
     cuda_real_type vmin, cuda_real_type vmax)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_list) return;
+    // One block per listed slot, its threads strided over the candidates: one
+    // thread per slot walked every bus of the grid alone (~12 ms per call on a
+    // 7k-bus grid, a fifth of an N-1 run's GPU time). The flag is an OR, so the
+    // result does not depend on the split.
+    const int i = blockIdx.x;
+    if (i >= n_list) return;   // uniform over the block
     const ptrdiff_t s = d_slots[i];
-    cuda_real_type flag = cuda_real_type(0);
-    for (int c = 0; c < n_cand; ++c) {
+    int hit = 0;
+    for (int c = threadIdx.x; c < n_cand && !hit; c += blockDim.x) {
         const int k = d_cand_pin[c];
         if (k >= 0 && d_pin != nullptr && d_pin[s * n_pin + k]) continue;   // PV: not an unknown
         const cuda_real_type vm = CudaFunHelper::my_cuCabs(d_V[s * n_bus + d_cand_bus[c]]);
-        if (vm < vmin || vm > vmax) { flag = cuda_real_type(1); break; }
+        if (vm < vmin || vm > vmax) hit = 1;
     }
-    d_out[static_cast<ptrdiff_t>(i) * stride + stride - 1] = flag;
+    hit = __syncthreads_or(hit);
+    if (threadIdx.x != 0) return;
+    d_out[static_cast<ptrdiff_t>(i) * stride + stride - 1] = hit ? cuda_real_type(1) : cuda_real_type(0);
     d_out[static_cast<ptrdiff_t>(i) * stride + stride - 2] =
         d_slack_absorbed != nullptr ? d_slack_absorbed[s] : cuda_real_type(0);
 }
@@ -228,7 +234,7 @@ __global__ void oc_sbus_delta_kernel(
     int n, int n_bus)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
+    if (t >= n || d_bus[t] < 0) return;   // bus -1: an unused entry of a fixed block
     cudaComplexType& s = d_Sbus[static_cast<ptrdiff_t>(d_slot[t]) * n_bus + d_bus[t]];
     s = CudaFunHelper::my_make_cuComplex(CudaFunHelper::my_cuCreal(s) + d_dp[t],
                                          CudaFunHelper::my_cuCimag(s) + d_dq[t]);
