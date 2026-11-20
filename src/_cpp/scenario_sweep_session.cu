@@ -588,9 +588,16 @@ void ScenarioSweepSession::_prepare_gen_contingency(
     const int n_rows = has_gen_off_ ? std::min(n_scenarios_, static_cast<int>(gen_off_.rows())) : n_scenarios_;
     const auto row_ok = [this](int r) { return row_unsupported_[static_cast<size_t>(r)].empty(); };
     gen_contingency::prepare_rows(gen_data_, n_rows,
-                                  [this, row_ok](int r, int g) { return has_gen_off_ && row_ok(r) && gen_off_(r, g); },
-                                  [this, row_ok](int r, int s) { return row_ok(r) && _row_trips(r, &MoreTrips::storages, s); },
-                                  [this, row_ok](int r, int h) { return row_ok(r) && _row_trips(r, &MoreTrips::hvdcs, h); },
+                                  [this, row_ok](int r, gen_contingency::RowOff& off) {
+                                      if (!row_ok(r)) return;
+                                      if (has_gen_off_)
+                                          for (int g = 0; g < static_cast<int>(gen_off_.cols()); ++g)
+                                              if (gen_off_(r, g)) off.gens.push_back(g);
+                                      if (has_more_off_ && static_cast<size_t>(r) < more_off_.size()) {
+                                          off.stos  = more_off_[static_cast<size_t>(r)].storages;
+                                          off.hvdcs = more_off_[static_cast<size_t>(r)].hvdcs;
+                                      }
+                                  },
                                   base_ledger_.get(), required, row_pv_to_pq, row_slack_off);
     row_pv_to_pq.resize(static_cast<size_t>(n_scenarios_));
     row_slack_off.resize(static_cast<size_t>(n_scenarios_));

@@ -508,8 +508,14 @@ void ContingencyAnalysisSession::run()
     row_pv_to_pq_.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
     row_slack_off.assign(static_cast<size_t>(n_ctg_all), std::vector<int>());
     if (any_controller_trip) {
-        gen_contingency::prepare_rows(gen_data_, n_ctg_all, ctg_gen_off, ctg_sto_off, ctg_hvdc_off, base_ledger_.get(),
-                                      required, row_pv_to_pq_, row_slack_off);
+        gen_contingency::prepare_rows(gen_data_, n_ctg_all,
+                                      [this, &unsupported](int r, gen_contingency::RowOff& off) {
+                                          if (!unsupported[static_cast<size_t>(r)].empty()) return;
+                                          off.gens  = ctg_gens_[static_cast<size_t>(r)];
+                                          off.stos  = ctg_more_[static_cast<size_t>(r)].storages;
+                                          off.hvdcs = ctg_more_[static_cast<size_t>(r)].hvdcs;
+                                      },
+                                      base_ledger_.get(), required, row_pv_to_pq_, row_slack_off);
         if (outer_ && !required.empty()) {
             // a row releasing a bus the outer loops' ledger did not reserve (ReactiveLimits
             // reserves every bus its own machines hold)
