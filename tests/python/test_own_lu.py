@@ -552,10 +552,12 @@ def test_dump_j_names_values_by_their_precision(case118, linear_solver, monkeypa
 
 
 @requires_gpu
-def test_fused_solve_levels_give_the_same_bits(case118, monkeypatch):
+def test_fused_solve_levels_give_the_same_residual(case118, monkeypatch):
     """the triangular solves' narrow levels run fused (one kernel per run of levels, a block barrier
     between them; GPUSIM2GRID_OWN_LU_FUSE=0: one launch per level): every value computed as the
-    level kernels do, the same solution bits -- seen through the raw benchmark's residual"""
+    level kernels do, so the raw benchmark's residual is the same to the bit. The solutions
+    themselves, and that the levels did fuse, are compared in tests/cpp/own_lu/test_fused_solve.cu
+    (the raw benchmark returns no solution)"""
     from gpusim2grid import AcPfGPU
     pf = AcPfGPU(case118, precision=PREC)
     indptr, indices, data = (np.asarray(a) for a in pf._s.get_J())

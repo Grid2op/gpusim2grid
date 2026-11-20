@@ -517,6 +517,18 @@ void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x)
     OWN_LU_CHECK(cudaGetLastError());
 }
 
+bool BatchedLu::fused_run_has_split_level() const
+{
+    auto any = [](const std::vector<SolveStep>& steps, const std::vector<Launch>& ls) {
+        for (const SolveStep& st : steps)
+            if (st.launch < 0)
+                for (int l = st.first; l < st.last; ++l)
+                    if (ls[static_cast<size_t>(l)].k > 1) return true;
+        return false;
+    };
+    return any(fw_steps_, fw_launch_) || any(bw_steps_, bw_launch_);
+}
+
 void BatchedLu::refine(const cuda_real_type* values, const int* indptr, const int* indices,
                        const cuda_real_type* b, cuda_real_type* x, int steps)
 {

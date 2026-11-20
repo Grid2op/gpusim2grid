@@ -63,8 +63,15 @@ std::vector<T> values(const Csr& a, int B)
     return v;
 }
 
-// the solutions of A_b x = rhs_b, with the fused kernel or (fuse = false) one launch per level
-std::vector<T> solve(const Csr& a, int B, bool fuse)
+// the solutions of A_b x = rhs_b, with the fused kernel or (fuse = false) one launch per level, and
+// the plan the solve ran (launches per solve, a split level inside a fused run)
+struct Solved {
+    std::vector<T> x;
+    int launches = 0;
+    bool split_in_run = false;
+};
+
+Solved solve(const Csr& a, int B, bool fuse)
 {
     if (fuse) unsetenv("GPUSIM2GRID_OWN_LU_FUSE");
     else setenv("GPUSIM2GRID_OWN_LU_FUSE", "0", 1);
@@ -82,7 +89,7 @@ std::vector<T> solve(const Csr& a, int B, bool fuse)
     lu.solve(thrust::raw_pointer_cast(db.data()), thrust::raw_pointer_cast(dx.data()));
     CHECK(cudaDeviceSynchronize() == cudaSuccess);
     thrust::host_vector<T> hx = dx;
-    return std::vector<T>(hx.begin(), hx.end());
+    return Solved{std::vector<T>(hx.begin(), hx.end()), lu.solve_launches(), lu.fused_run_has_split_level()};
 }
 
 bool same_bits(const std::vector<T>& x, const std::vector<T>& y)
@@ -121,9 +128,11 @@ TEST_CASE("chain of single-row levels: fused = per level, bit for bit")
 {
     const Csr a = pattern(50, false);
     for (int B : {1, 31, 40, 64}) {
-        const std::vector<T> fused = solve(a, B, true), plain = solve(a, B, false);
-        CHECK(same_bits(fused, plain));
-        CHECK(residual(a, B, fused) < TOL);
+        const Solved fused = solve(a, B, true), plain = solve(a, B, false);
+        // the levels did run fused (else both sides are the per-level kernels)
+        CHECK(fused.launches < plain.launches);
+        CHECK(same_bits(fused.x, plain.x));
+        CHECK(residual(a, B, fused.x) < TOL);
     }
 }
 
@@ -131,9 +140,12 @@ TEST_CASE("arrow matrix (a split level in the run): fused = per level, bit for b
 {
     const Csr a = pattern(40, true);
     for (int B : {1, 40}) {
-        const std::vector<T> fused = solve(a, B, true), plain = solve(a, B, false);
-        CHECK(same_bits(fused, plain));
-        CHECK(residual(a, B, fused) < TOL);
+        const Solved fused = solve(a, B, true), plain = solve(a, B, false);
+        CHECK(fused.launches < plain.launches);
+        CHECK(fused.split_in_run);     // the dense last row: split over several warps inside the run
+        CHECK(!plain.split_in_run);    // (nothing fused per level)
+        CHECK(same_bits(fused.x, plain.x));
+        CHECK(residual(a, B, fused.x) < TOL);
     }
 }
 

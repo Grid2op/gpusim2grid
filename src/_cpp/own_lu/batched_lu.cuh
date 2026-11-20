@@ -86,6 +86,12 @@ public:
     // Pivots clamped per active matrix by the last factorize() (host sync).
     std::vector<int> clamped_counts() const;
 
+    // The triangular solves' plan (diagnostic, for the tests): the launches one solve() makes
+    // (forward then backward; a fused run of levels is one), and whether a fused run holds a
+    // level split over several warps (k > 1)
+    int solve_launches() const { return static_cast<int>(fw_steps_.size() + bw_steps_.size()); }
+    bool fused_run_has_split_level() const;
+
     int n() const { return n_; }
     int batch() const { return B_; }
     int n_ent() const { return n_ent_; }
