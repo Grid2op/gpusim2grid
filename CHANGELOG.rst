@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] N-1 x actions setup (host work before the first GPU round): 2.8 -> 0.9 s on PtFige, 36k strategies;
+  connectivity certified without a search per row, generator trips walked per row, rows built without GC passes.
 - [ADDED] ``docs/environment_variables.md``: every environment variable gpusim2grid reads, in one page.
 - [ADDED] ``GPUSIM2GRID_ASYNC_TIMERS=1``: per-phase timers no longer wait for the GPU (their GPU times read 0), so
   the host keeps the GPU fed; opt-in.

@@ -8,7 +8,8 @@
 set(_g2g_cpp_tests
     test_v_groups_host test_v_groups_gather test_union_pattern test_connectivity_moves
     outer_device/test_device_features
-    own_lu/test_fused_solve)
+    own_lu/test_fused_solve
+    connectivity/test_connectivity_random)
 foreach(_src ${_g2g_cpp_tests})
     get_filename_component(_t ${_src} NAME)
     add_executable(${_t} ${_src}.cu)

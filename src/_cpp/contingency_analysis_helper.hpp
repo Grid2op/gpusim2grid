@@ -369,11 +369,19 @@ void build_flat_patches(
 //   every off-diagonal entry of the pattern, as before.
 //   union_pattern: Ybus_rm carries explicit zeros of a union pattern (bus moves) even without
 //   spare buses (a merge): its zero off-diagonal entries are no edges either.
+//   stats: optional, how many rows the cycle-space certificate answered without a search
+//   (accumulated, not reset): lets a test see that the certificate path is taken.
+struct ConnectivityStats {
+    int certified_removal = 0;   // rows without moves: removed edges certified harmless
+    int certified_moves   = 0;   // rows with bus moves: their own graph certified one piece
+};
+
 void check_connectivity(
     std::vector<Contingency>&                                          contingencies,
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>&      Ybus_rm,
     int                                                                n_graph = -1,
-    bool                                                               union_pattern = false);
+    bool                                                               union_pattern = false,
+    ConnectivityStats*                                                 stats = nullptr);
 
 // ---------------------------------------------------------------------------
 // MaskRowInfo
@@ -495,7 +503,8 @@ void compute_component_masks(
     const Eigen::SparseMatrix<eigen_cplx_type, Eigen::RowMajor>& Ybus_rm,
     const MaskConfig&                                             cfg,
     int                                                           n_graph = -1,    // see check_connectivity
-    bool                                                          union_pattern = false);
+    bool                                                          union_pattern = false,
+    ConnectivityStats*                                            stats = nullptr);   // see check_connectivity
 
 // ---------------------------------------------------------------------------
 // choose_reference_bus  (handle_disconnected_grid, automatic reference slack)
