@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [FIXED] Build against a lightsim2grid compiled with AVX (``-march=native``): nvcc's Eigen ABI probe checks the
+  alignment only, since Eigen never vectorizes in a CUDA file.
 - [IMPROVED] N-1 x actions setup (host work before the first GPU round): 2.8 -> 0.9 s on PtFige, 36k strategies;
   connectivity certified without a search per row, generator trips walked per row, rows built without GC passes.
 - [ADDED] ``docs/environment_variables.md``: every environment variable gpusim2grid reads, in one page.
