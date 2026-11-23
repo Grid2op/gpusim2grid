@@ -71,6 +71,90 @@ def test_contingency_analysis(grid: Any, init_from_n: bool):
     _same_rows(run("host"), run("device"), N_ROWS)
 
 
+@pytest.mark.parametrize("curves", [False, True], ids=["flat_limits", "curves"])
+@pytest.mark.parametrize("check", [False, True], ids=["copied", "check_mode"])
+@pytest.mark.parametrize("init_from_n", [False, True])
+def test_contingency_analysis_redistribute_slack(
+    grid: Any, init_from_n: bool, check: bool, curves: bool, monkeypatch: pytest.MonkeyPatch
+):
+    """redistribute_slack hands every row its loss, 0 MW included. A row losing power (an island,
+    a load trip: the generators at 0 MW clamp there, the others share it) is copied from the
+    template and its loss shared on the device (share_lost_kernel), ReactiveLimits' target P and
+    resumed frozen buses following: redistribute_slack adds no load through the host model. In
+    check mode each such row is also loaded through the host model and compared field by field
+    (the device model throws on a difference). With capability curves, the share moves the
+    reactive limits of the generators it moves: ReactiveLimits' frozen buses are frozen again at
+    the new ones"""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    if curves:
+        grid = case14_outer()
+        # the first two generators: max Q rising with P
+        grid.set_gen_capability_curves(np.array([0, 0, 1, 1]), np.array([0.0, 100.0, 0.0, 100.0]),
+                                       np.array([-10.0, -30.0, -10.0, -30.0]), np.array([5.0, 25.0, 5.0, 25.0]))
+        assert grid.ac_pf(np.full(grid.total_bus(), 1.04 + 0j), MAX_IT, TOL_MVA).size > 0
+    if check:
+        monkeypatch.setenv("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE", "1")
+    n_branch = len(grid.get_lines()) + len(grid.get_trafos())
+    n_load = len(grid.get_loads())
+    # the branch trips first: a connected one is the plain row the template is captured from
+    rows = [([b], [], [], []) for b in range(n_branch)] + [([], [], [ld], []) for ld in range(n_load)]
+
+    def run(backend: str, redistribute_slack: bool = True) -> Any:
+        ca = ContingencyAnalysisGPU(
+            grid,
+            outer_loops=True,
+            nb_iter=MAX_IT,
+            tol=TOL_MVA / grid.get_sn_mva(),
+            init_from_n_powerflow=init_from_n,
+            handle_disconnected_grid=True,
+            redistribute_slack=redistribute_slack,
+            keep_outer_trace=True,
+            outer_loops_backend=backend,
+        )
+        ca.add_contingencies(rows)
+        ca.compute(batch_size=4)
+        return ca
+
+    host, dev = run("host"), run("device")
+    _same_rows(host, dev, len(rows))
+    shared = 0
+    for k, (rh, rd) in enumerate(zip(host.get_outer_results(), dev.get_outer_results(), strict=True)):
+        _same_decisions(list(rh.decisions), list(rd.decisions), f"row {k}")
+        shared += any("SHARE_LOST_P" in d for d in rh.decisions)
+    assert shared >= n_load // 2, f"{shared} rows shared a loss: nothing tested"
+    if not check:
+        # the same rows through the host model as without a loss to share (the template's, a phantom
+        # slot's, a masked row whose island the n solve froze a bus of)
+        n_without = run("device", redistribute_slack=False).timings.n_oc_host_loads
+        assert dev.timings.n_oc_host_loads == n_without, (dev.timings.n_oc_host_loads, n_without)
+
+
+def test_contingency_analysis_redistribute_slack_generator_trips(grid: Any):
+    """a row disconnecting a generator loads through the host model (its own ReactiveLimits plan)
+    and shares its loss there: the same rows as the host backend"""
+    from gpusim2grid import ContingencyAnalysisGPU
+
+    n_gen = len(grid.get_generators())
+
+    def run(backend: str) -> Any:
+        ca = ContingencyAnalysisGPU(
+            grid,
+            outer_loops=True,
+            nb_iter=MAX_IT,
+            tol=TOL_MVA / grid.get_sn_mva(),
+            init_from_n_powerflow=True,
+            handle_disconnected_grid=True,
+            redistribute_slack=True,
+            outer_loops_backend=backend,
+        )
+        ca.add_contingencies([([], [], [], [g]) for g in range(n_gen)])
+        ca.compute(batch_size=3)
+        return ca
+
+    _same_rows(run("host"), run("device"), n_gen)
+
+
 def test_scenario_sweep_topologies(grid: Any):
     from gpusim2grid import ScenarioSweepGPU
 

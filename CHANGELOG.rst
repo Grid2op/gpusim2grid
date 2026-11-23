@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [FIXED] ``outer_loops_backend='device'`` with ``redistribute_slack``: a row's lost power is shared on the GPU
+  after its template copy, no longer by a host load per row (PtFige N-1: 1.85 -> 1.05 s, host 1.63 s).
 - [FIXED] Build against a lightsim2grid compiled with AVX (``-march=native``): nvcc's Eigen ABI probe checks the
   alignment only, since Eigen never vectorizes in a CUDA file.
 - [IMPROVED] N-1 x actions setup (host work before the first GPU round): 2.8 -> 0.9 s on PtFige, 36k strategies;

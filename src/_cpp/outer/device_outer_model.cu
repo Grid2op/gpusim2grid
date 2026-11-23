@@ -56,13 +56,13 @@ enum TraceAction : int {
     TA_DISTRIBUTE, TA_FAIL_RESIDUE, TA_UNITS_MOVED, TA_PARK, TA_UNPARK, TA_TARGET_Q_FOLLOWED, TA_RELEASE,
     TA_SATURATE, TA_SWITCH_ON, TA_KEPT_PQ_GROUP_HOLDS, TA_KEPT_PQ, TA_KEPT_PV_STRONGEST, TA_PV_TO_PQ_UNREALISTIC,
     TA_PV_TO_PQ, TA_KEPT_PQ_MAX_SWITCH, TA_PQ_TO_PV, TA_LIMIT_MOVED, TA_SETTLED, TA_ROUND_SECTIONS,
-    TA_ROUND_TAP, TA_KEPT_TAP, TA_MOVE_TAP, TA_ROUND_TO_RANGE
+    TA_ROUND_TAP, TA_KEPT_TAP, TA_MOVE_TAP, TA_ROUND_TO_RANGE, TA_SHARE_LOST_P
 };
 const char* const kActionNames[] = {
     "DISTRIBUTE", "FAIL_RESIDUE", "UNITS_MOVED", "PARK", "UNPARK", "TARGET_Q_FOLLOWED", "RELEASE",
     "SATURATE", "SWITCH_ON", "KEPT_PQ_GROUP_HOLDS", "KEPT_PQ", "KEPT_PV_STRONGEST", "PV_TO_PQ_UNREALISTIC",
     "PV_TO_PQ", "KEPT_PQ_MAX_SWITCH", "PQ_TO_PV", "LIMIT_MOVED", "SETTLED", "ROUND_SECTIONS",
-    "ROUND_TAP", "KEPT_TAP", "MOVE_TAP", "ROUND_TO_RANGE"};
+    "ROUND_TAP", "KEPT_TAP", "MOVE_TAP", "ROUND_TO_RANGE", "SHARE_LOST_P"};
 
 void check_cuda(cudaError_t e, const char* what)
 {
@@ -120,6 +120,12 @@ struct Dev {
     const double *mon_low, *mon_high, *svc_low_t, *svc_high_t;
     const int *ds_el, *ds_kind, *ds_bus;
     const double *ds_w, *ds_min, *ds_max;
+    // a row's lost power shared on the device (DeviceTables::rp_*): the n point's moved units, their
+    // buses and moves, its V at the watched buses ([2 n_watch], a Row's first fields), each
+    // ReactiveLimits bus' frozen state there; ReactiveLimits' storage units per bus (CSR)
+    int ds_reserved, rp_n, n_rp_gen, n_rp_sto;
+    const int *rp_gen_bus, *rp_sto_bus, *rl_rp_state, *rl_sto_ptr, *rl_sto, *rl_has_sto;
+    const double *rp_gen_move, *rp_sto_move, *rp_v;
     const int *corr_bus, *corr_of_bus;
     // per slot: the driver state
     int *row, *it, *last_unstable, *last_status, *first, *changed, *nb_outer, *nb_passes, *total_nr, *old_total;
@@ -1897,7 +1903,27 @@ private:
         return row >= 0 && static_cast<size_t>(row) < own_targets_.size() && own_targets_[static_cast<size_t>(row)];
     }
     bool plain_overrides(int row) const {
-        return row >= 0 && !own_targets(row) && (static_cast<size_t>(row) >= plain_.size() || plain_[static_cast<size_t>(row)]);
+        return row >= 0 && !own_targets(row) && (static_cast<size_t>(row) >= plain_.size() || plain_[static_cast<size_t>(row)])
+               && (!has_loss(row) || loss_on_device(row));
+    }
+    // a lost power to share (RowOverrides::lost_p_mw, redistribute_slack; the session hands every row its
+    // loss, 0 MW included)
+    bool has_loss(int row) const {
+        return row >= 0 && static_cast<size_t>(row) < row_loss_.size() && !std::isnan(row_loss_[static_cast<size_t>(row)]);
+    }
+    // shared on the device after the row's template copy (share_lost_kernel): from the n point or from
+    // scratch, not from another row's point (it shares beyond that point's loss), and not after an n solve
+    // that left units of a distributed-slack Newton parked (their keep-parked move follows the share)
+    bool loss_on_device(int row) const { return !resumes(row) && !(t_.ds_reserved && t_.rp_n_parked > 0); }
+    // a row whose load the template's is, bit for bit: it shares nothing (a loss of exactly 0 that
+    // strands no unit counts nothing, as no loss) -- the rows the template may be captured from
+    bool shares_nothing(int row) const {
+        return !has_loss(row) || (row_loss_[static_cast<size_t>(row)] == 0. && !has_masks(row) && !any_off_unit_moved_);
+    }
+    // a plain row with a loss and no mask: the template, then its share (the masked rows' path, no mask)
+    int edit_source(int row) const {
+        if (has_masks(row)) return mask_source(row);
+        return (tmpl_row_ && has_loss(row) && plain(row)) ? -1 : -2;
     }
     bool plain(int row) const { return plain_overrides(row) && !resumes(row); }
     // a row resuming from point k with plain overrides: a copy of point k's template once it exists
@@ -1970,6 +1996,8 @@ private:
     thrust::device_vector<double> d_bc_sign_, d_bc_rexp_, d_bc_tab_ratio_, d_bc_tab_block_, d_bc_tab_shift_, d_bc_alpha_,
         d_pc_vn_kv_, d_pc_target_;
     thrust::device_vector<double> d_ds_w_, d_ds_min_, d_ds_max_;
+    thrust::device_vector<int> i_rp_gen_bus_, i_rp_sto_bus_, i_rl_rp_state_, i_rl_sto_ptr_, i_rl_sto_, i_rl_has_sto_;
+    thrust::device_vector<double> d_rp_gen_move_, d_rp_sto_move_, d_rp_v_;
     thrust::device_vector<int> i_corr_bus_, i_corr_of_bus_;
     // per slot / per row: one int, one byte and one double pool each, carved by offsets
     struct Field { int kind; size_t width; size_t off; };   // kind 0 int, 1 uchar, 2 double
@@ -2027,6 +2055,8 @@ private:
     long prof_why_[6] = {0, 0, 0, 0, 0, 0};
     std::vector<RowResult> adj_;              // per row: its adjoint view (pq_buses ... gen_p_slope_*)
     std::vector<int> resume_of_row_;          // OuterHook::set_row_resume
+    std::vector<double> row_loss_;            // [rows] RowOverrides::lost_p_mw, NaN: none
+    bool any_off_unit_moved_ = false;         // the n point moved a unit off in the grid (DeviceTables::rp_*_bus -2)
     std::vector<char> referenced_;            // per row: another row resumes from its point
     std::vector<char> own_targets_;           // per row: set_row_targets gave it targets of its own
     std::vector<char> plain_;                 // per row: nothing in RowOverrides changes its start
@@ -2053,6 +2083,7 @@ private:
     thrust::device_vector<int> st_slots_, st_conv_, st_nr_, st_inner_, st_grow_, st_next_, st_status_;
     // load_rows' lists and staging, kept across calls (an allocation would sync the device)
     thrust::device_vector<int> ld_slots_, ld_tmpl_, ld_mask_, ld_point_;
+    thrust::device_vector<double> ld_loss_;   // the losses of the rows load_rows edits from the template
     // the phantom rows' template (a base-case load: row -1)
     bool phantom_ready_ = false;
     std::unique_ptr<HostRow> ph_host_;
@@ -2173,7 +2204,12 @@ void DeviceOuterModel::init_tables()
     i_gt_e_ = up(t_.gt_e); i_br_b1_ = up(t_.br_b1); i_br_b2_ = up(t_.br_b2); i_br_trafo_ = up(t_.br_trafo);
     i_trafo_gt_ = up(t_.trafo_gt); i_pin_of_bus_ = up(t_.pin_of_bus); d_tvg_target_ = up(t_.tvg_target); d_tvg_hdb_ = up(t_.tvg_hdb);
     d_ds_w_ = up(t_.ds_weight); d_ds_min_ = up(t_.ds_min_mw); d_ds_max_ = up(t_.ds_max_mw);
+    i_rp_gen_bus_ = up(t_.rp_gen_bus); i_rp_sto_bus_ = up(t_.rp_sto_bus); i_rl_rp_state_ = up(t_.rl_rp_state);
+    i_rl_sto_ptr_ = up(t_.rl_sto_ptr); i_rl_sto_ = up(t_.rl_sto); i_rl_has_sto_ = up(t_.rl_has_storage);
+    d_rp_gen_move_ = up(t_.rp_gen_move); d_rp_sto_move_ = up(t_.rp_sto_move); d_rp_v_ = up(t_.rp_v);
     i_corr_bus_ = up(t_.corr_bus); i_corr_of_bus_ = up(corr_of_bus_h_);
+    any_off_unit_moved_ = std::count(t_.rp_gen_bus.begin(), t_.rp_gen_bus.end(), -2) > 0
+                          || std::count(t_.rp_sto_bus.begin(), t_.rp_sto_bus.end(), -2) > 0;
 }
 
 // The per-slot fields, in one place: name -> (pool, width). The order is the Dev members'.
@@ -2337,6 +2373,11 @@ void DeviceOuterModel::build_dev()
     d.mon_low = raw(d_mon_low_); d.mon_high = raw(d_mon_high_); d.svc_low_t = raw(d_svc_low_t_); d.svc_high_t = raw(d_svc_high_t_);
     d.ds_el = raw(i_ds_el_); d.ds_kind = raw(i_ds_kind_); d.ds_bus = raw(i_ds_bus_);
     d.ds_w = raw(d_ds_w_); d.ds_min = raw(d_ds_min_); d.ds_max = raw(d_ds_max_);
+    d.ds_reserved = t_.ds_reserved; d.rp_n = t_.rp_n;
+    d.n_rp_gen = static_cast<int>(t_.rp_gen_bus.size()); d.n_rp_sto = static_cast<int>(t_.rp_sto_bus.size());
+    d.rp_gen_bus = raw(i_rp_gen_bus_); d.rp_sto_bus = raw(i_rp_sto_bus_); d.rl_rp_state = raw(i_rl_rp_state_);
+    d.rl_sto_ptr = raw(i_rl_sto_ptr_); d.rl_sto = raw(i_rl_sto_); d.rl_has_sto = raw(i_rl_has_sto_);
+    d.rp_gen_move = raw(d_rp_gen_move_); d.rp_sto_move = raw(d_rp_sto_move_); d.rp_v = raw(d_rp_v_);
     d.corr_bus = raw(i_corr_bus_); d.corr_of_bus = raw(i_corr_of_bus_);
 }
 
@@ -2378,6 +2419,7 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
     if (ns > 0) n = std::max(n, ov.storage_off.size() / ns);
     if (ngr > 0) n = std::max(n, ov.vc_v_set.size() / ngr);
     plain_.assign(n, 1);
+    row_loss_.assign(n, std::numeric_limits<double>::quiet_NaN());
     mask_only_.assign(n, 0);
     masked_rows_.assign(n, {});
     auto any_row = [](const auto& m, size_t r, size_t w, auto pred) {
@@ -2395,7 +2437,7 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
     };
     // the loads a row trips: TransformerVoltageControl freezes a bus at mis_bus - the row's own load Q
     // (device_tvc_image's tv_load); nothing else reads them (DistributedSlack takes a row's loss
-    // through its lost_p_mw, counted below)
+    // through its lost_p_mw: share_lost_kernel)
     const size_t nl = static_cast<size_t>(t_.n_load);
     const bool loads_matter = t_.has_tvc != 0;
     for (size_t r = 0; r < n; ++r) {
@@ -2405,7 +2447,8 @@ void DeviceOuterModel::note_plain_rows(const RowOverrides& ov)
         changes = changes || (r < ov.vc_tripped.size() && !ov.vc_tripped[r].empty());
         changes = changes || (r < ov.hvdc_off.size() && !ov.hvdc_off[r].empty());
         changes = changes || (r < ov.gen_bus.size() && !ov.gen_bus[r].empty());
-        changes = changes || (r < ov.lost_p_mw.size() && !std::isnan(ov.lost_p_mw[r]));
+        // its loss (redistribute_slack) is shared on the device after the copy (share_lost_kernel): row_loss_
+        row_loss_[r] = r < ov.lost_p_mw.size() ? ov.lost_p_mw[r] : std::numeric_limits<double>::quiet_NaN();
         changes = changes || any_set(ov.gen_off, r, ng);
         changes = changes || any_row(ov.gen_vm, r, ng, [](double v) { return !std::isnan(v); });
         changes = changes || any_set(ov.storage_off, r, ns);
@@ -2435,6 +2478,7 @@ int DeviceOuterModel::mask_source(int row) const
 {
     if (row < 0 || own_targets(row) || static_cast<size_t>(row) >= mask_only_.size() || !mask_only_[static_cast<size_t>(row)])
         return -2;
+    if (has_loss(row) && !loss_on_device(row)) return -2;
     // the plain template, or the template of the point the row resumes from
     const HostRow* tmpl = nullptr;
     int source = -2;
@@ -2491,6 +2535,10 @@ void DeviceOuterModel::compare_rows(const HostRow& host, const HostRow& dev, int
     for (const auto& kv : field_of_) {
         const Field& f = kv.second;
         if (kv.first.rfind("c_", 0) == 0) continue;   // controls: materialize writes them after
+        // the decisions the device recorded (its share's), flushed with the round's: the traces are
+        // compared as the rows' results
+        if (kv.first.rfind("tr_", 0) == 0) continue;
+        if (kv.first.rfind("s_", 0) == 0) continue;    // scratch (distribute's): no slot state
         for (size_t k = 0; k < f.width; ++k) {
             const size_t at = f.off + k;
             bool same;
@@ -2763,6 +2811,99 @@ __global__ void mask_rows_kernel(Dev d, const int* slots, int n, const int* mask
     }
 }
 
+// A row's lost power (redistribute_slack: RowOverrides::lost_p_mw), on a slot just copied from the
+// template (and masked): what the host load does from DistributedSlack's share on, in its order --
+// init_loops' DistributedSlack (Ls2gOuterModel::share_lost_p, DistributedSlackLoop::_share_lost_p,
+// the units its loss puts at a bound parked around a distributed-slack Newton), its ReactiveLimits
+// (each bus' target P, when it comes after DistributedSlack) and resume_loops' ReactiveLimits (the
+// buses the n point left frozen, at their limits at the targets the share moved). The template
+// shared nothing (a row sets NaN or exactly 0 lost and strands no unit: lost_mw 0), so everything
+// else is already the row's. Not for a row resuming from another row's point (it shares beyond that
+// point's loss) nor after an n solve that parked units of a distributed-slack Newton (the keep-parked
+// move follows the share): load_rows routes those through the host model. One thread per slot.
+__global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double lost_p_mw = lost_p[i];
+    if (isnan(lost_p_mw)) return;   // nothing to share: the template's state is the row's
+    const int s = slots[i];
+    const unsigned char* masked = SLOT(masked, d.n_bus);
+    // DistributedSlackLoop::lost_p_to_share_mw: the row's loss, plus the moves of the n point's units
+    // it loses (off in the grid or on a bus it masks), at the targets in force
+    double counted = lost_p_mw;
+    if (d.rp_n) {
+        const auto lost = [&](int b) { return b == -2 || (b >= 0 && b < d.n_bus && masked[b]); };
+        for (int j = 0; j < d.n_rp_gen; ++j) if (lost(d.rp_gen_bus[j])) counted += d.rp_gen_move[j];
+        for (int j = 0; j < d.n_rp_sto; ++j) if (lost(d.rp_sto_bus[j])) counted -= d.rp_sto_move[j];
+    }
+    S1(lost_mw) = counted;
+    // the loops the row runs, in order: share_lost_p is DistributedSlack's init
+    const int* active = SLOT(active, d.n_loops);
+    int pos_ds = -1, pos_rl = -1;
+    for (int k = 0; k < S1(n_active); ++k) {
+        if (d.loop_kind[active[k]] == DL_DISTRIBUTED_SLACK) pos_ds = k;
+        if (d.loop_kind[active[k]] == DL_REACTIVE_LIMITS) pos_rl = k;
+    }
+    if (pos_ds < 0) return;
+    const unsigned char* present = SLOT(ds_present, d.n_units);
+    int n_present = 0;
+    for (int k = 0; k < d.n_units; ++k) n_present += present[k] ? 1 : 0;
+    if (n_present == 0 || !(fabs(counted) > d.ds_eps_mw)) return;
+    bool all_sat;
+    distribute(d, s, counted, d.ds_eps_mw, all_sat);
+    const double* nmw = SLOT(s_new, d.n_units);
+    double* cur = SLOT(ds_cur, d.n_units);
+    for (int k = 0; k < d.n_units; ++k) {
+        if (!present[k]) continue;
+        const int ub = SLOT(ds_ubus, d.n_units)[k];
+        if (d.ds_kind[k] == 0) move_gen(d, s, d.ds_el[k], ub, nmw[k]);
+        else move_storage(d, s, d.ds_el[k], ub, -nmw[k]);
+        // the base (ds_inj) stays the targets the row started from
+        cur[k] = nmw[k];
+    }
+    S1(tr_li) = active[pos_ds];
+    rec(d, s, TA_SHARE_LOST_P, true, -1, counted, d.ds_eps_mw);
+    // around a distributed-slack Newton, the units its loss put at a bound start parked (every one when
+    // all are: distribute clears its flags then)
+    if (d.ds_reserved) {
+        const unsigned char* sat = SLOT(s_sat, d.n_units);
+        for (int k = 0; k < d.n_units; ++k) {
+            if (!present[k] || !(all_sat || sat[k])) continue;
+            SLOT(ds_park, d.n_units)[k] = 1;
+            SLOT(ds_parkh, d.n_units)[k] = counted > 0. ? 1 : 0;
+        }
+    }
+    if (d.keep_adj) ds_mark_solved(d, s);   // the first solve runs with these
+    if (pos_rl < 0) return;
+    // ReactiveLimits' init after DistributedSlack's: each bus' target P from the targets in force,
+    // but a bus none of whose generators moved (state0's sum; the row sets no storage target)
+    const unsigned char* rl_present = SLOT(rl_present, d.rl_n);
+    const unsigned char* goff = SLOT(rl_goff, 0);
+    if (pos_rl > pos_ds) {
+        double* rl_tp = SLOT(rl_tp, d.rl_n);
+        for (int k = 0; k < d.rl_n; ++k) {
+            if (!rl_present[k] || (!d.rl_has_sto[k] && rl_at_base(d, s, k))) continue;
+            double target_p = 0.;
+            for (int j = d.rl_gen_ptr[k]; j < d.rl_gen_ptr[k + 1]; ++j)
+                if (!goff[j]) target_p += gen_in_force(d, s, d.rl_gen[j]);
+            for (int j = d.rl_sto_ptr[k]; j < d.rl_sto_ptr[k + 1]; ++j) target_p -= sto_in_force(d, s, d.rl_sto[j]);
+            rl_tp[k] = target_p;
+        }
+    }
+    // resume_loops: each bus the n point left frozen, at the limit it holds now (or its target Q, the
+    // robust mode's), its V the point's
+    if (!d.rp_n) return;
+    const Row rv{d.rp_v, d.n_watch, 0, 0};
+    for (int k = 0; k < d.rl_n; ++k) {
+        const int state = d.rl_rp_state[k];
+        if (!rl_present[k] || state == 0) continue;
+        double q_min, q_max;
+        rl_limits(d, s, &rv, k, q_min, q_max);
+        rl_freeze(d, s, rv, k, SLOT(rl_real, d.rl_n)[k] ? SLOT(rl_tq_s, d.rl_n)[k] : (state < 0 ? q_min : q_max), state);
+    }
+}
+
 void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::vector<int>& rows_in)
 {
     if (slots_in.empty()) return;
@@ -2785,7 +2926,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
     // that the other plain rows of this call are copied already
     if (!tmpl_row_ && !check_tmpl_ && slots_in.size() > 1) {
         for (size_t k = 0; k < slots_in.size(); ++k) {
-            if (!plain(rows_in[k])) continue;
+            if (!plain(rows_in[k]) || !shares_nothing(rows_in[k])) continue;
             load_rows({slots_in[k]}, {rows_in[k]});
             std::vector<int> s2, r2;
             for (size_t j = 0; j < slots_in.size(); ++j)
@@ -2835,9 +2976,9 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
             from_point = it != point_tmpl_.end() && it->second.masks.empty();
         }
         if (row < 0 && phantom_ready_ && !check_tmpl_) { f_slots.push_back(slots_in[k]); }
-        else if (tmpl_row_ && !check_tmpl_ && plain(row) && !has_masks(row)) { t_slots.push_back(slots_in[k]); t_rows.push_back(row); }
+        else if (tmpl_row_ && !check_tmpl_ && plain(row) && !has_masks(row) && shares_nothing(row)) { t_slots.push_back(slots_in[k]); t_rows.push_back(row); }
         else if (from_point)                        { p_slots.push_back(slots_in[k]); p_rows.push_back(row); }
-        else if (const int src = mask_source(row); src != -2) {
+        else if (const int src = edit_source(row); src != -2) {
             m_slots.push_back(slots_in[k]); m_rows.push_back(row); m_src.push_back(src);
         }
         else                                        { slots.push_back(slots_in[k]); rows.push_back(row); }
@@ -2888,9 +3029,10 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         materialize_kernel<<<(np + 63) / 64, 64, 0, stream_>>>(dev_, d_ps, np);
         check_cuda(cudaGetLastError(), "point template load");
     }
-    // the masked rows: the template, then their masks on the device (only the mask lists go up)
+    // the masked rows and those with a loss to share: the template, then their masks and their share on
+    // the device (only the mask lists and the losses go up)
     if (!m_slots.empty()) {
-        g2g_nvtx::Range nv("device load: masked rows from the template");
+        g2g_nvtx::Range nv("device load: masked rows / rows sharing a loss, from the template");
         const int nm = static_cast<int>(m_slots.size());
         // the plain template's rows first, then those resuming from a point (their point's template)
         std::vector<int> order(static_cast<size_t>(nm));
@@ -2934,6 +3076,18 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         set_rows_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(raw(p_int_), d_ms, d_mr, nm, w_int_, field_of_.at("row").off);
         mask_rows_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(dev_, d_ms, nm, d_mptr, d_mbus);
         check_cuda(cudaGetLastError(), "masked load");
+        std::vector<double> loss(static_cast<size_t>(nm));
+        bool any_loss = false;
+        for (int k = 0; k < nm; ++k) {
+            const int r = m_rows[static_cast<size_t>(k)];
+            loss[static_cast<size_t>(k)] = has_loss(r) ? row_loss_[static_cast<size_t>(r)] : std::numeric_limits<double>::quiet_NaN();
+            any_loss = any_loss || has_loss(r);
+        }
+        if (any_loss) {
+            upload_h2d_grow(ld_loss_, loss.data(), loss.size(), stream_);   // pageable: staged, loss may die
+            share_lost_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(dev_, d_ms, raw(ld_loss_), nm);
+            check_cuda(cudaGetLastError(), "lost power share");
+        }
         if (check_tmpl_) {
             check_cuda(cudaStreamSynchronize(stream_), "masked load");   // each one also through the host model, compared field by field
             HostRow hr, dr;
@@ -3021,7 +3175,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
                 compare_rows_with(hr, *it->second.host, row);
             }
         }
-        if (plain(row)) {
+        if (plain(row) && shares_nothing(row)) {
             if (!tmpl_row_) {   // the first plain row: the template of the next ones
                 tmpl_row_ = std::make_unique<HostRow>(unmasked(hr, row));
                 tmpl_i_.assign(tmpl_row_->i.begin(), tmpl_row_->i.end());

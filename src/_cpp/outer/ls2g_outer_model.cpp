@@ -4332,6 +4332,9 @@ DeviceTables Ls2gOuterModel::device_tables() const
         const RlBusState& s0 = rl_dev().state0[k];
         t.rl0_target_p.push_back(s0.target_p); t.rl0_frozen_q.push_back(s0.frozen_q);
         t.rl0_state.push_back(s0.state); t.rl0_nb_pv_pq.push_back(s0.nb_pv_pq); t.rl0_realistic.push_back(s0.realistic ? 1 : 0);
+        // the state the n point left it frozen in (resume_loops re-freezes it there)
+        const auto fz = resume_ ? point_n_.frozen.find(b.bus_solver) : point_n_.frozen.end();
+        t.rl_rp_state.push_back(fz == point_n_.frozen.end() ? 0 : fz->second.first);
     }
     // VoltageControl
     t.n_ctrl = layout_.n_ctrl; t.n_grp = layout_.n_grp;
@@ -4369,6 +4372,43 @@ DeviceTables Ls2gOuterModel::device_tables() const
         t.ds_min_mw.push_back(static_cast<double>(u.min_p_mw));
         t.ds_max_mw.push_back(static_cast<double>(u.max_p_mw));
         if (u.overshoot_mw != 0.) throw std::domain_error("a DistributedSlack unit with an overshoot");
+    }
+    // what a row's loss reads of the n point (share_lost_p: DistributedSlackLoop::lost_p_to_share_mw
+    // on a row that sets no target, the same moves in the same order; resume_loops' V)
+    if (resume_) {
+        SlotState plain;
+        plain.rowv.layout = &sbl_;
+        plain.rp = &point_n_;
+        const ls2g::OuterGridView v = view(plain);
+        t.rp_n = 1;
+        t.rp_n_parked = static_cast<int>(point_n_.parked.size());
+        for (size_t gid = 0; gid < point_n_.gen_p.size(); ++gid) {
+            const int g = static_cast<int>(gid);
+            if (std::isnan(point_n_.gen_p[gid])) continue;
+            t.rp_gen_bus.push_back(v.gen_on(g) ? v.gen_bus_solver(g) : -2);
+            t.rp_gen_move.push_back(point_n_.gen_p[gid] - v.gen_target_p(g));
+        }
+        for (size_t sid = 0; sid < point_n_.sto_p.size(); ++sid) {
+            const int s = static_cast<int>(sid);
+            if (std::isnan(point_n_.sto_p[sid])) continue;
+            t.rp_sto_bus.push_back(v.storage_on(s) ? v.storage_bus_solver(s) : -2);
+            t.rp_sto_move.push_back(point_n_.sto_p[sid] - v.storage_target_p(s));
+        }
+        const size_t nw = layout_.watch_bus.size();
+        t.rp_v.assign(2 * nw, NaN);
+        for (size_t k = 0; k < nw; ++k) {
+            const int b = layout_.watch_bus[k];
+            cplx vb(NaN, NaN);
+            if (point_n_.V.size() > 0) {
+                if (b >= 0 && b < static_cast<int>(point_n_.V.size())) vb = cplx(point_n_.V(b).real(), point_n_.V(b).imag());
+            } else {
+                const auto it = std::lower_bound(point_n_.v_at.begin(), point_n_.v_at.end(), b,
+                                                 [](const std::pair<int, cplx>& e, int key) { return e.first < key; });
+                if (it != point_n_.v_at.end() && it->first == b) vb = it->second;
+            }
+            t.rp_v[k] = vb.real();
+            t.rp_v[nw + k] = vb.imag();
+        }
     }
     // ShuntControl's controllers and ShuntVoltageControl's groups
     {

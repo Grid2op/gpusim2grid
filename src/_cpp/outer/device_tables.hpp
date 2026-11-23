@@ -97,6 +97,20 @@ struct DeviceTables {
     std::vector<int>    held_svcs;           // sorted svc ids the plan holds
     std::vector<int>    svc_reg_is_own_bus;  // per svc id: regulated bus == its own bus
 
+    // ---- a row's lost power (redistribute_slack), shared on the device after a template copy ----
+    // (share_lost_kernel: Ls2gOuterModel::share_lost_p and what of the load follows it). Whether a
+    // row that sets no target resumes from the grid's own last solve (the n point, resume_), and
+    // what of that point the share reads: the generators / storage units it moved, in id order,
+    // each one's solver bus (-2: off in the grid, lost by every row) and its move (resumed - grid
+    // target, MW; storage units in the load convention), the units it left parked, V at the watched
+    // buses (re then im, NaN where the point holds none: [2 n_watch]) and, per ReactiveLimits bus
+    // (rl_*), the state it left it frozen in (0: not frozen)
+    int rp_n = 0, rp_n_parked = 0;
+    std::vector<int>    rp_gen_bus, rp_sto_bus;
+    std::vector<double> rp_gen_move, rp_sto_move;
+    std::vector<double> rp_v;
+    std::vector<int>    rl_rp_state;
+
     // ---- DistributedSlack: the grid's participants (units0_), in upstream's order ---------------
     std::vector<int>    ds_el_id, ds_kind, ds_bus, ds_in_slack;
     // a distributed-slack Newton (NROuterDist_*): its slack_absorbed column's buses (Layout::slack_bus),
