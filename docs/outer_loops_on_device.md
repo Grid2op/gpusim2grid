@@ -256,7 +256,9 @@ Per round, after `_residual_pass`, on the device slots that just converged:
 
 - The decision kernels sum in the host's order (one thread per sum where it matters, or a fixed-order
   reduction whose host counterpart is changed to match).
-- They are compiled with `-fmad=false`, or written with `__dadd_rn` / `__dmul_rn`.
+- They are compiled with `-fmad=false`, or written with `__dadd_rn` / `__dmul_rn`; the host model
+  (`ls2g_outer_model.cpp`) with `-ffp-contract=off`, since GCC contracts C++ into FMAs by default once
+  the `-march=native` / `-mfma` mirrored from lightsim2grid_core enables them.
 - The shadow mode (§7) reports any decision that differs, with its margin.
 
 ### 4.6 The device model behind `outer::OuterHook` (how M2 is built)

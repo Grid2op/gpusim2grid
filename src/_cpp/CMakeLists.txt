@@ -75,7 +75,12 @@ add_library(
 add_library(gpusim2grid::core ALIAS gpusim2grid_core)
 # The device outer-loop model follows the host one sum for sum: no FMA contraction, so that a
 # decision on a threshold goes the same way on both (docs/outer_loops_on_device.md, §4.6).
+# Both sides: GCC contracts C++ by default (-ffp-contract=fast) as soon as the ISA has FMA,
+# which the -march=native / -mfma mirrored from lightsim2grid_core below turns on.
 set_source_files_properties(outer/device_outer_model.cu PROPERTIES COMPILE_OPTIONS "-fmad=false")
+if(NOT MSVC)
+    set_source_files_properties(outer/ls2g_outer_model.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 set_target_properties(gpusim2grid_core PROPERTIES POSITION_INDEPENDENT_CODE ON EXPORT_NAME core)
 target_include_directories(gpusim2grid_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
