@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``linear_solver='own_lu'``: its symbolic plan is built with counting sorts instead of a sort of every
+  contribution (PtFige: 28 -> 12 ms per driver build; the same plan).
 - [FIXED] ``outer_loops_backend``: the host outer-loop model is compiled without FMA contraction, like the device
   one, so a borderline decision goes the same way on both on a ``-march=native`` build.
 - [FIXED] ``outer_loops_backend='device'`` with ``redistribute_slack``: a row's lost power is shared on the GPU

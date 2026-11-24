@@ -197,55 +197,94 @@ LuPlan build_lu_plan(int n, const std::vector<int>& indptr, const std::vector<in
             in_a[e] = 1;
         }
 
-    // ---- left-looking items: one record per contribution, then one
-    //      placeholder per diagonal and per L entry (so that every entry that
-    //      must be computed has an item even without contributions) ----
-    struct Rec { int tgt, lo, up, step; };
-    std::vector<Rec> recs;
+    // ---- left-looking items. Every contribution L(i,k) U(k,j) goes to the entry (i,j), whose step
+    //      2 level[min(i,j)] + (i > j) is a function of the entry alone: the items are the entries ordered by
+    //      (step, entry), each with its contributions in ascending k -- two counting sorts, linear. An entry is
+    //      an item when it has a contribution; every diagonal and every L entry is one anyway (it must be
+    //      computed even without contributions: its placeholder). ----
+    // The contributions of U row k: (i, j) over its columns; row i holds every column of U row k (the
+    // pattern is closed under elimination), so (i, j) is found by walking row i along them.
+    auto for_each_contribution = [&](auto&& fn) {
+        for (int k = 0; k < n; ++k) {
+            const int u0 = dp[k] + 1, u1 = rp[k + 1];  // U row k: columns j > k = rows i > k of L col k
+            if (u0 >= u1) continue;
+            for (int a = u0; a < u1; ++a) {
+                const int i = ci[a];
+                const int lik = entry_of(rp, ci, i, k);
+                int e = entry_of(rp, ci, i, ci[u0]);
+                if (lik < 0 || e < 0) throw std::logic_error("[own_lu::build_lu_plan] pattern not closed");
+                for (int c = u0; c < u1; ++c) {
+                    const int j = ci[c];
+                    while (ci[e] < j) ++e;
+                    if (ci[e] != j) throw std::logic_error("[own_lu::build_lu_plan] pattern not closed");
+                    fn(e, lik, c);
+                }
+            }
+        }
+    };
+    // one pass: the contributions in visit order (k ascending), then scattered by entry -- stable: each entry's
+    // contributions stay in k order
+    std::vector<int> te, tl, tc;
     {
         long long total = 0;
         for (int k = 0; k < n; ++k) {
             const long long c = rp[k + 1] - dp[k] - 1;
             total += c * c;
         }
-        recs.reserve(static_cast<size_t>(total) + n + (P.n_ent - n) / 2);
+        te.reserve(static_cast<size_t>(total));
+        tl.reserve(static_cast<size_t>(total));
+        tc.reserve(static_cast<size_t>(total));
     }
-    for (int k = 0; k < n; ++k) {
-        const int u0 = dp[k] + 1, u1 = rp[k + 1];  // U row k: columns j > k = rows i > k of L col k
-        for (int a = u0; a < u1; ++a) {
-            const int i = ci[a];
-            const int lik = entry_of(rp, ci, i, k);
-            for (int c = u0; c < u1; ++c) {
-                const int j = ci[c];
-                const int p = std::min(i, j);
-                recs.push_back({entry_of(rp, ci, i, j), lik, c, 2 * level[p] + (i > j ? 1 : 0)});
-            }
+    for_each_contribution([&](int e, int lik, int c) { te.push_back(e); tl.push_back(lik); tc.push_back(c); });
+    std::vector<int> cstart(static_cast<size_t>(P.n_ent) + 1, 0);
+    for (const int e : te) ++cstart[static_cast<size_t>(e) + 1];
+    for (int e = 0; e < P.n_ent; ++e) cstart[static_cast<size_t>(e) + 1] += cstart[static_cast<size_t>(e)];
+    std::vector<int> ecl(te.size()), ecu(te.size());
+    {
+        std::vector<int> fill(cstart.begin(), cstart.end() - 1);
+        for (size_t q = 0; q < te.size(); ++q) {
+            const int w = fill[static_cast<size_t>(te[q])]++;
+            ecl[static_cast<size_t>(w)] = tl[q];
+            ecu[static_cast<size_t>(w)] = tc[q];
         }
     }
-    for (int p = 0; p < n; ++p) recs.push_back({dp[p], -1, -1, 2 * level[p]});
-    for (int i = 0; i < n; ++i)
-        for (int e = rp[i]; e < dp[i]; ++e) recs.push_back({e, -1, -1, 2 * level[ci[e]] + 1});
-    std::stable_sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b) {
-        return a.step != b.step ? a.step < b.step : a.tgt < b.tgt;
-    });
-
-    std::vector<int> item_step;
-    P.f_cptr.push_back(0);
-    for (size_t q = 0; q < recs.size(); ++q) {
-        const Rec& r = recs[q];
-        if (q == 0 || r.tgt != recs[q - 1].tgt || r.step != recs[q - 1].step) {
-            if (q != 0) P.f_cptr.push_back(static_cast<int>(P.cl.size()));
-            const int piv = std::min(row_of[r.tgt], ci[r.tgt]);
-            P.f_tgt.push_back(in_a[r.tgt] ? r.tgt : ~r.tgt);
-            P.f_dg.push_back(dp[piv]);
-            item_step.push_back(r.step);
-        }
-        if (r.lo >= 0) {
-            P.cl.push_back(r.lo);
-            P.cu.push_back(r.up);
-        }
+    // the items by (step, entry): entries ascending into their step's bucket
+    const int n_steps = 2 * n_lev;
+    std::vector<int> scount(static_cast<size_t>(n_steps) + 1, 0), estep(P.n_ent, -1);
+    for (int e = 0; e < P.n_ent; ++e) {
+        const int i = row_of[e], j = ci[e];
+        const bool item = cstart[static_cast<size_t>(e) + 1] > cstart[static_cast<size_t>(e)] || j <= i;  // diagonal / L
+        if (!item) continue;
+        estep[e] = 2 * level[std::min(i, j)] + (i > j ? 1 : 0);
+        ++scount[static_cast<size_t>(estep[e]) + 1];
     }
-    P.f_cptr.push_back(static_cast<int>(P.cl.size()));
+    for (int s2 = 0; s2 < n_steps; ++s2) scount[static_cast<size_t>(s2) + 1] += scount[static_cast<size_t>(s2)];
+    std::vector<int> items(scount.back());
+    {
+        std::vector<int> fill(scount.begin(), scount.end() - 1);
+        for (int e = 0; e < P.n_ent; ++e)
+            if (estep[e] >= 0) items[static_cast<size_t>(fill[static_cast<size_t>(estep[e])]++)] = e;
+    }
+    const size_t n_items = items.size();
+    std::vector<int> item_step(n_items);
+    P.f_tgt.resize(n_items);
+    P.f_dg.resize(n_items);
+    P.f_cptr.resize(n_items + 1);
+    P.cl.resize(ecl.size());
+    P.cu.resize(ecu.size());
+    P.f_cptr[0] = 0;
+    int w = 0;
+    for (size_t q = 0; q < n_items; ++q) {
+        const int e = items[q];
+        P.f_tgt[q] = in_a[e] ? e : ~e;
+        P.f_dg[q] = dp[std::min(row_of[e], ci[e])];
+        item_step[q] = estep[e];
+        const int c0 = cstart[static_cast<size_t>(e)], c1 = cstart[static_cast<size_t>(e) + 1];
+        std::copy(ecl.begin() + c0, ecl.begin() + c1, P.cl.begin() + w);
+        std::copy(ecu.begin() + c0, ecu.begin() + c1, P.cu.begin() + w);
+        w += c1 - c0;
+        P.f_cptr[q + 1] = w;
+    }
     P.contributions = static_cast<long long>(P.cl.size());
 
     for (size_t a = 0; a < item_step.size();) {
