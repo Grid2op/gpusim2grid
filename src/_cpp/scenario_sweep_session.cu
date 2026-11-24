@@ -15,6 +15,7 @@
 #include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
 #include <limits>
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel, zero_branch_flows_kernel
+#include "contingency/own_branch_flows.cuh"   // override_own_branch_flows
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
 #include "ledger_data.hpp"       // LedgerData (mask_cfg_ controller-bus setup)
@@ -1044,12 +1045,113 @@ void ScenarioSweepSession::set_topology(
         if (has_more_off_ && r < more_off_.size())
             for (const auto& t : element_trips::svc_triplets(trip_data_, more_off_[r].svcs))
                 contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
+        // the parameters it gives some branches (set_branch_param_blocks)
+        _append_branch_params(static_cast<int>(r), contingencies_.back());
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
     has_topology_      = true;
     topology_implicit_ = false;
     topology_dirty_    = true;
     auto_ref_valid_    = false;
+}
+
+// =============================================================================
+// set_branch_param_blocks (lightsim2grid PR #303's set_line_parameters /
+// set_trafo_parameters)
+// =============================================================================
+void ScenarioSweepSession::set_branch_param_blocks(const std::vector<int>& rows,
+                                                   const std::vector<int>& branches,
+                                                   const std::vector<std::complex<double>>& y,
+                                                   int n_rows)
+{
+    static const char* who = "ScenarioSweepSession::set_branch_param_blocks";
+    if (!has_branch_data_)
+        throw std::runtime_error(std::string(who) + ": call set_branch_data() first");
+    if (branches.size() != rows.size() || y.size() != 4 * rows.size())
+        throw std::runtime_error(std::string(who) + ": rows, branches and y (4 per entry) disagree in length");
+    if (!rows.empty() && n_rows <= 0)
+        throw std::runtime_error(std::string(who) + ": n_rows must be > 0");
+    if (has_injections_ && n_rows > 0 && n_rows != n_scenarios_)
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(n_rows) + " rows, but set_injections() "
+                                 "fixed " + std::to_string(n_scenarios_) + " scenarios");
+    const int n_bra = static_cast<int>(h_branch_from_.size());
+    std::vector<std::vector<BranchParamBlock>> per_row(rows.empty() ? 0 : static_cast<size_t>(n_rows));
+    for (size_t k = 0; k < rows.size(); ++k) {
+        if (rows[k] < 0 || rows[k] >= n_rows)
+            throw std::runtime_error(std::string(who) + ": row " + std::to_string(rows[k]) + " is outside [0, " +
+                                     std::to_string(n_rows) + ")");
+        if (branches[k] < 0 || branches[k] >= n_bra)
+            throw std::runtime_error(std::string(who) + ": branch " + std::to_string(branches[k]) +
+                                     " is outside the " + std::to_string(n_bra) + " branches");
+        BranchParamBlock b;
+        b.first = branches[k];
+        for (int q = 0; q < 4; ++q) b.second[static_cast<size_t>(q)] = y[4 * k + static_cast<size_t>(q)];
+        per_row[static_cast<size_t>(rows[k])].push_back(b);
+    }
+    for (auto& row : per_row) {
+        std::sort(row.begin(), row.end(), [](const BranchParamBlock& a, const BranchParamBlock& b) { return a.first < b.first; });
+        for (size_t k = 1; k < row.size(); ++k)
+            if (row[k].first == row[k - 1].first)
+                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(row[k].first) +
+                                         " is given twice in one row");
+    }
+    // nothing set, or nothing left after a clear: no rebuild needed when there was nothing before
+    const bool had = has_branch_params_;
+    branch_params_    = std::move(per_row);
+    has_branch_params_ = !rows.empty();
+    if (!had && !has_branch_params_) return;
+    // the rows' Ybus patches, rebuilt with them (the caller's branch trips kept; the
+    // implicit "none" follows the new row count)
+    const bool keep = has_topology_ && !topology_implicit_;
+    const size_t n_implicit = has_branch_params_ ? branch_params_.size()
+                            : (has_injections_ ? static_cast<size_t>(n_scenarios_) : contingencies_.size());
+    const std::vector<std::vector<int>> trips = keep
+        ? tripped_branches_per_scenario_
+        : std::vector<std::vector<int>>(n_implicit);
+    set_topology(trips);
+    topology_implicit_ = !keep;
+}
+
+void ScenarioSweepSession::_append_branch_params(int r, Contingency& ctg) const
+{
+    if (!has_branch_params_ || r < 0 || static_cast<size_t>(r) >= branch_params_.size()) return;
+    const double sqrt3 = std::sqrt(3.0);
+    for (const BranchParamBlock& bp : branch_params_[static_cast<size_t>(r)]) {
+        const int b = bp.first;
+        // tripped by the row: its grid block went, the parameters do not matter
+        if (std::find(ctg.tripped_branches.begin(), ctg.tripped_branches.end(), b) != ctg.tripped_branches.end())
+            continue;
+        const int f = h_branch_from_(b), t = h_branch_to_(b);
+        if (f < 0 && t < 0) continue;   // in no matrix
+        const std::complex<double> grid[4] = {
+            std::complex<double>(static_cast<double>(h_yff_eff_(b).real()), static_cast<double>(h_yff_eff_(b).imag())),
+            std::complex<double>(static_cast<double>(h_yft_eff_(b).real()), static_cast<double>(h_yft_eff_(b).imag())),
+            std::complex<double>(static_cast<double>(h_ytf_eff_(b).real()), static_cast<double>(h_ytf_eff_(b).imag())),
+            std::complex<double>(static_cast<double>(h_ytt_eff_(b).real()), static_cast<double>(h_ytt_eff_(b).imag()))};
+        // subtracted from the row's Ybus: grid block - row block, on the entries the
+        // branch stamps (lightsim2grid's YbusPolicy::Contingency::_append_param_coeffs)
+        const auto add = [&ctg](int i, int j, std::complex<double> d) { ctg.triplets.push_back({i, j, d.real(), d.imag()}); };
+        if (f >= 0) add(f, f, grid[0] - bp.second[0]);
+        if (t >= 0) add(t, t, grid[3] - bp.second[3]);
+        if (f >= 0 && t >= 0) {
+            add(f, t, grid[1] - bp.second[1]);
+            add(t, f, grid[2] - bp.second[2]);
+        }
+        // the row's own block: its flows and current check (a side's current base is the
+        // nominal voltage of its bus, the other end's when it is Kron-reduced, as
+        // BatchPfDriver::upload_branch_admittances)
+        RowBranchBlock ob;
+        ob.branch = b;
+        ob.from = f;
+        ob.to = t;
+        for (int q = 0; q < 4; ++q) ob.y[q] = bp.second[static_cast<size_t>(q)];
+        const int vn_or = f >= 0 ? f : t, vn_ex = t >= 0 ? t : f;
+        ob.base_or_A = sn_mva_ * 1e6 / (sqrt3 * static_cast<double>(h_bus_vn_kv_(vn_or)) * 1e3);
+        ob.base_ex_A = sn_mva_ * 1e6 / (sqrt3 * static_cast<double>(h_bus_vn_kv_(vn_ex)) * 1e3);
+        ctg.own_branches.push_back(ob);
+    }
+    std::sort(ctg.own_branches.begin(), ctg.own_branches.end(),
+              [](const RowBranchBlock& a, const RowBranchBlock& b) { return a.branch < b.branch; });
 }
 
 // =============================================================================
@@ -1138,6 +1240,26 @@ std::vector<std::string> ScenarioSweepSession::_row_unsupported_reasons() const
                           "ShuntVoltageControl loop owns its sections";
                     break;
                 }
+        // with the outer loops, a transformer a TransformerVoltageControl / PhaseControl loop
+        // regulates is re-stamped from the GRID's parameters at each new tap (BranchControl):
+        // the row's own would be undone (lightsim2grid leaves that row out too)
+        if (why.empty() && outer_ && has_branch_params_ && base_ledger_ && !base_ledger_->bc_trafo.empty()
+                && static_cast<size_t>(r) < branch_params_.size()) {
+            const int n_lines = base_ledger_->bc_n_lines;
+            const std::vector<int>* trips = (has_topology_ && static_cast<size_t>(r) < tripped_branches_per_scenario_.size())
+                ? &tripped_branches_per_scenario_[static_cast<size_t>(r)] : nullptr;
+            for (const BranchParamBlock& bp : branch_params_[static_cast<size_t>(r)]) {
+                const int t = bp.first - n_lines;
+                if (t < 0) continue;
+                if (trips != nullptr && std::find(trips->begin(), trips->end(), bp.first) != trips->end()) continue;
+                if (std::find(base_ledger_->bc_trafo.begin(), base_ledger_->bc_trafo.end(), t) == base_ledger_->bc_trafo.end())
+                    continue;
+                why = "changes the parameters of transformer " + std::to_string(t) + ", whose taps a "
+                      "TransformerVoltageControl / PhaseControl loop regulates (it re-stamps the "
+                      "transformer from the grid's parameters)";
+                break;
+            }
+        }
         if (why.empty() && base_ledger_) {
             std::vector<int> gens;
             if (has_gen_off_ && r < gen_off_.rows())
@@ -1290,6 +1412,11 @@ void ScenarioSweepSession::run()
             "ScenarioSweepSession: set_gen_v()'s row count no longer "
             "matches set_injections()'s n_scenarios -- call set_gen_v() "
             "again after changing set_injections()");
+
+    if (has_branch_params_ && static_cast<int>(branch_params_.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_line_parameters / set_trafo_parameters' row count no longer "
+            "matches set_injections()'s n_scenarios -- set them again after changing set_injections()");
 
     if (has_topology_
             && static_cast<int>(contingencies_.size()) != n_scenarios_)
@@ -2178,6 +2305,9 @@ void ScenarioSweepSession::compute_flows()
             thrust::raw_pointer_cast(d_zero.data()),
             n_z);
     }
+    // the branches a row gives parameters of its own (set_line_parameters /
+    // set_trafo_parameters): at the row's block
+    override_own_branch_flows(*solver_, contingencies_, n_bus, "ScenarioSweepSession::compute_flows");
 
     timings_.t_flow_computation += flow_timer.stop_ms();
     // d_zero dies at the end of the scope: wait for the kernel reading it (stop_ms() does not under

@@ -285,6 +285,44 @@ GenPvReleasePlanData extract_gen_pv_release_plan_from_lsgrid(const ls2g::LSGrid&
 bool bridge_has_gen_pv_release();
 // lightsim2grid's held controllers (LSGrid::set_hold_frozen_regulators, PR #220)
 bool bridge_has_hold_frozen();
+
+// ScenarioSweep set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): per row,
+// the block each named branch STAMPS with the row's parameters -- lightsim2grid's own
+// LineContainer / TrafoContainer::pi_model_with (a transformer's r, x, h the NEUTRAL values,
+// its tap changers' corrections applied on top; ratio and shift what change_ratio_trafo /
+// change_shift_trafo take), Kron-reduced by BranchContainer::kron_block for the grid's end
+// statuses (y11 y12 y21 y22, pu, the effective block yac_eff_* would hold). Ids are container
+// ids, each matrix (n_rows, n_ids) row-major, a NaN cell keeps the grid's value (a complex one
+// when either part is NaN). A cell whose every matrix is NaN, and a branch off in the grid
+// (in no matrix), give nothing. Lines' branch ids are their own, transformers' n_lines + id.
+struct BranchParamBlocks {
+    std::vector<int>                  rows;
+    std::vector<int>                  branches;
+    std::vector<std::complex<double>> y;   // 4 per entry
+};
+using ParamRealMatRM = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using ParamCplxMatRM = Eigen::Matrix<std::complex<double>, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+// Throws std::invalid_argument for an id out of range or named twice, a matrix of another
+// shape, an infinite value, r and x both 0, a ratio that is not positive, or a cell whose
+// admittance is not finite (lightsim2grid's own checks); std::runtime_error when the
+// lightsim2grid built against predates PR #303 (bridge_has_branch_params).
+BranchParamBlocks branch_param_blocks(const ls2g::LSGrid& grid,
+                                      const Eigen::Ref<const Eigen::VectorXi>& line_ids,
+                                      const Eigen::Ref<const ParamRealMatRM>& line_r,
+                                      const Eigen::Ref<const ParamRealMatRM>& line_x,
+                                      const Eigen::Ref<const ParamCplxMatRM>& line_h1,
+                                      const Eigen::Ref<const ParamCplxMatRM>& line_h2,
+                                      const Eigen::Ref<const Eigen::VectorXi>& trafo_ids,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_r,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_x,
+                                      const Eigen::Ref<const ParamCplxMatRM>& trafo_h1,
+                                      const Eigen::Ref<const ParamCplxMatRM>& trafo_h2,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_ratio,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_shift);
+// Whether the lightsim2grid built against has PR #303's per-row batch inputs
+// (pi_model_with, kron_block, the row-weighted GenPCheck plan, OuterRowView's unit slack
+// weights): branch_param_blocks throws otherwise.
+bool bridge_has_branch_params();
 // lightsim2grid's outer loops (NROuter_*, branch dev_outer_batch_perf)
 bool bridge_has_outer_loops();
 

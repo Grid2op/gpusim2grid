@@ -416,6 +416,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # session's own n_scenarios is the live driver's until the next run.
         self._skip_rows_stale = False
         self._n_injection_rows = None
+        # set_line_parameters / set_trafo_parameters inputs ((ids, matrices) or None): the
+        # session takes both at once (_push_branch_params)
+        self._line_params = None
+        self._trafo_params = None
 
         # OLF-style bounded slack redistribution of what a row loses, and the
         # reference slack the fewest rows strand -- see
@@ -825,6 +829,177 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         ``compute_physical_violations``, a line in AC emulation or with a regulating station is
         reported BATCH_UNSUPPORTED (those checks cannot leave it out of a row yet)."""
         self._set_more_trip("set_contingency_hvdcs", mask)
+
+    # ------------------------------------------- per-row branch parameters (lightsim2grid PR #303)
+    def _element_ids(self, ids, container, kind):
+        """Element ids (ints, or names) of one kind of element, as an int32 array."""
+        names = None
+        out = []
+        for el in list(ids):
+            if isinstance(el, str):
+                if names is None:
+                    names = {e.name: e.id for e in container}
+                if el not in names:
+                    raise ValueError(f"No {kind} named \"{el}\" on the grid.")
+                out.append(names[el])
+            else:
+                out.append(int(el))
+        return np.asarray(out, dtype=np.int32)
+
+    @staticmethod
+    def _branch_param_matrices(nb_ids, setter, **matrices):
+        """The given matrices checked to shape (n_rows, nb_ids), the missing ones all NaN (the
+        grid's value) of that shape; h1 / h2 complex, the others float."""
+        given = {k: v for k, v in matrices.items() if v is not None}
+        if nb_ids and not given:
+            raise ValueError(f"{setter}: give at least one of {', '.join(matrices)}.")
+        n_rows = None
+        out = {}
+        for name, val in given.items():
+            dtype = np.complex128 if name in ("h1", "h2") else np.float64
+            arr = np.asarray(val, dtype=dtype)
+            if arr.ndim != 2 or arr.shape[1] != nb_ids:
+                raise ValueError(f"{setter}: `{name}` should be a matrix of shape (n_scenarios, {nb_ids}): one row "
+                                 f"per scenario, one column per element named, got shape {arr.shape}.")
+            if n_rows is None:
+                n_rows = arr.shape[0]
+            elif arr.shape[0] != n_rows:
+                raise ValueError(f"{setter}: `{name}` has {arr.shape[0]} rows, the other matrices {n_rows}.")
+            out[name] = np.ascontiguousarray(arr)
+        n_rows = 0 if n_rows is None else n_rows
+        for name in matrices:
+            if name not in out:
+                if name in ("h1", "h2"):
+                    out[name] = np.full((n_rows, nb_ids), complex(np.nan, np.nan), dtype=np.complex128)
+                else:
+                    out[name] = np.full((n_rows, nb_ids), np.nan, dtype=np.float64)
+        return out
+
+    def _require_branch_params(self, setter):
+        if self._grid is None:
+            raise RuntimeError(f"{setter}() needs a lightsim2grid grid; explicit-array (tuple) mode has no "
+                               f"branch parameters to read.")
+        if not getattr(_cpp, "have_ls2g_branch_params", False):
+            raise NotImplementedError(
+                f"{setter}() needs a lightsim2grid with per-row branch parameters (lightsim2grid PR #303); "
+                "this gpusim2grid was built against an older one (_gpusim2grid.have_ls2g_branch_params).")
+
+    def set_line_parameters(self, line_ids, r=None, x=None, h1=None, h2=None):
+        """Per-scenario parameters of some powerlines: the values each row gives them.
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_line_parameters`` (PR #303).
+
+        Parameters
+        ----------
+        line_ids:
+            The powerlines whose parameters vary (ids, or names), one column each in the
+            matrices below; lightsim2grid's powerline numbering (transformers have
+            :meth:`set_trafo_parameters`).
+        r, x: ``np.ndarray`` of float, shape ``(n_scenarios, len(line_ids))``
+            Series resistance and reactance, in pu.
+        h1, h2: ``np.ndarray`` of complex, shape ``(n_scenarios, len(line_ids))``
+            Shunt admittance ``g + j.b`` at side 1 and side 2, in pu.
+
+        Notes
+        -----
+        Any of the four may be omitted, and a ``NaN`` cell (a complex one when either part is
+        ``NaN``) keeps the grid's value. The values mean what lightsim2grid's
+        ``LSGrid.update_powerlines_parameters`` takes: a row solves, and reports flows and
+        violations, as the grid would with them. Only the values of existing admittance-matrix
+        entries change, so the whole sweep keeps a single symbolic analysis. A row that also
+        trips the line (:meth:`set_topology`) ignores its parameters.
+
+        A new call replaces the previous one; an empty ``line_ids`` clears it. The row count
+        must be the injections'. Raises for an id out of range or named twice, a matrix of
+        another shape, an infinite value or ``r`` and ``x`` both 0.
+        """
+        self._require_branch_params("set_line_parameters")
+        ids = self._element_ids(line_ids, self._grid.get_lines(), "powerline")
+        mats = self._branch_param_matrices(ids.size, "set_line_parameters", r=r, x=x, h1=h1, h2=h2)
+        self._set_branch_params("_line_params", (ids, mats) if ids.size else None)
+
+    def set_trafo_parameters(self, trafo_ids, r=None, x=None, h1=None, h2=None, ratio=None, shift_rad=None):
+        """Per-scenario parameters of some transformers: :meth:`set_line_parameters` for the
+        transformers, with their ratio and phase shift as well.
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_trafo_parameters`` (PR #303).
+
+        .. warning::
+            ``r``, ``x``, ``h1`` and ``h2`` are the values at the **neutral tap**, those
+            ``LSGrid.update_trafos_parameters_full`` takes. A transformer with tap changers (or
+            an impedance that depends on its shift) gets their corrections at their current
+            positions applied on top, exactly as the grid does: giving the impedance you read on
+            the transformer at its current tap applies that correction twice. Without a tap
+            changer the two are the same.
+
+        Parameters
+        ----------
+        trafo_ids:
+            The transformers whose parameters vary (ids, or names).
+        r, x, h1, h2: ``np.ndarray``, shape ``(n_scenarios, len(trafo_ids))``
+            As in :meth:`set_line_parameters`, in pu: the **neutral** values, see the warning.
+        ratio: ``np.ndarray`` of float, shape ``(n_scenarios, len(trafo_ids))``
+            The ratio, what ``LSGrid.change_ratio_trafo`` takes.
+        shift_rad: ``np.ndarray`` of float, shape ``(n_scenarios, len(trafo_ids))``
+            The phase shift, in radian (on side 1), what ``LSGrid.change_shift_trafo`` takes.
+
+        Notes
+        -----
+        With ``outer_loops=True``, a row changing a transformer whose taps a
+        TransformerVoltageControl / PhaseControl loop regulates is left out of the batch
+        (``BATCH_UNSUPPORTED``, the reason in :meth:`get_batch_unsupported_reasons`): the loop
+        would move the tap from the grid's parameters. Also raises for a ratio that is not
+        positive.
+        """
+        self._require_branch_params("set_trafo_parameters")
+        ids = self._element_ids(trafo_ids, self._grid.get_trafos(), "transformer")
+        mats = self._branch_param_matrices(ids.size, "set_trafo_parameters", r=r, x=x, h1=h1, h2=h2,
+                                           ratio=ratio, shift_rad=shift_rad)
+        self._set_branch_params("_trafo_params", (ids, mats) if ids.size else None)
+
+    def _set_branch_params(self, attr, value):
+        """Register one kind's parameters and push both; a refused call leaves the previous
+        registration (and the session) as they were."""
+        previous = getattr(self, attr)
+        setattr(self, attr, value)
+        try:
+            self._push_branch_params()
+        except Exception:
+            setattr(self, attr, previous)
+            raise
+
+    def _push_branch_params(self):
+        """Hand the session the blocks the rows' branch parameters stamp (lightsim2grid's own
+        pi models, computed by the bridge), lines and transformers together."""
+        lp, tp = self._line_params, self._trafo_params
+        n_rows = [m["r"].shape[0] for p in (lp, tp) if p is not None for m in (p[1],)]
+        if len(set(n_rows)) > 1:
+            raise ValueError(f"set_line_parameters and set_trafo_parameters disagree on the number of "
+                             f"scenarios ({n_rows[0]} and {n_rows[1]} rows).")
+        n = n_rows[0] if n_rows else 0
+        if self._n_injection_rows is not None and n and n != self._n_injection_rows:
+            raise ValueError(f"set_line_parameters / set_trafo_parameters: {n} rows, but the injections have "
+                             f"{self._n_injection_rows} scenarios.")
+
+        def empty_real(k=0):
+            return np.zeros((n, k), dtype=np.float64)
+
+        def empty_cplx(k=0):
+            return np.zeros((n, k), dtype=np.complex128)
+
+        none_ids = np.zeros(0, dtype=np.int32)
+        if lp is not None:
+            l_ids, lm = lp
+            l_args = (l_ids, lm["r"], lm["x"], lm["h1"], lm["h2"])
+        else:
+            l_args = (none_ids, empty_real(), empty_real(), empty_cplx(), empty_cplx())
+        if tp is not None:
+            t_ids, tm = tp
+            t_args = (t_ids, tm["r"], tm["x"], tm["h1"], tm["h2"], tm["ratio"], tm["shift_rad"])
+        else:
+            t_args = (none_ids, empty_real(), empty_real(), empty_cplx(), empty_cplx(), empty_real(), empty_real())
+        rows, branches, y = _cpp._branch_param_blocks(self._grid, *l_args, *t_args)
+        self._inner._s.set_branch_param_blocks(rows, branches, y, n)
 
     def get_batch_unsupported_reasons(self):
         """list[str], per row: why the batch left it out (``""``: it did not), after

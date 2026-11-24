@@ -58,6 +58,8 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <array>
+#include <complex>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -305,6 +307,16 @@ struct ScenarioSweepSession {
     std::vector<MoreTrips>        more_off_;
     bool                          has_more_off_ = false;
     std::vector<std::string>      row_unsupported_;
+    // ScenarioSweep set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): per
+    // row, the branches it gives parameters of its own with the block they stamp (sorted by
+    // branch, set_branch_param_blocks). set_topology turns them into the row's Ybus patch
+    // (grid block - row block, on the entries the branch already has) and its own blocks
+    // (Contingency::own_branches: flows, current check); a branch the row trips ignores them.
+    using BranchParamBlock = std::pair<int, std::array<std::complex<double>, 4>>;
+    std::vector<std::vector<BranchParamBlock>> branch_params_;
+    bool                                       has_branch_params_ = false;
+    // the row's own blocks and Ybus deltas of its branch parameters, into `ctg` (set_topology)
+    void _append_branch_params(int r, Contingency& ctg) const;
     // the controllers of the voltage-control groups each row trips, and whether the base
     // ledger carries the entries that takes (reserve_tripped_controller_slots)
     std::vector<std::vector<int>> row_vc_tripped_;
@@ -646,6 +658,18 @@ struct ScenarioSweepSession {
     more_trips_injection_delta() const;
     // per row, why the batch left it out ("": it did not), set by run()
     const std::vector<std::string>& get_batch_unsupported_reasons() const { return row_unsupported_; }
+    // ScenarioSweep set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): the
+    // branches whose parameters rows change, with the block those parameters stamp (y11 y12
+    // y21 y22 pu, 4 per entry, Kron-reduced for the branch's end statuses: the bridge's
+    // branch_param_blocks). Each row's Ybus is patched by value on the entries the branch
+    // already has (one cuDSS analysis for the batch), and its flows and current check read
+    // the row's block. A row tripping the branch ignores them. With the outer loops, a row
+    // changing a transformer a TransformerVoltageControl / PhaseControl loop regulates is left
+    // out (row_unsupported_). Replaces the previous set; empty clears it. Needs
+    // set_branch_data().
+    void set_branch_param_blocks(const std::vector<int>& rows, const std::vector<int>& branches,
+                                 const std::vector<std::complex<double>>& y, int n_rows);
+    bool has_branch_params() const { return has_branch_params_; }
 
     // =========================================================================
     // set_pv_pq_switches — the labelling side of one reactive-limit outer-loop

@@ -178,6 +178,13 @@ struct ScenarioSweepBatch {
     // -------------------------------------------------------------------------
     std::vector<int> h_trip_branch_flat_, h_trip_start_, h_trip_count_;
     thrust::device_vector<int> d_trip_branch_flat, d_trip_start, d_trip_count;
+    // the rows' own branch blocks (Contingency::own_branches: set_line_parameters /
+    // set_trafo_parameters), see TrippedBranchTable -- verbatim ContingencyBatch's
+    std::vector<int> h_trip_own_;
+    std::vector<RowBranchBlock> h_own_;
+    thrust::device_vector<int> d_trip_own, d_own_ft;
+    thrust::device_vector<cudaComplexType> d_own_y;
+    thrust::device_vector<cuda_real_type> d_own_base;
 
     // -------------------------------------------------------------------------
     // Device-resident per-scenario Sbus in ACTIVE-slot order (n_active × n_bus),
@@ -286,7 +293,8 @@ struct ScenarioSweepBatch {
                                mask_cfg, mask_.h);
 
         build_tripped_branch_table(contingencies, active_to_orig_,
-                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_);
+                                   h_trip_branch_flat_, h_trip_start_, h_trip_count_,
+                                   &h_trip_own_, &h_own_);
 
         _build_vm_reseed(contingencies);
 
@@ -450,10 +458,17 @@ struct ScenarioSweepBatch {
     // it is currently checking. Verbatim ContingencyBatch::tripped_branch_table.
     // -------------------------------------------------------------------------
     TrippedBranchTable tripped_branch_table() const {
-        return TrippedBranchTable{
+        TrippedBranchTable t{
             thrust::raw_pointer_cast(d_trip_start.data()),
             thrust::raw_pointer_cast(d_trip_count.data()),
             thrust::raw_pointer_cast(d_trip_branch_flat.data())};
+        if (!h_own_.empty()) {
+            t.d_own = thrust::raw_pointer_cast(d_trip_own.data());
+            t.d_own_y = thrust::raw_pointer_cast(d_own_y.data());
+            t.d_own_ft = thrust::raw_pointer_cast(d_own_ft.data());
+            t.d_own_base = thrust::raw_pointer_cast(d_own_base.data());
+        }
+        return t;
     }
 
     const cudaComplexType* d_Sbus_ptr(const BatchPfDriverContext& /*ctx*/) const {
