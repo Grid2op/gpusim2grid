@@ -26,6 +26,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "topology_
 SPLIT_CONTINGENCIES: list[list[int]] = [[], [3], [6]]
 
 
+def _check_template_mode() -> bool:
+    """GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE read as the device model reads it: on when set to
+    anything but empty or a value starting with 0"""
+    return os.environ.get("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE", "")[:1] not in ("", "0")
+
+
 @pytest.fixture(scope="module")
 def grid() -> Any:
     import pandapower.networks as pn
@@ -182,7 +188,7 @@ def test_rows_masking_only_spare_buses_are_copied_on_the_device(grid: Any, warm:
     from test_topo_outer_warm_start import _splits
 
     host, dev = _same_strategies(grid, _splits(grid), warm, handle_disconnected_grid=True)
-    if os.environ.get("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE"):
+    if _check_template_mode():
         pytest.skip("the check mode loads the rows through the host on purpose (to compare)")
     n_rows = len(np.asarray(host.get_row_status()))
     assert host.timings.n_oc_host_loads >= n_rows
@@ -207,7 +213,7 @@ def test_strategies_of_an_islanding_contingency_are_copied_on_the_device(grid: A
     leaf_bus = int(np.asarray(grid.id_me_to_ac_solver())[7])
     rows = [2] + [len(ctgs) + 2 * len(actions) + a for a in range(len(actions))]
     assert np.isnan(v[rows, leaf_bus]).all(), v[rows, leaf_bus]
-    if os.environ.get("GPUSIM2GRID_OUTER_DEVICE_CHECK_TEMPLATE"):
+    if _check_template_mode():
         pytest.skip("the check mode loads the rows through the host on purpose (to compare)")
     assert dev.timings.n_oc_host_loads <= 2 + len(ctgs), dev.timings.n_oc_host_loads
 
