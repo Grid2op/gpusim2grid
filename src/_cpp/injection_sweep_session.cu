@@ -462,7 +462,6 @@ void InjectionSweepSession::compute_flows()
     // the transformers the outer loops left on other taps: at the row's final taps
     solver_->override_outer_trafo_flows();
 
-    // stop_ms() records + synchronizes the stop event.
     timings_.t_flow_computation += flow_timer.stop_ms();
 
     // D→H download of flow results — timed separately.

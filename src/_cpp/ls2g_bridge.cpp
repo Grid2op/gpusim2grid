@@ -1896,7 +1896,8 @@ make_ss_outer_session_from_lsgrid(
     bool   resume_from_n,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
-    double max_dVm_override)
+    double max_dVm_override,
+    bool   device_backend)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
@@ -1930,7 +1931,8 @@ make_ss_outer_session_from_lsgrid(
     outer::Ls2gModelOptions opt;
     opt.keep_trace = keep_trace;
     opt.resume_from_n = resume_from_n;
-    session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
+    session->set_outer_model(device_backend ? outer::make_device_outer_model(grid, in.ledger, opt)
+                                            : outer::make_ls2g_outer_model(grid, in.ledger, opt));
     return session;
 }
 
@@ -1949,7 +1951,8 @@ make_ca_outer_session_from_lsgrid(
     bool   resume_from_n,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
-    double max_dVm_override)
+    double max_dVm_override,
+    bool   device_backend)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
@@ -1979,7 +1982,8 @@ make_ca_outer_session_from_lsgrid(
     outer::Ls2gModelOptions opt;
     opt.keep_trace = keep_trace;
     opt.resume_from_n = resume_from_n;
-    session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
+    session->set_outer_model(device_backend ? outer::make_device_outer_model(grid, in.ledger, opt)
+                                            : outer::make_ls2g_outer_model(grid, in.ledger, opt));
     return session;
 }
 
@@ -1998,7 +2002,8 @@ make_is_outer_session_from_lsgrid(
     bool   resume_from_n,
     int    scaling_max_voltage_change_override,
     double max_dVa_override,
-    double max_dVm_override)
+    double max_dVm_override,
+    bool   device_backend)
 {
     OuterInputs in = extract_outer_inputs(grid, resume_from_n);
     const int n_bus = static_cast<int>(in.Ybus.rows());
@@ -2021,7 +2026,8 @@ make_is_outer_session_from_lsgrid(
     outer::Ls2gModelOptions opt;
     opt.keep_trace = keep_trace;
     opt.resume_from_n = resume_from_n;
-    session->set_outer_model(outer::make_ls2g_outer_model(grid, in.ledger, opt));
+    session->set_outer_model(device_backend ? outer::make_device_outer_model(grid, in.ledger, opt)
+                                            : outer::make_ls2g_outer_model(grid, in.ledger, opt));
     return session;
 }
 

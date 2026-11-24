@@ -27,13 +27,23 @@
 
 namespace gen_contingency {
 
+// The elements one row takes out: generators, storage units, hvdc lines (any order, duplicates
+// allowed, ids out of range ignored).
+struct RowOff {
+    std::vector<int> gens, stos, hvdcs;
+    void clear() { gens.clear(); stos.clear(); hvdcs.clear(); }
+};
+
+// `row_off(r, off)`: fills `off` (cleared) with what row r takes out.
 // `required`: the buses some row takes their LAST local voltage controller off
 // and that own no Vm unknown / Q equation in the base ledger (they need a
 // reserved pair, see ledger_extend.hpp's add_switchable_vm_buses), sorted;
 // `row_pv_to_pq`: per row, the buses it releases (sorted); `row_slack_off`: per
-// row, the participating generators it takes out of the distributed slack.
-template <class GenOff, class StoOff, class HvdcOff>
-void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, StoOff sto_off, HvdcOff hvdc_off,
+// row, the participating generators it takes out of the distributed slack (sorted).
+// A row only visits the buses of the elements it takes out: most rows take out none
+// (a contingency analysis of branch trips with a few generator rows among them).
+template <class RowOffFn>
+void prepare_rows(const GenContingencyData& gd, int n_rows, RowOffFn row_off,
                   const LedgerData* base_ledger,
                   std::vector<int>& required,
                   std::vector<std::vector<int>>& row_pv_to_pq,
@@ -64,20 +74,43 @@ void prepare_rows(const GenContingencyData& gd, int n_rows, GenOff gen_off, StoO
             if (b >= 0) controllers[b].hvdcs.push_back(h);
         }
 
+    const auto sorted_ids = [](std::vector<int>& v, int n) {
+        v.erase(std::remove_if(v.begin(), v.end(), [n](int x) { return x < 0 || x >= n; }), v.end());
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    };
+    const auto has = [](const std::vector<int>& v, int x) { return std::binary_search(v.begin(), v.end(), x); };
     std::set<int> req;
+    RowOff off;
+    std::vector<int> cand;   // the buses of the row's elements that hold a local controller
     for (int r = 0; r < n_rows; ++r) {
-        for (const auto& kv : controllers) {
+        off.clear();
+        row_off(r, off);
+        sorted_ids(off.gens, n_gen);
+        sorted_ids(off.stos, gd.n_storage);
+        sorted_ids(off.hvdcs, gd.n_hvdc);
+        if (off.gens.empty() && off.stos.empty() && off.hvdcs.empty()) continue;
+        cand.clear();
+        for (int g : off.gens) cand.push_back(gd.bus[g]);
+        for (int s : off.stos) cand.push_back(gd.storage_vreg_bus[static_cast<size_t>(s)]);
+        for (int h : off.hvdcs)
+            for (int side = 0; side < 2; ++side) cand.push_back(gd.station_vreg_bus[static_cast<size_t>(2 * h + side)]);
+        std::sort(cand.begin(), cand.end());
+        cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+        for (int b : cand) {
+            const auto it = controllers.find(b);
+            if (it == controllers.end()) continue;
             bool all_off = true;
-            for (int g : kv.second.gens) if (!gen_off(r, g)) { all_off = false; break; }
-            if (all_off) for (int s : kv.second.stos) if (!sto_off(r, s)) { all_off = false; break; }
-            if (all_off) for (int h : kv.second.hvdcs) if (!hvdc_off(r, h)) { all_off = false; break; }
+            for (int g : it->second.gens) if (!has(off.gens, g)) { all_off = false; break; }
+            if (all_off) for (int s : it->second.stos) if (!has(off.stos, s)) { all_off = false; break; }
+            if (all_off) for (int h : it->second.hvdcs) if (!has(off.hvdcs, h)) { all_off = false; break; }
             if (all_off) {
-                row_pv_to_pq[static_cast<size_t>(r)].push_back(kv.first);
-                req.insert(kv.first);
+                row_pv_to_pq[static_cast<size_t>(r)].push_back(b);
+                req.insert(b);
             }
         }
-        for (int g = 0; g < n_gen; ++g)
-            if (gen_off(r, g) && gd.status[g] && gd.slack_participant[g])
+        for (int g : off.gens)
+            if (gd.status[g] && gd.slack_participant[g])
                 row_slack_off[static_cast<size_t>(r)].push_back(g);
     }
 
@@ -115,6 +148,7 @@ inline std::vector<int> tripped_controllers(const LedgerData& ld, const std::vec
                                             const std::vector<int>& svcs, const std::vector<int>& hvdcs)
 {
     std::vector<int> out;
+    if (gens.empty() && svcs.empty() && hvdcs.empty()) return out;
     const auto named = [](const std::vector<int>& ids, int id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); };
     for (size_t c = 0; c < ld.vc_kind.size() && c < ld.vc_elem_id.size(); ++c) {
         const int kind = ld.vc_kind[c], id = ld.vc_elem_id[c];

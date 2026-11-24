@@ -30,6 +30,8 @@ callers without a lightsim2grid grid.
 
 .. autofunction:: gpusim2grid.optimize_reference_slack
 
+.. autofunction:: gpusim2grid.outer_device_census
+
 Contingency x action screening
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

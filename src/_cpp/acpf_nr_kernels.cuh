@@ -812,8 +812,10 @@ __global__ void scatter_V_results_kernel(
 // ---------------------------------------------------------------------------
 // One thread per entry: the flows of branch d_branch[i] of result row d_row[i] recomputed
 // with its own pi block d_blk[4 i .. 4 i + 3] (y11 y12 y21 y22) -- a transformer an outer
-// loop left on other taps than the grid's (lightsim2grid's _record_row_trafo_blocks).
-// d_V is the [n_rows x n_bus] result voltages; the outputs as compute_branch_flows_kernel's.
+// loop left on other taps than the grid's (lightsim2grid's _record_row_trafo_blocks), a
+// strategy's transformer values or bus moves. d_ft (null: the branch's own) its (from, to)
+// buses d_ft[2 i, 2 i + 1] there, d_base (null: the branch's) the current bases of its sides
+// in A. d_V is the [n_rows x n_bus] result voltages; the outputs as compute_branch_flows_kernel's.
 __global__ void override_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_V,
     const int*             __restrict__ d_row,
@@ -825,7 +827,9 @@ __global__ void override_branch_flows_kernel(
     const cuda_real_type*  __restrict__ d_base_current_ex_A,
           cuda_real_type*  __restrict__ d_or_amps,
           cuda_real_type*  __restrict__ d_ex_amps,
-    int n_bus, int n_branches, int n);
+    int n_bus, int n_branches, int n,
+    const int*             __restrict__ d_ft,
+    const cuda_real_type*  __restrict__ d_base);
 
 __global__ void compute_branch_flows_kernel(
     const cudaComplexType* __restrict__ d_V,

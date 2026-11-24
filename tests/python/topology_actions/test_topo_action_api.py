@@ -186,3 +186,47 @@ def test_apply_to_opens_one_end_and_moves_the_other(kind: str):
     after = grid.get_lines()[el.id] if kind == "line" else grid.get_trafos()[el.id]
     assert not after.connected1 and after.connected2
     assert after.bus2_id == new_bus
+
+
+def test_set_actions_reads_and_copies_the_grid_a_fixed_number_of_times(monkeypatch: pytest.MonkeyPatch):
+    """set_actions validates and compiles every action against the grid: its element ends are
+    walked, and the grid copied for transformer values, a number of times that does not grow
+    with the actions (on a 7k-bus grid a walk is ~30 ms and a copy ~1 s: 771 actions took 25 s)."""
+    import copy
+
+    import gpusim2grid.actions as actions_mod
+    from gpusim2grid.actions import Action
+
+    from _topo_helpers import make_ca
+
+    grid = case14()
+    ends, deepcopy = actions_mod._element_ends, copy.deepcopy
+    calls: dict[str, int] = {}
+
+    def counted_ends(g: LSGrid):
+        calls["walks"] += 1
+        return ends(g)
+
+    def counted_deepcopy(x: Any, memo: Any = None) -> Any:
+        calls["copies"] += 1
+        return deepcopy(x, memo)
+
+    monkeypatch.setattr(actions_mod, "_element_ends", counted_ends)
+    monkeypatch.setattr(copy, "deepcopy", counted_deepcopy)
+
+    def counts(repeat: int) -> dict[str, int]:
+        ca = make_ca(grid, {})
+        ca.add_contingencies_by_branch_id([[]])
+        calls.update(walks=0, copies=0)
+        actions = [Action(trafo_shift_deg={0: float(d)}) for d in range(1, 1 + 2 * repeat)]
+        load_move = Action(load_bus={0: bus2(grid, grid.get_loads()[0].sub_id)})
+        actions += [Action(line_bus1={0: 0}), load_move] * repeat
+        ca.set_actions(actions)
+        return dict(calls)
+
+    few, many = counts(1), counts(5)
+    # both are counted (a walk, and the one copy the transformer actions need): else the patches
+    # missed the calls and the bounds below hold for nothing
+    assert few["walks"] >= 1 and few["copies"] == 1, few
+    assert many == few, (few, many)
+    assert many["walks"] <= 2

@@ -20,6 +20,7 @@
 #ifdef GPUSIM2GRID_HAVE_LS2G
 #include "ls2g_bridge.hpp"                   // make_*_session_from_lsgrid
 #include "outer/ls2g_outer_model.hpp"        // the outer-loop model (test harness)
+#include "outer/device_outer_model.hpp"     // DeviceNotImplemented -> NotImplementedError
 #include "ledger_extend.hpp"                 // move_reference (test hook)
 #include "contingency/slot_ranges.hpp"       // slot_upload_ranges (test hook)
 #include "Ls2gAbiTag.hpp"                    // ls2g_current_abi_tag, core_abi_tag
@@ -621,6 +622,16 @@ static void bind_physical_checks_types(pybind11::module_& m)
         .def_readonly("stride",    &GenPvReleaseViolationsResult::stride);
 }
 
+#ifdef GPUSIM2GRID_HAVE_LS2G
+// outer_loops_backend: "host" (Ls2gOuterModel) or "device" (outer/device_outer_model.hpp)
+static bool outer_backend_flag(const std::string& b)
+{
+    if (b == "host") return false;
+    if (b == "device") return true;
+    throw std::invalid_argument("outer_backend must be 'host' or 'device', got '" + b + "'");
+}
+#endif
+
 PYBIND11_MODULE(_gpusim2grid, m)
 {
     m.doc() =
@@ -1024,6 +1035,9 @@ PYBIND11_MODULE(_gpusim2grid, m)
                       "continuous: base-case loads of freed slots once the queue is empty")
         .def_readonly("n_base_loads_skipped", &BatchTimings::n_base_loads_skipped,
                       "continuous: base-case loads the tail made unnecessary (slot overwritten or out of the rounds)")
+        .def_readonly("n_oc_host_loads", &BatchTimings::n_oc_host_loads,
+                      "outer loops: rows whose loops' state the host model set up (backend HOST: every load; "
+                      "DEVICE: those not copied from a template on the device)")
         .def_readonly("n_tail_row_rounds", &BatchTimings::n_tail_row_rounds,
                       "Continuous scheduling: live rows summed over the rounds of the tail")
         .def_readonly("n_slot_moves", &BatchTimings::n_slot_moves,
@@ -1916,10 +1930,10 @@ PYBIND11_MODULE(_gpusim2grid, m)
     .def("v_results_ptr", &ContingencyAnalysisSession::v_results_ptr,
          "Device pointer (int) of the last run's (n_contingencies, n_bus) voltages, 0 before run().")
     .def("compute_max_loading", &ContingencyAnalysisSession::compute_max_loading,
-         pybind11::arg("lim1_ka"), pybind11::arg("lim2_ka"), pybind11::arg("skip") = std::vector<long long>(),
+         pybind11::arg("lim1_ka"), pybind11::arg("lim2_ka"),
          "Per row of the last run(): (rho, branch), the highest |I| / limit over the branches and "
-         "their two sides and the branch reaching it (-1: none), reduced on the device; skip: flat "
-         "row * n_branches + branch entries left out.")
+         "their two sides and the branch reaching it (-1: none), reduced on the device (the rows' "
+         "own branch blocks included, set_row_branch_blocks).")
     .def("get_or_amps",    &ContingencyAnalysisSession::get_or_amps,
          pybind11::call_guard<pybind11::gil_scoped_release>(),
          "Copy origin-terminal ampere flows to host: (n_contingencies * n_branches,). "
@@ -1954,11 +1968,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "always masked (identity rows, NaN voltage) whatever handle_disconnected_grid. Optional: a "
          "spare bus is masked by default in every row that does not use it (no add_row_triplets entry "
          "and no add_row_sbus_deltas bus on it), with no call.")
-    .def("set_row_unchecked_branches", &ContingencyAnalysisSession::set_row_unchecked_branches,
-         pybind11::arg("rows"),
-         "After build_contingencies*(): per row, the branches compute_limit_violations' current check "
-         "skips as it skips a tripped one (records and counts), because their admittance or ends on "
-         "that row are not the shared ones: the caller checks them from the row's own block.")
+    .def("set_row_branch_blocks", &ContingencyAnalysisSession::set_row_branch_blocks,
+         pybind11::arg("rows"), pybind11::arg("branches"), pybind11::arg("ends"), pybind11::arg("y"),
+         pybind11::arg("base_A"),
+         "After build_contingencies*(): the branches whose admittance or ends on a row are not the "
+         "shared ones (a strategy's transformer values, its bus moves), one entry each: rows[i], "
+         "branches[i], ends[2i:2i+2] (from, to solver buses, -1: Kron-reduced), y[4i:4i+4] "
+         "(y11 y12 y21 y22), base_A[2i:2i+2] (current bases of the two sides, A). The current check "
+         "(records and counts), compute_flows and compute_max_loading use them. Replaces the "
+         "previous set.")
     .def("set_streaming", &ContingencyAnalysisSession::set_streaming,
          pybind11::arg("parent_of_row"), pybind11::arg("condition"), pybind11::arg("warm"),
          "Streamed strategies (continuous scheduling): per row, the row of its contingency (-1: a "
@@ -3649,17 +3667,19 @@ PYBIND11_MODULE(_gpusim2grid, m)
         std::shared_ptr<outer::OuterHook> model;
     };
     pybind11::class_<OuterModelHarness>(m, "_OuterModelHarness")
-        .def(pybind11::init([](pybind11::object grid_py, bool keep_trace, bool resume_from_n) {
+        .def(pybind11::init([](pybind11::object grid_py, bool keep_trace, bool resume_from_n, const std::string& backend) {
                 ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
                 OuterModelHarness h;
                 h.in = extract_outer_inputs(grid, resume_from_n);
                 outer::Ls2gModelOptions opt;
                 opt.keep_trace = keep_trace;
                 opt.resume_from_n = resume_from_n;
-                h.model = outer::make_ls2g_outer_model(grid, h.in.ledger, opt);
+                if (backend == "host") h.model = outer::make_ls2g_outer_model(grid, h.in.ledger, opt);
+                else if (backend == "device") h.model = outer::make_device_outer_model(grid, h.in.ledger, opt);
+                else throw std::invalid_argument("backend must be 'host' or 'device'");
                 return h;
             }), pybind11::arg("grid"), pybind11::arg("keep_trace") = true,
-            pybind11::arg("resume_from_n") = false)
+            pybind11::arg("resume_from_n") = false, pybind11::arg("backend") = "host")
         .def_property_readonly("V0", [](const OuterModelHarness& h) { return h.in.V0; })
         .def_property_readonly("slack", [](const OuterModelHarness& h) { return h.in.slack; })
         .def_property_readonly("pv", [](const OuterModelHarness& h) { return h.in.pv; })
@@ -3727,16 +3747,21 @@ PYBIND11_MODULE(_gpusim2grid, m)
                 return d;
             })
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
-        .def("set_branch_off", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off,
-                                  std::vector<std::vector<int>> masked) {
+        .def("set_row_overrides", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off,
+                                     std::vector<std::vector<int>> masked,
+                                     std::vector<std::vector<std::pair<int, int>>> gen_bus) {
                 outer::RowOverrides ov;
                 ov.branch_off = std::move(branch_off);
                 ov.masked = std::move(masked);
+                ov.gen_bus = std::move(gen_bus);
                 h.model->set_row_overrides(std::move(ov));
-            }, pybind11::arg("branch_off"), pybind11::arg("masked") = std::vector<std::vector<int>>{},
-            "per row, the branches it opens (lines then trafos) and, optionally, the solver buses "
-            "handle_disconnected_grid masks. Replaces ALL the rows' overrides (generators off, "
-            "gen_v, lost power... are cleared): call it before begin().")
+            }, pybind11::arg("branch_off") = std::vector<std::vector<int>>{},
+            pybind11::arg("masked") = std::vector<std::vector<int>>{},
+            pybind11::arg("gen_bus") = std::vector<std::vector<std::pair<int, int>>>{},
+            "per row, the branches it opens (lines then trafos), the solver buses "
+            "handle_disconnected_grid masks and the generators it moves as (generator id, solver bus) "
+            "(RowOverrides). Replaces ALL the rows' overrides (generators off, gen_v, lost power... "
+            "are cleared): call it before begin().")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;
@@ -3774,17 +3799,34 @@ PYBIND11_MODULE(_gpusim2grid, m)
             pybind11::arg("sc_b") = std::vector<double>(), pybind11::arg("slack_absorbed") = 0.)
         .def("row_result", [](const OuterModelHarness& h, int row) { return h.model->row_result(row); });
 
+    pybind11::register_exception<outer::DeviceNotImplemented>(m, "OuterDeviceNotImplemented", PyExc_NotImplementedError);
+    m.def("_outer_device_census",
+        [](pybind11::object grid_py, bool resume_from_n) {
+            const ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            const OuterInputs in = extract_outer_inputs(grid, resume_from_n);
+            outer::Ls2gModelOptions opt;
+            opt.resume_from_n = resume_from_n;
+            std::vector<std::tuple<std::string, int, bool>> out;
+            for (const auto& f : outer::outer_device_census(grid, in.ledger, opt))
+                out.emplace_back(f.name, f.count, f.supported);
+            return out;
+        },
+        pybind11::arg("grid"), pybind11::arg("resume_from_n") = false,
+        "The features of a solved NROuter_* grid's outer loops, as (name, count, supported) "
+        "triples: how many of each the grid has (0: none) and whether "
+        "outer_loops_backend='device' implements it (docs/outer_loops_on_device.md).");
+
     m.def("_make_ca_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
            bool keep_trace, bool resume_from_n,
-           int scaling_override, double max_dVa_override, double max_dVm_override) {
+           int scaling_override, double max_dVa_override, double max_dVm_override, const std::string& outer_backend) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             pybind11::gil_scoped_release nogil;  // base-case solve
             return make_ca_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
                 reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
-                scaling_override, max_dVa_override, max_dVm_override);
+                scaling_override, max_dVa_override, max_dVm_override, outer_backend_flag(outer_backend));
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3800,19 +3842,20 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("outer_backend") = "host",
         "A ContingencyAnalysisSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_is_outer_session_from_lsgrid",
         [](pybind11::object grid_py, int batch_size, int nb_iter, int device, bool flag,
            ReorderingAlg reordering_alg, MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps,
            bool keep_trace, bool resume_from_n,
-           int scaling_override, double max_dVa_override, double max_dVm_override) {
+           int scaling_override, double max_dVa_override, double max_dVm_override, const std::string& outer_backend) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             pybind11::gil_scoped_release nogil;  // base-case solve
             return make_is_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, flag,
                 reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
-                scaling_override, max_dVa_override, max_dVm_override);
+                scaling_override, max_dVa_override, max_dVm_override, outer_backend_flag(outer_backend));
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3828,6 +3871,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("outer_backend") = "host",
         "An InjectionSweepSession running the grid's outer loops (see _make_ss_outer_session_from_lsgrid).");
 
     m.def("_make_ss_outer_session_from_lsgrid",
@@ -3835,13 +3879,13 @@ PYBIND11_MODULE(_gpusim2grid, m)
            bool compute_limit_violations, ReorderingAlg reordering_alg,
            MatchingAlg matching_alg, PivotEpsilonAlg pivot_epsilon_alg, int ir_n_steps, bool keep_trace,
            bool resume_from_n,
-           int scaling_override, double max_dVa_override, double max_dVm_override) {
+           int scaling_override, double max_dVa_override, double max_dVm_override, const std::string& outer_backend) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
             pybind11::gil_scoped_release nogil;  // base-case solve
             return make_ss_outer_session_from_lsgrid(
                 grid, batch_size, nb_iter, device, compute_limit_violations,
                 reordering_alg, matching_alg, pivot_epsilon_alg, ir_n_steps, keep_trace, resume_from_n,
-                scaling_override, max_dVa_override, max_dVm_override);
+                scaling_override, max_dVa_override, max_dVm_override, outer_backend_flag(outer_backend));
         },
         pybind11::arg("grid"),
         pybind11::arg("batch_size") = 100,
@@ -3857,6 +3901,7 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("scaling_max_voltage_change_override") = -1,
         pybind11::arg("max_dVa_override") = -1.0,
         pybind11::arg("max_dVm_override") = -1.0,
+        pybind11::arg("outer_backend") = "host",
         "A ScenarioSweepSession running the grid's outer loops (its algorithm an "
         "NROuter_* one, solved): continuous scheduling; each row starts from the grid's "
         "voltages, its generators' buses at their set-points, and default controls. "

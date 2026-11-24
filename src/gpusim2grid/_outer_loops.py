@@ -6,6 +6,8 @@
 ``NROuterDist_*`` outer loops run per row (docs/dev_notes/continuous_batching.md, Part B; the
 C++ side is ``outer/``). What the three facades check alike."""
 
+from enum import Enum
+
 from . import _gpusim2grid as _cpp
 
 
@@ -41,3 +43,43 @@ def _check_outer_loops_args(grid, use_bridge, scheduling, nb_iter_per_round, **u
     bad = [name for name, value in unsupported.items() if value]
     if bad:
         raise ValueError(f"outer_loops=True does not support {', '.join(bad)} yet")
+
+
+class OuterLoopsBackend(str, Enum):
+    """``outer_loops_backend``: where the outer loops run (docs/outer_loops_on_device.md). A str
+    enum (``enum.StrEnum`` needs Python 3.11): a member equals its string, which the facades
+    accept too."""
+
+    HOST = "host"      #: lightsim2grid's loops ported on the host (the default, today's behaviour)
+    DEVICE = "device"  #: the loops' decisions in CUDA kernels (``outer_loops=True`` only)
+
+    def __str__(self):
+        return self.value
+
+
+def _resolve_outer_loops_backend(backend, outer_loops):
+    """``outer_loops_backend`` (a member or its string) checked against ``outer_loops`` and the
+    build, as the member. A grid the device does not run yet is refused by the session itself
+    (``NotImplementedError``, the census of the model it builds, whole batch)."""
+    try:
+        backend = OuterLoopsBackend(backend)
+    except ValueError:
+        raise ValueError(f"outer_loops_backend must be one of {[b.value for b in OuterLoopsBackend]}, "
+                         f"got {backend!r}") from None
+    if backend is OuterLoopsBackend.DEVICE and not outer_loops:
+        raise ValueError("outer_loops_backend='device' needs outer_loops=True")
+    if backend is OuterLoopsBackend.DEVICE and _cpp.is_fp32:
+        raise ValueError("outer_loops_backend='device' needs an FP64 build (the device model works in "
+                         "double); this one is FP32. Use outer_loops_backend='host'.")
+    return backend
+
+
+def outer_device_census(grid, init_from_n_powerflow=True):
+    """The features of a solved ``NROuter_*`` grid's outer loops, as ``(name, count,
+    supported)``: how many of each the grid has (0: none) and whether
+    ``outer_loops_backend='device'`` implements it.
+
+    ``init_from_n_powerflow`` is the facades' argument, with the same default: the rows resume
+    from where the grid's own solve left its loops (the ``resumed ...`` features); ``False``
+    gives the census of rows started from the grid's default controls."""
+    return [tuple(f) for f in _cpp._outer_device_census(grid, bool(init_from_n_powerflow))]

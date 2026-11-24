@@ -32,6 +32,7 @@ preprocessing and as a reference oracle.
    :caption: Contents
 
    installation
+   environment_variables
    examples
    api
 
