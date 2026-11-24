@@ -74,8 +74,12 @@ def _resolve_outer_loops_backend(backend, outer_loops):
     return backend
 
 
-def outer_device_census(grid, init_from_n_powerflow=False):
+def outer_device_census(grid, init_from_n_powerflow=True):
     """The features of a solved ``NROuter_*`` grid's outer loops, as ``(name, count,
     supported)``: how many of each the grid has (0: none) and whether
-    ``outer_loops_backend='device'`` implements it."""
+    ``outer_loops_backend='device'`` implements it.
+
+    ``init_from_n_powerflow`` is the facades' argument, with the same default: the rows resume
+    from where the grid's own solve left its loops (the ``resumed ...`` features); ``False``
+    gives the census of rows started from the grid's default controls."""
     return [tuple(f) for f in _cpp._outer_device_census(grid, bool(init_from_n_powerflow))]

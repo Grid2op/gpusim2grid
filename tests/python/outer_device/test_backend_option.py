@@ -44,7 +44,7 @@ def _facades() -> list[Any]:
 def test_census_lists_every_feature_with_its_count(grid: Any):
     from gpusim2grid import outer_device_census
 
-    census = outer_device_census(grid)
+    census = outer_device_census(grid, init_from_n_powerflow=False)
     assert census, "the census lists every feature, those the grid lacks with count 0"
     for name, count, supported in census:
         assert isinstance(name, str) and isinstance(count, int) and isinstance(supported, bool)
@@ -69,6 +69,8 @@ def test_census_sees_the_resume_point(grid: Any):
     census = outer_device_census(grid, init_from_n_powerflow=True)
     counts: dict[str, int] = {name: count for name, count, _ in census}
     assert counts["resumed rows (init_from_n_powerflow)"] == 1
+    # the facades' default, which is the census they check at construction
+    assert outer_device_census(grid) == census
 
 
 # ---- the option -----------------------------------------------------------------------------
@@ -129,8 +131,9 @@ def test_census_marks_what_the_device_runs(grid: Any, grid_all_loops: Any):
     from gpusim2grid import outer_device_census
 
     for g in (grid, grid_all_loops):
-        census = outer_device_census(g)
-        assert all(ok for _, _, ok in census), [name for name, _, ok in census if not ok]
+        for resume in (False, True):
+            census = outer_device_census(g, init_from_n_powerflow=resume)
+            assert all(ok for _, _, ok in census), [name for name, _, ok in census if not ok]
     counts = {name: count for name, count, _ in outer_device_census(grid_all_loops)}
     for loop in ("PhaseControl", "TransformerVoltageControl", "ShuntVoltageControl"):
         assert counts[f"loop {loop}"] == 1
