@@ -7,11 +7,14 @@
 // (outer_loops_backend='device'; docs/outer_loops_on_device.md, §4.6).
 //
 // An outer::OuterHook like Ls2gOuterModel, whose per-slot state lives in device
-// arrays and whose decisions (the passes, the four default loops' checks, the
-// controls) run in kernels, one thread per slot, following the host model line
-// by line. A row is loaded by the host model it wraps (its own load, then the
-// slot state uploaded); the tables come from that model's plans. CUDA-free
-// header: the class is defined in the .cu.
+// arrays (slot-major pools) and whose decisions (the passes, the seven loops'
+// checks, the controls) run in kernels, one block per slot, following the host
+// model line by line: thread 0 runs the per-slot logic, the block evaluates the
+// ReactiveLimits buses in parallel. A row is copied on the device from a
+// template slot (the plain template, or its strategy's point), its masks applied
+// by a kernel; otherwise the host model it wraps loads it and the slot image is
+// uploaded as its differences from a template or baseline row. The tables come
+// from that model's plans. CUDA-free header: the class is defined in the .cu.
 // =============================================================================
 
 #ifndef GPUSIM2GRID_DEVICE_OUTER_MODEL_HPP
