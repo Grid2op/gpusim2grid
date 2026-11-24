@@ -3098,7 +3098,11 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
             for (int k = 0; k < nm; ++k) {
                 read_row(m_slots[static_cast<size_t>(k)], dr);
                 host_->load(m_slots[static_cast<size_t>(k)], m_rows[static_cast<size_t>(k)]);
-                side_->device_slot_image(m_slots[static_cast<size_t>(k)], img);
+                try {   // as the rows loaded through the host model below
+                    side_->device_slot_image(m_slots[static_cast<size_t>(k)], img);
+                } catch (const std::domain_error& e) {
+                    throw DeviceNotImplemented(e.what());
+                }
                 fill_row(img, hr);
                 compare_rows(hr, dr, m_rows[static_cast<size_t>(k)]);
             }
