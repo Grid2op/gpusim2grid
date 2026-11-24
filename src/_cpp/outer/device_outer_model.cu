@@ -1754,21 +1754,22 @@ __global__ void on_solved_kernel(Dev d, const int* slots, int n, const int* conv
 
 // the listed slots' controls into the driver's arrays (DeviceOuterHook::write_controls)
 __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOuterHook::ControlTargets t)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+{   // a block per listed slot: a copy, each element written by one thread
+    const int i = blockIdx.x;
+    if (i >= n) return;   // the whole block
+    const int t0 = threadIdx.x, nt = blockDim.x;
     const int s = slots[i];
     const size_t ss = static_cast<size_t>(s);
-    for (int k = 0; k < d.n_pin; ++k) t.pin[ss * d.n_pin + k] = SLOT(c_pin, d.n_pin)[k];
-    for (int j = 0; j < d.n_ctrl; ++j) {
+    for (int k = t0; k < d.n_pin; k += nt) t.pin[ss * d.n_pin + k] = SLOT(c_pin, d.n_pin)[k];
+    for (int j = t0; j < d.n_ctrl; j += nt) {
         t.held_q[ss * d.n_ctrl + j] = SLOT(c_held_q, d.n_ctrl)[j];
         t.plan_held[ss * d.n_ctrl + j] = SLOT(c_plan_held, d.n_ctrl)[j];
     }
-    for (int g = 0; g < d.n_grp; ++g) t.v_set[ss * d.n_grp + g] = SLOT(c_v_set, d.n_grp)[g];
-    for (int e = 0; e < d.n_hvdc; ++e) t.hvdc[ss * d.n_hvdc + e] = SLOT(c_hvdc_status, d.n_hvdc)[e];
+    for (int g = t0; g < d.n_grp; g += nt) t.v_set[ss * d.n_grp + g] = SLOT(c_v_set, d.n_grp)[g];
+    for (int e = t0; e < d.n_hvdc; e += nt) t.hvdc[ss * d.n_hvdc + e] = SLOT(c_hvdc_status, d.n_hvdc)[e];
     const size_t b0 = static_cast<size_t>(i) * d.nc;
     const int nsb = S1(c_sb_n);
-    for (int k = 0; k < d.nc; ++k) {
+    for (int k = t0; k < d.nc; k += nt) {
         t.ds_slot[b0 + k] = s;
         t.ds_bus[b0 + k] = k < nsb ? SLOT(c_sb_bus, d.nc)[k] : -1;
         t.ds_p[b0 + k] = k < nsb ? SLOT(c_sb_dp, d.nc)[k] : 0.;
@@ -1776,19 +1777,20 @@ __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOute
     }
     const size_t v0 = static_cast<size_t>(i) * d.vcap;
     const int nvr = S1(vmr_n);
-    for (int k = 0; k < d.vcap; ++k) {
+    for (int k = t0; k < d.vcap; k += nt) {
         t.vr_slot[v0 + k] = s;
         t.vr_bus[v0 + k] = k < nvr ? SLOT(vmr_bus, d.vcap)[k] : -1;
         t.vr_vm[v0 + k] = k < nvr ? SLOT(vmr_vm, d.vcap)[k] : 0.;
     }
-    S1(vmr_n) = 0;   // one-shot (OuterHook::clear_vm_reset)
+    __syncthreads();   // every thread has read vmr_n
+    if (t0 == 0) S1(vmr_n) = 0;   // one-shot (OuterHook::clear_vm_reset)
     if (t.slack_w != nullptr)
-        for (int k = 0; k < d.n_slack; ++k) t.slack_w[ss * d.n_slack + k] = SLOT(c_slack_w, d.n_slack)[k];
+        for (int k = t0; k < d.n_slack; k += nt) t.slack_w[ss * d.n_slack + k] = SLOT(c_slack_w, d.n_slack)[k];
     // BranchControl (one block of n_bc per listed slot): out of the row, retapped (once), the block at
     // the taps (4 complex), its shift and ratio, the controls
     if (t.bc_out != nullptr) {
         const size_t c0 = static_cast<size_t>(i) * d.n_bc;
-        for (int e = 0; e < d.n_bc; ++e) {
+        for (int e = t0; e < d.n_bc; e += nt) {
             t.bc_out[c0 + e] = SLOT(bc_out, d.n_bc)[e];
             t.bc_retap[c0 + e] = SLOT(bc_rt, d.n_bc)[e];
             for (int q = 0; q < 8; ++q) t.bc_tap[8 * (c0 + e) + q] = SLOT(bc_tap, 8 * d.n_bc)[8 * e + q];
@@ -1803,7 +1805,7 @@ __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOute
     // ShuntControl (one block of n_sc per listed slot): the sections set (once), their B, the controls
     if (t.sc_set != nullptr) {
         const size_t c0 = static_cast<size_t>(i) * d.n_sc;
-        for (int e = 0; e < d.n_sc; ++e) {
+        for (int e = t0; e < d.n_sc; e += nt) {
             t.sc_set[c0 + e] = SLOT(sc_pend, d.n_sc)[e];
             t.sc_b_new[c0 + e] = SLOT(sc_bnew, d.n_sc)[e];
             t.sc_ctl[c0 + e] = static_cast<signed char>(SLOT(sc_ctl, d.n_sc)[e]);
@@ -1913,7 +1915,7 @@ public:
     int vm_reset_block() const override { return vcap_; }
     void write_controls(int n, const int* d_slots, const ControlTargets& t, void* stream) override {
         if (n == 0) return;
-        write_controls_kernel<<<(n + 63) / 64, 64, 0, static_cast<cudaStream_t>(stream)>>>(dev_, d_slots, n, t);
+        write_controls_kernel<<<n, 128, 0, static_cast<cudaStream_t>(stream)>>>(dev_, d_slots, n, t);
         check_cuda(cudaGetLastError(), "write_controls");
     }
 
