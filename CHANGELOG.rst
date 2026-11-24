@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``outer_loops_backend='device'``: a row's independent per-element work (lost-power sums, controls,
+  results) is spread over a warp / block, the ordered sums kept in order. PtFige N-1: 0.502 -> 0.490 s.
 - [IMPROVED] ``linear_solver='own_lu'``: its symbolic plan is built with counting sorts instead of a sort of every
   contribution (PtFige: 28 -> 12 ms per driver build; the same plan).
 - [IMPROVED] ``ContingencyAnalysisGPU`` with ``outer_loops`` and ``redistribute_slack``: each row's lost power sums
