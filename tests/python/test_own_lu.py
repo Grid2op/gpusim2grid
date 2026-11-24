@@ -552,7 +552,7 @@ def test_dump_j_names_values_by_their_precision(case118, linear_solver, monkeypa
 
 
 @requires_gpu
-def test_fused_solve_levels_give_the_same_residual(case118, monkeypatch):
+def test_fused_solve_levels_give_the_same_residual(case118, residual_atol, monkeypatch):
     """the triangular solves' narrow levels run fused (one kernel per run of levels, a block barrier
     between them; GPUSIM2GRID_OWN_LU_FUSE=0: one launch per level): every value computed as the
     level kernels do, so the raw benchmark's residual is the same to the bit. The solutions
@@ -568,5 +568,5 @@ def test_fused_solve_levels_give_the_same_residual(case118, monkeypatch):
         r = _cpp.benchmark_cudss_batch_raw(n, indptr.tolist(), indices.tolist(), data.astype(float).tolist(), 40,
                                            n_refactorize=1, ir_n_steps=1, linear_solver=_cpp.LinearSolver.OwnLu)
         res[fuse] = r.max_rel_residual
-    assert 0. < res["0"] < 1e-6
+    assert 0. < res["0"] < residual_atol
     assert res["1"] == res["0"]
