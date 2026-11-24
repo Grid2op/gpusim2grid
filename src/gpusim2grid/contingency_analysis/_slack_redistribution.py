@@ -160,8 +160,12 @@ class SlackRedistributionFacadeMixin:
                 "set_slack_redistribution_data_from_grid() needs gpusim2grid compiled with "
                 "the lightsim2grid bridge; use set_slack_redistribution_data(...) with the "
                 "arrays instead.")
+        # the units a scenario sweep's rows give slack weights of their own (set_gen_slack_weights)
+        # are listed too (weight 0 where they are not participants: inert unless a row brings them in)
+        gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
         self._inner.set_slack_redistribution_data(
-            _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self._inner._s.n_bus))
+            _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self._inner._s.n_bus,
+                                                                list(gen_rw), list(sto_rw)))
 
     def set_slack_redistribution_data(self, data):
         """Explicit-array mode counterpart of

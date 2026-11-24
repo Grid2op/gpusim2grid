@@ -46,6 +46,7 @@
 #include "gen_contingency_data.hpp"          // GenContingencyData
 #include "element_trip_data.hpp"             // ElementTripData
 #include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
+#include "slack_weight_rows.hpp"            // SlackWeightRows
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "reordering_alg.hpp"
@@ -397,6 +398,15 @@ struct ScenarioSweepSession {
     std::vector<double>     ext_lost_p_mw_;
     bool                    has_ext_lost_ = false;
     bool                    rd_gp_last_ = false;   // the gen-P check got pre-pass targets last run
+    // ScenarioSweep set_gen_slack_weights / set_storage_slack_weights (lightsim2grid PR #303):
+    // per row, the raw slack weights of some units (set_slack_weight_rows); slack_w_applied_
+    // whether the live source holds weights built from them
+    SlackWeightRows         slack_w_rows_;
+    bool                    slack_w_applied_ = false;
+    // lightsim2grid's _check_slack_weight_rows: a positive weight only to a connected unit on a
+    // bus sharing the grid's slack (the slack column has entries there only), or that the row
+    // disconnects; throws std::invalid_argument
+    void _check_slack_weight_rows() const;
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
     CplxVect        Vinit_, Sbus_;
@@ -588,6 +598,21 @@ struct ScenarioSweepSession {
     bool has_slack_redistribution_data() const { return has_slack_rd_; }
     void set_gen_p_rows(Eigen::Ref<const RealMatRM> gen_p);
     SlackRedistributionReport get_slack_redistribution_report() const;
+    // ScenarioSweep set_gen_slack_weights / set_storage_slack_weights (lightsim2grid PR #303):
+    // per row, the raw distributed-slack weight of some units (container ids, one column each
+    // in a (n_rows x n_ids) matrix; NaN keeps the unit's own, 0 takes it out of the row's
+    // slack, a positive value makes a connected unit a participant). The values of the
+    // Jacobian's slack column change, not its pattern: the buses sharing the slack stay the
+    // grid's, and run() refuses a positive weight to a unit on another bus. The
+    // redistribute_slack pre-pass, the generator active-power check and the outer loops'
+    // DistributedSlack loop share with them too. Replaces the previous set; both families
+    // empty clears it.
+    void set_slack_weight_rows(Eigen::Ref<const Eigen::VectorXi> gen_ids,
+                               Eigen::Ref<const SlackWeightRows::Mat> gen_w,
+                               Eigen::Ref<const Eigen::VectorXi> sto_ids,
+                               Eigen::Ref<const SlackWeightRows::Mat> sto_w);
+    bool has_slack_weight_rows() const { return !slack_w_rows_.empty(); }
+    const SlackWeightRows& slack_weight_rows() const { return slack_w_rows_; }
 
     // The same pre-pass run by the CALLER (BatchPowerFlow: it needs the
     // correction inside its autograd graph, so it adds it to the Sbus it hands

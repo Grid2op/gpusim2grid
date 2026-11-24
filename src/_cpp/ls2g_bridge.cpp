@@ -676,8 +676,14 @@ int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver)
 #define GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(info) 0.
 #endif
 
-SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver)
+SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver,
+                                                          const std::vector<int>& extra_gens,
+                                                          const std::vector<int>& extra_stos)
 {
+    // the units only a row's own weight brings in (set_gen_slack_weights): listed where the
+    // grid would list them, with weight 0 (inert unless a row gives them one)
+    const std::set<int> extra_gen(extra_gens.begin(), extra_gens.end());
+    const std::set<int> extra_sto(extra_stos.begin(), extra_stos.end());
     const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
     auto to_solver = [&](int bus_me) -> int {
         int b = bus_me;
@@ -703,9 +709,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         d.gens_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
         if (b < 0) continue;
         const bool g_in_slack = gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12;
-        const double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)
-                                      : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(gi);
-        if (!(g_w > 1e-12)) continue;
+        double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)
+                                : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(gi);
+        if (!(g_w > 1e-12)) {
+            if (!extra_gen.count(g)) continue;
+            g_w = 0.;
+        }
         kind.push_back(SLACK_UNIT_GENERATOR);
         el_id.push_back(g);
         bus.push_back(b);
@@ -723,9 +732,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         const int b = si.connected ? to_solver(si.bus_id) : -1;
         if (b < 0) continue;
         const bool s_in_slack = si.is_slack && std::abs(static_cast<double>(si.slack_weight)) > 1e-12;
-        const double s_w = s_in_slack ? static_cast<double>(si.slack_weight)
-                                      : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(si);
-        if (!(s_w > 1e-12)) continue;
+        double s_w = s_in_slack ? static_cast<double>(si.slack_weight)
+                                : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(si);
+        if (!(s_w > 1e-12)) {
+            if (!extra_sto.count(s)) continue;
+            s_w = 0.;
+        }
         kind.push_back(SLACK_UNIT_STORAGE);
         el_id.push_back(s);
         bus.push_back(b);
@@ -997,10 +1009,12 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
     d.storage_vreg_bus.assign(static_cast<size_t>(d.n_storage), -1);
     d.storage_bus.assign(static_cast<size_t>(d.n_storage), -1);
     d.storage_slack_weight.assign(static_cast<size_t>(d.n_storage), 0.);
+    d.storage_any_bus.assign(static_cast<size_t>(d.n_storage), -1);
     for (int s = 0; s < d.n_storage; ++s) {
         const ls2g::StorageInfo si(storages, s);
         if (!si.connected) continue;
         const int b = bus_of(si.bus_id);
+        d.storage_any_bus[static_cast<size_t>(s)] = b;
         if (storages.is_local_voltage_controller(s)) d.storage_vreg_bus[static_cast<size_t>(s)] = b;
         if (si.is_slack && std::abs(static_cast<double>(si.slack_weight)) > 1e-12) {
             d.storage_bus[static_cast<size_t>(s)] = b;
@@ -1521,11 +1535,46 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
     return out;
 }
 
-GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver)
+namespace {
+// lightsim2grid PR #303's build_gen_p_plan(..., gen_row_weighted, storage_row_weighted): the
+// units some row gives a slack weight of its own are in the plan too
+template <class Grid, class Ids>
+auto build_gen_p_plan_rw(const Grid& grid, const Ids& ids, ls2g::gen_p_check::GenPPlan& plan,
+                         const std::vector<int>* gen_rw, const std::vector<int>* sto_rw, int)
+    -> decltype(ls2g::gen_p_check::build_gen_p_plan(grid, ids, plan, gen_rw, sto_rw), void())
 {
-    // lightsim2grid's own selection, on the labelling the session solves in
+    ls2g::gen_p_check::build_gen_p_plan(grid, ids, plan, gen_rw, sto_rw);
+}
+template <class Grid, class Ids>
+void build_gen_p_plan_rw(const Grid& grid, const Ids& ids, ls2g::gen_p_check::GenPPlan& plan,
+                         const std::vector<int>* gen_rw, const std::vector<int>* sto_rw, long)
+{
+    if (gen_rw != nullptr || sto_rw != nullptr)
+        throw std::runtime_error(
+            "the generator active-power check of rows giving slack weights of their own needs a lightsim2grid "
+            "with per-row slack weights (lightsim2grid PR #303); this gpusim2grid was built against an older one.");
+    ls2g::gen_p_check::build_gen_p_plan(grid, ids, plan);
+}
+}  // namespace
+
+GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver,
+                                            const std::vector<int>& row_weighted_gens,
+                                            const std::vector<int>& row_weighted_stos)
+{
+    // lightsim2grid's own selection, on the labelling the session solves in (with the units a
+    // row gives a slack weight of its own: one entry per element, >= 0 for those)
     ls2g::gen_p_check::GenPPlan plan;
-    ls2g::gen_p_check::build_gen_p_plan(grid, grid.id_me_to_ac_solver(), plan);
+    std::vector<int> gen_rw, sto_rw;
+    const auto mark = [](const std::vector<int>& ids, int n, std::vector<int>& out) {
+        if (ids.empty()) return;
+        out.assign(static_cast<size_t>(n), -1);
+        for (size_t k = 0; k < ids.size(); ++k)
+            if (ids[k] >= 0 && ids[k] < n) out[static_cast<size_t>(ids[k])] = static_cast<int>(k);
+    };
+    mark(row_weighted_gens, grid.get_generators().nb(), gen_rw);
+    mark(row_weighted_stos, grid.get_storages().nb(), sto_rw);
+    build_gen_p_plan_rw(grid, grid.id_me_to_ac_solver(), plan, gen_rw.empty() ? nullptr : &gen_rw,
+                        sto_rw.empty() ? nullptr : &sto_rw, 0);
 
     GenPPlanData out;
     out.sn_mva = static_cast<double>(grid.get_sn_mva());

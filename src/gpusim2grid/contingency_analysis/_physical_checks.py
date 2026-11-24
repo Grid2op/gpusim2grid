@@ -460,8 +460,11 @@ class PhysicalChecksFacadeMixin:
                 "set_gen_p_capability_from_grid() needs gpusim2grid compiled with the "
                 "lightsim2grid bridge (the plan is built by lightsim2grid's own "
                 "build_gen_p_plan); use set_gen_p_capability(...) with the plan arrays.")
+        # the units a scenario sweep's rows give slack weights of their own (set_gen_slack_weights)
+        # are in the plan too, whatever their own weight
+        gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
         self._inner.set_gen_p_capability(
-            _cpp._extract_gen_p_plan_from_lsgrid(grid, self._inner._s.n_bus))
+            _cpp._extract_gen_p_plan_from_lsgrid(grid, self._inner._s.n_bus, list(gen_rw), list(sto_rw)))
         self._push_gen_p_targets()
 
     def set_gen_p_capability(self, plan):

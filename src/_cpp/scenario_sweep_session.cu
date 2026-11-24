@@ -621,7 +621,11 @@ std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     return gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_scenarios_, n_bus,
                                               base_state_->h_slack_bus, base_state_->h_slack_w,
                                               ref_bus, "ScenarioSweepSession",
-                                              [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
+                                              [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); },
+                                              slack_w_rows_.empty() ? nullptr : &slack_w_rows_,
+                                              [this](int r, int g) {
+                                                  return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g);
+                                              });
 }
 
 // =============================================================================
@@ -657,6 +661,113 @@ void ScenarioSweepSession::set_slack_redistribution_data(const SlackRedistributi
 void ScenarioSweepSession::set_gen_p_rows(Eigen::Ref<const RealMatRM> gen_p)
 {
     gen_p_rows_ = gen_p;
+}
+
+// =============================================================================
+// set_slack_weight_rows -- lightsim2grid PR #303's set_gen_slack_weights /
+// set_storage_slack_weights (BaseBatchSweep::_set_slack_weights)
+// =============================================================================
+void ScenarioSweepSession::set_slack_weight_rows(Eigen::Ref<const Eigen::VectorXi> gen_ids,
+                                                 Eigen::Ref<const SlackWeightRows::Mat> gen_w,
+                                                 Eigen::Ref<const Eigen::VectorXi> sto_ids,
+                                                 Eigen::Ref<const SlackWeightRows::Mat> sto_w)
+{
+    static const char* who = "ScenarioSweepSession::set_slack_weight_rows";
+    if ((gen_ids.size() > 0 || sto_ids.size() > 0) && gen_data_.empty())
+        throw std::runtime_error(std::string(who) + ": this session has no generator data (explicit-array/tuple "
+                                 "mode): per-row slack weights need a session built from a lightsim2grid grid.");
+    SlackWeightRows next;
+    const auto fill = [&](SlackWeightRows::Family& fam, const Eigen::Ref<const Eigen::VectorXi>& ids,
+                          const Eigen::Ref<const SlackWeightRows::Mat>& w, int nb_el, const char* setter) {
+        const auto fail = [setter](const std::string& what) {
+            throw std::invalid_argument(std::string(setter) + ": " + what);
+        };
+        if (ids.size() == 0) return;
+        std::vector<int> sorted(ids.data(), ids.data() + ids.size());
+        for (int id : sorted)
+            if (id < 0 || id >= nb_el)
+                fail("id " + std::to_string(id) + " is out of range, the grid has " + std::to_string(nb_el) + " of them.");
+        std::sort(sorted.begin(), sorted.end());
+        const auto dup = std::adjacent_find(sorted.begin(), sorted.end());
+        if (dup != sorted.end()) fail("id " + std::to_string(*dup) + " is named twice.");
+        if (w.cols() != ids.size())
+            fail("`weights` has " + std::to_string(w.cols()) + " columns for " + std::to_string(ids.size()) +
+                 " ids: one row per scenario, one column per id.");
+        if (w.rows() <= 0) fail("`weights` has no row.");
+        if (has_injections_ && w.rows() != n_scenarios_)
+            fail("`weights` has " + std::to_string(w.rows()) + " rows, but set_injections() fixed " +
+                 std::to_string(n_scenarios_) + " scenarios.");
+        for (Eigen::Index r = 0; r < w.rows(); ++r)
+            for (Eigen::Index c = 0; c < w.cols(); ++c) {
+                const double x = w(r, c);
+                if (std::isnan(x)) continue;
+                if (!std::isfinite(x) || x < 0.)
+                    fail("a weight that is negative or infinite at (row " + std::to_string(r) + ", column " +
+                         std::to_string(c) + "): " + std::to_string(x) + ". Use 0 to take the unit out of the "
+                         "slack, NaN to keep the grid's weight.");
+            }
+        fam.ids.assign(ids.data(), ids.data() + ids.size());
+        fam.w = w;
+        fam.col_of_el.assign(static_cast<size_t>(nb_el), -1);
+        for (Eigen::Index c = 0; c < ids.size(); ++c) fam.col_of_el[static_cast<size_t>(ids(c))] = static_cast<int>(c);
+    };
+    fill(next.gen, gen_ids, gen_w, gen_data_.n_gen, "set_gen_slack_weights");
+    fill(next.sto, sto_ids, sto_w, gen_data_.n_storage, "set_storage_slack_weights");
+    if (!next.gen.empty() && !next.sto.empty() && next.gen.w.rows() != next.sto.w.rows())
+        throw std::invalid_argument("set_gen_slack_weights / set_storage_slack_weights disagree on the number of "
+                                    "scenarios (" + std::to_string(next.gen.w.rows()) + " and " +
+                                    std::to_string(next.sto.w.rows()) + " rows).");
+    next.refresh_rows();
+    slack_w_rows_ = std::move(next);
+}
+
+void ScenarioSweepSession::_check_slack_weight_rows() const
+{
+    if (slack_w_rows_.empty()) return;
+    if (slack_w_rows_.n_rows() != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_gen_slack_weights / set_storage_slack_weights' row count no longer "
+            "matches set_injections()'s n_scenarios -- set them again after changing set_injections()");
+    // the outer loops' DistributedSlack loop shares with them: its model checks them (only a
+    // unit that can take part in the grid's slack may get a positive weight)
+    if (outer_) return;
+    if (!base_state_ || base_state_->n_slack <= 0)
+        throw std::invalid_argument(
+            "set_gen_slack_weights / set_storage_slack_weights need the distributed slack "
+            "(use_distributed_slack=True): the rows' weights are values of its column.");
+    const int n_bus = base_state_->n_bus;
+    std::vector<char> slack_bus(static_cast<size_t>(n_bus), 0);
+    for (int b : base_state_->h_slack_bus)
+        if (b >= 0 && b < n_bus) slack_bus[static_cast<size_t>(b)] = 1;
+    const auto check = [&](const SlackWeightRows::Family& fam, const char* what, const char* setter,
+                           const auto& bus_of, const auto& off) {
+        for (int r = 0; r < n_scenarios_; ++r) {
+            if (!slack_w_rows_.has_row(r)) continue;
+            if (!row_unsupported_.empty() && !row_unsupported_[static_cast<size_t>(r)].empty()) continue;
+            for (size_t c = 0; c < fam.ids.size(); ++c) {
+                const int el = fam.ids[c];
+                const double w = fam.w(r, static_cast<Eigen::Index>(c));
+                if (!(w >= slack_weight_rows::MIN_WEIGHT)) continue;   // NaN, or out of the slack
+                const int b = bus_of(el);
+                if (b < 0 || off(r, el)) continue;                      // takes no share
+                if (slack_bus[static_cast<size_t>(b)]) continue;
+                throw std::invalid_argument(
+                    std::string(setter) + ": row " + std::to_string(r) + " gives " + what + " " + std::to_string(el) +
+                    " a slack weight, but it stands on solver bus " + std::to_string(b) + ", where no unit takes "
+                    "part in the grid's distributed slack. The buses sharing the slack are fixed for the batch: "
+                    "make that unit a participant of the grid's slack (add_gen_slackbus / add_storage_slackbus) "
+                    "and give it 0 in the rows where it should take no share.");
+            }
+        }
+    };
+    check(slack_w_rows_.gen, "generator", "set_gen_slack_weights",
+          [this](int g) { return gen_data_.status[static_cast<size_t>(g)] ? gen_data_.bus[static_cast<size_t>(g)] : -1; },
+          [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g); });
+    check(slack_w_rows_.sto, "storage unit", "set_storage_slack_weights",
+          [this](int st) {
+              return static_cast<size_t>(st) < gen_data_.storage_any_bus.size() ? gen_data_.storage_any_bus[static_cast<size_t>(st)] : -1;
+          },
+          [this](int r, int st) { return _row_trips(r, &MoreTrips::storages, st); });
 }
 
 void ScenarioSweepSession::set_external_slack_saturation(
@@ -800,7 +911,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     }
     return slack_redistribution::prepass_all(slack_rd_, n_scenarios_, base_state_->n_bus,
                                              skipped, masked, gen_off, gen_p_row, sbus_p_mw, row_p,
-                                             [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
+                                             [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); },
+                                             slack_w_rows_.empty() ? nullptr : &slack_w_rows_);
 }
 
 // =============================================================================
@@ -1485,6 +1597,7 @@ void ScenarioSweepSession::run()
     std::vector<std::vector<int>> row_pv_to_pq, row_slack_off;
     const std::vector<std::string> prev_unsupported = row_unsupported_;
     row_unsupported_ = _row_unsupported_reasons();
+    _check_slack_weight_rows();
     _prepare_gen_contingency(required, row_pv_to_pq, row_slack_off);
     // Reactive-limit outer loop: the Vm-fixed buses a row solves as PQ join
     // the reserved switchable set, exactly like a generator contingency's.
@@ -1871,7 +1984,9 @@ void ScenarioSweepSession::run()
     }
     // with the outer loops, the pre-pass only measured what each row loses (row_lost_p_mw_)
     const bool rd_active = (redistribute_slack_ && !outer_) || has_ext_sat_;
-    if (cold || warm || rd_active || rd_applied_) {
+    // the rows' own weights (set_gen_slack_weights) are values only: every run sets them
+    const bool weights_rows = !slack_w_rows_.empty() && !outer_;
+    if (cold || warm || rd_active || rd_applied_ || weights_rows || slack_w_applied_) {
         std::vector<cuda_real_type> w_rows;
         std::vector<std::vector<std::pair<int, double>>> dp_rows;
         if (rd_active) {
@@ -1881,7 +1996,8 @@ void ScenarioSweepSession::run()
             w_rows = slack_redistribution::build_row_weights(
                 slack_rd_, slack_rows_, n_scenarios_, gen_off, n_bus,
                 base_state_->h_slack_bus, base_state_->h_slack_w, _reference_bus(),
-                [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
+                [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); },
+                weights_rows ? &slack_w_rows_ : nullptr);
             dp_rows.resize(slack_rows_.size());
             for (size_t r = 0; r < slack_rows_.size(); ++r) dp_rows[r] = slack_rows_[r].dp_pu;
         } else {
@@ -1890,6 +2006,7 @@ void ScenarioSweepSession::run()
         solver_->source_.set_slack_redistribution(w_rows, base_state_->n_slack, dp_rows,
                                                   base_state_->n_slack, solver_->batch_size_, scs);
         rd_applied_ = rd_active;
+        slack_w_applied_ = weights_rows;
     }
 
     // the controllers each row has lost: tripped, or on a bus it masks
@@ -2009,6 +2126,8 @@ void ScenarioSweepSession::run()
     // this same driver uploads what changed meanwhile.
     if (phys_.compute_physical_violations) {
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
+        // the weights the rows share the slack with (set_gen_slack_weights): their machines' shares
+        solver_->upload_gen_p_row_weights(slack_w_rows_);
         rd_gp_last_ = rd_gp;
         gen_p_targets_dirty_ = false;
         gen_pv_release_targets_dirty_ = false;
@@ -2089,6 +2208,17 @@ void ScenarioSweepSession::run()
         }
         // ... and what it loses, for its DistributedSlack loop to share (redistribute_slack)
         ov.lost_p_mw = row_lost_p_mw_;
+        // ... and the weights it shares the slack with (set_gen_slack_weights)
+        const auto dense_w = [this](const SlackWeightRows::Family& fam, std::vector<double>& out) {
+            if (fam.empty()) return;
+            const size_t n_el = fam.col_of_el.size();
+            out.assign(static_cast<size_t>(n_scenarios_) * n_el, std::numeric_limits<double>::quiet_NaN());
+            for (int r = 0; r < n_scenarios_; ++r)
+                for (size_t c = 0; c < fam.ids.size(); ++c)
+                    out[static_cast<size_t>(r) * n_el + static_cast<size_t>(fam.ids[c])] = fam.w(r, static_cast<Eigen::Index>(c));
+        };
+        dense_w(slack_w_rows_.gen, ov.gen_slack_w);
+        dense_w(slack_w_rows_.sto, ov.storage_slack_w);
         outer_->set_row_overrides(std::move(ov));
     }
 

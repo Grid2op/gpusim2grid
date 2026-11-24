@@ -518,6 +518,14 @@ __global__ void check_gen_p_violations_kernel(
     int                                 n_ns_gen,
     const unsigned char*   __restrict__ d_no_share_sto,   // [n_rows × n_ns_sto] ORIGINAL order, or nullptr
     int                                 n_ns_sto,
+    const int*             __restrict__ d_rw_gen_col,      // [n_rw_gen] column of each generator in d_rw_gen, -1 none; or nullptr
+    int                                 n_rw_gen,
+    const cuda_real_type*  __restrict__ d_rw_gen,          // [n_rows x rw_gen_stride] ORIGINAL order: a row's own raw weights (NaN: the plan's)
+    int                                 rw_gen_stride,
+    const int*             __restrict__ d_rw_sto_col,
+    int                                 n_rw_sto,
+    const cuda_real_type*  __restrict__ d_rw_sto,
+    int                                 rw_sto_stride,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mw,
     int n_bus, int nnz_Y,

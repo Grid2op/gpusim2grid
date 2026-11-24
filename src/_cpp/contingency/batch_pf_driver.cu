@@ -975,6 +975,34 @@ void BatchPfDriver<BatchSource>::upload_gen_p_no_share(const std::vector<unsigne
 }
 
 template <typename BatchSource>
+void BatchPfDriver<BatchSource>::upload_gen_p_row_weights(const SlackWeightRows& w)
+{
+    auto t_start = std::chrono::steady_clock::now();
+    auto put = [&](const SlackWeightRows::Family& fam, thrust::device_vector<int>& d_col,
+                   thrust::device_vector<cuda_real_type>& d_w, int& n, int& stride) {
+        if (fam.empty()) {
+            d_col.clear(); d_col.shrink_to_fit();
+            d_w.clear(); d_w.shrink_to_fit();
+            n = stride = 0;
+            return;
+        }
+        if (fam.w.rows() != n_contingencies)
+            throw std::runtime_error("BatchPfDriver::upload_gen_p_row_weights: the weights must have one row per "
+                                     "scenario (ORIGINAL order).");
+        std::vector<cuda_real_type> h(static_cast<size_t>(fam.w.size()));
+        for (Eigen::Index k = 0; k < fam.w.size(); ++k) h[static_cast<size_t>(k)] = static_cast<cuda_real_type>(fam.w.data()[k]);
+        upload_h2d(d_col, fam.col_of_el.data(), fam.col_of_el.size(), cs);
+        upload_h2d(d_w, h.data(), h.size(), cs);
+        n = static_cast<int>(fam.col_of_el.size());
+        stride = static_cast<int>(fam.w.cols());
+        cs.synchronize();   // the staging vector dies here
+    };
+    put(w.gen, d_gp_rw_gen_col, d_gp_rw_gen, gen_p_rw_gen_n_, gen_p_rw_gen_stride_);
+    put(w.sto, d_gp_rw_sto_col, d_gp_rw_sto, gen_p_rw_sto_n_, gen_p_rw_sto_stride_);
+    t_gen_p_setup_ms_ += bpf_ms_since(t_start);
+}
+
+template <typename BatchSource>
 void BatchPfDriver<BatchSource>::run_gen_p_check_n()
 {
     if (!_gen_p_enabled)
@@ -1016,6 +1044,7 @@ void BatchPfDriver<BatchSource>::run_gen_p_check_n()
         /*d_gen_off=*/nullptr, /*n_gen=*/0,
         /*d_targets=*/nullptr, /*target_stride=*/0,
         /*d_no_share_gen=*/nullptr, 0, /*d_no_share_sto=*/nullptr, 0,
+        /*d_rw_gen_col=*/nullptr, 0, /*d_rw_gen=*/nullptr, 0, /*d_rw_sto_col=*/nullptr, 0, /*d_rw_sto=*/nullptr, 0,
         gen_p_sn_mva_, gen_p_tol_mw_,
         base.n_bus, base.nnz_Y,
         /*c_start=*/0, /*actual_batch=*/1, gen_p_capacity_,
@@ -2533,6 +2562,10 @@ void BatchPfDriver<BatchSource>::_evict(const NrIterBuffers& buf, int n_slots, i
             gen_p_ns_gen_,
             gen_p_ns_sto_ > 0 ? thrust::raw_pointer_cast(d_gp_no_share_sto.data()) : nullptr,
             gen_p_ns_sto_,
+            gen_p_rw_gen_n_ > 0 ? thrust::raw_pointer_cast(d_gp_rw_gen_col.data()) : nullptr, gen_p_rw_gen_n_,
+            gen_p_rw_gen_n_ > 0 ? thrust::raw_pointer_cast(d_gp_rw_gen.data()) : nullptr, gen_p_rw_gen_stride_,
+            gen_p_rw_sto_n_ > 0 ? thrust::raw_pointer_cast(d_gp_rw_sto_col.data()) : nullptr, gen_p_rw_sto_n_,
+            gen_p_rw_sto_n_ > 0 ? thrust::raw_pointer_cast(d_gp_rw_sto.data()) : nullptr, gen_p_rw_sto_stride_,
             gen_p_sn_mva_, gen_p_tol_mw_,
             n_bus, nnz_Y,
             c_start, n_slots, gen_p_capacity_,

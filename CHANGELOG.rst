@@ -5,6 +5,8 @@ Change Log
 --------------------
 - [ADDED] ``ScenarioSweepGPU.set_line_parameters`` / ``set_trafo_parameters`` (lightsim2grid PR #303): per-row
   r, x, h, ratio, shift; Ybus patched by value (one analysis), flows and current check at the row's block.
+- [ADDED] ``ScenarioSweepGPU.set_gen_slack_weights`` / ``set_storage_slack_weights`` (lightsim2grid PR #303):
+  per-row slack weights, followed by the solve, ``redistribute_slack``, the active-power check and outer loops.
 - [FIXED] ``outer_loops_backend``: the host outer-loop model is compiled without FMA contraction, like the device
   one, so a borderline decision goes the same way on both on a ``-march=native`` build.
 - [FIXED] ``outer_loops_backend='device'`` with ``redistribute_slack``: a row's lost power is shared on the GPU

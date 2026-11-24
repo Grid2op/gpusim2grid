@@ -48,6 +48,9 @@ struct GenContingencyData {
     // the storage units taking part in the distributed slack, by id (bus -1: not one)
     std::vector<int>    storage_bus;           // [n_storage]
     std::vector<double> storage_slack_weight;  // [n_storage]
+    // every storage unit's solver bus (-1: disconnected / outside the solved grid): where a
+    // ScenarioSweep row's own weight (set_storage_slack_weights) puts one that is not in the slack
+    std::vector<int>    storage_any_bus;       // [n_storage]
 
     bool empty() const { return n_gen == 0; }
 };

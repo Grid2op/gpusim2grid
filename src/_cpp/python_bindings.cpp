@@ -2868,6 +2868,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "branch has; its flows and current check read that block; a row tripping the branch "
          "ignores it. Replaces the previous set, empty clears it.")
     .def_property_readonly("has_branch_params", &ScenarioSweepSession::has_branch_params)
+    .def("set_slack_weight_rows", &ScenarioSweepSession::set_slack_weight_rows,
+         pybind11::arg("gen_ids"), pybind11::arg("gen_weights"), pybind11::arg("storage_ids"),
+         pybind11::arg("storage_weights"),
+         "set_gen_slack_weights / set_storage_slack_weights (lightsim2grid PR #303): per row, the raw "
+         "distributed-slack weight of some units (container ids, one column each in an (n_rows, n_ids) "
+         "matrix; NaN keeps the unit's own, 0 takes it out). The Jacobian's slack column changes by value "
+         "only; run() refuses a positive weight to a unit on a bus that does not share the grid's slack. "
+         "Both families empty clears it.")
+    .def_property_readonly("has_slack_weight_rows", &ScenarioSweepSession::has_slack_weight_rows)
     .def("get_row_status", &ScenarioSweepSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,
@@ -3425,12 +3434,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("presolved_v") = true);
 
     m.def("_extract_slack_redistribution_data_from_lsgrid",
-        [](pybind11::object grid_py, int n_bus_solver) {
+        [](pybind11::object grid_py, int n_bus_solver, std::vector<int> extra_gens, std::vector<int> extra_stos) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
-            return extract_slack_redistribution_data(grid, n_bus_solver);
+            return extract_slack_redistribution_data(grid, n_bus_solver, extra_gens, extra_stos);
         },
         pybind11::arg("grid"),
         pybind11::arg("n_bus_solver"),
+        pybind11::arg("extra_gens") = std::vector<int>(),
+        pybind11::arg("extra_stos") = std::vector<int>(),
         "SlackRedistributionData of the redistribute_slack pre-pass off a lightsim2grid "
         "LSGrid: the generators / storage units of the distributed slack with their "
         "[min_p, max_p] (set_gen_p_limits / set_storage_p_limits), every generator's "
@@ -3485,12 +3496,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "RuntimeError when built against a lightsim2grid without it.");
 
     m.def("_extract_gen_p_plan_from_lsgrid",
-        [](pybind11::object grid_py, int n_bus_solver) {
+        [](pybind11::object grid_py, int n_bus_solver, std::vector<int> row_weighted_gens,
+           std::vector<int> row_weighted_stos) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
-            return extract_gen_p_plan_from_lsgrid(grid, n_bus_solver);
+            return extract_gen_p_plan_from_lsgrid(grid, n_bus_solver, row_weighted_gens, row_weighted_stos);
         },
         pybind11::arg("grid"),
         pybind11::arg("n_bus_solver"),
+        pybind11::arg("row_weighted_gens") = std::vector<int>(),
+        pybind11::arg("row_weighted_stos") = std::vector<int>(),
         "GenPPlanData of compute_physical_violations off a solved lightsim2grid LSGrid, "
         "built by lightsim2grid's own gen_p_check::build_gen_p_plan (so which machines "
         "take a share of the distributed slack, and which of them can be reported, is "

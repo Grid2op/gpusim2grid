@@ -100,7 +100,12 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
 // weight, with their [min_p, max_p] and set-point in GENERATOR convention),
 // every generator's solver bus and set-point, and the shunts' active power per
 // solver bus. See slack_redistribution.hpp.
-SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver);
+// `extra_gens` / `extra_stos`: units a ScenarioSweep row gives a weight of its own
+// (set_gen_slack_weights), listed too where they are not participants -- weight 0, out of the
+// slack, inert unless a row's weight brings them in.
+SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver,
+                                                          const std::vector<int>& extra_gens = {},
+                                                          const std::vector<int>& extra_stos = {});
 
 // What tripping each shunt (its diagonal Ybus coefficient), load (its power)
 // and generator (its active set-point) changes, for the contingencies that trip
@@ -262,7 +267,11 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
 // GenPPlanData (solver bus numbering, MW in the GENERATOR convention: a storage
 // unit's load-convention target is negated, like upstream). n_bus_solver is the
 // session's n_bus. Empty when no participating machine has a limit.
-GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver);
+// `row_weighted_gens` / `_stos`: the units a ScenarioSweep row gives a slack weight of its own
+// (set_gen_slack_weights): in the plan too, whatever their own weight (lightsim2grid PR #303).
+GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver,
+                                            const std::vector<int>& row_weighted_gens = {},
+                                            const std::vector<int>& row_weighted_stos = {});
 
 // The plan of the PQ -> PV release check (compute_physical_violations,
 // lightsim2grid's GenPvReleaseCheck.hpp, PR #216) off a solved LSGrid, built by

@@ -420,6 +420,9 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # session takes both at once (_push_branch_params)
         self._line_params = None
         self._trafo_params = None
+        # set_gen_slack_weights / set_storage_slack_weights inputs ((ids, weights) or None)
+        self._gen_slack_w = None
+        self._sto_slack_w = None
 
         # OLF-style bounded slack redistribution of what a row loses, and the
         # reference slack the fewest rows strand -- see
@@ -1000,6 +1003,102 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
             t_args = (none_ids, empty_real(), empty_real(), empty_cplx(), empty_cplx(), empty_real(), empty_real())
         rows, branches, y = _cpp._branch_param_blocks(self._grid, *l_args, *t_args)
         self._inner._s.set_branch_param_blocks(rows, branches, y, n)
+
+    # ------------------------------------------------ per-row slack weights (lightsim2grid PR #303)
+    def set_gen_slack_weights(self, gen_ids, weights):
+        """Per-scenario distributed-slack weights of some generators: the share of the slack each
+        row gives them.
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_gen_slack_weights`` (PR #303).
+
+        Parameters
+        ----------
+        gen_ids:
+            The generators whose weight varies (ids, or names), one column each in ``weights``.
+        weights: ``np.ndarray`` of float, shape ``(n_scenarios, len(gen_ids))``
+            Raw (un-normalised) weights, what ``LSGrid.add_gen_slackbus`` takes. ``0`` takes the
+            generator out of that row's slack, ``NaN`` keeps the grid's weight.
+
+        Notes
+        -----
+        A row solves, and reports its generators' active-power limit violations
+        (``compute_physical_violations``), as the grid would with those weights: they are values
+        of the Jacobian's slack column, so the whole sweep keeps a single symbolic analysis. A
+        row that disconnects a generator ignores its weight; a row leaving no participant puts
+        the whole slack on the reference bus.
+
+        The buses that share the slack are the grid's, fixed for the batch: :meth:`compute`
+        raises for a positive weight to a generator on a bus where no unit takes part in the
+        grid's slack -- make it a participant of the grid's slack (``add_gen_slackbus``) and give
+        it ``0`` in the rows where it should take no share. Needs the distributed slack
+        (``use_distributed_slack=True``). With ``redistribute_slack`` the bounded pre-pass shares
+        with the row's weights too. With ``outer_loops=True`` the DistributedSlack loop shares
+        with them: only a generator that can take part in the grid's slack may get a positive
+        weight, and with ``init_from_n_powerflow`` such a row starts from the grid's targets,
+        not from where the grid's own solve left its loops (whose targets already hold the base
+        imbalance shared with the grid's weights); not with ``outer_loops_backend='device'``.
+
+        A new call replaces the previous one; an empty ``gen_ids`` clears it. The row count must
+        be the injections'. Raises for an id out of range or named twice, a matrix of another
+        shape, or a weight that is negative or infinite.
+        """
+        self._set_slack_weights("gen", gen_ids, weights)
+
+    def set_storage_slack_weights(self, storage_ids, weights):
+        """Per-scenario distributed-slack weights of some storage units: :meth:`set_gen_slack_weights`
+        for the storage units (``LSGrid.add_storage_slackbus``). Mirrors lightsim2grid's
+        ``ScenarioSweep.set_storage_slack_weights`` (PR #303).
+
+        Parameters
+        ----------
+        storage_ids:
+            The storage units whose weight varies (ids, or names).
+        weights: ``np.ndarray`` of float, shape ``(n_scenarios, len(storage_ids))``
+            As in :meth:`set_gen_slack_weights`.
+        """
+        self._set_slack_weights("sto", storage_ids, weights)
+
+    def _set_slack_weights(self, family, ids, weights):
+        setter = "set_gen_slack_weights" if family == "gen" else "set_storage_slack_weights"
+        if self._grid is None:
+            raise RuntimeError(f"{setter}() needs a lightsim2grid grid; explicit-array (tuple) mode has no "
+                               f"generators or storage units to read.")
+        if self.outer_loops and self.outer_loops_backend == OuterLoopsBackend.DEVICE:
+            raise NotImplementedError(f"{setter}() with outer_loops_backend='device': the device model's "
+                                      "DistributedSlack loop shares with the grid's weights; use the host backend.")
+        container = self._grid.get_generators() if family == "gen" else self._grid.get_storages()
+        kind = "generator" if family == "gen" else "storage unit"
+        ids = self._element_ids(ids, container, kind)
+        w = np.asarray(weights, dtype=np.float64)
+        if ids.size == 0 and w.size == 0:
+            w = np.zeros((0, 0), dtype=np.float64)
+        elif w.ndim != 2 or w.shape[1] != ids.size:
+            raise ValueError(f"{setter}: `weights` should be a matrix of shape (n_scenarios, {ids.size}): one row "
+                             f"per scenario, one column per element named, got shape {w.shape}.")
+        if self._n_injection_rows is not None and ids.size and w.shape[0] != self._n_injection_rows:
+            raise ValueError(f"{setter}: `weights` has {w.shape[0]} rows, but the injections have "
+                             f"{self._n_injection_rows} scenarios.")
+        new = (ids, np.ascontiguousarray(w)) if ids.size else None
+        gen = new if family == "gen" else self._gen_slack_w
+        sto = new if family == "sto" else self._sto_slack_w
+        empty = (np.zeros(0, dtype=np.int32), np.zeros((0, 0), dtype=np.float64))
+        g_ids, g_w = gen if gen is not None else empty
+        s_ids, s_w = sto if sto is not None else empty
+        self._inner._s.set_slack_weight_rows(g_ids, g_w, s_ids, s_w)
+        self._gen_slack_w, self._sto_slack_w = gen, sto
+        # the units only a row's weight brings in: in the pre-pass's data and the active-power
+        # check's plan, read off the grid again
+        if self.redistribute_slack:
+            self.set_slack_redistribution_data_from_grid()
+        if self.compute_physical_violations and self._inner.has_gen_p_capability:
+            self.set_gen_p_capability_from_grid()
+
+    def _row_weighted_unit_ids(self):
+        """(generator ids, storage ids) the rows give slack weights of their own."""
+        gen, sto = getattr(self, "_gen_slack_w", None), getattr(self, "_sto_slack_w", None)
+        g = [] if gen is None else [int(i) for i in gen[0]]
+        s = [] if sto is None else [int(i) for i in sto[0]]
+        return g, s
 
     def get_batch_unsupported_reasons(self):
         """list[str], per row: why the batch left it out (``""``: it did not), after

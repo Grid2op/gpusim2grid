@@ -55,6 +55,7 @@
 #ifndef SLACK_REDISTRIBUTION_HPP
 #define SLACK_REDISTRIBUTION_HPP
 
+#include "slack_weight_rows.hpp"   // SlackWeightRows (set_gen_slack_weights)
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -417,30 +418,56 @@ double injection_change_lost_mw(const SlackRedistributionData& d, double row_p_m
 // (gen_off(g) false for a generator), at their row set-point (gen_p_row(g) for
 // a generator, the grid's own for a storage unit), and turn the result into
 // the row's Sbus correction and saturated units.
+// A unit's weight in row `r` (`over`, nullable: the weights the rows give some units,
+// ScenarioSweep set_gen_slack_weights): the row's where it gives one -- a positive one makes
+// the unit a participant of the row's slack ("in the slack", no overshoot: add_gen_slackbus
+// sets its "can participate" weight the same), below MIN_WEIGHT it takes no part --, its own
+// otherwise (lightsim2grid's BaseBatchSweep::_apply_row_slack_weights).
+struct UnitWeight {
+    double w;
+    bool   in_slack;
+    bool   overridden;
+};
+inline UnitWeight unit_weight(const SlackRedistributionData& d, int k, const SlackWeightRows* over, int r)
+{
+    if (over != nullptr && over->has_row(r)) {
+        const SlackWeightRows::Family& fam = d.kind(k) == SLACK_UNIT_GENERATOR ? over->gen : over->sto;
+        if (fam.has(r, d.el_id(k))) {
+            const double w = fam.of(r, d.el_id(k));
+            return {w >= slack_weight_rows::MIN_WEIGHT ? w : 0., true, true};
+        }
+    }
+    return {static_cast<double>(d.weight(k)), d.unit_in_slack(k), false};
+}
+
 template <class BusMasked, class GenOff, class GenPRow, class StoOff = NoUnitOff>
 RowResult redistribute_row(const SlackRedistributionData& d, double lost,
                            BusMasked bus_masked, GenOff gen_off, GenPRow gen_p_row,
-                           double eps_mw = DEFAULT_EPS_MW, StoOff sto_off = StoOff())
+                           double eps_mw = DEFAULT_EPS_MW, StoOff sto_off = StoOff(),
+                           const SlackWeightRows* over = nullptr, int row = -1)
 {
     RowResult out;
     out.report.mismatch_mw = lost;
     if (std::abs(lost) <= eps_mw) return out;
 
     std::vector<Participant> units;
+    std::vector<char> unit_in_slack;
     units.reserve(static_cast<size_t>(d.n_units));
     for (int k = 0; k < d.n_units; ++k) {
-        if (!(static_cast<double>(d.weight(k)) > POOL_MIN_WEIGHT)) continue;
+        const UnitWeight uw = unit_weight(d, k, over, row);
+        if (!(uw.w > POOL_MIN_WEIGHT)) continue;
         if (bus_masked(d.bus_solver(k))) continue;
         const bool is_gen = d.kind(k) == SLACK_UNIT_GENERATOR;
         if (is_gen ? gen_off(d.el_id(k)) : sto_off(d.el_id(k))) continue;
         Participant p;
         p.unit         = k;
         p.injection_mw = is_gen ? gen_p_row(d.el_id(k)) : static_cast<double>(d.target_p_mw(k));
-        p.weight       = static_cast<double>(d.weight(k));
+        p.weight       = uw.w;
         p.min_p_mw     = static_cast<double>(d.min_p_mw(k));
         p.max_p_mw     = static_cast<double>(d.max_p_mw(k));
-        p.overshoot_mw = d.overshoot_mw.size() != 0 ? static_cast<double>(d.overshoot_mw(k)) : 0.;
+        p.overshoot_mw = (!uw.overridden && d.overshoot_mw.size() != 0) ? static_cast<double>(d.overshoot_mw(k)) : 0.;
         units.push_back(p);
+        unit_in_slack.push_back(uw.in_slack ? 1 : 0);
     }
     if (units.empty()) return out;   // the row's own fallback stays (see row_slack_weights)
 
@@ -455,7 +482,7 @@ RowResult redistribute_row(const SlackRedistributionData& d, double lost,
             out.dp_pu.emplace_back(d.bus_solver(p.unit), dp_mw / d.sn_mva);
         }
         // a pre-pass-only unit was never in the solve's slack: nothing to leave
-        if (saturated[i] && d.unit_in_slack(p.unit)) out.saturated_units.push_back(p.unit);
+        if (saturated[i] && unit_in_slack[i]) out.saturated_units.push_back(p.unit);
     }
     // one entry per bus: merge the units sharing one
     std::sort(out.dp_pu.begin(), out.dp_pu.end(),
@@ -481,15 +508,18 @@ RowResult redistribute_row(const SlackRedistributionData& d, double lost,
 inline void row_slack_weights(const SlackRedistributionData& d, const std::vector<char>& excluded,
                               int n_bus, const std::vector<int>& slack_bus, int ref_bus,
                               int row_for_errors, std::vector<double>& w_scratch,
-                              cuda_real_type* out_row)
+                              cuda_real_type* out_row, const SlackWeightRows* over = nullptr)
 {
     w_scratch.assign(static_cast<size_t>(n_bus), 0.0);
     double sum = 0.0;
     for (int k = 0; k < d.n_units; ++k) {
         if (excluded[static_cast<size_t>(k)]) continue;
-        if (!d.unit_in_slack(k)) continue;   // a pre-pass-only unit: not in the solve's slack
-        w_scratch[static_cast<size_t>(d.bus_solver(k))] += static_cast<double>(d.weight(k));
-        sum += static_cast<double>(d.weight(k));
+        // the row's own weight of it (set_gen_slack_weights), else its own; a pre-pass-only
+        // unit is not in the solve's slack
+        const UnitWeight uw = unit_weight(d, k, over, row_for_errors);
+        if (!uw.in_slack || !(uw.w > 0.)) continue;
+        w_scratch[static_cast<size_t>(d.bus_solver(k))] += uw.w;
+        sum += uw.w;
     }
     if (std::abs(sum) < 1e-12) {
         std::fill(w_scratch.begin(), w_scratch.end(), 0.0);
@@ -532,7 +562,7 @@ template <class Skipped, class Masked, class GenOff, class GenPRow, class SbusPM
 std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows, int n_bus,
                                    Skipped skipped, Masked masked, GenOff gen_off,
                                    GenPRow gen_p_row, SbusPMw sbus_p_mw, RowPMw row_p_mw,
-                                   StoOff sto_off = StoOff())
+                                   StoOff sto_off = StoOff(), const SlackWeightRows* over = nullptr)
 {
     std::vector<RowResult> out(static_cast<size_t>(std::max(n_rows, 0)));
     std::vector<char> is_masked(static_cast<size_t>(n_bus), 0);
@@ -545,7 +575,7 @@ std::vector<RowResult> prepass_all(const SlackRedistributionData& d, int n_rows,
         for (int b : m) is_masked[static_cast<size_t>(b)] = 1;
         out[static_cast<size_t>(r)] = redistribute_row(
             d, lost, [&](int b) { return b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)] != 0; },
-            g_off, g_p, DEFAULT_EPS_MW, [&](int s) { return sto_off(r, s); });
+            g_off, g_p, DEFAULT_EPS_MW, [&](int s) { return sto_off(r, s); }, over, r);
         for (int b : m) is_masked[static_cast<size_t>(b)] = 0;
     }
     return out;
@@ -572,7 +602,8 @@ std::vector<cuda_real_type> build_row_weights(const SlackRedistributionData& d,
                                               int n_rows, GenOff gen_off, int n_bus,
                                               const std::vector<int>& slack_bus,
                                               const std::vector<cuda_real_type>& base_w,
-                                              int ref_bus, StoOff sto_off = StoOff())
+                                              int ref_bus, StoOff sto_off = StoOff(),
+                                              const SlackWeightRows* over = nullptr)
 {
     std::vector<cuda_real_type> out;
     const int n_slack = static_cast<int>(slack_bus.size());
@@ -583,17 +614,19 @@ std::vector<cuda_real_type> build_row_weights(const SlackRedistributionData& d,
     for (int r = 0; r < n_rows; ++r) {
         std::fill(excluded.begin(), excluded.end(), 0);
         bool row_any = false;
+        const bool weighted = over != nullptr && over->has_row(r);
         for (int k = 0; k < d.n_units; ++k)
-            if (d.unit_in_slack(k) && (d.kind(k) == SLACK_UNIT_GENERATOR ? gen_off(r, d.el_id(k)) : sto_off(r, d.el_id(k)))) {
+            if (unit_weight(d, k, over, r).in_slack && (d.kind(k) == SLACK_UNIT_GENERATOR ? gen_off(r, d.el_id(k)) : sto_off(r, d.el_id(k)))) {
                 excluded[static_cast<size_t>(k)] = 1;
                 row_any = true;
             }
         if (static_cast<size_t>(r) < rows.size())
             for (int k : rows[static_cast<size_t>(r)].saturated_units) {
-                if (!d.unit_in_slack(k)) continue;   // e.g. handed in by set_external_slack_saturation
+                if (!unit_weight(d, k, over, r).in_slack) continue;   // e.g. handed in by set_external_slack_saturation
                 excluded[static_cast<size_t>(k)] = 1;
                 row_any = true;
             }
+        row_any = row_any || weighted;
         if (!row_any) continue;
         if (!any) {
             // first row taking something out: every row so far keeps the base
@@ -603,7 +636,7 @@ std::vector<cuda_real_type> build_row_weights(const SlackRedistributionData& d,
             any = true;
         }
         row_slack_weights(d, excluded, n_bus, slack_bus, ref_bus, r, w_scratch,
-                          out.data() + static_cast<ptrdiff_t>(r) * n_slack);
+                          out.data() + static_cast<ptrdiff_t>(r) * n_slack, over);
     }
     return out;
 }
