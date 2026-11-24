@@ -7,6 +7,8 @@ Change Log
   contribution (PtFige: 28 -> 12 ms per driver build; the same plan).
 - [IMPROVED] ``ContingencyAnalysisGPU`` with ``outer_loops`` and ``redistribute_slack``: each row's lost power sums
   its own tripped generators, no longer every generator of the grid (PtFige N-1: 62 -> <1 ms of host per run).
+- [IMPROVED] Prototype own_lu_top: programmatic dependent launch hides the gap between its dependent kernels
+  (PtFige N-1: 0.518 -> 0.514 s; ``GPUSIM2GRID_TOP_LU_PDL=0``: off).
 - [ADDED] Prototype ``GPUSIM2GRID_OWN_LU_TOP=1``: own_lu with its trailing elimination levels in shared memory
   (``src/_cpp/fused_lu/``; PtFige N-1 with outer loops 0.597 -> 0.517 s). Experimental, not tested in the suite yet.
 - [FIXED] ``outer_loops_backend``: the host outer-loop model is compiled without FMA contraction, like the device

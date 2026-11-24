@@ -40,6 +40,7 @@ Read by `pip install` (the in-tree build backend and CMake), not at runtime. Det
 | `GPUSIM2GRID_TOP_LU_M_LARGE` | an integer `≥ 0` | `104` | With `GPUSIM2GRID_OWN_LU_TOP=1`: the trailing block used above `GPUSIM2GRID_TOP_LU_NB` active matrices (a large one costs more than the launches it replaces there). |
 | `GPUSIM2GRID_TOP_LU_NB` | an integer | `768` | With `GPUSIM2GRID_OWN_LU_TOP=1`: up to this many active matrices the factorization takes the large trailing block, above it the `GPUSIM2GRID_TOP_LU_M_LARGE` one. |
 | `GPUSIM2GRID_TOP_LU_FUSE_NB` | an integer | `0` | With `GPUSIM2GRID_OWN_LU_TOP=1`: the runs of narrow solve levels are fused up to this many active matrices (issue #44: one launch per level is faster above). |
+| `GPUSIM2GRID_TOP_LU_PDL` | `0`, `1` | `1` | With `GPUSIM2GRID_OWN_LU_TOP=1`: every launch with programmatic dependent launch (a kernel starts before its predecessor ends and waits in-kernel for its results). `0`: plain launches, the same results. |
 | `GPUSIM2GRID_TOP_LU_STATS` | `0`, `1` | `0` | With `GPUSIM2GRID_OWN_LU_TOP=1`: prints the launches left outside the trailing block (count, chain, split per level). |
 
 ## Outer loops (`outer_loops=True`)

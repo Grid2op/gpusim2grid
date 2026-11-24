@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <array>
+#include <utility>
 
 namespace top_lu {
 
@@ -31,6 +32,14 @@ constexpr int kThreads = 256;
 
 // thread = (item, matrix), matrix fastest, over the first nb matrices (the
 // active prefix) of a batch of stride B
+// Programmatic dependent launch (TopLu::launch): a kernel may start before its predecessor in the stream has
+// finished; it waits here, before touching anything the predecessor produces or reads (a no-op otherwise)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define TOP_PDL_WAIT() cudaGridDependencySynchronize()
+#else
+#define TOP_PDL_WAIT() do {} while (0)
+#endif
+
 #define LU_ITEM_AND_MATRIX                                                  \
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; \
     if (idx >= (long long)n_items * nb) return;                            \
@@ -58,6 +67,7 @@ __global__ void lu_left_u(const int* __restrict__ tgt, const int* __restrict__ s
                           const int* __restrict__ dg, const int n_items, const int B, const int nb,
                           const T* __restrict__ tol, int* __restrict__ clamped, T* __restrict__ v)
 {
+    TOP_PDL_WAIT();
     LU_ITEM_AND_MATRIX
     const int t = LU_TARGET(tgt[it]);
     T s = (src[it] < 0 ? T(0) : ai[(size_t)src[it] * B + b]);
@@ -83,6 +93,7 @@ __global__ void lu_left_l(const int* __restrict__ tgt, const int* __restrict__ s
                           const int* __restrict__ dg, const int n_items, const int B, const int nb,
                           T* __restrict__ v)
 {
+    TOP_PDL_WAIT();
     LU_ITEM_AND_MATRIX
     const int t = LU_TARGET(tgt[it]);
     T s = (src[it] < 0 ? T(0) : ai[(size_t)src[it] * B + b]);
@@ -106,6 +117,7 @@ __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
                        const int B, const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     LU_ITEM_AND_MATRIX
     const int i = rows[it];
     T s = x[(size_t)i * B + b];
@@ -128,6 +140,7 @@ __global__ void lu_bwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
                        const int B, const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     LU_ITEM_AND_MATRIX
     const int i = rows[it];
     T s = x[(size_t)i * B + b];
@@ -151,6 +164,7 @@ template <class T>
 __global__ void lu_tr_in(const T* __restrict__ src, const int* __restrict__ map, const int ncols,
                          const int B, const int nb, T* __restrict__ dst)
 {
+    TOP_PDL_WAIT();
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
@@ -168,6 +182,7 @@ template <class T>
 __global__ void lu_tr_out(const T* __restrict__ src, const int* __restrict__ map, const int ncols,
                           const int B, const int nb, T* __restrict__ dst)
 {
+    TOP_PDL_WAIT();
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
@@ -185,6 +200,7 @@ __global__ void lu_tr_out(const T* __restrict__ src, const int* __restrict__ map
 template <class T>
 __global__ void lu_scaled_tol(const T* __restrict__ values, const int nnz, const T eps, T* __restrict__ tol)
 {
+    TOP_PDL_WAIT();
     __shared__ T red[256];
     const T* row = values + (size_t)blockIdx.x * nnz;
     T m = T(0);
@@ -225,6 +241,7 @@ __global__ void lu_left_split(const int* __restrict__ tgt, const int* __restrict
                               const int* __restrict__ dg, const int B, const int nb, const int is_u,
                               const T* __restrict__ tol, int* __restrict__ clamped, T* __restrict__ v)
 {
+    TOP_PDL_WAIT();
     LU_SPLIT_THREAD
     T acc = T(0);
     if (b < nb)
@@ -247,6 +264,7 @@ __global__ void lu_fwd_split(const int* __restrict__ rows, const int* __restrict
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
                              const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     LU_SPLIT_THREAD
     const int i = rows[it];
     T acc = T(0);
@@ -262,6 +280,7 @@ __global__ void lu_bwd_split(const int* __restrict__ rows, const int* __restrict
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
                              const int nb, const T* __restrict__ v, T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     LU_SPLIT_THREAD
     const int i = rows[it];
     T acc = T(0);
@@ -285,6 +304,7 @@ __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restric
                              const int* __restrict__ ci, const int B, const int nb, const T* __restrict__ v,
                              T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int b = blockIdx.x * 32 + lane;
     __shared__ T red[32][33];
@@ -333,6 +353,7 @@ __global__ void lu_residual(const T* __restrict__ values, const int* __restrict_
                             const int* __restrict__ indices, const int n, const int nnz, const int B,
                             const T* __restrict__ rhs, const T* __restrict__ x, T* __restrict__ r)
 {
+    TOP_PDL_WAIT();
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)n * B) return;
     const int b = (int)(idx / n), i = (int)(idx - (long long)b * n);
@@ -346,6 +367,7 @@ __global__ void lu_residual(const T* __restrict__ values, const int* __restrict_
 template <class T>
 __global__ void lu_axpy(const long long m, const T* __restrict__ d, T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < m) x[idx] += d[idx];
 }
@@ -368,6 +390,7 @@ __global__ void top_outside(const int* __restrict__ oq, const int* __restrict__ 
                             const int n_items, const int n_top, const int B, const int nb, const T* __restrict__ v,
                             T* __restrict__ tm)
 {
+    TOP_PDL_WAIT();
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
@@ -390,6 +413,7 @@ template <class T>
 __global__ void top_fo(const int* __restrict__ trows, const int* __restrict__ fo_ptr, const int* __restrict__ fo_ent,
                        const int* __restrict__ fo_col, const int B, const int nb, const T* __restrict__ v, T* __restrict__ xi)
 {
+    TOP_PDL_WAIT();
     __shared__ T red[32][33];
     const int lane = threadIdx.x & 31, part = threadIdx.x >> 5, K = blockDim.x >> 5, i = blockIdx.x;
     const int b = blockIdx.y * 32 + lane;
@@ -419,6 +443,7 @@ top_factor(const int m, const int n_top, const int* __restrict__ dq, const int* 
            const int* __restrict__ pslot, const int B, const int nb, const T* __restrict__ tol, int* __restrict__ clamped,
            T* __restrict__ tm)
 {
+    TOP_PDL_WAIT();
     extern __shared__ __align__(16) unsigned char sm[];
     T* D = reinterpret_cast<T*>(sm);
     T* inv = D + n_top;
@@ -473,6 +498,7 @@ __global__ void __launch_bounds__(kTopSolveThreads)
 top_fwd(const int m, const int n_top, const int* __restrict__ trows, const int* __restrict__ rk_ptr, const int* __restrict__ rk,
         const int* __restrict__ fl_q, const int n_fl, const int B, const int nb, const T* __restrict__ tm, T* __restrict__ xi)
 {
+    TOP_PDL_WAIT();
     extern __shared__ __align__(16) unsigned char sm[];
     T* xT = reinterpret_cast<T*>(sm);
     T* Ls = xT + m;
@@ -504,6 +530,7 @@ top_bwd(const int m, const int n_top, const int* __restrict__ trows, const int* 
         const int* __restrict__ bu_q, const int n_bu, const int* __restrict__ dg_q, const int B, const int nb,
         const T* __restrict__ tm, T* __restrict__ xi)
 {
+    TOP_PDL_WAIT();
     extern __shared__ __align__(16) unsigned char sm[];
     T* xT = reinterpret_cast<T*>(sm);
     T* xo = xT + m;
@@ -540,6 +567,7 @@ template <class T>
 __global__ void lu_tr_in_vals(const T* __restrict__ src, const int ncols, const int B, const int nb, T* __restrict__ dst,
                               unsigned long long* __restrict__ amax)
 {
+    TOP_PDL_WAIT();
     __shared__ T t[32][33];
     __shared__ double mx[8][32];
     const int b0 = blockIdx.y * 32;
@@ -571,6 +599,7 @@ __global__ void lu_tr_in_vals(const T* __restrict__ src, const int ncols, const 
 template <class T>
 __global__ void lu_tol_from_max(const unsigned long long* __restrict__ amax, const double eps, const int nb, T* __restrict__ tol)
 {
+    TOP_PDL_WAIT();
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < nb) tol[b] = static_cast<T>(eps * __longlong_as_double(static_cast<long long>(amax[b])));
 }
@@ -580,6 +609,7 @@ template <class T>
 __global__ void lu_tr_in2(const T* __restrict__ src, const int* __restrict__ map, const int ncols, const int B, const int nb,
                           T* __restrict__ dst, T* __restrict__ dst2)
 {
+    TOP_PDL_WAIT();
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
@@ -602,6 +632,7 @@ template <class T>
 __global__ void lu_tr_out_add(const T* __restrict__ src, const T* __restrict__ src2, const int* __restrict__ map,
                               const int ncols, const int B, const int nb, T* __restrict__ dst)
 {
+    TOP_PDL_WAIT();
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
@@ -624,6 +655,7 @@ __global__ void lu_residual_i(const int* __restrict__ ra_ptr, const int* __restr
                               const int n, const int B, const int nb, const T* __restrict__ ai, const T* __restrict__ bi,
                               const T* __restrict__ xi, T* __restrict__ ri)
 {
+    TOP_PDL_WAIT();
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)n * nb) return;
     const int i = (int)(idx / nb), b = (int)(idx - (long long)i * nb);
@@ -635,6 +667,7 @@ __global__ void lu_residual_i(const int* __restrict__ ra_ptr, const int* __restr
 template <class T>
 __global__ void lu_axpy_i(const int n, const int B, const int nb, const T* __restrict__ d, T* __restrict__ x)
 {
+    TOP_PDL_WAIT();
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)n * nb) return;
     const int i = (int)(idx / nb), b = (int)(idx - (long long)i * nb);
@@ -654,6 +687,26 @@ inline int split_for(int static_k, int count, int mc, int nb)
 }  // namespace
 
 
+
+
+// Every launch of TopLu, with programmatic dependent launch (GPUSIM2GRID_TOP_LU_PDL=0: off): the launch of a
+// kernel overlaps its predecessor's drain, the kernel waiting in TOP_PDL_WAIT for its results
+template <typename... KArgs, typename... Args>
+inline void pdl_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream, Args&&... args)
+{
+    static const bool on = [] { const char* e = std::getenv("GPUSIM2GRID_TOP_LU_PDL"); return !(e && e[0] == '0'); }();
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = on ? 1 : 0;
+    cfg.attrs = at;
+    cfg.numAttrs = 1;
+    OWN_LU_CHECK(cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...));
+}
 
 void TopLu::init(const own_lu::LuPlan& plan, int batch, cudaStream_t stream, double eps, int max_top,
                  int split_chain, int split_items)
@@ -1121,8 +1174,8 @@ void TopLu::factorize(const cuda_real_type* values)
     {   // J -> interleaved A + max |A_b|, then the clamps
         const int tiles = (nnz_ + 31) / 32;
         dim3 grid(std::min(tiles, 1024), (nb + 31) / 32), block(32, 8);
-        lu_tr_in_vals<T><<<grid, block, 0, stream_>>>(values, nnz_, B, nb, ai, rawm(d_amax_));
-        lu_tol_from_max<T><<<(nb + 255) / 256, 256, 0, stream_>>>(raw(d_amax_), eps_, nb, tol);
+        pdl_launch(lu_tr_in_vals<T>, dim3(grid), dim3(block), 0, stream_, values, nnz_, B, nb, ai, rawm(d_amax_));
+        pdl_launch(lu_tol_from_max<T>, dim3((nb + 255) / 256), dim3(256), 0, stream_, raw(d_amax_), eps_, nb, tol);
     }
     const int* tgt = raw(d_tgt_); const int* src = raw(d_src_); const int* cptr = raw(d_cptr_);
     const int* dg = raw(d_dg_); const int* cl = raw(d_cl_); const int* cu = raw(d_cu_);
@@ -1133,22 +1186,22 @@ void TopLu::factorize(const cuda_real_type* values)
         const int k = split_for(L.k, L.count, L.mc, nb);
         if (k > 1) {
             dim3 grid(L.count, (nb + 31) / 32);
-            lu_left_split<T><<<grid, 32 * k, 0, stream_>>>(tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu,
+            pdl_launch(lu_left_split<T>, dim3(grid), dim3(32 * k), 0, stream_, tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu,
                                                              dg + L.offset, B, nb, L.is_u ? 1 : 0, tol, clamped, v);
         } else if (L.is_u) {
-            lu_left_u<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(
+            pdl_launch(lu_left_u<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, 
                 tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, nb, tol, clamped, v);
         } else {
-            lu_left_l<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(
+            pdl_launch(lu_left_l<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, 
                 tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, nb, v);
         }
     }
     if (dense) {
-        top_outside<T><<<dim3((t.n_oa_ + 31) / 32, (nb + 31) / 32), dim3(32, 8), 0, stream_>>>(
+        pdl_launch(top_outside<T>, dim3(dim3((t.n_oa_ + 31) / 32, (nb + 31) / 32)), dim3(dim3(32, 8)), 0, stream_, 
             raw(t.d_oa_tgt_), raw(t.d_oa_src_), ai, raw(t.d_oa_cptr_), raw(t.d_oa_cl_), raw(t.d_oa_cu_), t.n_oa_, t.n_top_, B, nb, v, rawm(t.d_tm_));
         const int m = t.m_;
         const size_t sf = (static_cast<size_t>(t.n_top_) + 2 * m) * sizeof(T);
-        top_factor<T><<<nb, kTopFactorThreads, sf, stream_>>>(m, t.n_top_, raw(t.d_dg_q_), raw(t.d_rk_ptr_), raw(t.d_lslot_),
+        pdl_launch(top_factor<T>, dim3(nb), dim3(kTopFactorThreads), sf, stream_, m, t.n_top_, raw(t.d_dg_q_), raw(t.d_rk_ptr_), raw(t.d_lslot_),
                                                                raw(t.d_uslot_), raw(t.d_pp_ptr_), raw(t.d_pslot_), B, nb, tol,
                                                                clamped, rawm(t.d_tm_));
     }
@@ -1168,11 +1221,11 @@ void TopLu::run_solve(const Sched& s, bool forward, cuda_real_type* xi)
         const int* rows = raw(s.d_rows) + L.offset;
         const int k = split_for(L.k, L.count, L.mc, nb);
         if (forward) {
-            if (k > 1) lu_fwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
-            else lu_fwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb, v, xi);
+            if (k > 1) pdl_launch(lu_fwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), 0, stream_, rows, rp, dp, ci, B, nb, v, xi);
+            else pdl_launch(lu_fwd<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi);
         } else {
-            if (k > 1) lu_bwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
-            else lu_bwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb, v, xi);
+            if (k > 1) pdl_launch(lu_bwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), 0, stream_, rows, rp, dp, ci, B, nb, v, xi);
+            else pdl_launch(lu_bwd<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi);
         }
     };
     // a fused run is one block per 32 matrices: with many active matrices it leaves most of the GPU idle (issue
@@ -1185,10 +1238,10 @@ void TopLu::run_solve(const Sched& s, bool forward, cuda_real_type* xi)
                 continue;
             }
             if (forward)
-                lu_solve_run<T, true><<<(nb + 31) / 32, kRunThreads, 0, stream_>>>(raw(s.d_rows), raw(s.d_run), st.first,
+                pdl_launch(lu_solve_run<T, true>, dim3((nb + 31) / 32), dim3(kRunThreads), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first,
                                                                                  st.last, n_lv, rp, dp, ci, B, nb, v, xi);
             else
-                lu_solve_run<T, false><<<(nb + 31) / 32, kRunThreads, 0, stream_>>>(raw(s.d_rows), raw(s.d_run), st.first,
+                pdl_launch(lu_solve_run<T, false>, dim3((nb + 31) / 32), dim3(kRunThreads), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first,
                                                                                   st.last, n_lv, rp, dp, ci, B, nb, v, xi);
             continue;
         }
@@ -1204,12 +1257,12 @@ void TopLu::solve_core(const Top& t, cuda_real_type* xi)
         const int m = t.m_;
         run_solve(t.fw_rest_, true, xi);
         const size_t sw = (m + t.n_fl_) * sizeof(T) + (m + 1 + t.n_fl_) * 4;
-        top_fo<T><<<dim3(m, (nb + 31) / 32), 32 * 8, 0, stream_>>>(raw(t.d_t_rows_), raw(t.d_fo_ptr_), raw(t.d_fo_ent_), raw(t.d_fo_col_),
+        pdl_launch(top_fo<T>, dim3(dim3(m, (nb + 31) / 32)), dim3(32 * 8), 0, stream_, raw(t.d_t_rows_), raw(t.d_fo_ptr_), raw(t.d_fo_ent_), raw(t.d_fo_col_),
                                                                  B, nb, raw(d_v_), xi);
-        top_fwd<T><<<nb, kTopSolveThreads, sw, stream_>>>(m, t.n_top_, raw(t.d_t_rows_), raw(t.d_rk_ptr_), raw(t.d_rk_), raw(t.d_fl_q_), t.n_fl_,
+        pdl_launch(top_fwd<T>, dim3(nb), dim3(kTopSolveThreads), sw, stream_, m, t.n_top_, raw(t.d_t_rows_), raw(t.d_rk_ptr_), raw(t.d_rk_), raw(t.d_fl_q_), t.n_fl_,
                                                            B, nb, raw(t.d_tm_), xi);
         const size_t sb = (3 * m + t.n_bu_) * sizeof(T) + (m + 1 + t.n_bu_) * 4;
-        top_bwd<T><<<nb, kTopSolveThreads, sb, stream_>>>(m, t.n_top_, raw(t.d_t_rows_), raw(t.d_bu_ptr_), raw(t.d_bu_row_), raw(t.d_bu_q_),
+        pdl_launch(top_bwd<T>, dim3(nb), dim3(kTopSolveThreads), sb, stream_, m, t.n_top_, raw(t.d_t_rows_), raw(t.d_bu_ptr_), raw(t.d_bu_row_), raw(t.d_bu_q_),
                                                            t.n_bu_, raw(t.d_dg_q_), B, nb, raw(t.d_tm_), xi);
         run_solve(t.bw_rest_, false, xi);
     } else {
@@ -1224,7 +1277,7 @@ void TopLu::solve(const cuda_real_type* b, cuda_real_type* x)
     const int B = B_, nb = nb_;
     T* xi = rawm(d_xi_);
     dim3 tgrid((n_ + 31) / 32, (nb + 31) / 32), tblock(32, 8);
-    lu_tr_in2<T><<<tgrid, tblock, 0, stream_>>>(b, raw(d_inv_), n_, B, nb, rawm(d_bi_), xi);
+    pdl_launch(lu_tr_in2<T>, dim3(tgrid), dim3(tblock), 0, stream_, b, raw(d_inv_), n_, B, nb, rawm(d_bi_), xi);
     solve_core(tops_[cur_], xi);
     // x is written back by refine() (once, with the correction: x + d) or by flush(); solve() leaves it pending
     out_pending_ = true;
@@ -1253,11 +1306,11 @@ void TopLu::refine(const cuda_real_type* values, const int* indptr, const int* i
         T* ri = rawm(d_ri_);
         dim3 tgrid((n_ + 31) / 32, (nb + 31) / 32), tblock(32, 8);
         for (int s = 0; s < steps; ++s) {
-            lu_residual_i<T><<<blocks_for(mm), kThreads, 0, stream_>>>(raw(d_ra_ptr_), raw(d_ra_p_), raw(d_ra_col_), n_, B, nb,
+            pdl_launch(lu_residual_i<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, raw(d_ra_ptr_), raw(d_ra_p_), raw(d_ra_col_), n_, B, nb,
                                                                        raw(d_ai_), raw(d_bi_), xi, ri);
             solve_core(tops_[cur_], ri);
-            if (s + 1 < steps) lu_axpy_i<T><<<blocks_for(mm), kThreads, 0, stream_>>>(n_, B, nb, ri, xi);
-            else lu_tr_out_add<T><<<tgrid, tblock, 0, stream_>>>(xi, ri, raw(d_inv_), n_, B, nb, x);
+            if (s + 1 < steps) pdl_launch(lu_axpy_i<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, n_, B, nb, ri, xi);
+            else pdl_launch(lu_tr_out_add<T>, dim3(tgrid), dim3(tblock), 0, stream_, xi, ri, raw(d_inv_), n_, B, nb, x);
         }
         out_pending_ = false;
         interleaved_ok_ = false;
@@ -1270,10 +1323,10 @@ void TopLu::refine(const cuda_real_type* values, const int* indptr, const int* i
         d_d_.resize(static_cast<size_t>(n_) * B_);
     }
     for (int s = 0; s < steps; ++s) {
-        lu_residual<T><<<blocks_for(mm), kThreads, 0, stream_>>>(values, indptr, indices, n_, nnz_, nb_, b, x, rawm(d_r_));
+        pdl_launch(lu_residual<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, values, indptr, indices, n_, nnz_, nb_, b, x, rawm(d_r_));
         solve(rawm(d_r_), rawm(d_d_));
         flush();
-        lu_axpy<T><<<blocks_for(mm), kThreads, 0, stream_>>>(mm, raw(d_d_), x);
+        pdl_launch(lu_axpy<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, mm, raw(d_d_), x);
     }
     interleaved_ok_ = false;
     OWN_LU_CHECK(cudaGetLastError());
@@ -1284,7 +1337,7 @@ void TopLu::flush()
     if (!out_pending_) return;
     using T = cuda_real_type;
     dim3 tgrid((n_ + 31) / 32, (nb_ + 31) / 32), tblock(32, 8);
-    lu_tr_out<T><<<tgrid, tblock, 0, stream_>>>(raw(d_xi_), raw(d_inv_), n_, B_, nb_, last_x_);
+    pdl_launch(lu_tr_out<T>, dim3(tgrid), dim3(tblock), 0, stream_, raw(d_xi_), raw(d_inv_), n_, B_, nb_, last_x_);
     out_pending_ = false;
     OWN_LU_CHECK(cudaGetLastError());
 }
