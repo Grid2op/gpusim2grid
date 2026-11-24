@@ -2139,8 +2139,11 @@ void DeviceOuterModel::init_tables()
     n_loops_ = static_cast<int>(t_.loop_kind.size());
     if (t_.has_tvc) { tvr_ = t_.rl_n; tvb_ = t_.n_bus; }
     if (t_.keep_trace) {
-        // one on_solved checks each active loop at most once: DistributedSlack's few records and a
-        // PARK per unit, a record per hvdc line and monitor, ReactiveLimits' up to two per bus
+        // one on_solved checks each active loop at most once (the buffer is flushed after every
+        // decide): a re-check of loop L runs L..n-1, and the new pass it may start stops at
+        // last_unstable == L, as Ls2gOuterModel::drive. DistributedSlack's few records and a PARK per
+        // unit, a record per hvdc line and monitor, ReactiveLimits' up to two per bus (KEPT_PQ and
+        // LIMIT_MOVED), the SETTLED record in the 16
         tcap_ = 2 * t_.rl_n + 2 * n_units_ + n_hl_ + n_mon_ + t_.n_pc + t_.n_tvg + 2 * t_.n_gt +
                 (t_.svg_ptr.empty() ? 0 : t_.svg_ptr.back()) + 16;
         trn_ = t_.rl_n;
