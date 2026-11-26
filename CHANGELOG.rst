@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] With a droop HVDC line, only the J positions ``fill_J`` does not write are zeroed before it, no longer
+  the whole batched J (PtFige N-1: ~2 ms per large round).
 - [IMPROVED] ``outer_loops_backend='device'``: no pinned host copy of the outer-loop gather, which only the host
   model reads (PtFige: a 15 ms ``cudaMallocHost`` per driver build).
 - [IMPROVED] ``outer_loops_backend='device'``: a row's independent per-element work (lost-power sums, controls,

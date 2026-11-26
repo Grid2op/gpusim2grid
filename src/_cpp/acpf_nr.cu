@@ -854,6 +854,17 @@ AcPfNrState::AcPfNrState(
     upload_h2d(d_map_j12, h_map_j12.data(), nnz_Y, cs);
     upload_h2d(d_map_j21, h_map_j21.data(), nnz_Y, cs);
     upload_h2d(d_map_j22, h_map_j22.data(), nnz_Y, cs);
+    {
+        std::vector<char> mapped(static_cast<size_t>(nnz_J), 0);
+        for (const std::vector<int>* m : {&h_map_j11, &h_map_j12, &h_map_j21, &h_map_j22})
+            for (int p : *m)
+                if (p >= 0) mapped[static_cast<size_t>(p)] = 1;
+        std::vector<int> unmapped;
+        for (int p = 0; p < nnz_J; ++p)
+            if (!mapped[static_cast<size_t>(p)]) unmapped.push_back(p);
+        if (!unmapped.empty()) upload_h2d(d_J_unmapped_pos, unmapped.data(), unmapped.size(), cs);
+        else d_J_unmapped_pos.clear();
+    }
 
     // MultiSlack feature data (distributed slack in the Jacobian). Slack
     // participants are the buses with a nonzero slack weight; each owns a P row

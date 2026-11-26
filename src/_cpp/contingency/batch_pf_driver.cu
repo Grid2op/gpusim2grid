@@ -1504,6 +1504,11 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
         }
     }
 
+    if (buf.zero_J_before_fill) {   // only what fill_J does not overwrite (see nr_feature_zero_J)
+        buf.n_J_zero_pos = static_cast<int>(base.d_J_unmapped_pos.size());
+        buf.d_J_zero_pos = buf.n_J_zero_pos > 0 ? thrust::raw_pointer_cast(base.d_J_unmapped_pos.data()) : nullptr;
+    }
+
     // NR step-scaling (MaxVoltageChange) -- off (nullptr scratch) unless
     // enabled, matching every other opt-in extension above.
     buf.scaling_max_voltage_change = scaling_max_voltage_change_;
