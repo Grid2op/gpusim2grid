@@ -1711,7 +1711,10 @@ void BatchPfDriver<BatchSource>::_oc_setup()
     upload_h2d(d_oc_cand_pin_, cand_pin.data(), cand_pin.size(), cs);
     d_oc_list_.resize(S);
     d_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
-    h_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
+    // Only the host model downloads the gather (the device one reads d_oc_gather_ in place, see
+    // _oc_gather): a pinned S x oc_stride buffer was a ~15 ms cudaMallocHost at every driver build.
+    if (dynamic_cast<outer::DeviceOuterHook*>(outer_hook_) == nullptr)
+        h_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
 }
 
 template <typename BatchSource>

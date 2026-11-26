@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``outer_loops_backend='device'``: no pinned host copy of the outer-loop gather, which only the host
+  model reads (PtFige: a 15 ms ``cudaMallocHost`` per driver build).
 - [IMPROVED] ``outer_loops_backend='device'``: a row's independent per-element work (lost-power sums, controls,
   results, the controls' upload) is spread over a warp / block, the ordered sums kept in order. PtFige N-1:
   0.502 -> 0.474 s.
