@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``linear_solver='own_lu'``: the split levels' reduction sized by their warps, no longer a fixed
+  8.4 KB array capping them at 10 blocks per SM (42% occupancy). PtFige N-1: 0.357 -> 0.354 s.
 - [IMPROVED] ``linear_solver='own_lu'``: the symbolic plan (and own_lu_top's trailing blocks) kept per Jacobian
   pattern, process-wide: a new session on the same grid no longer rebuilds them (PtFige: ~20 ms per driver build).
 - [IMPROVED] With a droop HVDC line, only the J positions ``fill_J`` does not write are zeroed before it, no longer

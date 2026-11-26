@@ -219,12 +219,20 @@ __global__ void lu_scaled_tol(const T* __restrict__ values, const int nnz, const
 // Split variants for the narrow levels near the root: block = 32 consecutive
 // matrices (lane) x K warps, one item per blockIdx.x; warp w sums the
 // contributions w, w + K, ...; partial sums added in warp order (deterministic).
+// red holds the K warps' partial sums only: dynamic shared memory of lu_split_smem<T>(K) bytes. A static
+// [32][33] array (8.4 KB whatever K) capped these kernels at 10 blocks per SM, i.e. 42% occupancy with
+// K = 2 (Nsight Compute, PtFige N-1 at batch 4096: the split levels at 72-76% of peak DRAM vs ~88% for
+// the unsplit ones).
 #define LU_SPLIT_THREAD                                         \
     const int lane = threadIdx.x & 31, part = threadIdx.x >> 5; \
     const int K = blockDim.x >> 5;                              \
     const int it = blockIdx.x;                                  \
     const int b = blockIdx.y * 32 + lane;   /* b < nb: active */ \
-    __shared__ T red[32][33];
+    extern __shared__ __align__(16) unsigned char lu_split_sm[]; \
+    T (*red)[33] = reinterpret_cast<T (*)[33]>(lu_split_sm);
+
+template <class T>
+constexpr size_t lu_split_smem(int k) { return static_cast<size_t>(k) * 33 * sizeof(T); }
 
 template <class T>
 __device__ __forceinline__ T lu_split_sum(T acc, const int lane, const int part, const int K, T (*red)[33])
@@ -1278,7 +1286,7 @@ void TopLu::factorize(const cuda_real_type* values)
         const int k = split_for(L.k, L.count, L.mc, nb);
         if (k > 1) {
             dim3 grid(L.count, (nb + 31) / 32);
-            pdl_launch(lu_left_split<T>, dim3(grid), dim3(32 * k), 0, stream_, tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu,
+            pdl_launch(lu_left_split<T>, dim3(grid), dim3(32 * k), lu_split_smem<T>(k), stream_, tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu,
                                                              dg + L.offset, B, nb, L.is_u ? 1 : 0, tol, clamped, v);
         } else if (L.is_u) {
             pdl_launch(lu_left_u<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, 
@@ -1313,10 +1321,10 @@ void TopLu::run_solve(const Sched& s, bool forward, cuda_real_type* xi)
         const int* rows = raw(s.d_rows) + L.offset;
         const int k = split_for(L.k, L.count, L.mc, nb);
         if (forward) {
-            if (k > 1) pdl_launch(lu_fwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), 0, stream_, rows, rp, dp, ci, B, nb, v, xi);
+            if (k > 1) pdl_launch(lu_fwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), lu_split_smem<T>(k), stream_, rows, rp, dp, ci, B, nb, v, xi);
             else pdl_launch(lu_fwd<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi);
         } else {
-            if (k > 1) pdl_launch(lu_bwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), 0, stream_, rows, rp, dp, ci, B, nb, v, xi);
+            if (k > 1) pdl_launch(lu_bwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), lu_split_smem<T>(k), stream_, rows, rp, dp, ci, B, nb, v, xi);
             else pdl_launch(lu_bwd<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi);
         }
     };
