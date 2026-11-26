@@ -163,3 +163,28 @@ avoiding the barrier without a per-thread FP64 division (warp 0 computes the rec
 warps wait on a flag rather than a full barrier). Estimate: ~0.5-1 ms per large round plus a little in
 the tail, i.e. -3 to -6 ms per run (~1-2%): not worth a day before the larger levers of sections 1, 2
 and 4 (shared Ybus, J in the LU's layout, mixed precision).
+
+## 6. The batch size
+
+`BATCH_SIZE` swept on the head of section 5 (`ac835e8`), tail 1 x batch size (groups of one slot, as
+many groups as slots: the same compaction as `bench_n1_expe.sh`'s 1 x 4096), everything else as in
+section 0. Session run, median of 5 repeats; 8801 converged, 4443 outer / 21021 Newton iterations
+everywhere.
+
+| batch | session run | large rounds | tail | rounds (tail) | per row, large rounds | driver construction |
+|---|---|---|---|---|---|---|
+| 512 | 0.447 s | 40 x 10.1 ms | 0.028 s | 48 (8) | 0.020 ms | 8 ms |
+| 1024 | 0.381 s | 19 x 16.7 ms | 0.048 s | 29 (10) | 0.016 ms | 9 ms |
+| 2048 | 0.357 s | 9 x 30.4 ms | 0.063 s | 20 (11) | 0.015 ms | 11 ms |
+| 3072 | 0.356 s | 5 x 48.2 ms | 0.11 s | 17 (12) | 0.016 ms | 13 ms |
+| **4096** | **0.354 s** | 4 x 59 ms | 0.094 s | 15 (11) | 0.014 ms | 15 ms |
+| 8192 | 0.372 s | 1 x 124 ms | 0.21 s | 12 (11) | 0.015 ms | 27 ms |
+
+- Below 2048 every round pays a fixed cost (~650 dependent kernels + the host's part, ~4-5 ms) more
+  often (48 rounds at 512), and a large round's cost per row keeps falling up to 4096 as the GPU fills.
+- 8192 slots hold nearly all 8803 rows: the queue empties after the first round, and the rounds after
+  it count as tail but still carry thousands of live rows (19 ms each), with twice the memory and the
+  driver build (27 ms of allocations).
+- The optimum is flat from 2048 to 4096 (0.354-0.357 s): 4096, the expe setting, stays marginally the
+  best; 2048 halves the batch's GPU memory (LU factors 4.6 -> 2.3 GB, likewise J and the per-slot Ybus)
+  for +3 ms, the choice on a shared or smaller GPU. Nothing to change in the code.
