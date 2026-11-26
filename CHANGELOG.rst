@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``linear_solver='own_lu'``: ``ir_n_steps`` refines only the matrices whose factorization clamped a
+  pivot, nothing when none did (``GPUSIM2GRID_OWN_LU_IR=all``: every one). PtFige N-1: 0.354 -> 0.308 s.
 - [IMPROVED] ``linear_solver='own_lu'``: the split levels' reduction sized by their warps, no longer a fixed
   8.4 KB array capping them at 10 blocks per SM (42% occupancy). PtFige N-1: 0.357 -> 0.354 s.
 - [IMPROVED] ``linear_solver='own_lu'``: the symbolic plan (and own_lu_top's trailing blocks) kept per Jacobian

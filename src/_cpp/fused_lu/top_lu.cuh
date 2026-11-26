@@ -37,6 +37,7 @@
 
 #include "../dtypes.hpp"
 #include "../own_lu/lu_plan.hpp"
+#include "../own_lu/batched_lu.cuh"   // own_lu_refine_all
 
 namespace top_lu {
 
@@ -73,7 +74,11 @@ private:
         std::vector<SolveStep> steps;
         thrust::device_vector<int> d_rows, d_run;
     };
-    void run_solve(const Sched& s, bool forward, cuda_real_type* xi);
+    void run_solve(const Sched& s, bool forward, cuda_real_type* xi, const int* mask);
+    // solve() on the matrices `mask` selects (clamp counts > 0; nullptr: all): refine()'s, as own_lu's
+    void solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask);
+    bool refine_all_ = false;   // own_lu::own_lu_refine_all()
+    int batch_clamp_total() const;   // d_clamped_[0], host-synchronizing
 
     int n_ = 0, nnz_ = 0, n_ent_ = 0, B_ = 0, nb_ = 0;
     double eps_ = 0.;
@@ -144,7 +149,7 @@ private:
     Top tops_[2];
     int cur_ = 0, top_nb_ = 768;
     int fuse_nb_ = 0;  // fused solve runs up to this many active matrices (GPUSIM2GRID_TOP_LU_FUSE_NB; issue #44)
-    void solve_core(const Top& t, cuda_real_type* xi);
+    void solve_core(const Top& t, cuda_real_type* xi, const int* mask);
 
     // init() = init_symbolic() (a function of the plan, the parameters and the device alone: the
     // schedules, the item lists, both trailing blocks) + alloc_batch() (the buffers sized by the

@@ -34,6 +34,7 @@ Read by `pip install` (the in-tree build backend and CMake), not at runtime. Det
 |---|---|---|---|
 | `GPUSIM2GRID_OWN_LU_EPS` | a number `≥ 0` | `1e-12` (FP64 build), `1e-5` (FP32 build) | The relative pivot clamp: a pivot below `x · max\|J\|` is clamped and counted in `cudss_npivots_*`. `0`: no clamp. |
 | `GPUSIM2GRID_OWN_LU_FUSE` | `0`, `1` | `1` | `1`: the runs of narrow levels of the triangular solves fused into one kernel each (when the device supports it). `0`: every level its own launch (same bits, more launches). |
+| `GPUSIM2GRID_OWN_LU_IR` | `clamped`, `all` | `clamped` | What `ir_n_steps` refines with `linear_solver='own_lu'`: `clamped`, only the matrices whose last factorization clamped a pivot (nothing when none did); `all`, every matrix (the former behaviour; the others' solutions then move by rounding only). |
 | `GPUSIM2GRID_OWN_LU_PLAN_CACHE` | `0`, `1` | `1` | `1`: own_lu's symbolic plan (and own_lu_top's trailing blocks) kept process-wide per Jacobian pattern and order, reused by a new session on the same pattern. `0`: rebuilt by every driver. |
 | `GPUSIM2GRID_OWN_LU_STATS` | `0`, `1` | `0` | `1`: prints the widths of the factorization and solve launches (how many are narrow, split or fusable). |
 | `GPUSIM2GRID_OWN_LU_TOP` | `0`, `1` | `0` | Prototype. `1`: `linear_solver='own_lu'` uses `top_lu::TopLu` (`src/_cpp/fused_lu/`, built when present): the last elimination levels factored and solved in shared memory, one block per matrix. `0`: own_lu unchanged. |

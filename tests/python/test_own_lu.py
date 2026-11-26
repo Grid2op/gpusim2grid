@@ -20,7 +20,7 @@ import warnings
 import numpy as np
 import pytest
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 import gpusim2grid._gpusim2grid as _cpp
 
 pytestmark = requires_gpu
@@ -142,6 +142,34 @@ def test_raw_refinement_recovers_a_clamped_pivot(monkeypatch):
     r0, r1, r2 = (r.max_rel_residual for r in res)
     assert r0 > 1e-8                          # the clamp is visible
     assert r1 < 1e-2 * r0 and r2 < 1e-2 * max(r1, 1e-13), (r0, r1, r2)
+
+
+@pytest.mark.skipif(bool(_cpp.is_fp32), reason="FP32's 1e-5 clamp; the parity bound is an FP64 one")
+@pytest.mark.parametrize("scheduling", ["chunked", "continuous"])
+@pytest.mark.parametrize("top", ["0", "1"], ids=["own_lu", "own_lu_top"])
+def test_refinement_only_where_a_pivot_was_clamped(case118, monkeypatch, top, scheduling):
+    """ir_n_steps refines only the matrices whose factorization clamped a pivot (the saddle matrix
+    above): the others' factors are those of their own matrix, a step changes their solution by
+    rounding only, and it cost a second triangular solve of every matrix (PtFige N-1: 53 ms of
+    0.354 s). case118's N-1 clamps nothing, so ir_n_steps=1 is ir_n_steps=0 to the bit -- statuses,
+    iterations, V -- on both own LUs; GPUSIM2GRID_OWN_LU_IR=all refines every matrix as before, which
+    moves V by rounding only."""
+    monkeypatch.setenv("GPUSIM2GRID_OWN_LU_TOP", top)
+    monkeypatch.setenv("GPUSIM2GRID_COUNT_PIVOTS", "1")
+    monkeypatch.delenv("GPUSIM2GRID_OWN_LU_EPS", raising=False)
+    monkeypatch.delenv("GPUSIM2GRID_OWN_LU_IR", raising=False)
+    runs = {}
+    for name, ir, ir_env in (("ir0", 0, None), ("ir1", 1, None), ("all", 1, "all")):
+        if ir_env is not None:
+            monkeypatch.setenv("GPUSIM2GRID_OWN_LU_IR", ir_env)
+        ca, nbr = _n1(case118, "own_lu", scheduling, ir_n_steps=ir)
+        ca.compute(batch_size=64)
+        assert ca.timings.cudss_npivots_total == 0          # nothing clamped, nothing to refine
+        runs[name] = _outcome(ca, nbr)
+    for got, want in zip(runs["ir1"], runs["ir0"]):
+        np.testing.assert_array_equal(got, want)
+    np.testing.assert_array_equal(runs["all"][0], runs["ir0"][0])
+    np.testing.assert_allclose(runs["all"][2], runs["ir0"][2], rtol=0, atol=parity_tol("state"))
 
 
 @pytest.mark.parametrize("n_active", [1, 7, 20])
