@@ -12,6 +12,9 @@
 #include "lu_plan.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <list>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -321,6 +324,38 @@ LuPlan build_lu_plan(int n, const std::vector<int>& indptr, const std::vector<in
     slices(level, n_lev, fw_len, P.fw_rows, P.fw_levels);
     slices(blevel, n_blev, bw_len, P.bw_rows, P.bw_levels);
     return P;
+}
+
+std::shared_ptr<const LuPlan> build_lu_plan_cached(int n, const std::vector<int>& indptr,
+                                                   const std::vector<int>& indices,
+                                                   const std::vector<int>& order)
+{
+    static const bool on = [] {
+        const char* e = std::getenv("GPUSIM2GRID_OWN_LU_PLAN_CACHE");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return std::make_shared<const LuPlan>(build_lu_plan(n, indptr, indices, order));
+    struct Entry {
+        int n;
+        std::vector<int> indptr, indices, order;
+        std::shared_ptr<const LuPlan> plan;
+    };
+    static std::mutex mu;
+    static std::list<Entry> cache;   // most recent first
+    constexpr size_t kKeep = 4;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        for (auto it = cache.begin(); it != cache.end(); ++it)
+            if (it->n == n && it->indptr == indptr && it->indices == indices && it->order == order) {
+                cache.splice(cache.begin(), cache, it);
+                return cache.front().plan;
+            }
+    }
+    auto plan = std::make_shared<const LuPlan>(build_lu_plan(n, indptr, indices, order));
+    std::lock_guard<std::mutex> lock(mu);
+    cache.push_front(Entry{n, indptr, indices, order, plan});
+    if (cache.size() > kKeep) cache.pop_back();
+    return plan;
 }
 
 }  // namespace own_lu

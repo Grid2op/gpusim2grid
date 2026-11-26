@@ -706,7 +706,7 @@ private:
         user_perm_ = perm ? *perm : own_lu::amd_order(dim_J_, ip, ix);
         double eps = own_lu::default_pivot_eps();
         if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_EPS")) eps = std::atof(e);
-        own_.init(own_lu::build_lu_plan(dim_J_, ip, ix, user_perm_), ubatch_, cs_, eps);
+        own_.init(*own_lu::build_lu_plan_cached(dim_J_, ip, ix, user_perm_), ubatch_, cs_, eps);
     }
 
     template <class T>

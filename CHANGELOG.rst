@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``linear_solver='own_lu'``: the symbolic plan (and own_lu_top's trailing blocks) kept per Jacobian
+  pattern, process-wide: a new session on the same grid no longer rebuilds them (PtFige: ~20 ms per driver build).
 - [IMPROVED] With a droop HVDC line, only the J positions ``fill_J`` does not write are zeroed before it, no longer
   the whole batched J (PtFige N-1: ~2 ms per large round).
 - [IMPROVED] ``outer_loops_backend='device'``: no pinned host copy of the outer-loop gather, which only the host

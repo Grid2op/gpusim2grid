@@ -146,6 +146,16 @@ private:
     int fuse_nb_ = 0;  // fused solve runs up to this many active matrices (GPUSIM2GRID_TOP_LU_FUSE_NB; issue #44)
     void solve_core(const Top& t, cuda_real_type* xi);
 
+    // init() = init_symbolic() (a function of the plan, the parameters and the device alone: the
+    // schedules, the item lists, both trailing blocks) + alloc_batch() (the buffers sized by the
+    // batch). The symbolic part is kept per plan, process-wide, and copied into a new TopLu on the
+    // same plan instead of rebuilt (~10 ms of host work + ~100 uploads on PtFige, at every driver
+    // build): copy_symbolic_from copies every member init_symbolic sets, and nothing else.
+    void init_symbolic(const own_lu::LuPlan& plan, int max_top, int split_chain, int split_items);
+    void alloc_batch(int batch);
+    void copy_symbolic_from(const TopLu& o);
+    void set_smem_attributes() const;
+
     thrust::device_vector<cuda_real_type> d_v_, d_tol_, d_r_, d_d_;
     thrust::device_vector<int> d_clamped_;
 };

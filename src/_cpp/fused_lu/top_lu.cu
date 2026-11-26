@@ -16,6 +16,8 @@
 #include <string>
 #include <array>
 #include <utility>
+#include <list>
+#include <mutex>
 
 namespace top_lu {
 
@@ -708,18 +710,126 @@ inline void pdl_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t s
     OWN_LU_CHECK(cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...));
 }
 
+namespace {
+// The symbolic templates (TopLu::init): matched on the plan's content, the parameters, the
+// environment variables init_symbolic reads and the device. Never freed at exit (deliberately
+// leaked: their device memory would be freed after the CUDA context in a static destructor).
+struct TopTemplateKey {
+    int n = 0, nnz = 0, n_ent = 0, max_top = 0, split_chain = 0, split_items = 0, device = 0;
+    std::vector<int> order, rp, ci, a_ent;
+    std::string env;
+};
+std::string top_env_string()
+{
+    std::string s;
+    for (const char* v : {"GPUSIM2GRID_TOP_LU_M", "GPUSIM2GRID_TOP_LU_M_LARGE", "GPUSIM2GRID_TOP_LU_NB",
+                          "GPUSIM2GRID_TOP_LU_FUSE_NB"}) {
+        const char* e = std::getenv(v);
+        s += e ? e : "-";
+        s += '|';
+    }
+    return s;
+}
+}  // namespace
+
 void TopLu::init(const own_lu::LuPlan& plan, int batch, cudaStream_t stream, double eps, int max_top,
                  int split_chain, int split_items)
 {
-
-    using T = cuda_real_type;
     if (batch <= 0) throw std::invalid_argument("[top_lu::TopLu::init] batch must be > 0");
+    static const bool cache_on = [] {
+        const char* e = std::getenv("GPUSIM2GRID_OWN_LU_PLAN_CACHE");
+        return !(e && e[0] == '0');
+    }();
+    if (!cache_on) {
+        init_symbolic(plan, max_top, split_chain, split_items);
+    } else {
+        TopTemplateKey key;
+        key.n = plan.n; key.nnz = plan.nnz; key.n_ent = plan.n_ent;
+        key.max_top = max_top; key.split_chain = split_chain; key.split_items = split_items;
+        OWN_LU_CHECK(cudaGetDevice(&key.device));
+        key.env = top_env_string();
+        static std::mutex mu;
+        static std::list<std::pair<TopTemplateKey, TopLu*>> cache;   // most recent first
+        std::lock_guard<std::mutex> lock(mu);
+        auto match = [&](const TopTemplateKey& k) {   // the cheap fields first, the vectors only then
+            return k.n == key.n && k.nnz == key.nnz && k.n_ent == key.n_ent && k.max_top == key.max_top
+                && k.split_chain == key.split_chain && k.split_items == key.split_items && k.device == key.device
+                && k.env == key.env && k.order == plan.order && k.rp == plan.rp && k.ci == plan.ci
+                && k.a_ent == plan.a_ent;
+        };
+        auto it = cache.begin();
+        while (it != cache.end() && !match(it->first)) ++it;
+        if (it != cache.end()) {
+            cache.splice(cache.begin(), cache, it);
+            copy_symbolic_from(*cache.front().second);
+            set_smem_attributes();
+        } else {
+            init_symbolic(plan, max_top, split_chain, split_items);
+            key.order = plan.order; key.rp = plan.rp; key.ci = plan.ci; key.a_ent = plan.a_ent;
+            TopLu* t = new TopLu();
+            t->copy_symbolic_from(*this);
+            cache.emplace_front(std::move(key), t);
+            if (cache.size() > 4) { delete cache.back().second; cache.pop_back(); }
+        }
+    }
+    eps_ = eps;
+    stream_ = stream;
+    alloc_batch(batch);
+}
+
+void TopLu::copy_symbolic_from(const TopLu& o)
+{
+    n_ = o.n_; nnz_ = o.nnz_; n_ent_ = o.n_ent_;
+    split_chain_ = o.split_chain_; split_items_ = o.split_items_;
+    d_src_ = o.d_src_; d_ra_ptr_ = o.d_ra_ptr_; d_ra_p_ = o.d_ra_p_; d_ra_col_ = o.d_ra_col_;
+    d_a_ent_ = o.d_a_ent_; d_inv_ = o.d_inv_; d_rp_ = o.d_rp_; d_dp_ = o.d_dp_; d_ci_ = o.d_ci_;
+    d_tgt_ = o.d_tgt_; d_cptr_ = o.d_cptr_; d_dg_ = o.d_dg_; d_cl_ = o.d_cl_; d_cu_ = o.d_cu_;
+    f_all_ = o.f_all_; fw_all_ = o.fw_all_; bw_all_ = o.bw_all_;
+    for (int c = 0; c < 2; ++c) {
+        tops_[c] = o.tops_[c];
+        tops_[c].d_tm_.clear();   // batch-sized: alloc_batch
+    }
+    top_nb_ = o.top_nb_; fuse_nb_ = o.fuse_nb_;
+    cur_ = 0;
+    fact_gen_ = 0; solve_gen_ = -1;
+    interleaved_ok_ = false; out_pending_ = false;
+    last_b_ = nullptr; last_values_ = nullptr; last_x_ = nullptr;
+}
+
+void TopLu::set_smem_attributes() const
+{
+    using T = cuda_real_type;
+    const int sf = std::max(tops_[0].sf, tops_[1].sf), sw = std::max(tops_[0].sw, tops_[1].sw),
+              sb = std::max(tops_[0].sb, tops_[1].sb);
+    if (sf > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_factor<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sf));
+    if (sw > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_fwd<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sw));
+    if (sb > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_bwd<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sb));
+}
+
+void TopLu::alloc_batch(int batch)
+{
+    using T = cuda_real_type;
+    B_ = nb_ = batch;
+    d_v_.assign(static_cast<size_t>(n_ent_) * B_, T(0));
+    d_ai_.alloc(static_cast<size_t>(nnz_) * B_);  // written by the transpose before any read
+    for (Top& t : tops_) t.d_tm_.assign(static_cast<size_t>(std::max(t.n_top_, 1)) * B_, T(0));
+    d_bi_.alloc(static_cast<size_t>(n_) * B_);
+    d_ri_.alloc(static_cast<size_t>(n_) * B_);
+    d_amax_.assign(B_, 0ULL);
+    d_xi_.alloc(static_cast<size_t>(n_) * B_);
+    d_tol_.assign(B_, T(0));
+    d_clamped_.assign(B_, 0);
+    d_r_.clear();
+    d_d_.clear();
+    OWN_LU_CHECK(cudaDeviceSynchronize());
+}
+
+void TopLu::init_symbolic(const own_lu::LuPlan& plan, int max_top, int split_chain, int split_items)
+{
+    using T = cuda_real_type;
     n_ = plan.n;
     nnz_ = plan.nnz;
     n_ent_ = plan.n_ent;
-    B_ = nb_ = batch;
-    eps_ = eps;
-    stream_ = stream;
     split_chain_ = split_chain;
     split_items_ = split_items;
     const int n = n_;
@@ -1110,13 +1220,7 @@ void TopLu::init(const own_lu::LuPlan& plan, int batch, cudaStream_t stream, dou
     };
     build_top(tops_[0], max_top);
     build_top(tops_[1], max_top > 0 ? std::min(max_top, cap_large) : cap_large);
-    {
-        const int sf = std::max(tops_[0].sf, tops_[1].sf), sw = std::max(tops_[0].sw, tops_[1].sw),
-                  sb = std::max(tops_[0].sb, tops_[1].sb);
-        if (sf > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_factor<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sf));
-        if (sw > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_fwd<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sw));
-        if (sb > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_bwd<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sb));
-    }
+    set_smem_attributes();
     if (const char* e = std::getenv("GPUSIM2GRID_TOP_LU_STATS"); e != nullptr && *e && *e != '0') {
         auto dump = [](const char* what, const std::vector<Launch>& ls) {
             std::fprintf(stderr, "[top_lu] %s: %zu launches\n", what, ls.size());
@@ -1128,18 +1232,6 @@ void TopLu::init(const own_lu::LuPlan& plan, int batch, cudaStream_t stream, dou
         dump("forward outside T", tops_[0].fw_rest_.launches);
         dump("backward outside T", tops_[0].bw_rest_.launches);
     }
-    d_v_.assign(static_cast<size_t>(n_ent_) * B_, T(0));
-    d_ai_.alloc(static_cast<size_t>(nnz_) * B_);  // written by the transpose before any read
-    for (Top& t : tops_) t.d_tm_.assign(static_cast<size_t>(std::max(t.n_top_, 1)) * B_, T(0));
-    d_bi_.alloc(static_cast<size_t>(n_) * B_);
-    d_ri_.alloc(static_cast<size_t>(n_) * B_);
-    d_amax_.assign(B_, 0ULL);
-    d_xi_.alloc(static_cast<size_t>(n_) * B_);
-    d_tol_.assign(B_, T(0));
-    d_clamped_.assign(B_, 0);
-    d_r_.clear();
-    d_d_.clear();
-    OWN_LU_CHECK(cudaDeviceSynchronize());
 }
 
 int TopLu::launches_factor() const
