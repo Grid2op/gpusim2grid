@@ -134,3 +134,32 @@ at ~1.85x: about -16 ms per large round, ~-80 ms per run (estimate), the converg
 untouched and the outer loops on the device in FP64. To check: the number of refinement steps a float
 LU needs on PtFige's J (its clamped pivots at FP32's 1e-5 relative clamp), and whether Newton's
 iteration counts -- hence the outer loops' decisions -- stay those of the FP64 run.
+
+## 5. The split levels (done) and `top_factor` (parked)
+
+**Split levels, done** (`ac835e8`): `lu_left_split` / `lu_fwd_split` / `lu_bwd_split` declared a static
+`red[32][33]` (8.4 KB) whatever their number of warps K, which capped them at 10 blocks per SM (42%
+occupancy for K = 2, 83% for K = 4, Nsight Compute's shared-memory limiter); the array is now K x 33
+values of dynamic shared memory. Same sums in the same order. PtFige N-1: 0.357 -> 0.354 s, less than
+the ~5 ms expected: above ~75% of peak DRAM a higher occupancy buys little, and these kernels are
+latency-bound in the tail anyway.
+
+**`top_factor`, parked.** In the large rounds it factors the capped trailing block (`tops_[1]`, 104
+pivots): one block of 512 threads per matrix, 39.7 KB of dynamic shared memory, hence 2 blocks per SM
+(66% occupancy; a third does not fit in this GPU's ~100 KB per SM), 26% memory / 41% SM: limited by
+its two block barriers per pivot. 1.66 ms per large round, 0.3-1 ms per tail round. Tried:
+
+- **One barrier per pivot** (every thread clamps the pivot and takes its reciprocal itself, the
+  previous reciprocal kept in a register; the same bits): +7 ms per run. 512 FP64 divisions per pivot
+  cost more than the barrier on a card whose FP64 rate is 1/64 of FP32.
+- **A smaller capped block** (`GPUSIM2GRID_TOP_LU_M_LARGE`, PtFige N-1 session run, median of 5): 64 ->
+  0.356 s, 80 -> 0.355, 96 -> 0.355, 104 (the default) -> 0.354, 160 -> 0.367. What a smaller block saves
+  in shared memory / barriers, the pivots it hands back to the per-level launches cost again: the
+  default stays.
+
+What would be left is a different kernel, e.g. one warp per matrix (`__syncwarp` instead of block
+barriers, several matrices per block, the trailing block's pattern sized to fit), or a pivot sequence
+avoiding the barrier without a per-thread FP64 division (warp 0 computes the reciprocal and the other
+warps wait on a flag rather than a full barrier). Estimate: ~0.5-1 ms per large round plus a little in
+the tail, i.e. -3 to -6 ms per run (~1-2%): not worth a day before the larger levers of sections 1, 2
+and 4 (shared Ybus, J in the LU's layout, mixed precision).
