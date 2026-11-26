@@ -64,3 +64,73 @@ overrides, the outer-loop pins and holds, `zero_J_positions_kernel`, the clamp's
 slot-major refinement residual, the adjoint (J -> J^T gather, `_solve_JT_rebuilt`), the J dumps and
 `j_values_dlpack`. A stride pair (row stride, slot stride) passed to every one of them would keep
 both layouts available (cuDSS needs slot-major).
+
+## 3. Memory- or compute-bound: Nsight Compute on one large round
+
+`sudo ncu` (hardware counters are admin-only on pf9sodsia004, `RmProfilingAdminOnly: 1`; root needs no
+driver change), GPU 0 only, clocks untouched, one complete large round of the setting above (652
+kernels, 4096 slots; FP64, own_lu_top, device outer loops), sections SpeedOfLight,
+ComputeWorkloadAnalysis, MemoryWorkloadAnalysis, Occupancy. ms under ncu (61.8 ms for the round, 55
+under nsys); % of peak, time-weighted over the kernel's launches in the round.
+
+**Memory-bound, ~66% of the round** (DRAM 72-94% of peak: at the roofline, only fewer bytes help):
+
+| kernel | ms | DRAM % | SM % | FP64 pipe % |
+|---|---|---|---|---|
+| `lu_left_u` (factorization, U step) | 6.65 | 89 | 19 | 19 |
+| `lu_bwd` (backward solve, 148 levels) | 5.44 | 83 | 31 | 34 |
+| `lu_left_l` (factorization, L step) | 5.34 | 84 | 57 | 59 |
+| `lu_tr_in_vals` (J -> interleaved) | 4.49 | 89 | 11 | 11 |
+| `lu_left_split` | 3.78 | 76 | 28 | 31 |
+| `lu_fwd_split` (occupancy 47%) | 3.35 | 75 | 11 | 12 |
+| `lu_fwd` | 3.24 | 91 | 12 | 12 |
+| `lu_residual_i` (refinement residual) | 3.14 | 93 | 15 | 15 |
+| b / x transposes, `top_outside`, `top_fo`, gathers, `update_Vm`, `lu_bwd_split` (occupancy 33%) | ~6 | 72-94 | low | low |
+
+**FP64-compute-bound, ~22%** (FP64 pipe 63-85%; FP64 is 1/64 of the FP32 rate on this card):
+
+| kernel | ms | DRAM % | FP64 pipe % |
+|---|---|---|---|
+| `spmv_fill_F_kernel` (3 passes) | 7.29 | 69 | 80 |
+| `fill_J_kernel` (DRAM-saturated too) | 4.07 | 88 | 75 |
+| `update_Va_kernel` | 1.16 | 60 | 85 |
+| `compute_residuals_kernel` | 1.10 | 69 | 83 |
+| `reduce_step_norms`, `oc_unrealistic`, `vc_hold_rows` | ~0.7 | 43-79 | 63-85 |
+
+**Latency-bound, ~6%** (memory and SM both low, low occupancy): the device outer model (`on_solved`
+1.55 ms at 4-14%, `share_lost` 0.57, `materialize`, `mask_rows`) and `top_fwd`: serial per-row work and
+barriers. **Mixed, ~5%**: `top_factor` (1.66 ms, 26% memory / 41% SM: one block per matrix, a barrier
+per pivot), `top_bwd`, `template_rows`.
+
+Cross-check: the same kernels timed by nsys in an FP32 build (same launch configurations, batch 4096)
+against the FP64 profile: 1.8-2.0x on the memory-bound ones (the int index arrays do not shrink),
+2.2-2.8x on the FP64-bound ones (`spmv_fill_F` 2.77x, `update_Va` 2.6x, `fill_J` 1.96x), 1.4-1.7x on the
+latency / occupancy-bound split levels and reductions.
+
+## 4. What a lower precision would buy
+
+**Full FP32 build** (estimate from section 3): a large round ~55 -> ~30 ms; the run 0.357 -> ~0.22 s
+(4 large rounds 237 -> ~130 ms, the two medium ones ~58 -> ~35, the tail ~35 -> ~30, host + construction
++ device outer model ~27 unchanged). Two conditions, neither holding today:
+
+- FP32 does not converge at the loose tolerance (1e-4 pu) on PtFige: every row ran its 30 Newton
+  iterations, 0 converged (the bus currents are sums of Ybus terms up to ~1e3-1e5 pu that cancel;
+  float leaves ~1e-4-1e-3 pu). `--tight` (1e-10 pu) is out of reach anyway.
+- `outer_loops_backend='device'` is refused in an FP32 build (`_outer_loops.py`): the device model is
+  written in double and works in the driver's `real_t` buffers in place (`device_model_f64`). Not a
+  numerical necessity -- the host model already decides on FP32 states, widened to double -- but the
+  port is needed (double inside with float <-> double at the boundary, keeping lockstep with the host
+  model; or the model itself in `real_t`, lockstep then lost near thresholds). With the host backend
+  (~+0.3 s on PtFige) the gain is gone.
+
+Measuring it also needed a shim: the facades default to `precision="fp64"`, which an FP32 extension
+refuses, and `bench_n1.sh` passes none.
+
+**Mixed precision, the realistic one:** V, F, the convergence test and the refinement residual stay in
+FP64, only the LU (factorization, triangular solves, the J / b / x transposes) in FP32. Newton takes an
+inexact step anyway, and `ir_n_steps=1` -- already what the bench runs -- is exactly the refinement of a
+float LU against a double residual. The LU's memory-bound kernels are ~35 ms of a large round (nsys)
+at ~1.85x: about -16 ms per large round, ~-80 ms per run (estimate), the convergence criterion
+untouched and the outer loops on the device in FP64. To check: the number of refinement steps a float
+LU needs on PtFige's J (its clamped pivots at FP32's 1e-5 relative clamp), and whether Newton's
+iteration counts -- hence the outer loops' decisions -- stay those of the FP64 run.
