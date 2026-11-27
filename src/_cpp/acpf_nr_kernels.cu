@@ -806,7 +806,30 @@ __global__ void apply_step_scale_kernel(
 // V bit-identical (masked buses, identity rows).
 // =============================================================================
 namespace {
-__device__ __forceinline__ void v_sincos(double x, double* s, double* c) { sincos(x, s, c); }
+// |x| <= 0.25 rad -- a Newton angle step, nearly always -- by the Taylor series to x^11 / x^12 (truncation
+// ~1e-17 relative, below half an ulp; Horner with FMAs, ~13 FP64 operations against ~35 for the library's
+// argument reduction and polynomials); larger steps by sincos. Both ~1 ulp: V to rounding.
+__device__ __forceinline__ void v_sincos(double x, double* s, double* c)
+{
+    if (fabs(x) <= 0.25) {
+        const double x2 = x * x;
+        double ps = -1.0 / 39916800.0;           // -1/11!
+        ps = fma(ps, x2, 1.0 / 362880.0);         //  1/9!
+        ps = fma(ps, x2, -1.0 / 5040.0);          // -1/7!
+        ps = fma(ps, x2, 1.0 / 120.0);            //  1/5!
+        ps = fma(ps, x2, -1.0 / 6.0);             // -1/3!
+        *s = fma(ps * x2, x, x);
+        double pc = 1.0 / 479001600.0;            //  1/12!
+        pc = fma(pc, x2, -1.0 / 3628800.0);       // -1/10!
+        pc = fma(pc, x2, 1.0 / 40320.0);          //  1/8!
+        pc = fma(pc, x2, -1.0 / 720.0);           // -1/6!
+        pc = fma(pc, x2, 1.0 / 24.0);             //  1/4!
+        pc = fma(pc, x2, -0.5);                   // -1/2!
+        *c = fma(pc, x2, 1.0);
+        return;
+    }
+    sincos(x, s, c);
+}
 __device__ __forceinline__ void v_sincos(float x, float* s, float* c)    { sincosf(x, s, c); }
 __device__ __forceinline__ double v_rsqrt(double x) { return rsqrt(x); }
 __device__ __forceinline__ float  v_rsqrt(float x)  { return rsqrtf(x); }
