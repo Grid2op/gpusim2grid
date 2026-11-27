@@ -231,10 +231,15 @@ per-row outer / Newton iterations identical; V within the 1.2e-12 run-to-run spr
 - **`distribute()` in the device outer model** (instrumented with clock64): 120 slack units on
   PtFige, but 250-330 us per call in one thread -- one FP64 division per unit per clamping round on
   a 1/64-rate FP64 card -- and it is on the critical path of most rounds (the slowest row's
-  `on_solved`: 470-750 us; without a distribute, 130-180 us). `__restrict__` (overlapping the
-  units' loads): -5 to -10% of it only. Spreading the units over the block (sums kept sequential
-  by thread 0 from shared memory, for the lockstep with the host model) would need a pause / resume
-  of `drive()` around `check_ds` like the ReactiveLimits one: estimated -3 to -4 ms per run.
+  `on_solved`: 470-750 us; without a distribute, 130-180 us). Neither memory latency nor the
+  divisions explain it: `__restrict__` (overlapping the units' loads) gave -5 to -10%, computing 8
+  units' candidates before their clamps (overlapping the divisions, the same bits) nothing at all.
+  What is left is the number of clamping rounds (up to units + 1), each walking all 120 units
+  however few remain active: iterating a compacted list of the active units (kept in index order,
+  the same sums) is the next thing to try, with the clock64 instrumentation to count the rounds.
+  Spreading the units over the block (sums kept sequential by thread 0 from shared memory, for the
+  lockstep with the host model) would need a pause / resume of `drive()` around `check_ds` like the
+  ReactiveLimits one. Either: at most -3 to -4 ms per run.
 - **The small FP64-bound kernels** (`update_Va` / `update_Vm`: one FP64 sincos / rsqrt per bus
   already; `compute_residuals`: an integer max|F| would be bit-exact but it is near its bandwidth
   floor, ~-1 ms per run).
