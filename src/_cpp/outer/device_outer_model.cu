@@ -2900,9 +2900,13 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
     }
     if (pos_ds < 0) return;
     const unsigned char* present = SLOT(ds_present, d.n_units);
+    // counted 32 units at a time by a ballot, every lane the same total (__reduce_add_sync needs sm_80, and
+    // the build targets sm_75)
     int n_present = 0;
-    for (int k = lane; k < d.n_units; k += 32) n_present += present[k] ? 1 : 0;
-    n_present = __reduce_add_sync(0xffffffffu, n_present);
+    for (int k0 = 0; k0 < d.n_units; k0 += 32) {
+        const int k = k0 + lane;
+        n_present += __popc(__ballot_sync(0xffffffffu, k < d.n_units && present[k]));
+    }
     if (n_present == 0 || !(fabs(counted) > d.ds_eps_mw)) return;
     if (lane == 0) {   // DistributedSlack's share and its bookkeeping: sequential
     bool all_sat;
