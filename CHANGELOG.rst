@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] Batch power flows: the fused SpMV + mismatch kernel takes its buses sorted by Ybus row length
+  with a per-slot Ybus too (contingency analysis, scenario sweep); same results. PtFige N-1: 0.308 -> 0.303 s.
 - [IMPROVED] ``linear_solver='own_lu'``: ``ir_n_steps`` refines only the matrices whose factorization clamped a
   pivot, nothing when none did (``GPUSIM2GRID_OWN_LU_IR=all``: every one). PtFige N-1: 0.354 -> 0.308 s.
 - [IMPROVED] ``linear_solver='own_lu'``: the split levels' reduction sized by their warps, no longer a fixed

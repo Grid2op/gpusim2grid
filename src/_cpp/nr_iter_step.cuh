@@ -284,7 +284,8 @@ struct NrIterBuffers {
     const int*             d_p_row_of_bus = nullptr;
     const int*             d_q_row_of_bus = nullptr;
     // Buses by Ybus row length (AcPfNrState::d_bus_order), the thread order of
-    // spmv_fill_F_kernel; nullptr: natural order. Set with ybus_shared only.
+    // spmv_fill_F_kernel; nullptr: natural order. Set by the batch driver whenever
+    // the fused kernel runs (the per-slot Ybus too: each bus's sum is unchanged).
     const int*             d_bus_order    = nullptr;
 
     // Every slot holds the same Ybus (an injection sweep without outer-loop
