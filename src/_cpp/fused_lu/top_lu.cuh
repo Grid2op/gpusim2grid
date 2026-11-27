@@ -29,6 +29,7 @@
 #ifndef GPUSIM2GRID_FUSED_LU_TOP_LU_CUH
 #define GPUSIM2GRID_FUSED_LU_TOP_LU_CUH
 
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -40,6 +41,20 @@
 #include "../own_lu/batched_lu.cuh"   // own_lu_refine_all
 
 namespace top_lu {
+
+// A symbolic (read-only once built) device array whose copies share the storage: TopLu::copy_symbolic_from
+// hands a new TopLu the template's arrays without copying device memory (~3 ms of device-to-device copies
+// per driver build on PtFige). assign() builds new storage, as thrust's does; data() feeds raw().
+template <class T>
+struct SharedDev {
+    std::shared_ptr<thrust::device_vector<T>> p = std::make_shared<thrust::device_vector<T>>();
+    template <class It>
+    void assign(It b, It e) { p = std::make_shared<thrust::device_vector<T>>(b, e); }
+    void assign(size_t n, const T& v) { p = std::make_shared<thrust::device_vector<T>>(n, v); }
+    auto data() const { return p->data(); }
+    size_t size() const { return p->size(); }
+    bool empty() const { return p->empty(); }
+};
 
 class TopLu {
 public:
@@ -72,7 +87,7 @@ private:
     struct Sched {  // a triangular solve's level launches, narrow runs fused
         std::vector<Launch> launches;
         std::vector<SolveStep> steps;
-        thrust::device_vector<int> d_rows, d_run;
+        SharedDev<int> d_rows, d_run;
     };
     void run_solve(const Sched& s, bool forward, cuda_real_type* xi, const int* mask);
     // solve() on the matrices `mask` selects (clamp counts > 0; nullptr: all): refine()'s, as own_lu's
@@ -107,7 +122,7 @@ private:
     };
     RawBuf d_ai_, d_bi_, d_ri_, d_xi_;
     thrust::device_vector<unsigned long long> d_amax_;
-    thrust::device_vector<int> d_src_, d_ra_ptr_, d_ra_p_, d_ra_col_;
+    SharedDev<int> d_src_, d_ra_ptr_, d_ra_p_, d_ra_col_;
     long long fact_gen_ = 0, solve_gen_ = -1;
     bool interleaved_ok_ = false, out_pending_ = false;
     const cuda_real_type *last_b_ = nullptr, *last_values_ = nullptr;
@@ -115,8 +130,8 @@ private:
     cudaStream_t stream_ = nullptr;
     int split_chain_ = 16, split_items_ = 256;
 
-    thrust::device_vector<int> d_a_ent_, d_inv_, d_rp_, d_dp_, d_ci_;
-    thrust::device_vector<int> d_tgt_, d_cptr_, d_dg_, d_cl_, d_cu_;
+    SharedDev<int> d_a_ent_, d_inv_, d_rp_, d_dp_, d_ci_;
+    SharedDev<int> d_tgt_, d_cptr_, d_dg_, d_cl_, d_cu_;
     std::vector<Launch> f_all_;  // every factor step
     Sched fw_all_, bw_all_;
 
@@ -129,22 +144,22 @@ private:
         int m_ = 0, l0_ = 0, sf = 0, sw = 0, sb = 0;
         std::vector<Launch> f_bottom_;  // the factor steps below l0_
         Sched fw_rest_, bw_rest_;       // the rows outside T
-        thrust::device_vector<int> d_t_rows_;                                 // T, ascending (plan numbering)
-        thrust::device_vector<int> d_oa_tgt_, d_oa_src_, d_oa_cptr_, d_oa_cl_, d_oa_cu_;  // T x T items, outside part
+        SharedDev<int> d_t_rows_;                                 // T, ascending (plan numbering)
+        SharedDev<int> d_oa_tgt_, d_oa_src_, d_oa_cptr_, d_oa_cl_, d_oa_cu_;  // T x T items, outside part
         int n_oa_ = 0;
-        thrust::device_vector<int> d_top_ent_;                                // T x T pattern entries (q order)
-        thrust::device_vector<int> d_lslot_, d_uslot_, d_pp_ptr_, d_pslot_;   // the sparse T factorization's slots
+        SharedDev<int> d_top_ent_;                                // T x T pattern entries (q order)
+        SharedDev<int> d_lslot_, d_uslot_, d_pp_ptr_, d_pslot_;   // the sparse T factorization's slots
         int n_top_ = 0;
-        thrust::device_vector<int> d_rk_ptr_, d_rk_;          // per local pivot k: local rows i > k of L(:, k)
-        thrust::device_vector<int> d_fo_ptr_, d_fo_ent_, d_fo_col_;  // per local row: its L entries outside T
-        thrust::device_vector<int> d_fl_ent_;
-        thrust::device_vector<int> d_bu_ptr_, d_bu_row_, d_bu_ent_;  // per local column k: rows i < k of U(:, k)
-        thrust::device_vector<int> d_dg_ent_;
+        SharedDev<int> d_rk_ptr_, d_rk_;          // per local pivot k: local rows i > k of L(:, k)
+        SharedDev<int> d_fo_ptr_, d_fo_ent_, d_fo_col_;  // per local row: its L entries outside T
+        SharedDev<int> d_fl_ent_;
+        SharedDev<int> d_bu_ptr_, d_bu_row_, d_bu_ent_;  // per local column k: rows i < k of U(:, k)
+        SharedDev<int> d_dg_ent_;
         int n_fl_ = 0, n_bu_ = 0;
         // T x T matrix-major (tm[b * n_top + q]): written by top_outside, factored in place by top_factor, read by
         // the T solves (contiguous per matrix; the interleaved v strides by the batch)
         thrust::device_vector<cuda_real_type> d_tm_;
-        thrust::device_vector<int> d_fl_q_, d_bu_q_, d_dg_q_;
+        SharedDev<int> d_fl_q_, d_bu_q_, d_dg_q_;
     };
     Top tops_[2];
     int cur_ = 0, top_nb_ = 768;
@@ -161,7 +176,8 @@ private:
     void copy_symbolic_from(const TopLu& o);
     void set_smem_attributes() const;
 
-    thrust::device_vector<cuda_real_type> d_v_, d_tol_, d_r_, d_d_;
+    RawBuf d_v_;   // the factors: every entry written by the factorization before it is read
+    thrust::device_vector<cuda_real_type> d_tol_, d_r_, d_d_;
     thrust::device_vector<int> d_clamped_;
 };
 

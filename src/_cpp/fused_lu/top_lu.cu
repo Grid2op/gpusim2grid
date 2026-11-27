@@ -832,7 +832,9 @@ void TopLu::alloc_batch(int batch)
 {
     using T = cuda_real_type;
     B_ = nb_ = batch;
-    d_v_.assign(static_cast<size_t>(n_ent_) * B_, T(0));
+    // no zeroing: every factor entry is written by the factorization before anything reads it (a fill
+    // entry's sum starts from 0 in the kernels, LU_START): 4.6 GB of memset per driver build on PtFige
+    d_v_.alloc(static_cast<size_t>(n_ent_) * B_);
     d_ai_.alloc(static_cast<size_t>(nnz_) * B_);  // written by the transpose before any read
     for (Top& t : tops_) t.d_tm_.assign(static_cast<size_t>(std::max(t.n_top_, 1)) * B_, T(0));
     d_bi_.alloc(static_cast<size_t>(n_) * B_);
@@ -857,7 +859,7 @@ void TopLu::init_symbolic(const own_lu::LuPlan& plan, int max_top, int split_cha
     const int n = n_;
     const std::vector<int>&rp = plan.rp, &dp = plan.dp, &ci = plan.ci;
 
-    auto up = [](thrust::device_vector<int>& d, const std::vector<int>& h) {
+    auto up = [](SharedDev<int>& d, const std::vector<int>& h) {
         if (h.empty()) d.assign(1, 0);
         else d.assign(h.begin(), h.end());
     };
