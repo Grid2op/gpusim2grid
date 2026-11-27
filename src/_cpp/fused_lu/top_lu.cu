@@ -953,9 +953,11 @@ void TopLu::init_symbolic(const own_lu::LuPlan& plan, int max_top, int split_cha
         make_sched(bw_all_, rows, sl);
     }
     // the factorization's items with explicit sources: the plan's (target entry, its A position or -1 for a
-    // fill entry: start 0), then, at the end of the U step of its row's level, a copy item for every U entry of A
-    // without one (no contribution: own_lu leaves the transposed A value there; the factors start from the
-    // interleaved copy of A here, so the entry must be written)
+    // fill entry: start 0), then, at the end of the U step of its row's level, an item for every U entry
+    // without one: a copy of its A value (no contribution: own_lu leaves the transposed A value there; the
+    // factors start from the interleaved copy of A here, so the entry must be written), or a 0 for an entry
+    // of the symmetrized pattern with neither an A value nor a contribution -- the backward solve reads it,
+    // and the factors are not zero-filled (PtFige's J has one such entry)
     std::vector<int> erow(n_ent_);
     for (int i = 0; i < n; ++i)
         for (int e = rp[i]; e < rp[i + 1]; ++e) erow[e] = i;
@@ -977,14 +979,14 @@ void TopLu::init_symbolic(const own_lu::LuPlan& plan, int max_top, int split_cha
         std::vector<int> ex_ptr(H + 1, 0), ex;  // per level, the U entries of A without an item (rows ascending)
         for (int r = 0; r < n; ++r)
             for (int e = dp[r] + 1; e < rp[r + 1]; ++e)
-                if (!has_item[e] && a_of[e] >= 0) ++ex_ptr[level[r] + 1];
+                if (!has_item[e]) ++ex_ptr[level[r] + 1];
         for (int L = 0; L < H; ++L) ex_ptr[L + 1] += ex_ptr[L];
         ex.resize(ex_ptr[H]);
         {
             std::vector<int> fill(ex_ptr.begin(), ex_ptr.end() - 1);
             for (int r = 0; r < n; ++r)
                 for (int e = dp[r] + 1; e < rp[r + 1]; ++e)
-                    if (!has_item[e] && a_of[e] >= 0) ex[fill[level[r]]++] = e;
+                    if (!has_item[e]) ex[fill[level[r]]++] = e;
         }
         for (const auto& st : plan.factor_steps) {
             Step ns{static_cast<int>(it_tgt.size()), 0, st.max_chain, st.is_u};

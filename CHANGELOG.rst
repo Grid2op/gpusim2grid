@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [FIXED] Prototype own_lu_top: a factor entry with neither a value in J nor a contribution was never written,
+  and read by the backward solve from factors that are not zero-filled.
 - [IMPROVED] ``outer_loops_backend='device'``: DistributedSlack's distribute() run by the slot's whole block (the
   ``redistribute_slack`` share by the row's warp), the ordered sums on one thread (bit-identical). PtFige N-1: 0.294 -> 0.293 s.
 - [IMPROVED] Batch Newton: the residual norm and the step limiter's max|dx| taken on the integer pipe (bit

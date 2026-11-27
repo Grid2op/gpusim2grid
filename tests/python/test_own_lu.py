@@ -172,6 +172,38 @@ def test_refinement_only_where_a_pivot_was_clamped(case118, monkeypatch, top, sc
     np.testing.assert_allclose(runs["all"][2], runs["ir0"][2], rtol=0, atol=parity_tol("state"))
 
 
+def test_top_lu_writes_the_entries_without_a_value_or_a_contribution(monkeypatch, residual_atol):
+    """An entry of the symmetrized factor pattern may have neither a value in A nor a contribution
+    (U(0, 1) of a block [[a, 0], [b, c]]): no elimination step computes it, the backward solve reads
+    it, and own_lu_top does not zero-fill its factors. It gets an explicit zero item. Shown on a
+    block-diagonal matrix of 200 such blocks, GPUSIM2GRID_TOP_LU_M=1 leaving every pivot to the level
+    kernels (a trailing block needs two pivots), after a factorization of the same size whose U(0, 1)
+    are not zero: the factors' buffer of the second solver is the first one's, freed (a stale 1 there
+    gave x_0 = b_0 - x_1: a relative residual of 1)."""
+    monkeypatch.setenv("GPUSIM2GRID_OWN_LU_TOP", "1")
+    monkeypatch.setenv("GPUSIM2GRID_TOP_LU_M", "1")
+    nblk = 200
+    n = 2 * nblk
+
+    def blocks(a01):   # CSR of nblk blocks [[2, a01], [1, 3]] (a01 = None: the entry absent)
+        indptr, indices, data = [0], [], []
+        for k in range(nblk):
+            indices += [2 * k] + ([2 * k + 1] if a01 is not None else [])
+            data += [2.] + ([a01] if a01 is not None else [])
+            indptr.append(len(indices))
+            indices += [2 * k, 2 * k + 1]
+            data += [1., 3.]
+            indptr.append(len(indices))
+        return n, indptr, indices, data
+
+    kw = dict(n_refactorize=1, reordering_alg=_cpp.ReorderingAlg.NoReordering, linear_solver=_cpp.LinearSolver.OwnLu)
+    full = _cpp.benchmark_cudss_batch_raw(*blocks(1.), 64, **kw)
+    assert full.n_nonfinite_slots == 0 and full.max_rel_residual < residual_atol
+    lower = _cpp.benchmark_cudss_batch_raw(*blocks(None), 64, **kw)
+    assert lower.n_nonfinite_slots == 0
+    assert lower.max_rel_residual < residual_atol, lower.max_rel_residual
+
+
 @pytest.mark.parametrize("n_active", [1, 7, 20])
 def test_raw_active_prefix_leaves_the_other_matrices_alone(case118, residual_atol, n_active):
     """BatchedLu's active prefix (what the continuous tail runs on): the first
