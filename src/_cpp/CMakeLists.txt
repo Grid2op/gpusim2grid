@@ -73,6 +73,11 @@ add_library(
     own_lu/batched_lu.cu
     ${_gpusim2grid_ls2g_sources})
 add_library(gpusim2grid::core ALIAS gpusim2grid_core)
+# prototype (untracked fused_lu/): own_lu with a dense trailing block, picked by GPUSIM2GRID_OWN_LU_TOP=1
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/fused_lu/top_lu.cu)
+    target_sources(gpusim2grid_core PRIVATE fused_lu/top_lu.cu)
+    target_compile_definitions(gpusim2grid_core PUBLIC GPUSIM2GRID_HAVE_TOP_LU)  # PUBLIC: CudssBatchSolver's layout depends on it
+endif()
 # The device outer-loop model follows the host one sum for sum: no FMA contraction, so that a
 # decision on a threshold goes the same way on both (docs/outer_loops_on_device.md, §4.6).
 # Both sides: GCC contracts C++ by default (-ffp-contract=fast) as soon as the ISA has FMA,

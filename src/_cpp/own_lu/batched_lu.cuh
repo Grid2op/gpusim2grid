@@ -42,6 +42,9 @@
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 
+#include <cstdlib>
+#include <string>
+
 #include "../dtypes.hpp"
 #include "lu_plan.hpp"
 
@@ -53,6 +56,16 @@ namespace own_lu {
 constexpr double default_pivot_eps()
 {
     return sizeof(cuda_real_type) == 4 ? 1e-5 : 1e-12;
+}
+
+// What refine() refines: by default only the matrices whose last factorization clamped a pivot -- the
+// others' factors are those of their own matrix, a refinement step changes their solution by rounding
+// only, and it cost a second triangular solve of every matrix (PtFige N-1: 53 ms of 0.354 s for 17
+// clamped pivots in ~21 000 factorizations). GPUSIM2GRID_OWN_LU_IR=all: every matrix, as before.
+inline bool own_lu_refine_all()
+{
+    const char* e = std::getenv("GPUSIM2GRID_OWN_LU_IR");
+    return e != nullptr && std::string(e) == "all";
 }
 
 class BatchedLu {
@@ -68,9 +81,11 @@ public:
     void factorize(const cuda_real_type* values);
     // b, x: [B × n] slot-major. x may alias b (but then b is gone: no refine()).
     void solve(const cuda_real_type* b, cuda_real_type* x);
-    // x += LU^-1 (b - A x), `steps` times; A = values on (indptr, indices),
-    // device CSR of the plan's pattern. Needs b intact: x must not alias b
-    // (std::invalid_argument when steps > 0).
+    // x += LU^-1 (b - A x), `steps` times, for the matrices whose factorization
+    // clamped a pivot (own_lu_refine_all(): every matrix); the others' x is left
+    // as solve() gave it. A = values on (indptr, indices), device CSR of the
+    // plan's pattern. Needs b intact: x must not alias b (std::invalid_argument
+    // when steps > 0).
     void refine(const cuda_real_type* values, const int* indptr, const int* indices,
                 const cuda_real_type* b, cuda_real_type* x, int steps);
 
@@ -100,6 +115,9 @@ public:
     bool initialized() const { return B_ > 0; }
 
 private:
+    // solve() on the matrices `mask` selects (clamp counts > 0; nullptr: all)
+    void solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask);
+    bool refine_all_ = false;
     struct Launch { int offset, count, k; bool is_u; };
     // a triangular solve's steps: one launch, or a run of consecutive narrow levels (each fitting one
     // pass of a 32-warp block: count * k <= 32) in one fused kernel, levels [first, last) of the run

@@ -44,11 +44,17 @@ constexpr int kThreads = 256;
 #define LU_TARGET(raw) ((raw) < 0 ? ~(raw) : (raw))
 #define LU_START(raw, v, t, B, b) ((raw) < 0 ? T(0) : (v)[(size_t)(t) * (B) + (b)])
 
+// Refinement on the matrices whose factorization clamped a pivot only (refine(); GPUSIM2GRID_OWN_LU_IR=all:
+// every matrix): the solve kernels take the per-matrix clamp counts as a mask and leave a matrix with none
+// alone (nullptr: every matrix, the plain solve). `b` is always < nb where it is read.
+#define LU_MASKED(b) (mask != nullptr && mask[b] <= 0)
+
 template <class T>
 __device__ __forceinline__ T clamp_pivot(T s, T e, int* clamped, int b)
 {
     if (fabs(s) < e) {
         atomicAdd(clamped + b, 1);
+        atomicAdd(clamped - 1, 1);   // the batch's total (d_clamped_[0])
         return s < T(0) ? -e : e;
     }
     return s;
@@ -89,9 +95,10 @@ __global__ void lu_left_l(const int* __restrict__ tgt, const int* __restrict__ c
 template <class T>
 __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
-                       const int B, const int nb, const T* __restrict__ v, T* __restrict__ x)
+                       const int B, const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
 {
     LU_ITEM_AND_MATRIX
+    if (LU_MASKED(b)) return;
     const int i = rows[it];
     T s = x[(size_t)i * B + b];
     for (int e = rp[i]; e < dp[i]; ++e) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
@@ -101,9 +108,10 @@ __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
 template <class T>
 __global__ void lu_bwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
-                       const int B, const int nb, const T* __restrict__ v, T* __restrict__ x)
+                       const int B, const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
 {
     LU_ITEM_AND_MATRIX
+    if (LU_MASKED(b)) return;
     const int i = rows[it];
     T s = x[(size_t)i * B + b];
     for (int e = dp[i] + 1; e < rp[i + 1]; ++e) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
@@ -166,12 +174,20 @@ __global__ void lu_scaled_tol(const T* __restrict__ values, const int nnz, const
 // Split variants for the narrow levels near the root: block = 32 consecutive
 // matrices (lane) x K warps, one item per blockIdx.x; warp w sums the
 // contributions w, w + K, ...; partial sums added in warp order (deterministic).
+// red holds the K warps' partial sums only: dynamic shared memory of lu_split_smem<T>(K) bytes. A static
+// [32][33] array (8.4 KB whatever K) capped these kernels at 10 blocks per SM, i.e. 42% occupancy with
+// K = 2 (Nsight Compute, PtFige N-1 at batch 4096: the split levels at 72-76% of peak DRAM vs ~88% for
+// the unsplit ones).
 #define LU_SPLIT_THREAD                                         \
     const int lane = threadIdx.x & 31, part = threadIdx.x >> 5; \
     const int K = blockDim.x >> 5;                              \
     const int it = blockIdx.x;                                  \
     const int b = blockIdx.y * 32 + lane;   /* b < nb: active */ \
-    __shared__ T red[32][33];
+    extern __shared__ __align__(16) unsigned char lu_split_sm[]; \
+    T (*red)[33] = reinterpret_cast<T (*)[33]>(lu_split_sm);
+
+template <class T>
+constexpr size_t lu_split_smem(int k) { return static_cast<size_t>(k) * 33 * sizeof(T); }
 
 template <class T>
 __device__ __forceinline__ T lu_split_sum(T acc, const int lane, const int part, const int K, T (*red)[33])
@@ -210,31 +226,31 @@ __global__ void lu_left_split(const int* __restrict__ tgt, const int* __restrict
 template <class T>
 __global__ void lu_fwd_split(const int* __restrict__ rows, const int* __restrict__ rp,
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
-                             const int nb, const T* __restrict__ v, T* __restrict__ x)
+                             const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
 {
     LU_SPLIT_THREAD
     const int i = rows[it];
     T acc = T(0);
-    if (b < nb)
+    if (b < nb && !LU_MASKED(b))
         for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
-    if (part != 0 || b >= nb) return;
+    if (part != 0 || b >= nb || LU_MASKED(b)) return;
     x[(size_t)i * B + b] -= sum;
 }
 
 template <class T>
 __global__ void lu_bwd_split(const int* __restrict__ rows, const int* __restrict__ rp,
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
-                             const int nb, const T* __restrict__ v, T* __restrict__ x)
+                             const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
 {
     LU_SPLIT_THREAD
     const int i = rows[it];
     T acc = T(0);
-    if (b < nb)
+    if (b < nb && !LU_MASKED(b))
         for (int e = dp[i] + 1 + part; e < rp[i + 1]; e += K)
             acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
-    if (part != 0 || b >= nb) return;
+    if (part != 0 || b >= nb || LU_MASKED(b)) return;
     x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[(size_t)dp[i] * B + b];
 }
 
@@ -248,7 +264,7 @@ template <class T, bool kForward>
 __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restrict__ rows, const int* __restrict__ run, const int first,
                              const int last, const int n_lv, const int* __restrict__ rp, const int* __restrict__ dp,
                              const int* __restrict__ ci, const int B, const int nb, const T* __restrict__ v,
-                             T* __restrict__ x)
+                             T* __restrict__ x, const int* __restrict__ mask)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int b = blockIdx.x * 32 + lane;
@@ -256,7 +272,7 @@ __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restric
     for (int l = first; l < last; ++l) {
         const int offset = run[l], count = run[n_lv + l], K = run[2 * n_lv + l];
         const int item = warp / K, part = warp - item * K;
-        const bool active = item < count && b < nb;
+        const bool active = item < count && b < nb && !LU_MASKED(b);
         const int i = item < count ? rows[offset + item] : 0;
         if (K == 1) {
             if (active) {
@@ -296,11 +312,12 @@ __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restric
 template <class T>
 __global__ void lu_residual(const T* __restrict__ values, const int* __restrict__ indptr,
                             const int* __restrict__ indices, const int n, const int nnz, const int B,
-                            const T* __restrict__ rhs, const T* __restrict__ x, T* __restrict__ r)
+                            const T* __restrict__ rhs, const T* __restrict__ x, T* __restrict__ r, const int* __restrict__ mask)
 {
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)n * B) return;
     const int b = (int)(idx / n), i = (int)(idx - (long long)b * n);
+    if (LU_MASKED(b)) { r[idx] = T(0); return; }
     const T* a = values + (size_t)b * nnz;
     const T* xb = x + (size_t)b * n;
     T s = rhs[idx];
@@ -309,10 +326,11 @@ __global__ void lu_residual(const T* __restrict__ values, const int* __restrict_
 }
 
 template <class T>
-__global__ void lu_axpy(const long long m, const T* __restrict__ d, T* __restrict__ x)
+__global__ void lu_axpy(const long long m, const int n, const T* __restrict__ d, T* __restrict__ x,
+                        const int* __restrict__ mask)
 {
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < m) x[idx] += d[idx];
+    if (idx < m && !LU_MASKED(idx / n)) x[idx] += d[idx];
 }
 
 inline unsigned blocks_for(long long work) { return static_cast<unsigned>((work + kThreads - 1) / kThreads); }
@@ -381,6 +399,7 @@ void BatchedLu::init(const LuPlan& plan, int batch, cudaStream_t stream, double 
     // the triangular solves' steps: runs of at least two consecutive narrow levels fused
     // (GPUSIM2GRID_OWN_LU_FUSE=0: none, every level its own launch)
     // (and none when the fused kernel cannot run at its block size on this device / build)
+    refine_all_ = own_lu_refine_all();
     const char* fuse_env = std::getenv("GPUSIM2GRID_OWN_LU_FUSE");
     const bool fuse = !(fuse_env != nullptr && fuse_env[0] == '0') && fused_solve_supported();
     auto plan_steps = [&](const std::vector<Launch>& ls, std::vector<SolveStep>& steps, thrust::device_vector<int>& d_run) {
@@ -429,7 +448,7 @@ void BatchedLu::init(const LuPlan& plan, int batch, cudaStream_t stream, double 
     d_v_.assign(static_cast<size_t>(n_ent_) * B_, cuda_real_type(0));
     d_xi_.assign(static_cast<size_t>(n_) * B_, cuda_real_type(0));
     d_tol_.assign(B_, cuda_real_type(0));
-    d_clamped_.assign(B_, 0);
+    d_clamped_.assign(B_ + 1, 0);   // [0]: the batch's clamp total (clamped[-1] in the kernels), then one per matrix
     d_r_.clear();
     d_d_.clear();
     OWN_LU_CHECK(cudaDeviceSynchronize());
@@ -449,8 +468,8 @@ void BatchedLu::factorize(const cuda_real_type* values)
     const int B = B_, nb = nb_;
     T* v = rawm(d_v_);
     T* tol = rawm(d_tol_);
-    int* clamped = rawm(d_clamped_);
-    OWN_LU_CHECK(cudaMemsetAsync(clamped, 0, sizeof(int) * nb, stream_));
+    int* clamped = rawm(d_clamped_) + 1;   // per matrix; clamped[-1]: the batch's total
+    OWN_LU_CHECK(cudaMemsetAsync(clamped - 1, 0, sizeof(int) * (nb + 1), stream_));
     if (eps_ > 0.)
         lu_scaled_tol<T><<<nb, 256, 0, stream_>>>(values, nnz_, static_cast<T>(eps_), tol);
     {
@@ -462,7 +481,7 @@ void BatchedLu::factorize(const cuda_real_type* values)
     for (const Launch& L : f_launch_) {
         if (L.k > 1) {
             dim3 grid(L.count, (nb + 31) / 32);
-            lu_left_split<T><<<grid, 32 * L.k, 0, stream_>>>(tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset,
+            lu_left_split<T><<<grid, 32 * L.k, lu_split_smem<T>(L.k), stream_>>>(tgt + L.offset, cptr + L.offset, cl, cu, dg + L.offset,
                                                              B, nb, L.is_u ? 1 : 0, tol, clamped, v);
         } else if (L.is_u) {
             lu_left_u<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(
@@ -475,7 +494,9 @@ void BatchedLu::factorize(const cuda_real_type* values)
     OWN_LU_CHECK(cudaGetLastError());
 }
 
-void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x)
+void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x) { solve_impl(b, x, nullptr); }
+
+void BatchedLu::solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask)
 {
     using T = cuda_real_type;
     const int B = B_, nb = nb_;
@@ -488,30 +509,30 @@ void BatchedLu::solve(const cuda_real_type* b, cuda_real_type* x)
     for (const SolveStep& st : fw_steps_) {
         if (st.launch < 0) {
             lu_solve_run<T, true><<<(nb + 31) / 32, kRunThreads, 0, stream_>>>(raw(d_fw_rows_), raw(d_fw_run_), st.first, st.last,
-                                                                         n_fw, rp, dp, ci, B, nb, v, xi);
+                                                                         n_fw, rp, dp, ci, B, nb, v, xi, mask);
             continue;
         }
         const Launch& L = fw_launch_[static_cast<size_t>(st.launch)];
         const int* rows = raw(d_fw_rows_) + L.offset;
         if (L.k > 1)
-            lu_fwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
+            lu_fwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, lu_split_smem<T>(L.k), stream_>>>(rows, rp, dp, ci, B, nb, v, xi, mask);
         else
             lu_fwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb,
-                                                                                      v, xi);
+                                                                                      v, xi, mask);
     }
     for (const SolveStep& st : bw_steps_) {
         if (st.launch < 0) {
             lu_solve_run<T, false><<<(nb + 31) / 32, kRunThreads, 0, stream_>>>(raw(d_bw_rows_), raw(d_bw_run_), st.first, st.last,
-                                                                          n_bw, rp, dp, ci, B, nb, v, xi);
+                                                                          n_bw, rp, dp, ci, B, nb, v, xi, mask);
             continue;
         }
         const Launch& L = bw_launch_[static_cast<size_t>(st.launch)];
         const int* rows = raw(d_bw_rows_) + L.offset;
         if (L.k > 1)
-            lu_bwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, 0, stream_>>>(rows, rp, dp, ci, B, nb, v, xi);
+            lu_bwd_split<T><<<dim3(L.count, (nb + 31) / 32), 32 * L.k, lu_split_smem<T>(L.k), stream_>>>(rows, rp, dp, ci, B, nb, v, xi, mask);
         else
             lu_bwd<T><<<blocks_for((long long)L.count * nb), kThreads, 0, stream_>>>(rows, rp, dp, ci, L.count, B, nb,
-                                                                                      v, xi);
+                                                                                      v, xi, mask);
     }
     lu_tr_out<T><<<tgrid, tblock, 0, stream_>>>(xi, raw(d_inv_), n_, B, nb, x);
     OWN_LU_CHECK(cudaGetLastError());
@@ -537,16 +558,27 @@ void BatchedLu::refine(const cuda_real_type* values, const int* indptr, const in
     if (static_cast<const void*>(x) == static_cast<const void*>(b))
         throw std::invalid_argument("own_lu::BatchedLu::refine: x aliases b (the residual b - A x needs b "
                                     "intact): solve into another buffer to refine");
+    // Nothing clamped anywhere in the batch (the usual case): nothing to refine, and not even the masked
+    // correction's launch chain (~160 nearly empty kernels a round) -- one 4-byte read of the batch's clamp
+    // total, after a host sync the round needs soon anyway.
+    if (!refine_all_) {
+        int total = 0;
+        OWN_LU_CHECK(cudaMemcpyAsync(&total, raw(d_clamped_), sizeof(int), cudaMemcpyDeviceToHost, stream_));
+        OWN_LU_CHECK(cudaStreamSynchronize(stream_));
+        if (total == 0) return;   // x is solve()'s
+    }
     if (d_r_.size() != static_cast<size_t>(n_) * B_) {   // sized for the whole batch, once
         d_r_.resize(static_cast<size_t>(n_) * B_);
         d_d_.resize(static_cast<size_t>(n_) * B_);
     }
     const long long m = static_cast<long long>(n_) * nb_;   // slot-major: the prefix is contiguous
+    // only the matrices whose factorization clamped a pivot (the others' x is left as solve() gave it)
+    const int* mask = refine_all_ ? nullptr : raw(d_clamped_) + 1;
     for (int s = 0; s < steps; ++s) {
         lu_residual<T><<<blocks_for(m), kThreads, 0, stream_>>>(values, indptr, indices, n_, nnz_, nb_, b, x,
-                                                                rawm(d_r_));
-        solve(rawm(d_r_), rawm(d_d_));
-        lu_axpy<T><<<blocks_for(m), kThreads, 0, stream_>>>(m, raw(d_d_), x);
+                                                                rawm(d_r_), mask);
+        solve_impl(rawm(d_r_), rawm(d_d_), mask);
+        lu_axpy<T><<<blocks_for(m), kThreads, 0, stream_>>>(m, n_, raw(d_d_), x, mask);
     }
     OWN_LU_CHECK(cudaGetLastError());
 }
@@ -555,7 +587,7 @@ std::vector<int> BatchedLu::clamped_counts() const
 {
     std::vector<int> h(nb_, 0);
     OWN_LU_CHECK(cudaStreamSynchronize(stream_));
-    OWN_LU_CHECK(cudaMemcpy(h.data(), raw(d_clamped_), sizeof(int) * nb_, cudaMemcpyDeviceToHost));
+    OWN_LU_CHECK(cudaMemcpy(h.data(), raw(d_clamped_) + 1, sizeof(int) * nb_, cudaMemcpyDeviceToHost));
     return h;
 }
 

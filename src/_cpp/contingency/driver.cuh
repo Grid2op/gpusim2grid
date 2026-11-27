@@ -250,12 +250,17 @@ inline void run_nr_loop(
 
         // ⑤  Update V: Va (pvpq) then Vm (pq) — both on cs, CUDA stream ordering
         //     serialises them without an explicit CPU event.
-        update_Va_kernel<<<nr_grid_size((long long)batch_size * buf.n_theta, BS), BS, 0, cs>>>(
-            buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
-            buf.n_theta, n_bus, dim_J, batch_size);
-        update_Vm_kernel<<<nr_grid_size((long long)batch_size * buf.n_vm, BS), BS, 0, cs>>>(
-            buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
-            buf.n_vm, n_bus, dim_J, batch_size);
+        if (buf.d_theta_col_of_bus != nullptr && buf.d_vm_col_of_bus != nullptr) {
+            update_V_fused_kernel<<<nr_grid_size((long long)batch_size * n_bus, BS), BS, 0, cs>>>(
+                buf.d_V, buf.d_dx, buf.d_theta_col_of_bus, buf.d_vm_col_of_bus, n_bus, dim_J, batch_size);
+        } else {
+            update_Va_kernel<<<nr_grid_size((long long)batch_size * buf.n_theta, BS), BS, 0, cs>>>(
+                buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
+                buf.n_theta, n_bus, dim_J, batch_size);
+            update_Vm_kernel<<<nr_grid_size((long long)batch_size * buf.n_vm, BS), BS, 0, cs>>>(
+                buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
+                buf.n_vm, n_bus, dim_J, batch_size);
+        }
         nr_feature_update(buf, dim_J, batch_size, cs);
         step.t_update_V = timer.stop_ms();
 

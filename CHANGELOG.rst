@@ -3,6 +3,37 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] ``outer_loops_backend='device'``: DistributedSlack's distribute() run by the slot's whole block (the
+  ``redistribute_slack`` share by the row's warp), the ordered sums on one thread (bit-identical). PtFige N-1: 0.294 -> 0.293 s.
+- [IMPROVED] Batch Newton: the residual norm and the step limiter's max|dx| taken on the integer pipe (bit
+  patterns), the same values. PtFige N-1: 0.297 -> 0.294 s.
+- [IMPROVED] Batch Newton: V updated in one pass (angle then magnitude per bus, the same operations) instead
+  of two. PtFige N-1: 0.298 -> 0.297 s.
+- [IMPROVED] Newton angle update (FP64): a step of at most 0.25 rad by its Taylor series (below half an ulp), larger
+  ones by ``sincos``; V to rounding. PtFige N-1: 0.300 -> 0.298 s.
+- [IMPROVED] Batch power flows: the fused SpMV + mismatch kernel takes its buses sorted by Ybus row length
+  with a per-slot Ybus too (contingency analysis, scenario sweep); same results. PtFige N-1: 0.308 -> 0.303 s.
+- [IMPROVED] ``linear_solver='own_lu'``: ``ir_n_steps`` refines only the matrices whose factorization clamped a
+  pivot, nothing when none did (``GPUSIM2GRID_OWN_LU_IR=all``: every one). PtFige N-1: 0.354 -> 0.308 s.
+- [IMPROVED] ``linear_solver='own_lu'``: the split levels' reduction sized by their warps, no longer a fixed
+  8.4 KB array capping them at 10 blocks per SM (42% occupancy). PtFige N-1: 0.357 -> 0.354 s.
+- [IMPROVED] ``linear_solver='own_lu'``: the symbolic plan (and own_lu_top's trailing blocks) kept per Jacobian
+  pattern, process-wide: a new session on the same grid no longer rebuilds them (PtFige: ~20 ms per driver build).
+- [IMPROVED] With a droop HVDC line, only the J positions ``fill_J`` does not write are zeroed before it, no longer
+  the whole batched J (PtFige N-1: ~2 ms per large round).
+- [IMPROVED] ``outer_loops_backend='device'``: no pinned host copy of the outer-loop gather, which only the host
+  model reads (PtFige: a 15 ms ``cudaMallocHost`` per driver build).
+- [IMPROVED] ``outer_loops_backend='device'``: a row's independent per-element work (lost-power sums, controls,
+  results, the controls' upload) is spread over a warp / block, the ordered sums kept in order. PtFige N-1:
+  0.502 -> 0.474 s.
+- [IMPROVED] ``linear_solver='own_lu'``: its symbolic plan is built with counting sorts instead of a sort of every
+  contribution (PtFige: 28 -> 12 ms per driver build; the same plan).
+- [IMPROVED] ``ContingencyAnalysisGPU`` with ``outer_loops`` and ``redistribute_slack``: each row's lost power sums
+  its own tripped generators, no longer every generator of the grid (PtFige N-1: 62 -> <1 ms of host per run).
+- [IMPROVED] Prototype own_lu_top: programmatic dependent launch hides the gap between its dependent kernels
+  (PtFige N-1: 0.518 -> 0.514 s; ``GPUSIM2GRID_TOP_LU_PDL=0``: off).
+- [ADDED] Prototype ``GPUSIM2GRID_OWN_LU_TOP=1``: own_lu with its trailing elimination levels in shared memory
+  (``src/_cpp/fused_lu/``; PtFige N-1 with outer loops 0.597 -> 0.517 s). Experimental, not tested in the suite yet.
 - [FIXED] ``outer_loops_backend``: the host outer-loop model is compiled without FMA contraction, like the device
   one, so a borderline decision goes the same way on both on a ``-march=native`` build.
 - [FIXED] ``outer_loops_backend='device'`` with ``redistribute_slack``: a row's lost power is shared on the GPU

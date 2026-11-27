@@ -34,6 +34,7 @@
 #ifndef GPUSIM2GRID_OWN_LU_PLAN_HPP
 #define GPUSIM2GRID_OWN_LU_PLAN_HPP
 
+#include <memory>
 #include <vector>
 
 namespace own_lu {
@@ -77,6 +78,14 @@ struct LuPlan {
 // pattern / order mismatch.
 LuPlan build_lu_plan(int n, const std::vector<int>& indptr, const std::vector<int>& indices,
                      const std::vector<int>& order);
+
+// build_lu_plan through a small process-wide cache: the plan is a function of (n, pattern, order)
+// alone, and a new session on the same Jacobian pattern (a repeated N-1 on one grid) would rebuild
+// the same one (~12 ms on PtFige). Matched on the full inputs, not a hash; the last few kept.
+// GPUSIM2GRID_OWN_LU_PLAN_CACHE=0: no cache.
+std::shared_ptr<const LuPlan> build_lu_plan_cached(int n, const std::vector<int>& indptr,
+                                                   const std::vector<int>& indices,
+                                                   const std::vector<int>& order);
 
 }  // namespace own_lu
 

@@ -196,6 +196,11 @@ struct AcPfNrState {
     thrust::device_vector<int> d_p_row_of_bus, d_q_row_of_bus;
     // [n_bus] the buses by Ybus row length: the fused kernel's thread order.
     thrust::device_vector<int> d_bus_order;
+    // h_theta_col_of_bus / h_vm_col_of_bus on the device, for the batch's fused V update (one pass over V,
+    // update_V_fused_kernel): only when no bus appears twice in the theta or Vm list (fused_V_ok), which
+    // the two list kernels already need (they would race on the bus' V)
+    bool fused_V_ok = false;
+    thrust::device_vector<int> d_theta_col_of_bus, d_vm_col_of_bus;
     bool fused_F_ok = false;
 
     // -------------------------------------------------------------------------
@@ -475,6 +480,10 @@ struct AcPfNrState {
     thrust::device_vector<int> d_map_j12;
     thrust::device_vector<int> d_map_j21;
     thrust::device_vector<int> d_map_j22;
+    // The J positions no Ybus entry maps (custom rows, feature-only and reserved slots):
+    // fill_J_kernel overwrites every other one, so zeroing these alone before it leaves J
+    // exactly as a memset of the whole J would (NrIterBuffers::d_J_zero_pos).
+    thrust::device_vector<int> d_J_unmapped_pos;
 
     // -------------------------------------------------------------------------
     // Base-case snapshots  (saved after NR convergence; device-to-device copy)

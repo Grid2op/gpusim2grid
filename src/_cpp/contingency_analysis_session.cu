@@ -713,9 +713,13 @@ void ContingencyAnalysisSession::run()
                     row_p[static_cast<size_t>(bd.first)] = static_cast<double>(h_Sbus_base_(bd.first).real()) * sn + bd.second.real() * sn;
                 for (int b : ctg.masked_buses) is_masked[static_cast<size_t>(b)] = 1;
                 const auto bus_masked = [&](int b) { return b >= 0 && b < n_bus && is_masked[static_cast<size_t>(b)] != 0; };
+                // the row's disconnected generators (none when the row is unsupported: ctg_gen_off is false then)
+                static const std::vector<int> no_gens;
+                const std::vector<int>& off_gens =
+                    unsupported[static_cast<size_t>(r)].empty() ? ctg_gens_[static_cast<size_t>(r)] : no_gens;
                 const double lost =
-                    slack_redistribution::lost_mw(slack_rd_, ctg.masked_buses, g_off, g_p,
-                                                  [&](int b) { return row_p[static_cast<size_t>(b)]; })
+                    slack_redistribution::lost_mw_sparse(slack_rd_, ctg.masked_buses, off_gens, g_p,
+                                                         [&](int b) { return row_p[static_cast<size_t>(b)]; })
                     + (has_trip_data_ ? element_trips::trip_lost_mw(trip_data_, ctg_loads_[static_cast<size_t>(r)],
                                                                     ctg_shunts_[static_cast<size_t>(r)], bus_masked)
                                         + element_trips::more_lost_mw(trip_data_, ctg_more_[static_cast<size_t>(r)])

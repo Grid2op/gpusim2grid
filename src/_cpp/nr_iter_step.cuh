@@ -284,7 +284,8 @@ struct NrIterBuffers {
     const int*             d_p_row_of_bus = nullptr;
     const int*             d_q_row_of_bus = nullptr;
     // Buses by Ybus row length (AcPfNrState::d_bus_order), the thread order of
-    // spmv_fill_F_kernel; nullptr: natural order. Set with ybus_shared only.
+    // spmv_fill_F_kernel; nullptr: natural order. Set by the batch driver whenever
+    // the fused kernel runs (the per-slot Ybus too: each bus's sum is unchanged).
     const int*             d_bus_order    = nullptr;
 
     // Every slot holds the same Ybus (an injection sweep without outer-loop
@@ -301,6 +302,18 @@ struct NrIterBuffers {
     // mismatch and the masks still run on every slot. nullptr: always compute.
     cuda_real_type*        d_F_raw        = nullptr;
     const int*             d_F_clean      = nullptr;
+
+    // With zero_J_before_fill: zero only these J positions (the ones fill_J_kernel does not
+    // overwrite, AcPfNrState::d_J_unmapped_pos) instead of the whole J -- the same J after
+    // fill_J, without a memset of batch x nnz_J values. n_J_zero_pos < 0: the whole J.
+    const int*             d_J_zero_pos   = nullptr;
+    int                    n_J_zero_pos   = -1;
+
+    // Both set (the batch driver, AcPfNrState::fused_V_ok): V updated in one pass, one thread per (slot,
+    // bus) -- the angle step then the magnitude step, as update_Va_kernel then update_Vm_kernel do: the
+    // same bits, V read and written once instead of twice.
+    const int*             d_theta_col_of_bus = nullptr;
+    const int*             d_vm_col_of_bus    = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -381,9 +394,14 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
 
 inline void nr_feature_zero_J(const NrIterBuffers& buf, int nnz_J, int batch, cudaStream_t cs)
 {
-    if (buf.zero_J_before_fill)
+    if (!buf.zero_J_before_fill || batch <= 0) return;
+    if (buf.n_J_zero_pos < 0) {
         cudaMemsetAsync(buf.d_J_values, 0,
                         static_cast<size_t>(batch) * nnz_J * sizeof(cuda_real_type), cs);
+    } else if (buf.n_J_zero_pos > 0) {
+        const dim3 grid((buf.n_J_zero_pos + BS - 1) / BS, static_cast<unsigned>(batch < 65535 ? batch : 65535));
+        zero_J_positions_kernel<<<grid, BS, 0, cs>>>(buf.d_J_values, buf.d_J_zero_pos, buf.n_J_zero_pos, nnz_J, batch);
+    }
 }
 
 inline void nr_feature_fill_J(const NrIterBuffers& buf,
@@ -746,12 +764,17 @@ inline void nr_iter_step_correct(
     // ⑥  Update V in-place: Va first, then Vm.
     //     Both kernels run on cs — CUDA stream ordering serialises them without
     //     an explicit CPU-side event.
-    update_Va_kernel<<<nr_grid_size((long long)actual_batch * buf.n_theta, BS), BS, 0, cs>>>(
-        buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
-        buf.n_theta, n_bus, dim_J, actual_batch);
-    update_Vm_kernel<<<nr_grid_size((long long)actual_batch * buf.n_vm, BS), BS, 0, cs>>>(
-        buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
-        buf.n_vm, n_bus, dim_J, actual_batch);
+    if (buf.d_theta_col_of_bus != nullptr && buf.d_vm_col_of_bus != nullptr) {
+        update_V_fused_kernel<<<nr_grid_size((long long)actual_batch * n_bus, BS), BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_theta_col_of_bus, buf.d_vm_col_of_bus, n_bus, dim_J, actual_batch);
+    } else {
+        update_Va_kernel<<<nr_grid_size((long long)actual_batch * buf.n_theta, BS), BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
+            buf.n_theta, n_bus, dim_J, actual_batch);
+        update_Vm_kernel<<<nr_grid_size((long long)actual_batch * buf.n_vm, BS), BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
+            buf.n_vm, n_bus, dim_J, actual_batch);
+    }
     nr_feature_update(buf, dim_J, actual_batch, cs);
     t.t_update_V += timer.stop_ms();
 }

@@ -636,6 +636,20 @@ __global__ void spmv_fill_F_kernel(
 // full path (warp divergence): that arithmetic, not memory, set the cost in
 // FP64 on GPUs with a reduced FP64 rate (~10x the FP32 time on an RTX A1000).
 // =============================================================================
+__global__ void zero_J_positions_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*            __restrict__ pos,
+    int n_pos,
+    int nnz_J,
+    int actual_batch)
+{
+    const int a = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (a >= n_pos) return;
+    const int p = pos[a];
+    for (ptrdiff_t b = blockIdx.y; b < actual_batch; b += gridDim.y)
+        d_J_values[b * nnz_J + p] = static_cast<cuda_real_type>(0.);
+}
+
 namespace {
 __device__ __forceinline__ double j_rsqrt(double x) { return rsqrt(x); }
 __device__ __forceinline__ float  j_rsqrt(float x)  { return rsqrtf(x); }
@@ -709,6 +723,21 @@ __global__ void fill_J_kernel(
     }
 }
 
+// The bit-pattern view compute_residuals_kernel and reduce_step_norms_kernel take their max on.
+template <class T> struct ResBits;
+template <> struct ResBits<double> {
+    using type = unsigned long long;
+    static constexpr type inf_bits = 0x7FF0000000000000ULL;
+    __device__ static type abs_bits(double x) { return static_cast<type>(__double_as_longlong(x)) & 0x7FFFFFFFFFFFFFFFULL; }
+    __device__ static double from_bits(type u) { return __longlong_as_double(static_cast<long long>(u)); }
+};
+template <> struct ResBits<float> {
+    using type = unsigned int;
+    static constexpr type inf_bits = 0x7F800000U;
+    __device__ static type abs_bits(float x) { return __float_as_uint(x) & 0x7FFFFFFFU; }
+    __device__ static float from_bits(type u) { return __uint_as_float(u); }
+};
+
 // =============================================================================
 // NR step-scaling (MaxVoltageChange), mirrors lightsim2grid's own
 // MaxVoltageChangeScalingPolicy (ScalingPolicies.hpp): after solving J*dx=F,
@@ -742,19 +771,22 @@ __global__ void reduce_step_norms_kernel(
     const ptrdiff_t b = blockIdx.x;  // widened; see fill_J_kernel's own note
     if (b >= actual_batch) return;
     const cuda_real_type* dx = d_dx + b * dim_J;
-    cuda_real_type max_dtheta = 0, max_dvm = 0;
+    // `if (!(m >= a)) m = a` (atomic_max_nonneg's own test) on the integer pipe, |v| as v's bit pattern
+    // with the sign cleared (see compute_residuals_kernel): m >= a is false exactly when one of them is
+    // NaN or a's pattern exceeds m's -- the same values, NaN included (a later element replaces a NaN, as
+    // before), without the FP64 compares (1/64 of the FP32 rate on some GPUs).
+    using U = ResBits<cuda_real_type>;
+    typename U::type mt = 0, mv = 0;
     for (int k = threadIdx.x; k < n_theta; k += blockDim.x) {
-        const cuda_real_type v = dx[theta_cols[k]];
-        const cuda_real_type a = v < 0 ? -v : v;
-        if (!(max_dtheta >= a)) max_dtheta = a;  // atomic_max_nonneg's own test
+        const typename U::type a = U::abs_bits(dx[theta_cols[k]]);
+        if (mt > U::inf_bits || a > U::inf_bits || a > mt) mt = a;
     }
     for (int k = threadIdx.x; k < n_vm; k += blockDim.x) {
-        const cuda_real_type v = dx[vm_cols[k]];
-        const cuda_real_type a = v < 0 ? -v : v;
-        if (!(max_dvm >= a)) max_dvm = a;
+        const typename U::type a = U::abs_bits(dx[vm_cols[k]]);
+        if (mv > U::inf_bits || a > U::inf_bits || a > mv) mv = a;
     }
-    atomic_max_nonneg(&d_max_dtheta[b], max_dtheta);
-    atomic_max_nonneg(&d_max_dvm[b], max_dvm);
+    atomic_max_nonneg(&d_max_dtheta[b], U::from_bits(mt));
+    atomic_max_nonneg(&d_max_dvm[b], U::from_bits(mv));
 }
 
 __global__ void apply_step_scale_kernel(
@@ -792,7 +824,30 @@ __global__ void apply_step_scale_kernel(
 // V bit-identical (masked buses, identity rows).
 // =============================================================================
 namespace {
-__device__ __forceinline__ void v_sincos(double x, double* s, double* c) { sincos(x, s, c); }
+// |x| <= 0.25 rad -- a Newton angle step, nearly always -- by the Taylor series to x^11 / x^12 (truncation
+// ~1e-17 relative, below half an ulp; Horner with FMAs, ~13 FP64 operations against ~35 for the library's
+// argument reduction and polynomials); larger steps by sincos. Both ~1 ulp: V to rounding.
+__device__ __forceinline__ void v_sincos(double x, double* s, double* c)
+{
+    if (fabs(x) <= 0.25) {
+        const double x2 = x * x;
+        double ps = -1.0 / 39916800.0;           // -1/11!
+        ps = fma(ps, x2, 1.0 / 362880.0);         //  1/9!
+        ps = fma(ps, x2, -1.0 / 5040.0);          // -1/7!
+        ps = fma(ps, x2, 1.0 / 120.0);            //  1/5!
+        ps = fma(ps, x2, -1.0 / 6.0);             // -1/3!
+        *s = fma(ps * x2, x, x);
+        double pc = 1.0 / 479001600.0;            //  1/12!
+        pc = fma(pc, x2, -1.0 / 3628800.0);       // -1/10!
+        pc = fma(pc, x2, 1.0 / 40320.0);          //  1/8!
+        pc = fma(pc, x2, -1.0 / 720.0);           // -1/6!
+        pc = fma(pc, x2, 1.0 / 24.0);             //  1/4!
+        pc = fma(pc, x2, -0.5);                   // -1/2!
+        *c = fma(pc, x2, 1.0);
+        return;
+    }
+    sincos(x, s, c);
+}
 __device__ __forceinline__ void v_sincos(float x, float* s, float* c)    { sincosf(x, s, c); }
 __device__ __forceinline__ double v_rsqrt(double x) { return rsqrt(x); }
 __device__ __forceinline__ float  v_rsqrt(float x)  { return rsqrtf(x); }
@@ -851,6 +906,46 @@ __global__ void update_Vm_kernel(
     }
     const cuda_real_type scale = static_cast<cuda_real_type>(1) + dvm * v_rsqrt(n2);
     V = CudaFunHelper::my_make_cuComplex(scale * re, scale * im);
+}
+
+// update_Va_kernel then update_Vm_kernel for one (slot, bus), V kept in registers between them: the
+// same operations on the same values, one read and one write of V instead of two each.
+__global__ void update_V_fused_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_dx,
+    const int*             __restrict__ theta_col_of_bus,
+    const int*             __restrict__ vm_col_of_bus,
+    int n_bus,
+    int dim_J,
+    int actual_batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_bus;
+    const int       i   = static_cast<int>(tid - b * n_bus);
+    if (b >= actual_batch) return;
+    const int tc = theta_col_of_bus[i], vc = vm_col_of_bus[i];
+    const cuda_real_type zero = static_cast<cuda_real_type>(0);
+    const cuda_real_type dva = tc >= 0 ? d_dx[b * dim_J + tc] : zero;
+    const cuda_real_type dvm = vc >= 0 ? d_dx[b * dim_J + vc] : zero;
+    if (dva == zero && dvm == zero) return;
+    cudaComplexType V = d_V[b * n_bus + i];
+    if (dva != zero) {
+        cuda_real_type s, c;
+        v_sincos(dva, &s, &c);
+        V = CudaFunHelper::my_cuCmul(V, CudaFunHelper::my_make_cuComplex(c, s));
+    }
+    if (dvm != zero) {
+        const cuda_real_type re = CudaFunHelper::my_cuCreal(V);
+        const cuda_real_type im = CudaFunHelper::my_cuCimag(V);
+        const cuda_real_type n2 = re * re + im * im;
+        if (n2 == zero) {
+            V = CudaFunHelper::my_make_cuComplex(dvm, zero);   // as update_Vm_kernel
+        } else {
+            const cuda_real_type scale = static_cast<cuda_real_type>(1) + dvm * v_rsqrt(n2);
+            V = CudaFunHelper::my_make_cuComplex(scale * re, scale * im);
+        }
+    }
+    d_V[b * n_bus + i] = V;
 }
 
 // =============================================================================
@@ -1161,35 +1256,32 @@ __global__ void compute_residuals_kernel(
 
     extern __shared__ cuda_real_type sdata[];
 
+    // ‖F_b‖∞ on the integer pipe (FP64 runs at 1/64 of FP32 on some GPUs; this kernel was FP64-bound):
+    // |v|'s bit pattern is v's with the sign bit cleared, non-negative reals order as their patterns, and
+    // a NaN's pattern exceeds +inf's -- so the max of the patterns is max|v| when no element is NaN, and
+    // above +inf's when some is. NaN must PROPAGATE: a slot whose F is NaN somewhere (e.g. a NaN cuDSS
+    // solve poisoning V) reports NaN, never a finite residual that would look converged. The same values
+    // as the former floating-point max (-0 and +0 alike give +0; a NaN anywhere gives NaN).
+    using U = ResBits<cuda_real_type>;
     const cuda_real_type* F_b = d_F + b * dim_J;
-    cuda_real_type local_max = cuda_real_type(0);
-
-    // Each thread scans its portion of F_b. NaN must PROPAGATE: a plain
-    // `v > local_max` is false for NaN, so a slot whose F is entirely NaN
-    // (e.g. a NaN cuDSS solve poisoning V) would otherwise report residual 0
-    // and look converged. `nan_max` is a sticky-NaN max: once any element of
-    // F_b is NaN the slot's residual is NaN. (The lambda is a plain __device__
-    // helper; keeping it local avoids adding a header symbol for one use.)
-    auto nan_max = [](cuda_real_type a, cuda_real_type b) -> cuda_real_type {
-        return (isnan(a) || isnan(b)) ? cuda_real_type(NAN) : (b > a ? b : a);
-    };
+    typename U::type m = 0;
     for (int i = threadIdx.x; i < dim_J; i += blockDim.x) {
-        cuda_real_type v = F_b[i];
-        if (v < cuda_real_type(0)) v = -v;
-        local_max = nan_max(local_max, v);
+        const typename U::type u = U::abs_bits(F_b[i]);
+        m = u > m ? u : m;
     }
-    sdata[threadIdx.x] = local_max;
+    typename U::type* su = reinterpret_cast<typename U::type*>(sdata);   // the same size as a real
+    su[threadIdx.x] = m;
     __syncthreads();
-
-    // Tree reduction within the block (NaN-propagating, see above).
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            sdata[threadIdx.x] = nan_max(sdata[threadIdx.x], sdata[threadIdx.x + stride]);
+        if (threadIdx.x < stride) {
+            const typename U::type o = su[threadIdx.x + stride];
+            if (o > su[threadIdx.x]) su[threadIdx.x] = o;
+        }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
         const int out = d_result_map ? d_result_map[a] : a;
-        d_residuals[out] = sdata[0];
+        d_residuals[out] = su[0] > U::inf_bits ? cuda_real_type(NAN) : U::from_bits(su[0]);
     }
 }

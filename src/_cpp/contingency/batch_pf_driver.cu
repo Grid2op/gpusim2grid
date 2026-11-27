@@ -1495,13 +1495,25 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
     if (base.fused_F_ok) {   // see spmv_fill_F_kernel
         buf.d_p_row_of_bus = thrust::raw_pointer_cast(base.d_p_row_of_bus.data());
         buf.d_q_row_of_bus = thrust::raw_pointer_cast(base.d_q_row_of_bus.data());
+        // Buses by Ybus row length (AcPfNrState::d_bus_order): a warp holds rows of (nearly) one length
+        // instead of waiting for its longest. Each bus's sum is the same, in the same order: the same
+        // bits. It once came with the shared Ybus only (the per-slot one's reads are less coalesced
+        // that way), but it pays there too: PtFige N-1 at batch 4096, residual phase 47 -> 42 ms.
+        buf.d_bus_order = thrust::raw_pointer_cast(base.d_bus_order.data());
         // Every slot the same Ybus: the source's own tile, and nothing patches
         // a slot (BranchControl / ShuntControl only exist with the outer loops).
         if (BatchSource::ybus_same_in_every_slot() && outer_hook_ == nullptr
-            && base.n_bc == 0 && base.n_sc == 0) {
+            && base.n_bc == 0 && base.n_sc == 0)
             buf.ybus_shared = true;
-            buf.d_bus_order = thrust::raw_pointer_cast(base.d_bus_order.data());
-        }
+    }
+
+    if (base.fused_V_ok) {   // V in one pass (update_V_fused_kernel)
+        buf.d_theta_col_of_bus = thrust::raw_pointer_cast(base.d_theta_col_of_bus.data());
+        buf.d_vm_col_of_bus = thrust::raw_pointer_cast(base.d_vm_col_of_bus.data());
+    }
+    if (buf.zero_J_before_fill) {   // only what fill_J does not overwrite (see nr_feature_zero_J)
+        buf.n_J_zero_pos = static_cast<int>(base.d_J_unmapped_pos.size());
+        buf.d_J_zero_pos = buf.n_J_zero_pos > 0 ? thrust::raw_pointer_cast(base.d_J_unmapped_pos.data()) : nullptr;
     }
 
     // NR step-scaling (MaxVoltageChange) -- off (nullptr scratch) unless
@@ -1711,7 +1723,10 @@ void BatchPfDriver<BatchSource>::_oc_setup()
     upload_h2d(d_oc_cand_pin_, cand_pin.data(), cand_pin.size(), cs);
     d_oc_list_.resize(S);
     d_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
-    h_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
+    // Only the host model downloads the gather (the device one reads d_oc_gather_ in place, see
+    // _oc_gather): a pinned S x oc_stride buffer was a ~15 ms cudaMallocHost at every driver build.
+    if (dynamic_cast<outer::DeviceOuterHook*>(outer_hook_) == nullptr)
+        h_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
 }
 
 template <typename BatchSource>
