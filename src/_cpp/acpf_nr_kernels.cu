@@ -890,6 +890,46 @@ __global__ void update_Vm_kernel(
     V = CudaFunHelper::my_make_cuComplex(scale * re, scale * im);
 }
 
+// update_Va_kernel then update_Vm_kernel for one (slot, bus), V kept in registers between them: the
+// same operations on the same values, one read and one write of V instead of two each.
+__global__ void update_V_fused_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_dx,
+    const int*             __restrict__ theta_col_of_bus,
+    const int*             __restrict__ vm_col_of_bus,
+    int n_bus,
+    int dim_J,
+    int actual_batch)
+{
+    const ptrdiff_t tid = static_cast<ptrdiff_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const ptrdiff_t b   = tid / n_bus;
+    const int       i   = static_cast<int>(tid - b * n_bus);
+    if (b >= actual_batch) return;
+    const int tc = theta_col_of_bus[i], vc = vm_col_of_bus[i];
+    const cuda_real_type zero = static_cast<cuda_real_type>(0);
+    const cuda_real_type dva = tc >= 0 ? d_dx[b * dim_J + tc] : zero;
+    const cuda_real_type dvm = vc >= 0 ? d_dx[b * dim_J + vc] : zero;
+    if (dva == zero && dvm == zero) return;
+    cudaComplexType V = d_V[b * n_bus + i];
+    if (dva != zero) {
+        cuda_real_type s, c;
+        v_sincos(dva, &s, &c);
+        V = CudaFunHelper::my_cuCmul(V, CudaFunHelper::my_make_cuComplex(c, s));
+    }
+    if (dvm != zero) {
+        const cuda_real_type re = CudaFunHelper::my_cuCreal(V);
+        const cuda_real_type im = CudaFunHelper::my_cuCimag(V);
+        const cuda_real_type n2 = re * re + im * im;
+        if (n2 == zero) {
+            V = CudaFunHelper::my_make_cuComplex(dvm, zero);   // as update_Vm_kernel
+        } else {
+            const cuda_real_type scale = static_cast<cuda_real_type>(1) + dvm * v_rsqrt(n2);
+            V = CudaFunHelper::my_make_cuComplex(scale * re, scale * im);
+        }
+    }
+    d_V[b * n_bus + i] = V;
+}
+
 // =============================================================================
 // MultiSlack kernels (Phase 2)
 // =============================================================================

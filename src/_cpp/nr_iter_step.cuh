@@ -308,6 +308,12 @@ struct NrIterBuffers {
     // fill_J, without a memset of batch x nnz_J values. n_J_zero_pos < 0: the whole J.
     const int*             d_J_zero_pos   = nullptr;
     int                    n_J_zero_pos   = -1;
+
+    // Both set (the batch driver, AcPfNrState::fused_V_ok): V updated in one pass, one thread per (slot,
+    // bus) -- the angle step then the magnitude step, as update_Va_kernel then update_Vm_kernel do: the
+    // same bits, V read and written once instead of twice.
+    const int*             d_theta_col_of_bus = nullptr;
+    const int*             d_vm_col_of_bus    = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -758,12 +764,17 @@ inline void nr_iter_step_correct(
     // ⑥  Update V in-place: Va first, then Vm.
     //     Both kernels run on cs — CUDA stream ordering serialises them without
     //     an explicit CPU-side event.
-    update_Va_kernel<<<nr_grid_size((long long)actual_batch * buf.n_theta, BS), BS, 0, cs>>>(
-        buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
-        buf.n_theta, n_bus, dim_J, actual_batch);
-    update_Vm_kernel<<<nr_grid_size((long long)actual_batch * buf.n_vm, BS), BS, 0, cs>>>(
-        buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
-        buf.n_vm, n_bus, dim_J, actual_batch);
+    if (buf.d_theta_col_of_bus != nullptr && buf.d_vm_col_of_bus != nullptr) {
+        update_V_fused_kernel<<<nr_grid_size((long long)actual_batch * n_bus, BS), BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_theta_col_of_bus, buf.d_vm_col_of_bus, n_bus, dim_J, actual_batch);
+    } else {
+        update_Va_kernel<<<nr_grid_size((long long)actual_batch * buf.n_theta, BS), BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_theta_buses, buf.d_theta_cols,
+            buf.n_theta, n_bus, dim_J, actual_batch);
+        update_Vm_kernel<<<nr_grid_size((long long)actual_batch * buf.n_vm, BS), BS, 0, cs>>>(
+            buf.d_V, buf.d_dx, buf.d_vm_buses, buf.d_vm_cols,
+            buf.n_vm, n_bus, dim_J, actual_batch);
+    }
     nr_feature_update(buf, dim_J, actual_batch, cs);
     t.t_update_V += timer.stop_ms();
 }

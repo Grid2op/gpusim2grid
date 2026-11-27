@@ -353,6 +353,17 @@ __global__ void update_Va_kernel(
 // Feature-free: vm_buses == pq, vm_cols == [n_pvpq, n_pvpq + n_pq).
 // Reads Va from d_V after update_Va_kernel has written it (same stream).
 // ---------------------------------------------------------------------------
+// update_V_fused_kernel: update_Va_kernel then update_Vm_kernel in one pass, one thread per (slot, bus),
+// from the per-bus columns (-1: none); see NrIterBuffers::d_theta_col_of_bus.
+__global__ void update_V_fused_kernel(
+          cudaComplexType* __restrict__ d_V,
+    const cuda_real_type*  __restrict__ d_dx,
+    const int*             __restrict__ theta_col_of_bus,
+    const int*             __restrict__ vm_col_of_bus,
+    int n_bus,
+    int dim_J,
+    int actual_batch);
+
 __global__ void update_Vm_kernel(
           cudaComplexType* __restrict__ d_V,
     const cuda_real_type*  __restrict__ d_dx,

@@ -1507,6 +1507,10 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
             buf.ybus_shared = true;
     }
 
+    if (base.fused_V_ok) {   // V in one pass (update_V_fused_kernel)
+        buf.d_theta_col_of_bus = thrust::raw_pointer_cast(base.d_theta_col_of_bus.data());
+        buf.d_vm_col_of_bus = thrust::raw_pointer_cast(base.d_vm_col_of_bus.data());
+    }
     if (buf.zero_J_before_fill) {   // only what fill_J does not overwrite (see nr_feature_zero_J)
         buf.n_J_zero_pos = static_cast<int>(base.d_J_unmapped_pos.size());
         buf.d_J_zero_pos = buf.n_J_zero_pos > 0 ? thrust::raw_pointer_cast(base.d_J_unmapped_pos.data()) : nullptr;

@@ -725,8 +725,19 @@ AcPfNrState::AcPfNrState(
         h_q_row_of_bus.assign(n_bus, -1);
         h_p_diag_pos.assign(n_bus, -1);
         h_q_diag_pos.assign(n_bus, -1);
-        for (int i = 0; i < n_theta; ++i) h_theta_col_of_bus[theta_buses[i]] = theta_cols[i];
-        for (int i = 0; i < n_vm;    ++i) h_vm_col_of_bus[vm_buses[i]]       = vm_cols[i];
+        fused_V_ok = true;
+        for (int i = 0; i < n_theta; ++i) {
+            if (h_theta_col_of_bus[theta_buses[i]] >= 0) fused_V_ok = false;
+            h_theta_col_of_bus[theta_buses[i]] = theta_cols[i];
+        }
+        for (int i = 0; i < n_vm; ++i) {
+            if (h_vm_col_of_bus[vm_buses[i]] >= 0) fused_V_ok = false;
+            h_vm_col_of_bus[vm_buses[i]] = vm_cols[i];
+        }
+        if (fused_V_ok && n_bus > 0) {
+            upload_h2d(d_theta_col_of_bus, h_theta_col_of_bus.data(), n_bus, cs);
+            upload_h2d(d_vm_col_of_bus, h_vm_col_of_bus.data(), n_bus, cs);
+        }
         // (fused_F_ok: no bus owns two P rows or two Q rows, see the upload below)
         fused_F_ok = true;
         for (int i = 0; i < n_p; ++i) {

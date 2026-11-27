@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] Batch Newton: V updated in one pass (angle then magnitude per bus, the same operations) instead
+  of two. PtFige N-1: 0.298 -> 0.297 s.
 - [IMPROVED] Newton angle update (FP64): a step of at most 0.25 rad by its Taylor series (below half an ulp), larger
   ones by ``sincos``; V to rounding. PtFige N-1: 0.300 -> 0.298 s.
 - [IMPROVED] Batch power flows: the fused SpMV + mismatch kernel takes its buses sorted by Ybus row length
