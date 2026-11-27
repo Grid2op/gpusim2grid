@@ -3,6 +3,8 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [IMPROVED] Batch Newton: the residual norm and the step limiter's max|dx| taken on the integer pipe (bit
+  patterns), the same values. PtFige N-1: 0.297 -> 0.294 s.
 - [IMPROVED] Batch Newton: V updated in one pass (angle then magnitude per bus, the same operations) instead
   of two. PtFige N-1: 0.298 -> 0.297 s.
 - [IMPROVED] Newton angle update (FP64): a step of at most 0.25 rad by its Taylor series (below half an ulp), larger

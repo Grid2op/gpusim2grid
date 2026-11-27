@@ -195,7 +195,7 @@ Same setting; every number a median of 5 repeats of `bench_n1.sh` (the expe's se
 changed in the scripts), results checked against the previous step each time (statuses, NaN rows,
 per-row outer / Newton iterations identical; V within the 1.2e-12 run-to-run spread).
 
-**Kept** (session run 0.354 -> 0.297 s):
+**Kept** (session run 0.354 -> 0.294 s):
 
 | change | session run | where |
 |---|---|---|
@@ -204,6 +204,7 @@ per-row outer / Newton iterations identical; V within the 1.2e-12 run-to-run spr
 | TopLu: symbolic arrays shared with the template instead of copied, factors not zero-filled (driver construction 15 -> 11 ms) | 0.303 -> 0.300 | `perf/n1-next` (fc7efe9) |
 | the Newton angle step by its Taylor series when \|dva\| <= 0.25 rad (~13 FP64 operations instead of sincos' ~35; ~1 ulp both, V to rounding) | 0.300 -> 0.298 | `perf/n1-next` (09f97b6) |
 | V updated in one pass, angle then magnitude per bus (the same operations; update_Vm was DRAM-bound) | 0.298 -> 0.297 | `perf/n1-next` (0580eb2) |
+| the residual norm and the step limiter's max\|dx\| on the integer pipe (bit patterns: the same values, NaN rules included) | 0.297 -> 0.294 | `perf/n1-next` |
 
 **Measured and dropped** -- each would cost a large or risky change for at most a few ms:
 
