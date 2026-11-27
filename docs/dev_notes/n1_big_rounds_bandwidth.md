@@ -263,3 +263,71 @@ norms / gathers ~30; host before the first round ~16 ms (source 4.8, driver cons
 The large rounds are at the bandwidth floor of their kernels; what remains is a few ms here and
 there (the `distribute()` restructuring, MinFill on the grid, driver fills) unless the work itself
 shrinks.
+
+## 8. The first Newton iteration by a low-rank update (2026-11-27)
+
+Same setting. Session run 0.292 -> 0.255 s (median of 5), statuses, per-row outer / Newton iteration counts
+and rounds those of the run with every matrix factorized, V within 5e-12.
+
+**The observation.** A contingency row starts from the base case's voltages, so at its first Newton
+iteration its J is the base case's but for the rows of its tripped branch's two buses: 4 rows for 90% of the
+rows of PtFige's N-1, at most 12 for nearly all the others (masked islands, pinned buses). That iteration is
+8 803 of the run's 21 021 row-iterations, each paid as a full factorization (5.6 us per row: transpose, levels,
+trailing block) and solve (1.8 us).
+
+**What `GPUSIM2GRID_OWN_LU_LOWRANK=1` does** (`top_lu.cuh`; with `GPUSIM2GRID_OWN_LU_TOP=1`, FP64): the solver
+keeps a reference matrix -- the entrywise majority of three matrices of its first factorization: the first,
+the middle and the last one (the first three contingencies trip branches of one bus: their majority kept
+two of its rows off the base case) --, its factorization (a `TopLu` of one matrix) and its inverse. At every
+factorization a matrix whose rows are the reference's but for K (12) at most is not factorized:
+`x = z - W_R (I + D W_R)^-1 D z` (Woodbury), `z = A_ref^-1 b`, `D` the modified rows' difference, `W_R` the
+inverse's columns of those rows. When its right-hand side is also the reference's but for a few rows (8 at
+most: 71% of the rows; the others lose power and get `redistribute_slack`'s correction on ~120 slack units),
+`z` itself is `z_ref` plus columns of the inverse and nothing is solved; otherwise `z` is one solve on the
+reference's factors. Everything is decided by comparing values (sampled entries first, a row otherwise never
+read): a matrix that does not fit -- more rows, a capacitance matrix with pivots spread over more than 1e8 --
+is factorized as before, so no assumption about the caller is involved. An injection sweep's first iteration
+fits too (no modified row).
+
+Accuracy: residuals `max|b - A x| / max|b|` of the low-rank rows 2e-11 at worst on PtFige, the factorized
+rows' 2e-11 (`GPUSIM2GRID_OWN_LU_LOWRANK_CHECK`). Loose convergence (1e-4 pu), PtFige and ecct: every per-row
+count identical. Tight (1e-10 pu): 3 rows of PtFige's 8 803 and 3 of ecct's 9 455 take one Newton iteration
+more or less (a residual within rounding of the tolerance; for 2 of ecct's, one outer iteration more or
+less with it), same statuses, V within 4e-12.
+
+Where its time goes (PtFige, per run): reference factorization 1.0 ms, inverse 8.5 ms (once: the transposed
+system for the 14 364 unit vectors at once, written straight in the layout the columns are read in -- the
+forward part along each vector's path of the elimination tree, 1.3 ms, the backward part level by level,
+5.9 ms), the rows' comparison and capacitance matrices ~7 ms (it reads the candidates' J: 0.78 MB each), the
+right-hand sides' ~2 ms, solves on the reference ~3.5 ms, columns out ~4.5 ms; against ~65 ms of
+factorizations and solves no longer done.
+
+Left on the table: the candidates' J is still filled by `fill_J` (4.1 ms per 4 096) and read back by the
+comparison (2.6 ms): only the modified rows matter, but knowing them without filling J means the driver
+telling the solver (the patched Ybus entries, the masks, the pins); the inverse (1.65 GB on PtFige,
+`GPUSIM2GRID_OWN_LU_LOWRANK_MAX_MB`) is rebuilt by every driver.
+
+**A latent bug found on the way** (fixed): an entry of the symmetrized factor pattern with neither a value in J
+nor a contribution (PtFige has one, U(6276, 6278) in the plan's numbering) is computed by no item, and the
+backward solve reads it. Since "factors not zeroed" (`fc7efe9`) its value was whatever the buffer held: zero
+in practice (the 4.6 GB buffer comes back as the previous driver left it), until the one-matrix reference
+got recycled memory. It now gets an explicit zero item
+(`test_top_lu_writes_the_entries_without_a_value_or_a_contribution`).
+
+**Measured and dropped: the factorization by pieces of the elimination tree in shared memory.** The tree cut
+into connected pieces whose entries fit one block's shared memory, one block per (piece, 32 matrices)
+factorizing the piece with barriers between its levels and handing the contributions to its ancestors'
+entries over as sums (a multifrontal's update blocks), pieces of a tier in one launch: no operand is re-read
+from DRAM (the level kernels read each factor entry 4.5 times, once per level using it). Standalone
+prototype on PtFige's J, 4 096 matrices: 19.2 ms for a factorization against ~23 today, of which 7.6 ms read
+J (scattered 8-byte reads from the slot-major J: 2.6-3.4x the traffic of a coalesced read, lines shared by
+rows of different tiers), and its solve 12.7 ms against ~7. With a transpose of J in front it comes to ~18.5:
+not worth the rewrite. Two facts about this card it gave, measured (`fp64probe`):
+
+- An FP64 instruction costs 7 ns of SM time per *warp*, whatever the number of active lanes (four units per
+  SM, 28 ns each; a division 71 ns): 862 G lane-FMA/s with full warps, 27 G with one lane. Hence "lanes =
+  matrices" everywhere in the LU; a first prototype with one matrix per block (lanes = items) took 37 ms.
+- L2: 128 MB, ~4.6 TB/s read when the data fits, 1.42 TB/s from DRAM.
+
+A cache-blocked level schedule (the levels of a subtree for all matrices while it fits the L2) was modelled
+before that: ~2 000 more launches per factorization for a third of the traffic at best, no gain.

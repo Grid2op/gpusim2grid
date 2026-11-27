@@ -3,6 +3,9 @@ Change Log
 
 [0.3.1] (unreleased)
 --------------------
+- [ADDED] Prototype ``GPUSIM2GRID_OWN_LU_LOWRANK=1`` (own_lu_top): a row's first Newton iteration is not
+  factorized, its step is one reference factorization corrected by the Woodbury identity (its J is the base
+  case's but for a few rows). Results to rounding. PtFige N-1: 0.292 -> 0.255 s.
 - [FIXED] Prototype own_lu_top: a factor entry with neither a value in J nor a contribution was never written,
   and read by the backward solve from factors that are not zero-filled.
 - [IMPROVED] ``outer_loops_backend='device'``: DistributedSlack's distribute() run by the slot's whole block (the

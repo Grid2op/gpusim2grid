@@ -8,6 +8,7 @@
 #include "top_lu.cuh"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,10 @@ constexpr int kThreads = 256;
 // every matrix): the solve kernels take the per-matrix clamp counts as a mask and leave a matrix with none
 // alone (nullptr: every matrix, the plain solve). `b` is always < nb where it is read.
 #define LU_MASKED(b) (mask != nullptr && mask[b] <= 0)
+
+// A factor entry of matrix b in a solve kernel: one per matrix (interleaved), or the reference's, the same for
+// every lane (kSh: the low-rank first steps solve on one shared factorization)
+#define LU_VI(e) (kSh ? (size_t)(e) : (size_t)(e) * B + b)
 
 template <class T>
 __device__ __forceinline__ T clamp_pivot(T s, T e, int* clamped, int b)
@@ -120,7 +125,7 @@ __global__ void lu_left_l(const int* __restrict__ tgt, const int* __restrict__ s
 }
 
 // Forward (unit L): x[i] -= sum L[i,k] x[k]; backward: x[i] = (x[i] - sum U[i,j] x[j]) / U[i,i].
-template <class T>
+template <class T, bool kSh = false>
 __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
                        const int B, const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
@@ -135,16 +140,16 @@ __global__ void lu_fwd(const int* __restrict__ rows, const int* __restrict__ rp,
         int e = rp[i];
         const int ee = dp[i];
         for (; e + 1 < ee; e += 2) {
-            s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
-            s2 = fma(-v[(size_t)(e + 1) * B + b], x[(size_t)ci[e + 1] * B + b], s2);
+            s = fma(-v[LU_VI(e)], x[(size_t)ci[e] * B + b], s);
+            s2 = fma(-v[LU_VI((e + 1))], x[(size_t)ci[e + 1] * B + b], s2);
         }
-        if (e < ee) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
+        if (e < ee) s = fma(-v[LU_VI(e)], x[(size_t)ci[e] * B + b], s);
         s += s2;
     }
     x[(size_t)i * B + b] = s;
 }
 
-template <class T>
+template <class T, bool kSh = false>
 __global__ void lu_bwd(const int* __restrict__ rows, const int* __restrict__ rp,
                        const int* __restrict__ dp, const int* __restrict__ ci, const int n_items,
                        const int B, const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
@@ -159,13 +164,13 @@ __global__ void lu_bwd(const int* __restrict__ rows, const int* __restrict__ rp,
         int e = dp[i] + 1;
         const int ee = rp[i + 1];
         for (; e + 1 < ee; e += 2) {
-            s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
-            s2 = fma(-v[(size_t)(e + 1) * B + b], x[(size_t)ci[e + 1] * B + b], s2);
+            s = fma(-v[LU_VI(e)], x[(size_t)ci[e] * B + b], s);
+            s2 = fma(-v[LU_VI((e + 1))], x[(size_t)ci[e + 1] * B + b], s2);
         }
-        if (e < ee) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
+        if (e < ee) s = fma(-v[LU_VI(e)], x[(size_t)ci[e] * B + b], s);
         s += s2;
     }
-    x[(size_t)i * B + b] = s / v[(size_t)dp[i] * B + b];
+    x[(size_t)i * B + b] = s / v[LU_VI(dp[i])];
 }
 
 // Layout changes, 32 x 32 tiles (block 32 x 8), matrices b < nb only.
@@ -190,7 +195,7 @@ __global__ void lu_tr_in(const T* __restrict__ src, const int* __restrict__ map,
 
 template <class T>
 __global__ void lu_tr_out(const T* __restrict__ src, const int* __restrict__ map, const int ncols,
-                          const int B, const int nb, T* __restrict__ dst)
+                          const int B, const int nb, T* __restrict__ dst, const int* __restrict__ perm)
 {
     TOP_PDL_WAIT();
     __shared__ T t[32][33];
@@ -202,7 +207,7 @@ __global__ void lu_tr_out(const T* __restrict__ src, const int* __restrict__ map
     __syncthreads();
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int b = b0 + r, j = j0 + threadIdx.x;
-        if (b < nb && j < ncols) dst[(size_t)b * ncols + j] = t[threadIdx.x][r];
+        if (b < nb && j < ncols) dst[(size_t)(perm ? perm[b] : b) * ncols + j] = t[threadIdx.x][r];
     }
 }
 
@@ -277,7 +282,7 @@ __global__ void lu_left_split(const int* __restrict__ tgt, const int* __restrict
     }
 }
 
-template <class T>
+template <class T, bool kSh = false>
 __global__ void lu_fwd_split(const int* __restrict__ rows, const int* __restrict__ rp,
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
                              const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
@@ -287,13 +292,13 @@ __global__ void lu_fwd_split(const int* __restrict__ rows, const int* __restrict
     const int i = rows[it];
     T acc = T(0);
     if (b < nb && !LU_MASKED(b))
-        for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
+        for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[LU_VI(e)], x[(size_t)ci[e] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
     if (part != 0 || b >= nb || LU_MASKED(b)) return;
     x[(size_t)i * B + b] -= sum;
 }
 
-template <class T>
+template <class T, bool kSh = false>
 __global__ void lu_bwd_split(const int* __restrict__ rows, const int* __restrict__ rp,
                              const int* __restrict__ dp, const int* __restrict__ ci, const int B,
                              const int nb, const T* __restrict__ v, T* __restrict__ x, const int* __restrict__ mask)
@@ -304,10 +309,10 @@ __global__ void lu_bwd_split(const int* __restrict__ rows, const int* __restrict
     T acc = T(0);
     if (b < nb && !LU_MASKED(b))
         for (int e = dp[i] + 1 + part; e < rp[i + 1]; e += K)
-            acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
+            acc = fma(v[LU_VI(e)], x[(size_t)ci[e] * B + b], acc);
     const T sum = lu_split_sum(acc, lane, part, K, red);
     if (part != 0 || b >= nb || LU_MASKED(b)) return;
-    x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[(size_t)dp[i] * B + b];
+    x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[LU_VI(dp[i])];
 }
 
 constexpr int kRunThreads = 1024;   // lu_solve_run's block: 32 matrices (lanes) x 32 warps
@@ -316,7 +321,7 @@ constexpr int kRunThreads = 1024;   // lu_solve_run's block: 32 matrices (lanes)
 // 32 warps, the levels in order with a block barrier between them (a matrix depends on its own rows
 // only). In a level of k parts, warps item * k ... item * k + k - 1 take item `item`; every value is
 // computed as lu_fwd / lu_bwd (k = 1) or lu_fwd_split / lu_bwd_split (k > 1) do: the same bits.
-template <class T, bool kForward>
+template <class T, bool kForward, bool kSh = false>
 __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restrict__ rows, const int* __restrict__ run, const int first,
                              const int last, const int n_lv, const int* __restrict__ rp, const int* __restrict__ dp,
                              const int* __restrict__ ci, const int B, const int nb, const T* __restrict__ v,
@@ -335,21 +340,21 @@ __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restric
             if (active) {
                 T s = x[(size_t)i * B + b];
                 if (kForward) {
-                    for (int e = rp[i]; e < dp[i]; ++e) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
+                    for (int e = rp[i]; e < dp[i]; ++e) s = fma(-v[LU_VI(e)], x[(size_t)ci[e] * B + b], s);
                     x[(size_t)i * B + b] = s;
                 } else {
-                    for (int e = dp[i] + 1; e < rp[i + 1]; ++e) s = fma(-v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], s);
-                    x[(size_t)i * B + b] = s / v[(size_t)dp[i] * B + b];
+                    for (int e = dp[i] + 1; e < rp[i + 1]; ++e) s = fma(-v[LU_VI(e)], x[(size_t)ci[e] * B + b], s);
+                    x[(size_t)i * B + b] = s / v[LU_VI(dp[i])];
                 }
             }
         } else {
             T acc = T(0);
             if (active) {
                 if (kForward) {
-                    for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
+                    for (int e = rp[i] + part; e < dp[i]; e += K) acc = fma(v[LU_VI(e)], x[(size_t)ci[e] * B + b], acc);
                 } else {
                     for (int e = dp[i] + 1 + part; e < rp[i + 1]; e += K)
-                        acc = fma(v[(size_t)e * B + b], x[(size_t)ci[e] * B + b], acc);
+                        acc = fma(v[LU_VI(e)], x[(size_t)ci[e] * B + b], acc);
                 }
             }
             red[warp][lane] = acc;
@@ -358,7 +363,7 @@ __global__ void __launch_bounds__(kRunThreads) lu_solve_run(const int* __restric
                 T sum = T(0);
                 for (int w = 0; w < K; ++w) sum += red[item * K + w][lane];
                 if (kForward) x[(size_t)i * B + b] -= sum;
-                else x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[(size_t)dp[i] * B + b];
+                else x[(size_t)i * B + b] = (x[(size_t)i * B + b] - sum) / v[LU_VI(dp[i])];
             }
         }
         __syncthreads();   // the level's rows before the next level reads them
@@ -429,7 +434,7 @@ __global__ void top_outside(const int* __restrict__ oq, const int* __restrict__ 
 }
 
 // T rows: x_T[i] -= L(i, outside T) x_outside, block = 32 matrices (lanes) x K warps, one row per blockIdx.x
-template <class T>
+template <class T, bool kSh = false>
 __global__ void top_fo(const int* __restrict__ trows, const int* __restrict__ fo_ptr, const int* __restrict__ fo_ent,
                        const int* __restrict__ fo_col, const int B, const int nb, const T* __restrict__ v, T* __restrict__ xi, const int* __restrict__ mask)
 {
@@ -439,7 +444,7 @@ __global__ void top_fo(const int* __restrict__ trows, const int* __restrict__ fo
     const int b = blockIdx.y * 32 + lane;
     T acc = T(0);
     if (b < nb && !LU_MASKED(b))
-        for (int a = fo_ptr[i] + part; a < fo_ptr[i + 1]; a += K) acc = fma(v[(size_t)fo_ent[a] * B + b], xi[(size_t)fo_col[a] * B + b], acc);
+        for (int a = fo_ptr[i] + part; a < fo_ptr[i + 1]; a += K) acc = fma(v[LU_VI(fo_ent[a])], xi[(size_t)fo_col[a] * B + b], acc);
     red[part][lane] = acc;
     __syncthreads();
     if (part == 0 && b < nb && !LU_MASKED(b)) {
@@ -514,7 +519,7 @@ __device__ __forceinline__ T top_warp_sum(T s)
 
 // One block per matrix: T's forward (unit L) on T x T (top_fo took the columns outside T), column-oriented:
 // x_T[i] -= L(i, k) x_T[k] for the pattern rows of column k, a barrier per column; L from the matrix-major tm
-template <class T>
+template <class T, bool kSh = false>
 __global__ void __launch_bounds__(kTopSolveThreads)
 top_fwd(const int m, const int n_top, const int* __restrict__ trows, const int* __restrict__ rk_ptr, const int* __restrict__ rk,
         const int* __restrict__ fl_q, const int n_fl, const int B, const int nb, const T* __restrict__ tm, T* __restrict__ xi, const int* __restrict__ mask)
@@ -527,7 +532,7 @@ top_fwd(const int m, const int n_top, const int* __restrict__ trows, const int* 
     int* kr = kp + m + 1;
     const int b = blockIdx.x, tid = threadIdx.x, bd = blockDim.x;
     if (b >= nb || LU_MASKED(b)) return;   // the whole block: before any barrier
-    const T* tb = tm + (size_t)b * n_top;
+    const T* tb = tm + (kSh ? (size_t)0 : (size_t)b * n_top);
     for (int q = tid; q < n_fl; q += bd) {
         Ls[q] = tb[fl_q[q]];
         kr[q] = rk[q];
@@ -545,7 +550,7 @@ top_fwd(const int m, const int n_top, const int* __restrict__ trows, const int* 
 
 // One block per matrix: T's backward, column-oriented: x_k = x_T[k] / U(k, k) (reciprocals taken once), then
 // x_T[i] -= U(i, k) x_k for the pattern rows i < k of column k, a barrier per column. U(T, outside) is empty.
-template <class T>
+template <class T, bool kSh = false>
 __global__ void __launch_bounds__(kTopSolveThreads)
 top_bwd(const int m, const int n_top, const int* __restrict__ trows, const int* __restrict__ bu_ptr, const int* __restrict__ bu_row,
         const int* __restrict__ bu_q, const int n_bu, const int* __restrict__ dg_q, const int B, const int nb,
@@ -561,7 +566,7 @@ top_bwd(const int m, const int n_top, const int* __restrict__ trows, const int* 
     int* kr = kp + m + 1;
     const int b = blockIdx.x, tid = threadIdx.x, bd = blockDim.x;
     if (b >= nb || LU_MASKED(b)) return;   // the whole block: before any barrier
-    const T* tb = tm + (size_t)b * n_top;
+    const T* tb = tm + (kSh ? (size_t)0 : (size_t)b * n_top);
     for (int q = tid; q < n_bu; q += bd) {
         Us[q] = tb[bu_q[q]];
         kr[q] = bu_row[q];
@@ -586,7 +591,7 @@ top_bwd(const int m, const int n_top, const int* __restrict__ trows, const int* 
 // order is the values'), grid-striding over column tiles so that a block adds one atomic per matrix
 template <class T>
 __global__ void lu_tr_in_vals(const T* __restrict__ src, const int ncols, const int B, const int nb, T* __restrict__ dst,
-                              unsigned long long* __restrict__ amax)
+                              unsigned long long* __restrict__ amax, const int* __restrict__ perm)
 {
     TOP_PDL_WAIT();
     __shared__ T t[32][33];
@@ -596,7 +601,7 @@ __global__ void lu_tr_in_vals(const T* __restrict__ src, const int ncols, const 
     for (int j0 = blockIdx.x * 32; j0 < ncols; j0 += gridDim.x * 32) {
         for (int r = threadIdx.y; r < 32; r += 8) {
             const int b = b0 + r, j = j0 + threadIdx.x;
-            if (b < nb && j < ncols) t[r][threadIdx.x] = src[(size_t)b * ncols + j];
+            if (b < nb && j < ncols) t[r][threadIdx.x] = src[(size_t)(perm ? perm[b] : b) * ncols + j];
         }
         __syncthreads();
         for (int r = threadIdx.y; r < 32; r += 8) {
@@ -628,14 +633,14 @@ __global__ void lu_tol_from_max(const unsigned long long* __restrict__ amax, con
 // b -> two interleaved copies (the right-hand side kept for the refinement, the one the solve overwrites)
 template <class T>
 __global__ void lu_tr_in2(const T* __restrict__ src, const int* __restrict__ map, const int ncols, const int B, const int nb,
-                          T* __restrict__ dst, T* __restrict__ dst2)
+                          T* __restrict__ dst, T* __restrict__ dst2, const int* __restrict__ perm)
 {
     TOP_PDL_WAIT();
     __shared__ T t[32][33];
     const int j0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int b = b0 + r, j = j0 + threadIdx.x;
-        if (b < nb && j < ncols) t[r][threadIdx.x] = src[(size_t)b * ncols + j];
+        if (b < nb && j < ncols) t[r][threadIdx.x] = src[(size_t)(perm ? perm[b] : b) * ncols + j];
     }
     __syncthreads();
     for (int r = threadIdx.y; r < 32; r += 8) {
@@ -651,7 +656,7 @@ __global__ void lu_tr_in2(const T* __restrict__ src, const int* __restrict__ map
 // out: dst[b * ncols + j] = src[map[j] * B + b] + src2[map[j] * B + b] (the refined solution)
 template <class T>
 __global__ void lu_tr_out_add(const T* __restrict__ src, const T* __restrict__ src2, const int* __restrict__ map,
-                              const int ncols, const int B, const int nb, T* __restrict__ dst, const int* __restrict__ mask)
+                              const int ncols, const int B, const int nb, T* __restrict__ dst, const int* __restrict__ mask, const int* __restrict__ perm)
 {
     TOP_PDL_WAIT();
     __shared__ T t[32][33];
@@ -666,7 +671,7 @@ __global__ void lu_tr_out_add(const T* __restrict__ src, const T* __restrict__ s
     __syncthreads();
     for (int r = threadIdx.y; r < 32; r += 8) {
         const int b = b0 + r, j = j0 + threadIdx.x;
-        if (b < nb && j < ncols) dst[(size_t)b * ncols + j] = t[threadIdx.x][r];
+        if (b < nb && j < ncols) dst[(size_t)(perm ? perm[b] : b) * ncols + j] = t[threadIdx.x][r];
     }
 }
 
@@ -696,6 +701,403 @@ __global__ void lu_axpy_i(const int n, const int B, const int nb, const T* __res
     if (LU_MASKED(b)) return;
     x[(size_t)i * B + b] += d[(size_t)i * B + b];
 }
+
+// ---- low-rank first steps (top_lu.cuh) ----
+
+constexpr int kLrMaxK = 16;   // the capacitance system of a candidate lives in a thread's local arrays
+
+__device__ __forceinline__ bool lr_same(double x, double y) { return __double_as_longlong(x) == __double_as_longlong(y); }
+__device__ __forceinline__ bool lr_same(float x, float y) { return __float_as_int(x) == __float_as_int(y); }
+
+// The reference: the entrywise majority of three matrices (the base case's J wherever at most one of the three rows
+// changed the entry)
+template <class T>
+__global__ void lr_majority(const T* __restrict__ a, const T* __restrict__ b, const T* __restrict__ c, const int nnz,
+                            T* __restrict__ ref)
+{
+    TOP_PDL_WAIT();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    const T x = a[i], y = b[i];
+    ref[i] = (lr_same(x, y) || lr_same(x, c[i])) ? x : y;
+}
+
+// kind[b] = 0 when at most K of the sampled positions (one per sampled row) of matrix b differ from the reference
+// (it may be a candidate: lr_diff looks at every row), else -1; cnt[b] = 0; tot: how many were kept
+template <class T>
+__global__ void lr_sample(const T* __restrict__ values, const T* __restrict__ ref, const int* __restrict__ samp, const int ns,
+                          const int nnz, const int nb, const int K, int* __restrict__ kind, int* __restrict__ cnt,
+                          int* __restrict__ tot)
+{
+    TOP_PDL_WAIT();
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nb) return;
+    const T* a = values + (size_t)b * nnz;
+    int d = 0;
+    for (int s = 0; s < ns; ++s) d += lr_same(a[samp[s]], ref[samp[s]]) ? 0 : 1;
+    kind[b] = d <= K ? 0 : -1;
+    cnt[b] = 0;
+    if (d <= K) atomicAdd(tot, 1);
+}
+
+// The rows of matrix b that differ from the reference's (bitwise), for the matrices the samples kept: block = (256
+// rows, matrix); cnt[b] counts them, the first K go to rows (in no order: lr_capacitance sorts them)
+template <class T>
+__global__ void lr_diff(const T* __restrict__ values, const T* __restrict__ ref, const int* __restrict__ jptr, const int n,
+                        const int nnz, const int K, const int* __restrict__ kind, int* __restrict__ cnt, int* __restrict__ rows)
+{
+    TOP_PDL_WAIT();
+    const int b = blockIdx.y;
+    if (kind[b] < 0) return;
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    const T* a = values + (size_t)b * nnz;
+    bool d = false;
+    for (int p = jptr[r]; p < jptr[r + 1]; ++p) d = d || !lr_same(a[p], ref[p]);
+    if (d) {
+        const int i = atomicAdd(cnt + b, 1);
+        if (i < K) rows[(size_t)b * K + i] = r;
+    }
+}
+
+// The capacitance matrix of a candidate, S = I + D W_R with D = (A_b - A_ref)[R, :] and W_R = A_ref^-1[:, R]
+// (winv[inv[r] * n + j] = A_ref^-1[j, r]), factorized in place with partial pivoting (whole rows swapped: piv, as
+// LAPACK's getrf). kind[b] = its number of rows, or -1 (factorized like the others) with more than K rows, a zero
+// or non-finite pivot, or pivots spread over more than max_ratio.
+template <class T>
+__global__ void lr_capacitance(const T* __restrict__ values, const T* __restrict__ ref, const int* __restrict__ jptr,
+                               const int* __restrict__ jcol, const int* __restrict__ inv, const T* __restrict__ winv,
+                               const int n, const int nnz, const int nb, const int K, const T max_ratio, int* __restrict__ kind,
+                               const int* __restrict__ cnt, int* __restrict__ rows, T* __restrict__ S, int* __restrict__ piv)
+{
+    TOP_PDL_WAIT();
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nb || kind[b] < 0) return;
+    const int k = cnt[b];
+    if (k > K) { kind[b] = -1; return; }
+    int* rw = rows + (size_t)b * K;
+    for (int a = 1; a < k; ++a) {   // the atomics' order is not reproducible: ascending rows
+        const int x = rw[a];
+        int c = a - 1;
+        while (c >= 0 && rw[c] > x) { rw[c + 1] = rw[c]; --c; }
+        rw[c + 1] = x;
+    }
+    T* Sb = S + (size_t)b * K * K;
+    int* pb = piv + (size_t)b * K;
+    const T* a = values + (size_t)b * nnz;
+    for (int i = 0; i < k; ++i) {
+        const int r = rw[i];
+        for (int c = 0; c < k; ++c) {
+            const T* wc = winv + (size_t)inv[rw[c]] * n;
+            T s = i == c ? T(1) : T(0);
+            for (int p = jptr[r]; p < jptr[r + 1]; ++p) s = fma(a[p] - ref[p], wc[jcol[p]], s);
+            Sb[i * K + c] = s;
+        }
+    }
+    T pmax = T(0), pmin = T(0);
+    bool ok = true;
+    for (int c = 0; c < k && ok; ++c) {
+        int im = c;
+        T vm = fabs(Sb[c * K + c]);
+        for (int i = c + 1; i < k; ++i) {
+            const T x = fabs(Sb[i * K + c]);
+            if (x > vm) { vm = x; im = i; }
+        }
+        pb[c] = im;
+        if (!(vm > T(0)) || isinf(vm)) { ok = false; break; }   // also a NaN column
+        if (im != c)
+            for (int j = 0; j < k; ++j) {
+                const T x = Sb[c * K + j];
+                Sb[c * K + j] = Sb[im * K + j];
+                Sb[im * K + j] = x;
+            }
+        if (c == 0 || vm > pmax) pmax = vm;
+        if (c == 0 || vm < pmin) pmin = vm;
+        const T inv = T(1) / Sb[c * K + c];
+        for (int i = c + 1; i < k; ++i) {
+            const T l = Sb[i * K + c] * inv;
+            Sb[i * K + c] = l;
+            for (int j = c + 1; j < k; ++j) Sb[i * K + j] = fma(-l, Sb[c * K + j], Sb[i * K + j]);
+        }
+    }
+    kind[b] = (ok && !(pmin * max_ratio < pmax)) ? k : -1;
+}
+
+// y = S^-1 (D z) of the candidates, z their reference solve (interleaved, lane c of xi); y per lane
+template <class T>
+__global__ void lr_coeff(const T* __restrict__ values, const T* __restrict__ ref, const int* __restrict__ jptr,
+                         const int* __restrict__ jcol, const int* __restrict__ inv, const T* __restrict__ xi, const int B,
+                         const int nnz, const int nc, const int K, const int* __restrict__ perm, const int* __restrict__ kind,
+                         const int* __restrict__ rows, const T* __restrict__ S, const int* __restrict__ piv, T* __restrict__ y)
+{
+    TOP_PDL_WAIT();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    const int b = perm[c], k = kind[b];
+    const int* rw = rows + (size_t)b * K;
+    const T* Sb = S + (size_t)b * K * K;
+    const int* pb = piv + (size_t)b * K;
+    const T* a = values + (size_t)b * nnz;
+    T t[kLrMaxK];
+    for (int i = 0; i < k; ++i) {
+        const int r = rw[i];
+        T s = T(0);
+        for (int p = jptr[r]; p < jptr[r + 1]; ++p) s = fma(a[p] - ref[p], xi[(size_t)inv[jcol[p]] * B + c], s);
+        t[i] = s;
+    }
+    for (int i = 0; i < k; ++i) {
+        const int im = pb[i];
+        const T x = t[i];
+        t[i] = t[im];
+        t[im] = x;
+    }
+    for (int i = 1; i < k; ++i) {
+        T s = t[i];
+        for (int j = 0; j < i; ++j) s = fma(-Sb[i * K + j], t[j], s);
+        t[i] = s;
+    }
+    for (int i = k - 1; i >= 0; --i) {
+        T s = t[i];
+        for (int j = i + 1; j < k; ++j) s = fma(-Sb[i * K + j], t[j], s);
+        t[i] = s / Sb[i * K + i];
+    }
+    for (int i = 0; i < k; ++i) y[(size_t)c * K + i] = t[i];
+}
+
+// The candidates' solution: dst[matrix, j] = z[j] - sum_a y_a A_ref^-1[j, r_a], z interleaved (lane c of src), the
+// inverse's columns contiguous (32 x 32 tiles as lu_tr_out)
+template <class T>
+__global__ void lu_tr_out_lr(const T* __restrict__ src, const int* __restrict__ map, const int ncols, const int B,
+                             const int nc, T* __restrict__ dst, const int* __restrict__ perm, const int* __restrict__ kind,
+                             const int* __restrict__ rows, const T* __restrict__ y, const T* __restrict__ winv, const int K)
+{
+    TOP_PDL_WAIT();
+    __shared__ T t[32][33];
+    const int j0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    for (int r = threadIdx.y; r < 32; r += 8) {
+        const int j = j0 + r, c = c0 + threadIdx.x;
+        if (c < nc && j < ncols) t[r][threadIdx.x] = src[(size_t)map[j] * B + c];
+    }
+    __syncthreads();
+    for (int r = threadIdx.y; r < 32; r += 8) {
+        const int c = c0 + r, j = j0 + threadIdx.x;
+        if (c < nc && j < ncols) {
+            const int b = perm[c], k = kind[b];
+            T s = t[threadIdx.x][r];
+            for (int a = 0; a < k; ++a) s = fma(-y[(size_t)c * K + a], winv[(size_t)map[rows[(size_t)b * K + a]] * ncols + j], s);
+            dst[(size_t)b * ncols + j] = s;
+        }
+    }
+}
+
+constexpr int kLrMaxKf = 16;
+
+// The rows of a candidate's right-hand side that differ from the reference's (bitwise): block = (256 rows, candidate
+// lane c of matrix perm[c]); cntf[c] counts them, the first Kf go to frows (lr_coeff_cols sorts them)
+template <class T>
+__global__ void lr_fdiff(const T* __restrict__ rhs, const T* __restrict__ fref, const int n, const int Kf,
+                         const int* __restrict__ perm, int* __restrict__ cntf, int* __restrict__ frows)
+{
+    TOP_PDL_WAIT();
+    const int c = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    if (!lr_same(rhs[(size_t)perm[c] * n + r], fref[r])) {
+        const int i = atomicAdd(cntf + c, 1);
+        if (i < Kf) frows[(size_t)c * Kf + i] = r;
+    }
+}
+
+// The columns mode of a candidate (lane c of the columns' lanes): b = f_ref + db (db on the rows F), so z = A_ref^-1 b = z_ref + W_F db and
+// x = z - W_R y, y = S^-1 (D z): the coefficients of the columns W_R (-y) and W_F (db), D z computed from z_ref and
+// the entries of W_F at D's columns.
+template <class T>
+__global__ void lr_coeff_cols(const T* __restrict__ values, const T* __restrict__ ref, const int* __restrict__ jptr,
+                              const int* __restrict__ jcol, const int* __restrict__ inv, const T* __restrict__ rhs,
+                              const T* __restrict__ fref, const T* __restrict__ zref, const T* __restrict__ winv, const int n,
+                              const int nnz,
+                              const int nc, const int K, const int Kf, const int* __restrict__ perm,
+                              const int* __restrict__ kind, const int* __restrict__ rows, const T* __restrict__ S,
+                              const int* __restrict__ piv, const int* __restrict__ cntf, int* __restrict__ frows,
+                              const int* __restrict__ cold, int* __restrict__ ncol, int* __restrict__ colrow,
+                              T* __restrict__ coef)
+{
+    TOP_PDL_WAIT();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    const int co = cold[c];   // the candidate's lane when its right-hand side was compared (cntf, frows)
+    const int b = perm[c], k = kind[b], kf = cntf[co];
+    const int* rw = rows + (size_t)b * K;
+    const T* Sb = S + (size_t)b * K * K;
+    const int* pb = piv + (size_t)b * K;
+    const T* a = values + (size_t)b * nnz;
+    int* fr = frows + (size_t)co * Kf;
+    for (int i = 1; i < kf; ++i) {   // ascending rows: the atomics' order is not reproducible
+        const int x = fr[i];
+        int j = i - 1;
+        while (j >= 0 && fr[j] > x) { fr[j + 1] = fr[j]; --j; }
+        fr[j + 1] = x;
+    }
+    T db[kLrMaxKf];
+    for (int f = 0; f < kf; ++f) db[f] = rhs[(size_t)b * n + fr[f]] - fref[fr[f]];
+    T t[kLrMaxK];
+    for (int i = 0; i < k; ++i) {
+        const int r = rw[i];
+        T s = T(0);
+        for (int p = jptr[r]; p < jptr[r + 1]; ++p) {
+            const int col = jcol[p];
+            T z = zref[col];
+            for (int f = 0; f < kf; ++f) z = fma(winv[(size_t)inv[fr[f]] * n + col], db[f], z);
+            s = fma(a[p] - ref[p], z, s);
+        }
+        t[i] = s;
+    }
+    for (int i = 0; i < k; ++i) {
+        const int im = pb[i];
+        const T x = t[i];
+        t[i] = t[im];
+        t[im] = x;
+    }
+    for (int i = 1; i < k; ++i) {
+        T s = t[i];
+        for (int j = 0; j < i; ++j) s = fma(-Sb[i * K + j], t[j], s);
+        t[i] = s;
+    }
+    for (int i = k - 1; i >= 0; --i) {
+        T s = t[i];
+        for (int j = i + 1; j < k; ++j) s = fma(-Sb[i * K + j], t[j], s);
+        t[i] = s / Sb[i * K + i];
+    }
+    const int CW = K + Kf;
+    int* cr = colrow + (size_t)c * CW;
+    T* cf = coef + (size_t)c * CW;
+    for (int i = 0; i < k; ++i) { cr[i] = inv[rw[i]]; cf[i] = -t[i]; }   // the inverse's columns by pivot
+    for (int f = 0; f < kf; ++f) { cr[k + f] = inv[fr[f]]; cf[k + f] = db[f]; }
+    ncol[c] = k + kf;
+}
+
+// The candidates' solution in the columns mode: dst[matrix, j] = z_ref[j] + sum_q coef_q winv[row_q * n + j]
+template <class T>
+__global__ void lr_out_cols(const T* __restrict__ zref, const T* __restrict__ winv, const int n, const int nc, const int CW,
+                            const int* __restrict__ perm, const int* __restrict__ ncol, const int* __restrict__ colrow,
+                            const T* __restrict__ coef, T* __restrict__ dst)
+{
+    TOP_PDL_WAIT();
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)n * nc) return;
+    const int c = (int)(idx / n), j = (int)(idx - (long long)c * n);
+    const int* cr = colrow + (size_t)c * CW;
+    const T* cf = coef + (size_t)c * CW;
+    T s = zref[j];
+    const int m = ncol[c];
+    for (int q = 0; q < m; ++q) s = fma(cf[q], winv[(size_t)cr[q] * n + j], s);
+    dst[(size_t)perm[c] * n + j] = s;
+}
+
+// The reference's factors complete in v: the trailing block's entries, kept apart (tm), copied in
+template <class T>
+__global__ void lr_densify(const int* __restrict__ top_ent, const T* __restrict__ tm, const int n_top, T* __restrict__ v)
+{
+    TOP_PDL_WAIT();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n_top) v[top_ent[q]] = tm[q];
+}
+
+// A_ref^-1, every column at once: X[p * n + j] = A_ref^-1[j, order[p]], i.e. row p of X is the inverse's column
+// order[p], contiguous. Lane j (an unknown) solves the transposed system A^T x = e_j on the factors (A = L U:
+// U^T w = e, L^T x = w), an entry of U^T / L^T being the transposed entry's value (tpos).
+// lr_inv_walk: w, zero but on the path from pivot inv[j] to the root of the elimination tree (thread = lane):
+// w_i = (e_i - sum_{k < i} U(k, i) w_k) / U(i, i), each w_k pushed to its row's entries -- ancestors, all on the path,
+// one per level: the accumulators stay in the thread, indexed by level. X zeroed beforehand (off the path).
+constexpr int kLrLev = 320;
+template <class T>
+__global__ void lr_inv_walk(const int* __restrict__ inv, const int* __restrict__ lev, const int n_lev, const int* __restrict__ rp,
+                            const int* __restrict__ dp, const int* __restrict__ ci, const T* __restrict__ v, const int n,
+                            T* __restrict__ X)
+{
+    TOP_PDL_WAIT();
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    T acc[kLrLev];
+    for (int l = 0; l < n_lev; ++l) acc[l] = T(0);
+    int i = inv[j];
+    acc[lev[i]] = T(1);
+    for (;;) {
+        const T w = acc[lev[i]] / v[dp[i]];
+        X[(size_t)i * n + j] = w;
+        const int e0 = dp[i] + 1, e1 = rp[i + 1];
+        if (e0 >= e1) break;   // the root
+        for (int e = e0; e < e1; ++e) {
+            const int l = lev[ci[e]];
+            acc[l] = fma(-v[e], w, acc[l]);
+        }
+        i = ci[e0];   // the parent: the first entry of U's row
+    }
+}
+
+// lr_inv_bwd: one level of L^T x = w (the levels downwards: a row's operands are its ancestors), thread =
+// (row, lane), lanes side by side: x_i = w_i - sum_{k > i} L(k, i) x_k
+template <class T>
+__global__ void lr_inv_bwd(const int* __restrict__ rows, const int n_items, const int* __restrict__ rp,
+                           const int* __restrict__ dp, const int* __restrict__ ci, const int* __restrict__ tpos,
+                           const T* __restrict__ v, const int n, T* __restrict__ X)
+{
+    TOP_PDL_WAIT();
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)n_items * n) return;
+    const int it = (int)(idx / n), j = (int)(idx - (long long)it * n);
+    const int i = rows[it];
+    T s = X[(size_t)i * n + j], s2 = T(0);
+    int e = dp[i] + 1;
+    const int ee = rp[i + 1];
+    if (e >= ee) return;   // a root: x = w
+    for (; e + 1 < ee; e += 2) {
+        s = fma(-v[tpos[e]], X[(size_t)ci[e] * n + j], s);
+        s2 = fma(-v[tpos[e + 1]], X[(size_t)ci[e + 1] * n + j], s2);
+    }
+    if (e < ee) s = fma(-v[tpos[e]], X[(size_t)ci[e] * n + j], s);
+    X[(size_t)i * n + j] = s + s2;
+}
+
+// diagnostic (GPUSIM2GRID_OWN_LU_LOWRANK_STATS): out[2 b] = max_i |rhs - A x|, out[2 b + 1] = max_i |rhs|, one block per matrix
+template <class T>
+__global__ void lr_dbg_residual(const T* __restrict__ values, const int* __restrict__ indptr, const int* __restrict__ indices,
+                                const int n, const int nnz, const T* __restrict__ rhs, const T* __restrict__ x, double* __restrict__ out)
+{
+    TOP_PDL_WAIT();
+    __shared__ double red[2][256];
+    const int b = blockIdx.x;
+    const T* a = values + (size_t)b * nnz;
+    const T* xb = x + (size_t)b * n;
+    double mr = 0., mb = 0.;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        T s = rhs[(size_t)b * n + i];
+        mb = fmax(mb, fabs((double)s));
+        for (int p = indptr[i]; p < indptr[i + 1]; ++p) s = fma(-a[p], xb[indices[p]], s);
+        const double r = fabs((double)s);
+        if (!(r <= mr)) mr = r;   // a NaN residual stays
+    }
+    red[0][threadIdx.x] = mr; red[1][threadIdx.x] = mb;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int k = 1; k < blockDim.x; ++k) {
+            if (!(red[0][k] <= mr)) mr = red[0][k];
+            mb = fmax(mb, red[1][k]);
+        }
+        out[2 * b] = mr; out[2 * b + 1] = mb;
+    }
+}
+
+// mask by matrix of a refinement with a lane map: the factorized lanes' clamp counts (1 without them: every one),
+// 0 for the low-rank lanes
+__global__ void lr_slot_mask(const int* __restrict__ perm, const int* __restrict__ clamped, const int nreg, const int nb,
+                             int* __restrict__ slot_mask)
+{
+    TOP_PDL_WAIT();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nb) return;
+    slot_mask[perm[c]] = c < nreg ? (clamped != nullptr ? clamped[c] : 1) : 0;
+}
+
 // Warps per item when few matrices are active: the GPU is mostly idle, so a level whose items carry a real chain
 // of contributions is split over warps (each summing every k-th) whatever its width, the chain cut ~4 x k fold;
 // with many matrices the plan's static choice stays (own_lu's).
@@ -797,6 +1199,43 @@ void TopLu::init(const own_lu::LuPlan& plan, int batch, cudaStream_t stream, dou
     stream_ = stream;
     refine_all_ = own_lu::own_lu_refine_all();
     alloc_batch(batch);
+    // the low-rank first steps (GPUSIM2GRID_OWN_LU_LOWRANK=1): FP64 only, J row-major, A_ref^-1 within its budget
+    lr_on_ = lr_ready_ = lr_failed_ = lr_inv_ready_ = lr_f_ready_ = false;
+    ref_.reset();
+    auto env_on = [](const char* name) { const char* e = std::getenv(name); return e != nullptr && *e != '\0' && *e != '0'; };
+    if (!is_ref_ && env_on("GPUSIM2GRID_OWN_LU_LOWRANK") && sizeof(cuda_real_type) == 8 && batch >= 3
+        && d_jptr_.size() == static_cast<size_t>(n_) + 1) {
+        double max_mb = 4096.;
+        if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_LOWRANK_MAX_MB")) max_mb = std::atof(e);
+        if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_LOWRANK_K")) lr_K_ = std::min(std::max(std::atoi(e), 1), kLrMaxK);
+        if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_LOWRANK_MIN")) lr_min_ = std::max(std::atoi(e), 1);
+        lr_stats_ = env_on("GPUSIM2GRID_OWN_LU_LOWRANK_STATS");
+        if (static_cast<double>(n_) * n_ * sizeof(cuda_real_type) <= max_mb * 1048576.) {
+            lr_on_ = true;
+            ref_ = std::make_unique<TopLu>();
+            ref_->is_ref_ = true;
+            ref_->init(plan, 1, stream, eps, max_top, split_chain, split_items);
+            // the reference's trailing block: the one a large batch uses, whatever the candidates' number
+            ref_->force_cur_ = (batch > top_nb_ && tops_[1].m_ > 0) ? 1 : 0;
+            const size_t K = static_cast<size_t>(lr_K_);
+            d_kind_.assign(B_, -1);
+            d_lr_cnt_.assign(B_ + 1, 0);
+            d_lr_rows_.assign(B_ * K, 0);
+            d_lr_piv_.assign(B_ * K, 0);
+            d_perm_.assign(B_, 0);
+            d_slot_mask_.assign(B_, 0);
+            d_lr_S_.alloc(B_ * K * K);
+            d_lr_y_.alloc(B_ * K);
+            if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_LOWRANK_KF")) lr_Kf_ = std::min(std::max(std::atoi(e), 0), kLrMaxKf);
+            const size_t Kf = static_cast<size_t>(lr_Kf_);
+            d_lr_cntf_.assign(B_ + 1, 0);
+            d_lr_frows_.assign(B_ * std::max<size_t>(Kf, 1), 0);
+            d_lr_ncol_.assign(B_, 0);
+            d_lr_cold_.assign(B_, 0);
+            d_lr_colrow_.assign(B_ * (K + Kf), 0);
+            d_lr_coef_.alloc(B_ * (K + Kf));
+        }
+    }
 }
 
 void TopLu::copy_symbolic_from(const TopLu& o)
@@ -812,6 +1251,8 @@ void TopLu::copy_symbolic_from(const TopLu& o)
         tops_[c].d_tm_.clear();   // batch-sized: alloc_batch
     }
     top_nb_ = o.top_nb_; fuse_nb_ = o.fuse_nb_;
+    d_jptr_ = o.d_jptr_; d_jcol_ = o.d_jcol_; d_samp_ = o.d_samp_; n_samp_ = o.n_samp_;
+    d_tpos_ = o.d_tpos_; d_lev_ = o.d_lev_; n_lev_ = o.n_lev_;
     cur_ = 0;
     fact_gen_ = 0; solve_gen_ = -1;
     interleaved_ok_ = false; out_pending_ = false;
@@ -826,12 +1267,16 @@ void TopLu::set_smem_attributes() const
     if (sf > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_factor<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sf));
     if (sw > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_fwd<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sw));
     if (sb > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_bwd<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, sb));
+    if (sw > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_fwd<T, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sw));
+    if (sb > 0) OWN_LU_CHECK(cudaFuncSetAttribute(top_bwd<T, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sb));
 }
 
 void TopLu::alloc_batch(int batch)
 {
     using T = cuda_real_type;
-    B_ = nb_ = batch;
+    B_ = nb_ = nreg_ = batch;
+    nc_ = 0;
+    lane_map_ = false;
     // no zeroing: every factor entry is written by the factorization before anything reads it (a fill
     // entry's sum starts from 0 in the kernels, LU_START): 4.6 GB of memset per driver build on PtFige
     d_v_.alloc(static_cast<size_t>(n_ent_) * B_);
@@ -1040,6 +1485,49 @@ void TopLu::init_symbolic(const own_lu::LuPlan& plan, int max_top, int split_cha
         up(d_ra_ptr_, ra_ptr);
         up(d_ra_p_, ra_p);
         up(d_ra_col_, ra_col);
+    }
+
+    // J's own rows (the low-rank first steps compare matrices row by row): a position's row and column from
+    // its factor entry; one sampled position per sampled row. Left empty when the positions are not row-major.
+    {
+        std::vector<int> jptr(n + 1, 0), jcol(nnz_), samp;
+        bool row_major = true;
+        int prev = 0;
+        for (int p = 0; p < nnz_; ++p) {
+            const int e = plan.a_ent[p];
+            const int r = plan.order[erow[e]];
+            jcol[p] = plan.order[ci[e]];
+            if (r < prev) row_major = false;
+            prev = r;
+            ++jptr[r + 1];
+        }
+        for (int i = 0; i < n; ++i) jptr[i + 1] += jptr[i];
+        if (!row_major) jptr.assign(1, 0);
+        else {
+            const int ns = std::min(64, n);
+            for (int s2 = 0; s2 < ns; ++s2) {
+                const int p = jptr[static_cast<long long>(s2) * n / ns];
+                if (p < nnz_ && (samp.empty() || samp.back() != p)) samp.push_back(p);
+            }
+        }
+        n_samp_ = static_cast<int>(samp.size());
+        up(d_jptr_, jptr);
+        up(d_jcol_, jcol);
+        up(d_samp_, samp);
+    }
+    {
+        std::vector<int> tpos(n_ent_);
+        for (int i = 0; i < n; ++i)
+            for (int e = rp[i]; e < rp[i + 1]; ++e) {   // (i, j) -> (j, i): the pattern is symmetric
+                const int j = ci[e];
+                const auto b = ci.begin() + rp[j], en = ci.begin() + rp[j + 1];
+                const auto it = std::lower_bound(b, en, i);
+                if (it == en || *it != i) throw std::logic_error("[top_lu] the factors' pattern is not symmetric");
+                tpos[e] = static_cast<int>(it - ci.begin());
+            }
+        up(d_tpos_, tpos);
+        up(d_lev_, level);
+        n_lev_ = H;
     }
 
     if (const char* e = std::getenv("GPUSIM2GRID_TOP_LU_M")) max_top = std::atoi(e);
@@ -1276,28 +1764,274 @@ int TopLu::launches_solve() const
 void TopLu::set_active(int nb)
 {
     if (nb < 1 || nb > B_) throw std::invalid_argument("[top_lu::TopLu::set_active] need 1 <= nb <= batch");
+    if (nb == nb_) return;
     nb_ = nb;
+    nreg_ = nb;   // until the next factorize(): no lane map
+    nc_ = 0;
+    lane_map_ = false;
+}
+
+TopLu::Factors TopLu::own_factors(int nb) const
+{
+    return Factors{d_v_.data(), raw(tops_[cur_].d_tm_), false, nb};
+}
+
+// ---- low-rank first steps ----
+
+namespace {
+// GPUSIM2GRID_OWN_LU_LOWRANK_STATS: wall time of a phase, the stream drained before and after (diagnostic only)
+struct LrPhase {
+    const char* what; cudaStream_t s; bool on; std::chrono::steady_clock::time_point t0;
+    LrPhase(const char* w, cudaStream_t st, bool o) : what(w), s(st), on(o)
+    {
+        if (on) { cudaStreamSynchronize(s); t0 = std::chrono::steady_clock::now(); }
+    }
+    ~LrPhase()
+    {
+        if (!on) return;
+        cudaStreamSynchronize(s);
+        std::fprintf(stderr, "[top_lu]   %-22s %7.3f ms\n", what,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+};
+}  // namespace
+
+// The reference: the entrywise majority of three matrices of the first factorization -- the first, the middle and
+// the last one: far apart in the caller's order, so unlikely to change the same rows (the first three contingencies
+// of an N-1 often trip branches of one bus) --, factorized once. A reference whose factorization clamps a pivot is
+// not the matrix the identity needs: the path stays off.
+void TopLu::lr_setup_reference(const cuda_real_type* values)
+{
+    using T = cuda_real_type;
+    if (nb_ < 3) return;
+    d_jref_.alloc(static_cast<size_t>(nnz_));
+    lr_ref_[0] = 0; lr_ref_[1] = nb_ / 2; lr_ref_[2] = nb_ - 1;
+    pdl_launch(lr_majority<T>, dim3(blocks_for(nnz_)), dim3(kThreads), 0, stream_, values + static_cast<size_t>(lr_ref_[0]) * nnz_,
+               values + static_cast<size_t>(lr_ref_[1]) * nnz_, values + static_cast<size_t>(lr_ref_[2]) * nnz_, nnz_,
+               d_jref_.data());
+    {
+        LrPhase ph_("reference factorize", stream_, lr_stats_);
+        ref_->factorize(d_jref_.data());
+    }
+    if (ref_->batch_clamp_total() != 0) {
+        lr_failed_ = true;
+        if (lr_stats_) std::fprintf(stderr, "[top_lu] low rank: the reference clamps a pivot, path off\n");
+        return;
+    }
+    lr_ready_ = true;
+}
+
+// A_ref^-1 (winv[p * n + j] = A_ref^-1[j, order[p]]) from the reference's factors, its trailing block's entries
+// first copied into them (the kernels read one array): the forward part along each unit vector's path, the
+// backward part level by level, every column at once.
+void TopLu::lr_build_inverse()
+{
+    using T = cuda_real_type;
+    if (n_lev_ > kLrLev) { lr_failed_ = true; return; }
+    try {
+        d_winv_.alloc(static_cast<size_t>(n_) * n_);
+    } catch (const std::exception&) {
+        cudaGetLastError();
+        lr_failed_ = true;
+        return;
+    }
+    const Top& t = ref_->tops_[ref_->cur_];
+    if (t.m_ > 0 && !ref_->levels_only_)
+        pdl_launch(lr_densify<T>, dim3((t.n_top_ + 255) / 256), dim3(256), 0, stream_, raw(t.d_top_ent_), raw(t.d_tm_), t.n_top_,
+                   ref_->d_v_.data());
+    const T* v = ref_->d_v_.data();
+    T* X = d_winv_.data();
+    const int* rp = raw(d_rp_); const int* dp = raw(d_dp_); const int* ci = raw(d_ci_); const int* tpos = raw(d_tpos_);
+    {
+        LrPhase ph_("inverse: zero", stream_, lr_stats_);
+        OWN_LU_CHECK(cudaMemsetAsync(X, 0, sizeof(T) * static_cast<size_t>(n_) * n_, stream_));
+    }
+    {
+        LrPhase ph_("inverse: forward", stream_, lr_stats_);
+        pdl_launch(lr_inv_walk<T>, dim3((n_ + 31) / 32), dim3(32), 0, stream_, raw(d_inv_), raw(d_lev_), n_lev_, rp, dp, ci, v, n_, X);
+    }
+    LrPhase ph_("inverse: backward", stream_, lr_stats_);
+    for (auto L = fw_all_.launches.rbegin(); L != fw_all_.launches.rend(); ++L)
+        pdl_launch(lr_inv_bwd<T>, dim3(blocks_for(static_cast<long long>(L->count) * n_)), dim3(kThreads), 0, stream_,
+                   raw(fw_all_.d_rows) + L->offset, L->count, rp, dp, ci, tpos, v, n_, X);
+    lr_inv_ready_ = true;
+}
+
+// Which matrices of this factorization take the low-rank path: those whose sampled entries are the reference's
+// (but K at most), then whose rows are (but K at most), then whose capacitance matrix factorizes with pivots of
+// comparable size. Sets the lanes (d_perm_: the others first, in order, then the candidates, in order).
+void TopLu::lr_classify(const cuda_real_type* values)
+{
+    using T = cuda_real_type;
+    const int nb = nb_, K = lr_K_;
+    int* kind = rawm(d_kind_);
+    int* cnt = rawm(d_lr_cnt_);
+    OWN_LU_CHECK(cudaMemsetAsync(cnt + B_, 0, sizeof(int), stream_));
+    pdl_launch(lr_sample<T>, dim3((nb + 255) / 256), dim3(256), 0, stream_, values, d_jref_.data(), raw(d_samp_), n_samp_,
+               nnz_, nb, K, kind, cnt, cnt + B_);
+    int n0 = 0;
+    OWN_LU_CHECK(cudaMemcpyAsync(&n0, cnt + B_, sizeof(int), cudaMemcpyDeviceToHost, stream_));
+    OWN_LU_CHECK(cudaStreamSynchronize(stream_));
+    if (n0 < lr_min_) return;
+    if (!lr_inv_ready_) {
+        LrPhase ph_("inverse", stream_, lr_stats_);
+        lr_build_inverse();
+        if (lr_failed_) return;
+    }
+    LrPhase ph_diff("diff + capacitance", stream_, lr_stats_);
+    pdl_launch(lr_diff<T>, dim3((n_ + 255) / 256, nb), dim3(256), 0, stream_, values, d_jref_.data(), raw(d_jptr_), n_, nnz_,
+               K, kind, cnt, rawm(d_lr_rows_));
+    pdl_launch(lr_capacitance<T>, dim3((nb + 31) / 32), dim3(32), 0, stream_, values, d_jref_.data(), raw(d_jptr_),
+               raw(d_jcol_), raw(d_inv_), d_winv_.data(), n_, nnz_, nb, K, static_cast<T>(lr_max_ratio_), kind, cnt, rawm(d_lr_rows_),
+               d_lr_S_.data(), rawm(d_lr_piv_));
+    h_kind_.resize(static_cast<size_t>(nb));
+    OWN_LU_CHECK(cudaMemcpyAsync(h_kind_.data(), kind, sizeof(int) * nb, cudaMemcpyDeviceToHost, stream_));
+    OWN_LU_CHECK(cudaStreamSynchronize(stream_));
+    int nc = 0;
+    for (int b = 0; b < nb; ++b) nc += h_kind_[static_cast<size_t>(b)] >= 0;
+    if (lr_stats_) {
+        int hist[kLrMaxK + 1] = {0};
+        for (int b = 0; b < nb; ++b)
+            if (h_kind_[static_cast<size_t>(b)] >= 0) ++hist[h_kind_[static_cast<size_t>(b)]];
+        std::fprintf(stderr, "[top_lu] low rank: %d matrices, %d kept by the samples, %d candidates, by rows:", nb, n0, nc);
+        for (int k = 0; k <= K; ++k)
+            if (hist[k]) std::fprintf(stderr, " %d:%d", k, hist[k]);
+        std::fprintf(stderr, "\n");
+    }
+    if (nc < lr_min_) return;
+    h_perm_.resize(static_cast<size_t>(nb));
+    int r = 0, c = nb - nc;
+    for (int b = 0; b < nb; ++b) h_perm_[static_cast<size_t>(h_kind_[static_cast<size_t>(b)] >= 0 ? c++ : r++)] = b;
+    OWN_LU_CHECK(cudaMemcpyAsync(rawm(d_perm_), h_perm_.data(), sizeof(int) * nb, cudaMemcpyHostToDevice, stream_));
+    OWN_LU_CHECK(cudaStreamSynchronize(stream_));   // h_perm_ may be rewritten by the next call
+    nreg_ = nb - nc;
+    nc_ = nc;
+    lane_map_ = true;
+}
+
+// The columns mode's test and data: the reference right-hand side (the majority of the reference matrix's three
+// rows: set at the first solve) and its solution z_ref, then each candidate's rows off it. The
+// candidates with more than lr_Kf_ of them are solved on the reference's factors: their lanes come first
+// (the candidates' lanes hold nothing yet), d_lr_cold_ keeping where each one was when compared.
+int TopLu::lr_prepare_rhs(const cuda_real_type* b)
+{
+    using T = cuda_real_type;
+    if (lr_Kf_ <= 0 || (!lr_f_ready_ && nb_ <= lr_ref_[2])) return nc_;
+    if (!lr_f_ready_) {
+        d_fref_.alloc(static_cast<size_t>(n_));
+        d_zref_.alloc(static_cast<size_t>(n_));
+        pdl_launch(lr_majority<T>, dim3(blocks_for(n_)), dim3(kThreads), 0, stream_, b + static_cast<size_t>(lr_ref_[0]) * n_,
+                   b + static_cast<size_t>(lr_ref_[1]) * n_, b + static_cast<size_t>(lr_ref_[2]) * n_, n_, d_fref_.data());
+        ref_->solve(d_fref_.data(), d_zref_.data());
+        ref_->flush();
+        lr_f_ready_ = true;
+    }
+    int* cntf = rawm(d_lr_cntf_);
+    OWN_LU_CHECK(cudaMemsetAsync(cntf, 0, sizeof(int) * nc_, stream_));
+    pdl_launch(lr_fdiff<T>, dim3((n_ + 255) / 256, nc_), dim3(256), 0, stream_, b, d_fref_.data(), n_, lr_Kf_,
+               raw(d_perm_) + nreg_, cntf, rawm(d_lr_frows_));
+    h_cntf_.resize(static_cast<size_t>(nc_));
+    OWN_LU_CHECK(cudaMemcpyAsync(h_cntf_.data(), cntf, sizeof(int) * nc_, cudaMemcpyDeviceToHost, stream_));
+    OWN_LU_CHECK(cudaStreamSynchronize(stream_));
+    int nB = 0;
+    for (int c = 0; c < nc_; ++c) nB += h_cntf_[static_cast<size_t>(c)] > lr_Kf_;
+    // lanes: the solved candidates, then the columns ones (both in order); h_tail_: [matrices | former lanes]
+    h_tail_.resize(2 * static_cast<size_t>(nc_));
+    int iB = 0, iA = nB;
+    for (int c = 0; c < nc_; ++c) {
+        const int at = h_cntf_[static_cast<size_t>(c)] > lr_Kf_ ? iB++ : iA++;
+        h_tail_[static_cast<size_t>(at)] = h_perm_[static_cast<size_t>(nreg_ + c)];
+        h_tail_[static_cast<size_t>(nc_ + at)] = c;
+    }
+    for (int c = 0; c < nc_; ++c) h_perm_[static_cast<size_t>(nreg_ + c)] = h_tail_[static_cast<size_t>(c)];
+    OWN_LU_CHECK(cudaMemcpyAsync(rawm(d_perm_) + nreg_, h_tail_.data(), sizeof(int) * nc_, cudaMemcpyHostToDevice, stream_));
+    OWN_LU_CHECK(cudaMemcpyAsync(rawm(d_lr_cold_), h_tail_.data() + nc_, sizeof(int) * nc_, cudaMemcpyHostToDevice, stream_));
+    OWN_LU_CHECK(cudaStreamSynchronize(stream_));   // h_tail_ may be rewritten by the next call
+    if (lr_stats_) std::fprintf(stderr, "[top_lu] low rank: %d candidates solved on the reference, %d by columns\n", nB, nc_ - nB);
+    return nB;
+}
+
+// The candidates' lanes: z on the reference's factors, then the coefficients of the correction (lu_tr_out_lr
+// applies it when the solution is written out)
+void TopLu::lr_solve_candidates(int nB)
+{
+    using T = cuda_real_type;
+    const int rc = ref_->cur_;
+    const Factors f{ref_->d_v_.data(), raw(ref_->tops_[rc].d_tm_), true, nB};
+    T* xc = d_xi_.data() + nreg_;
+    {
+        LrPhase ph_("solve: shared", stream_, lr_stats_);
+        solve_core(tops_[rc], xc, nullptr, f);
+    }
+    LrPhase ph_("solve: coefficients", stream_, lr_stats_);
+    pdl_launch(lr_coeff<T>, dim3((nB + 31) / 32), dim3(32), 0, stream_, last_values_, d_jref_.data(), raw(d_jptr_),
+               raw(d_jcol_), raw(d_inv_), xc, B_, nnz_, nB, lr_K_, raw(d_perm_) + nreg_, raw(d_kind_), raw(d_lr_rows_),
+               d_lr_S_.data(), raw(d_lr_piv_), d_lr_y_.data());
+}
+
+void TopLu::write_out(cuda_real_type* x, const cuda_real_type* add, const int* mask)
+{
+    using T = cuda_real_type;
+    const int* perm = lane_map_ ? raw(d_perm_) : nullptr;
+    dim3 tblock(32, 8);
+    LrPhase ph_("solve: x out", stream_, lr_stats_ && lr_on_);
+    if (nreg_ > 0) {
+        dim3 tgrid((n_ + 31) / 32, (nreg_ + 31) / 32);
+        if (add != nullptr)
+            pdl_launch(lu_tr_out_add<T>, dim3(tgrid), dim3(tblock), 0, stream_, d_xi_.data(), add, raw(d_inv_), n_, B_, nreg_,
+                       x, mask, perm);
+        else
+            pdl_launch(lu_tr_out<T>, dim3(tgrid), dim3(tblock), 0, stream_, d_xi_.data(), raw(d_inv_), n_, B_, nreg_, x, perm);
+    }
+    if (pending_lr_ && lr_nB_ > 0) {
+        dim3 tgrid((n_ + 31) / 32, (lr_nB_ + 31) / 32);
+        pdl_launch(lu_tr_out_lr<T>, dim3(tgrid), dim3(tblock), 0, stream_, d_xi_.data() + nreg_, raw(d_inv_), n_, B_, lr_nB_, x,
+                   raw(d_perm_) + nreg_, raw(d_kind_), raw(d_lr_rows_), d_lr_y_.data(), d_winv_.data(), lr_K_);
+    }
+    if (pending_lr_ && lr_nA_ > 0) {
+        pdl_launch(lr_out_cols<T>, dim3(blocks_for(static_cast<long long>(n_) * lr_nA_)), dim3(kThreads), 0, stream_,
+                   d_zref_.data(), d_winv_.data(), n_, lr_nA_, lr_K_ + lr_Kf_, raw(d_perm_) + nreg_ + lr_nB_, raw(d_lr_ncol_),
+                   raw(d_lr_colrow_), d_lr_coef_.data(), x);
+    }
+    out_pending_ = false;
+    pending_lr_ = false;
 }
 
 void TopLu::factorize(const cuda_real_type* values)
 {
     using T = cuda_real_type;
-    const int B = B_, nb = nb_;
+    lane_map_ = false;
+    nreg_ = nb_;
+    nc_ = 0;
+    if (lr_on_ && !lr_failed_) {
+        LrPhase ph_("classification (all)", stream_, lr_stats_);
+        if (!lr_ready_) lr_setup_reference(values);
+        if (lr_ready_) lr_classify(values);
+    }
+    LrPhase ph_f("factorization", stream_, lr_stats_ && lr_on_);
+    const int B = B_, nb = nreg_;   // the lanes factorized
+    const int* perm = lane_map_ ? raw(d_perm_) : nullptr;
     T* v = rawm(d_v_);
     T* ai = rawm(d_ai_);
     T* tol = rawm(d_tol_);
-    int* clamped = rawm(d_clamped_) + 1;   // per matrix; clamped[-1]: the batch's total
-    OWN_LU_CHECK(cudaMemsetAsync(clamped - 1, 0, sizeof(int) * (nb + 1), stream_));
-    OWN_LU_CHECK(cudaMemsetAsync(rawm(d_amax_), 0, sizeof(unsigned long long) * nb, stream_));
+    int* clamped = rawm(d_clamped_) + 1;   // per lane; clamped[-1]: the batch's total
+    OWN_LU_CHECK(cudaMemsetAsync(clamped - 1, 0, sizeof(int) * (nb_ + 1), stream_));
+    OWN_LU_CHECK(cudaMemsetAsync(rawm(d_amax_), 0, sizeof(unsigned long long) * nb_, stream_));
+    cur_ = force_cur_ >= 0 ? force_cur_ : ((nb > top_nb_ && tops_[1].m_ > 0) ? 1 : 0);  // the solves that follow use the same T
+    ++fact_gen_;
+    last_values_ = values;
+    if (nb == 0) {
+        OWN_LU_CHECK(cudaGetLastError());
+        return;
+    }
     {   // J -> interleaved A + max |A_b|, then the clamps
         const int tiles = (nnz_ + 31) / 32;
         dim3 grid(std::min(tiles, 1024), (nb + 31) / 32), block(32, 8);
-        pdl_launch(lu_tr_in_vals<T>, dim3(grid), dim3(block), 0, stream_, values, nnz_, B, nb, ai, rawm(d_amax_));
+        pdl_launch(lu_tr_in_vals<T>, dim3(grid), dim3(block), 0, stream_, values, nnz_, B, nb, ai, rawm(d_amax_), perm);
         pdl_launch(lu_tol_from_max<T>, dim3((nb + 255) / 256), dim3(256), 0, stream_, raw(d_amax_), eps_, nb, tol);
     }
     const int* tgt = raw(d_tgt_); const int* src = raw(d_src_); const int* cptr = raw(d_cptr_);
     const int* dg = raw(d_dg_); const int* cl = raw(d_cl_); const int* cu = raw(d_cu_);
-    cur_ = (nb > top_nb_ && tops_[1].m_ > 0) ? 1 : 0;  // the solves that follow use the same T
     Top& t = tops_[cur_];
     const bool dense = t.m_ > 0 && !levels_only_;
     for (const Launch& L : dense ? t.f_bottom_ : f_all_) {
@@ -1307,15 +2041,15 @@ void TopLu::factorize(const cuda_real_type* values)
             pdl_launch(lu_left_split<T>, dim3(grid), dim3(32 * k), lu_split_smem<T>(k), stream_, tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu,
                                                              dg + L.offset, B, nb, L.is_u ? 1 : 0, tol, clamped, v);
         } else if (L.is_u) {
-            pdl_launch(lu_left_u<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, 
+            pdl_launch(lu_left_u<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_,
                 tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, nb, tol, clamped, v);
         } else {
-            pdl_launch(lu_left_l<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, 
+            pdl_launch(lu_left_l<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_,
                 tgt + L.offset, src + L.offset, ai, cptr + L.offset, cl, cu, dg + L.offset, L.count, B, nb, v);
         }
     }
     if (dense) {
-        pdl_launch(top_outside<T>, dim3(dim3((t.n_oa_ + 31) / 32, (nb + 31) / 32)), dim3(dim3(32, 8)), 0, stream_, 
+        pdl_launch(top_outside<T>, dim3(dim3((t.n_oa_ + 31) / 32, (nb + 31) / 32)), dim3(dim3(32, 8)), 0, stream_,
             raw(t.d_oa_tgt_), raw(t.d_oa_src_), ai, raw(t.d_oa_cptr_), raw(t.d_oa_cl_), raw(t.d_oa_cu_), t.n_oa_, t.n_top_, B, nb, v, rawm(t.d_tm_));
         const int m = t.m_;
         const size_t sf = (static_cast<size_t>(t.n_top_) + 2 * m) * sizeof(T);
@@ -1323,27 +2057,32 @@ void TopLu::factorize(const cuda_real_type* values)
                                                                raw(t.d_uslot_), raw(t.d_pp_ptr_), raw(t.d_pslot_), B, nb, tol,
                                                                clamped, rawm(t.d_tm_));
     }
-    ++fact_gen_;
-    last_values_ = values;
     OWN_LU_CHECK(cudaGetLastError());
 }
 
-void TopLu::run_solve(const Sched& s, bool forward, cuda_real_type* xi, const int* mask)
+// a solve kernel on this instance's factors or on shared ones (Factors::shared)
+#define TOP_LAUNCH_SH(K, ...)                                \
+    do {                                                     \
+        if (f.shared) pdl_launch(K<T, true>, __VA_ARGS__);   \
+        else pdl_launch(K<T, false>, __VA_ARGS__);           \
+    } while (0)
+
+void TopLu::run_solve(const Sched& s, bool forward, cuda_real_type* xi, const int* mask, const Factors& f)
 {
     using T = cuda_real_type;
-    const int B = B_, nb = nb_;
-    const T* v = raw(d_v_);
+    const int B = B_, nb = f.nb;
+    const T* v = f.v;
     const int* rp = raw(d_rp_); const int* dp = raw(d_dp_); const int* ci = raw(d_ci_);
     const int n_lv = static_cast<int>(s.launches.size());
     auto level = [&](const Launch& L) {
         const int* rows = raw(s.d_rows) + L.offset;
         const int k = split_for(L.k, L.count, L.mc, nb);
         if (forward) {
-            if (k > 1) pdl_launch(lu_fwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), lu_split_smem<T>(k), stream_, rows, rp, dp, ci, B, nb, v, xi, mask);
-            else pdl_launch(lu_fwd<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi, mask);
+            if (k > 1) TOP_LAUNCH_SH(lu_fwd_split, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), lu_split_smem<T>(k), stream_, rows, rp, dp, ci, B, nb, v, xi, mask);
+            else TOP_LAUNCH_SH(lu_fwd, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi, mask);
         } else {
-            if (k > 1) pdl_launch(lu_bwd_split<T>, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), lu_split_smem<T>(k), stream_, rows, rp, dp, ci, B, nb, v, xi, mask);
-            else pdl_launch(lu_bwd<T>, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi, mask);
+            if (k > 1) TOP_LAUNCH_SH(lu_bwd_split, dim3(dim3(L.count, (nb + 31) / 32)), dim3(32 * k), lu_split_smem<T>(k), stream_, rows, rp, dp, ci, B, nb, v, xi, mask);
+            else TOP_LAUNCH_SH(lu_bwd, dim3(blocks_for((long long)L.count * nb)), dim3(kThreads), 0, stream_, rows, rp, dp, ci, L.count, B, nb, v, xi, mask);
         }
     };
     // a fused run is one block per 32 matrices: with many active matrices it leaves most of the GPU idle (issue
@@ -1355,50 +2094,80 @@ void TopLu::run_solve(const Sched& s, bool forward, cuda_real_type* xi, const in
                 for (int l = st.first; l < st.last; ++l) level(s.launches[static_cast<size_t>(l)]);
                 continue;
             }
-            if (forward)
-                pdl_launch(lu_solve_run<T, true>, dim3((nb + 31) / 32), dim3(kRunThreads), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first,
-                                                                                 st.last, n_lv, rp, dp, ci, B, nb, v, xi, mask);
-            else
-                pdl_launch(lu_solve_run<T, false>, dim3((nb + 31) / 32), dim3(kRunThreads), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first,
-                                                                                  st.last, n_lv, rp, dp, ci, B, nb, v, xi, mask);
+            const dim3 grid((nb + 31) / 32), block(kRunThreads);
+            if (forward) {
+                if (f.shared) pdl_launch(lu_solve_run<T, true, true>, dim3(grid), dim3(block), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first, st.last, n_lv, rp, dp, ci, B, nb, v, xi, mask);
+                else pdl_launch(lu_solve_run<T, true, false>, dim3(grid), dim3(block), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first, st.last, n_lv, rp, dp, ci, B, nb, v, xi, mask);
+            } else {
+                if (f.shared) pdl_launch(lu_solve_run<T, false, true>, dim3(grid), dim3(block), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first, st.last, n_lv, rp, dp, ci, B, nb, v, xi, mask);
+                else pdl_launch(lu_solve_run<T, false, false>, dim3(grid), dim3(block), 0, stream_, raw(s.d_rows), raw(s.d_run), st.first, st.last, n_lv, rp, dp, ci, B, nb, v, xi, mask);
+            }
             continue;
         }
         level(s.launches[static_cast<size_t>(st.launch)]);
     }
 }
 
-void TopLu::solve_core(const Top& t, cuda_real_type* xi, const int* mask)
+void TopLu::solve_core(const Top& t, cuda_real_type* xi, const int* mask, const Factors& f)
 {
     using T = cuda_real_type;
-    const int B = B_, nb = nb_;
+    const int B = B_, nb = f.nb;
+    if (nb <= 0) return;
     if (t.m_ > 0 && !levels_only_) {
         const int m = t.m_;
-        run_solve(t.fw_rest_, true, xi, mask);
+        run_solve(t.fw_rest_, true, xi, mask, f);
         const size_t sw = (m + t.n_fl_) * sizeof(T) + (m + 1 + t.n_fl_) * 4;
-        pdl_launch(top_fo<T>, dim3(dim3(m, (nb + 31) / 32)), dim3(32 * 8), 0, stream_, raw(t.d_t_rows_), raw(t.d_fo_ptr_), raw(t.d_fo_ent_), raw(t.d_fo_col_),
-                                                                 B, nb, raw(d_v_), xi, mask);
-        pdl_launch(top_fwd<T>, dim3(nb), dim3(kTopSolveThreads), sw, stream_, m, t.n_top_, raw(t.d_t_rows_), raw(t.d_rk_ptr_), raw(t.d_rk_), raw(t.d_fl_q_), t.n_fl_,
-                                                           B, nb, raw(t.d_tm_), xi, mask);
+        TOP_LAUNCH_SH(top_fo, dim3(dim3(m, (nb + 31) / 32)), dim3(32 * 8), 0, stream_, raw(t.d_t_rows_), raw(t.d_fo_ptr_), raw(t.d_fo_ent_), raw(t.d_fo_col_),
+                                                                 B, nb, f.v, xi, mask);
+        TOP_LAUNCH_SH(top_fwd, dim3(nb), dim3(kTopSolveThreads), sw, stream_, m, t.n_top_, raw(t.d_t_rows_), raw(t.d_rk_ptr_), raw(t.d_rk_), raw(t.d_fl_q_), t.n_fl_,
+                                                           B, nb, f.tm, xi, mask);
         const size_t sb = (3 * m + t.n_bu_) * sizeof(T) + (m + 1 + t.n_bu_) * 4;
-        pdl_launch(top_bwd<T>, dim3(nb), dim3(kTopSolveThreads), sb, stream_, m, t.n_top_, raw(t.d_t_rows_), raw(t.d_bu_ptr_), raw(t.d_bu_row_), raw(t.d_bu_q_),
-                                                           t.n_bu_, raw(t.d_dg_q_), B, nb, raw(t.d_tm_), xi, mask);
-        run_solve(t.bw_rest_, false, xi, mask);
+        TOP_LAUNCH_SH(top_bwd, dim3(nb), dim3(kTopSolveThreads), sb, stream_, m, t.n_top_, raw(t.d_t_rows_), raw(t.d_bu_ptr_), raw(t.d_bu_row_), raw(t.d_bu_q_),
+                                                           t.n_bu_, raw(t.d_dg_q_), B, nb, f.tm, xi, mask);
+        run_solve(t.bw_rest_, false, xi, mask, f);
     } else {
-        run_solve(fw_all_, true, xi, mask);
-        run_solve(bw_all_, false, xi, mask);
+        run_solve(fw_all_, true, xi, mask, f);
+        run_solve(bw_all_, false, xi, mask, f);
     }
 }
 
-void TopLu::solve(const cuda_real_type* b, cuda_real_type* x) { solve_impl(b, x, nullptr); }
+#undef TOP_LAUNCH_SH
 
-void TopLu::solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask)
+void TopLu::solve(const cuda_real_type* b, cuda_real_type* x) { solve_impl(b, x, nullptr, true); }
+
+void TopLu::solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask, bool with_lowrank)
 {
     using T = cuda_real_type;
     const int B = B_, nb = nb_;
     T* xi = rawm(d_xi_);
-    dim3 tgrid((n_ + 31) / 32, (nb + 31) / 32), tblock(32, 8);
-    pdl_launch(lu_tr_in2<T>, dim3(tgrid), dim3(tblock), 0, stream_, b, raw(d_inv_), n_, B, nb, rawm(d_bi_), xi);
-    solve_core(tops_[cur_], xi, mask);
+    const int* perm = lane_map_ ? raw(d_perm_) : nullptr;
+    int nB = 0, nA = 0;   // the low-rank lanes: solved on the reference's factors, by columns
+    if (with_lowrank && nc_ > 0) {
+        LrPhase ph_("solve: rhs rows", stream_, lr_stats_);
+        nB = lr_prepare_rhs(b);
+        nA = nc_ - nB;
+    }
+    const int nin = nreg_ + nB;   // the lanes whose right-hand side is solved on
+    if (nin > 0) {
+        LrPhase ph_("solve: b in", stream_, lr_stats_ && lr_on_);
+        dim3 tgrid((n_ + 31) / 32, (nin + 31) / 32), tblock(32, 8);
+        pdl_launch(lu_tr_in2<T>, dim3(tgrid), dim3(tblock), 0, stream_, b, raw(d_inv_), n_, B, nin, rawm(d_bi_), xi, perm);
+    }
+    {
+        LrPhase ph_("solve: factorized", stream_, lr_stats_ && lr_on_);
+        solve_core(tops_[cur_], xi, mask, own_factors(nreg_));
+    }
+    if (nB > 0) lr_solve_candidates(nB);
+    if (nA > 0) {
+        LrPhase ph_("solve: column coeffs", stream_, lr_stats_);
+        pdl_launch(lr_coeff_cols<T>, dim3((nA + 31) / 32), dim3(32), 0, stream_, last_values_, d_jref_.data(), raw(d_jptr_),
+                   raw(d_jcol_), raw(d_inv_), b, d_fref_.data(), d_zref_.data(), d_winv_.data(), n_, nnz_, nA, lr_K_, lr_Kf_,
+                   raw(d_perm_) + nreg_ + nB, raw(d_kind_), raw(d_lr_rows_), d_lr_S_.data(), raw(d_lr_piv_), raw(d_lr_cntf_),
+                   rawm(d_lr_frows_), raw(d_lr_cold_) + nB, rawm(d_lr_ncol_), rawm(d_lr_colrow_), d_lr_coef_.data());
+    }
+    pending_lr_ = nB + nA > 0;
+    lr_nB_ = nB;
+    lr_nA_ = nA;
     // x is written back by refine() (once, with the correction: x + d) or by flush(); solve() leaves it pending
     out_pending_ = true;
     // the interleaved b and x stay valid for refine() while nothing was factorized in between and this is the
@@ -1414,31 +2183,49 @@ void TopLu::refine(const cuda_real_type* values, const int* indptr, const int* i
                    cuda_real_type* x, int steps)
 {
     using T = cuda_real_type;
+    if (lr_stats_ && lr_on_ && out_pending_ && x == last_x_ && b == last_b_ && std::getenv("GPUSIM2GRID_OWN_LU_LOWRANK_CHECK")) {   // diagnostic: every matrix's residual
+        flush();
+        thrust::device_vector<double> d_out(2 * static_cast<size_t>(nb_));
+        pdl_launch(lr_dbg_residual<T>, dim3(nb_), dim3(256), 0, stream_, values, indptr, indices, n_, nnz_, b, x, rawm(d_out));
+        OWN_LU_CHECK(cudaStreamSynchronize(stream_));
+        std::vector<double> h(2 * static_cast<size_t>(nb_));
+        OWN_LU_CHECK(cudaMemcpy(h.data(), rawm(d_out), sizeof(double) * h.size(), cudaMemcpyDeviceToHost));
+        double worst[2] = {0., 0.};
+        int bad[2] = {0, 0}, cnt[2] = {0, 0};
+        for (int m = 0; m < nb_; ++m) {
+            const int lr = lane_map_ && h_kind_[static_cast<size_t>(m)] >= 0 ? 1 : 0;
+            const double rel = h[2 * m] / std::max(h[2 * m + 1], 1e-300);
+            ++cnt[lr];
+            if (!(rel <= worst[lr])) worst[lr] = rel;
+            if (!(rel <= 1e-8)) ++bad[lr];
+        }
+        std::fprintf(stderr, "[top_lu] residuals max|b - A x| / max|b|: factorized %d lanes worst %.2e (%d above 1e-8), "
+                     "low rank %d lanes worst %.2e (%d above 1e-8)\n", cnt[0], worst[0], bad[0], cnt[1], worst[1], bad[1]);
+    }
     if (steps <= 0) { flush(); return; }
     if (static_cast<const void*>(x) == static_cast<const void*>(b))
         throw std::invalid_argument("top_lu::TopLu::refine: x aliases b");
     // Nothing clamped anywhere in the batch (the usual case): nothing to refine, and not even the masked
     // correction's launch chain (~160 nearly empty kernels a round) -- one 4-byte read of the batch's clamp
-    // total, after a host sync the round needs soon anyway.
-    if (!refine_all_ && batch_clamp_total() == 0) { flush(); return; }
-    const int B = B_, nb = nb_;
-    const long long mm = static_cast<long long>(n_) * nb_;
-    // only the matrices whose factorization clamped a pivot (the others' x is left as solve() gave it)
+    // total, after a host sync the round needs soon anyway. The low-rank lanes are never refined (nothing of
+    // theirs was factorized, hence clamped).
+    if (nreg_ == 0 || (!refine_all_ && batch_clamp_total() == 0)) { flush(); return; }
+    const int B = B_, nb = nreg_;
+    const long long mi = static_cast<long long>(n_) * nb;
+    // only the lanes whose factorization clamped a pivot (the others' x is left as solve() gave it)
     const int* mask = refine_all_ ? nullptr : raw(d_clamped_) + 1;
     if (interleaved_ok_ && b == last_b_ && x == last_x_ && values == last_values_) {
         // in the interleaved layout: r = b - A x on the copy of A the factorization transposed, the correction
         // solved in place, x + d written back by the last transpose
         T* xi = rawm(d_xi_);
         T* ri = rawm(d_ri_);
-        dim3 tgrid((n_ + 31) / 32, (nb + 31) / 32), tblock(32, 8);
         for (int s = 0; s < steps; ++s) {
-            pdl_launch(lu_residual_i<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, raw(d_ra_ptr_), raw(d_ra_p_), raw(d_ra_col_), n_, B, nb,
+            pdl_launch(lu_residual_i<T>, dim3(blocks_for(mi)), dim3(kThreads), 0, stream_, raw(d_ra_ptr_), raw(d_ra_p_), raw(d_ra_col_), n_, B, nb,
                                                                        raw(d_ai_), raw(d_bi_), xi, ri, mask);
-            solve_core(tops_[cur_], ri, mask);
-            if (s + 1 < steps) pdl_launch(lu_axpy_i<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, n_, B, nb, ri, xi, mask);
-            else pdl_launch(lu_tr_out_add<T>, dim3(tgrid), dim3(tblock), 0, stream_, xi, ri, raw(d_inv_), n_, B, nb, x, mask);
+            solve_core(tops_[cur_], ri, mask, own_factors(nb));
+            if (s + 1 < steps) pdl_launch(lu_axpy_i<T>, dim3(blocks_for(mi)), dim3(kThreads), 0, stream_, n_, B, nb, ri, xi, mask);
+            else write_out(x, ri, mask);
         }
-        out_pending_ = false;
         interleaved_ok_ = false;
         OWN_LU_CHECK(cudaGetLastError());
         return;
@@ -1448,11 +2235,17 @@ void TopLu::refine(const cuda_real_type* values, const int* indptr, const int* i
         d_r_.resize(static_cast<size_t>(n_) * B_);
         d_d_.resize(static_cast<size_t>(n_) * B_);
     }
+    const long long mm = static_cast<long long>(n_) * nb_;
+    const int* smask = mask;   // by matrix: the lanes' through the map
+    if (lane_map_) {
+        pdl_launch(lr_slot_mask, dim3((nb_ + 255) / 256), dim3(256), 0, stream_, raw(d_perm_), mask, nreg_, nb_, rawm(d_slot_mask_));
+        smask = raw(d_slot_mask_);
+    }
     for (int s = 0; s < steps; ++s) {
-        pdl_launch(lu_residual<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, values, indptr, indices, n_, nnz_, nb_, b, x, rawm(d_r_), mask);
-        solve_impl(rawm(d_r_), rawm(d_d_), mask);
+        pdl_launch(lu_residual<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, values, indptr, indices, n_, nnz_, nb_, b, x, rawm(d_r_), smask);
+        solve_impl(rawm(d_r_), rawm(d_d_), mask, false);
         flush();
-        pdl_launch(lu_axpy<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, mm, n_, raw(d_d_), x, mask);
+        pdl_launch(lu_axpy<T>, dim3(blocks_for(mm)), dim3(kThreads), 0, stream_, mm, n_, raw(d_d_), x, smask);
     }
     interleaved_ok_ = false;
     OWN_LU_CHECK(cudaGetLastError());
@@ -1461,10 +2254,7 @@ void TopLu::refine(const cuda_real_type* values, const int* indptr, const int* i
 void TopLu::flush()
 {
     if (!out_pending_) return;
-    using T = cuda_real_type;
-    dim3 tgrid((n_ + 31) / 32, (nb_ + 31) / 32), tblock(32, 8);
-    pdl_launch(lu_tr_out<T>, dim3(tgrid), dim3(tblock), 0, stream_, raw(d_xi_), raw(d_inv_), n_, B_, nb_, last_x_);
-    out_pending_ = false;
+    write_out(last_x_, nullptr, nullptr);
     OWN_LU_CHECK(cudaGetLastError());
 }
 
@@ -1480,7 +2270,13 @@ std::vector<int> TopLu::clamped_counts() const
 {
     std::vector<int> h(nb_, 0);
     OWN_LU_CHECK(cudaStreamSynchronize(stream_));
-    OWN_LU_CHECK(cudaMemcpy(h.data(), raw(d_clamped_) + 1, sizeof(int) * nb_, cudaMemcpyDeviceToHost));
+    if (!lane_map_) {
+        OWN_LU_CHECK(cudaMemcpy(h.data(), raw(d_clamped_) + 1, sizeof(int) * nb_, cudaMemcpyDeviceToHost));
+        return h;
+    }
+    std::vector<int> lanes(static_cast<size_t>(std::max(nreg_, 1)), 0);   // the factorized lanes' counts, by matrix
+    if (nreg_ > 0) OWN_LU_CHECK(cudaMemcpy(lanes.data(), raw(d_clamped_) + 1, sizeof(int) * nreg_, cudaMemcpyDeviceToHost));
+    for (int c = 0; c < nreg_; ++c) h[static_cast<size_t>(h_perm_[static_cast<size_t>(c)])] = lanes[static_cast<size_t>(c)];
     return h;
 }
 

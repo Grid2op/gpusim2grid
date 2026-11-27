@@ -29,6 +29,7 @@
 #ifndef GPUSIM2GRID_FUSED_LU_TOP_LU_CUH
 #define GPUSIM2GRID_FUSED_LU_TOP_LU_CUH
 
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -89,9 +90,13 @@ private:
         std::vector<SolveStep> steps;
         SharedDev<int> d_rows, d_run;
     };
-    void run_solve(const Sched& s, bool forward, cuda_real_type* xi, const int* mask);
+    // The factors a triangular solve reads: this instance's (one per lane) or the reference's (one for every lane,
+    // shared: the low-rank first steps), over `nb` lanes of the interleaved x
+    struct Factors { const cuda_real_type* v; const cuda_real_type* tm; bool shared; int nb; };
+    void run_solve(const Sched& s, bool forward, cuda_real_type* xi, const int* mask, const Factors& f);
     // solve() on the matrices `mask` selects (clamp counts > 0; nullptr: all): refine()'s, as own_lu's
-    void solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask);
+    // with_lowrank: the main solve (the low-rank lanes too); false: a refinement's correction (factorized lanes)
+    void solve_impl(const cuda_real_type* b, cuda_real_type* x, const int* mask, bool with_lowrank);
     bool refine_all_ = false;   // own_lu::own_lu_refine_all()
     int batch_clamp_total() const;   // d_clamped_[0], host-synchronizing
 
@@ -164,7 +169,56 @@ private:
     Top tops_[2];
     int cur_ = 0, top_nb_ = 768;
     int fuse_nb_ = 0;  // fused solve runs up to this many active matrices (GPUSIM2GRID_TOP_LU_FUSE_NB; issue #44)
-    void solve_core(const Top& t, cuda_real_type* xi, const int* mask);
+    void solve_core(const Top& t, cuda_real_type* xi, const int* mask, const Factors& f);
+    Factors own_factors(int nb) const;
+
+    // ---- low-rank first steps (GPUSIM2GRID_OWN_LU_LOWRANK=1, prototype; docs/dev_notes/n1_big_rounds_bandwidth.md,
+    //      section 8) ----
+    // A matrix whose rows are the reference's but for at most lr_K_ of them (a contingency row at its first Newton
+    // iteration: the base case's J but for the rows of its tripped branch's buses) is not factorized: its solve is
+    // the reference's (one factorization, shared) corrected by the Woodbury identity,
+    //   x = z - W_R (I + D W_R)^-1 D z,  z = A_ref^-1 b,  D = (A - A_ref)[R, :],  W_R = A_ref^-1[:, R].
+    // The reference: the entrywise majority of three matrices of the first factorization (ref_: a TopLu of one
+    // matrix), its inverse computed once (d_winv_). factorize() classifies the matrices -- sampled entries, then
+    // every row, then the capacitance matrix I + D W_R factorized with pivots of comparable size -- and puts
+    // those that do not fit first in the interleaved layout (lanes [0, nreg_): factorized as before), the
+    // candidates after them (lanes [nreg_, nreg_ + nc_)). solve(): a candidate whose right-hand side is the
+    // reference's but for at most lr_Kf_ rows needs no solve (z = z_ref + columns of the inverse: x is z_ref plus
+    // a combination of columns); the others are solved on the reference's factors.
+    bool lr_on_ = false, is_ref_ = false;
+    bool lr_ready_ = false, lr_failed_ = false, lr_inv_ready_ = false, lr_stats_ = false;
+    int lr_K_ = 12;        // most modified rows of a candidate
+    int lr_ref_[3] = {0, 1, 2};   // the matrices of the first factorization the reference is the majority of
+    int lr_min_ = 32;      // fewest candidates worth the path
+    double lr_max_ratio_ = 1e8;   // largest pivot ratio of the capacitance matrix
+    int nreg_ = 0, nc_ = 0;
+    bool lane_map_ = false;       // d_perm_ (lane -> matrix) in use since the last factorize()
+    // the pending output holds low-rank lanes: the first lr_nB_ of them solved on the reference's factors
+    // (interleaved, corrected when written out), the lr_nA_ others by columns (their right-hand side is the
+    // reference's but for a few rows: x = z_ref + a combination of columns of A_ref^-1, nothing solved)
+    bool pending_lr_ = false;
+    int lr_nB_ = 0, lr_nA_ = 0;
+    bool lr_f_ready_ = false;
+    int lr_Kf_ = 8;        // most rows of a candidate's right-hand side off the reference's, for the columns mode
+    int force_cur_ = -1;          // the trailing block to use whatever the active count (the reference's)
+    std::unique_ptr<TopLu> ref_;
+    SharedDev<int> d_jptr_, d_jcol_, d_samp_;   // J's rows (positions), columns; the sampled positions
+    int n_samp_ = 0;
+    SharedDev<int> d_tpos_, d_lev_;   // an entry's transposed one (the reference inverse solves A^T); a pivot's level
+    int n_lev_ = 0;
+    RawBuf d_jref_, d_winv_, d_lr_S_, d_lr_y_, d_fref_, d_zref_, d_lr_coef_;
+    thrust::device_vector<int> d_kind_, d_lr_rows_, d_lr_cnt_, d_perm_, d_lr_piv_, d_slot_mask_;
+    thrust::device_vector<int> d_lr_cntf_, d_lr_frows_, d_lr_ncol_, d_lr_colrow_, d_lr_cold_;
+    std::vector<int> h_cntf_, h_tail_;
+    std::vector<int> h_kind_, h_perm_;
+    void lr_setup_reference(const cuda_real_type* values);
+    void lr_classify(const cuda_real_type* values);
+    void lr_build_inverse();
+    void lr_solve_candidates(int nB);
+    // the candidates whose right-hand side does not fit the columns mode: how many, their lanes put first
+    int lr_prepare_rhs(const cuda_real_type* b);
+    // the pending solution to x: the factorized lanes (+ `add` under `mask`: the refined one), the low-rank lanes
+    void write_out(cuda_real_type* x, const cuda_real_type* add, const int* mask);
 
     // init() = init_symbolic() (a function of the plan, the parameters and the device alone: the
     // schedules, the item lists, both trailing blocks) + alloc_batch() (the buffers sized by the

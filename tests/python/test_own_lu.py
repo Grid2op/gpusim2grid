@@ -182,6 +182,7 @@ def test_top_lu_writes_the_entries_without_a_value_or_a_contribution(monkeypatch
     gave x_0 = b_0 - x_1: a relative residual of 1)."""
     monkeypatch.setenv("GPUSIM2GRID_OWN_LU_TOP", "1")
     monkeypatch.setenv("GPUSIM2GRID_TOP_LU_M", "1")
+    monkeypatch.delenv("GPUSIM2GRID_OWN_LU_LOWRANK", raising=False)
     nblk = 200
     n = 2 * nblk
 
@@ -202,6 +203,73 @@ def test_top_lu_writes_the_entries_without_a_value_or_a_contribution(monkeypatch
     lower = _cpp.benchmark_cudss_batch_raw(*blocks(None), 64, **kw)
     assert lower.n_nonfinite_slots == 0
     assert lower.max_rel_residual < residual_atol, lower.max_rel_residual
+
+
+@pytest.mark.skipif(bool(_cpp.is_fp32), reason="the low-rank first steps are FP64 only; FP64 parity bounds")
+@pytest.mark.parametrize("scheduling", ["chunked", "continuous"])
+def test_low_rank_first_steps(case118, scheduling, monkeypatch, capfd):
+    """GPUSIM2GRID_OWN_LU_LOWRANK=1 (own_lu_top): a row at its first Newton iteration -- the base
+    voltages, so the base case's J but for the rows of its tripped branch's buses -- is not factorized:
+    its step is the reference factorization's, corrected by the Woodbury identity. Same statuses and
+    iteration counts as with every matrix factorized, V to rounding; and the path was taken (its
+    diagnostic line counts the candidates), by columns and by a solve on the reference's factors
+    (GPUSIM2GRID_OWN_LU_LOWRANK_KF=0: every candidate)."""
+    monkeypatch.setenv("GPUSIM2GRID_OWN_LU_TOP", "1")
+    monkeypatch.setenv("GPUSIM2GRID_OWN_LU_LOWRANK_STATS", "1")
+    runs = {}
+    for name, env in (("off", {}), ("on", {"GPUSIM2GRID_OWN_LU_LOWRANK": "1"}),
+                      ("solved", {"GPUSIM2GRID_OWN_LU_LOWRANK": "1", "GPUSIM2GRID_OWN_LU_LOWRANK_KF": "0"})):
+        for k in ("GPUSIM2GRID_OWN_LU_LOWRANK", "GPUSIM2GRID_OWN_LU_LOWRANK_KF"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        capfd.readouterr()
+        ca, nbr = _n1(case118, "own_lu", scheduling)
+        ca.compute(batch_size=64)
+        err = capfd.readouterr().err
+        runs[name] = _outcome(ca, nbr)
+        lines = [l for l in err.splitlines() if "low rank:" in l and "candidates, by rows" in l]
+        if name == "off":
+            assert not lines
+            continue
+        n_cand = sum(int(l.split("kept by the samples,")[1].split("candidates")[0]) for l in lines)
+        assert n_cand >= nbr // 2, err[-2000:]     # most rows' first iteration
+        by_cols = sum(int(l.split("on the reference,")[1].split("by columns")[0])
+                      for l in err.splitlines() if "by columns" in l)
+        assert (by_cols > 0) == (name == "on"), err[-2000:]
+    assert (runs["off"][0] == CONVERGED).sum() > nbr // 2
+    for name in ("on", "solved"):
+        _same_rows(runs[name], runs["off"], parity_tol("state"))
+
+
+@pytest.mark.skipif(bool(_cpp.is_fp32), reason="the low-rank first steps are FP64 only; FP64 parity bounds")
+def test_low_rank_first_steps_injection_sweep(case118, monkeypatch, capfd):
+    """An injection sweep's rows share the base case's J at their first iteration (no modified row:
+    the reference's solve as it is) and differ by their right-hand sides only -- everywhere, so each is
+    solved on the reference's factors. Same rows as with every matrix factorized."""
+    from gpusim2grid import InjectionSweepGPU
+    monkeypatch.setenv("GPUSIM2GRID_OWN_LU_TOP", "1")
+    monkeypatch.setenv("GPUSIM2GRID_OWN_LU_LOWRANK_STATS", "1")
+    n_rows = 96
+    n_bus = case118.get_Ybus_solver().shape[0]
+    sn = case118.get_sn_mva()
+    Sbus = case118.get_Sbus_solver()
+    scale = np.random.default_rng(0).uniform(0.9, 1.1, size=(n_rows, n_bus))
+    runs = {}
+    for name in ("off", "on"):
+        monkeypatch.delenv("GPUSIM2GRID_OWN_LU_LOWRANK", raising=False)
+        if name == "on":
+            monkeypatch.setenv("GPUSIM2GRID_OWN_LU_LOWRANK", "1")
+        capfd.readouterr()
+        sw = InjectionSweepGPU(case118, precision=PREC, nb_iter=10, linear_solver="own_lu")
+        sw.set_injections(Sbus.real * sn * scale, Sbus.imag * sn * scale, sn)
+        sw.compute(batch_size=n_rows)
+        err = capfd.readouterr().err
+        runs[name] = _outcome(sw, n_rows)
+        if name == "on":
+            assert f"{n_rows} candidates, by rows: 0:{n_rows}" in err, err[-2000:]
+    assert (runs["off"][0] == CONVERGED).all()
+    _same_rows(runs["on"], runs["off"], parity_tol("state"))
 
 
 @pytest.mark.parametrize("n_active", [1, 7, 20])
