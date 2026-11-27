@@ -251,6 +251,17 @@ __global__ void fill_FQ_kernel(
     int sbus_stride);
 
 // ---------------------------------------------------------------------------
+// zero_J_positions_kernel: J[b * nnz_J + pos[a]] = 0 for every listed position, every slot
+// b < actual_batch (blockIdx.y, grid-stride past 65535); see NrIterBuffers::d_J_zero_pos.
+// -----------------------------------------------------------------------------
+__global__ void zero_J_positions_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*            __restrict__ pos,
+    int n_pos,
+    int nnz_J,
+    int actual_batch);
+
+// -----------------------------------------------------------------------------
 // fill_J_kernel
 //
 // Fills the Jacobian for a batch of systems (actual_batch=1 for single-system NR).

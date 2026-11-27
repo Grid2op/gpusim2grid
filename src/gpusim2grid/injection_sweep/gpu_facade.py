@@ -98,7 +98,10 @@ class InjectionSweepGPU(PhysicalChecksFacadeMixin, SchedulingFacadeMixin):
         the iteration lightsim2grid's does, and a hard one (e.g. after
         TransformerVoltageControl releases a held remote voltage controller)
         can diverge without refinement where lightsim2grid's KLU converges.
-        One step costs one more residual and solve per Newton iteration. Mutable:
+        One step costs one more residual and solve per Newton iteration. With
+        ``linear_solver='own_lu'`` only the matrices whose factorization clamped
+        a pivot are refined (the others' factors are their own matrix's), and
+        nothing when none was (``GPUSIM2GRID_OWN_LU_IR=all``: every one). Mutable:
         takes effect on the next :meth:`compute` (the base case keeps the
         construction value).
     linear_solver : {'cudss', 'own_lu'}, default 'cudss'

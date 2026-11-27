@@ -1504,6 +1504,11 @@ NrIterBuffers BatchPfDriver<BatchSource>::_make_nr_buffers()
         }
     }
 
+    if (buf.zero_J_before_fill) {   // only what fill_J does not overwrite (see nr_feature_zero_J)
+        buf.n_J_zero_pos = static_cast<int>(base.d_J_unmapped_pos.size());
+        buf.d_J_zero_pos = buf.n_J_zero_pos > 0 ? thrust::raw_pointer_cast(base.d_J_unmapped_pos.data()) : nullptr;
+    }
+
     // NR step-scaling (MaxVoltageChange) -- off (nullptr scratch) unless
     // enabled, matching every other opt-in extension above.
     buf.scaling_max_voltage_change = scaling_max_voltage_change_;
@@ -1711,7 +1716,10 @@ void BatchPfDriver<BatchSource>::_oc_setup()
     upload_h2d(d_oc_cand_pin_, cand_pin.data(), cand_pin.size(), cs);
     d_oc_list_.resize(S);
     d_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
-    h_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
+    // Only the host model downloads the gather (the device one reads d_oc_gather_ in place, see
+    // _oc_gather): a pinned S x oc_stride buffer was a ~15 ms cudaMallocHost at every driver build.
+    if (dynamic_cast<outer::DeviceOuterHook*>(outer_hook_) == nullptr)
+        h_oc_gather_.resize(static_cast<size_t>(S) * oc_stride_);
 }
 
 template <typename BatchSource>

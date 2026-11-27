@@ -636,6 +636,20 @@ __global__ void spmv_fill_F_kernel(
 // full path (warp divergence): that arithmetic, not memory, set the cost in
 // FP64 on GPUs with a reduced FP64 rate (~10x the FP32 time on an RTX A1000).
 // =============================================================================
+__global__ void zero_J_positions_kernel(
+          cuda_real_type* __restrict__ d_J_values,
+    const int*            __restrict__ pos,
+    int n_pos,
+    int nnz_J,
+    int actual_batch)
+{
+    const int a = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (a >= n_pos) return;
+    const int p = pos[a];
+    for (ptrdiff_t b = blockIdx.y; b < actual_batch; b += gridDim.y)
+        d_J_values[b * nnz_J + p] = static_cast<cuda_real_type>(0.);
+}
+
 namespace {
 __device__ __forceinline__ double j_rsqrt(double x) { return rsqrt(x); }
 __device__ __forceinline__ float  j_rsqrt(float x)  { return rsqrtf(x); }

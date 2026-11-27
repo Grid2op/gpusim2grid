@@ -475,6 +475,10 @@ struct AcPfNrState {
     thrust::device_vector<int> d_map_j12;
     thrust::device_vector<int> d_map_j21;
     thrust::device_vector<int> d_map_j22;
+    // The J positions no Ybus entry maps (custom rows, feature-only and reserved slots):
+    // fill_J_kernel overwrites every other one, so zeroing these alone before it leaves J
+    // exactly as a memset of the whole J would (NrIterBuffers::d_J_zero_pos).
+    thrust::device_vector<int> d_J_unmapped_pos;
 
     // -------------------------------------------------------------------------
     // Base-case snapshots  (saved after NR convergence; device-to-device copy)

@@ -103,6 +103,9 @@
 #include "../../own_lu/lu_plan.hpp"
 #include "../../own_lu/lu_order.hpp"
 #include "../../linear_solver.hpp"
+#if defined(GPUSIM2GRID_HAVE_TOP_LU) && __has_include("../../fused_lu/own_lu_switch.cuh")
+#include "../../fused_lu/own_lu_switch.cuh"  // prototype: GPUSIM2GRID_OWN_LU_TOP=1 (untracked)
+#endif
 
 enum class CudssBatchMode { Uniform, BlockDiag, NonUniform, OwnLu };
 
@@ -226,7 +229,11 @@ struct CudssBatchSolver {
 
     // OwnLu: the batched LU, the buffers it works on (rebound by bind_slice)
     // and the refinement steps (CudssContext keeps its own copy for cuDSS).
+#if defined(GPUSIM2GRID_HAVE_TOP_LU) && __has_include("../../fused_lu/own_lu_switch.cuh")
+    top_lu::OwnLuSwitch own_;
+#else
     own_lu::BatchedLu own_;
+#endif
     cuda_real_type* d_F_cur_  = nullptr;
     cuda_real_type* d_dx_cur_ = nullptr;
     int ir_n_steps_ = 0;
@@ -699,7 +706,7 @@ private:
         user_perm_ = perm ? *perm : own_lu::amd_order(dim_J_, ip, ix);
         double eps = own_lu::default_pivot_eps();
         if (const char* e = std::getenv("GPUSIM2GRID_OWN_LU_EPS")) eps = std::atof(e);
-        own_.init(own_lu::build_lu_plan(dim_J_, ip, ix, user_perm_), ubatch_, cs_, eps);
+        own_.init(*own_lu::build_lu_plan_cached(dim_J_, ip, ix, user_perm_), ubatch_, cs_, eps);
     }
 
     template <class T>

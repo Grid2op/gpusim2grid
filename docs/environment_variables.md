@@ -34,7 +34,16 @@ Read by `pip install` (the in-tree build backend and CMake), not at runtime. Det
 |---|---|---|---|
 | `GPUSIM2GRID_OWN_LU_EPS` | a number `≥ 0` | `1e-12` (FP64 build), `1e-5` (FP32 build) | The relative pivot clamp: a pivot below `x · max\|J\|` is clamped and counted in `cudss_npivots_*`. `0`: no clamp. |
 | `GPUSIM2GRID_OWN_LU_FUSE` | `0`, `1` | `1` | `1`: the runs of narrow levels of the triangular solves fused into one kernel each (when the device supports it). `0`: every level its own launch (same bits, more launches). |
+| `GPUSIM2GRID_OWN_LU_IR` | `clamped`, `all` | `clamped` | What `ir_n_steps` refines with `linear_solver='own_lu'`: `clamped`, only the matrices whose last factorization clamped a pivot (nothing when none did); `all`, every matrix (the former behaviour; the others' solutions then move by rounding only). |
+| `GPUSIM2GRID_OWN_LU_PLAN_CACHE` | `0`, `1` | `1` | `1`: own_lu's symbolic plan (and own_lu_top's trailing blocks) kept process-wide per Jacobian pattern and order, reused by a new session on the same pattern. `0`: rebuilt by every driver. |
 | `GPUSIM2GRID_OWN_LU_STATS` | `0`, `1` | `0` | `1`: prints the widths of the factorization and solve launches (how many are narrow, split or fusable). |
+| `GPUSIM2GRID_OWN_LU_TOP` | `0`, `1` | `0` | Prototype. `1`: `linear_solver='own_lu'` uses `top_lu::TopLu` (`src/_cpp/fused_lu/`, built when present): the last elimination levels factored and solved in shared memory, one block per matrix. `0`: own_lu unchanged. |
+| `GPUSIM2GRID_TOP_LU_M` | an integer `≥ 0` | `0` | With `GPUSIM2GRID_OWN_LU_TOP=1`: the largest trailing block (pivots). `0`: as large as one block's shared memory holds. |
+| `GPUSIM2GRID_TOP_LU_M_LARGE` | an integer `≥ 0` | `104` | With `GPUSIM2GRID_OWN_LU_TOP=1`: the trailing block used above `GPUSIM2GRID_TOP_LU_NB` active matrices (a large one costs more than the launches it replaces there). |
+| `GPUSIM2GRID_TOP_LU_NB` | an integer | `768` | With `GPUSIM2GRID_OWN_LU_TOP=1`: up to this many active matrices the factorization takes the large trailing block, above it the `GPUSIM2GRID_TOP_LU_M_LARGE` one. |
+| `GPUSIM2GRID_TOP_LU_FUSE_NB` | an integer | `0` | With `GPUSIM2GRID_OWN_LU_TOP=1`: the runs of narrow solve levels are fused up to this many active matrices (issue #44: one launch per level is faster above). |
+| `GPUSIM2GRID_TOP_LU_PDL` | `0`, `1` | `1` | With `GPUSIM2GRID_OWN_LU_TOP=1`: every launch with programmatic dependent launch (a kernel starts before its predecessor ends and waits in-kernel for its results). `0`: plain launches, the same results. |
+| `GPUSIM2GRID_TOP_LU_STATS` | `0`, `1` | `0` | With `GPUSIM2GRID_OWN_LU_TOP=1`: prints the launches left outside the trailing block (count, chain, split per level). |
 
 ## Outer loops (`outer_loops=True`)
 

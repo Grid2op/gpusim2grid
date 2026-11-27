@@ -301,6 +301,12 @@ struct NrIterBuffers {
     // mismatch and the masks still run on every slot. nullptr: always compute.
     cuda_real_type*        d_F_raw        = nullptr;
     const int*             d_F_clean      = nullptr;
+
+    // With zero_J_before_fill: zero only these J positions (the ones fill_J_kernel does not
+    // overwrite, AcPfNrState::d_J_unmapped_pos) instead of the whole J -- the same J after
+    // fill_J, without a memset of batch x nnz_J values. n_J_zero_pos < 0: the whole J.
+    const int*             d_J_zero_pos   = nullptr;
+    int                    n_J_zero_pos   = -1;
 };
 
 // -----------------------------------------------------------------------------
@@ -381,9 +387,14 @@ inline void nr_feature_mismatch(const NrIterBuffers& buf,
 
 inline void nr_feature_zero_J(const NrIterBuffers& buf, int nnz_J, int batch, cudaStream_t cs)
 {
-    if (buf.zero_J_before_fill)
+    if (!buf.zero_J_before_fill || batch <= 0) return;
+    if (buf.n_J_zero_pos < 0) {
         cudaMemsetAsync(buf.d_J_values, 0,
                         static_cast<size_t>(batch) * nnz_J * sizeof(cuda_real_type), cs);
+    } else if (buf.n_J_zero_pos > 0) {
+        const dim3 grid((buf.n_J_zero_pos + BS - 1) / BS, static_cast<unsigned>(batch < 65535 ? batch : 65535));
+        zero_J_positions_kernel<<<grid, BS, 0, cs>>>(buf.d_J_values, buf.d_J_zero_pos, buf.n_J_zero_pos, nnz_J, batch);
+    }
 }
 
 inline void nr_feature_fill_J(const NrIterBuffers& buf,

@@ -393,6 +393,25 @@ double lost_mw(const SlackRedistributionData& d, const std::vector<int>& masked,
     return lost;
 }
 
+// lost_mw for a row whose disconnected generators are a list `off_gens` (any order, duplicates allowed): the
+// same sum, over the same generators in the same (ascending) order, so the same bits -- without visiting every
+// generator of the grid for each row (a contingency analysis walked n_gen x n_rows lambdas for it).
+template <class GenPRow, class SbusPMw>
+double lost_mw_sparse(const SlackRedistributionData& d, const std::vector<int>& masked, std::vector<int> off_gens,
+                      GenPRow gen_p_row, SbusPMw sbus_p_mw)
+{
+    std::sort(off_gens.begin(), off_gens.end());
+    off_gens.erase(std::unique(off_gens.begin(), off_gens.end()), off_gens.end());
+    double lost = 0.;
+    for (int g : off_gens) {
+        if (g < 0 || g >= d.n_gen || d.gen_bus_solver(g) < 0) continue;
+        lost += gen_p_row(g);
+    }
+    for (int b : masked)
+        lost += sbus_p_mw(b) - static_cast<double>(d.shunt_p_mw(b));
+    return lost;
+}
+
 // Term (c) of a scenario row (MW, generator convention): what its injections
 // take out of the balance of the grid's set-points, d.base_p_mw minus the row's
 // total active injection `row_p_mw` (sn * sum Re(Sbus_row), which the

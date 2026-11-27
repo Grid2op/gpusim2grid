@@ -1479,28 +1479,37 @@ __device__ int check(const Dev& d, int s, const Row& rv, int loop, int iteration
 }
 
 // ---- materialize: the slot's controls --------------------------------------------------------------
-__device__ void materialize(const Dev& d, int s)
+// materialize, split for a block: materialize_par on every thread t of nt (the per-element copies, each element
+// written by one thread exactly as the sequential loop writes it), a barrier, then materialize_seq on one thread
+// (what depends on the order: a group's set-point overridden by its SVCs, the compacted correction list, the
+// retaps, the slack weights summed per bus). materialize = both on one thread.
+__device__ void materialize_par(const Dev& d, int s, int t, int nt)
 {
     const unsigned char* pq = SLOT(pq, d.n_pin);
     unsigned char* pin = SLOT(c_pin, d.n_pin);
-    for (int k = 0; k < d.n_pin; ++k) pin[k] = pq[k] ? 0 : 1;
+    for (int k = t; k < d.n_pin; k += nt) pin[k] = pq[k] ? 0 : 1;
     const double* held_q = SLOT(held_q, d.n_ctrl);
     const double* svc_on = SLOT(svc_on, d.n_ctrl);
     double* c_held = SLOT(c_held_q, d.n_ctrl);
     unsigned char* plan_held = SLOT(c_plan_held, d.n_ctrl);
     double* v_set = SLOT(c_v_set, d.n_grp);
-    for (int g = 0; g < d.n_grp; ++g) v_set[g] = d.vc_v_set[g];
-    for (int j = 0; j < d.n_ctrl; ++j) {
+    for (int g = t; g < d.n_grp; g += nt) v_set[g] = d.vc_v_set[g];
+    for (int j = t; j < d.n_ctrl; j += nt) {
         c_held[j] = held_q[j];
-        plan_held[j] = d.vc_plan_held[j] ? 1 : 0;
-        if (d.vc_plan_held[j] && d.vc_kind[j] == VC_SVC && isfinite(svc_on[j])) {
-            plan_held[j] = 0;
-            v_set[d.vc_group[j]] = svc_on[j];
-        }
+        plan_held[j] = (d.vc_plan_held[j] && !(d.vc_kind[j] == VC_SVC && isfinite(svc_on[j]))) ? 1 : 0;
     }
     const int* regime = SLOT(hvdc_regime, d.n_hvdc);
     int* status = SLOT(c_hvdc_status, d.n_hvdc);
-    for (int e = 0; e < d.n_hvdc; ++e) status[e] = regime[e] == 2 ? d.hv_st0[e] : regime[e];
+    for (int e = t; e < d.n_hvdc; e += nt) status[e] = regime[e] == 2 ? d.hv_st0[e] : regime[e];
+}
+__device__ void materialize_seq(const Dev& d, int s)
+{
+    {   // a plan-held SVC switched on sets its group's v_set (in controller order: the last one wins)
+        const double* svc_on = SLOT(svc_on, d.n_ctrl);
+        double* v_set = SLOT(c_v_set, d.n_grp);
+        for (int j = 0; j < d.n_ctrl; ++j)
+            if (d.vc_plan_held[j] && d.vc_kind[j] == VC_SVC && isfinite(svc_on[j])) v_set[d.vc_group[j]] = svc_on[j];
+    }
     // target_delta + i.freeze_q, per bus, both over corr_bus (sorted)
     const unsigned char* dset = SLOT(dset, d.nc);
     const unsigned char* fset = SLOT(fset, d.nc);
@@ -1546,9 +1555,14 @@ __device__ void materialize(const Dev& d, int s)
         }
     }
 }
+__device__ void materialize(const Dev& d, int s)
+{
+    materialize_par(d, s, 0, 1);
+    materialize_seq(d, s);
+}
 
 // ---- finish ----------------------------------------------------------------------------------------
-__device__ int finish(const Dev& d, int s, int inner_status)
+__device__ int finish_scalar(const Dev& d, int s, int inner_status)   // finish, but its per-element results
 {
     int status;
     if (S1(last_status) == FAILED) status = FAILED;
@@ -1563,21 +1577,27 @@ __device__ int finish(const Dev& d, int s, int inner_status)
         d.r_failed[r] = status == FAILED ? S1(last_loop) : -1;
         d.r_outer[r] = S1(nb_outer);
         d.r_nr[r] = S1(nr_steps);
-        for (int k = 0; k < d.n_units; ++k)
-            d.r_unit_mw[static_cast<size_t>(r) * d.n_units + k] =
-                d.ds_kind[k] == 0 ? SLOT(gen_tp, d.n_gen)[d.ds_el[k]] : SLOT(sto_tp, d.n_sto)[d.ds_el[k]];
-        for (int e = 0; e < d.n_hvdc; ++e) d.r_hvdc[static_cast<size_t>(r) * d.n_hvdc + e] = SLOT(hvdc_regime, d.n_hvdc)[e];
-        for (int j = 0; j < d.n_sc_sh; ++j) d.r_sc[static_cast<size_t>(r) * d.n_sc_sh + j] = SLOT(sc_cnt, d.n_sc_sh)[j];
-        for (int e = 0; e < d.n_bc; ++e) {
-            d.r_pos[static_cast<size_t>(r) * d.n_bc + e] = SLOT(bc_pos, d.n_bc)[e];
-            d.r_rpos[static_cast<size_t>(r) * d.n_bc + e] = SLOT(bc_rpos, d.n_bc)[e];
-        }
     }
     return row_status;
 }
+// the finished row's per-element results, thread t of nt (finish_scalar has run; any order: one write each)
+__device__ void finish_arrays(const Dev& d, int s, int t, int nt)
+{
+    const int r = S1(row);
+    if (r < 0) return;
+    for (int k = t; k < d.n_units; k += nt)
+        d.r_unit_mw[static_cast<size_t>(r) * d.n_units + k] =
+            d.ds_kind[k] == 0 ? SLOT(gen_tp, d.n_gen)[d.ds_el[k]] : SLOT(sto_tp, d.n_sto)[d.ds_el[k]];
+    for (int e = t; e < d.n_hvdc; e += nt) d.r_hvdc[static_cast<size_t>(r) * d.n_hvdc + e] = SLOT(hvdc_regime, d.n_hvdc)[e];
+    for (int j = t; j < d.n_sc_sh; j += nt) d.r_sc[static_cast<size_t>(r) * d.n_sc_sh + j] = SLOT(sc_cnt, d.n_sc_sh)[j];
+    for (int e = t; e < d.n_bc; e += nt) {
+        d.r_pos[static_cast<size_t>(r) * d.n_bc + e] = SLOT(bc_pos, d.n_bc)[e];
+        d.r_rpos[static_cast<size_t>(r) * d.n_bc + e] = SLOT(bc_rpos, d.n_bc)[e];
+    }
+}
 
 // ---- drive: the for loop over the loops of a pass, from loop i --------------------------------------
-// returns 0 Resolve, 1 Done (row_status set)
+// returns 0 Resolve (the caller materializes), 1 Done (row_status set; the caller writes finish_arrays)
 // 2: paused before a ReactiveLimits check, whose buses the block evaluates first (p_recheck keeps
 // what to resume with: nothing of that check has run yet); `rl_ready`: they are evaluated
 __device__ int drive(const Dev& d, int s, const Row* rv, int& row_status, int inner_status, bool recheck,
@@ -1602,7 +1622,7 @@ __device__ int drive(const Dev& d, int s, const Row* rv, int& row_status, int in
                 S1(it) = 0;
                 continue;
             }
-            row_status = finish(d, s, inner_status);
+            row_status = finish_scalar(d, s, inner_status);   // the caller writes finish_arrays
             return 1;
         }
         const int loop = active[i];
@@ -1625,8 +1645,7 @@ __device__ int drive(const Dev& d, int s, const Row* rv, int& row_status, int in
             ++loop_iter[i];
             S1(last_unstable) = i;
             S1(check_unreal) = S1(pass_check_unreal);
-            materialize(d, s);
-            return 0;
+            return 0;   // the caller materializes the controls (a block: materialize_par then materialize_seq)
         }
         // STABLE or FAILED: the loop's do-while ends here
         if (!S1(pass_check_unreal) && i == S1(last_fixing) && S1(solver_ok) && rv != nullptr && unreal_flag) {
@@ -1671,7 +1690,7 @@ __global__ void on_solved_kernel(Dev d, const int* slots, int n, const int* conv
         if (S1(first)) {
             S1(first) = 0;
             if (!S1(solver_ok)) {
-                row_status = finish(d, s, inner_status[i]);
+                row_status = finish_scalar(d, s, inner_status[i]);
                 next = 1;
             } else {
                 S1(pass_check_unreal) = S1(last_fixing) < 0;
@@ -1718,6 +1737,14 @@ __global__ void on_solved_kernel(Dev d, const int* slots, int n, const int* conv
         }
         __syncthreads();
     }
+    // what drive left to the block: the controls of a row to re-solve, the results of a finished one
+    if (sh_next == 0) {
+        materialize_par(d, s, threadIdx.x, blockDim.x);
+        __syncthreads();
+        if (threadIdx.x == 0) materialize_seq(d, s);
+    } else if (sh_next == 1) {
+        finish_arrays(d, s, threadIdx.x, blockDim.x);
+    }
     if (threadIdx.x != 0) return;
     next_out[i] = sh_next;
     status_out[i] = row_status;
@@ -1727,21 +1754,22 @@ __global__ void on_solved_kernel(Dev d, const int* slots, int n, const int* conv
 
 // the listed slots' controls into the driver's arrays (DeviceOuterHook::write_controls)
 __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOuterHook::ControlTargets t)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+{   // a block per listed slot: a copy, each element written by one thread
+    const int i = blockIdx.x;
+    if (i >= n) return;   // the whole block
+    const int t0 = threadIdx.x, nt = blockDim.x;
     const int s = slots[i];
     const size_t ss = static_cast<size_t>(s);
-    for (int k = 0; k < d.n_pin; ++k) t.pin[ss * d.n_pin + k] = SLOT(c_pin, d.n_pin)[k];
-    for (int j = 0; j < d.n_ctrl; ++j) {
+    for (int k = t0; k < d.n_pin; k += nt) t.pin[ss * d.n_pin + k] = SLOT(c_pin, d.n_pin)[k];
+    for (int j = t0; j < d.n_ctrl; j += nt) {
         t.held_q[ss * d.n_ctrl + j] = SLOT(c_held_q, d.n_ctrl)[j];
         t.plan_held[ss * d.n_ctrl + j] = SLOT(c_plan_held, d.n_ctrl)[j];
     }
-    for (int g = 0; g < d.n_grp; ++g) t.v_set[ss * d.n_grp + g] = SLOT(c_v_set, d.n_grp)[g];
-    for (int e = 0; e < d.n_hvdc; ++e) t.hvdc[ss * d.n_hvdc + e] = SLOT(c_hvdc_status, d.n_hvdc)[e];
+    for (int g = t0; g < d.n_grp; g += nt) t.v_set[ss * d.n_grp + g] = SLOT(c_v_set, d.n_grp)[g];
+    for (int e = t0; e < d.n_hvdc; e += nt) t.hvdc[ss * d.n_hvdc + e] = SLOT(c_hvdc_status, d.n_hvdc)[e];
     const size_t b0 = static_cast<size_t>(i) * d.nc;
     const int nsb = S1(c_sb_n);
-    for (int k = 0; k < d.nc; ++k) {
+    for (int k = t0; k < d.nc; k += nt) {
         t.ds_slot[b0 + k] = s;
         t.ds_bus[b0 + k] = k < nsb ? SLOT(c_sb_bus, d.nc)[k] : -1;
         t.ds_p[b0 + k] = k < nsb ? SLOT(c_sb_dp, d.nc)[k] : 0.;
@@ -1749,19 +1777,20 @@ __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOute
     }
     const size_t v0 = static_cast<size_t>(i) * d.vcap;
     const int nvr = S1(vmr_n);
-    for (int k = 0; k < d.vcap; ++k) {
+    for (int k = t0; k < d.vcap; k += nt) {
         t.vr_slot[v0 + k] = s;
         t.vr_bus[v0 + k] = k < nvr ? SLOT(vmr_bus, d.vcap)[k] : -1;
         t.vr_vm[v0 + k] = k < nvr ? SLOT(vmr_vm, d.vcap)[k] : 0.;
     }
-    S1(vmr_n) = 0;   // one-shot (OuterHook::clear_vm_reset)
+    __syncthreads();   // every thread has read vmr_n
+    if (t0 == 0) S1(vmr_n) = 0;   // one-shot (OuterHook::clear_vm_reset)
     if (t.slack_w != nullptr)
-        for (int k = 0; k < d.n_slack; ++k) t.slack_w[ss * d.n_slack + k] = SLOT(c_slack_w, d.n_slack)[k];
+        for (int k = t0; k < d.n_slack; k += nt) t.slack_w[ss * d.n_slack + k] = SLOT(c_slack_w, d.n_slack)[k];
     // BranchControl (one block of n_bc per listed slot): out of the row, retapped (once), the block at
     // the taps (4 complex), its shift and ratio, the controls
     if (t.bc_out != nullptr) {
         const size_t c0 = static_cast<size_t>(i) * d.n_bc;
-        for (int e = 0; e < d.n_bc; ++e) {
+        for (int e = t0; e < d.n_bc; e += nt) {
             t.bc_out[c0 + e] = SLOT(bc_out, d.n_bc)[e];
             t.bc_retap[c0 + e] = SLOT(bc_rt, d.n_bc)[e];
             for (int q = 0; q < 8; ++q) t.bc_tap[8 * (c0 + e) + q] = SLOT(bc_tap, 8 * d.n_bc)[8 * e + q];
@@ -1776,7 +1805,7 @@ __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOute
     // ShuntControl (one block of n_sc per listed slot): the sections set (once), their B, the controls
     if (t.sc_set != nullptr) {
         const size_t c0 = static_cast<size_t>(i) * d.n_sc;
-        for (int e = 0; e < d.n_sc; ++e) {
+        for (int e = t0; e < d.n_sc; e += nt) {
             t.sc_set[c0 + e] = SLOT(sc_pend, d.n_sc)[e];
             t.sc_b_new[c0 + e] = SLOT(sc_bnew, d.n_sc)[e];
             t.sc_ctl[c0 + e] = static_cast<signed char>(SLOT(sc_ctl, d.n_sc)[e]);
@@ -1785,10 +1814,14 @@ __global__ void write_controls_kernel(Dev d, const int* slots, int n, DeviceOute
     }
 }
 
-__global__ void materialize_kernel(Dev d, const int* slots, int n)
+__global__ void materialize_kernel(Dev d, const int* slots, int n)   // a block per listed slot
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) materialize(d, slots[i]);
+    const int i = blockIdx.x;
+    if (i >= n) return;   // the whole block
+    const int s = slots[i];
+    materialize_par(d, s, threadIdx.x, blockDim.x);
+    __syncthreads();
+    if (threadIdx.x == 0) materialize_seq(d, s);
 }
 
 // ---- the model -------------------------------------------------------------------------------------
@@ -1882,7 +1915,7 @@ public:
     int vm_reset_block() const override { return vcap_; }
     void write_controls(int n, const int* d_slots, const ControlTargets& t, void* stream) override {
         if (n == 0) return;
-        write_controls_kernel<<<(n + 63) / 64, 64, 0, static_cast<cudaStream_t>(stream)>>>(dev_, d_slots, n, t);
+        write_controls_kernel<<<n, 128, 0, static_cast<cudaStream_t>(stream)>>>(dev_, d_slots, n, t);
         check_cuda(cudaGetLastError(), "write_controls");
     }
 
@@ -2826,8 +2859,12 @@ __global__ void mask_rows_kernel(Dev d, const int* slots, int n, const int* mask
 // move follows the share): load_rows routes those through the host model. One thread per slot.
 __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p, int n)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    // a warp per row: the loops whose iterations are independent (each its own element) run on its lanes, the
+    // ordered sums keep their order (lanes filter, the terms are added in index order on every lane), the rest
+    // runs on lane 0: the host model's arithmetic, operation for operation
+    const int lane = threadIdx.x & 31;
+    const int i = static_cast<int>((static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5);
+    if (i >= n) return;   // the whole warp
     const double lost_p_mw = lost_p[i];
     if (isnan(lost_p_mw)) return;   // nothing to share: the template's state is the row's
     const int s = slots[i];
@@ -2837,10 +2874,23 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
     double counted = lost_p_mw;
     if (d.rp_n) {
         const auto lost = [&](int b) { return b == -2 || (b >= 0 && b < d.n_bus && masked[b]); };
-        for (int j = 0; j < d.n_rp_gen; ++j) if (lost(d.rp_gen_bus[j])) counted += d.rp_gen_move[j];
-        for (int j = 0; j < d.n_rp_sto; ++j) if (lost(d.rp_sto_bus[j])) counted -= d.rp_sto_move[j];
+        // the lanes test 32 units at a time; the lost ones' moves are added in index order (every lane the same sum)
+        for (int j0 = 0; j0 < d.n_rp_gen; j0 += 32) {
+            const int j = j0 + lane;
+            const bool l = j < d.n_rp_gen && lost(d.rp_gen_bus[j]);
+            const double mv = l ? d.rp_gen_move[j] : 0.;
+            for (unsigned m = __ballot_sync(0xffffffffu, l); m != 0u; m &= m - 1u)
+                counted += __shfl_sync(0xffffffffu, mv, __ffs(m) - 1);
+        }
+        for (int j0 = 0; j0 < d.n_rp_sto; j0 += 32) {
+            const int j = j0 + lane;
+            const bool l = j < d.n_rp_sto && lost(d.rp_sto_bus[j]);
+            const double mv = l ? d.rp_sto_move[j] : 0.;
+            for (unsigned m = __ballot_sync(0xffffffffu, l); m != 0u; m &= m - 1u)
+                counted -= __shfl_sync(0xffffffffu, mv, __ffs(m) - 1);
+        }
     }
-    S1(lost_mw) = counted;
+    if (lane == 0) S1(lost_mw) = counted;
     // the loops the row runs, in order: share_lost_p is DistributedSlack's init
     const int* active = SLOT(active, d.n_loops);
     int pos_ds = -1, pos_rl = -1;
@@ -2850,9 +2900,15 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
     }
     if (pos_ds < 0) return;
     const unsigned char* present = SLOT(ds_present, d.n_units);
+    // counted 32 units at a time by a ballot, every lane the same total (__reduce_add_sync needs sm_80, and
+    // the build targets sm_75)
     int n_present = 0;
-    for (int k = 0; k < d.n_units; ++k) n_present += present[k] ? 1 : 0;
+    for (int k0 = 0; k0 < d.n_units; k0 += 32) {
+        const int k = k0 + lane;
+        n_present += __popc(__ballot_sync(0xffffffffu, k < d.n_units && present[k]));
+    }
     if (n_present == 0 || !(fabs(counted) > d.ds_eps_mw)) return;
+    if (lane == 0) {   // DistributedSlack's share and its bookkeeping: sequential
     bool all_sat;
     distribute(d, s, counted, d.ds_eps_mw, all_sat);
     const double* nmw = SLOT(s_new, d.n_units);
@@ -2878,6 +2934,8 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
         }
     }
     if (d.keep_adj) ds_mark_solved(d, s);   // the first solve runs with these
+    }
+    __syncwarp();   // lane 0's targets before the lanes read them
     if (pos_rl < 0) return;
     // ReactiveLimits' init after DistributedSlack's: each bus' target P from the targets in force,
     // but a bus none of whose generators moved (state0's sum; the row sets no storage target)
@@ -2885,7 +2943,7 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
     const unsigned char* goff = SLOT(rl_goff, 0);
     if (pos_rl > pos_ds) {
         double* rl_tp = SLOT(rl_tp, d.rl_n);
-        for (int k = 0; k < d.rl_n; ++k) {
+        for (int k = lane; k < d.rl_n; k += 32) {   // each bus its own target, summed as the host does
             if (!rl_present[k] || (!d.rl_has_sto[k] && rl_at_base(d, s, k))) continue;
             double target_p = 0.;
             for (int j = d.rl_gen_ptr[k]; j < d.rl_gen_ptr[k + 1]; ++j)
@@ -2894,9 +2952,10 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
             rl_tp[k] = target_p;
         }
     }
+    __syncwarp();
     // resume_loops: each bus the n point left frozen, at the limit it holds now (or its target Q, the
-    // robust mode's), its V the point's
-    if (!d.rp_n) return;
+    // robust mode's), its V the point's -- sequential, lane 0
+    if (!d.rp_n || lane != 0) return;
     const Row rv{d.rp_v, d.n_watch, 0, 0};
     for (int k = 0; k < d.rl_n; ++k) {
         const int state = d.rl_rp_state[k];
@@ -3004,7 +3063,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         copy(p_int_, ph_i_, w_int_);
         copy(p_u8_, ph_u_, w_u8_);
         copy(p_f64_, ph_f_, w_f64_);
-        materialize_kernel<<<(nf + 63) / 64, 64, 0, stream_>>>(dev_, raw(ld_phantom_), nf);
+        if (nf > 0) materialize_kernel<<<nf, 128, 0, stream_>>>(dev_, raw(ld_phantom_), nf);
         check_cuda(cudaGetLastError(), "phantom load");
     }
     // the rows resuming from a point that has a template: copies of it, grouped by point
@@ -3029,7 +3088,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         copy(p_u8_, pt_u_, w_u8_);
         copy(p_f64_, pt_f_, w_f64_);
         set_rows_kernel<<<(np + 63) / 64, 64, 0, stream_>>>(raw(p_int_), d_ps, d_pr, np, w_int_, field_of_.at("row").off);
-        materialize_kernel<<<(np + 63) / 64, 64, 0, stream_>>>(dev_, d_ps, np);
+        if (np > 0) materialize_kernel<<<np, 128, 0, stream_>>>(dev_, d_ps, np);
         check_cuda(cudaGetLastError(), "point template load");
     }
     // the masked rows and those with a loss to share: the template, then their masks and their share on
@@ -3088,7 +3147,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         }
         if (any_loss) {
             upload_h2d_grow(ld_loss_, loss.data(), loss.size(), stream_);   // pageable: staged, loss may die
-            share_lost_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(dev_, d_ms, raw(ld_loss_), nm);
+            share_lost_kernel<<<(nm + 3) / 4, 128, 0, stream_>>>(dev_, d_ms, raw(ld_loss_), nm);   // a warp per row
             check_cuda(cudaGetLastError(), "lost power share");
         }
         if (check_tmpl_) {
@@ -3107,7 +3166,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
                 compare_rows(hr, dr, m_rows[static_cast<size_t>(k)]);
             }
         }
-        materialize_kernel<<<(nm + 63) / 64, 64, 0, stream_>>>(dev_, d_ms, nm);
+        if (nm > 0) materialize_kernel<<<nm, 128, 0, stream_>>>(dev_, d_ms, nm);
         check_cuda(cudaGetLastError(), "materialize");
     }
     if (!t_slots.empty()) {
@@ -3128,7 +3187,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         copy(p_u8_, tmpl_u_, w_u8_);
         copy(p_f64_, tmpl_f_, w_f64_);
         set_rows_kernel<<<(nt + 63) / 64, 64, 0, stream_>>>(raw(p_int_), d_ts, d_tr, nt, w_int_, field_of_.at("row").off);
-        materialize_kernel<<<(nt + 63) / 64, 64, 0, stream_>>>(dev_, d_ts, nt);
+        if (nt > 0) materialize_kernel<<<nt, 128, 0, stream_>>>(dev_, d_ts, nt);
         check_cuda(cudaGetLastError(), "template load");
     }
     const int n = static_cast<int>(slots.size());
@@ -3246,7 +3305,7 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
     apply(p_int_, base_i_, pt_i_, w_int_, dif_i_pos_, dif_i_val_, ld_dpos_i_, ld_dval_i_);
     apply(p_u8_, base_u_, pt_u_, w_u8_, dif_u_pos_, dif_u_val_, ld_dpos_u_, ld_dval_u_);
     apply(p_f64_, base_f_, pt_f_, w_f64_, dif_f_pos_, dif_f_val_, ld_dpos_f_, ld_dval_f_);
-    materialize_kernel<<<(n + 63) / 64, 64, 0, stream_>>>(dev_, raw(ld_slots_), n);
+    if (n > 0) materialize_kernel<<<n, 128, 0, stream_>>>(dev_, raw(ld_slots_), n);
     check_cuda(cudaGetLastError(), "materialize");
     n_host_loads_ += n;
     if (prof_on_) {
