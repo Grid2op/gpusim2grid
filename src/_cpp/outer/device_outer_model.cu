@@ -47,6 +47,9 @@ namespace outer {
 namespace {
 
 constexpr int STABLE = 0, UNSTABLE = 1, FAILED = 2, CHECK_AGAIN = 3;   // OuterLoopStatus
+// not an OuterLoopStatus: a DistributedSlack check paused before its distribute(), which the block runs
+// before drive() resumes it (s_dstage)
+constexpr int DS_PAUSED = 100;
 constexpr int VC_GEN = 0, VC_SVC = 1, VC_HVDC_1 = 2, VC_HVDC_2 = 3;     // VoltageControlSolverData::Kind
 // device error codes (a case the host scan should have refused, or a capacity)
 constexpr int kNoTap = -2147483647 - 1;   // RatioTapControl: no move requested (INT_MIN)
@@ -180,6 +183,12 @@ struct Dev {
     double *s_pq_lim;
     double *s_lo, *s_hi, *s_new;
     unsigned char *s_act, *s_sat;
+    // distribute() by the block: the pause stage (0 none; 1 / 3 paused in check_ds_in_newton
+    // / check_ds; 2 / 4 distributed, to resume), the inputs and results kept across the pause, per unit the
+    // round's change and whether it was active
+    int *s_dstage, *s_dnun, *s_dasat;
+    double *s_drem, *s_dret, *s_ddlt;
+    unsigned char *s_dwact;
     int *s_hl;
     // per row: the results
     int *r_status, *r_unreal, *r_failed, *r_outer, *r_nr;
@@ -480,65 +489,122 @@ __device__ void ds_fold(const Dev& d, int s, double sa)
 }
 
 // ---- lightsim2grid's slack_redistribution::distribute (no overshoot), over the slot's units ------
-// writes s_new (the new injections) and s_sat; returns not_distributed_mw, `all_saturated`
-__device__ double distribute(const Dev& d, int s, double mismatch_mw, double eps_mw, bool& all_saturated)
+// The threads running it together: the slot's block (on_solved_kernel, after a check paused with DS_PAUSED)
+// or the row's warp (share_lost_kernel). sync() is the group's barrier, which also orders its threads'
+// memory; sh is what thread 0 hands the others, in the caller's shared memory, one per group.
+struct DsShared {
+    double rem, fsum;
+    int nb, clamped, go;
+};
+struct BlockGroup {
+    int t, nt;
+    DsShared* sh;
+    __device__ void sync() const { __syncthreads(); }
+};
+struct WarpGroup {
+    int t;   // the lane
+    static constexpr int nt = 32;
+    DsShared* sh;
+    __device__ void sync() const { __syncwarp(); }
+};
+
+// The units spread over the group's threads, the order-dependent sums -- factor_sum, done -- by thread 0 over
+// the units in their order, so every value is the host's, bit for bit. One thread's serial FP64 work held the
+// warp's FP64 pipe for each instruction (1/64 of the FP32 rate on some GPUs): 130-330 us a call with 120
+// units on PtFige. Writes s_new (the new injections) and s_sat, sets `all_saturated` on every thread, returns
+// not_distributed_mw on thread 0.
+template <class Group>
+__device__ double distribute(const Group& g, const Dev& d, int s, double mismatch_mw, bool& all_saturated)
 {
-    const unsigned char* present = SLOT(ds_present, d.n_units);
-    const double* inj = SLOT(ds_inj, d.n_units);
-    double* lo = SLOT(s_lo, d.n_units);
-    double* hi = SLOT(s_hi, d.n_units);
-    double* nmw = SLOT(s_new, d.n_units);
-    unsigned char* active = SLOT(s_act, d.n_units);
-    unsigned char* sat = SLOT(s_sat, d.n_units);
-    all_saturated = false;
-    int nb = 0;
-    for (int k = 0; k < d.n_units; ++k) {
+    const unsigned char* __restrict__ present = SLOT(ds_present, d.n_units);
+    const double* __restrict__ inj = SLOT(ds_inj, d.n_units);
+    double* __restrict__ lo = SLOT(s_lo, d.n_units);
+    double* __restrict__ hi = SLOT(s_hi, d.n_units);
+    double* __restrict__ nmw = SLOT(s_new, d.n_units);
+    unsigned char* __restrict__ active = SLOT(s_act, d.n_units);
+    unsigned char* __restrict__ sat = SLOT(s_sat, d.n_units);
+    double* __restrict__ dlt = SLOT(s_ddlt, d.n_units);
+    unsigned char* __restrict__ wact = SLOT(s_dwact, d.n_units);
+    const int n_units = d.n_units;
+    const double eps_mw = d.ds_eps_mw;
+    const int t = g.t, nt = g.nt;
+    DsShared& sh = *g.sh;
+    if (t == 0) { sh.nb = 0; sh.clamped = 0; }
+    g.sync();
+    int nb_t = 0;
+    for (int k = t; k < n_units; k += nt) {
         sat[k] = 0;
         active[k] = 0;
         if (!present[k]) continue;
-        ++nb;
+        ++nb_t;
         nmw[k] = inj[k];
     }
-    if (nb == 0 || fabs(mismatch_mw) <= eps_mw) return 0.;
-    const double inf = CUDART_INF;
-    for (int k = 0; k < d.n_units; ++k) {
-        if (!present[k]) continue;
-        active[k] = 1;
-        lo[k] = isfinite(d.ds_min[k]) ? d.ds_min[k] : -inf;
-        hi[k] = isfinite(d.ds_max[k]) ? d.ds_max[k] : inf;
-        if (inj[k] < 0.) hi[k] = fmin(hi[k], 0.);
-        else lo[k] = fmax(lo[k], 0.);
-    }
+    if (nb_t) atomicAdd(&sh.nb, nb_t);   // an integer count: the order does not matter
+    g.sync();
+    const int nb = sh.nb;
+    all_saturated = false;
     double remaining = mismatch_mw;
-    int nb_active = nb, rounds = 0;
-    while (nb_active > 0 && fabs(remaining) > eps_mw && rounds <= nb + 1) {
-        ++rounds;
-        double factor_sum = 0.;
-        for (int k = 0; k < d.n_units; ++k) if (active[k]) factor_sum += d.ds_w[k];
-        if (factor_sum <= 0.) break;
-        double done = 0.;
-        for (int k = 0; k < d.n_units; ++k) {
-            if (!active[k]) continue;
-            const double old = nmw[k];
-            double cand = old + remaining * d.ds_w[k] / factor_sum;
-            if (remaining > 0. && cand >= hi[k]) {
-                cand = old > hi[k] ? old : hi[k];
-                active[k] = 0; sat[k] = 1; --nb_active;
-            } else if (remaining < 0. && cand <= lo[k]) {
-                cand = old < lo[k] ? old : lo[k];
-                active[k] = 0; sat[k] = 1; --nb_active;
-            }
-            done += cand - old;
-            nmw[k] = cand;
+    if (!(nb == 0 || fabs(mismatch_mw) <= eps_mw)) {
+        const double inf = CUDART_INF;
+        for (int k = t; k < n_units; k += nt) {
+            if (!present[k]) continue;
+            active[k] = 1;
+            lo[k] = isfinite(d.ds_min[k]) ? d.ds_min[k] : -inf;
+            hi[k] = isfinite(d.ds_max[k]) ? d.ds_max[k] : inf;
+            if (inj[k] < 0.) hi[k] = fmin(hi[k], 0.);
+            else lo[k] = fmax(lo[k], 0.);
         }
-        remaining -= done;
+        int nb_active = nb, rounds = 0;
+        for (;;) {
+            g.sync();   // the units' state of the previous step
+            if (t == 0) {
+                sh.go = 0;
+                if (nb_active > 0 && fabs(remaining) > eps_mw && rounds <= nb + 1) {
+                    double factor_sum = 0.;
+                    for (int k = 0; k < n_units; ++k) if (active[k]) factor_sum += d.ds_w[k];
+                    sh.fsum = factor_sum;
+                    sh.rem = remaining;
+                    sh.go = factor_sum <= 0. ? 0 : 1;
+                }
+                sh.clamped = 0;
+            }
+            g.sync();
+            if (!sh.go) break;
+            ++rounds;
+            const double rem = sh.rem, factor_sum = sh.fsum;
+            int clamped_t = 0;
+            for (int k = t; k < n_units; k += nt) {
+                wact[k] = active[k];
+                if (!active[k]) continue;
+                const double old = nmw[k];
+                double cand = old + rem * d.ds_w[k] / factor_sum;
+                if (rem > 0. && cand >= hi[k]) {
+                    cand = old > hi[k] ? old : hi[k];
+                    active[k] = 0; sat[k] = 1; ++clamped_t;
+                } else if (rem < 0. && cand <= lo[k]) {
+                    cand = old < lo[k] ? old : lo[k];
+                    active[k] = 0; sat[k] = 1; ++clamped_t;
+                }
+                dlt[k] = cand - old;
+                nmw[k] = cand;
+            }
+            if (clamped_t) atomicAdd(&sh.clamped, clamped_t);
+            g.sync();
+            nb_active -= sh.clamped;   // every thread: the same count
+            if (t == 0) {
+                double done = 0.;
+                for (int k = 0; k < n_units; ++k) if (wact[k]) done += dlt[k];
+                remaining -= done;
+            }
+        }
+        // the units are DistributedSlack's own participants: never in the solve's slack (in_slack false)
+        if (nb_active == 0) {
+            all_saturated = true;
+            for (int k = t; k < n_units; k += nt) sat[k] = 0;
+        }
     }
-    // the units are DistributedSlack's own participants: never in the solve's slack (in_slack false)
-    if (nb_active == 0) {
-        all_saturated = true;
-        for (int k = 0; k < d.n_units; ++k) sat[k] = 0;
-    }
-    return remaining;
+    g.sync();   // the units' results, for whichever thread reads them next
+    return (nb == 0 || fabs(mismatch_mw) <= eps_mw) ? 0. : remaining;
 }
 
 // SlotState::ds_mark_solved: the units parked and their output as the next solve has them
@@ -555,27 +621,41 @@ __device__ int check_ds_in_newton(const Dev& d, int s, const Row& rv)
 {
     const unsigned char* present = SLOT(ds_present, d.n_units);
     double* cur = SLOT(ds_cur, d.n_units);
-    const double* inj = SLOT(ds_inj, d.n_units);
-    // where the solve left the units: the fold moved their targets by their share
-    for (int k = 0; k < d.n_units; ++k) {
-        if (!present[k]) continue;
-        cur[k] = d.ds_kind[k] == 0 ? gen_in_force(d, s, d.ds_el[k]) : -sto_in_force(d, s, d.ds_el[k]);
-    }
-    // the solve just checked ran with the units parked as the last check left them
-    if (d.keep_adj) ds_mark_solved(d, s);
-    double mre, mim;
-    mis_bus(d, s, rv, d.slack_bus, mre, mim);
-    double mismatch = mre * d.sn;
-    if (isnan(mismatch)) mismatch = 0.;
-    double remaining = mismatch;
+    double remaining;
     int n_units = 0;
-    for (int k = 0; k < d.n_units; ++k) {
-        if (!present[k]) continue;
-        ++n_units;
-        remaining += cur[k] - inj[k];
-    }
     bool all_sat;
-    const double not_distributed = distribute(d, s, remaining, d.ds_eps_mw, all_sat);
+    double not_distributed;
+    if (S1(s_dstage) == 2) {   // resumed: the block distributed `remaining`
+        S1(s_dstage) = 0;
+        remaining = S1(s_drem);
+        n_units = S1(s_dnun);
+        all_sat = S1(s_dasat) != 0;
+        not_distributed = S1(s_dret);
+    } else {
+        const double* inj = SLOT(ds_inj, d.n_units);
+        // where the solve left the units: the fold moved their targets by their share
+        for (int k = 0; k < d.n_units; ++k) {
+            if (!present[k]) continue;
+            cur[k] = d.ds_kind[k] == 0 ? gen_in_force(d, s, d.ds_el[k]) : -sto_in_force(d, s, d.ds_el[k]);
+        }
+        // the solve just checked ran with the units parked as the last check left them
+        if (d.keep_adj) ds_mark_solved(d, s);
+        double mre, mim;
+        mis_bus(d, s, rv, d.slack_bus, mre, mim);
+        double mismatch = mre * d.sn;
+        if (isnan(mismatch)) mismatch = 0.;
+        remaining = mismatch;
+        for (int k = 0; k < d.n_units; ++k) {
+            if (!present[k]) continue;
+            ++n_units;
+            remaining += cur[k] - inj[k];
+        }
+        // the block distributes (on_solved_kernel), then drive() resumes this check
+        S1(s_drem) = remaining;
+        S1(s_dnun) = n_units;
+        S1(s_dstage) = 1;
+        return DS_PAUSED;
+    }
     unsigned char* sat = SLOT(s_sat, d.n_units);
     if (all_sat) for (int k = 0; k < d.n_units; ++k) if (present[k]) sat[k] = 1;
     const double residue = n_units == 0 ? remaining : not_distributed;
@@ -620,24 +700,36 @@ __device__ int check_ds(const Dev& d, int s, const Row& rv)
         for (int k = 0; k < d.n_units; ++k) n_present += SLOT(ds_present, d.n_units)[k] ? 1 : 0;
         if (n_present > 0) return check_ds_in_newton(d, s, rv);
     }
-    double mre, mim;
-    mis_bus(d, s, rv, d.slack_bus, mre, mim);
-    const double mismatch = mre * d.sn;
-    const bool triggered = fabs(mismatch) > d.ds_mismatch_mw && fabs(mismatch) > d.ds_eps_mw;
-    rec(d, s, TA_DISTRIBUTE, triggered, -1, mismatch, fmax(d.ds_mismatch_mw, d.ds_eps_mw));
-    if (!triggered) return STABLE;
     const unsigned char* present = SLOT(ds_present, d.n_units);
     double* cur = SLOT(ds_cur, d.n_units);
-    const double* inj = SLOT(ds_inj, d.n_units);
-    double remaining = mismatch;
+    double remaining;
     int n_units = 0;
-    for (int k = 0; k < d.n_units; ++k) {
-        if (!present[k]) continue;
-        ++n_units;
-        remaining += cur[k] - inj[k];
+    double not_distributed;
+    if (S1(s_dstage) == 4) {   // resumed: the block distributed `remaining`
+        S1(s_dstage) = 0;
+        remaining = S1(s_drem);
+        n_units = S1(s_dnun);
+        not_distributed = S1(s_dret);
+    } else {
+        double mre, mim;
+        mis_bus(d, s, rv, d.slack_bus, mre, mim);
+        const double mismatch = mre * d.sn;
+        const bool triggered = fabs(mismatch) > d.ds_mismatch_mw && fabs(mismatch) > d.ds_eps_mw;
+        rec(d, s, TA_DISTRIBUTE, triggered, -1, mismatch, fmax(d.ds_mismatch_mw, d.ds_eps_mw));
+        if (!triggered) return STABLE;
+        const double* inj = SLOT(ds_inj, d.n_units);
+        remaining = mismatch;
+        for (int k = 0; k < d.n_units; ++k) {
+            if (!present[k]) continue;
+            ++n_units;
+            remaining += cur[k] - inj[k];
+        }
+        // the block distributes (on_solved_kernel), then drive() resumes this check
+        S1(s_drem) = remaining;
+        S1(s_dnun) = n_units;
+        S1(s_dstage) = 3;
+        return DS_PAUSED;
     }
-    bool all_sat;
-    const double not_distributed = distribute(d, s, remaining, d.ds_eps_mw, all_sat);
     const double residue = n_units == 0 ? remaining : not_distributed;
     if (d.ds_fail && fabs(residue) > d.ds_eps_mw) {
         rec(d, s, TA_FAIL_RESIDUE, true, -1, residue, d.ds_eps_mw);
@@ -1635,6 +1727,8 @@ __device__ int drive(const Dev& d, int s, const Row* rv, int& row_status, int in
             status = check_rl_apply(d, s, *rv);
         } else if (!settled) {
             status = check(d, s, *rv, loop, loop_iter[i]);
+            // paused before its distribute(): the block runs it, then drive() comes back to this check
+            if (status == DS_PAUSED) { S1(p_recheck) = rechecking ? 1 : 0; return 3; }
         }
         if (!settled) {
             S1(last_status) = status;
@@ -1676,6 +1770,7 @@ __global__ void on_solved_kernel(Dev d, const int* slots, int n, const int* conv
     Row rv{g, d.n_watch, d.n_ctrl, d.n_bc};
     const Row* rvp = conv ? &rv : nullptr;
     __shared__ int sh_next;
+    __shared__ DsShared ds_sh;   // distribute()'s
     int row_status = inner_status[i];   // thread 0's
     if (threadIdx.x == 0) {
         bool rl_ready = false;
@@ -1726,15 +1821,26 @@ __global__ void on_solved_kernel(Dev d, const int* slots, int n, const int* conv
         sh_next = next;
     }
     __syncthreads();
-    while (sh_next == 2) {   // paused before a ReactiveLimits check
-        if (threadIdx.x == 0) rl_groups_holding(d, s);
-        __syncthreads();
-        for (int k = threadIdx.x; k < d.rl_n; k += blockDim.x) eval_rl_bus(d, s, rv, k);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            bool rl_ready = true;
-            sh_next = drive(d, s, rvp, row_status, inner_status[i], S1(p_recheck) != 0, unreal_flag, rl_ready);
+    while (sh_next == 2 || sh_next == 3) {
+        bool rl_ready = false;
+        if (sh_next == 2) {   // paused before a ReactiveLimits check
+            if (threadIdx.x == 0) rl_groups_holding(d, s);
+            __syncthreads();
+            for (int k = threadIdx.x; k < d.rl_n; k += blockDim.x) eval_rl_bus(d, s, rv, k);
+            __syncthreads();
+            rl_ready = true;
+        } else {              // paused before a DistributedSlack check's distribute(): the block runs it
+            bool all_sat;
+            const double ret = distribute(BlockGroup{static_cast<int>(threadIdx.x), static_cast<int>(blockDim.x),
+                                                     &ds_sh}, d, s, S1(s_drem), all_sat);
+            if (threadIdx.x == 0) {   // what the check reads when drive() resumes it
+                S1(s_dret) = ret;
+                S1(s_dasat) = all_sat ? 1 : 0;
+                S1(s_dstage) += 1;
+            }
         }
+        if (threadIdx.x == 0)
+            sh_next = drive(d, s, rvp, row_status, inner_status[i], S1(p_recheck) != 0, unreal_flag, rl_ready);
         __syncthreads();
     }
     // what drive left to the block: the controls of a row to re-solve, the results of a finished one
@@ -2288,7 +2394,9 @@ void DeviceOuterModel::init_tables()
     X(s_hold, 1, t_.n_grp) X(s_slope, 1, t_.n_grp) X(s_pq_k, 0, t_.rl_n) X(s_pq_lo, 0, t_.rl_n)            \
     X(s_pv_k, 0, t_.rl_n) X(s_mv_k, 0, t_.rl_n) X(s_pq_real, 1, t_.rl_n) X(s_pq_lim, 2, t_.rl_n)           \
     X(s_lo, 2, n_units_) X(s_hi, 2, n_units_) X(s_new, 2, n_units_) X(s_act, 1, n_units_)                \
-    X(s_sat, 1, n_units_) X(s_hl, 0, n_hl_) X(s_cls, 0, t_.rl_n) X(s_qlim, 2, t_.rl_n)
+    X(s_sat, 1, n_units_) X(s_hl, 0, n_hl_) X(s_cls, 0, t_.rl_n) X(s_qlim, 2, t_.rl_n)                  \
+    X(s_dstage, 0, 1) X(s_dnun, 0, 1) X(s_dasat, 0, 1) X(s_drem, 2, 1) X(s_dret, 2, 1)                   \
+    X(s_ddlt, 2, n_units_) X(s_dwact, 1, n_units_)
 
 template <typename P> struct KindOf;
 template <> struct KindOf<int*> { static constexpr int v = 0; };
@@ -2857,8 +2965,11 @@ __global__ void mask_rows_kernel(Dev d, const int* slots, int n, const int* mask
 // else is already the row's. Not for a row resuming from another row's point (it shares beyond that
 // point's loss) nor after an n solve that parked units of a distributed-slack Newton (the keep-parked
 // move follows the share): load_rows routes those through the host model. One thread per slot.
+constexpr int SHARE_LOST_WARPS = 4;   // share_lost_kernel's rows a block
+
 __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p, int n)
 {
+    __shared__ DsShared ds_sh[SHARE_LOST_WARPS];   // distribute()'s, one per warp
     // a warp per row: the loops whose iterations are independent (each its own element) run on its lanes, the
     // ordered sums keep their order (lanes filter, the terms are added in index order on every lane), the rest
     // runs on lane 0: the host model's arithmetic, operation for operation
@@ -2904,9 +3015,10 @@ __global__ void share_lost_kernel(Dev d, const int* slots, const double* lost_p,
     for (int k = lane; k < d.n_units; k += 32) n_present += present[k] ? 1 : 0;
     n_present = __reduce_add_sync(0xffffffffu, n_present);
     if (n_present == 0 || !(fabs(counted) > d.ds_eps_mw)) return;
-    if (lane == 0) {   // DistributedSlack's share and its bookkeeping: sequential
+    // DistributedSlack's share by the warp (every lane the same counted), its bookkeeping on lane 0
     bool all_sat;
-    distribute(d, s, counted, d.ds_eps_mw, all_sat);
+    distribute(WarpGroup{lane, &ds_sh[threadIdx.x >> 5]}, d, s, counted, all_sat);
+    if (lane == 0) {   // sequential
     const double* nmw = SLOT(s_new, d.n_units);
     double* cur = SLOT(ds_cur, d.n_units);
     for (int k = 0; k < d.n_units; ++k) {
@@ -3143,7 +3255,8 @@ void DeviceOuterModel::load_rows(const std::vector<int>& slots_in, const std::ve
         }
         if (any_loss) {
             upload_h2d_grow(ld_loss_, loss.data(), loss.size(), stream_);   // pageable: staged, loss may die
-            share_lost_kernel<<<(nm + 3) / 4, 128, 0, stream_>>>(dev_, d_ms, raw(ld_loss_), nm);   // a warp per row
+            share_lost_kernel<<<(nm + SHARE_LOST_WARPS - 1) / SHARE_LOST_WARPS, 32 * SHARE_LOST_WARPS, 0, stream_>>>(
+                dev_, d_ms, raw(ld_loss_), nm);   // a warp per row
             check_cuda(cudaGetLastError(), "lost power share");
         }
         if (check_tmpl_) {
