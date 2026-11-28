@@ -17,13 +17,14 @@ import warnings
 import numpy as np
 import pytest
 
-from conftest import requires_gpu
+from conftest import parity_tol, requires_gpu
 import gpusim2grid._gpusim2grid as _cpp
 
 pytestmark = [
     requires_gpu,
     pytest.mark.skipif(not getattr(_cpp, "have_ls2g_bridge", False), reason="needs the lightsim2grid bridge"),
 ]
+needs_fp64 = pytest.mark.skipif(bool(_cpp.is_fp32), reason="parity tolerances are FP64 ones")
 needs_ls2g_weights = pytest.mark.skipif(
     not getattr(_cpp, "have_ls2g_branch_params", False),
     reason="lightsim2grid's own ScenarioSweep with per-row slack weights (PR #303) is the oracle")
@@ -486,6 +487,45 @@ def test_outer_loops_share_with_the_rows_weights(init_from_n, solver_atol):
     res, res_ls = sw.get_outer_results(), ls.get_outer_results()
     for row in range(N_ROWS):
         assert res[row].nb_outer_iterations == res_ls[row].nb_outer_iterations, f"row {row}"
+
+
+@needs_ls2g_weights
+@needs_fp64
+def test_outer_loops_ignore_a_weight_to_a_unit_the_row_disconnects():
+    """Under the outer loops only a unit that can take part in the grid's slack may get a
+    positive weight -- but a row disconnecting that unit ignores its weight, as without the
+    outer loops (lightsim2grid's ScenarioSweep refuses the batch): the row is the one giving it
+    none. A positive weight to it in a row keeping it connected is still refused."""
+    if not getattr(_cpp, "have_ls2g_outer_loops", False):
+        pytest.skip("lightsim2grid without its outer loops")
+    import test_outer_loops_batch as olb
+    from gpusim2grid import ScenarioSweepGPU
+
+    grid = olb._case14()
+    n_gen = len(grid.get_generators())
+    out = 3   # cannot take part in the grid's slack
+    flags = [g != out for g in range(n_gen)]
+    grid.set_gen_can_participate_slack(flags, np.full(n_gen, 300.))
+    assert grid.ac_pf(np.asarray(grid.get_V(), dtype=complex), olb.MAX_IT, olb.TOL_MVA).size > 0
+    n_rows = 2
+    load_p, load_q = grid.get_loads_res_full()[:2]
+    rep = lambda a: np.repeat(np.asarray(a, dtype=np.float64)[None, :], n_rows, axis=0)   # noqa: E731
+    gen_off = np.zeros((n_rows, n_gen), dtype=bool)
+    gen_off[:, out] = True
+    w = np.array([[np.nan], [50.]])   # row 1 weights the unit it disconnects
+    sw = ScenarioSweepGPU(grid, outer_loops=True, nb_iter=olb.MAX_IT, init_from_n_powerflow=False,
+                          tol=olb.TOL_MVA / grid.get_sn_mva(), ir_n_steps=1)
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(grid.get_gen_target_p()))
+    sw.set_contingency_gens(gen_off)
+    sw.set_gen_slack_weights([out], w)
+    sw.compute(batch_size=n_rows)
+    V = sw.solver.V_results.to_numpy().reshape(n_rows, sw.n_bus)
+    assert np.all(np.isfinite(V))
+    np.testing.assert_allclose(V[1], V[0], rtol=0, atol=parity_tol("state"))
+    # connected, it is refused
+    sw.set_contingency_gens(np.zeros((n_rows, n_gen), dtype=bool))
+    with pytest.raises(ValueError, match="takes no part in the grid's distributed slack"):
+        sw.compute(batch_size=n_rows)
 
 
 def test_refusals():

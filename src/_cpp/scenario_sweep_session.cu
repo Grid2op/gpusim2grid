@@ -2266,17 +2266,28 @@ void ScenarioSweepSession::run()
         }
         // ... and what it loses, for its DistributedSlack loop to share (redistribute_slack)
         ov.lost_p_mw = row_lost_p_mw_;
-        // ... and the weights it shares the slack with (set_gen_slack_weights)
-        const auto dense_w = [this](const SlackWeightRows::Family& fam, std::vector<double>& out) {
+        // ... and the weights it shares the slack with (set_gen_slack_weights): only those that act --
+        // not a row the batch leaves out (never solved), nor a unit the row disconnects (it takes
+        // no share, as without the outer loops). The model refuses a positive weight to a unit
+        // that cannot take part in the grid's slack (lightsim2grid's rule under outer loops, which
+        // refuses those two too: gpusim2grid follows its rule without the outer loops there), and
+        // a row left with none of its own resumes like the others.
+        const auto dense_w = [this](const SlackWeightRows::Family& fam, std::vector<double>& out, const auto& off) {
             if (fam.empty()) return;
             const size_t n_el = fam.col_of_el.size();
             out.assign(static_cast<size_t>(n_scenarios_) * n_el, std::numeric_limits<double>::quiet_NaN());
-            for (int r = 0; r < n_scenarios_; ++r)
-                for (size_t c = 0; c < fam.ids.size(); ++c)
+            for (int r = 0; r < n_scenarios_; ++r) {
+                if (!row_unsupported_.empty() && !row_unsupported_[static_cast<size_t>(r)].empty()) continue;
+                for (size_t c = 0; c < fam.ids.size(); ++c) {
+                    if (off(r, fam.ids[c])) continue;
                     out[static_cast<size_t>(r) * n_el + static_cast<size_t>(fam.ids[c])] = fam.w(r, static_cast<Eigen::Index>(c));
+                }
+            }
         };
-        dense_w(slack_w_rows_.gen, ov.gen_slack_w);
-        dense_w(slack_w_rows_.sto, ov.storage_slack_w);
+        dense_w(slack_w_rows_.gen, ov.gen_slack_w,
+                [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g); });
+        dense_w(slack_w_rows_.sto, ov.storage_slack_w,
+                [this](int r, int st) { return _row_trips(r, &MoreTrips::storages, st); });
         outer_->set_row_overrides(std::move(ov));
     }
 
