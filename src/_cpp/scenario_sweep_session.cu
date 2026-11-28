@@ -1046,6 +1046,17 @@ void ScenarioSweepSession::set_branch_data(
                         "the new " + std::to_string(n_bra_new) + " branches -- call "
                         "set_topology() with valid ids first");
     }
+    // ... and so do the rows' own parameters: the topology rebuilt below reads the new data at
+    // each branch they name (_append_branch_params)
+    if (has_branch_params_)
+        for (size_t r = 0; r < branch_params_.size(); ++r)
+            for (const BranchParamBlock& bp : branch_params_[r])
+                if (bp.first >= n_bra_new)
+                    throw std::runtime_error(
+                        "ScenarioSweepSession::set_branch_data: row " + std::to_string(r) + "'s parameters "
+                        "(set_line_parameters / set_trafo_parameters) name branch " + std::to_string(bp.first) +
+                        ", out of range for the new " + std::to_string(n_bra_new) + " branches -- set them "
+                        "again (or clear them) first");
 
     h_branch_from_   = branch_from;
     h_branch_to_     = branch_to;

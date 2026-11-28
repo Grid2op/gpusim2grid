@@ -342,6 +342,24 @@ def test_a_refused_call_leaves_the_session_as_it_was():
     np.testing.assert_allclose(a_or, a_plain, rtol=tol, atol=tol * np.max(a_plain))
 
 
+def test_branch_data_must_hold_the_rows_branches(solver_atol):
+    """set_branch_data rebuilds the rows' Ybus patches from the new data: data without a branch
+    a row's parameters name is refused before anything is replaced, as one without a tripped
+    branch is -- the session stays usable."""
+    from gpusim2grid._ls2g_utils import extract_branch_data
+
+    grid = _case14()
+    p = _Params(grid)
+    sw = _sweep(grid, params=p)
+    args, n_lines, _ = extract_branch_data(grid)
+    n_keep = n_lines + int(np.max(p.trafo_ids))   # without the last transformer the rows name
+    short = tuple(np.asarray(a)[:n_keep] for a in args[:6]) + tuple(args[6:])
+    with pytest.raises(RuntimeError, match="set_line_parameters / set_trafo_parameters"):
+        sw.set_branch_data(*short)
+    _results(sw, grid)
+    assert np.all(sw.last_residuals() < solver_atol)
+
+
 def test_outer_loops_regulated_transformer_is_left_out(solver_atol):
     """Under outer loops, a row changing a transformer a TransformerVoltageControl loop
     regulates is BATCH_UNSUPPORTED (the loop re-stamps it from the grid's values); a row
