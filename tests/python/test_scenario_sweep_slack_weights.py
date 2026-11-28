@@ -68,6 +68,56 @@ def _case14_all_slack():
     return grid
 
 
+def _feeder_colocated():
+    """test_gen_p_violations' 4-bus radial feeder (80 MW / 60 MVAr on bus 3) with one more
+    generator: generator 2, on bus 0 next to generator 0, takes NO part in the grid's slack
+    (generators 0 and 1 share it) -- only a row's own weight brings it in, so the grid's
+    active-power plan and pre-pass data lack it. Every generator has an active range the rows'
+    shares leave. Solved; returns (grid, v0)."""
+    from lightsim2grid.lightsim2grid_cpp import LSGrid
+
+    grid = LSGrid()
+    grid.set_sn_mva(100.)
+    grid.set_init_vm_pu(1.0)
+    grid.init_bus(4, 1, np.full(4, 138.), 0, 0)
+    grid.init_powerlines(np.full(3, 0.01), np.full(3, 0.1), np.zeros(3, dtype=complex),
+                         np.array([0, 1, 2]), np.array([1, 2, 3]))
+    grid.init_loads(np.array([80.]), np.array([60.]), np.array([3]))
+    grid.init_generators(np.array([0., 10., 5.]), np.array([1.02, 1.05, 1.02]),
+                         np.full(3, -1e3), np.full(3, 1e3), np.array([0, 1, 0]))
+    grid.add_gen_slackbus(0, 1.)
+    grid.add_gen_slackbus(1, 1.)
+    grid.set_gen_p_limits(np.zeros(3), np.array([30., 30., 10.]))
+    grid.tell_solver_need_reset()
+    v0 = grid.ac_pf(np.ones(4, dtype=complex), MAX_IT, TOL)
+    assert v0.shape[0] > 0
+    return grid, v0
+
+
+COLOCATED_W = np.array([[np.nan], [1.], [3.]])   # generator 2's weight per row: none, 1, 3
+
+
+def _colocated_reference(grid, v0, **options):
+    """lightsim2grid's ScenarioSweep on _feeder_colocated with COLOCATED_W, the active-power
+    check on (tolerance 0); `options` its attributes (e.g. redistribute_slack)"""
+    from lightsim2grid.scenarioSweep import ScenarioSweepCPP
+    import test_gen_p_violations as gpv
+
+    n_rows = COLOCATED_W.shape[0]
+    ls = ScenarioSweepCPP(grid)
+    for k, v in options.items():
+        setattr(ls, k, v)
+    gpv._ls_enable(ls, 0.)
+    ls.modify_load_p(np.repeat(_elements(grid)[0][None, :], n_rows, axis=0))
+    ls.set_gen_slack_weights(np.array([2]), COLOCATED_W)
+    ls.compute(v0.copy(), MAX_IT, TOL)
+    assert np.all(ls.converged_mask())
+    ref = gpv._p_records(ls.get_physical_violations())
+    # generator 2 (only the rows' weights make it share) is reported: the test checks something
+    assert any(rec[1] == 2 for row in ref for rec in row)
+    return ref
+
+
 def _elements(grid):
     load_p, load_q = grid.get_loads_res_full()[:2]
     return (np.asarray(load_p, dtype=np.float64), np.asarray(load_q, dtype=np.float64),
@@ -253,6 +303,27 @@ def test_gen_p_check_follows_the_rows_weights(solver_atol):
     assert any(ref), "nothing reported: the test checks nothing"
     # the weights decide what is reported: row 0 (none given) differs from a weighted row
     assert sorted(x[:3] for x in ref[0]) != sorted(x[:3] for x in ref[1])
+
+
+@needs_ls2g_weights
+def test_gen_p_plan_follows_weights_set_while_the_checks_are_off(solver_atol):
+    """A plan built while the active-power check was on, the check turned off, weights set
+    bringing in a unit the grid's plan lacks, the check back on: the plan lists that unit
+    (lightsim2grid's ScenarioSweep records). Turning the check on keeps a plan it finds, so the
+    weights must have refreshed it while it was off."""
+    import test_gen_p_violations as gpv
+
+    grid, v0 = _feeder_colocated()
+    ref = _colocated_reference(grid, v0)
+    n_rows = COLOCATED_W.shape[0]
+    sw = _sweep(grid, n_rows=n_rows, compute_physical_violations=True)   # the grid's plan
+    sw.physical_violation_tol_mva = 0.
+    sw.compute_physical_violations = False
+    sw.set_gen_slack_weights([2], COLOCATED_W)
+    sw.compute_physical_violations = True
+    sw.compute(batch_size=n_rows)
+    got = gpv._p_records(sw.get_physical_violations())
+    gpv._assert_same(ref, got, gpv._mw_atol(grid, solver_atol))
 
 
 @needs_ls2g_weights

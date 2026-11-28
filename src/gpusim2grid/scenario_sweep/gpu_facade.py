@@ -1088,10 +1088,11 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         self._inner._s.set_slack_weight_rows(g_ids, g_w, s_ids, s_w)
         self._gen_slack_w, self._sto_slack_w = gen, sto
         # the units only a row's weight brings in: in the pre-pass's data and the active-power
-        # check's plan, read off the grid again
+        # check's plan, read off the grid again -- a plan set is refreshed even while the check is
+        # off, since turning it back on keeps the plan it finds
         if self.redistribute_slack:
             self.set_slack_redistribution_data_from_grid()
-        if self.compute_physical_violations and self._inner.has_gen_p_capability:
+        if self._inner.has_gen_p_capability:
             self.set_gen_p_capability_from_grid()
 
     def _row_weighted_unit_ids(self):
