@@ -1082,22 +1082,40 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         new = (ids, np.ascontiguousarray(w)) if ids.size else None
         gen = new if family == "gen" else self._gen_slack_w
         sto = new if family == "sto" else self._sto_slack_w
+        # the units only a row's weight brings in: in the pre-pass's data and the active-power
+        # check's plan, read off the grid again -- a plan set is refreshed even while the check is
+        # off, since turning it back on keeps the plan it finds. Built before anything is set, so
+        # that a refusal (e.g. the plan of a lightsim2grid without PR #303) changes nothing.
+        rw = self._row_weighted_unit_ids((gen, sto))
+        rd = self._slack_redistribution_data_off_grid(None, *rw) if self.redistribute_slack else None
+        plan = self._gen_p_plan_off_grid(None, *rw) if self._inner.has_gen_p_capability else None
+        self._push_slack_weights(gen, sto)
+        previous = self._gen_slack_w, self._sto_slack_w
+        self._gen_slack_w, self._sto_slack_w = gen, sto
+        try:
+            if rd is not None:
+                self._inner.set_slack_redistribution_data(rd)
+            if plan is not None:
+                self._inner.set_gen_p_capability(plan)
+                self._push_gen_p_targets()
+        except Exception:
+            self._gen_slack_w, self._sto_slack_w = previous
+            self._push_slack_weights(*previous)
+            raise
+
+    def _push_slack_weights(self, gen, sto):
+        """Hand the session both families' (ids, weights) (None: none)."""
         empty = (np.zeros(0, dtype=np.int32), np.zeros((0, 0), dtype=np.float64))
         g_ids, g_w = gen if gen is not None else empty
         s_ids, s_w = sto if sto is not None else empty
         self._inner._s.set_slack_weight_rows(g_ids, g_w, s_ids, s_w)
-        self._gen_slack_w, self._sto_slack_w = gen, sto
-        # the units only a row's weight brings in: in the pre-pass's data and the active-power
-        # check's plan, read off the grid again -- a plan set is refreshed even while the check is
-        # off, since turning it back on keeps the plan it finds
-        if self.redistribute_slack:
-            self.set_slack_redistribution_data_from_grid()
-        if self._inner.has_gen_p_capability:
-            self.set_gen_p_capability_from_grid()
 
-    def _row_weighted_unit_ids(self):
-        """(generator ids, storage ids) the rows give slack weights of their own."""
-        gen, sto = getattr(self, "_gen_slack_w", None), getattr(self, "_sto_slack_w", None)
+    def _row_weighted_unit_ids(self, weights=None):
+        """(generator ids, storage ids) the rows give slack weights of their own -- those of
+        `weights` ((gen, sto), each (ids, weights) or None) when given, the ones set otherwise."""
+        if weights is None:
+            weights = getattr(self, "_gen_slack_w", None), getattr(self, "_sto_slack_w", None)
+        gen, sto = weights
         g = [] if gen is None else [int(i) for i in gen[0]]
         s = [] if sto is None else [int(i) for i in sto[0]]
         return g, s

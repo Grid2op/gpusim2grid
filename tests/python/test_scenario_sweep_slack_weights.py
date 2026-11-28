@@ -327,6 +327,32 @@ def test_gen_p_plan_follows_weights_set_while_the_checks_are_off(solver_atol):
 
 
 @needs_ls2g_weights
+def test_refused_weights_leave_the_previous_ones(monkeypatch, solver_atol):
+    """set_gen_slack_weights refused while it re-reads what depends on the row-weighted units
+    (a lightsim2grid without PR #303 refuses the active-power plan of such units): the call
+    changes nothing, the next compute() is the one the previous weights give."""
+    import test_gen_p_violations as gpv
+
+    grid, v0 = _feeder_colocated()
+    ref = _colocated_reference(grid, v0)
+    n_rows = COLOCATED_W.shape[0]
+    sw = _sweep(grid, n_rows=n_rows, compute_physical_violations=True)
+    sw.physical_violation_tol_mva = 0.
+    sw.set_gen_slack_weights([2], COLOCATED_W)
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("the generator active-power check of rows giving slack weights of their own "
+                           "needs a lightsim2grid with per-row slack weights (lightsim2grid PR #303)")
+
+    with monkeypatch.context() as m:
+        m.setattr(_cpp, "_extract_gen_p_plan_from_lsgrid", refuse)
+        with pytest.raises(RuntimeError, match="PR #303"):
+            sw.set_gen_slack_weights([2], np.full((n_rows, 1), 7.))
+    sw.compute(batch_size=n_rows)
+    gpv._assert_same(ref, gpv._p_records(sw.get_physical_violations()), gpv._mw_atol(grid, solver_atol))
+
+
+@needs_ls2g_weights
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_outer_loops_share_with_the_rows_weights(init_from_n, solver_atol):
     """Under NROuter_*, the DistributedSlack loop shares with the row's weights (and a weighted

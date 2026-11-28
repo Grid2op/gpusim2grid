@@ -448,6 +448,15 @@ class PhysicalChecksFacadeMixin:
         changed on the grid. In explicit-array mode use
         :meth:`set_gen_p_capability` instead (or nothing: an unset plan means
         no machine has a limit)."""
+        # the units a scenario sweep's rows give slack weights of their own (set_gen_slack_weights)
+        # are in the plan too, whatever their own weight
+        gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
+        self._inner.set_gen_p_capability(self._gen_p_plan_off_grid(grid, gen_rw, sto_rw))
+        self._push_gen_p_targets()
+
+    def _gen_p_plan_off_grid(self, grid, gen_rw, sto_rw):
+        """The plan :meth:`set_gen_p_capability_from_grid` hands the session, with `gen_rw` /
+        `sto_rw` the row-weighted units -- built only, nothing set."""
         from .. import _gpusim2grid as _cpp
         grid = self._grid if grid is None else grid
         if grid is None:
@@ -460,12 +469,7 @@ class PhysicalChecksFacadeMixin:
                 "set_gen_p_capability_from_grid() needs gpusim2grid compiled with the "
                 "lightsim2grid bridge (the plan is built by lightsim2grid's own "
                 "build_gen_p_plan); use set_gen_p_capability(...) with the plan arrays.")
-        # the units a scenario sweep's rows give slack weights of their own (set_gen_slack_weights)
-        # are in the plan too, whatever their own weight
-        gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
-        self._inner.set_gen_p_capability(
-            _cpp._extract_gen_p_plan_from_lsgrid(grid, self._inner._s.n_bus, list(gen_rw), list(sto_rw)))
-        self._push_gen_p_targets()
+        return _cpp._extract_gen_p_plan_from_lsgrid(grid, self._inner._s.n_bus, list(gen_rw), list(sto_rw))
 
     def set_gen_p_capability(self, plan):
         """Explicit-array mode counterpart of :meth:`set_gen_p_capability_from_grid`
