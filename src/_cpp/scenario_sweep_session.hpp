@@ -117,6 +117,12 @@ struct ScenarioSweepSession {
     // =========================================================================
     bool injections_dirty_     = false;
     bool topology_dirty_       = false;
+    // bumped by every rebuild of the rows' branches (set_topology -- the setters rebuilding it
+    // with branch parameters, trips, new branch data -- and run()'s implicit topology); the one the
+    // last completed run() solved is what compute_flows reads the flows of (it refuses another:
+    // the last run's V through other trips / blocks is no row's flows)
+    std::uint64_t topology_generation_     = 0;
+    std::uint64_t run_topology_generation_ = ~std::uint64_t(0);
     bool gen_v_dirty_          = false;
     bool gen_off_dirty_        = false;
     bool injections_on_device_ = false;

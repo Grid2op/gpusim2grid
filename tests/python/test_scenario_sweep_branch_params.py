@@ -342,6 +342,27 @@ def test_a_refused_call_leaves_the_session_as_it_was():
     np.testing.assert_allclose(a_or, a_plain, rtol=tol, atol=tol * np.max(a_plain))
 
 
+def test_compute_flows_refuses_branches_changed_since_the_run(solver_atol):
+    """compute_flows reads the last run's voltages through the rows' branches as they are now
+    (the trips zeroed, the rows' own blocks written over): after set_line_parameters or
+    set_topology that would be the old voltages through the new blocks / trips -- no row's
+    flows -- so it refuses until compute() ran again."""
+    grid = _case14()
+    p = _Params(grid)
+    sw = _sweep(grid, params=p)
+    _results(sw, grid)
+    sw.set_line_parameters(p.line_ids, p.line_r, 2. * p.line_x, p.line_h1, p.line_h2)
+    with pytest.raises(RuntimeError, match="changed since the last run"):
+        sw.compute_flows()
+    _results(sw, grid)
+    sw.set_topology([[3]] + [[] for _ in range(N_ROWS - 1)])
+    with pytest.raises(RuntimeError, match="changed since the last run"):
+        sw.compute_flows()
+    _, a_or, _ = _results(sw, grid)
+    assert a_or[0, 3] == 0.
+    assert np.all(sw.last_residuals() < solver_atol)
+
+
 def test_branch_data_must_hold_the_rows_branches(solver_atol):
     """set_branch_data rebuilds the rows' Ybus patches from the new data: data without a branch
     a row's parameters name is refused before anything is replaced, as one without a tripped

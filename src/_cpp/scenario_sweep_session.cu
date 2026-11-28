@@ -1203,6 +1203,7 @@ void ScenarioSweepSession::set_topology(
     topology_implicit_ = false;
     topology_dirty_    = true;
     auto_ref_valid_    = false;
+    ++topology_generation_;
 }
 
 // =============================================================================
@@ -1787,6 +1788,7 @@ void ScenarioSweepSession::run()
         contingencies_.assign(static_cast<size_t>(n_scenarios_), Contingency{});
         tripped_branches_per_scenario_.assign(
             static_cast<size_t>(n_scenarios_), std::vector<int>{});
+        ++topology_generation_;
     }
 
     // Per-row state a new batch source computes from scratch: reset the
@@ -2309,6 +2311,7 @@ void ScenarioSweepSession::run()
     skip_dirty_ = false;
     switches_dirty_ = false;
     last_run_kept_jacobian_ = keep_final_jacobian_;
+    run_topology_generation_ = topology_generation_;
 
     solver_->cs.synchronize();
     timings_.t_session_run_wall_ms = ms_since(t_run0);
@@ -2434,6 +2437,13 @@ void ScenarioSweepSession::compute_flows()
     if (!solver_)
         throw std::runtime_error(
             "ScenarioSweepSession: call run() before compute_flows()");
+    // the last run's V through the rows' branches as they are NOW (their trips zeroed, their own
+    // blocks written over): a topology or parameter change since would give no row's flows
+    if (topology_generation_ != run_topology_generation_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::compute_flows: the rows' branches changed since the last run() "
+            "(set_topology, set_line_parameters / set_trafo_parameters, set_branch_data, a "
+            "contingency setter...): call run() first");
 
     // The admittances + dense flow buffers survive on a persistent driver:
     // upload them once per driver, not once per compute_flows() call.
