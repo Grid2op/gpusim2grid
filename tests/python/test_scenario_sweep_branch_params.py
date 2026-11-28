@@ -319,6 +319,29 @@ def test_setters_refuse(solver_atol):
     assert np.all(sw.last_residuals() < solver_atol)
 
 
+@needs_fp64
+def test_a_refused_call_leaves_the_session_as_it_was():
+    """set_line_parameters refused because the topology no longer has the injections' row count
+    (set_topology, then injections for one more row): the session keeps no parameter -- the
+    topology set again, every row is the plain one (to rounding: two sessions, see CLAUDE.md)."""
+    grid = _case14()
+    n = N_ROWS - 1
+    sw = _sweep(grid, n_rows=n, topology=[[] for _ in range(n)])
+    load_p, load_q = grid.get_loads_res_full()[:2]
+    gen_p = np.asarray(grid.get_gen_target_p(), dtype=np.float64)
+    rep = lambda a: np.repeat(np.asarray(a, dtype=np.float64)[None, :], N_ROWS, axis=0)   # noqa: E731
+    sw.set_injections_from_elements(rep(load_p), rep(load_q), rep(gen_p))
+    p = _Params(grid)
+    with pytest.raises(ValueError, match="set the topology again"):
+        sw.set_line_parameters(p.line_ids, p.line_r, p.line_x, p.line_h1, p.line_h2)
+    sw.set_topology([[] for _ in range(N_ROWS)])
+    V, a_or, _ = _results(sw, grid)
+    V_plain, a_plain, _ = _results(_sweep(grid), grid)
+    tol = parity_tol("state")
+    np.testing.assert_allclose(V, V_plain, rtol=0, atol=tol)
+    np.testing.assert_allclose(a_or, a_plain, rtol=tol, atol=tol * np.max(a_plain))
+
+
 def test_outer_loops_regulated_transformer_is_left_out(solver_atol):
     """Under outer loops, a row changing a transformer a TransformerVoltageControl loop
     regulates is BATCH_UNSUPPORTED (the loop re-stamps it from the grid's values); a row

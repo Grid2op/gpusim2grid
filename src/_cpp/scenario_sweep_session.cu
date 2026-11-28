@@ -1236,18 +1236,33 @@ void ScenarioSweepSession::set_branch_param_blocks(const std::vector<int>& rows,
     }
     // nothing set, or nothing left after a clear: no rebuild needed when there was nothing before
     const bool had = has_branch_params_;
-    branch_params_    = std::move(per_row);
-    has_branch_params_ = !rows.empty();
-    if (!had && !has_branch_params_) return;
+    const bool has = !rows.empty();
+    if (!had && !has) return;
     // the rows' Ybus patches, rebuilt with them (the caller's branch trips kept; the
-    // implicit "none" follows the new row count)
+    // implicit "none" follows the new row count). The rebuild must be accepted before anything
+    // is replaced, so that a refused call leaves the session as it was: a kept topology whose
+    // row count the injections changed since is refused by set_topology
     const bool keep = has_topology_ && !topology_implicit_;
-    const size_t n_implicit = has_branch_params_ ? branch_params_.size()
+    if (keep && has_injections_ && static_cast<int>(tripped_branches_per_scenario_.size()) != n_scenarios_)
+        throw std::invalid_argument(std::string(who) + ": the topology (set_topology) has " +
+                                    std::to_string(tripped_branches_per_scenario_.size()) + " rows, but "
+                                    "set_injections() fixed " + std::to_string(n_scenarios_) + " scenarios: set "
+                                    "the topology again first");
+    const size_t n_implicit = has ? per_row.size()
                             : (has_injections_ ? static_cast<size_t>(n_scenarios_) : contingencies_.size());
     const std::vector<std::vector<int>> trips = keep
         ? tripped_branches_per_scenario_
         : std::vector<std::vector<int>>(n_implicit);
-    set_topology(trips);
+    std::vector<std::vector<BranchParamBlock>> previous = std::move(branch_params_);
+    branch_params_    = std::move(per_row);
+    has_branch_params_ = has;
+    try {
+        set_topology(trips);
+    } catch (...) {
+        branch_params_     = std::move(previous);
+        has_branch_params_ = had;
+        throw;
+    }
     topology_implicit_ = !keep;
 }
 
