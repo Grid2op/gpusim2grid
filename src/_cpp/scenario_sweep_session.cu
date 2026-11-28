@@ -739,7 +739,21 @@ void ScenarioSweepSession::_check_slack_weight_rows() const
     std::vector<char> slack_bus(static_cast<size_t>(n_bus), 0);
     for (int b : base_state_->h_slack_bus)
         if (b >= 0 && b < n_bus) slack_bus[static_cast<size_t>(b)] = 1;
-    const auto check = [&](const SlackWeightRows::Family& fam, const char* what, const char* setter,
+    // what shares with a row's weights must list the unit: the redistribute_slack pre-pass data
+    // (build_row_weights builds the solve's row weights from it: a unit it lacks would silently
+    // take no share, unlike without the pre-pass) and the active-power check's plan (each bus'
+    // weight total). The grid's list every connected one (*_from_grid, which set_gen_slack_weights
+    // refreshes); data set explicitly may not.
+    const bool rd_needs = has_slack_rd_ && ((redistribute_slack_ && !outer_) || has_ext_sat_);
+    const bool gp_needs = phys_.compute_physical_violations && phys_.has_gen_p_plan &&
+                          phys_.gen_p_plan.n_entries > 0;   // none: nothing reported reads them
+    std::set<std::pair<int, int>> rd_units, plan_units;   // (5 GENERATOR / 6 STORAGE, container id)
+    if (rd_needs)
+        for (int k = 0; k < slack_rd_.n_units; ++k) rd_units.emplace(slack_rd_.kind(k), slack_rd_.el_id(k));
+    if (gp_needs)
+        for (int p = 0; p < phys_.gen_p_plan.n_part; ++p)
+            plan_units.emplace(phys_.gen_p_plan.part_el_type(p), phys_.gen_p_plan.part_el_id(p));
+    const auto check = [&](const SlackWeightRows::Family& fam, int kind, const char* what, const char* setter,
                            const auto& bus_of, const auto& off) {
         for (int r = 0; r < n_scenarios_; ++r) {
             if (!slack_w_rows_.has_row(r)) continue;
@@ -750,20 +764,33 @@ void ScenarioSweepSession::_check_slack_weight_rows() const
                 if (!(w >= slack_weight_rows::MIN_WEIGHT)) continue;   // NaN, or out of the slack
                 const int b = bus_of(el);
                 if (b < 0 || off(r, el)) continue;                      // takes no share
-                if (slack_bus[static_cast<size_t>(b)]) continue;
-                throw std::invalid_argument(
-                    std::string(setter) + ": row " + std::to_string(r) + " gives " + what + " " + std::to_string(el) +
-                    " a slack weight, but it stands on solver bus " + std::to_string(b) + ", where no unit takes "
-                    "part in the grid's distributed slack. The buses sharing the slack are fixed for the batch: "
-                    "make that unit a participant of the grid's slack (add_gen_slackbus / add_storage_slackbus) "
-                    "and give it 0 in the rows where it should take no share.");
+                const auto unit = [&]() {
+                    return std::string(setter) + ": row " + std::to_string(r) + " gives " + what + " " +
+                           std::to_string(el) + " a slack weight";
+                };
+                if (!slack_bus[static_cast<size_t>(b)])
+                    throw std::invalid_argument(
+                        unit() + ", but it stands on solver bus " + std::to_string(b) + ", where no unit takes "
+                        "part in the grid's distributed slack. The buses sharing the slack are fixed for the batch: "
+                        "make that unit a participant of the grid's slack (add_gen_slackbus / add_storage_slackbus) "
+                        "and give it 0 in the rows where it should take no share.");
+                if (rd_needs && !rd_units.count({kind, el}))
+                    throw std::invalid_argument(
+                        unit() + ", but the redistribute_slack pre-pass data does not list it: data set with "
+                        "set_slack_redistribution_data must list every unit a row gives a weight to (weight 0 where "
+                        "it takes no part in the grid's slack), as set_slack_redistribution_data_from_grid() does.");
+                if (gp_needs && !plan_units.count({kind, el}))
+                    throw std::invalid_argument(
+                        unit() + ", but the active-power check's plan does not list it among the units taking a "
+                        "share: a plan set with set_gen_p_capability must list every unit a row gives a weight to, "
+                        "as set_gen_p_capability_from_grid() does.");
             }
         }
     };
-    check(slack_w_rows_.gen, "generator", "set_gen_slack_weights",
+    check(slack_w_rows_.gen, SLACK_UNIT_GENERATOR, "generator", "set_gen_slack_weights",
           [this](int g) { return gen_data_.status[static_cast<size_t>(g)] ? gen_data_.bus[static_cast<size_t>(g)] : -1; },
           [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g); });
-    check(slack_w_rows_.sto, "storage unit", "set_storage_slack_weights",
+    check(slack_w_rows_.sto, SLACK_UNIT_STORAGE, "storage unit", "set_storage_slack_weights",
           [this](int st) {
               return static_cast<size_t>(st) < gen_data_.storage_any_bus.size() ? gen_data_.storage_any_bus[static_cast<size_t>(st)] : -1;
           },

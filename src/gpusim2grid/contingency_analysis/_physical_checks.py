@@ -452,6 +452,9 @@ class PhysicalChecksFacadeMixin:
         # are in the plan too, whatever their own weight
         gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
         self._inner.set_gen_p_capability(self._gen_p_plan_off_grid(grid, gen_rw, sto_rw))
+        # the grid's: a scenario sweep's set_gen_slack_weights reads it again (an explicit one
+        # it leaves alone)
+        self._gen_p_plan_from_grid = True
         self._push_gen_p_targets()
 
     def _gen_p_plan_off_grid(self, grid, gen_rw, sto_rw):
@@ -475,6 +478,7 @@ class PhysicalChecksFacadeMixin:
         """Explicit-array mode counterpart of :meth:`set_gen_p_capability_from_grid`
         -- see the engine's ``set_gen_p_capability`` for the arrays."""
         self._inner.set_gen_p_capability(plan)
+        self._gen_p_plan_from_grid = False
         self._push_gen_p_targets()
 
     @property

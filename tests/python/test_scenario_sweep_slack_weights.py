@@ -352,6 +352,45 @@ def test_refused_weights_leave_the_previous_ones(monkeypatch, solver_atol):
     gpv._assert_same(ref, gpv._p_records(sw.get_physical_violations()), gpv._mw_atol(grid, solver_atol))
 
 
+def test_explicit_prepass_data_lacking_a_weighted_unit_is_refused():
+    """redistribute_slack builds the solve's row weights from its pre-pass data: data set
+    explicitly that lacks a unit a row weights would silently drop its share (the same row
+    without the pre-pass keeps it). set_gen_slack_weights leaves such data alone, compute()
+    refuses it; the grid's data (set_slack_redistribution_data_from_grid) lists the unit."""
+    grid, _ = _feeder_colocated()
+    n_rows = COLOCATED_W.shape[0]
+    sw = _sweep(grid, n_rows=n_rows, redistribute_slack=True)
+    sw.set_gen_slack_weights([2], COLOCATED_W)
+    # the grid's data without the rows' units: generator 2 is not listed
+    sw.set_slack_redistribution_data(_cpp._extract_slack_redistribution_data_from_lsgrid(grid, sw.n_bus))
+    with pytest.raises(ValueError, match="pre-pass data does not list it"):
+        sw.compute(batch_size=n_rows)
+    sw.set_gen_slack_weights([2], COLOCATED_W)   # leaves the caller's data as it is
+    with pytest.raises(ValueError, match="pre-pass data does not list it"):
+        sw.compute(batch_size=n_rows)
+    sw.set_slack_redistribution_data_from_grid()
+    sw.compute(batch_size=n_rows)
+    assert np.all(np.isfinite(sw.solver.V_results.to_numpy()))
+
+
+@needs_ls2g_weights
+def test_explicit_gen_p_plan_lacking_a_weighted_unit_is_refused():
+    """The active-power check's plan set explicitly (set_gen_p_capability) is the caller's:
+    set_gen_slack_weights does not replace it by the grid's, and compute() refuses a row
+    weighting a unit it lacks -- it would neither check that unit nor count it in its bus' total."""
+    grid, _ = _feeder_colocated()
+    n_rows = COLOCATED_W.shape[0]
+    sw = _sweep(grid, n_rows=n_rows)
+    sw.set_gen_p_capability(_cpp._extract_gen_p_plan_from_lsgrid(grid, sw.n_bus))   # without generator 2
+    sw.compute_physical_violations = True   # keeps the plan it finds
+    sw.set_gen_slack_weights([2], COLOCATED_W)
+    with pytest.raises(ValueError, match="plan does not list it"):
+        sw.compute(batch_size=n_rows)
+    # the grid's plan lists it
+    sw.set_gen_p_capability_from_grid()
+    sw.compute(batch_size=n_rows)
+
+
 @needs_ls2g_weights
 @pytest.mark.parametrize("init_from_n", [False, True])
 def test_outer_loops_share_with_the_rows_weights(init_from_n, solver_atol):

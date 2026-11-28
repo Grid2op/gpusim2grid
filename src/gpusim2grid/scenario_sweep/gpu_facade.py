@@ -1085,10 +1085,16 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # the units only a row's weight brings in: in the pre-pass's data and the active-power
         # check's plan, read off the grid again -- a plan set is refreshed even while the check is
         # off, since turning it back on keeps the plan it finds. Built before anything is set, so
-        # that a refusal (e.g. the plan of a lightsim2grid without PR #303) changes nothing.
+        # that a refusal (e.g. the plan of a lightsim2grid without PR #303) changes nothing. Data
+        # and a plan the caller set explicitly are theirs: left as they are (compute() refuses a
+        # row weighting a unit they lack).
         rw = self._row_weighted_unit_ids((gen, sto))
-        rd = self._slack_redistribution_data_off_grid(None, *rw) if self.redistribute_slack else None
-        plan = self._gen_p_plan_off_grid(None, *rw) if self._inner.has_gen_p_capability else None
+        rd_from_grid = getattr(self, "_slack_rd_from_grid", True)
+        plan_from_grid = getattr(self, "_gen_p_plan_from_grid", False)
+        rd = (self._slack_redistribution_data_off_grid(None, *rw)
+              if self.redistribute_slack and rd_from_grid else None)
+        plan = (self._gen_p_plan_off_grid(None, *rw)
+                if self._inner.has_gen_p_capability and plan_from_grid else None)
         self._push_slack_weights(gen, sto)
         previous = self._gen_slack_w, self._sto_slack_w
         self._gen_slack_w, self._sto_slack_w = gen, sto

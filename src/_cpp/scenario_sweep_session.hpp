@@ -405,7 +405,9 @@ struct ScenarioSweepSession {
     bool                    slack_w_applied_ = false;
     // lightsim2grid's _check_slack_weight_rows: a positive weight only to a connected unit on a
     // bus sharing the grid's slack (the slack column has entries there only), or that the row
-    // disconnects; throws std::invalid_argument
+    // disconnects; and one the redistribute_slack pre-pass data and the active-power check's
+    // plan list, when they are in use (data set explicitly may lack it). Throws
+    // std::invalid_argument
     void _check_slack_weight_rows() const;
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;

@@ -153,6 +153,9 @@ class SlackRedistributionFacadeMixin:
         gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
         self._inner.set_slack_redistribution_data(
             self._slack_redistribution_data_off_grid(grid, gen_rw, sto_rw))
+        # the grid's (as the factory's at construction): a scenario sweep's set_gen_slack_weights
+        # reads it again (explicit data it leaves alone)
+        self._slack_rd_from_grid = True
 
     def _slack_redistribution_data_off_grid(self, grid, gen_rw, sto_rw):
         """The data :meth:`set_slack_redistribution_data_from_grid` hands the session, with
@@ -177,6 +180,7 @@ class SlackRedistributionFacadeMixin:
         :meth:`set_slack_redistribution_data_from_grid` -- see the engine's
         ``set_slack_redistribution_data`` for the arrays."""
         self._inner.set_slack_redistribution_data(data)
+        self._slack_rd_from_grid = False
 
     @property
     def redistribute_slack(self):
