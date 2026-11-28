@@ -342,6 +342,28 @@ def test_a_refused_call_leaves_the_session_as_it_was():
     np.testing.assert_allclose(a_or, a_plain, rtol=tol, atol=tol * np.max(a_plain))
 
 
+@needs_fp64
+def test_session_reads_strided_blocks():
+    """The session's set_branch_param_blocks reads its (n, 4) blocks through their strides: a
+    column slice of a wider array gives the same rows as the blocks themselves (to rounding:
+    two sessions, see CLAUDE.md)."""
+    grid = _case14()
+    p = _Params(grid)
+    none = np.zeros(0, dtype=np.int32)
+    real0, cplx0 = np.zeros((N_ROWS, 0)), np.zeros((N_ROWS, 0), dtype=complex)
+    rows, branches, y = _cpp._branch_param_blocks(
+        grid, p.line_ids.astype(np.int32), p.line_r, p.line_x, p.line_h1, p.line_h2,
+        none, real0, real0, cplx0, cplx0, real0, real0)
+    wide = np.full((y.shape[0], 6), 99. + 99.j)
+    wide[:, :4] = y
+    V = []
+    for blocks in (np.ascontiguousarray(y), wide[:, :4]):
+        sw = _sweep(grid)
+        sw._inner._s.set_branch_param_blocks(rows, branches, blocks, N_ROWS)
+        V.append(_results(sw, grid)[0])
+    np.testing.assert_allclose(V[1], V[0], rtol=0, atol=parity_tol("state"))
+
+
 def test_compute_flows_refuses_branches_changed_since_the_run(solver_atol):
     """compute_flows reads the last run's voltages through the rows' branches as they are now
     (the trips zeroed, the rows' own blocks written over): after set_line_parameters or

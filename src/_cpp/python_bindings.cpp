@@ -2855,7 +2855,11 @@ PYBIND11_MODULE(_gpusim2grid, m)
             int n_rows) {
              if (y.rows() != rows.size())
                  throw std::invalid_argument("set_branch_param_blocks: y must have one row (y11 y12 y21 y22) per entry");
-             std::vector<std::complex<double>> flat(y.data(), y.data() + y.size());
+             // element by element: the Ref maps a strided array (a column slice of a wider one) as
+             // it is, its rows not 4 apart
+             std::vector<std::complex<double>> flat(static_cast<size_t>(y.size()));
+             for (Eigen::Index k = 0; k < y.rows(); ++k)
+                 for (Eigen::Index q = 0; q < 4; ++q) flat[static_cast<size_t>(4 * k + q)] = y(k, q);
              s.set_branch_param_blocks(std::vector<int>(rows.data(), rows.data() + rows.size()),
                                        std::vector<int>(branches.data(), branches.data() + branches.size()),
                                        flat, n_rows);
