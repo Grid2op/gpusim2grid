@@ -261,9 +261,11 @@ def test_with_topology_the_trip_wins(solver_atol):
         _assert_amps(a_or[row], ref_or, solver_atol, f"row {row}")
 
 
-def test_current_violations_read_the_rows_block(solver_atol):
+@needs_fp64
+def test_current_violations_read_the_rows_block():
     """The fused current check reads a changed branch's own block: its CURRENT record's value
-    is the row's current (compute_flows), not what the grid's block would give."""
+    is the row's current (compute_flows), not what the grid's block would give -- to rounding:
+    the same voltages through the same block, in two sessions (see CLAUDE.md)."""
     from gpusim2grid.contingency_analysis._limit_violations import LimitViolationType
 
     grid = _case14()
@@ -286,7 +288,7 @@ def test_current_violations_read_the_rows_block(solver_atol):
         assert cur, f"row {row}: no CURRENT record on line {line}"
         got = max(v.value for v in cur) * 1e3
         want = max(a_or[row, line], a_ex[row, line])
-        np.testing.assert_allclose(got, want, rtol=solver_atol, err_msg=f"row {row}")
+        np.testing.assert_allclose(got, want, rtol=parity_tol("state"), err_msg=f"row {row}")
 
 
 def test_setters_refuse(solver_atol):
