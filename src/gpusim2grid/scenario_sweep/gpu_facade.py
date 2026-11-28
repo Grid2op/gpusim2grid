@@ -1034,9 +1034,10 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         (``use_distributed_slack=True``). With ``redistribute_slack`` the bounded pre-pass shares
         with the row's weights too. With ``outer_loops=True`` the DistributedSlack loop shares
         with them: only a generator that can take part in the grid's slack may get a positive
-        weight, and with ``init_from_n_powerflow`` such a row starts from the grid's targets,
-        not from where the grid's own solve left its loops (whose targets already hold the base
-        imbalance shared with the grid's weights); not with ``outer_loops_backend='device'``.
+        weight, and with ``init_from_n_powerflow`` such a row starts from the grid's targets and
+        voltage set-points, as without it, not from where the grid's own solve left its loops
+        (whose targets already hold the base imbalance shared with the grid's weights, and whose
+        frozen buses sit off their set-points); not with ``outer_loops_backend='device'``.
 
         A new call replaces the previous one; an empty ``gen_ids`` clears it. The row count must
         be the injections'. Raises for an id out of range or named twice, a matrix of another

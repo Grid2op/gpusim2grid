@@ -20,6 +20,7 @@
 #include "device_outer_model.hpp"
 
 #include "../ledger_data.hpp"
+#include "outer_row_seed.hpp"   // seed_rows_vm (fresh_vm_)
 
 #include <LSGrid.hpp>
 #include <batch_algorithm/BusQCheck.hpp>
@@ -608,6 +609,14 @@ private:
     // where the grid's own solve left the loops (Ls2gModelOptions::resume_from_n)
     bool resume_ = false;
     ResumePoint point_n_;
+    // resume_ only: what a row whose loops start from scratch anyway (one giving slack weights
+    // of its own) resets, as (solver bus, |V|): the buses seed_rows_vm -- where every row of a
+    // batch without init_from_n_powerflow starts -- puts at another magnitude than the grid's
+    // solve left them (the ones its loops froze, ...). Per entry, the generators writing that
+    // bus: where the row gives one of them a voltage of its own (gen_v), the source seeded it.
+    std::vector<std::pair<int, double>> fresh_vm_;
+    std::vector<std::vector<int>> fresh_vm_gens_;
+    void reset_fresh_vm(SlotState& st) const;
     // the rows' own points (keep_row_points: by row, nullptr while the row has not ended
     // stable) and the point each row resumes from
     bool keep_points_ = false;
@@ -895,6 +904,19 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
         pn.ratio_tap.assign(point->ratio_tap.begin(), point->ratio_tap.end());
         pn.sections.assign(point->sections.begin(), point->sections.end());
 #endif
+        // what a row starting from scratch resets: the rows are loaded with the grid's V as it
+        // is (extract_outer_inputs), the from-scratch seed moves these buses
+        const ls2g::CplxVect V_n = g.get_V_solver();
+        ls2g::CplxVect V_seed = V_n;
+        seed_rows_vm(g, V_seed);
+        std::map<int, std::vector<int>> writers;
+        g.get_generators().vm_writers_by_bus(sbl_.id_me_to_solver, writers);
+        for (Eigen::Index b = 0; b < V_seed.size(); ++b) {
+            if (std::abs(V_seed(b)) == std::abs(V_n(b))) continue;
+            fresh_vm_.emplace_back(static_cast<int>(b), static_cast<double>(std::abs(V_seed(b))));
+            const auto it = writers.find(static_cast<int>(b));
+            fresh_vm_gens_.push_back(it != writers.end() ? it->second : std::vector<int>());
+        }
     }
 
     // ---- VoltageControl, as the ledger has it --------------------------------------------
@@ -1321,6 +1343,11 @@ void Ls2gOuterModel::load(int slot, int row)
                                              ", which the outer loops' ledger has not reserved");
                 st.pq[static_cast<size_t>(k)] = 1;
             }
+        // a row of a resumed batch whose loops start from scratch (its own slack weights, above)
+        // starts where they do without init_from_n_powerflow, at the set-points: it is loaded
+        // with the grid's solved V, whose buses its loops froze are off theirs, and PV again
+        // from the start a bus is held at the magnitude it starts from
+        if (resume_ && st.rp == nullptr) reset_fresh_vm(st);
     }
     // the grid's plan, unless the row changes what it is built from: the units it
     // disconnects, the buses it masks, its machines' voltage set-points (a local bus'
@@ -1482,6 +1509,21 @@ void Ls2gOuterModel::load(int slot, int row)
         st.check_unrealistic = st.last_fixing < 0;
     }
     materialize(st);
+}
+
+void Ls2gOuterModel::reset_fresh_vm(SlotState& st) const
+{
+    // not where something else re-seeds the bus: a generator the row moves there (load),
+    // or the row's own set-point of one of its writers (the source's gen_v, applied before)
+    const std::vector<ls2g::real_type>& row_vm = st.rowv.gens.target_vm;
+    for (size_t k = 0; k < fresh_vm_.size(); ++k) {
+        const int b = fresh_vm_[k].first;
+        if (std::find(st.vm_reset_bus.begin(), st.vm_reset_bus.end(), b) != st.vm_reset_bus.end()) continue;
+        bool row_sets = false;
+        for (int g : fresh_vm_gens_[k])
+            row_sets = row_sets || (static_cast<size_t>(g) < row_vm.size() && !std::isnan(row_vm[static_cast<size_t>(g)]));
+        if (!row_sets) reset_vm(st, b, fresh_vm_[k].second);
+    }
 }
 
 void Ls2gOuterModel::take_resume_targets(SlotState& st) const

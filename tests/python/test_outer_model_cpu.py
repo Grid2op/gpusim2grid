@@ -857,6 +857,44 @@ def test_rows_resume_from_the_n_solve(q_limit):
     assert resumed > 0
 
 
+@pytest.mark.skipif(not getattr(_cpp, "have_ls2g_outer_resume", False),
+                    reason="lightsim2grid without its loops' state accessors")
+@pytest.mark.skipif(not getattr(_cpp, "have_ls2g_branch_params", False),
+                    reason="per-row slack weights need lightsim2grid PR #303")
+def test_weighted_row_of_a_resumed_batch_starts_at_the_set_points(solver_atol):
+    """init_from_n_powerflow, a row giving slack weights of its own (set_gen_slack_weights):
+    its loops start from scratch, so it starts as a batch without init_from_n_powerflow does --
+    every generator bus at its set-point. Starting from the "n" voltages instead left each bus
+    the "n" solve froze PV at its frozen magnitude: with less load its machines stay within
+    their limits there, so nothing froze it again and the row converged off the set-point. The
+    row's weight is the grid's own (its "can participate" one): the row is the grid itself,
+    whose own single NROuter solve is the reference."""
+    load_scale = 0.6
+    base = _case14(q_limit=15.)
+    v0 = np.full(base.total_bus(), 1.04 + 0j)
+    assert base.ac_pf(v0, MAX_IT, TOL_MVA).size > 0
+    V_n = np.asarray(base.get_V())
+    gens = base.get_generators()
+    # the "n" solve left generator buses off their set-points (frozen at a reactive limit)
+    assert any(abs(abs(V_n[g.bus_id]) - g.target_vm_pu) > 1e-3 for g in gens)
+    n_gen = len(gens)
+    w = np.full((1, n_gen), np.nan)
+    w[0, 0] = 300.   # _case14's "can participate" weight: the grid's own
+
+    h = _cpp._OuterModelHarness(base, keep_trace=True, resume_from_n=True)
+    h.set_row_overrides(gen_slack_w=list(w.ravel()))
+    h.begin(1, 1)
+    row = _case14(q_limit=15., load_scale=load_scale)
+    V_ref = row.ac_pf(V_n.astype(complex), MAX_IT, TOL_MVA)
+    assert V_ref.size > 0
+    V, status = _run_row_full(h, 0, row.get_Ybus_solver().toarray(), np.asarray(row.get_Sbus_solver()),
+                              TOL_MVA / row.get_sn_mva())
+    msg = "\n".join(h.row_result(0).decisions)
+    assert status == CONVERGED, msg
+    buses = np.asarray(row.id_ac_solver_to_me(), dtype=int)
+    np.testing.assert_allclose(V, V_ref[buses], rtol=0., atol=solver_atol, err_msg=msg)
+
+
 # --------------------------------------------------------------------------------------
 # PhaseControl: a phase shifter regulating its active power (its shift a Newton unknown,
 # then rounded to the closest tap), or limiting its current (one tap at a time); its pi

@@ -9,6 +9,7 @@
 #include "ls2g_bridge.hpp"
 #include "ledger_extend.hpp"   // materialize_vc_custom_rows, reserve_stranded_controller_slots
 #include "outer/ls2g_outer_model.hpp"   // the outer loops' model (lightsim2grid's NROuter_*)
+#include "outer/outer_row_seed.hpp"     // seed_rows_vm (extract_outer_inputs)
 #include "timing_utils.hpp"    // ms_since
 #include "user_ordering.hpp"    // prototype: constrained_order_hook
 
@@ -2094,25 +2095,7 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
     // generators' buses at their set-points (BaseBatchSolverSynch::_solve_n_case's
     // seed_vm_keeping): a PV bus keeps the magnitude it starts from
     in.V0 = grid.get_V_solver();
-    if (!resume_from_n) {
-        // seed_vm_keeping (LSGrid.cpp): with set_keep_vinit_at_group_controlled_buses,
-        // the buses a voltage-control group holds keep the magnitude they start from
-        std::vector<int> held;
-        if (grid.get_keep_vinit_at_group_controlled_buses())
-            held = grid.get_ac_layout().voltage_control.group_controlled_solver_buses(
-                grid.get_ac_layout().id_me_to_solver);
-        std::vector<ls2g::cplx_type> kept;
-        for (int b : held) kept.push_back(in.V0(b));
-        // LSGrid's own seed: every voltage source, not only the generators (a station
-        // or a storage unit a loop froze in the grid's solve is off its set-point there)
-        Eigen::Ref<ls2g::CplxVect> Vr(in.V0);
-        const auto& me_to_solver = grid.get_ac_layout().id_me_to_solver;
-        grid.get_generators().set_vm(Vr, me_to_solver);
-        grid.get_dclines().set_vm(Vr, me_to_solver);
-        grid.get_svcs().set_vm(Vr, me_to_solver);
-        grid.get_storages().set_vm(Vr, me_to_solver);
-        for (size_t k = 0; k < held.size(); ++k) in.V0(held[k]) = kept[k];
-    }
+    if (!resume_from_n) outer::seed_rows_vm(grid, in.V0);
     in.Sbus = grid.get_Sbus_solver();
     return in;
 #endif

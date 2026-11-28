@@ -3817,19 +3817,26 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
         .def("set_row_overrides", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off,
                                      std::vector<std::vector<int>> masked,
-                                     std::vector<std::vector<std::pair<int, int>>> gen_bus) {
+                                     std::vector<std::vector<std::pair<int, int>>> gen_bus,
+                                     std::vector<double> gen_slack_w, std::vector<double> storage_slack_w) {
                 outer::RowOverrides ov;
                 ov.branch_off = std::move(branch_off);
                 ov.masked = std::move(masked);
                 ov.gen_bus = std::move(gen_bus);
+                ov.gen_slack_w = std::move(gen_slack_w);
+                ov.storage_slack_w = std::move(storage_slack_w);
                 h.model->set_row_overrides(std::move(ov));
             }, pybind11::arg("branch_off") = std::vector<std::vector<int>>{},
             pybind11::arg("masked") = std::vector<std::vector<int>>{},
             pybind11::arg("gen_bus") = std::vector<std::vector<std::pair<int, int>>>{},
+            pybind11::arg("gen_slack_w") = std::vector<double>{},
+            pybind11::arg("storage_slack_w") = std::vector<double>{},
             "per row, the branches it opens (lines then trafos), the solver buses "
-            "handle_disconnected_grid masks and the generators it moves as (generator id, solver bus) "
-            "(RowOverrides). Replaces ALL the rows' overrides (generators off, gen_v, lost power... "
-            "are cleared): call it before begin().")
+            "handle_disconnected_grid masks, the generators it moves as (generator id, solver bus) "
+            "and the slack weights it gives its units (n_rows x n_gen / n_rows x n_storage, "
+            "row-major, NaN: the grid's; set_gen_slack_weights) (RowOverrides). Replaces ALL the "
+            "rows' overrides (generators off, gen_v, lost power... are cleared): call it before "
+            "begin().")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;
