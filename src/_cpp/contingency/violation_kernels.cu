@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "violation_kernels.cuh"
+#include "../slack_weight_rows.hpp"   // slack_weight_rows::MIN_WEIGHT (weight_of)
 
 #include <math.h>   // isnan
 
@@ -1081,7 +1082,10 @@ __global__ void check_gen_p_violations_kernel(
     const cuda_real_type*  rws = d_rw_sto ? d_rw_sto + static_cast<ptrdiff_t>(out_c) * rw_sto_stride : nullptr;
     const cuda_real_type   eps = cuda_real_type(1e-12);
     // the row's raw weight of a machine (ScenarioSweep set_gen_slack_weights), `own` -- the
-    // plan's, the grid's -- where it gives none (upstream's weight_of)
+    // plan's, the grid's -- where it gives none (upstream's weight_of). A row's weight below
+    // slack_weight_rows::MIN_WEIGHT takes no share in the solve (row_slack_weights,
+    // redistribute_row): 0 here too, so the machine is not checked as one sharing the slack
+    // (upstream passes the raw value, which its 1e-12 test below lets through)
     auto weight_of = [&](int type, int id, cuda_real_type own) -> cuda_real_type {
         const int*            col = type == ELEM_GENERATOR ? d_rw_gen_col : d_rw_sto_col;
         const cuda_real_type* row = type == ELEM_GENERATOR ? rwg : rws;
@@ -1090,7 +1094,8 @@ __global__ void check_gen_p_violations_kernel(
         const int c = col[id];
         if (c < 0) return own;
         const cuda_real_type w = row[c];
-        return isnan(w) ? own : w;
+        if (isnan(w)) return own;
+        return w >= cuda_real_type(slack_weight_rows::MIN_WEIGHT) ? w : cuda_real_type(0);
     };
 
     auto bus_live = [&](int b) -> bool {

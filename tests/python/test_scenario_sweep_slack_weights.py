@@ -68,12 +68,12 @@ def _case14_all_slack():
     return grid
 
 
-def _feeder_colocated():
+def _feeder_colocated(max_p=(30., 30., 10.)):
     """test_gen_p_violations' 4-bus radial feeder (80 MW / 60 MVAr on bus 3) with one more
-    generator: generator 2, on bus 0 next to generator 0, takes NO part in the grid's slack
-    (generators 0 and 1 share it) -- only a row's own weight brings it in, so the grid's
-    active-power plan and pre-pass data lack it. Every generator has an active range the rows'
-    shares leave. Solved; returns (grid, v0)."""
+    generator: generator 2 (5 MW), on bus 0 next to generator 0, takes NO part in the grid's
+    slack (generators 0 and 1 share it) -- only a row's own weight brings it in, so the grid's
+    active-power plan and pre-pass data lack it. Every generator has an active range [0, max_p]
+    the rows' shares leave. Solved; returns (grid, v0)."""
     from lightsim2grid.lightsim2grid_cpp import LSGrid
 
     grid = LSGrid()
@@ -87,7 +87,7 @@ def _feeder_colocated():
                          np.full(3, -1e3), np.full(3, 1e3), np.array([0, 1, 0]))
     grid.add_gen_slackbus(0, 1.)
     grid.add_gen_slackbus(1, 1.)
-    grid.set_gen_p_limits(np.zeros(3), np.array([30., 30., 10.]))
+    grid.set_gen_p_limits(np.zeros(3), np.asarray(max_p, dtype=float))
     grid.tell_solver_need_reset()
     v0 = grid.ac_pf(np.ones(4, dtype=complex), MAX_IT, TOL)
     assert v0.shape[0] > 0
@@ -350,6 +350,27 @@ def test_refused_weights_leave_the_previous_ones(monkeypatch, solver_atol):
             sw.set_gen_slack_weights([2], np.full((n_rows, 1), 7.))
     sw.compute(batch_size=n_rows)
     gpv._assert_same(ref, gpv._p_records(sw.get_physical_violations()), gpv._mw_atol(grid, solver_atol))
+
+
+@needs_ls2g_weights
+def test_gen_p_check_ignores_a_weight_the_solve_ignores():
+    """A row's weight below 1e-7 takes no share in the solve (upstream's _tol_equal_float):
+    nor in the active-power check, which then does not check the machine as one sharing the
+    slack -- the row is the one giving it 0. Generator 2's 5 MW target is above its 3 MW max_p:
+    reported as soon as it shares (a weight of 1), not with 0 or 1e-8."""
+    import test_gen_p_violations as gpv
+
+    grid, _ = _feeder_colocated(max_p=(30., 30., 3.))
+    w = np.array([[0.], [1e-8], [1.]])
+    sw = _sweep(grid, n_rows=3, compute_physical_violations=True)
+    sw.physical_violation_tol_mva = 0.
+    sw.set_gen_slack_weights([2], w)
+    sw.compute(batch_size=3)
+    got = gpv._p_records(sw.get_physical_violations())
+    gen2 = [[rec for rec in row if rec[1] == 2] for row in got]
+    assert not gen2[0] and not gen2[1], got
+    assert gen2[2], got
+    assert sorted(rec[:3] for rec in got[1]) == sorted(rec[:3] for rec in got[0])
 
 
 def test_explicit_prepass_data_lacking_a_weighted_unit_is_refused():
