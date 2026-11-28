@@ -719,6 +719,7 @@ void ScenarioSweepSession::set_slack_weight_rows(Eigen::Ref<const Eigen::VectorX
                                     std::to_string(next.sto.w.rows()) + " rows).");
     next.refresh_rows();
     slack_w_rows_ = std::move(next);
+    slack_w_rows_dirty_ = true;
 }
 
 void ScenarioSweepSession::_check_slack_weight_rows() const
@@ -2181,8 +2182,10 @@ void ScenarioSweepSession::run()
     // this same driver uploads what changed meanwhile.
     if (phys_.compute_physical_violations) {
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
-        // the weights the rows share the slack with (set_gen_slack_weights): their machines' shares
-        solver_->upload_gen_p_row_weights(slack_w_rows_);
+        // the weights the rows share the slack with (set_gen_slack_weights): their machines' shares,
+        // uploaded when they changed or the driver is new (it keeps them across runs)
+        if (slack_w_rows_dirty_ || cold) solver_->upload_gen_p_row_weights(slack_w_rows_);
+        slack_w_rows_dirty_ = false;
         rd_gp_last_ = rd_gp;
         gen_p_targets_dirty_ = false;
         gen_pv_release_targets_dirty_ = false;

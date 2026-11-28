@@ -97,19 +97,19 @@ def _feeder_colocated(max_p=(30., 30., 10.)):
 COLOCATED_W = np.array([[np.nan], [1.], [3.]])   # generator 2's weight per row: none, 1, 3
 
 
-def _colocated_reference(grid, v0, **options):
-    """lightsim2grid's ScenarioSweep on _feeder_colocated with COLOCATED_W, the active-power
-    check on (tolerance 0); `options` its attributes (e.g. redistribute_slack)"""
+def _colocated_reference(grid, v0, weights=COLOCATED_W, **options):
+    """lightsim2grid's ScenarioSweep on _feeder_colocated with generator 2's `weights`, the
+    active-power check on (tolerance 0); `options` its attributes (e.g. redistribute_slack)"""
     from lightsim2grid.scenarioSweep import ScenarioSweepCPP
     import test_gen_p_violations as gpv
 
-    n_rows = COLOCATED_W.shape[0]
+    n_rows = weights.shape[0]
     ls = ScenarioSweepCPP(grid)
     for k, v in options.items():
         setattr(ls, k, v)
     gpv._ls_enable(ls, 0.)
     ls.modify_load_p(np.repeat(_elements(grid)[0][None, :], n_rows, axis=0))
-    ls.set_gen_slack_weights(np.array([2]), COLOCATED_W)
+    ls.set_gen_slack_weights(np.array([2]), weights)
     ls.compute(v0.copy(), MAX_IT, TOL)
     assert np.all(ls.converged_mask())
     ref = gpv._p_records(ls.get_physical_violations())
@@ -324,6 +324,27 @@ def test_gen_p_plan_follows_weights_set_while_the_checks_are_off(solver_atol):
     sw.compute(batch_size=n_rows)
     got = gpv._p_records(sw.get_physical_violations())
     gpv._assert_same(ref, got, gpv._mw_atol(grid, solver_atol))
+
+
+@needs_ls2g_weights
+def test_gen_p_check_follows_weights_changed_between_runs(solver_atol):
+    """The active-power check's copy of the rows' weights lives on the driver, uploaded when the
+    weights change: new weights between two compute() on the same driver are the ones checked
+    (lightsim2grid's ScenarioSweep records)."""
+    import test_gen_p_violations as gpv
+
+    grid, v0 = _feeder_colocated()
+    n_rows = COLOCATED_W.shape[0]
+    first_w = COLOCATED_W[::-1].copy()
+    sw = _sweep(grid, n_rows=n_rows, compute_physical_violations=True)
+    sw.physical_violation_tol_mva = 0.
+    atol = gpv._mw_atol(grid, solver_atol)
+    for w in (first_w, COLOCATED_W):
+        sw.set_gen_slack_weights([2], w)
+        sw.compute(batch_size=n_rows)
+        gpv._assert_same(_colocated_reference(grid, v0, weights=w),
+                         gpv._p_records(sw.get_physical_violations()), atol)
+    assert sw._inner._s.driver_build_counter == 1   # the second run reused the driver
 
 
 @needs_ls2g_weights

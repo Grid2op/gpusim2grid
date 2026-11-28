@@ -409,6 +409,9 @@ struct ScenarioSweepSession {
     // whether the live source holds weights built from them
     SlackWeightRows         slack_w_rows_;
     bool                    slack_w_applied_ = false;
+    // the active-power check's copy on the driver is behind slack_w_rows_ (uploaded by the next
+    // run with the check on; a new driver always uploads them)
+    bool                    slack_w_rows_dirty_ = false;
     // lightsim2grid's _check_slack_weight_rows: a positive weight only to a connected unit on a
     // bus sharing the grid's slack (the slack column has entries there only), or that the row
     // disconnects; and one the redistribute_slack pre-pass data and the active-power check's
