@@ -724,6 +724,9 @@ void ScenarioSweepSession::set_slack_weight_rows(Eigen::Ref<const Eigen::VectorX
 
 void ScenarioSweepSession::_check_slack_weight_rows() const
 {
+    // Raised for the batch, not reported per row (row_unsupported_): these are inputs the caller
+    // fixes, as lightsim2grid's _check_slack_weight_rows raises them from compute() -- not rows
+    // the batch cannot solve yet
     if (slack_w_rows_.empty()) return;
     if (slack_w_rows_.n_rows() != n_scenarios_)
         throw std::runtime_error(
