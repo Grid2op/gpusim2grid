@@ -9,6 +9,7 @@
 #include "ls2g_bridge.hpp"
 #include "ledger_extend.hpp"   // materialize_vc_custom_rows, reserve_stranded_controller_slots
 #include "outer/ls2g_outer_model.hpp"   // the outer loops' model (lightsim2grid's NROuter_*)
+#include "outer/outer_row_seed.hpp"     // seed_rows_vm (extract_outer_inputs)
 #include "timing_utils.hpp"    // ms_since
 #include "user_ordering.hpp"    // prototype: constrained_order_hook
 
@@ -41,6 +42,7 @@
 #define GPUSIM2GRID_HAVE_LS2G_OUTER_LOOPS 1
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -351,7 +353,194 @@ std::vector<int> vc_held_flags(const D& v, int)
     }
 }
 
+// lightsim2grid PR #303's per-row batch inputs: LineContainer::pi_model_with (with
+// TrafoContainer::pi_model_with, BranchContainer::kron_block, build_gen_p_plan's row-weighted
+// units and OuterRowView::Units::slack_weight, which came with it)
+template <class C, class = void>
+struct has_pi_model_with : std::false_type {};
+template <class C>
+struct has_pi_model_with<C, std::void_t<decltype(std::declval<const C&>().pi_model_with(
+    0, ls2g::real_type(), ls2g::real_type(), ls2g::cplx_type(), ls2g::cplx_type()))>> : std::true_type {};
+
+// set_line_parameters / set_trafo_parameters: lightsim2grid's own checks (BaseBatchSweep::
+// _set_branch_parameters), before anything is computed. `ratio` / `shift` null for lines.
+void check_branch_params(const char* setter, int nb_el, const Eigen::Ref<const Eigen::VectorXi>& ids,
+                         const Eigen::Ref<const ParamRealMatRM>& r, const Eigen::Ref<const ParamRealMatRM>& x,
+                         const Eigen::Ref<const ParamCplxMatRM>& h1, const Eigen::Ref<const ParamCplxMatRM>& h2,
+                         const Eigen::Ref<const ParamRealMatRM>* ratio, const Eigen::Ref<const ParamRealMatRM>* shift)
+{
+    const auto fail = [setter](const std::string& what) {
+        throw std::invalid_argument(std::string(setter) + ": " + what);
+    };
+    const Eigen::Index nb_ids = ids.size();
+    std::vector<int> sorted(ids.data(), ids.data() + nb_ids);
+    for (int id : sorted)
+        if (id < 0 || id >= nb_el)
+            fail("id " + std::to_string(id) + " is out of range, the grid has " + std::to_string(nb_el) + " of them.");
+    std::sort(sorted.begin(), sorted.end());
+    const auto dup = std::adjacent_find(sorted.begin(), sorted.end());
+    if (dup != sorted.end()) fail("id " + std::to_string(*dup) + " is named twice.");
+    const Eigen::Index nb_rows = r.rows();
+    const auto check_shape = [&](Eigen::Index rows, Eigen::Index cols, const char* name) {
+        if (rows == nb_rows && cols == nb_ids) return;
+        fail(std::string("`") + name + "` has shape (" + std::to_string(rows) + ", " + std::to_string(cols) +
+             "), expected (" + std::to_string(nb_rows) + ", " + std::to_string(nb_ids) +
+             "): one row per simulation, one column per id.");
+    };
+    check_shape(r.rows(), r.cols(), "r");
+    check_shape(x.rows(), x.cols(), "x");
+    check_shape(h1.rows(), h1.cols(), "h1");
+    check_shape(h2.rows(), h2.cols(), "h2");
+    if (ratio != nullptr) check_shape(ratio->rows(), ratio->cols(), "ratio");
+    if (shift != nullptr) check_shape(shift->rows(), shift->cols(), "shift_rad");
+    const auto cell = [](Eigen::Index row, Eigen::Index col) {
+        return "(row " + std::to_string(row) + ", column " + std::to_string(col) + ")";
+    };
+    for (Eigen::Index row = 0; row < nb_rows; ++row) {
+        for (Eigen::Index col = 0; col < nb_ids; ++col) {
+            const std::complex<double> a = h1(row, col), b = h2(row, col);
+            if (std::isinf(r(row, col)) || std::isinf(x(row, col)) || std::isinf(a.real()) || std::isinf(a.imag()) ||
+                std::isinf(b.real()) || std::isinf(b.imag()) || (shift != nullptr && std::isinf((*shift)(row, col))))
+                fail("an infinite value at " + cell(row, col) + ". Use NaN to keep the grid's value.");
+            if (r(row, col) == 0. && x(row, col) == 0.)
+                fail("r and x are both 0 at " + cell(row, col) + ": the series impedance would be 0.");
+            if (ratio != nullptr) {
+                const double rho = (*ratio)(row, col);
+                if (!std::isnan(rho) && !(rho > 0. && std::isfinite(rho)))
+                    fail("a ratio that is not a positive number at " + cell(row, col) + ".");
+            }
+        }
+    }
+}
+
+// every cell of that branch NaN in that row: the row keeps the grid's parameters
+// (lightsim2grid's YbusPolicy keeps_grid)
+bool keeps_grid_params(Eigen::Index row, Eigen::Index col, const Eigen::Ref<const ParamRealMatRM>& r,
+                       const Eigen::Ref<const ParamRealMatRM>& x, const Eigen::Ref<const ParamCplxMatRM>& h1,
+                       const Eigen::Ref<const ParamCplxMatRM>& h2, const Eigen::Ref<const ParamRealMatRM>* ratio,
+                       const Eigen::Ref<const ParamRealMatRM>* shift)
+{
+    const auto nan_c = [](std::complex<double> v) { return std::isnan(v.real()) || std::isnan(v.imag()); };
+    if (!std::isnan(r(row, col)) || !std::isnan(x(row, col))) return false;
+    if (!nan_c(h1(row, col)) || !nan_c(h2(row, col))) return false;
+    if (ratio != nullptr && !std::isnan((*ratio)(row, col))) return false;
+    if (shift != nullptr && !std::isnan((*shift)(row, col))) return false;
+    return true;
+}
+
+// the per-row stamped blocks of one container; Lines / Trafos are templates so that a
+// lightsim2grid without pi_model_with still compiles (the call is never instantiated then)
+template <class Container, class ModelOf>
+void append_branch_param_blocks(const Container& branches, int branch_offset, const char* kind,
+                                const Eigen::Ref<const Eigen::VectorXi>& ids,
+                                const Eigen::Ref<const ParamRealMatRM>& r, const Eigen::Ref<const ParamRealMatRM>& x,
+                                const Eigen::Ref<const ParamCplxMatRM>& h1, const Eigen::Ref<const ParamCplxMatRM>& h2,
+                                const Eigen::Ref<const ParamRealMatRM>* ratio,
+                                const Eigen::Ref<const ParamRealMatRM>* shift,
+                                ModelOf model_of, BranchParamBlocks& out)
+{
+    const auto& on = branches.get_status_global();
+    const auto& s1 = branches.get_status_side_1();
+    const auto& s2 = branches.get_status_side_2();
+    for (Eigen::Index row = 0; row < r.rows(); ++row) {
+        for (Eigen::Index col = 0; col < ids.size(); ++col) {
+            if (keeps_grid_params(row, col, r, x, h1, h2, ratio, shift)) continue;
+            const int el = ids(col);
+            if (!on[static_cast<size_t>(el)]) continue;   // in no matrix, nothing to change
+            const auto model = model_of(el, row, col);
+            // lightsim2grid's check_finite_model (AC): r and x both 0 through the grid's values
+            for (const auto& y : model.yac)
+                if (!std::isfinite(std::real(y)) || !std::isfinite(std::imag(y)))
+                    throw std::invalid_argument(
+                        std::string("set_") + kind + "_parameters: row " + std::to_string(row) + " gives " + kind +
+                        " " + std::to_string(el) + " parameters whose admittance is not finite (r and x both 0).");
+            const auto stamped = Container::kron_block(model.yac, true, s1[static_cast<size_t>(el)],
+                                                       s2[static_cast<size_t>(el)]);
+            out.rows.push_back(static_cast<int>(row));
+            out.branches.push_back(branch_offset + el);
+            for (int q = 0; q < 4; ++q)
+                out.y.emplace_back(static_cast<double>(std::real(stamped[static_cast<size_t>(q)])),
+                                   static_cast<double>(std::imag(stamped[static_cast<size_t>(q)])));
+        }
+    }
+}
+
+template <class Lines, class Trafos>
+BranchParamBlocks branch_param_blocks_impl(const Lines& lines, const Trafos& trafos,
+                                           const Eigen::Ref<const Eigen::VectorXi>& line_ids,
+                                           const Eigen::Ref<const ParamRealMatRM>& line_r,
+                                           const Eigen::Ref<const ParamRealMatRM>& line_x,
+                                           const Eigen::Ref<const ParamCplxMatRM>& line_h1,
+                                           const Eigen::Ref<const ParamCplxMatRM>& line_h2,
+                                           const Eigen::Ref<const Eigen::VectorXi>& trafo_ids,
+                                           const Eigen::Ref<const ParamRealMatRM>& trafo_r,
+                                           const Eigen::Ref<const ParamRealMatRM>& trafo_x,
+                                           const Eigen::Ref<const ParamCplxMatRM>& trafo_h1,
+                                           const Eigen::Ref<const ParamCplxMatRM>& trafo_h2,
+                                           const Eigen::Ref<const ParamRealMatRM>& trafo_ratio,
+                                           const Eigen::Ref<const ParamRealMatRM>& trafo_shift)
+{
+    BranchParamBlocks out;
+    if constexpr (!has_pi_model_with<Lines>::value) {
+        throw std::runtime_error(
+            "set_line_parameters / set_trafo_parameters need a lightsim2grid with per-row branch "
+            "parameters (LineContainer::pi_model_with, lightsim2grid PR #303); this gpusim2grid was "
+            "built against an older one (gpusim2grid._gpusim2grid.have_ls2g_branch_params is False).");
+    } else {
+        using real_t_ = ls2g::real_type;
+        using cplx_t_ = ls2g::cplx_type;
+        const int n_lines = static_cast<int>(lines.nb());
+        if (line_ids.size() > 0)
+            check_branch_params("set_line_parameters", n_lines, line_ids, line_r, line_x, line_h1, line_h2,
+                                nullptr, nullptr);
+        if (trafo_ids.size() > 0)
+            check_branch_params("set_trafo_parameters", static_cast<int>(trafos.nb()), trafo_ids, trafo_r, trafo_x,
+                                trafo_h1, trafo_h2, &trafo_ratio, &trafo_shift);
+        const auto c = [](std::complex<double> v) { return cplx_t_(static_cast<real_t_>(v.real()), static_cast<real_t_>(v.imag())); };
+        if (line_ids.size() > 0)
+            append_branch_param_blocks(lines, 0, "line", line_ids, line_r, line_x, line_h1, line_h2, nullptr, nullptr,
+                [&](int el, Eigen::Index row, Eigen::Index col) {
+                    return lines.pi_model_with(el, static_cast<real_t_>(line_r(row, col)), static_cast<real_t_>(line_x(row, col)),
+                                               c(line_h1(row, col)), c(line_h2(row, col)));
+                }, out);
+        if (trafo_ids.size() > 0)
+            append_branch_param_blocks(trafos, n_lines, "trafo", trafo_ids, trafo_r, trafo_x, trafo_h1, trafo_h2,
+                                       &trafo_ratio, &trafo_shift,
+                [&](int el, Eigen::Index row, Eigen::Index col) {
+                    return trafos.pi_model_with(el, static_cast<real_t_>(trafo_r(row, col)), static_cast<real_t_>(trafo_x(row, col)),
+                                                c(trafo_h1(row, col)), c(trafo_h2(row, col)),
+                                                static_cast<real_t_>(trafo_ratio(row, col)),
+                                                static_cast<real_t_>(trafo_shift(row, col)));
+                }, out);
+    }
+    return out;
+}
+
 }  // namespace
+
+BranchParamBlocks branch_param_blocks(const ls2g::LSGrid& grid,
+                                      const Eigen::Ref<const Eigen::VectorXi>& line_ids,
+                                      const Eigen::Ref<const ParamRealMatRM>& line_r,
+                                      const Eigen::Ref<const ParamRealMatRM>& line_x,
+                                      const Eigen::Ref<const ParamCplxMatRM>& line_h1,
+                                      const Eigen::Ref<const ParamCplxMatRM>& line_h2,
+                                      const Eigen::Ref<const Eigen::VectorXi>& trafo_ids,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_r,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_x,
+                                      const Eigen::Ref<const ParamCplxMatRM>& trafo_h1,
+                                      const Eigen::Ref<const ParamCplxMatRM>& trafo_h2,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_ratio,
+                                      const Eigen::Ref<const ParamRealMatRM>& trafo_shift)
+{
+    return branch_param_blocks_impl(grid.get_powerlines_as_data(), grid.get_trafos_as_data(),
+                                    line_ids, line_r, line_x, line_h1, line_h2,
+                                    trafo_ids, trafo_r, trafo_x, trafo_h1, trafo_h2, trafo_ratio, trafo_shift);
+}
+
+bool bridge_has_branch_params()
+{
+    return has_pi_model_with<std::decay_t<decltype(std::declval<const ls2g::LSGrid&>().get_powerlines_as_data())>>::value;
+}
 
 LedgerData drop_multislack_augmentation(const LedgerData& in,
                                         const Eigen::VectorXi& pv,
@@ -488,8 +677,14 @@ int forced_reference_bus_solver(const ls2g::LSGrid& grid, int n_bus_solver)
 #define GPUSIM2GRID_CAN_PARTICIPATE_OVERSHOOT(info) 0.
 #endif
 
-SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver)
+SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& grid, int n_bus_solver,
+                                                          const std::vector<int>& extra_gens,
+                                                          const std::vector<int>& extra_stos)
 {
+    // the units only a row's own weight brings in (set_gen_slack_weights): listed where the
+    // grid would list them, with weight 0 (inert unless a row gives them one)
+    const std::set<int> extra_gen(extra_gens.begin(), extra_gens.end());
+    const std::set<int> extra_sto(extra_stos.begin(), extra_stos.end());
     const std::vector<int> me_to_solver = grid.id_me_to_ac_solver_numpy();
     auto to_solver = [&](int bus_me) -> int {
         int b = bus_me;
@@ -515,9 +710,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         d.gens_target_p_mw(g) = static_cast<eigen_real_type>(gi.target_p_mw);
         if (b < 0) continue;
         const bool g_in_slack = gi.is_slack && std::abs(static_cast<double>(gi.slack_weight)) > 1e-12;
-        const double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)
-                                      : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(gi);
-        if (!(g_w > 1e-12)) continue;
+        double g_w = g_in_slack ? static_cast<double>(gi.slack_weight)
+                                : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(gi);
+        if (!(g_w > 1e-12)) {
+            if (!extra_gen.count(g)) continue;
+            g_w = 0.;
+        }
         kind.push_back(SLACK_UNIT_GENERATOR);
         el_id.push_back(g);
         bus.push_back(b);
@@ -535,9 +733,12 @@ SlackRedistributionData extract_slack_redistribution_data(const ls2g::LSGrid& gr
         const int b = si.connected ? to_solver(si.bus_id) : -1;
         if (b < 0) continue;
         const bool s_in_slack = si.is_slack && std::abs(static_cast<double>(si.slack_weight)) > 1e-12;
-        const double s_w = s_in_slack ? static_cast<double>(si.slack_weight)
-                                      : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(si);
-        if (!(s_w > 1e-12)) continue;
+        double s_w = s_in_slack ? static_cast<double>(si.slack_weight)
+                                : GPUSIM2GRID_CAN_PARTICIPATE_WEIGHT(si);
+        if (!(s_w > 1e-12)) {
+            if (!extra_sto.count(s)) continue;
+            s_w = 0.;
+        }
         kind.push_back(SLACK_UNIT_STORAGE);
         el_id.push_back(s);
         bus.push_back(b);
@@ -809,10 +1010,12 @@ GenContingencyData extract_gen_contingency_data(const ls2g::LSGrid& grid, int n_
     d.storage_vreg_bus.assign(static_cast<size_t>(d.n_storage), -1);
     d.storage_bus.assign(static_cast<size_t>(d.n_storage), -1);
     d.storage_slack_weight.assign(static_cast<size_t>(d.n_storage), 0.);
+    d.storage_any_bus.assign(static_cast<size_t>(d.n_storage), -1);
     for (int s = 0; s < d.n_storage; ++s) {
         const ls2g::StorageInfo si(storages, s);
         if (!si.connected) continue;
         const int b = bus_of(si.bus_id);
+        d.storage_any_bus[static_cast<size_t>(s)] = b;
         if (storages.is_local_voltage_controller(s)) d.storage_vreg_bus[static_cast<size_t>(s)] = b;
         if (si.is_slack && std::abs(static_cast<double>(si.slack_weight)) > 1e-12) {
             d.storage_bus[static_cast<size_t>(s)] = b;
@@ -1333,11 +1536,46 @@ BusQPlanData extract_bus_q_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_
     return out;
 }
 
-GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver)
+namespace {
+// lightsim2grid PR #303's build_gen_p_plan(..., gen_row_weighted, storage_row_weighted): the
+// units some row gives a slack weight of its own are in the plan too
+template <class Grid, class Ids>
+auto build_gen_p_plan_rw(const Grid& grid, const Ids& ids, ls2g::gen_p_check::GenPPlan& plan,
+                         const std::vector<int>* gen_rw, const std::vector<int>* sto_rw, int)
+    -> decltype(ls2g::gen_p_check::build_gen_p_plan(grid, ids, plan, gen_rw, sto_rw), void())
 {
-    // lightsim2grid's own selection, on the labelling the session solves in
+    ls2g::gen_p_check::build_gen_p_plan(grid, ids, plan, gen_rw, sto_rw);
+}
+template <class Grid, class Ids>
+void build_gen_p_plan_rw(const Grid& grid, const Ids& ids, ls2g::gen_p_check::GenPPlan& plan,
+                         const std::vector<int>* gen_rw, const std::vector<int>* sto_rw, long)
+{
+    if (gen_rw != nullptr || sto_rw != nullptr)
+        throw std::runtime_error(
+            "the generator active-power check of rows giving slack weights of their own needs a lightsim2grid "
+            "with per-row slack weights (lightsim2grid PR #303); this gpusim2grid was built against an older one.");
+    ls2g::gen_p_check::build_gen_p_plan(grid, ids, plan);
+}
+}  // namespace
+
+GenPPlanData extract_gen_p_plan_from_lsgrid(const ls2g::LSGrid& grid, int n_bus_solver,
+                                            const std::vector<int>& row_weighted_gens,
+                                            const std::vector<int>& row_weighted_stos)
+{
+    // lightsim2grid's own selection, on the labelling the session solves in (with the units a
+    // row gives a slack weight of its own: one entry per element, >= 0 for those)
     ls2g::gen_p_check::GenPPlan plan;
-    ls2g::gen_p_check::build_gen_p_plan(grid, grid.id_me_to_ac_solver(), plan);
+    std::vector<int> gen_rw, sto_rw;
+    const auto mark = [](const std::vector<int>& ids, int n, std::vector<int>& out) {
+        if (ids.empty()) return;
+        out.assign(static_cast<size_t>(n), -1);
+        for (size_t k = 0; k < ids.size(); ++k)
+            if (ids[k] >= 0 && ids[k] < n) out[static_cast<size_t>(ids[k])] = static_cast<int>(k);
+    };
+    mark(row_weighted_gens, grid.get_generators().nb(), gen_rw);
+    mark(row_weighted_stos, grid.get_storages().nb(), sto_rw);
+    build_gen_p_plan_rw(grid, grid.id_me_to_ac_solver(), plan, gen_rw.empty() ? nullptr : &gen_rw,
+                        sto_rw.empty() ? nullptr : &sto_rw, 0);
 
     GenPPlanData out;
     out.sn_mva = static_cast<double>(grid.get_sn_mva());
@@ -1857,25 +2095,7 @@ OuterInputs extract_outer_inputs(const ls2g::LSGrid& grid, bool resume_from_n)
     // generators' buses at their set-points (BaseBatchSolverSynch::_solve_n_case's
     // seed_vm_keeping): a PV bus keeps the magnitude it starts from
     in.V0 = grid.get_V_solver();
-    if (!resume_from_n) {
-        // seed_vm_keeping (LSGrid.cpp): with set_keep_vinit_at_group_controlled_buses,
-        // the buses a voltage-control group holds keep the magnitude they start from
-        std::vector<int> held;
-        if (grid.get_keep_vinit_at_group_controlled_buses())
-            held = grid.get_ac_layout().voltage_control.group_controlled_solver_buses(
-                grid.get_ac_layout().id_me_to_solver);
-        std::vector<ls2g::cplx_type> kept;
-        for (int b : held) kept.push_back(in.V0(b));
-        // LSGrid's own seed: every voltage source, not only the generators (a station
-        // or a storage unit a loop froze in the grid's solve is off its set-point there)
-        Eigen::Ref<ls2g::CplxVect> Vr(in.V0);
-        const auto& me_to_solver = grid.get_ac_layout().id_me_to_solver;
-        grid.get_generators().set_vm(Vr, me_to_solver);
-        grid.get_dclines().set_vm(Vr, me_to_solver);
-        grid.get_svcs().set_vm(Vr, me_to_solver);
-        grid.get_storages().set_vm(Vr, me_to_solver);
-        for (size_t k = 0; k < held.size(); ++k) in.V0(held[k]) = kept[k];
-    }
+    if (!resume_from_n) outer::seed_rows_vm(grid, in.V0);
     in.Sbus = grid.get_Sbus_solver();
     return in;
 #endif

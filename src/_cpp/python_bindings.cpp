@@ -2848,6 +2848,39 @@ PYBIND11_MODULE(_gpusim2grid, m)
          "(dp_mw, dq_mvar), each (n_scenarios, n_bus): what the rows' tripped static generators, "
          "storage units, SVCs and hvdc stations add to their injection.")
     .def_property_readonly("has_more_trips", &ScenarioSweepSession::has_more_trips)
+    .def("set_branch_param_blocks",
+         [](ScenarioSweepSession& s, Eigen::Ref<const Eigen::VectorXi> rows,
+            Eigen::Ref<const Eigen::VectorXi> branches,
+            Eigen::Ref<const Eigen::Matrix<std::complex<double>, Eigen::Dynamic, 4, Eigen::RowMajor>> y,
+            int n_rows) {
+             if (y.rows() != rows.size())
+                 throw std::invalid_argument("set_branch_param_blocks: y must have one row (y11 y12 y21 y22) per entry");
+             // element by element: the Ref maps a strided array (a column slice of a wider one) as
+             // it is, its rows not 4 apart
+             std::vector<std::complex<double>> flat(static_cast<size_t>(y.size()));
+             for (Eigen::Index k = 0; k < y.rows(); ++k)
+                 for (Eigen::Index q = 0; q < 4; ++q) flat[static_cast<size_t>(4 * k + q)] = y(k, q);
+             s.set_branch_param_blocks(std::vector<int>(rows.data(), rows.data() + rows.size()),
+                                       std::vector<int>(branches.data(), branches.data() + branches.size()),
+                                       flat, n_rows);
+         },
+         pybind11::arg("rows"), pybind11::arg("branches"), pybind11::arg("y"), pybind11::arg("n_rows"),
+         "set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): per entry, a row, a "
+         "branch (lines then transformers) and the block its parameters STAMP there ((n, 4) "
+         "complex: y11 y12 y21 y22 pu, Kron-reduced for the branch's end statuses -- what "
+         "_branch_param_blocks gives). The row's Ybus is patched by value on the entries the "
+         "branch has; its flows and current check read that block; a row tripping the branch "
+         "ignores it. Replaces the previous set, empty clears it.")
+    .def_property_readonly("has_branch_params", &ScenarioSweepSession::has_branch_params)
+    .def("set_slack_weight_rows", &ScenarioSweepSession::set_slack_weight_rows,
+         pybind11::arg("gen_ids"), pybind11::arg("gen_weights"), pybind11::arg("storage_ids"),
+         pybind11::arg("storage_weights"),
+         "set_gen_slack_weights / set_storage_slack_weights (lightsim2grid PR #303): per row, the raw "
+         "distributed-slack weight of some units (container ids, one column each in an (n_rows, n_ids) "
+         "matrix; NaN keeps the unit's own, 0 takes it out). The Jacobian's slack column changes by value "
+         "only; run() refuses a positive weight to a unit on a bus that does not share the grid's slack. "
+         "Both families empty clears it.")
+    .def_property_readonly("has_slack_weight_rows", &ScenarioSweepSession::has_slack_weight_rows)
     .def("get_row_status", &ScenarioSweepSession::get_row_status,
          "(n_rows,) int: RowStatus of each row in the last run().")
     .def("get_or_amps",    &ScenarioSweepSession::get_or_amps,
@@ -3405,12 +3438,14 @@ PYBIND11_MODULE(_gpusim2grid, m)
         pybind11::arg("presolved_v") = true);
 
     m.def("_extract_slack_redistribution_data_from_lsgrid",
-        [](pybind11::object grid_py, int n_bus_solver) {
+        [](pybind11::object grid_py, int n_bus_solver, std::vector<int> extra_gens, std::vector<int> extra_stos) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
-            return extract_slack_redistribution_data(grid, n_bus_solver);
+            return extract_slack_redistribution_data(grid, n_bus_solver, extra_gens, extra_stos);
         },
         pybind11::arg("grid"),
         pybind11::arg("n_bus_solver"),
+        pybind11::arg("extra_gens") = std::vector<int>(),
+        pybind11::arg("extra_stos") = std::vector<int>(),
         "SlackRedistributionData of the redistribute_slack pre-pass off a lightsim2grid "
         "LSGrid: the generators / storage units of the distributed slack with their "
         "[min_p, max_p] (set_gen_p_limits / set_storage_p_limits), every generator's "
@@ -3430,13 +3465,50 @@ PYBIND11_MODULE(_gpusim2grid, m)
         "its reactive limits (tol_mva is ignored, kept for the callers). Solver bus numbering. "
         "Raises when the lightsim2grid built against predates PR #216.");
 
+    m.def("_branch_param_blocks",
+        [](pybind11::object grid_py,
+           Eigen::Ref<const Eigen::VectorXi> line_ids, Eigen::Ref<const ParamRealMatRM> line_r,
+           Eigen::Ref<const ParamRealMatRM> line_x, Eigen::Ref<const ParamCplxMatRM> line_h1,
+           Eigen::Ref<const ParamCplxMatRM> line_h2,
+           Eigen::Ref<const Eigen::VectorXi> trafo_ids, Eigen::Ref<const ParamRealMatRM> trafo_r,
+           Eigen::Ref<const ParamRealMatRM> trafo_x, Eigen::Ref<const ParamCplxMatRM> trafo_h1,
+           Eigen::Ref<const ParamCplxMatRM> trafo_h2, Eigen::Ref<const ParamRealMatRM> trafo_ratio,
+           Eigen::Ref<const ParamRealMatRM> trafo_shift) {
+            const ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
+            const BranchParamBlocks b = branch_param_blocks(grid, line_ids, line_r, line_x, line_h1, line_h2,
+                                                            trafo_ids, trafo_r, trafo_x, trafo_h1, trafo_h2,
+                                                            trafo_ratio, trafo_shift);
+            const Eigen::Index n = static_cast<Eigen::Index>(b.rows.size());
+            Eigen::VectorXi rows = Eigen::VectorXi::Map(b.rows.data(), n);
+            Eigen::VectorXi branches = Eigen::VectorXi::Map(b.branches.data(), n);
+            Eigen::Matrix<std::complex<double>, Eigen::Dynamic, 4, Eigen::RowMajor> y(n, 4);
+            for (Eigen::Index k = 0; k < n; ++k)
+                for (int q = 0; q < 4; ++q) y(k, q) = b.y[static_cast<size_t>(4 * k + q)];
+            return pybind11::make_tuple(rows, branches, y);
+        },
+        pybind11::arg("grid"),
+        pybind11::arg("line_ids"), pybind11::arg("line_r"), pybind11::arg("line_x"),
+        pybind11::arg("line_h1"), pybind11::arg("line_h2"),
+        pybind11::arg("trafo_ids"), pybind11::arg("trafo_r"), pybind11::arg("trafo_x"),
+        pybind11::arg("trafo_h1"), pybind11::arg("trafo_h2"), pybind11::arg("trafo_ratio"),
+        pybind11::arg("trafo_shift"),
+        "ScenarioSweep set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): "
+        "(rows, branches, y), per row and branch whose parameters it changes, the block they "
+        "stamp ((n, 4) complex, y11 y12 y21 y22 pu), computed by lightsim2grid's own "
+        "pi_model_with and kron_block. Ids are container ids, each matrix (n_rows, n_ids), NaN "
+        "keeps the grid's value. Raises ValueError for what lightsim2grid's setters refuse, "
+        "RuntimeError when built against a lightsim2grid without it.");
+
     m.def("_extract_gen_p_plan_from_lsgrid",
-        [](pybind11::object grid_py, int n_bus_solver) {
+        [](pybind11::object grid_py, int n_bus_solver, std::vector<int> row_weighted_gens,
+           std::vector<int> row_weighted_stos) {
             ls2g::LSGrid& grid = grid_py.cast<ls2g::LSGrid&>();
-            return extract_gen_p_plan_from_lsgrid(grid, n_bus_solver);
+            return extract_gen_p_plan_from_lsgrid(grid, n_bus_solver, row_weighted_gens, row_weighted_stos);
         },
         pybind11::arg("grid"),
         pybind11::arg("n_bus_solver"),
+        pybind11::arg("row_weighted_gens") = std::vector<int>(),
+        pybind11::arg("row_weighted_stos") = std::vector<int>(),
         "GenPPlanData of compute_physical_violations off a solved lightsim2grid LSGrid, "
         "built by lightsim2grid's own gen_p_check::build_gen_p_plan (so which machines "
         "take a share of the distributed slack, and which of them can be reported, is "
@@ -3749,19 +3821,26 @@ PYBIND11_MODULE(_gpusim2grid, m)
         .def("clear_vm_reset", [](OuterModelHarness& h, int slot) { h.model->clear_vm_reset(slot); })
         .def("set_row_overrides", [](OuterModelHarness& h, std::vector<std::vector<int>> branch_off,
                                      std::vector<std::vector<int>> masked,
-                                     std::vector<std::vector<std::pair<int, int>>> gen_bus) {
+                                     std::vector<std::vector<std::pair<int, int>>> gen_bus,
+                                     std::vector<double> gen_slack_w, std::vector<double> storage_slack_w) {
                 outer::RowOverrides ov;
                 ov.branch_off = std::move(branch_off);
                 ov.masked = std::move(masked);
                 ov.gen_bus = std::move(gen_bus);
+                ov.gen_slack_w = std::move(gen_slack_w);
+                ov.storage_slack_w = std::move(storage_slack_w);
                 h.model->set_row_overrides(std::move(ov));
             }, pybind11::arg("branch_off") = std::vector<std::vector<int>>{},
             pybind11::arg("masked") = std::vector<std::vector<int>>{},
             pybind11::arg("gen_bus") = std::vector<std::vector<std::pair<int, int>>>{},
+            pybind11::arg("gen_slack_w") = std::vector<double>{},
+            pybind11::arg("storage_slack_w") = std::vector<double>{},
             "per row, the branches it opens (lines then trafos), the solver buses "
-            "handle_disconnected_grid masks and the generators it moves as (generator id, solver bus) "
-            "(RowOverrides). Replaces ALL the rows' overrides (generators off, gen_v, lost power... "
-            "are cleared): call it before begin().")
+            "handle_disconnected_grid masks, the generators it moves as (generator id, solver bus) "
+            "and the slack weights it gives its units (n_rows x n_gen / n_rows x n_storage, "
+            "row-major, NaN: the grid's; set_gen_slack_weights) (RowOverrides). Replaces ALL the "
+            "rows' overrides (generators off, gen_v, lost power... are cleared): call it before "
+            "begin().")
         .def("row_trafo_blocks", [](const OuterModelHarness& h, int row) {
                 std::vector<int> t;
                 std::vector<double> b;
@@ -3916,12 +3995,15 @@ PYBIND11_MODULE(_gpusim2grid, m)
     m.attr("have_ls2g_gen_pv_release") = bridge_has_gen_pv_release();
     // the held controllers need lightsim2grid PR #220 (set_hold_frozen_regulators)
     m.attr("have_ls2g_hold_frozen") = bridge_has_hold_frozen();
+    // ScenarioSweep's per-row branch parameters / slack weights need lightsim2grid PR #303
+    m.attr("have_ls2g_branch_params") = bridge_has_branch_params();
 #else
     m.attr("have_ls2g_bridge") = false;
     m.attr("have_ls2g_outer_loops") = false;
     m.attr("have_ls2g_outer_resume") = false;
     m.attr("have_ls2g_gen_pv_release") = false;
     m.attr("have_ls2g_hold_frozen") = false;
+    m.attr("have_ls2g_branch_params") = false;
 #endif
 
     m.def("solve_cudss_raw", &solve_cudss_raw,

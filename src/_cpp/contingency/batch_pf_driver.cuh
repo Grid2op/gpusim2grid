@@ -49,6 +49,7 @@
 // ContingencyAnalysisSolver: cs FIRST so it is destroyed LAST.
 // =============================================================================
 
+#include "../slack_weight_rows.hpp"   // SlackWeightRows (upload_gen_p_row_weights)
 #include <thrust/device_vector.h>
 #include <algorithm>
 #include <cstring>        // std::memcpy (download_into)
@@ -542,6 +543,12 @@ struct BatchPfDriver {
     // [n_contingencies * n_gen] / [n_contingencies * n_sto]; empty = none
     thrust::device_vector<unsigned char>  d_gp_no_share_gen, d_gp_no_share_sto;
     int            gen_p_ns_gen_ = 0, gen_p_ns_sto_ = 0;
+    // ScenarioSweep set_gen_slack_weights: per row, the raw weights of some units
+    // (upload_gen_p_row_weights): per container id its column (-1: none), and
+    // [n_contingencies * n_cols] ORIGINAL row order (NaN: the plan's); empty = none
+    thrust::device_vector<int>            d_gp_rw_gen_col, d_gp_rw_sto_col;
+    thrust::device_vector<cuda_real_type> d_gp_rw_gen, d_gp_rw_sto;
+    int            gen_p_rw_gen_n_ = 0, gen_p_rw_sto_n_ = 0, gen_p_rw_gen_stride_ = 0, gen_p_rw_sto_stride_ = 0;
     thrust::device_vector<int>            d_gp_out_element_type, d_gp_out_element_id, d_gp_out_type;  // [n_contingencies * K_g]
     thrust::device_vector<cuda_real_type> d_gp_out_value, d_gp_out_limit;
     thrust::device_vector<int>            d_gp_count;        // [n_contingencies]; -1 = never simulated, else 0..K_g
@@ -990,6 +997,9 @@ struct BatchPfDriver {
     // order; an empty vector clears that family. Kept across set_gen_p_check.
     void upload_gen_p_no_share(const std::vector<unsigned char>& gen_mask, int n_gen,
                                const std::vector<unsigned char>& sto_mask, int n_sto);
+    // ScenarioSweep set_gen_slack_weights / set_storage_slack_weights: the weights each row
+    // shares the slack with (an empty table clears them). Kept across set_gen_p_check.
+    void upload_gen_p_row_weights(const SlackWeightRows& w);
     void run_gen_p_check_n();
 
     // compute_physical_violations: same contract as set_bus_q_check for the

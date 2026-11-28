@@ -149,6 +149,12 @@ struct RowOverrides {
     // grid's targets) that DistributedSlack shares before its first solve (redistribute_slack,
     // lightsim2grid's OuterRowView::lost_p_mw); NaN: nothing to share
     std::vector<double> lost_p_mw;
+    // n_rows x n_gen / n_rows x n_storage, row-major (empty: none): the raw weight each unit
+    // shares the slack with in that row (ScenarioSweep set_gen_slack_weights, lightsim2grid's
+    // OuterRowView::Units::slack_weight), NaN where the row keeps the grid's "can participate"
+    // weight. A row giving one starts from the grid's targets, not from a resume point.
+    std::vector<double> gen_slack_w;
+    std::vector<double> storage_slack_w;
 };
 
 // Mirrors lightsim2grid's OuterRowResult (BaseBatchSweep.hpp).

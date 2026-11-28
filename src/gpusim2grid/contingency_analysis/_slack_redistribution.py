@@ -148,6 +148,18 @@ class SlackRedistributionFacadeMixin:
         every generator's set-point and the shunts' active power. Needs the
         compiled bridge. Done automatically when ``redistribute_slack`` is
         turned on (so limits set on the grid after construction are seen)."""
+        # the units a scenario sweep's rows give slack weights of their own (set_gen_slack_weights)
+        # are listed too (weight 0 where they are not participants: inert unless a row brings them in)
+        gen_rw, sto_rw = getattr(self, "_row_weighted_unit_ids", lambda: ([], []))()
+        self._inner.set_slack_redistribution_data(
+            self._slack_redistribution_data_off_grid(grid, gen_rw, sto_rw))
+        # the grid's (as the factory's at construction): a scenario sweep's set_gen_slack_weights
+        # reads it again (explicit data it leaves alone)
+        self._slack_rd_from_grid = True
+
+    def _slack_redistribution_data_off_grid(self, grid, gen_rw, sto_rw):
+        """The data :meth:`set_slack_redistribution_data_from_grid` hands the session, with
+        `gen_rw` / `sto_rw` the row-weighted units -- built only, nothing set."""
         from .. import _gpusim2grid as _cpp
         grid = self._grid if grid is None else grid
         if grid is None:
@@ -160,14 +172,15 @@ class SlackRedistributionFacadeMixin:
                 "set_slack_redistribution_data_from_grid() needs gpusim2grid compiled with "
                 "the lightsim2grid bridge; use set_slack_redistribution_data(...) with the "
                 "arrays instead.")
-        self._inner.set_slack_redistribution_data(
-            _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self._inner._s.n_bus))
+        return _cpp._extract_slack_redistribution_data_from_lsgrid(grid, self._inner._s.n_bus,
+                                                                   list(gen_rw), list(sto_rw))
 
     def set_slack_redistribution_data(self, data):
         """Explicit-array mode counterpart of
         :meth:`set_slack_redistribution_data_from_grid` -- see the engine's
         ``set_slack_redistribution_data`` for the arrays."""
         self._inner.set_slack_redistribution_data(data)
+        self._slack_rd_from_grid = False
 
     @property
     def redistribute_slack(self):

@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include "violation_kernels.cuh"
+#include "../slack_weight_rows.hpp"   // slack_weight_rows::MIN_WEIGHT (weight_of)
 
 #include <math.h>   // isnan
 
@@ -1034,6 +1035,14 @@ __global__ void check_gen_p_violations_kernel(
     int                                 n_ns_gen,
     const unsigned char*   __restrict__ d_no_share_sto,
     int                                 n_ns_sto,
+    const int*             __restrict__ d_rw_gen_col,      // [n_rw_gen] column of each generator in d_rw_gen, -1 none; or nullptr
+    int                                 n_rw_gen,
+    const cuda_real_type*  __restrict__ d_rw_gen,          // [n_rows x rw_gen_stride] ORIGINAL order: a row's own raw weights (NaN: the plan's)
+    int                                 rw_gen_stride,
+    const int*             __restrict__ d_rw_sto_col,
+    int                                 n_rw_sto,
+    const cuda_real_type*  __restrict__ d_rw_sto,
+    int                                 rw_sto_stride,
     cuda_real_type                      sn_mva,
     cuda_real_type                      tol_mw,
     int n_bus, int nnz_Y,
@@ -1069,7 +1078,25 @@ __global__ void check_gen_p_violations_kernel(
     const cuda_real_type*  tgt = d_targets ? d_targets + static_cast<ptrdiff_t>(out_c) * target_stride : nullptr;
     const unsigned char*   nsg = d_no_share_gen ? d_no_share_gen + static_cast<ptrdiff_t>(out_c) * n_ns_gen : nullptr;
     const unsigned char*   nss = d_no_share_sto ? d_no_share_sto + static_cast<ptrdiff_t>(out_c) * n_ns_sto : nullptr;
+    const cuda_real_type*  rwg = d_rw_gen ? d_rw_gen + static_cast<ptrdiff_t>(out_c) * rw_gen_stride : nullptr;
+    const cuda_real_type*  rws = d_rw_sto ? d_rw_sto + static_cast<ptrdiff_t>(out_c) * rw_sto_stride : nullptr;
     const cuda_real_type   eps = cuda_real_type(1e-12);
+    // the row's raw weight of a machine (ScenarioSweep set_gen_slack_weights), `own` -- the
+    // plan's, the grid's -- where it gives none (upstream's weight_of). A row's weight below
+    // slack_weight_rows::MIN_WEIGHT takes no share in the solve (row_slack_weights,
+    // redistribute_row): 0 here too, so the machine is not checked as one sharing the slack
+    // (upstream passes the raw value, which its 1e-12 test below lets through)
+    auto weight_of = [&](int type, int id, cuda_real_type own) -> cuda_real_type {
+        const int*            col = type == ELEM_GENERATOR ? d_rw_gen_col : d_rw_sto_col;
+        const cuda_real_type* row = type == ELEM_GENERATOR ? rwg : rws;
+        const int             n   = type == ELEM_GENERATOR ? n_rw_gen : n_rw_sto;
+        if (row == nullptr || col == nullptr || id < 0 || id >= n) return own;
+        const int c = col[id];
+        if (c < 0) return own;
+        const cuda_real_type w = row[c];
+        if (isnan(w)) return own;
+        return w >= cuda_real_type(slack_weight_rows::MIN_WEIGHT) ? w : cuda_real_type(0);
+    };
 
     auto bus_live = [&](int b) -> bool {
         const cudaComplexType Vb = V[b];
@@ -1091,8 +1118,12 @@ __global__ void check_gen_p_violations_kernel(
     // the live raw participation of the participants grouped under slot s
     auto slot_raw_w = [&](int s) -> cuda_real_type {
         cuda_real_type w = 0;
-        for (int p = d_part_start[s]; p < d_part_start[s + 1]; ++p)
-            if (takes_share(d_part_el_type[p], d_part_el_id[p])) w += d_part_weight[p];
+        for (int p = d_part_start[s]; p < d_part_start[s + 1]; ++p) {
+            if (!takes_share(d_part_el_type[p], d_part_el_id[p])) continue;
+            const cuda_real_type wp = weight_of(d_part_el_type[p], d_part_el_id[p], d_part_weight[p]);
+            if (fabs(wp) < eps) continue;
+            w += wp;
+        }
         return w;
     };
     auto finite_or_zero = [](cudaComplexType v) -> cudaComplexType {
@@ -1137,6 +1168,8 @@ __global__ void check_gen_p_violations_kernel(
         const int etype = d_el_type[k];
         const int eid   = d_el_id[k];
         if (!machine_live(etype, eid)) continue;   // disconnected by this row: produces nothing
+        const cuda_real_type entry_w = weight_of(etype, eid, d_weight[k]);
+        if (fabs(entry_w) < eps) continue;          // out of this row's distribution
 
         // its target, plus its share of what its bus had to make up -- exactly
         // as lightsim2grid's GeneratorContainer::set_p_slack computes it after
@@ -1179,7 +1212,7 @@ __global__ void check_gen_p_violations_kernel(
                 if (b1 == b) mis += p1_flow;
                 if (b2 == b) mis += p2_flow;
             }
-            p_mw += mis * sn_mva * d_weight[k] / bus_raw_w;
+            p_mw += mis * sn_mva * entry_w / bus_raw_w;
         }
         if (!isfinite(p_mw)) continue;
 

@@ -63,6 +63,27 @@ void ScenarioSweepBatch::initialize(BatchPfDriverContext& ctx, cudaStream_t cs)
             upload_h2d(d_trip_branch_flat, h_trip_branch_flat_.data(),
                        h_trip_branch_flat_.size(), cs);
     }
+    if (!h_own_.empty()) {
+        const size_t n_own = h_own_.size();
+        std::vector<cudaComplexType> y(4 * n_own);
+        std::vector<int> ft(2 * n_own);
+        std::vector<cuda_real_type> base(2 * n_own);
+        for (size_t k = 0; k < n_own; ++k) {
+            const RowBranchBlock& ob = h_own_[k];
+            for (int q = 0; q < 4; ++q)
+                y[4 * k + q] = CudaFunHelper::my_make_cuComplex(static_cast<cuda_real_type>(ob.y[q].real()),
+                                                                static_cast<cuda_real_type>(ob.y[q].imag()));
+            ft[2 * k] = ob.from;
+            ft[2 * k + 1] = ob.to;
+            base[2 * k] = static_cast<cuda_real_type>(ob.base_or_A);
+            base[2 * k + 1] = static_cast<cuda_real_type>(ob.base_ex_A);
+        }
+        upload_h2d(d_trip_own, h_trip_own_.data(), h_trip_own_.size(), cs);
+        upload_h2d(d_own_y, y.data(), y.size(), cs);
+        upload_h2d(d_own_ft, ft.data(), ft.size(), cs);
+        upload_h2d(d_own_base, base.data(), base.size(), cs);
+        cudaStreamSynchronize(cs);   // the staging vectors die here
+    }
 
     if (n_bus_ != ctx.n_bus)
         throw std::runtime_error(

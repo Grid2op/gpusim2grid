@@ -46,6 +46,7 @@
 #include "gen_contingency_data.hpp"          // GenContingencyData
 #include "element_trip_data.hpp"             // ElementTripData
 #include "slack_redistribution.hpp"          // SlackRedistributionData, slack_redistribution::RowResult
+#include "slack_weight_rows.hpp"            // SlackWeightRows
 #include "contingency/physical_checks_data.hpp"  // PhysicalChecksConfig, BusQPlanData, *ViolationsResult
 #include "contingency/row_status.hpp"           // BatchScheduling, RowStatus
 #include "reordering_alg.hpp"
@@ -58,6 +59,8 @@
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
 
+#include <array>
+#include <complex>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -114,6 +117,12 @@ struct ScenarioSweepSession {
     // =========================================================================
     bool injections_dirty_     = false;
     bool topology_dirty_       = false;
+    // bumped by every rebuild of the rows' branches (set_topology -- the setters rebuilding it
+    // with branch parameters, trips, new branch data -- and run()'s implicit topology); the one the
+    // last completed run() solved is what compute_flows reads the flows of (it refuses another:
+    // the last run's V through other trips / blocks is no row's flows)
+    std::uint64_t topology_generation_     = 0;
+    std::uint64_t run_topology_generation_ = ~std::uint64_t(0);
     bool gen_v_dirty_          = false;
     bool gen_off_dirty_        = false;
     bool injections_on_device_ = false;
@@ -305,6 +314,16 @@ struct ScenarioSweepSession {
     std::vector<MoreTrips>        more_off_;
     bool                          has_more_off_ = false;
     std::vector<std::string>      row_unsupported_;
+    // ScenarioSweep set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): per
+    // row, the branches it gives parameters of its own with the block they stamp (sorted by
+    // branch, set_branch_param_blocks). set_topology turns them into the row's Ybus patch
+    // (grid block - row block, on the entries the branch already has) and its own blocks
+    // (Contingency::own_branches: flows, current check); a branch the row trips ignores them.
+    using BranchParamBlock = std::pair<int, std::array<std::complex<double>, 4>>;
+    std::vector<std::vector<BranchParamBlock>> branch_params_;
+    bool                                       has_branch_params_ = false;
+    // the row's own blocks and Ybus deltas of its branch parameters, into `ctg` (set_topology)
+    void _append_branch_params(int r, Contingency& ctg) const;
     // the controllers of the voltage-control groups each row trips, and whether the base
     // ledger carries the entries that takes (reserve_tripped_controller_slots)
     std::vector<std::vector<int>> row_vc_tripped_;
@@ -385,6 +404,20 @@ struct ScenarioSweepSession {
     std::vector<double>     ext_lost_p_mw_;
     bool                    has_ext_lost_ = false;
     bool                    rd_gp_last_ = false;   // the gen-P check got pre-pass targets last run
+    // ScenarioSweep set_gen_slack_weights / set_storage_slack_weights (lightsim2grid PR #303):
+    // per row, the raw slack weights of some units (set_slack_weight_rows); slack_w_applied_
+    // whether the live source holds weights built from them
+    SlackWeightRows         slack_w_rows_;
+    bool                    slack_w_applied_ = false;
+    // the active-power check's copy on the driver is behind slack_w_rows_ (uploaded by the next
+    // run with the check on; a new driver always uploads them)
+    bool                    slack_w_rows_dirty_ = false;
+    // lightsim2grid's _check_slack_weight_rows: a positive weight only to a connected unit on a
+    // bus sharing the grid's slack (the slack column has entries there only), or that the row
+    // disconnects; and one the redistribute_slack pre-pass data and the active-power check's
+    // plan list, when they are in use (data set explicitly may lack it). Throws
+    // std::invalid_argument
+    void _check_slack_weight_rows() const;
 
     Eigen::SparseMatrix<eigen_cplx_type> Ybus_cm_;
     CplxVect        Vinit_, Sbus_;
@@ -576,6 +609,21 @@ struct ScenarioSweepSession {
     bool has_slack_redistribution_data() const { return has_slack_rd_; }
     void set_gen_p_rows(Eigen::Ref<const RealMatRM> gen_p);
     SlackRedistributionReport get_slack_redistribution_report() const;
+    // ScenarioSweep set_gen_slack_weights / set_storage_slack_weights (lightsim2grid PR #303):
+    // per row, the raw distributed-slack weight of some units (container ids, one column each
+    // in a (n_rows x n_ids) matrix; NaN keeps the unit's own, 0 takes it out of the row's
+    // slack, a positive value makes a connected unit a participant). The values of the
+    // Jacobian's slack column change, not its pattern: the buses sharing the slack stay the
+    // grid's, and run() refuses a positive weight to a unit on another bus. The
+    // redistribute_slack pre-pass, the generator active-power check and the outer loops'
+    // DistributedSlack loop share with them too. Replaces the previous set; both families
+    // empty clears it.
+    void set_slack_weight_rows(Eigen::Ref<const Eigen::VectorXi> gen_ids,
+                               Eigen::Ref<const SlackWeightRows::Mat> gen_w,
+                               Eigen::Ref<const Eigen::VectorXi> sto_ids,
+                               Eigen::Ref<const SlackWeightRows::Mat> sto_w);
+    bool has_slack_weight_rows() const { return !slack_w_rows_.empty(); }
+    const SlackWeightRows& slack_weight_rows() const { return slack_w_rows_; }
 
     // The same pre-pass run by the CALLER (BatchPowerFlow: it needs the
     // correction inside its autograd graph, so it adds it to the Sbus it hands
@@ -646,6 +694,18 @@ struct ScenarioSweepSession {
     more_trips_injection_delta() const;
     // per row, why the batch left it out ("": it did not), set by run()
     const std::vector<std::string>& get_batch_unsupported_reasons() const { return row_unsupported_; }
+    // ScenarioSweep set_line_parameters / set_trafo_parameters (lightsim2grid PR #303): the
+    // branches whose parameters rows change, with the block those parameters stamp (y11 y12
+    // y21 y22 pu, 4 per entry, Kron-reduced for the branch's end statuses: the bridge's
+    // branch_param_blocks). Each row's Ybus is patched by value on the entries the branch
+    // already has (one cuDSS analysis for the batch), and its flows and current check read
+    // the row's block. A row tripping the branch ignores them. With the outer loops, a row
+    // changing a transformer a TransformerVoltageControl / PhaseControl loop regulates is left
+    // out (row_unsupported_). Replaces the previous set; empty clears it. Needs
+    // set_branch_data().
+    void set_branch_param_blocks(const std::vector<int>& rows, const std::vector<int>& branches,
+                                 const std::vector<std::complex<double>>& y, int n_rows);
+    bool has_branch_params() const { return has_branch_params_; }
 
     // =========================================================================
     // set_pv_pq_switches — the labelling side of one reactive-limit outer-loop

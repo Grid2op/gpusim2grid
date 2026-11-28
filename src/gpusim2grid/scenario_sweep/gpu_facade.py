@@ -416,6 +416,13 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         # session's own n_scenarios is the live driver's until the next run.
         self._skip_rows_stale = False
         self._n_injection_rows = None
+        # set_line_parameters / set_trafo_parameters inputs ((ids, matrices) or None): the
+        # session takes both at once (_push_branch_params)
+        self._line_params = None
+        self._trafo_params = None
+        # set_gen_slack_weights / set_storage_slack_weights inputs ((ids, weights) or None)
+        self._gen_slack_w = None
+        self._sto_slack_w = None
 
         # OLF-style bounded slack redistribution of what a row loses, and the
         # reference slack the fewest rows strand -- see
@@ -825,6 +832,300 @@ class ScenarioSweepGPU(PhysicalChecksFacadeMixin, SlackRedistributionFacadeMixin
         ``compute_physical_violations``, a line in AC emulation or with a regulating station is
         reported BATCH_UNSUPPORTED (those checks cannot leave it out of a row yet)."""
         self._set_more_trip("set_contingency_hvdcs", mask)
+
+    # ------------------------------------------- per-row branch parameters (lightsim2grid PR #303)
+    def _element_ids(self, ids, container, kind):
+        """Element ids (ints, or names) of one kind of element, as an int32 array."""
+        names = None
+        out = []
+        for el in list(ids):
+            if isinstance(el, str):
+                if names is None:
+                    names = {e.name: e.id for e in container}
+                if el not in names:
+                    raise ValueError(f"No {kind} named \"{el}\" on the grid.")
+                out.append(names[el])
+            else:
+                out.append(int(el))
+        return np.asarray(out, dtype=np.int32)
+
+    @staticmethod
+    def _branch_param_matrices(nb_ids, setter, **matrices):
+        """The given matrices checked to shape (n_rows, nb_ids), the missing ones all NaN (the
+        grid's value) of that shape; h1 / h2 complex, the others float."""
+        given = {k: v for k, v in matrices.items() if v is not None}
+        if nb_ids and not given:
+            raise ValueError(f"{setter}: give at least one of {', '.join(matrices)}.")
+        n_rows = None
+        out = {}
+        for name, val in given.items():
+            dtype = np.complex128 if name in ("h1", "h2") else np.float64
+            arr = np.asarray(val, dtype=dtype)
+            if arr.ndim != 2 or arr.shape[1] != nb_ids:
+                raise ValueError(f"{setter}: `{name}` should be a matrix of shape (n_scenarios, {nb_ids}): one row "
+                                 f"per scenario, one column per element named, got shape {arr.shape}.")
+            if n_rows is None:
+                n_rows = arr.shape[0]
+            elif arr.shape[0] != n_rows:
+                raise ValueError(f"{setter}: `{name}` has {arr.shape[0]} rows, the other matrices {n_rows}.")
+            out[name] = np.ascontiguousarray(arr)
+        n_rows = 0 if n_rows is None else n_rows
+        for name in matrices:
+            if name not in out:
+                if name in ("h1", "h2"):
+                    out[name] = np.full((n_rows, nb_ids), complex(np.nan, np.nan), dtype=np.complex128)
+                else:
+                    out[name] = np.full((n_rows, nb_ids), np.nan, dtype=np.float64)
+        return out
+
+    def _require_branch_params(self, setter):
+        if self._grid is None:
+            raise RuntimeError(f"{setter}() needs a lightsim2grid grid; explicit-array (tuple) mode has no "
+                               f"branch parameters to read.")
+        if not getattr(_cpp, "have_ls2g_branch_params", False):
+            raise NotImplementedError(
+                f"{setter}() needs a lightsim2grid with per-row branch parameters (lightsim2grid PR #303); "
+                "this gpusim2grid was built against an older one (_gpusim2grid.have_ls2g_branch_params).")
+
+    def set_line_parameters(self, line_ids, r=None, x=None, h1=None, h2=None):
+        """Per-scenario parameters of some powerlines: the values each row gives them.
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_line_parameters`` (PR #303).
+
+        Parameters
+        ----------
+        line_ids:
+            The powerlines whose parameters vary (ids, or names), one column each in the
+            matrices below; lightsim2grid's powerline numbering (transformers have
+            :meth:`set_trafo_parameters`).
+        r, x: ``np.ndarray`` of float, shape ``(n_scenarios, len(line_ids))``
+            Series resistance and reactance, in pu.
+        h1, h2: ``np.ndarray`` of complex, shape ``(n_scenarios, len(line_ids))``
+            Shunt admittance ``g + j.b`` at side 1 and side 2, in pu.
+
+        Notes
+        -----
+        Any of the four may be omitted, and a ``NaN`` cell (a complex one when either part is
+        ``NaN``) keeps the grid's value. The values mean what lightsim2grid's
+        ``LSGrid.update_powerlines_parameters`` takes: a row solves, and reports flows and
+        violations, as the grid would with them. Only the values of existing admittance-matrix
+        entries change, so the whole sweep keeps a single symbolic analysis. A row that also
+        trips the line (:meth:`set_topology`) ignores its parameters.
+
+        A new call replaces the previous one; an empty ``line_ids`` clears it. The row count
+        must be the injections'. Raises for an id out of range or named twice, a matrix of
+        another shape, an infinite value or ``r`` and ``x`` both 0.
+        """
+        self._require_branch_params("set_line_parameters")
+        ids = self._element_ids(line_ids, self._grid.get_lines(), "powerline")
+        mats = self._branch_param_matrices(ids.size, "set_line_parameters", r=r, x=x, h1=h1, h2=h2)
+        self._set_branch_params("_line_params", (ids, mats) if ids.size else None)
+
+    def set_trafo_parameters(self, trafo_ids, r=None, x=None, h1=None, h2=None, ratio=None, shift_rad=None):
+        """Per-scenario parameters of some transformers: :meth:`set_line_parameters` for the
+        transformers, with their ratio and phase shift as well.
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_trafo_parameters`` (PR #303).
+
+        .. warning::
+            ``r``, ``x``, ``h1`` and ``h2`` are the values at the **neutral tap**, those
+            ``LSGrid.update_trafos_parameters_full`` takes. A transformer with tap changers (or
+            an impedance that depends on its shift) gets their corrections at their current
+            positions applied on top, exactly as the grid does: giving the impedance you read on
+            the transformer at its current tap applies that correction twice. Without a tap
+            changer the two are the same.
+
+        Parameters
+        ----------
+        trafo_ids:
+            The transformers whose parameters vary (ids, or names).
+        r, x, h1, h2: ``np.ndarray``, shape ``(n_scenarios, len(trafo_ids))``
+            As in :meth:`set_line_parameters`, in pu: the **neutral** values, see the warning.
+        ratio: ``np.ndarray`` of float, shape ``(n_scenarios, len(trafo_ids))``
+            The ratio, what ``LSGrid.change_ratio_trafo`` takes.
+        shift_rad: ``np.ndarray`` of float, shape ``(n_scenarios, len(trafo_ids))``
+            The phase shift, in radian (on side 1), what ``LSGrid.change_shift_trafo`` takes.
+
+        Notes
+        -----
+        With ``outer_loops=True``, a row changing a transformer whose taps a
+        TransformerVoltageControl / PhaseControl loop regulates is left out of the batch
+        (``BATCH_UNSUPPORTED``, the reason in :meth:`get_batch_unsupported_reasons`): the loop
+        would move the tap from the grid's parameters. Also raises for a ratio that is not
+        positive.
+        """
+        self._require_branch_params("set_trafo_parameters")
+        ids = self._element_ids(trafo_ids, self._grid.get_trafos(), "transformer")
+        mats = self._branch_param_matrices(ids.size, "set_trafo_parameters", r=r, x=x, h1=h1, h2=h2,
+                                           ratio=ratio, shift_rad=shift_rad)
+        self._set_branch_params("_trafo_params", (ids, mats) if ids.size else None)
+
+    def _set_branch_params(self, attr, value):
+        """Register one kind's parameters and push both; a refused call leaves the previous
+        registration (and the session) as they were."""
+        previous = getattr(self, attr)
+        setattr(self, attr, value)
+        try:
+            self._push_branch_params()
+        except Exception:
+            setattr(self, attr, previous)
+            raise
+
+    def _push_branch_params(self):
+        """Hand the session the blocks the rows' branch parameters stamp (lightsim2grid's own
+        pi models, computed by the bridge), lines and transformers together."""
+        lp, tp = self._line_params, self._trafo_params
+        n_rows = [m["r"].shape[0] for p in (lp, tp) if p is not None for m in (p[1],)]
+        if len(set(n_rows)) > 1:
+            raise ValueError(f"set_line_parameters and set_trafo_parameters disagree on the number of "
+                             f"scenarios ({n_rows[0]} and {n_rows[1]} rows).")
+        n = n_rows[0] if n_rows else 0
+        if self._n_injection_rows is not None and n and n != self._n_injection_rows:
+            raise ValueError(f"set_line_parameters / set_trafo_parameters: {n} rows, but the injections have "
+                             f"{self._n_injection_rows} scenarios.")
+
+        def empty_real(k=0):
+            return np.zeros((n, k), dtype=np.float64)
+
+        def empty_cplx(k=0):
+            return np.zeros((n, k), dtype=np.complex128)
+
+        none_ids = np.zeros(0, dtype=np.int32)
+        if lp is not None:
+            l_ids, lm = lp
+            l_args = (l_ids, lm["r"], lm["x"], lm["h1"], lm["h2"])
+        else:
+            l_args = (none_ids, empty_real(), empty_real(), empty_cplx(), empty_cplx())
+        if tp is not None:
+            t_ids, tm = tp
+            t_args = (t_ids, tm["r"], tm["x"], tm["h1"], tm["h2"], tm["ratio"], tm["shift_rad"])
+        else:
+            t_args = (none_ids, empty_real(), empty_real(), empty_cplx(), empty_cplx(), empty_real(), empty_real())
+        rows, branches, y = _cpp._branch_param_blocks(self._grid, *l_args, *t_args)
+        self._inner._s.set_branch_param_blocks(rows, branches, y, n)
+
+    # ------------------------------------------------ per-row slack weights (lightsim2grid PR #303)
+    def set_gen_slack_weights(self, gen_ids, weights):
+        """Per-scenario distributed-slack weights of some generators: the share of the slack each
+        row gives them.
+
+        Mirrors lightsim2grid's ``ScenarioSweep.set_gen_slack_weights`` (PR #303).
+
+        Parameters
+        ----------
+        gen_ids:
+            The generators whose weight varies (ids, or names), one column each in ``weights``.
+        weights: ``np.ndarray`` of float, shape ``(n_scenarios, len(gen_ids))``
+            Raw (un-normalised) weights, what ``LSGrid.add_gen_slackbus`` takes. ``0`` takes the
+            generator out of that row's slack, ``NaN`` keeps the grid's weight.
+
+        Notes
+        -----
+        A row solves, and reports its generators' active-power limit violations
+        (``compute_physical_violations``), as the grid would with those weights: they are values
+        of the Jacobian's slack column, so the whole sweep keeps a single symbolic analysis. A
+        row that disconnects a generator ignores its weight; a row leaving no participant puts
+        the whole slack on the reference bus.
+
+        The buses that share the slack are the grid's, fixed for the batch: :meth:`compute`
+        raises for a positive weight to a generator on a bus where no unit takes part in the
+        grid's slack -- make it a participant of the grid's slack (``add_gen_slackbus``) and give
+        it ``0`` in the rows where it should take no share. Needs the distributed slack
+        (``use_distributed_slack=True``). With ``redistribute_slack`` the bounded pre-pass shares
+        with the row's weights too. With ``outer_loops=True`` the DistributedSlack loop shares
+        with them: only a generator that can take part in the grid's slack may get a positive
+        weight (in a row keeping it connected), and with ``init_from_n_powerflow`` such a row
+        starts from the grid's targets and voltage set-points, as without it, not from where the
+        grid's own solve left its loops (whose targets already hold the base imbalance shared
+        with the grid's weights, and whose frozen buses sit off their set-points); not with
+        ``outer_loops_backend='device'``.
+
+        A new call replaces the previous one; an empty ``gen_ids`` clears it. The row count must
+        be the injections'. Raises for an id out of range or named twice, a matrix of another
+        shape, or a weight that is negative or infinite.
+        """
+        self._set_slack_weights("gen", gen_ids, weights)
+
+    def set_storage_slack_weights(self, storage_ids, weights):
+        """Per-scenario distributed-slack weights of some storage units: :meth:`set_gen_slack_weights`
+        for the storage units (``LSGrid.add_storage_slackbus``). Mirrors lightsim2grid's
+        ``ScenarioSweep.set_storage_slack_weights`` (PR #303).
+
+        Parameters
+        ----------
+        storage_ids:
+            The storage units whose weight varies (ids, or names).
+        weights: ``np.ndarray`` of float, shape ``(n_scenarios, len(storage_ids))``
+            As in :meth:`set_gen_slack_weights`.
+        """
+        self._set_slack_weights("sto", storage_ids, weights)
+
+    def _set_slack_weights(self, family, ids, weights):
+        setter = "set_gen_slack_weights" if family == "gen" else "set_storage_slack_weights"
+        if self._grid is None:
+            raise RuntimeError(f"{setter}() needs a lightsim2grid grid; explicit-array (tuple) mode has no "
+                               f"generators or storage units to read.")
+        if self.outer_loops and self.outer_loops_backend == OuterLoopsBackend.DEVICE:
+            raise NotImplementedError(f"{setter}() with outer_loops_backend='device': the device model's "
+                                      "DistributedSlack loop shares with the grid's weights; use the host backend.")
+        container = self._grid.get_generators() if family == "gen" else self._grid.get_storages()
+        kind = "generator" if family == "gen" else "storage unit"
+        ids = self._element_ids(ids, container, kind)
+        w = np.asarray(weights, dtype=np.float64)
+        if ids.size == 0 and w.size == 0:
+            w = np.zeros((0, 0), dtype=np.float64)
+        elif w.ndim != 2 or w.shape[1] != ids.size:
+            raise ValueError(f"{setter}: `weights` should be a matrix of shape (n_scenarios, {ids.size}): one row "
+                             f"per scenario, one column per element named, got shape {w.shape}.")
+        if self._n_injection_rows is not None and ids.size and w.shape[0] != self._n_injection_rows:
+            raise ValueError(f"{setter}: `weights` has {w.shape[0]} rows, but the injections have "
+                             f"{self._n_injection_rows} scenarios.")
+        new = (ids, np.ascontiguousarray(w)) if ids.size else None
+        gen = new if family == "gen" else self._gen_slack_w
+        sto = new if family == "sto" else self._sto_slack_w
+        # the units only a row's weight brings in: in the pre-pass's data and the active-power
+        # check's plan, read off the grid again -- a plan set is refreshed even while the check is
+        # off, since turning it back on keeps the plan it finds. Built before anything is set, so
+        # that a refusal (e.g. the plan of a lightsim2grid without PR #303) changes nothing. Data
+        # and a plan the caller set explicitly are theirs: left as they are (compute() refuses a
+        # row weighting a unit they lack).
+        rw = self._row_weighted_unit_ids((gen, sto))
+        rd_from_grid = getattr(self, "_slack_rd_from_grid", True)
+        plan_from_grid = getattr(self, "_gen_p_plan_from_grid", False)
+        rd = (self._slack_redistribution_data_off_grid(None, *rw)
+              if self.redistribute_slack and rd_from_grid else None)
+        plan = (self._gen_p_plan_off_grid(None, *rw)
+                if self._inner.has_gen_p_capability and plan_from_grid else None)
+        self._push_slack_weights(gen, sto)
+        previous = self._gen_slack_w, self._sto_slack_w
+        self._gen_slack_w, self._sto_slack_w = gen, sto
+        try:
+            if rd is not None:
+                self._inner.set_slack_redistribution_data(rd)
+            if plan is not None:
+                self._inner.set_gen_p_capability(plan)
+                self._push_gen_p_targets()
+        except Exception:
+            self._gen_slack_w, self._sto_slack_w = previous
+            self._push_slack_weights(*previous)
+            raise
+
+    def _push_slack_weights(self, gen, sto):
+        """Hand the session both families' (ids, weights) (None: none)."""
+        empty = (np.zeros(0, dtype=np.int32), np.zeros((0, 0), dtype=np.float64))
+        g_ids, g_w = gen if gen is not None else empty
+        s_ids, s_w = sto if sto is not None else empty
+        self._inner._s.set_slack_weight_rows(g_ids, g_w, s_ids, s_w)
+
+    def _row_weighted_unit_ids(self, weights=None):
+        """(generator ids, storage ids) the rows give slack weights of their own -- those of
+        `weights` ((gen, sto), each (ids, weights) or None) when given, the ones set otherwise."""
+        if weights is None:
+            weights = getattr(self, "_gen_slack_w", None), getattr(self, "_sto_slack_w", None)
+        gen, sto = weights
+        g = [] if gen is None else [int(i) for i in gen[0]]
+        s = [] if sto is None else [int(i) for i in sto[0]]
+        return g, s
 
     def get_batch_unsupported_reasons(self):
         """list[str], per row: why the batch left it out (``""``: it did not), after

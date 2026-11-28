@@ -15,15 +15,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "dtypes.hpp"
 #include "gen_contingency_data.hpp"
 #include "ledger_data.hpp"
+#include "slack_weight_rows.hpp"
 
 namespace gen_contingency {
 
@@ -233,15 +236,22 @@ inline std::vector<std::pair<int, double>> held_by_value(const LedgerData& ld, c
 // the participating generators each row takes out (row_slack_off), on the base
 // participant layout (`slack_bus`: the bus of each slack index). The storage
 // units taking part in the slack keep their share on every row (no row
-// disconnects one). Empty when no row takes anything out. `ref_bus` takes the
-// whole share of a row that leaves no participant.
-template <class StoOff>
+// disconnects one). Empty when no row takes anything out nor gives weights of its own.
+// `ref_bus` takes the whole share of a row that leaves no participant.
+// `over` (nullable): the raw weights rows give some units (ScenarioSweep
+// set_gen_slack_weights / set_storage_slack_weights, lightsim2grid PR #303) -- a
+// positive one makes a connected unit a participant, 0 takes it out; `gen_off(r, g)`
+// says whether row r disconnects generator g (a unit only the row's weight brings in
+// is not in row_slack_off: one the row disconnects takes no share all the same).
+template <class StoOff, class GenOff = std::nullptr_t>
 std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
                                                      const std::vector<std::vector<int>>& row_slack_off,
                                                      int n_rows, int n_bus,
                                                      const std::vector<int>& slack_bus,
                                                      const std::vector<cuda_real_type>& base_w,
-                                                     int ref_bus, const std::string& who, StoOff sto_off)
+                                                     int ref_bus, const std::string& who, StoOff sto_off,
+                                                     const SlackWeightRows* over = nullptr,
+                                                     GenOff gen_off = nullptr)
 {
     std::vector<cuda_real_type> out;
     const int n_slack = static_cast<int>(slack_bus.size());
@@ -252,9 +262,14 @@ std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
             if (gd.storage_bus[static_cast<size_t>(s)] >= 0 && sto_off(r, s)) return true;
         return false;
     };
+    const auto row_weighted = [&](int r) { return over != nullptr && over->has_row(r); };
+    const auto gen_off_row = [&](int r, int g) {
+        if constexpr (std::is_same_v<GenOff, std::nullptr_t>) { (void)r; (void)g; return false; }
+        else return static_cast<bool>(gen_off(r, g));
+    };
     bool any = false;
     for (const auto& v : row_slack_off) if (!v.empty()) { any = true; break; }
-    for (int r = 0; r < n_rows && !any; ++r) any = row_sto_off(r);
+    for (int r = 0; r < n_rows && !any; ++r) any = row_sto_off(r) || row_weighted(r);
     if (!any) return out;
 
     out.assign(static_cast<size_t>(n_rows) * n_slack, static_cast<cuda_real_type>(0.));
@@ -263,7 +278,8 @@ std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
     for (int r = 0; r < n_rows; ++r) {
         cuda_real_type* row = out.data() + static_cast<ptrdiff_t>(r) * n_slack;
         const bool sto_out = row_sto_off(r);
-        if (row_slack_off[static_cast<size_t>(r)].empty() && !sto_out) {
+        const bool weighted = row_weighted(r);
+        if (row_slack_off[static_cast<size_t>(r)].empty() && !sto_out && !weighted) {
             std::copy(base_w.begin(), base_w.end(), row);
             continue;
         }
@@ -272,7 +288,24 @@ std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
         std::fill(w.begin(), w.end(), 0.0);
         double sum = 0.0;
         const std::vector<double>& sto_w = gd.storage_slack_weight_bus;
-        if (!sto_out) {
+        if (weighted && !over->sto.empty()) {
+            // per unit: the row's weight where it gives one (any connected unit), its own otherwise
+            for (int s = 0; s < gd.n_storage; ++s) {
+                double ws;
+                int b;
+                if (over->sto.has(r, s)) {
+                    ws = over->sto.of(r, s);
+                    b = static_cast<size_t>(s) < gd.storage_any_bus.size() ? gd.storage_any_bus[static_cast<size_t>(s)] : -1;
+                    if (!(ws >= slack_weight_rows::MIN_WEIGHT)) continue;
+                } else {
+                    b = gd.storage_bus[static_cast<size_t>(s)];
+                    ws = gd.storage_slack_weight[static_cast<size_t>(s)];
+                }
+                if (b < 0 || sto_off(r, s)) continue;
+                w[static_cast<size_t>(b)] += ws;
+                sum += ws;
+            }
+        } else if (!sto_out) {
             for (int b = 0; b < n_bus && b < static_cast<int>(sto_w.size()); ++b) {
                 w[static_cast<size_t>(b)] = sto_w[static_cast<size_t>(b)];
                 sum += sto_w[static_cast<size_t>(b)];
@@ -286,11 +319,18 @@ std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
             }
         }
         for (int g = 0; g < gd.n_gen; ++g) {
-            if (!gd.status[g] || !gd.slack_participant[g] || off[static_cast<size_t>(g)]) continue;
+            if (!gd.status[g] || off[static_cast<size_t>(g)]) continue;
+            double wg = gd.slack_weight[g];
+            if (weighted && over->gen.has(r, g)) {
+                wg = over->gen.of(r, g);
+                if (!(wg >= slack_weight_rows::MIN_WEIGHT) || gen_off_row(r, g)) continue;
+            } else if (!gd.slack_participant[g]) {
+                continue;
+            }
             const int b = gd.bus[g];
             if (b < 0) continue;
-            w[static_cast<size_t>(b)] += gd.slack_weight[g];
-            sum += gd.slack_weight[g];
+            w[static_cast<size_t>(b)] += wg;
+            sum += wg;
         }
         if (std::abs(sum) < 1e-12) {
             // Every participant off: the reference bus keeps the whole share
@@ -306,7 +346,8 @@ std::vector<cuda_real_type> row_slack_weights(const GenContingencyData& gd,
             w[static_cast<size_t>(b)] = 0.0;   // consumed
         }
         // A survivor bus that is not a base participant cannot exist (the
-        // survivors are a subset of the base participants); the degenerate
+        // survivors are a subset of the base participants, and a row's own
+        // weights are checked against the slack buses before); the degenerate
         // "reference gets 1" case can, when the reference carries no base
         // weight (several slacks) -- refuse rather than silently drop it.
         for (int b = 0; b < n_bus; ++b)

@@ -20,6 +20,7 @@
 #include "device_outer_model.hpp"
 
 #include "../ledger_data.hpp"
+#include "outer_row_seed.hpp"   // seed_rows_vm (fresh_vm_)
 
 #include <LSGrid.hpp>
 #include <batch_algorithm/BusQCheck.hpp>
@@ -272,6 +273,9 @@ struct ResumePoint {
 struct SlotState {
     int row = -1;
     const ResumePoint* rp = nullptr;      // where the row's loops resume from (nullptr: from scratch)
+    // the raw slack weights the row gives its units (RowOverrides::gen_slack_w / storage_slack_w,
+    // NaN: the grid's "can participate" one; empty: none) -- OuterRowView::Units::slack_weight
+    std::vector<double> gen_slack_w, sto_slack_w;
     double lost_mw = 0.;                  // what share_lost_p counted (ResumePoint::lost_mw)
     // ---- the row as its loops see it (OuterRowView; its layout and masked list point
     // into the model and this slot) ---------------------------------------------------------
@@ -458,7 +462,14 @@ public:
     void row_trafo_blocks(int row, std::vector<int>& trafo, std::vector<double>& block) const override;
     int n_rows() const override { return n_rows_; }
     void set_row_targets(int n_rows, std::vector<double> gen_p, std::vector<double> storage_p) override;
-    void set_row_overrides(RowOverrides overrides) override { ov_ = std::move(overrides); }
+    void set_row_overrides(RowOverrides overrides) override {
+        check_row_slack_weights(overrides);
+        ov_ = std::move(overrides);
+    }
+    // lightsim2grid's _check_slack_weight_rows under outer loops: the buses the DistributedSlack
+    // loop's Newton share uses are reserved once for the batch, from the units that can take
+    // part in the grid's slack -- a row's positive weight to any other is refused
+    void check_row_slack_weights(const RowOverrides& ov) const;
     void keep_row_points(bool keep) override { keep_points_ = keep; }
     void set_row_resume(std::vector<int> point_of_row) override { resume_of_row_ = std::move(point_of_row); }
     void set_spare_buses(const LedgerData& ledger, const std::vector<int>& spare_grid_bus) override;
@@ -598,6 +609,14 @@ private:
     // where the grid's own solve left the loops (Ls2gModelOptions::resume_from_n)
     bool resume_ = false;
     ResumePoint point_n_;
+    // resume_ only: what a row whose loops start from scratch anyway (one giving slack weights
+    // of its own) resets, as (solver bus, |V|): the buses seed_rows_vm -- where every row of a
+    // batch without init_from_n_powerflow starts -- puts at another magnitude than the grid's
+    // solve left them (the ones its loops froze, ...). Per entry, the generators writing that
+    // bus: where the row gives one of them a voltage of its own (gen_v), the source seeded it.
+    std::vector<std::pair<int, double>> fresh_vm_;
+    std::vector<std::vector<int>> fresh_vm_gens_;
+    void reset_fresh_vm(SlotState& st) const;
     // the rows' own points (keep_row_points: by row, nullptr while the row has not ended
     // stable) and the point each row resumes from
     bool keep_points_ = false;
@@ -675,8 +694,10 @@ private:
     void ds_keep_parked(SlotState& st) const;
     double ds_share(const SlotState& st, std::vector<size_t>* units) const;
     void ds_fold(SlotState& st, double sa) const;
+    // `gen_w` / `sto_w` (nullable, NaN: the grid's): the weights the row gives its units
     void collect_units(const ls2g::OuterGridView& v, std::vector<ls2g::slack_redistribution::Participant>& units,
-                       std::vector<int>& bus) const;
+                       std::vector<int>& bus, const std::vector<double>* gen_w = nullptr,
+                       const std::vector<double>* sto_w = nullptr) const;
     void set_active(SlotState& st) const;
     void add_injection(SlotState& st, int bus, cplx ds) const {
         if (ds == cplx(0., 0.)) return;
@@ -883,6 +904,19 @@ Ls2gOuterModel::Ls2gOuterModel(const ls2g::LSGrid& grid, const LedgerData& ledge
         pn.ratio_tap.assign(point->ratio_tap.begin(), point->ratio_tap.end());
         pn.sections.assign(point->sections.begin(), point->sections.end());
 #endif
+        // what a row starting from scratch resets: the rows are loaded with the grid's V as it
+        // is (extract_outer_inputs), the from-scratch seed moves these buses
+        const ls2g::CplxVect V_n = g.get_V_solver();
+        ls2g::CplxVect V_seed = V_n;
+        seed_rows_vm(g, V_seed);
+        std::map<int, std::vector<int>> writers;
+        g.get_generators().vm_writers_by_bus(sbl_.id_me_to_solver, writers);
+        for (Eigen::Index b = 0; b < V_seed.size(); ++b) {
+            if (std::abs(V_seed(b)) == std::abs(V_n(b))) continue;
+            fresh_vm_.emplace_back(static_cast<int>(b), static_cast<double>(std::abs(V_seed(b))));
+            const auto it = writers.find(static_cast<int>(b));
+            fresh_vm_gens_.push_back(it != writers.end() ? it->second : std::vector<int>());
+        }
     }
 
     // ---- VoltageControl, as the ledger has it --------------------------------------------
@@ -1223,6 +1257,27 @@ void Ls2gOuterModel::load(int slot, int row)
                                      ov_.load_off.begin() + static_cast<ptrdiff_t>((r + 1) * n_load_));
         }
         if (r < ov_.lost_p_mw.size()) st.rowv.lost_p_mw = ov_.lost_p_mw[r];
+        // the slack weights the row gives its units (set_gen_slack_weights): its own DistributedSlack
+        // units, and it starts from the grid's targets -- the "n" solve's loops shared its imbalance
+        // with the grid's weights, which the row's would then only complete (lightsim2grid's
+        // _set_outer_row_resume)
+        st.gen_slack_w.clear();
+        st.sto_slack_w.clear();
+        bool row_weights = false;
+        const auto take_w = [&](const std::vector<double>& m, int n, std::vector<double>& out) {
+            if (m.empty() || n <= 0) return;
+            out.assign(m.begin() + static_cast<ptrdiff_t>(r * n), m.begin() + static_cast<ptrdiff_t>((r + 1) * n));
+            bool any = false;
+            for (double w : out) any = any || !std::isnan(w);
+            if (!any) out.clear();
+            row_weights = row_weights || any;
+        };
+        take_w(ov_.gen_slack_w, n_gen_, st.gen_slack_w);
+        take_w(ov_.storage_slack_w, n_sto_, st.sto_slack_w);
+        if (row_weights) {
+            changes_units = true;
+            st.rp = nullptr;
+        }
         // a controller the row trips is gone, as one on a masked bus (below)
         if (r < ov_.vc_tripped.size() && !ov_.vc_tripped[r].empty()) {
             for (int c : ov_.vc_tripped[r]) st.held_q[static_cast<size_t>(c)] = 0.;
@@ -1288,6 +1343,11 @@ void Ls2gOuterModel::load(int slot, int row)
                                              ", which the outer loops' ledger has not reserved");
                 st.pq[static_cast<size_t>(k)] = 1;
             }
+        // a row of a resumed batch whose loops start from scratch (its own slack weights, above)
+        // starts where they do without init_from_n_powerflow, at the set-points: it is loaded
+        // with the grid's solved V, whose buses its loops froze are off theirs, and PV again
+        // from the start a bus is held at the magnitude it starts from
+        if (resume_ && st.rp == nullptr) reset_fresh_vm(st);
     }
     // the grid's plan, unless the row changes what it is built from: the units it
     // disconnects, the buses it masks, its machines' voltage set-points (a local bus'
@@ -1320,7 +1380,7 @@ void Ls2gOuterModel::load(int slot, int row)
         if (prof_.on && !st.masked.empty()) ++prof_.n[P_LOAD_MASKED_ROWS];
         // a unit the row moves that the grid's participants lack (one the grid has disconnected):
         // collect_units' then
-        bool units_filterable = true;
+        bool units_filterable = st.gen_slack_w.empty() && st.sto_slack_w.empty();
         if (gen_moves != nullptr)
             for (const auto& gb : *gen_moves) {
                 if (!(grid_->get_generators().get_can_participate_slack_weight(gb.first) > 0.)) continue;
@@ -1383,7 +1443,8 @@ void Ls2gOuterModel::load(int slot, int row)
                 st.ds_units = ref;   // the injections as collect_units has them (init_loops rewrites them)
             }
         } else if (changes_units) {
-            collect_units(view(st), st.ds_units, st.ds_unit_bus);
+            collect_units(view(st), st.ds_units, st.ds_unit_bus, st.gen_slack_w.empty() ? nullptr : &st.gen_slack_w,
+                          st.sto_slack_w.empty() ? nullptr : &st.sto_slack_w);
         } else if (!st.masked.empty()) {
             st.ds_units.reserve(units0_.size());
             st.ds_unit_bus.reserve(units0_.size());
@@ -1450,6 +1511,21 @@ void Ls2gOuterModel::load(int slot, int row)
     materialize(st);
 }
 
+void Ls2gOuterModel::reset_fresh_vm(SlotState& st) const
+{
+    // not where something else re-seeds the bus: a generator the row moves there (load),
+    // or the row's own set-point of one of its writers (the source's gen_v, applied before)
+    const std::vector<ls2g::real_type>& row_vm = st.rowv.gens.target_vm;
+    for (size_t k = 0; k < fresh_vm_.size(); ++k) {
+        const int b = fresh_vm_[k].first;
+        if (std::find(st.vm_reset_bus.begin(), st.vm_reset_bus.end(), b) != st.vm_reset_bus.end()) continue;
+        bool row_sets = false;
+        for (int g : fresh_vm_gens_[k])
+            row_sets = row_sets || (static_cast<size_t>(g) < row_vm.size() && !std::isnan(row_vm[static_cast<size_t>(g)]));
+        if (!row_sets) reset_vm(st, b, fresh_vm_[k].second);
+    }
+}
+
 void Ls2gOuterModel::take_resume_targets(SlotState& st) const
 {
     // OuterLoopAlgo::_take_targets: the targets the loops moved there, but where the row sets
@@ -1491,10 +1567,43 @@ std::shared_ptr<const RlPlan> Ls2gOuterModel::rl_plan_masked(const std::vector<i
     return rl;
 }
 
+void Ls2gOuterModel::check_row_slack_weights(const RowOverrides& ov) const
+{
+    const auto check = [&](const std::vector<double>& m, int n, const char* what, const char* setter,
+                           const auto& grid_weight) {
+        if (m.empty() || n <= 0) return;
+        for (size_t k = 0; k < m.size(); ++k) {
+            if (!(m[k] >= 1e-7)) continue;   // NaN, or out of the slack (upstream _tol_equal_float)
+            const int el = static_cast<int>(k % static_cast<size_t>(n));
+            if (grid_weight(el) > 0.) continue;
+            throw std::invalid_argument(
+                std::string(setter) + ": row " + std::to_string(k / static_cast<size_t>(n)) + " gives " + what + " " +
+                std::to_string(el) + " a slack weight, but it takes no part in the grid's distributed slack, with "
+                "the outer loops: the units sharing the slack are reserved once for the batch. Make that unit a "
+                "participant of the grid's slack (add_gen_slackbus / add_storage_slackbus) and give it 0 in the "
+                "rows where it should take no share.");
+        }
+    };
+    const auto& gens = grid_->get_generators();
+    const auto& stos = grid_->get_storages();
+    check(ov.gen_slack_w, n_gen_, "generator", "set_gen_slack_weights",
+          [&gens](int g) { return static_cast<double>(gens.get_can_participate_slack_weight(g)); });
+    check(ov.storage_slack_w, n_sto_, "storage unit", "set_storage_slack_weights",
+          [&stos](int s) { return static_cast<double>(stos.get_can_participate_slack_weight(s)); });
+}
+
 void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
                                    std::vector<ls2g::slack_redistribution::Participant>& units,
-                                   std::vector<int>& bus_of) const
+                                   std::vector<int>& bus_of, const std::vector<double>* gen_w,
+                                   const std::vector<double>* sto_w) const
 {
+    // the row's weight of a unit where it gives one (OuterGridView::gen_slack_weight), the
+    // grid's "can participate" one otherwise
+    const auto row_w = [](const std::vector<double>* w, int el, double own) {
+        if (w == nullptr || static_cast<size_t>(el) >= w->size()) return own;
+        const double x = (*w)[static_cast<size_t>(el)];
+        return std::isnan(x) ? own : x;
+    };
     // DistributedSlackLoop's collect_units: the participants of this row
     units.clear();
     bus_of.clear();
@@ -1512,10 +1621,12 @@ void Ls2gOuterModel::collect_units(const ls2g::OuterGridView& v,
     };
     for (int el = 0; el < gens.nb(); ++el)
         add(ls2g::slack_redistribution::UnitKind::GENERATOR, el, v.gen_bus_solver(el),
-            gens.get_can_participate_slack_weight(el), v.gen_target_p(el), gens.get_min_p(el), gens.get_max_p(el));
+            row_w(gen_w, el, gens.get_can_participate_slack_weight(el)), v.gen_target_p(el), gens.get_min_p(el),
+            gens.get_max_p(el));
     for (int el = 0; el < stos.nb(); ++el)
         add(ls2g::slack_redistribution::UnitKind::STORAGE, el, v.storage_bus_solver(el),
-            stos.get_can_participate_slack_weight(el), -v.storage_target_p(el), stos.get_min_p(el), stos.get_max_p(el));
+            row_w(sto_w, el, stos.get_can_participate_slack_weight(el)), -v.storage_target_p(el), stos.get_min_p(el),
+            stos.get_max_p(el));
 }
 
 bool Ls2gOuterModel::filtered_bus_q_plan(const ls2g::OuterGridView& v, ls2g::bus_q_check::BusQPlan& out,

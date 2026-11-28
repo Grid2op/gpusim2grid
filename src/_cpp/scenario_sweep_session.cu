@@ -15,6 +15,7 @@
 #include "contingency/gen_v_override.hpp"   // GenVOverride, build_gen_v_override
 #include <limits>
 #include "acpf_nr_kernels.cuh"   // compute_branch_flows_kernel, zero_branch_flows_kernel
+#include "contingency/own_branch_flows.cuh"   // override_own_branch_flows
 #include "cu_complex_utils.h"
 #include "cuda_utils.h"          // ms_since
 #include "ledger_data.hpp"       // LedgerData (mask_cfg_ controller-bus setup)
@@ -620,7 +621,11 @@ std::vector<cuda_real_type> ScenarioSweepSession::_row_slack_weights(
     return gen_contingency::row_slack_weights(gen_data_, row_slack_off, n_scenarios_, n_bus,
                                               base_state_->h_slack_bus, base_state_->h_slack_w,
                                               ref_bus, "ScenarioSweepSession",
-                                              [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
+                                              [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); },
+                                              slack_w_rows_.empty() ? nullptr : &slack_w_rows_,
+                                              [this](int r, int g) {
+                                                  return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g);
+                                              });
 }
 
 // =============================================================================
@@ -656,6 +661,144 @@ void ScenarioSweepSession::set_slack_redistribution_data(const SlackRedistributi
 void ScenarioSweepSession::set_gen_p_rows(Eigen::Ref<const RealMatRM> gen_p)
 {
     gen_p_rows_ = gen_p;
+}
+
+// =============================================================================
+// set_slack_weight_rows -- lightsim2grid PR #303's set_gen_slack_weights /
+// set_storage_slack_weights (BaseBatchSweep::_set_slack_weights)
+// =============================================================================
+void ScenarioSweepSession::set_slack_weight_rows(Eigen::Ref<const Eigen::VectorXi> gen_ids,
+                                                 Eigen::Ref<const SlackWeightRows::Mat> gen_w,
+                                                 Eigen::Ref<const Eigen::VectorXi> sto_ids,
+                                                 Eigen::Ref<const SlackWeightRows::Mat> sto_w)
+{
+    static const char* who = "ScenarioSweepSession::set_slack_weight_rows";
+    if ((gen_ids.size() > 0 || sto_ids.size() > 0) && gen_data_.empty())
+        throw std::runtime_error(std::string(who) + ": this session has no generator data (explicit-array/tuple "
+                                 "mode): per-row slack weights need a session built from a lightsim2grid grid.");
+    SlackWeightRows next;
+    const auto fill = [&](SlackWeightRows::Family& fam, const Eigen::Ref<const Eigen::VectorXi>& ids,
+                          const Eigen::Ref<const SlackWeightRows::Mat>& w, int nb_el, const char* setter) {
+        const auto fail = [setter](const std::string& what) {
+            throw std::invalid_argument(std::string(setter) + ": " + what);
+        };
+        if (ids.size() == 0) return;
+        std::vector<int> sorted(ids.data(), ids.data() + ids.size());
+        for (int id : sorted)
+            if (id < 0 || id >= nb_el)
+                fail("id " + std::to_string(id) + " is out of range, the grid has " + std::to_string(nb_el) + " of them.");
+        std::sort(sorted.begin(), sorted.end());
+        const auto dup = std::adjacent_find(sorted.begin(), sorted.end());
+        if (dup != sorted.end()) fail("id " + std::to_string(*dup) + " is named twice.");
+        if (w.cols() != ids.size())
+            fail("`weights` has " + std::to_string(w.cols()) + " columns for " + std::to_string(ids.size()) +
+                 " ids: one row per scenario, one column per id.");
+        if (w.rows() <= 0) fail("`weights` has no row.");
+        if (has_injections_ && w.rows() != n_scenarios_)
+            fail("`weights` has " + std::to_string(w.rows()) + " rows, but set_injections() fixed " +
+                 std::to_string(n_scenarios_) + " scenarios.");
+        for (Eigen::Index r = 0; r < w.rows(); ++r)
+            for (Eigen::Index c = 0; c < w.cols(); ++c) {
+                const double x = w(r, c);
+                if (std::isnan(x)) continue;
+                if (!std::isfinite(x) || x < 0.)
+                    fail("a weight that is negative or infinite at (row " + std::to_string(r) + ", column " +
+                         std::to_string(c) + "): " + std::to_string(x) + ". Use 0 to take the unit out of the "
+                         "slack, NaN to keep the grid's weight.");
+            }
+        fam.ids.assign(ids.data(), ids.data() + ids.size());
+        fam.w = w;
+        fam.col_of_el.assign(static_cast<size_t>(nb_el), -1);
+        for (Eigen::Index c = 0; c < ids.size(); ++c) fam.col_of_el[static_cast<size_t>(ids(c))] = static_cast<int>(c);
+    };
+    fill(next.gen, gen_ids, gen_w, gen_data_.n_gen, "set_gen_slack_weights");
+    fill(next.sto, sto_ids, sto_w, gen_data_.n_storage, "set_storage_slack_weights");
+    if (!next.gen.empty() && !next.sto.empty() && next.gen.w.rows() != next.sto.w.rows())
+        throw std::invalid_argument("set_gen_slack_weights / set_storage_slack_weights disagree on the number of "
+                                    "scenarios (" + std::to_string(next.gen.w.rows()) + " and " +
+                                    std::to_string(next.sto.w.rows()) + " rows).");
+    next.refresh_rows();
+    slack_w_rows_ = std::move(next);
+    slack_w_rows_dirty_ = true;
+}
+
+void ScenarioSweepSession::_check_slack_weight_rows() const
+{
+    // Raised for the batch, not reported per row (row_unsupported_): these are inputs the caller
+    // fixes, as lightsim2grid's _check_slack_weight_rows raises them from compute() -- not rows
+    // the batch cannot solve yet
+    if (slack_w_rows_.empty()) return;
+    if (slack_w_rows_.n_rows() != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_gen_slack_weights / set_storage_slack_weights' row count no longer "
+            "matches set_injections()'s n_scenarios -- set them again after changing set_injections()");
+    // the outer loops' DistributedSlack loop shares with them: its model checks them (only a
+    // unit that can take part in the grid's slack may get a positive weight)
+    if (outer_) return;
+    if (!base_state_ || base_state_->n_slack <= 0)
+        throw std::invalid_argument(
+            "set_gen_slack_weights / set_storage_slack_weights need the distributed slack "
+            "(use_distributed_slack=True): the rows' weights are values of its column.");
+    const int n_bus = base_state_->n_bus;
+    std::vector<char> slack_bus(static_cast<size_t>(n_bus), 0);
+    for (int b : base_state_->h_slack_bus)
+        if (b >= 0 && b < n_bus) slack_bus[static_cast<size_t>(b)] = 1;
+    // what shares with a row's weights must list the unit: the redistribute_slack pre-pass data
+    // (build_row_weights builds the solve's row weights from it: a unit it lacks would silently
+    // take no share, unlike without the pre-pass) and the active-power check's plan (each bus'
+    // weight total). The grid's list every connected one (*_from_grid, which set_gen_slack_weights
+    // refreshes); data set explicitly may not.
+    const bool rd_needs = has_slack_rd_ && ((redistribute_slack_ && !outer_) || has_ext_sat_);
+    const bool gp_needs = phys_.compute_physical_violations && phys_.has_gen_p_plan &&
+                          phys_.gen_p_plan.n_entries > 0;   // none: nothing reported reads them
+    std::set<std::pair<int, int>> rd_units, plan_units;   // (5 GENERATOR / 6 STORAGE, container id)
+    if (rd_needs)
+        for (int k = 0; k < slack_rd_.n_units; ++k) rd_units.emplace(slack_rd_.kind(k), slack_rd_.el_id(k));
+    if (gp_needs)
+        for (int p = 0; p < phys_.gen_p_plan.n_part; ++p)
+            plan_units.emplace(phys_.gen_p_plan.part_el_type(p), phys_.gen_p_plan.part_el_id(p));
+    const auto check = [&](const SlackWeightRows::Family& fam, int kind, const char* what, const char* setter,
+                           const auto& bus_of, const auto& off) {
+        for (int r = 0; r < n_scenarios_; ++r) {
+            if (!slack_w_rows_.has_row(r)) continue;
+            if (!row_unsupported_.empty() && !row_unsupported_[static_cast<size_t>(r)].empty()) continue;
+            for (size_t c = 0; c < fam.ids.size(); ++c) {
+                const int el = fam.ids[c];
+                const double w = fam.w(r, static_cast<Eigen::Index>(c));
+                if (!(w >= slack_weight_rows::MIN_WEIGHT)) continue;   // NaN, or out of the slack
+                const int b = bus_of(el);
+                if (b < 0 || off(r, el)) continue;                      // takes no share
+                const auto unit = [&]() {
+                    return std::string(setter) + ": row " + std::to_string(r) + " gives " + what + " " +
+                           std::to_string(el) + " a slack weight";
+                };
+                if (!slack_bus[static_cast<size_t>(b)])
+                    throw std::invalid_argument(
+                        unit() + ", but it stands on solver bus " + std::to_string(b) + ", where no unit takes "
+                        "part in the grid's distributed slack. The buses sharing the slack are fixed for the batch: "
+                        "make that unit a participant of the grid's slack (add_gen_slackbus / add_storage_slackbus) "
+                        "and give it 0 in the rows where it should take no share.");
+                if (rd_needs && !rd_units.count({kind, el}))
+                    throw std::invalid_argument(
+                        unit() + ", but the redistribute_slack pre-pass data does not list it: data set with "
+                        "set_slack_redistribution_data must list every unit a row gives a weight to (weight 0 where "
+                        "it takes no part in the grid's slack), as set_slack_redistribution_data_from_grid() does.");
+                if (gp_needs && !plan_units.count({kind, el}))
+                    throw std::invalid_argument(
+                        unit() + ", but the active-power check's plan does not list it among the units taking a "
+                        "share: a plan set with set_gen_p_capability must list every unit a row gives a weight to, "
+                        "as set_gen_p_capability_from_grid() does.");
+            }
+        }
+    };
+    check(slack_w_rows_.gen, SLACK_UNIT_GENERATOR, "generator", "set_gen_slack_weights",
+          [this](int g) { return gen_data_.status[static_cast<size_t>(g)] ? gen_data_.bus[static_cast<size_t>(g)] : -1; },
+          [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g); });
+    check(slack_w_rows_.sto, SLACK_UNIT_STORAGE, "storage unit", "set_storage_slack_weights",
+          [this](int st) {
+              return static_cast<size_t>(st) < gen_data_.storage_any_bus.size() ? gen_data_.storage_any_bus[static_cast<size_t>(st)] : -1;
+          },
+          [this](int r, int st) { return _row_trips(r, &MoreTrips::storages, st); });
 }
 
 void ScenarioSweepSession::set_external_slack_saturation(
@@ -799,7 +942,8 @@ std::vector<slack_redistribution::RowResult> ScenarioSweepSession::_slack_prepas
     }
     return slack_redistribution::prepass_all(slack_rd_, n_scenarios_, base_state_->n_bus,
                                              skipped, masked, gen_off, gen_p_row, sbus_p_mw, row_p,
-                                             [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
+                                             [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); },
+                                             slack_w_rows_.empty() ? nullptr : &slack_w_rows_);
 }
 
 // =============================================================================
@@ -906,6 +1050,17 @@ void ScenarioSweepSession::set_branch_data(
                         "the new " + std::to_string(n_bra_new) + " branches -- call "
                         "set_topology() with valid ids first");
     }
+    // ... and so do the rows' own parameters: the topology rebuilt below reads the new data at
+    // each branch they name (_append_branch_params)
+    if (has_branch_params_)
+        for (size_t r = 0; r < branch_params_.size(); ++r)
+            for (const BranchParamBlock& bp : branch_params_[r])
+                if (bp.first >= n_bra_new)
+                    throw std::runtime_error(
+                        "ScenarioSweepSession::set_branch_data: row " + std::to_string(r) + "'s parameters "
+                        "(set_line_parameters / set_trafo_parameters) name branch " + std::to_string(bp.first) +
+                        ", out of range for the new " + std::to_string(n_bra_new) + " branches -- set them "
+                        "again (or clear them) first");
 
     h_branch_from_   = branch_from;
     h_branch_to_     = branch_to;
@@ -1044,12 +1199,129 @@ void ScenarioSweepSession::set_topology(
         if (has_more_off_ && r < more_off_.size())
             for (const auto& t : element_trips::svc_triplets(trip_data_, more_off_[r].svcs))
                 contingencies_.back().triplets.push_back({t.bus, t.bus, t.re, t.im});
+        // the parameters it gives some branches (set_branch_param_blocks)
+        _append_branch_params(static_cast<int>(r), contingencies_.back());
         tripped_branches_per_scenario_.push_back(branch_ids);
     }
     has_topology_      = true;
     topology_implicit_ = false;
     topology_dirty_    = true;
     auto_ref_valid_    = false;
+    ++topology_generation_;
+}
+
+// =============================================================================
+// set_branch_param_blocks (lightsim2grid PR #303's set_line_parameters /
+// set_trafo_parameters)
+// =============================================================================
+void ScenarioSweepSession::set_branch_param_blocks(const std::vector<int>& rows,
+                                                   const std::vector<int>& branches,
+                                                   const std::vector<std::complex<double>>& y,
+                                                   int n_rows)
+{
+    static const char* who = "ScenarioSweepSession::set_branch_param_blocks";
+    if (!has_branch_data_)
+        throw std::runtime_error(std::string(who) + ": call set_branch_data() first");
+    if (branches.size() != rows.size() || y.size() != 4 * rows.size())
+        throw std::runtime_error(std::string(who) + ": rows, branches and y (4 per entry) disagree in length");
+    if (!rows.empty() && n_rows <= 0)
+        throw std::runtime_error(std::string(who) + ": n_rows must be > 0");
+    if (has_injections_ && n_rows > 0 && n_rows != n_scenarios_)
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(n_rows) + " rows, but set_injections() "
+                                 "fixed " + std::to_string(n_scenarios_) + " scenarios");
+    const int n_bra = static_cast<int>(h_branch_from_.size());
+    std::vector<std::vector<BranchParamBlock>> per_row(rows.empty() ? 0 : static_cast<size_t>(n_rows));
+    for (size_t k = 0; k < rows.size(); ++k) {
+        if (rows[k] < 0 || rows[k] >= n_rows)
+            throw std::runtime_error(std::string(who) + ": row " + std::to_string(rows[k]) + " is outside [0, " +
+                                     std::to_string(n_rows) + ")");
+        if (branches[k] < 0 || branches[k] >= n_bra)
+            throw std::runtime_error(std::string(who) + ": branch " + std::to_string(branches[k]) +
+                                     " is outside the " + std::to_string(n_bra) + " branches");
+        BranchParamBlock b;
+        b.first = branches[k];
+        for (int q = 0; q < 4; ++q) b.second[static_cast<size_t>(q)] = y[4 * k + static_cast<size_t>(q)];
+        per_row[static_cast<size_t>(rows[k])].push_back(b);
+    }
+    for (auto& row : per_row) {
+        std::sort(row.begin(), row.end(), [](const BranchParamBlock& a, const BranchParamBlock& b) { return a.first < b.first; });
+        for (size_t k = 1; k < row.size(); ++k)
+            if (row[k].first == row[k - 1].first)
+                throw std::runtime_error(std::string(who) + ": branch " + std::to_string(row[k].first) +
+                                         " is given twice in one row");
+    }
+    // nothing set, or nothing left after a clear: no rebuild needed when there was nothing before
+    const bool had = has_branch_params_;
+    const bool has = !rows.empty();
+    if (!had && !has) return;
+    // the rows' Ybus patches, rebuilt with them (the caller's branch trips kept; the
+    // implicit "none" follows the new row count). The rebuild must be accepted before anything
+    // is replaced, so that a refused call leaves the session as it was: a kept topology whose
+    // row count the injections changed since is refused by set_topology
+    const bool keep = has_topology_ && !topology_implicit_;
+    if (keep && has_injections_ && static_cast<int>(tripped_branches_per_scenario_.size()) != n_scenarios_)
+        throw std::invalid_argument(std::string(who) + ": the topology (set_topology) has " +
+                                    std::to_string(tripped_branches_per_scenario_.size()) + " rows, but "
+                                    "set_injections() fixed " + std::to_string(n_scenarios_) + " scenarios: set "
+                                    "the topology again first");
+    const size_t n_implicit = has ? per_row.size()
+                            : (has_injections_ ? static_cast<size_t>(n_scenarios_) : contingencies_.size());
+    const std::vector<std::vector<int>> trips = keep
+        ? tripped_branches_per_scenario_
+        : std::vector<std::vector<int>>(n_implicit);
+    std::vector<std::vector<BranchParamBlock>> previous = std::move(branch_params_);
+    branch_params_    = std::move(per_row);
+    has_branch_params_ = has;
+    try {
+        set_topology(trips);
+    } catch (...) {
+        branch_params_     = std::move(previous);
+        has_branch_params_ = had;
+        throw;
+    }
+    topology_implicit_ = !keep;
+}
+
+void ScenarioSweepSession::_append_branch_params(int r, Contingency& ctg) const
+{
+    if (!has_branch_params_ || r < 0 || static_cast<size_t>(r) >= branch_params_.size()) return;
+    const double sqrt3 = std::sqrt(3.0);
+    for (const BranchParamBlock& bp : branch_params_[static_cast<size_t>(r)]) {
+        const int b = bp.first;
+        // tripped by the row: its grid block went, the parameters do not matter
+        if (std::find(ctg.tripped_branches.begin(), ctg.tripped_branches.end(), b) != ctg.tripped_branches.end())
+            continue;
+        const int f = h_branch_from_(b), t = h_branch_to_(b);
+        if (f < 0 && t < 0) continue;   // in no matrix
+        const std::complex<double> grid[4] = {
+            std::complex<double>(static_cast<double>(h_yff_eff_(b).real()), static_cast<double>(h_yff_eff_(b).imag())),
+            std::complex<double>(static_cast<double>(h_yft_eff_(b).real()), static_cast<double>(h_yft_eff_(b).imag())),
+            std::complex<double>(static_cast<double>(h_ytf_eff_(b).real()), static_cast<double>(h_ytf_eff_(b).imag())),
+            std::complex<double>(static_cast<double>(h_ytt_eff_(b).real()), static_cast<double>(h_ytt_eff_(b).imag()))};
+        // subtracted from the row's Ybus: grid block - row block, on the entries the
+        // branch stamps (lightsim2grid's YbusPolicy::Contingency::_append_param_coeffs)
+        const auto add = [&ctg](int i, int j, std::complex<double> d) { ctg.triplets.push_back({i, j, d.real(), d.imag()}); };
+        if (f >= 0) add(f, f, grid[0] - bp.second[0]);
+        if (t >= 0) add(t, t, grid[3] - bp.second[3]);
+        if (f >= 0 && t >= 0) {
+            add(f, t, grid[1] - bp.second[1]);
+            add(t, f, grid[2] - bp.second[2]);
+        }
+        // the row's own block: its flows and current check (a side's current base is the
+        // nominal voltage of its bus, the other end's when it is Kron-reduced, as
+        // BatchPfDriver::upload_branch_admittances)
+        RowBranchBlock ob;
+        ob.branch = b;
+        ob.from = f;
+        ob.to = t;
+        for (int q = 0; q < 4; ++q) ob.y[q] = bp.second[static_cast<size_t>(q)];
+        const int vn_or = f >= 0 ? f : t, vn_ex = t >= 0 ? t : f;
+        ob.base_or_A = sn_mva_ * 1e6 / (sqrt3 * static_cast<double>(h_bus_vn_kv_(vn_or)) * 1e3);
+        ob.base_ex_A = sn_mva_ * 1e6 / (sqrt3 * static_cast<double>(h_bus_vn_kv_(vn_ex)) * 1e3);
+        ctg.own_branches.push_back(ob);
+    }
+    std::sort(ctg.own_branches.begin(), ctg.own_branches.end(),
+              [](const RowBranchBlock& a, const RowBranchBlock& b) { return a.branch < b.branch; });
 }
 
 // =============================================================================
@@ -1138,6 +1410,26 @@ std::vector<std::string> ScenarioSweepSession::_row_unsupported_reasons() const
                           "ShuntVoltageControl loop owns its sections";
                     break;
                 }
+        // with the outer loops, a transformer a TransformerVoltageControl / PhaseControl loop
+        // regulates is re-stamped from the GRID's parameters at each new tap (BranchControl):
+        // the row's own would be undone (lightsim2grid leaves that row out too)
+        if (why.empty() && outer_ && has_branch_params_ && base_ledger_ && !base_ledger_->bc_trafo.empty()
+                && static_cast<size_t>(r) < branch_params_.size()) {
+            const int n_lines = base_ledger_->bc_n_lines;
+            const std::vector<int>* trips = (has_topology_ && static_cast<size_t>(r) < tripped_branches_per_scenario_.size())
+                ? &tripped_branches_per_scenario_[static_cast<size_t>(r)] : nullptr;
+            for (const BranchParamBlock& bp : branch_params_[static_cast<size_t>(r)]) {
+                const int t = bp.first - n_lines;
+                if (t < 0) continue;
+                if (trips != nullptr && std::find(trips->begin(), trips->end(), bp.first) != trips->end()) continue;
+                if (std::find(base_ledger_->bc_trafo.begin(), base_ledger_->bc_trafo.end(), t) == base_ledger_->bc_trafo.end())
+                    continue;
+                why = "changes the parameters of transformer " + std::to_string(t) + ", whose taps a "
+                      "TransformerVoltageControl / PhaseControl loop regulates (it re-stamps the "
+                      "transformer from the grid's parameters)";
+                break;
+            }
+        }
         if (why.empty() && base_ledger_) {
             std::vector<int> gens;
             if (has_gen_off_ && r < gen_off_.rows())
@@ -1291,6 +1583,11 @@ void ScenarioSweepSession::run()
             "matches set_injections()'s n_scenarios -- call set_gen_v() "
             "again after changing set_injections()");
 
+    if (has_branch_params_ && static_cast<int>(branch_params_.size()) != n_scenarios_)
+        throw std::runtime_error(
+            "ScenarioSweepSession: set_line_parameters / set_trafo_parameters' row count no longer "
+            "matches set_injections()'s n_scenarios -- set them again after changing set_injections()");
+
     if (has_topology_
             && static_cast<int>(contingencies_.size()) != n_scenarios_)
         throw std::runtime_error(
@@ -1358,6 +1655,7 @@ void ScenarioSweepSession::run()
     std::vector<std::vector<int>> row_pv_to_pq, row_slack_off;
     const std::vector<std::string> prev_unsupported = row_unsupported_;
     row_unsupported_ = _row_unsupported_reasons();
+    _check_slack_weight_rows();
     _prepare_gen_contingency(required, row_pv_to_pq, row_slack_off);
     // Reactive-limit outer loop: the Vm-fixed buses a row solves as PQ join
     // the reserved switchable set, exactly like a generator contingency's.
@@ -1494,6 +1792,7 @@ void ScenarioSweepSession::run()
         contingencies_.assign(static_cast<size_t>(n_scenarios_), Contingency{});
         tripped_branches_per_scenario_.assign(
             static_cast<size_t>(n_scenarios_), std::vector<int>{});
+        ++topology_generation_;
     }
 
     // Per-row state a new batch source computes from scratch: reset the
@@ -1744,7 +2043,9 @@ void ScenarioSweepSession::run()
     }
     // with the outer loops, the pre-pass only measured what each row loses (row_lost_p_mw_)
     const bool rd_active = (redistribute_slack_ && !outer_) || has_ext_sat_;
-    if (cold || warm || rd_active || rd_applied_) {
+    // the rows' own weights (set_gen_slack_weights) are values only: every run sets them
+    const bool weights_rows = !slack_w_rows_.empty() && !outer_;
+    if (cold || warm || rd_active || rd_applied_ || weights_rows || slack_w_applied_) {
         std::vector<cuda_real_type> w_rows;
         std::vector<std::vector<std::pair<int, double>>> dp_rows;
         if (rd_active) {
@@ -1754,7 +2055,8 @@ void ScenarioSweepSession::run()
             w_rows = slack_redistribution::build_row_weights(
                 slack_rd_, slack_rows_, n_scenarios_, gen_off, n_bus,
                 base_state_->h_slack_bus, base_state_->h_slack_w, _reference_bus(),
-                [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); });
+                [this](int r, int s) { return _row_trips(r, &MoreTrips::storages, s); },
+                weights_rows ? &slack_w_rows_ : nullptr);
             dp_rows.resize(slack_rows_.size());
             for (size_t r = 0; r < slack_rows_.size(); ++r) dp_rows[r] = slack_rows_[r].dp_pu;
         } else {
@@ -1763,6 +2065,7 @@ void ScenarioSweepSession::run()
         solver_->source_.set_slack_redistribution(w_rows, base_state_->n_slack, dp_rows,
                                                   base_state_->n_slack, solver_->batch_size_, scs);
         rd_applied_ = rd_active;
+        slack_w_applied_ = weights_rows;
     }
 
     // the controllers each row has lost: tripped, or on a bus it masks
@@ -1882,6 +2185,10 @@ void ScenarioSweepSession::run()
     // this same driver uploads what changed meanwhile.
     if (phys_.compute_physical_violations) {
         solver_->upload_gen_p_no_share(rd_ns_gen, slack_rd_.n_gen, rd_ns_sto, slack_rd_.n_sto);
+        // the weights the rows share the slack with (set_gen_slack_weights): their machines' shares,
+        // uploaded when they changed or the driver is new (it keeps them across runs)
+        if (slack_w_rows_dirty_ || cold) solver_->upload_gen_p_row_weights(slack_w_rows_);
+        slack_w_rows_dirty_ = false;
         rd_gp_last_ = rd_gp;
         gen_p_targets_dirty_ = false;
         gen_pv_release_targets_dirty_ = false;
@@ -1962,6 +2269,28 @@ void ScenarioSweepSession::run()
         }
         // ... and what it loses, for its DistributedSlack loop to share (redistribute_slack)
         ov.lost_p_mw = row_lost_p_mw_;
+        // ... and the weights it shares the slack with (set_gen_slack_weights): only those that act --
+        // not a row the batch leaves out (never solved), nor a unit the row disconnects (it takes
+        // no share, as without the outer loops). The model refuses a positive weight to a unit
+        // that cannot take part in the grid's slack (lightsim2grid's rule under outer loops, which
+        // refuses those two too: gpusim2grid follows its rule without the outer loops there), and
+        // a row left with none of its own resumes like the others.
+        const auto dense_w = [this](const SlackWeightRows::Family& fam, std::vector<double>& out, const auto& off) {
+            if (fam.empty()) return;
+            const size_t n_el = fam.col_of_el.size();
+            out.assign(static_cast<size_t>(n_scenarios_) * n_el, std::numeric_limits<double>::quiet_NaN());
+            for (int r = 0; r < n_scenarios_; ++r) {
+                if (!row_unsupported_.empty() && !row_unsupported_[static_cast<size_t>(r)].empty()) continue;
+                for (size_t c = 0; c < fam.ids.size(); ++c) {
+                    if (off(r, fam.ids[c])) continue;
+                    out[static_cast<size_t>(r) * n_el + static_cast<size_t>(fam.ids[c])] = fam.w(r, static_cast<Eigen::Index>(c));
+                }
+            }
+        };
+        dense_w(slack_w_rows_.gen, ov.gen_slack_w,
+                [this](int r, int g) { return has_gen_off_ && g < gen_off_.cols() && r < gen_off_.rows() && gen_off_(r, g); });
+        dense_w(slack_w_rows_.sto, ov.storage_slack_w,
+                [this](int r, int st) { return _row_trips(r, &MoreTrips::storages, st); });
         outer_->set_row_overrides(std::move(ov));
     }
 
@@ -1999,6 +2328,7 @@ void ScenarioSweepSession::run()
     skip_dirty_ = false;
     switches_dirty_ = false;
     last_run_kept_jacobian_ = keep_final_jacobian_;
+    run_topology_generation_ = topology_generation_;
 
     solver_->cs.synchronize();
     timings_.t_session_run_wall_ms = ms_since(t_run0);
@@ -2124,6 +2454,13 @@ void ScenarioSweepSession::compute_flows()
     if (!solver_)
         throw std::runtime_error(
             "ScenarioSweepSession: call run() before compute_flows()");
+    // the last run's V through the rows' branches as they are NOW (their trips zeroed, their own
+    // blocks written over): a topology or parameter change since would give no row's flows
+    if (topology_generation_ != run_topology_generation_)
+        throw std::runtime_error(
+            "ScenarioSweepSession::compute_flows: the rows' branches changed since the last run() "
+            "(set_topology, set_line_parameters / set_trafo_parameters, set_branch_data, a "
+            "contingency setter...): call run() first");
 
     // The admittances + dense flow buffers survive on a persistent driver:
     // upload them once per driver, not once per compute_flows() call.
@@ -2178,6 +2515,9 @@ void ScenarioSweepSession::compute_flows()
             thrust::raw_pointer_cast(d_zero.data()),
             n_z);
     }
+    // the branches a row gives parameters of its own (set_line_parameters /
+    // set_trafo_parameters): at the row's block
+    override_own_branch_flows(*solver_, contingencies_, n_bus, "ScenarioSweepSession::compute_flows");
 
     timings_.t_flow_computation += flow_timer.stop_ms();
     // d_zero dies at the end of the scope: wait for the kernel reading it (stop_ms() does not under
